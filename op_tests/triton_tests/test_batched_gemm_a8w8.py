@@ -202,9 +202,10 @@ def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output, impl: str):
 
 
 if __name__ == "__main__":
-    dtype = "fp16"
-    b, m, n, k = 16, 1, 1, 1
+    dtype = "bf16"
+    b, m, n, k = 1, 128, 128, 32
+    layout = "TN"
     output = False
     impl = "gluon"
 
-    test_batched_gemm_a8w8(dtype, b, m, n, k, output, impl)
+    test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output, impl)

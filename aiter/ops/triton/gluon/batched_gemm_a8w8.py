@@ -349,8 +349,8 @@ def _issue_loads(
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
     EVEN_K: gl.constexpr,
-    NUM_STAGES: gl.constexpr = 1,
-    USE_ASYNC_COPY: gl.constexpr = True,
+    NUM_STAGES: gl.constexpr,
+    USE_ASYNC_COPY: gl.constexpr,
 ):
     # Create masks depending on whether K is evenly split
     mask_a = (
@@ -364,35 +364,9 @@ def _issue_loads(
         else ((offs_bk[:, None] < K - load_idx * BLOCK_SIZE_K) & (offs_bn[None, :] < N))
     )
 
-    # Figure out conditions where ttg.async_copy_global_to_local would be illegal op,
-    # in which case we fall back to regular load + store to shared memory.
-    # The operation is illegal when the contiguous array of values we are trying to copy
-    # is less than 4 bytes (or elements, since this is a8w8) in size.
-
-    # TODO: Figure out whether we need to consider the memory layout when deciding
-    # to bypass the asynchronous copy
-
-    # can_copy_a = True
-    # if stride_ak == 1:      # layout[0] == "T"
-    #     if K < 4 or BLOCK_SIZE_K < 4:
-    #         can_copy_a = False
-    # if stride_am == 1:    # layout[0] == "N"
-    #     if M < 4 or BLOCK_SIZE_M < 4:
-    #         can_copy_a = False
-    # can_copy_b = True
-    # if stride_bn == 1:      # layout[1] == "T"
-    #     if N < 4 or BLOCK_SIZE_N < 4:
-    #         can_copy_b = False
-    # if stride_bk == 1:    # layout[1] == "N"
-    #     if K < 4 or BLOCK_SIZE_K < 4:
-    #         can_copy_b = False
-
-    can_copy_a = M >= 4 and BLOCK_SIZE_M >= 4
-    can_copy_b = N >= 4 and BLOCK_SIZE_N >= 4
-
     # If not using asynchronous copy functions, load A and B to registers
     # and then store in shared memory
-    if USE_ASYNC_COPY and can_copy_a and can_copy_b:
+    if USE_ASYNC_COPY:
         # Load the next block of A
         # acp.buffer_load_to_shared(
         #     dest=smem_a.index(load_idx % NUM_STAGES),
@@ -456,13 +430,13 @@ def _compute_loop(
     dot_b_layout,
     accumulator,
     zeros,
-    NUM_STAGES=1,
+    NUM_STAGES,
 ):
     # Grab the current block of A from shared memory
-    cur_a = smem_a.index(read_idx % NUM_STAGES).load(layout=dot_a_layout)
+    cur_a = acp.load_shared_relaxed(smem_a.index(read_idx % NUM_STAGES), dot_a_layout)
 
     # Grab the current block of B from shared memory
-    cur_b = smem_b.index(read_idx % NUM_STAGES).load(layout=dot_b_layout)
+    cur_b = acp.load_shared_relaxed(smem_b.index(read_idx % NUM_STAGES), dot_b_layout)
 
     # Perform and store the MFMA operation
     accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
@@ -862,6 +836,47 @@ def batched_gemm_a8w8(
         B,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
+
+    print("M:", M)
+    print("N:", N)
+    print("K:", K)
+    print("BLOCK_SIZE_M:", config["BLOCK_SIZE_M"])
+    print("BLOCK_SIZE_N:", config["BLOCK_SIZE_N"])
+    print("BLOCK_SIZE_K:", config["BLOCK_SIZE_K"])
+    print("Batch:", B)
+    print(
+        "Grid Per Batch:",
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+    )
+
+    # Figure out conditions where ttg.async_copy_global_to_local would be illegal op,
+    # in which case we fall back to regular load + store to shared memory.
+    # The operation is illegal when the contiguous array of values we are trying to copy
+    # is less than 4 bytes (or elements, since this is a8w8) in size.
+
+    # TODO: Figure out whether we need to consider the memory layout when deciding
+    # to bypass the asynchronous copy
+
+    # can_copy_a = True
+    # if stride_ak == 1:      # layout[0] == "T"
+    #     if K < 4 or BLOCK_SIZE_K < 4:
+    #         can_copy_a = False
+    # if stride_am == 1:    # layout[0] == "N"
+    #     if M < 4 or BLOCK_SIZE_M < 4:
+    #         can_copy_a = False
+    # can_copy_b = True
+    # if stride_bn == 1:      # layout[1] == "T"
+    #     if N < 4 or BLOCK_SIZE_N < 4:
+    #         can_copy_b = False
+    # if stride_bk == 1:    # layout[1] == "N"
+    #     if K < 4 or BLOCK_SIZE_K < 4:
+    #         can_copy_b = False
+
+    # FIXME: If K-dimension is too small, the async_copy functions do not work
+    can_copy_m = M >= 4 and config["BLOCK_SIZE_M"] >= 4
+    can_copy_n = N >= 4 and config["BLOCK_SIZE_N"] >= 4
+    can_copy_k = K >= 4 and config["BLOCK_SIZE_K"] >= 4
+    use_async_copy = use_async_copy and can_copy_m and can_copy_n and can_copy_k
 
     _batched_gemm_a8w8_kernel[grid](
         XQ,
