@@ -281,6 +281,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     // printf("K: %u\n", args.K);
     // printf("splitk: %u\n", args.splitk);
     // printf("is_out_b16: %u\n", args.is_out_b16);
+    // printf("add_bias: %u\n", args.add_bias);
     // printf("=======================================\n");
 
     auto it_kl = config_map->find(selectedKernelName);
