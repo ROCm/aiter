@@ -848,6 +848,7 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
     
+    aiter.logger.info(f'a2 = {a2}')
 
     if (
         quant_type == QuantType.per_1x32
@@ -1162,7 +1163,8 @@ def torch_moe_stage1(
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
-        if use_swiglu:
+        # if use_swiglu:
+        if False:
             out = swiglu(gate, up)
         else:
             out = torch_act(gate) * up
