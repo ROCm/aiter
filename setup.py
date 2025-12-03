@@ -172,8 +172,6 @@ if IS_ROCM:
             return []
         else:
             return []
-        else:
-            return []
 
     exclude_ops = get_exclude_ops()
 
