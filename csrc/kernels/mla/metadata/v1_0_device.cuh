@@ -53,7 +53,12 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_splits = get_local_splits(seqlen_kv, params.num_splits, num_splits_per_cu);
         const int32_t payload = ck_tile::integer_divide_ceil(num_blocks, num_splits);
-        const int32_t split_local = ck_tile::integer_divide_ceil(num_blocks, payload);
+        int32_t split_local = ck_tile::integer_divide_ceil(num_blocks, payload);
+	int32_t tail = seqlen_kv % (payload * params.kv_granularity);
+        if (tail <= 4 && tail != 0)
+        {
+	    split_local--;
+	}
         p_lds_split[bid] = split_local;
         p_lds_payload[bid] = payload;
         p_lds_kv_seqlen[bid_ori + 1] = kv_end;
@@ -102,7 +107,6 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
             {
                 work_info.kv_end = kv_end;
                 work_info.kv_offset = 0;
-                sid++;
             }
             p_work_info_set[work_index] = work_info;
             params.p_reduce_partial_map[work_index] = work_info.partial_qo_loc;
