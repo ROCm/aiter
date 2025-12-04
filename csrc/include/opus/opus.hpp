@@ -804,7 +804,7 @@ OPUS_H_D constexpr auto set_slice(C&& dst_c, V&& src_c, S&&...ss) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // BELOW IS AMDGPU SPECIFIC TYPES/ARCH/INTRINSICS
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// dtype, sufix is "_t", and register corresponding ext_vector_type, and a specialization of is_dtype
+// dtype, suffix is "_t", and register corresponding ext_vector_type, and a specialization of is_dtype
 #define REGISTER_DTYPE(dtype_base_, dtype_impl_)        \
     using dtype_base_ ## _t    = dtype_impl_;           \
     using dtype_base_ ## x1_t  = dtype_base_ ## _t __attribute__((ext_vector_type(1 )));    \
@@ -907,6 +907,7 @@ template<> OPUS_D float       min<float>(const float&a, const float&b) { return 
 
 template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = max(a, b); return max(max_0, max(min_0, c)); }
 template<> OPUS_D float       med3<float>(const float&a, const float&b, const float&c) { return __builtin_amdgcn_fmed3f(a, b, c); }
+template<> OPUS_D __fp16      med3<__fp16>(const __fp16&a, const __fp16&b, const __fp16&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // buffer load/store related
 OPUS_D constexpr auto buffer_default_config() {

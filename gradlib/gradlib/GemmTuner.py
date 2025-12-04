@@ -17,20 +17,19 @@
 
 import functools
 import os
+from functools import lru_cache
 
-import aiter
 import pandas as pd
-from aiter import dtypes
 import torch
 import torch.nn.functional as F
-from aiter import logger
 
-from aiter.utility.mp_tuner import mp_tuner
-from functools import lru_cache
-from aiter.jit.core import get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num
+import aiter
+from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
+from aiter.utility.mp_tuner import mp_tuner
 
 aiter.hipb_create_extension()
 
@@ -40,22 +39,33 @@ def init_hipblas():
     aiter.hipb_create_extension()
 
 
-def call_hipb_mm(input, weight, bias, scale_a, scale_b, solidx, out_dtype):
+def call_hipb_mm(
+    input, weight, bias, scale_a, scale_b, solidx, out_dtype, bpreshuffle=False
+):
     init_hipblas()
     return aiter.hipb_mm(
         input,
-        weight,
+        weight.t(),
         solidx,
         bias=bias,
         out_dtype=out_dtype,
         scaleA=scale_a,
         scaleB=scale_b,
+        bpreshuffle=bpreshuffle,
     )
 
 
-def run_gemm_bf16_asm(inp, w, out, bias=None, splitK=None, kernelName=None):
+def run_gemm_bf16_asm(
+    inp, w, out, bias=None, splitK=None, kernelName=None, bpreshuffle=False
+):
     return aiter.gemm_a16w16_asm(
-        inp, w, out, bias=bias, splitK=splitK, kernelName=kernelName
+        inp,
+        w,
+        out,
+        bias=bias,
+        splitK=splitK,
+        kernelName=kernelName,
+        bpreshuffle=bpreshuffle,
     )
 
 
@@ -73,18 +83,34 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 
 
 def generate_data(
-    m, n, k, indtype, outdtype, scaleAB, seed=0, bias=None, device="cuda:0"
+    m,
+    n,
+    k,
+    indtype,
+    outdtype,
+    scaleAB,
+    is_shuffle=False,
+    seed=0,
+    bias=None,
+    device="cuda:0",
 ):
     torch.manual_seed(seed)
     inp = torch.randn((m, k), device=device).to(indtype)
     weights = torch.randn((n, k), device=device).to(indtype)
+    if is_shuffle:
+        shuffleweights = shuffle_weight(weights, layout=(16, 16))
+    else:
+        shuffleweights = weights
+
     # blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device=device)
     bias = torch.randn(n, device=device).to(outdtype) if bias else None
     scale_half = torch.tensor(0.5, dtype=dtypes.fp32, device=device)
     scale_one = torch.tensor(1, dtype=dtypes.fp32, device=device)
     scale = scale_half if scaleAB else scale_one
+    # if scaleAB:
+    #    scaleB = scaleB.t()
     out_asm = torch.empty(m, n, dtype=outdtype, device=device)
-    return (inp, weights, weights.t(), bias, scale, out_asm)
+    return (inp, weights, weights.t(), bias, scale, out_asm, shuffleweights)
 
 
 def get_gemm_ref(inp, weights, bias, scale, indtype, outdtype):
@@ -131,6 +157,7 @@ class Gemm:
         indtype,
         outdtype,
         scaleAB=False,
+        is_shuffle=False,
         mp=1,
         err_ratio=0.01,
         profile_file="",
@@ -145,7 +172,7 @@ class Gemm:
         self.outdtype = outdtype
         self.scaleAB = scaleAB
         self.nb = CACHE_INVALIDATE_BUFFERS
-        (self.inp, self.weights, _, self.bias, _, scaleA) = generate_data(
+        (self.inp, self.weights, _, self.bias, _, scaleA, _) = generate_data(
             m, n, k, indtype, outdtype, scaleAB, 0, bias
         )
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
@@ -163,6 +190,7 @@ class Gemm:
         # ratio of hipblaslt time
         self.hipb_prefer_ratio = 0.995
         self.mp = mp
+        self.is_shuffle = is_shuffle
         # self.inbpe = self.inp.element_size()
         # self.outbpe = self.ref.element_size()
         self.asm_map = {}
@@ -175,6 +203,7 @@ class Gemm:
             out_dtype=self.outdtype,
             scaleA=HALF if self.scaleAB else None,
             scaleB=HALF if self.scaleAB else None,
+            bpreshuffle=self.is_shuffle,
         )
         print(
             "M N K bias dtype outdtype",
@@ -222,13 +251,18 @@ class Gemm:
             ref = F.linear(self.inp, self.weights, self.bias).to(self.outdtype)
         return ref
 
-    def get_asm_kernels(self, file):
+    def get_asm_kernels(self, file, is_shuffle=False):
         if not os.path.exists(file):
             print(f"ASM kernel list file not exist: {file}")
             return {}
         df = pd.read_csv(file)
+        if "bPreshuffle" in df.columns:
+            shuffle_int = 1 if is_shuffle else 0
+            df = df[df["bPreshuffle"] == shuffle_int]
         kernel_dict = (
-            df.groupby(["tileM", "tileN", "pf"])["knl_name"].apply(list).to_dict()
+            df.groupby(["tileM", "tileN", "pf", "splitK"])["knl_name"]
+            .apply(list)
+            .to_dict()
         )
         return kernel_dict
 
@@ -236,24 +270,44 @@ class Gemm:
         if (
             self.scaleAB
             or self.k % 64 != 0
-            or (not (self.indtype == dtypes.bf16 and self.outdtype == dtypes.fp32))
-        ):
+            or self.indtype != dtypes.bf16
+            or self.outdtype != dtypes.fp32
+        ) and get_gfx() == "gfx942":
+            print(
+                f"only indtype=bf16 and outdtype=fp32 and k%64==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
+            )
             self.asm_gtimedf = pd.DataFrame(columns=["gtimems", "libtype"])
             return []
-        asm_kernel_list_csv = f"{get_asm_dir()}/bf16gemm/bf16gemm_outf32.csv"
-        asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
+        if (
+            self.scaleAB
+            or self.k % 256 != 0
+            or self.n % 256 != 0  # mismatch randomly
+            or self.indtype != dtypes.bf16
+            or self.outdtype != dtypes.bf16
+        ) and get_gfx() == "gfx950":
+            print(
+                f"only indtype=bf16 and outdtype=bf16 and k%256==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
+            )
+
+            self.asm_gtimedf = pd.DataFrame(columns=["gtimems", "libtype"])
+            return []
+        asm_kernel_list_csv = f"{get_asm_dir()}/bf16gemm/bf16gemm_fp32bf16.csv"
+        asm_kernels = self.get_asm_kernels(asm_kernel_list_csv, self.is_shuffle)
         asm_tiles = [key for key in asm_kernels.keys()]
         solidx = 0
         task_asm = []
 
         solutions = 0
         for key in asm_tiles:
-            tile_m, tile_n, pf = key
+            tile_m, tile_n, pf, splitK = key
             print(f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}")
             kernelName = asm_kernels[key][0]
-            maxSplitK = compute_gemm_SplitK(
-                self.m, self.n, self.k, tile_m, tile_n, 256
-            )  # if self.splitK else 1
+            if splitK:
+                maxSplitK = compute_gemm_SplitK(
+                    self.m, self.n, self.k, tile_m, tile_n, 256
+                )  # if self.splitK else 1
+            else:
+                maxSplitK = 1
             solidx = solidx + 1
             self.asm_map[solidx] = kernelName
             for splitK in range(1, maxSplitK + 1):
@@ -262,10 +316,11 @@ class Gemm:
                         self.m,
                         self.n,
                         self.k,
-                        False,
+                        False if self.bias is None else True,
                         str(self.indtype),
                         str(self.outdtype),
                         self.scaleAB,
+                        self.is_shuffle,
                     ),
                     solidx,
                     splitK,
@@ -283,9 +338,10 @@ class Gemm:
                             self.indtype,
                             self.outdtype,
                             self.scaleAB,
+                            self.is_shuffle,
                         ),
                         run_gemm_bf16_asm,
-                        ([0, 1, 5, 3], splitK, kernelName),
+                        ([0, 6, 5, 3], splitK, kernelName, self.is_shuffle),
                         {},
                         get_gemm_ref,
                         ([0, 1, 3, 4], self.indtype, self.outdtype),
@@ -326,10 +382,11 @@ class Gemm:
                     self.m,
                     self.n,
                     self.k,
-                    False,
+                    True if self.bias is not None else False,
                     str(self.indtype),
                     str(self.outdtype),
                     self.scaleAB,
+                    self.is_shuffle,
                 ),
                 solidx,
                 0,  # splitK
@@ -340,9 +397,17 @@ class Gemm:
                 (
                     info,
                     generate_data,
-                    (self.m, self.n, self.k, self.indtype, self.outdtype, self.scaleAB),
+                    (
+                        self.m,
+                        self.n,
+                        self.k,
+                        self.indtype,
+                        self.outdtype,
+                        self.scaleAB,
+                        self.is_shuffle,
+                    ),
                     call_hipb_mm,
-                    ([0, 2, 3, 4, 4], solidx, self.outdtype),
+                    ([0, 6, 3, 4, 4], solidx, self.outdtype),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
@@ -442,7 +507,7 @@ class GemmTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
-        "untune_file": "aiter/configs/untuned_gemm.csv",
+        "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
         "batch": 1,
     }
 
@@ -487,7 +552,17 @@ class GemmTuner(GemmCommonTuner):
 
     def __init__(
         self,
-        key=["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB", "cu_num"],
+        key=[
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "bias",
+            "dtype",
+            "outdtype",
+            "scaleAB",
+            "bpreshuffle",
+        ],
         resultList=[
             "libtype",
             "solidx",
@@ -547,13 +622,14 @@ class GemmTuner(GemmCommonTuner):
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             if "outdtype" not in self.untunedf.columns:
-                self.untunedf["outdtype"] = ""
+                self.untunedf["outdtype"] = str(args.indtype)
             if "scaleAB" not in self.untunedf.columns:
                 self.untunedf["scaleAB"] = False
             if args.indtype is not None:
                 self.untunedf["dtype"] = str(args.indtype)
             if args.outdtype is not None:
                 self.untunedf["outdtype"] = str(args.outdtype)
+
             if args.all_bias:
                 for i in range(len(self.untunedf)):
                     ds = self.untunedf.iloc[i]
@@ -566,6 +642,7 @@ class GemmTuner(GemmCommonTuner):
                             bias=bias,
                             outdtype=str(ds["outdtype"]),
                             scaleAB=ds["scaleAB"],
+                            bpreshuffle=ds["bpreshuffle"],
                         )
             self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
             self.untunedf["cu_num"] = self.get_cu_num()
@@ -576,11 +653,21 @@ class GemmTuner(GemmCommonTuner):
                 )
                 if args.verbose:
                     logger.info("skiped tuned shapes:")
-                    print(self.untunedf[mask])
                 self.untunedf = self.untunedf[~mask]
             self.untunedf.drop_duplicates().reset_index(drop=True)
+            print("untunedf is ", self.untunedf)
 
-    def add_gemm(self, m, n, k, indtype, bias=False, outdtype=None, scaleAB=False):
+    def add_gemm(
+        self,
+        m,
+        n,
+        k,
+        indtype,
+        bias=False,
+        outdtype=None,
+        scaleAB=False,
+        bpreshuffle=False,
+    ):
         assert indtype is not None
         outdtype = outdtype if outdtype is not None else indtype
         assert outdtype is not None
@@ -594,9 +681,11 @@ class GemmTuner(GemmCommonTuner):
                 & (self.tunedf["bias"] == bias)
                 & (self.tunedf["dtype"] == str(indtype))
                 & (self.tunedf["outdtype"] == str(outdtype))
+                & (self.tunedf["bpreshuffle"] == str(bpreshuffle))
             ].empty
         ):
             entry = {
+                "cu_num": [self.cu_num],
                 "M": [m],
                 "N": [n],
                 "K": [k],
@@ -604,10 +693,10 @@ class GemmTuner(GemmCommonTuner):
                 "dtype": [indtype],
                 "outdtype": [outdtype],
                 "scaleAB": [scaleAB],
+                "bpreshuffle": [bpreshuffle],
             }
             df = pd.DataFrame(entry)
             self.untunedf = pd.concat([self.untunedf, df], ignore_index=True)
-            print("self untunedf is ", self.untunedf)
         else:
             print(
                 f">>>Info: Found Duplicate shape(M:{m},"
@@ -621,6 +710,7 @@ class GemmTuner(GemmCommonTuner):
             ds = df.loc[i, :]
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
+            outdtype = outdtype if outdtype is not None else indtype
             gemmobj = Gemm(
                 ds["M"],
                 ds["N"],
@@ -629,6 +719,7 @@ class GemmTuner(GemmCommonTuner):
                 indtype=eval(indtype),
                 outdtype=eval(outdtype),
                 scaleAB=ds["scaleAB"],
+                is_shuffle=ds["bpreshuffle"],
                 mp=args.mp,
                 err_ratio=args.errRatio,
                 profile_file=args.profile_file,
@@ -648,9 +739,10 @@ class GemmTuner(GemmCommonTuner):
             splitK = info[2]
             kernelName = info[4]
             libtype = info[3]
+            res_one.append(get_cu_num())
             for ele in info[0]:
                 res_one.append(ele)
-            res_one.append(get_cu_num())
+
             res_one.append(libtype)
             res_one.append(int(solidx))
             res_one.append(int(splitK))
@@ -707,13 +799,15 @@ class GemmTuner(GemmCommonTuner):
 
             if len(gtimedf_dic[key]) == 0:
                 print(">>> No  hipblas or asm solutions found!", flush=True)
+                failedf = df.iloc[0:1]
+                self.failed = pd.concat([self.failed, failedf], ignore_index=True)
                 continue
             asm_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "asm"]
             hibs_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "hipblaslt"]
             if len(hibs_gtimedf) == 0:
                 print(">>>Only asm solutions found!", flush=True)
             elif len(asm_gtimedf) == 0:
-                print(">>> no hipblas solutions found!", flush=True)
+                print(">>>Only hipblas solutions found!", flush=True)
             resultdf1 = best_gtimedf.head(1).reset_index(drop=True)
             kernal_name = (
                 aiter.getHipblasltKernelName(int(resultdf1.iloc[0]["solidx"]))

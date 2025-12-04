@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check-signal:
@@ -27,11 +27,12 @@ jobs:
   sglang:
     name: sglang integration
     needs: [check-signal]
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-mi300-1gpu
     env:
-      SGL_BRANCH: v0.5.3
+      SGL_BRANCH: v0.5.5
       GPU_ARCH: gfx942
-      SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi30x-20251019
+      GPU_ARCH_CI: mi300 # used in sglang ci scripts
+      SGL_IMAGE: rocm/sgl-dev:v0.5.5.post3-rocm700-mi30x-20251124
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -62,7 +63,7 @@ jobs:
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && git submodule update --init --recursive \
-           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
+           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
@@ -99,10 +100,16 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Setup pip config
+        run: |
+          docker exec -u root sglang_aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root sglang_aiter_test bash -c "pip config set global.retries 10"
+
       - name: Install dependencies
         run: |
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
+          sed -i "4s/^GPU_ARCH=.*/GPU_ARCH=\"${GPU_ARCH_CI}\"/" scripts/ci/amd_ci_install_dependency.sh
           bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate Accuracy
@@ -110,7 +117,7 @@ jobs:
         run: |
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
-          bash scripts/ci/amd_ci_exec.sh pip show aiter || true
+          bash scripts/ci/amd_ci_exec.sh printenv | grep GPU_ARCH || true
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
           bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
           bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py

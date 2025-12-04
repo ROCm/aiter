@@ -10,19 +10,16 @@ from aiter import logger
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
-    AITER_CONFIG_GEMM_A8W8_FILE,
-    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE,
-    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
-    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+    AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 from torch.library import Library
+from ..ops.gemm_op_common import get_padded_m
 
 aiter_lib = Library("aiter", "FRAGMENT")
-from ..ops.gemm_op_common import get_padded_m
 
 
 def gen_gemm_a8w8_ck_fake_tensors(
@@ -73,6 +70,30 @@ def gemm_a8w8_bpreshuffle_ck(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
 ) -> torch.Tensor: ...
+
+
+def gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+) -> torch.Tensor:
+    return Out
+
+
+@compile_ops(
+    "module_gemm_a8w8_bpreshuffle_cktile",
+    fc_name="gemm_a8w8_bpreshuffle_cktile",
+    gen_fake=gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors,
+)
+def gemm_a8w8_bpreshuffle_cktile(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+) -> Tensor: ...
 
 
 def gen_gemm_a8w8_asm_fake_tensors(
@@ -169,6 +190,38 @@ def flatmm_a8w8_blockscale_asm(
 ) -> Tensor: ...
 
 
+def gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    splitK: Optional[int] = None,
+    kernelName: Optional[str] = None,
+    bpreshuffle: Optional[bool] = True,
+) -> Tensor:
+    return out
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_bpreshuffle_asm",
+    fc_name="gemm_a8w8_blockscale_bpreshuffle_asm",
+    gen_fake=gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors,
+)
+def gemm_a8w8_blockscale_bpreshuffle_asm(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    splitK: Optional[int] = None,
+    kernelName: Optional[str] = None,
+    bpreshuffle: Optional[bool] = True,
+) -> Tensor: ...
+
+
 def gen_mi350_a8w8_blockscale_asm_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
@@ -249,21 +302,32 @@ def get_bpreshuffle_GEMM_config(
     q_dtype_w: torch.dtype,
     tuned_file=f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
 ):
-    if not hasattr(get_bpreshuffle_GEMM_config, "bpreshuffle_gemm_dict"):
+    # Use dict to cache configs for different files
+    if not hasattr(get_bpreshuffle_GEMM_config, "file_cache"):
+        get_bpreshuffle_GEMM_config.file_cache = {}
+
+    # Load file if not cached
+    if tuned_file not in get_bpreshuffle_GEMM_config.file_cache:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
-        get_bpreshuffle_GEMM_config.bpreshuffle_gemm_dict = asmGemmDictDf.set_index(
+        get_bpreshuffle_GEMM_config.file_cache[tuned_file] = asmGemmDictDf.set_index(
             ["cu_num", "M", "N", "K", "q_dtype_w"]
         ).to_dict("index")
+
     cu_num = get_cu_num()
-    config = get_bpreshuffle_GEMM_config.bpreshuffle_gemm_dict.get(
-        (cu_num, M, N, K, str(q_dtype_w)), None
-    )
-    if config is not None:
-        if AITER_LOG_TUNED_CONFIG:
-            logger.info(
-                f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w} is tuned, in {tuned_file}!"
-            )
-    else:
+    padded_M = M
+    config = None
+    for gl in [None, 0, 1]:
+        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
+        config = get_bpreshuffle_GEMM_config.file_cache[tuned_file].get(
+            (cu_num, padded_M, N, K, str(q_dtype_w)), None
+        )
+        if config is not None:
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info(
+                    f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
+                )
+            break
+    if config is None:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
         )
@@ -331,7 +395,11 @@ def gemm_a8w8_ASM(
         and w_scale.dtype == dtypes.fp32
         and (
             asm_config := get_bpreshuffle_GEMM_config(
-                m, n, k, dtypes.i8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+                m,
+                n,
+                k,
+                dtypes.i8,
+                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
             )
         )
         is not None
@@ -366,7 +434,7 @@ def gemm_a8w8_CK(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
-    ck_config = get_CKGEMM_config(m, n, k, AITER_CONFIG_GEMM_A8W8_FILE)
+    ck_config = get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE)
     if splitK is None:
         if ck_config is not None:
             splitK = ck_config["splitK"]
@@ -406,9 +474,6 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
-    get_bpreshuffle_GEMM_config(
-        m, n, k, dtypes.fp8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
-    )
     # if (
     #     ck_config is None
     #     and dtype == dtypes.bf16
@@ -421,7 +486,44 @@ def gemm_a8w8_bpreshuffle(
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+
+    # CKTile only supports bf16 dtype
+    if dtype == dtypes.bf16:
+        cktile_config = get_bpreshuffle_GEMM_config(
+            m,
+            n,
+            k,
+            dtypes.fp8,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE,
+        )
+    else:
+        cktile_config = None
+
+    ck_config = get_bpreshuffle_GEMM_config(
+        m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    )
+    if cktile_config is not None and ck_config is not None:
+        cktile_time = cktile_config.get("us", float("inf"))
+        ck_time = ck_config.get("us", float("inf"))
+
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"Both CKTile and CK configs found for M:{m}, N:{n}, K:{k} - "
+                f"CKTile time: {cktile_time:.6f}us, CK time: {ck_time:.6f}us"
+            )
+
+        if cktile_time <= ck_time:
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info("Using CKTile implementation (faster)")
+            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+        else:
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info("Using CK implementation (faster)")
+            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    else:
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info("default Using CK implementation")
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gemm_a8w8_blockscale_fake(
@@ -463,7 +565,7 @@ def gemm_a8w8_blockscale(
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
-        get_CKGEMM_config(m, n, k, AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
+        get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
@@ -509,7 +611,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    get_CKGEMM_config(m, n, k, AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE)
+    get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
@@ -525,8 +629,6 @@ def mi350_a8w8_blockscale_ASM(
     assert dtype in [
         dtypes.bf16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    m = XQ.shape[0]
-    n = WQ.shape[0]
     return mi350_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
 
@@ -612,3 +714,18 @@ def gemm_a8w8_blockscale_bpreshuffle_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_bpreshuffle_cktile_tune",
+    fc_name="gemm_a8w8_bpreshuffle_cktile_tune",
+)
+def gemm_a8w8_bpreshuffle_cktile_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK: int = 0,
+) -> Tensor: ...
