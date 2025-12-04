@@ -199,7 +199,7 @@ def test_gmm(
     trans_rhs = trans_rhs_from_str(trans_rhs_str)
     rng_seed = rng_seed_from_str(rng_seed_str)
 
-    lhs, rhs, multiple_group_sizes, out_torch = gen_gmm_tensors(
+    lhs, rhs, multiple_group_sizes, out_torch, bias = gen_gmm_tensors(
         M,
         K,
         N,
@@ -210,14 +210,9 @@ def test_gmm(
         trans_rhs=trans_rhs,
         rng_seed=rng_seed,
         unif_group_sizes=True,  # 1st group_sizes in test is evenly distributed
+        use_bias=use_bias,
     )
     out_triton = torch.empty_like(out_torch)
-
-    # Generate bias tensor if needed
-    bias = None
-    if use_bias:
-        torch.manual_seed(rng_seed + 1000)  # Different seed for bias
-        bias = torch.randn(G, N, dtype=in_dtype, device=lhs.device)
 
     for group_sizes in multiple_group_sizes:
         torch_gmm(

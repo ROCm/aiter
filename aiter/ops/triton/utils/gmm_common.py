@@ -339,6 +339,7 @@ def gen_gmm_tensors(
     trans_rhs: bool = TRANS_RHS,
     rng_seed: int | None = RNG_SEED,
     unif_group_sizes: bool = False,
+    use_bias: bool = False,
 ) -> tuple[Tensor, Tensor, list[Tensor], Tensor]:
     lhs, rhs, group_sizes_0 = gen_gmm_input(
         M,
@@ -355,7 +356,12 @@ def gen_gmm_tensors(
         num_group_sizes, M, G, device=device, rng_seed=None, group_sizes_0=group_sizes_0
     )
     out = gen_gmm_output(M, N, device=device, preferred_element_type=output_type)
-    return lhs, rhs, multiple_group_sizes, out
+    bias = None
+    if use_bias:
+        torch.manual_seed(rng_seed + 1000)  # Different seed for bias
+        bias = torch.randn(G, N, dtype=input_type, device=device)
+
+    return lhs, rhs, multiple_group_sizes, out, bias
 
 
 # GMM helpers: get information from tensors.
@@ -536,7 +542,7 @@ def gen_tgmm_bias_grad(
         # Return dummy pointer when bias_grad is not needed.
         # Must be float32 because atomic_add does not support bf16/fp16,
         # and Triton validates the pointer dtype even in dead branches.
-        return torch.empty((1, 1), device=device, dtype=torch.float32)
+        return torch.tensor([], device=device, dtype=torch.float32)
 
 
 def gen_tgmm_tensors(
@@ -552,7 +558,7 @@ def gen_tgmm_tensors(
     trans_rhs: bool = False,
     rng_seed: int | None = RNG_SEED,
     unif_group_sizes: bool = False,
-    with_bias_grad: bool = False,
+    use_bias: bool = False,
 ) -> tuple[Tensor, Tensor, list[Tensor], Tensor]:
     lhs, rhs, group_sizes_0 = gen_tgmm_input(
         M,
@@ -569,7 +575,7 @@ def gen_tgmm_tensors(
         num_group_sizes, M, G, device=device, rng_seed=None, group_sizes_0=group_sizes_0
     )
     out = gen_tgmm_output(K, N, G, device=device, preferred_element_type=output_type)
-    if with_bias_grad:
+    if use_bias:
         bias_grad = gen_tgmm_bias_grad(K, G, device=device, with_bias_grad=True)
     else:
         bias_grad = None
