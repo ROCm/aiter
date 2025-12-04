@@ -120,11 +120,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[
-            16,
-            16,
-            32,
-        ],  # FIXED: Needed K = 32 for valid V_MFMA_F32_16X16X32_BF8_BF8 instruction
+        instr_shape=[16, 16, 32],  # V_MFMA_F32_16X16X32_FP8_FP8 instruction
         transposed=True,
         warps_per_cta=[NUM_WARPS // 2, 2],
     )
