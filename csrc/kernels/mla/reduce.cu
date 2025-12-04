@@ -482,11 +482,11 @@ __global__ void kn_mla_reduce_v1(
 
 #define MLA_MERGE_ROUTER(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME, ...)                                   \
     MLA_MERGE_CASE_IF(                                                                                      \
-        NUM_HEAD,  1, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                     \
-    MLA_MERGE_CASE_EF(                                                                                      \
         NUM_HEAD,  1, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NAME, __VA_ARGS__)                     \
     MLA_MERGE_CASE_EF(                                                                                      \
-        NUM_HEAD,  1, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                     \
+        NUM_HEAD,  1, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  1, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NAME, __VA_ARGS__)                     \
     MLA_MERGE_CASE_EF(                                                                                      \
         NUM_HEAD,  1, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                     \
     MLA_MERGE_CASE_EF(                                                                                      \
