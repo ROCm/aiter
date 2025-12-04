@@ -505,7 +505,11 @@ def test_mha_backward(
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
-    # pytest.skip("Backward accuracy issues due to Triton compiler")
+    # TODO: Enable these test cases once this is fixed
+    if arch == "gfx942":
+        pytest.skip(
+            "Backward accuracy issues due to Triton compiler on gfx942 architecture"
+        )
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
     mha_set_use_fused_bwd_kernel(FUSED)
