@@ -130,8 +130,8 @@ def test_fmoe(
             w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
             w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
         else:
-            w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
-            w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
+            w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.i8, dtypeMax=4)
+            w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.i8, dtypeMax=4)
             w1_qt = w1_qt.view(*w1.shape[:-1], -1)
             w2_qt = w2_qt.view(*w2.shape[:-1], -1)
             w1_scale = w1_scale.view(w1.shape[0] * w1.shape[1], -1)
