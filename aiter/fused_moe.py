@@ -689,7 +689,8 @@ def get_2stage_cfgs(
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        # and activation == ActivationType.Swiglu
+        and q_dtype_w in [dtypes.fp4x2, torch.uint8]
     ):
         return MOEMetadata(
             functools.partial(
@@ -820,7 +821,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype in [dtypes.fp4x2, torch.uint8]
-        and activation == ActivationType.Swiglu
+        # and activation == ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
@@ -895,7 +896,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype in [ dtypes.fp4x2, torch.uint8]
-        and activation == ActivationType.Swiglu
+        # and activation == ActivationType.Swiglu
     ):
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
