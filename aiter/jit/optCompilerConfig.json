@@ -102,6 +102,20 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_pa_metadata": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/pa_metadata_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_comm.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_2_pa_device.cuh'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla.cu'",
@@ -354,6 +368,18 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_gemm_a8w8_blockscale_bpreshuffle_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_a8w8_blockscale_bpreshuffle.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/asm_a8w8_blockscale_bpreshuffle_asm_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m fp8gemm_blockscale --output_dir {{}}'"
     },
     "module_gemm_mi350_a8w8_blockscale_asm": {
         "srcs": [
@@ -815,7 +841,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --filter \"*_ndropout_*\" --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'"
         ]
     },
@@ -1037,6 +1063,18 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_reduce_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/reduce.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_topk_plain": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/topk_plain_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/topk_plain_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

@@ -1,12 +1,6 @@
 import triton
 from functools import lru_cache
 
-# For now, there is 1-to-1 correspondence between arch and device
-_ARCH_TO_DEVICE = {
-    "gfx942": "gfx942",
-    "gfx950": "MI350X",
-}
-
 
 @lru_cache(maxsize=1)
 def get_arch():

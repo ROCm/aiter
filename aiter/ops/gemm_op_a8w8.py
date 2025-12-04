@@ -17,9 +17,9 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 from torch.library import Library
+from ..ops.gemm_op_common import get_padded_m
 
 aiter_lib = Library("aiter", "FRAGMENT")
-from ..ops.gemm_op_common import get_padded_m
 
 
 def gen_gemm_a8w8_ck_fake_tensors(
@@ -190,7 +190,39 @@ def flatmm_a8w8_blockscale_asm(
 ) -> Tensor: ...
 
 
-def gen_mi350_a8w8_blockscale_asm_fake_tensors(
+def gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    splitK: Optional[int] = None,
+    kernelName: Optional[str] = None,
+    bpreshuffle: Optional[bool] = True,
+) -> Tensor:
+    return out
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_bpreshuffle_asm",
+    fc_name="gemm_a8w8_blockscale_bpreshuffle_asm",
+    gen_fake=gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors,
+)
+def gemm_a8w8_blockscale_bpreshuffle_asm(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    splitK: Optional[int] = None,
+    kernelName: Optional[str] = None,
+    bpreshuffle: Optional[bool] = True,
+) -> Tensor: ...
+
+
+def gen_gfx950_a8w8_blockscale_asm_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -201,11 +233,11 @@ def gen_mi350_a8w8_blockscale_asm_fake_tensors(
 
 
 @compile_ops(
-    "module_gemm_mi350_a8w8_blockscale_asm",
-    fc_name="mi350_a8w8_blockscale_asm",
-    gen_fake=gen_mi350_a8w8_blockscale_asm_fake_tensors,
+    "module_gemm_gfx950_a8w8_blockscale_asm",
+    fc_name="gfx950_a8w8_blockscale_asm",
+    gen_fake=gen_gfx950_a8w8_blockscale_asm_fake_tensors,
 )
-def mi350_a8w8_blockscale_asm(
+def gfx950_a8w8_blockscale_asm(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -482,15 +514,15 @@ def gemm_a8w8_bpreshuffle(
 
         if cktile_time <= ck_time:
             if AITER_LOG_TUNED_CONFIG:
-                logger.info(f"Using CKTile implementation (faster)")
+                logger.info("Using CKTile implementation (faster)")
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
         else:
             if AITER_LOG_TUNED_CONFIG:
-                logger.info(f"Using CK implementation (faster)")
+                logger.info("Using CK implementation (faster)")
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
     else:
         if AITER_LOG_TUNED_CONFIG:
-            logger.info(f"default Using CK implementation")
+            logger.info("default Using CK implementation")
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
@@ -529,7 +561,7 @@ def gemm_a8w8_blockscale(
 
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
-            return mi350_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+            return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
@@ -586,7 +618,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
-def mi350_a8w8_blockscale_ASM(
+def gfx950_a8w8_blockscale_ASM(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -597,9 +629,7 @@ def mi350_a8w8_blockscale_ASM(
     assert dtype in [
         dtypes.bf16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    m = XQ.shape[0]
-    n = WQ.shape[0]
-    return mi350_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
+    return gfx950_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gen_gemm_a8w8_tune_fake_tensors(
