@@ -6,7 +6,7 @@
 Test script for Iris-based reduce-scatter and all-gather communication primitives.
 
 This script demonstrates how to use the reduce_scatter and all_gather
-functions for multi-GPU communication in AITER.
+functions for multi-GPU communication in aiter.
 
 Usage:
     # Run with default settings (2 GPUs)
