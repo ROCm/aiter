@@ -454,15 +454,25 @@ def mla_ps_prefill_fwd(
     )
 
     # This is triton kernel
-    mla_prefill_reduce(
+    # mla_prefill_reduce(
+    #     logits,
+    #     attn_lse,
+    #     reduce_indptr,
+    #     reduce_final_map,
+    #     reduce_partial_map,
+    #     output,
+    #     tile_q=256,
+    #     use_triton=True,  # Set to False to use PyTorch fallback
+    # )
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    aiter.mla_reduce_v1(
         logits,
         attn_lse,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
         output,
-        tile_q=256,
-        use_triton=True,  # Set to False to use PyTorch fallback
+        final_lse,
     )
     # final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
     # aiter.mla_reduce_v1(
