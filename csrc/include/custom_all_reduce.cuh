@@ -1047,52 +1047,227 @@ namespace aiter
   /*
    * block size can be 256 and 512
    * corresponding 2048 and 4096 elem per block
+   * run this kernel only when n % (tnum_gpu * pack_size) == 0 
    * */
-  template <typename T, int tnum, int n_loop>
+  template <typename T, int ngpus, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(
+      RankData* _dp,
       RankSignals sg,
+      Signal* self_sg,
       T* __restrict__ residual_inp,
       T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
       float eps,
       int rank,
+      int size,
       int m,
       int n
   )
   {
     constexpr int pack_size = packed_t<T>::P::size;
+    constexpr int tnum_gpu = tnum / ngpus;
     using P = typename packed_t<T>::P;
     using A = typename packed_t<T>::A;
+    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+    int tid = blockIdx.x * tnum_gpu + lane_id;
+    int m_gpu = m / ngpus;
+    int n_pack_num = n / pack_size;
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+
+    // signal number of token
+    int signal_num_per_row = n / (tnum_gpu * pack_size);
+    int signal_num = signal_num_per_row * m;
+    uint32_t* token_signal[ngpus];
+
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i)
+    {
+      token_signal[i] = (uint32_t*)get_tmp_buf<P>(sg.signals[i]);
+      ptrs[i] = (const P*)_dp->ptrs[i];
+      tmps[i] = (P*)(((uint32_t*)get_tmp_buf<P>(sg.signals[i])) + signal_num * 16); // 64byte align
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    int part = size / (pack_size * ngpus);
+    for (int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    {
+      // cross device read by all warp
+      P input_reg = ptrs[warp_id][rank * part + idx];
+      *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+      __syncthreads();
+      // calculate and save in first warp
+      if (warp_id == 0)
+      {
+        A add_reg;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          add_reg.data[i] = ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
+        }
+#pragma unroll
+        for (int i = 1; i < ngpus; ++i)
+        {
+#pragma unroll
+          for (int j = 0; j < pack_size; ++j)
+          {
+            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
+          }
+        }
+        P add_rslt;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          add_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+        }
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
+      }
+      __syncthreads();
+
+      // cross device store data
+      P rslt = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
+      tmps[warp_id][rank * part + idx] = rslt;
+      __syncthreads();
+
+      //cross device store signal
+      if (lane_id == 0) {
+        token_signal[warp_id][(rank * m_gpu * signal_num_per_row + idx / tnum_gpu) * 16] = 111;
+        // __scoped_atomic_store_n(&token_signal[warp_id][(rank * m_gpu * signal_num_per_row + idx / tnum_gpu) * 16],
+        //                       111, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+      }
+    }
+    // end_sync<ngpus, true>(sg, self_sg, rank);
+
     __shared__ float smem[tnum];
-    P* tmps = get_tmp_buf<P>(sg.signals[rank]);
+    __shared__ bool isReady[n_loop];
+    // P* tmps_rms = (const P*)((const uint32_t*)get_tmp_buf<P>(sg.signals[rank]) + signal_num);
 
     for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
       float square_sum = 0.0f;
-      A rms_inp_f32[n_loop];
+      P rmsnorm_inp[n_loop];
       P w_arr[n_loop];
+
+//       int cnt = n_loop;
+//       int nop = 0;
+//       uint32_t local_signal[signal_num_per_row];
+//       int flag[n_loop];
+//       if (threadIdx.x == 0) {
+// #pragma unroll
+//         for (int i = 0; i < n_loop; ++i) {
+//           isReady[i] = false;
+//         }
+//       }
+//       __syncthreads();
+
+// #pragma unroll
+//       for (int i = 0; i < signal_num_per_row; ++i) {
+//         local_signal[i] = 0;
+//       }
+// #pragma unroll
+//       for (int i = 0; i < n_loop; ++i) {
+//         flag[i] = 0;
+//       }
+//       while (cnt > 0) {
+// #pragma unroll
+//         for (int n_iter = 0; n_iter < n_loop; ++n_iter) {
+//           if (flag[n_iter] == 1) continue;
+//           // __syncthreads();
+
+//           if (threadIdx.x == 0) {
+//             bool r = true;
+//             int signal_cnt_per_block = ngpus;
+//             if (n_iter == n_loop - 1) {
+//               signal_cnt_per_block = signal_num_per_row - n_iter * ngpus;
+//             }
+// #pragma unroll
+//             for (int j = 0; j < signal_cnt_per_block; j++) {
+//               if (local_signal[n_iter * ngpus + j] == 0) {
+//                 // if (token_signal[rank][(bid * signal_num_per_row + n_iter * ngpus + j) * 16] == 111) {
+//                 //   token_signal[rank][(bid * signal_num_per_row + n_iter * ngpus + j) * 16] = 222;
+//                 if (__scoped_atomic_load_n(&token_signal[rank][(bid * signal_num_per_row + n_iter * ngpus + j) * 16],
+//                                     __ATOMIC_ACQUIRE,
+//                                     __MEMORY_SCOPE_DEVICE) == 111) {
+//                   __scoped_atomic_store_n(&token_signal[rank][(bid * signal_num_per_row + n_iter * ngpus + j) * 16],
+//                               222, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+//                   local_signal[n_iter * ngpus + j] = 1;
+//                 } else {
+//                   r = false;
+//                 }
+//               }
+//             }
+//             if (r) {
+//               isReady[n_iter] = r;
+//             }
+//           } // read token signal end
+
+//           __syncthreads();
+
+//           if(!isReady[n_iter]) continue;
+//           --cnt;
+//           flag[n_iter] = 1;
+
+//           if (n_iter * tnum + threadIdx.x >= (n / pack_size)) continue;
+        
+//           int read_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+//           P reduce_out_pack = tmps[rank][read_idx];
+//           P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+//           w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+//           A reduce_pack;
+// #pragma unroll
+//           for (int i = 0; i < pack_size; ++i)
+//           {
+//             float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+//             float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+//             float rms_inp = ar_out + res_inp;
+//             rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+//             reduce_pack.data[i] = rms_inp * rms_inp;
+//           }
+//           square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+//         }
+//       }
+
+      int nop = 0;
+
 #pragma unroll
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
       {
-        if (n_iter * tnum + threadIdx.x < (n / pack_size))
-        {
-          int read_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
-          P reduce_out_pack = tmps[read_idx];
-          P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-          w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
-          A reduce_pack;
-#pragma unroll
-          for (int i = 0; i < pack_size; ++i)
-          {
-            float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
-            float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
-            float rms_inp = ar_out + res_inp;
-            rms_inp_f32[n_iter].data[i] = rms_inp;
-            reduce_pack.data[i] = rms_inp * rms_inp;
-          }
-          square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+        int signal_cnt_per_block = ngpus;
+        if (n_iter == n_loop - 1) {
+          signal_cnt_per_block = signal_num_per_row - n_iter * ngpus;
         }
+        if (threadIdx.x == 0) {
+#pragma unroll
+          for (int i = 0; i < signal_cnt_per_block; i++) {
+            while(token_signal[rank][(bid * signal_num_per_row + n_iter * ngpus + i) * 16] != 111) {
+              // asm volatile("s_nop 0;" ::: "memory");
+              // ++nop; // meaningless operation
+            }
+            token_signal[rank][(bid * signal_num_per_row + n_iter * ngpus + i) * 16] = 222;
+          }
+        }
+        __syncthreads();
+
+        if (n_iter * tnum + threadIdx.x >= (n / pack_size)) continue;
+        
+        int read_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+        P reduce_out_pack = tmps[rank][read_idx];
+        P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+        w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+        A reduce_pack;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+          float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+          float rms_inp = ar_out + res_inp;
+          rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+          reduce_pack.data[i] = rms_inp * rms_inp;
+        }
+        square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
       }
       smem[threadIdx.x] = square_sum;
       __syncthreads();
@@ -1105,18 +1280,16 @@ namespace aiter
         if (n_iter * tnum + threadIdx.x < (n / pack_size))
         {
           P rmsnorm_rslt;
-          P rmsnorm_inp;
 #pragma unroll
           for (int i = 0; i < pack_size; ++i)
           {
-            float x_f32 = rms_inp_f32[n_iter].data[i];
+            float x_f32 = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
             float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
-            rmsnorm_inp.data[i] = ck_tile::type_convert<T>(x_f32);
             rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
           }
           int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
           *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
-          *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
+          *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
         }
       }
     }
@@ -1673,45 +1846,67 @@ namespace aiter
     uint32_t num_cu = dev_prop.multiProcessorCount;
 
     // step 1, run reduce-scatter + allgather cross device save
-    dim3 block(512);
-    int block_num = ((size / world_size_) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, 80));
-    switch (world_size_)
-    {
-      case 8:
-        reduce_scatter_cross_device_store<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
-        break;
-      case 4:
-        reduce_scatter_cross_device_store<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
-        break;
-      case 2:
-        reduce_scatter_cross_device_store<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
-        break;
-      default:
-        printf("fused allreduce rmsnorm world size error\n");
-    }
+    // dim3 block(512);
+    // int block_num = ((size / world_size_) + 512 - 1) / 512;
+    // dim3 grid(std::min(block_num, 80));
+    // switch (world_size_)
+    // {
+    //   case 8:
+    //     reduce_scatter_cross_device_store<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+    //     break;
+    //   case 4:
+    //     reduce_scatter_cross_device_store<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+    //     break;
+    //   case 2:
+    //     reduce_scatter_cross_device_store<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+    //     break;
+    //   default:
+    //     printf("fused allreduce rmsnorm world size error\n");
+    // }
 
     // step 2, run allgather local device load + rmsnorm
     int n_bytes = n * sizeof(T);
+    dim3 block;
+    dim3 grid;
     auto setGrid = [&](int naive_grid_size, const void* kernel_ptr)
     {
       int occupancy;
       hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
-      grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
+      int max_grid_size = kMaxBlocks < num_cu * occupancy ? kMaxBlocks : num_cu * occupancy;
+      grid.x = naive_grid_size < max_grid_size ? naive_grid_size : max_grid_size;
+      // grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
     };
 
-#define launch_fused_allreduce_rmsnorm(template_kernel)                                                               \
+#define launch_fused_allreduce_rmsnorm(template_kernel, ...)                                                             \
     do                                                                                                                \
     {                                                                                                                 \
-      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                                               \
+      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel<T, __VA_ARGS__>);                               \
       setGrid(naive_grid_size, kernel_ptr);                                                                           \
-      template_kernel<<<grid, block, 0, stream>>>(sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+      template_kernel<T, __VA_ARGS__><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, residual_inp, residual_out, output, weight, eps, rank_, size, m, n); \
     } while (0)
+
+#define dispatch_worldsize(kernel_name, ...)                           \
+    do                                                                 \
+    {                                                                  \
+      switch (world_size_)                                             \
+      {                                                                \
+        case 8:                                                        \
+          launch_fused_allreduce_rmsnorm(kernel_name, 8, __VA_ARGS__); \
+          break;                                                       \
+        case 4:                                                        \
+          launch_fused_allreduce_rmsnorm(kernel_name, 4, __VA_ARGS__); \
+          break;                                                       \
+        case 2:                                                        \
+          launch_fused_allreduce_rmsnorm(kernel_name, 2, __VA_ARGS__); \
+          break;                                                       \
+      }                                                                \
+    } while(0)
 
     if (n_bytes % 1024 == 0)
     {
       if (8192 <= n_bytes && n_bytes <= 32768)
       {
+        block.x = 512;
         int naive_grid_size = m;
         int n_loop = n_bytes / 8192; // 1, 2, 3, 4
         if (n_bytes % 8192 == 0)
@@ -1719,16 +1914,16 @@ namespace aiter
           switch (n_loop)
           {
             case 1:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 1>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 1);
               break;
             case 2:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 2>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 2);
               break;
             case 3:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 3>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 3);
               break;
             case 4:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 4>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 4);
               break;
           }
         }
@@ -1738,13 +1933,13 @@ namespace aiter
           switch (n_loop)
           {
             case 2:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 2>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 2);
               break;
             case 3:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 3>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 3);
               break;
             case 4:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 4>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 4);
               break;
           }
         }
@@ -1756,31 +1951,32 @@ namespace aiter
         if (n_bytes == 4096)
         {
           // naive n_loop = 1
-          launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 1>));
+          dispatch_worldsize(local_device_load_rmsnorm, 256, 1);
         }
         else
         {
           // n_loop = 2
-          launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 256, 2>));
+          dispatch_worldsize(local_device_load_rmsnorm, 256, 2);
         }
       }
       else if (1024 <= n_bytes && n_bytes < 4096)
       {
-        block.x = 256;
-        int naive_grid_size = (m + 3) / 4;
-        int n_loop = n_bytes / 1024;
-        switch (n_loop)
-        {
-          case 1:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 1>));
-            break;
-          case 2:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 2>));
-            break;
-          case 3:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 3>));
-            break;
-        }
+        printf("fused allreduce rmsnorm shape size 1k<=n<4k\n");
+        // block.x = 256;
+        // int naive_grid_size = (m + 3) / 4;
+        // int n_loop = n_bytes / 1024;
+        // switch (n_loop)
+        // {
+        //   case 1:
+        //     launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 1>));
+        //     break;
+        //   case 2:
+        //     launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 2>));
+        //     break;
+        //   case 3:
+        //     launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 3>));
+        //     break;
+        // }
       }
       else
       {
