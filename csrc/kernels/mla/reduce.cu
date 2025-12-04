@@ -17,8 +17,6 @@ struct MlaReduceKernelV1Traits
 {
     static constexpr int32_t kSizeDV             = kSizeDV_;       // hidden dimension size of value/output
     static constexpr int32_t kNumHeadQ           = kNumHeadQ_;     // head count of q
-    static constexpr int32_t kNumHeadQMask       = kNumHeadQ - 1;
-    static constexpr int32_t kNumHeadQLog2       = __builtin_ctz(kNumHeadQ);
     static constexpr int32_t kNumWarps           = 2;
     static constexpr int32_t kNumThreads         = kNumWarps * ck_tile::get_warp_size();
     static constexpr int32_t kOccupancy          = 8;
@@ -627,12 +625,20 @@ __global__ void kn_mla_reduce_v1(
         ss << "#heads: " << (NUM_HEAD)                                                                      \
            << ", head dimension: " << (HEAD_DIM)                                                            \
            << ", Output LSE: " << (OUTPUT_LSE)                                                              \
-           << ", Has reduce final map: " << (NRFM);                                                         \
+           << ", Has reduce final map: " << (!NRFM);                                                        \
         TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");        \
     }
 
 #define MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NUM_WG_PER_SEQ, NAME, ...)                   \
     MLA_REDUCE_CASE_IF(                                                                                      \
+        NUM_HEAD,   1, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
+    MLA_REDUCE_CASE_EF(                                                                                      \
+        NUM_HEAD,   1, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
+    MLA_REDUCE_CASE_EF(                                                                                      \
+        NUM_HEAD,   1, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
+    MLA_REDUCE_CASE_EF(                                                                                      \
+        NUM_HEAD,   1, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
+    MLA_REDUCE_CASE_EF(                                                                                      \
         NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
     MLA_REDUCE_CASE_EF(                                                                                      \
         NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
@@ -640,7 +646,7 @@ __global__ void kn_mla_reduce_v1(
         NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
     MLA_REDUCE_CASE_EF(                                                                                      \
         NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_IF(                                                                                      \
+    MLA_REDUCE_CASE_EF(                                                                                      \
         NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                                                      \
         NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
