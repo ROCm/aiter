@@ -19,98 +19,6 @@ FMHA_BWD_API = """#include <hip/hip_fp16.h>
 
 namespace aiter {
 
-struct __attribute__((packed)) fmha_bwd_v3_args_gfx950
-{
-    void *ptr_dq;                   // 0x00: dq or dq_acc
-    p2 _p0;
-    void *ptr_dk;                   // 0x10
-    p2 _p1;
-    void *ptr_dv;                   // 0x20
-    p2 _p2;
-    const void *ptr_q;              // 0x30
-    p2 _p3;
-    const void *ptr_k;              // 0x40
-    p2 _p4;
-    const void *ptr_v;              // 0x50
-    p2 _p5;
-    const void *ptr_do;             // 0x60
-    p2 _p6;
-    const void *ptr_lse;            // 0x70
-    p2 _p7;
-    const void *ptr_d;              // 0x80
-    p2 _p8;
-    float scalar;                   // 0x90
-    p3 _p9;
-    float log2e;                    // 0xa0
-    p3 _p10;
-    unsigned int seqlen_q;          // 0xb0: s_seq_len_q
-    p3 _p11;
-    unsigned int Ts;                // 0xc0: s_Seqs_k*sub_K
-    p3 _p12;
-    unsigned int Hs_q;              // 0xd0: s_Hs_q
-    p3 _p13;
-    unsigned int BAs_q;             // 0xe0: s_BAs_q
-    p3 _p14;
-    unsigned int Seqs_q;            // 0xf0: s_Seqs_q
-    p3 _p15;
-    unsigned int ratio;             // 0x100
-    p3 _p16;
-    unsigned int Hs_k;              // 0x110: s_Hs_k
-    p3 _p17;
-    unsigned int BAs_k;             // 0x120: s_BAs_k
-    p3 _p18;
-    unsigned int Seqs_k;            // 0x130: s_Seqs_k
-    p3 _p19;
-    unsigned int Seqs_dk;           // 0x140: s_Seqs_dk
-    p3 _p20;
-    unsigned int seqlen_k;          // 0x150: batch mode
-    p3 _p21;
-    unsigned int head_dim_q;        // 0x160: batch&group mode for headdim padding
-    p3 _p22;
-    unsigned int head_dim_v;        // 0x170: batch&group mode for headdim padding
-    p3 _p23;
-    unsigned int nhead_q;           // 0x180: batch mode lsed([B,H,S]) addr = batch_idx * nhead_q * seqlen_q * 4 + head_idx * seqlen_q * 4
-    p3 _p24;
-    unsigned int Hs_v;              // 0x190: batch&group mode
-    p3 _p25;
-    unsigned int BAs_v;             // 0x1a0: batch mode
-    p3 _p26;
-    unsigned int Seqs_v;            // 0x1b0: batch&group mode
-    p3 _p27;
-    unsigned int Hs_do;             // 0x1c0: batch&group mode
-    p3 _p28;
-    unsigned int BAs_do;            // 0x1d0: group mode
-    p3 _p29;
-    unsigned int Seqs_do;           // 0x1e0: batch&group mode
-    p3 _p30;
-    unsigned int Hs_dk;             // 0x1f0: batch&group mode
-    p3 _p31;
-    unsigned int BAs_dk;            // 0x200: group mode
-    p3 _p32;
-    unsigned int Hs_dv;             // 0x210: batch&group mode
-    p3 _p33;
-    unsigned int BAs_dv;            // 0x220: group mode
-    p3 _p34;
-    unsigned int Seqs_dv;           // 0x230: batch&group mode
-    p3 _p35;
-    unsigned int Hs_lsed;           // 0x240: group mode lsed([H,TotalValid_Q(90)]) addr = seqstart_q[batch_idx] * 4 + head_idx * nhead_stride_lsed(s_Hs_lsed)
-    p3 _p36;
-    const void *ptr_qseq;                 // 0x250: group mode seqstart_q [0, 20, 50, 90]
-    p2 _p37;
-    const void *ptr_kseq;                 // 0x260: group mode seqstart_k [0, 50, 110, 180]
-    p2 _p38;
-    const void *ptr_qseq_padded;          // 0x270: group mode seqstart_q_padded [0, 30(20+10), 70(20+10+30+10), 120(20+10+30+10+40+10)] if 10 is padded after each seqlen[30(20+10), 40(30+10), 50(40+10)]
-    p2 _p39;
-    const void *ptr_kseq_padded;          // 0x280: group mode seqstart_k_padded [0, 60(50+10), 130(50+10+60+10), 200(50+10+60+10+70+10)] if 10 is padded after each seqlen[60(50+10), 70(60+10), 80(70+10)]
-    p2 _p40;
-    unsigned int max_seqlen_dq;    // 0x290: gorup mode max seqlen q for a16 dq_acc store, padding to 16x
-    p3 _p41;
-    int mask_x;                     // 0x290
-    p3 _p42;
-    int mask_y;                     // 0x2a0
-    p3 _p43;
-};
-
 // TODO: This three template should be refactored to reduce code duplication
 template <uint32_t HeadDim_q, bool IsGroupMode>
 struct dq_shuffle_traits_
@@ -776,7 +684,7 @@ class fmha_bwd_v3_kernel
     }
 
     void
-    launch_kernel(fmha_bwd_v3_traits fmha_v3_traits, fmha_bwd_v3_args_gfx950 args, const ck_tile::stream_config& s) const
+    launch_kernel(fmha_bwd_v3_traits fmha_v3_traits, fmha_bwd_v3_args_universal args, const ck_tile::stream_config& s) const
     {
         size_t arg_size = sizeof(args);
         void* config[]  = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
@@ -1188,6 +1096,183 @@ float fmha_bwd_v3_swa_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
     );
 }
 
+template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_>
+float fmha_bwd_v3_genl_gfx942(const ck_tile::stream_config& s, fmha_bwd_args a, const void* seqlen_q_padded = nullptr, const void* seqlen_k_padded = nullptr)
+{    
+    if(s.log_level_ > 0)
+        std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name << std::flush;
+
+    fmha_bwd_v3_args_universal args;
+    args.ptr_dq  = a.dq_ptr;
+    args.ptr_dk  = a.dk_ptr;
+    args.ptr_dv  = a.dv_ptr;
+    args.ptr_q   = a.q_ptr;
+    args.ptr_k   = a.k_ptr;
+    args.ptr_v   = a.v_ptr;
+    args.ptr_do  = a.do_ptr;
+    args.ptr_lse = a.lse_ptr;
+    args.ptr_d   = a.d_ptr;
+    args.scalar  = a.scale;
+    args.log2e   = ck_tile::log2e_v<float>;
+    args.ratio    = a.nhead_q / a.nhead_k;
+    args.seqlen_q = a.seqlen_q;
+    args.seqlen_k           = a.seqlen_k;
+    args.head_dim_q         = a.hdim_q;
+    args.head_dim_v         = a.hdim_v;
+    args.nhead_q            = a.nhead_q;
+    args.Ts                 = FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv * a.stride_k * 2;
+    args.Hs_q               = a.nhead_stride_q * 2;
+    args.BAs_q              = a.batch_stride_q * 2;
+    args.Seqs_q             = a.stride_q * 2;
+    args.Hs_k               = a.nhead_stride_k * 2;
+    args.BAs_k              = a.batch_stride_k * 2;
+    args.Seqs_k             = a.stride_k * 2;
+    args.Hs_v               = a.nhead_stride_v * 2;
+    args.BAs_v              = a.batch_stride_v * 2;
+    args.Seqs_v             = a.stride_v * 2;
+    args.Hs_do              = a.nhead_stride_do * 2;
+    args.BAs_do             = a.batch_stride_do * 2;
+    args.Seqs_do            = a.stride_do * 2;
+    args.Hs_dk              = a.nhead_stride_dk * 2;
+    args.BAs_dk             = a.batch_stride_dk * 2;
+    args.Seqs_dk            = a.stride_dk * 2;
+    args.Hs_dv              = a.nhead_stride_dv * 2;
+    args.BAs_dv             = a.batch_stride_dv * 2;
+    args.Seqs_dv            = a.stride_dv * 2;
+    args.Hs_lsed            = a.nhead_stride_lsed * 4;
+
+    if (a.cu_seqlen_k_ptr && a.seqstart_k_ptr) {
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+        args.ptr_kseq           = a.cu_seqlen_k_ptr;
+    } else {
+        args.ptr_kseq           = a.seqstart_k_ptr;
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+    }
+
+    if (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) {
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+        args.ptr_qseq           = a.cu_seqlen_q_ptr;
+    } else {
+        args.ptr_qseq           = a.seqstart_q_ptr;
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+    }
+    args.max_seqlen_dq     = (a.max_seqlen_q + 15) / 16 * 16;
+    
+    // convert l/r to x/y HERE
+    if (a.window_size_left == -1 && a.window_size_right == 0) {
+        args.mask_y = 0;
+        args.mask_x = 0; 
+    } else {
+        auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
+            a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k,
+            (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) || 
+            a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+        args.mask_y = generic_mask.at(ck_tile::number<0>{});
+        args.mask_x = generic_mask.at(ck_tile::number<1>{});
+    }
+
+    auto traits = fmha_bwd_v3_traits{a.batch,
+                                      a.nhead_q,
+                                      a.seqlen_q,
+                                      a.seqlen_k,
+                                      a.hdim_q,
+                                      a.mask_type,
+                                      FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
+                                      FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv};
+
+    static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    return ck_tile::launch_kernel(s,
+        [=](const ck_tile::stream_config& s_){ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); },
+        [=](const ck_tile::stream_config& s_){ impl.launch_kernel(traits, args, s_); }
+    );
+}
+
+template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_, typename convert_dq_trait_>
+float fmha_bwd_v3_genl_gfx942(const ck_tile::stream_config& s, fmha_bwd_args a, const void* seqlen_q_padded = nullptr, const void* seqlen_k_padded = nullptr)
+{
+    if(s.log_level_ > 0)
+        std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name << ", " << fmha_bwd_convert_dq_get_name_<convert_dq_trait_>() << std::flush;
+    fmha_bwd_v3_args_universal args;
+    args.ptr_dq      = a.dq_acc_ptr;
+    args.ptr_dk      = a.dk_ptr;
+    args.ptr_dv      = a.dv_ptr;
+    args.ptr_q       = a.q_ptr;
+    args.ptr_k       = a.k_ptr;
+    args.ptr_v       = a.v_ptr;
+    args.ptr_do      = a.do_ptr;
+    args.ptr_lse     = a.lse_ptr;
+    args.ptr_d       = a.d_ptr;
+    args.scalar      = a.scale;
+    args.log2e       = ck_tile::log2e_v<float>;
+    args.ratio       = a.nhead_q / a.nhead_k;
+    args.seqlen_q    = a.seqlen_q;
+    args.seqlen_k    = a.seqlen_k;
+    args.head_dim_q  = a.hdim_q;
+    args.head_dim_v  = a.hdim_v;
+    args.nhead_q     = a.nhead_q;
+    args.Ts          = FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv * a.stride_k * 2;
+    args.Hs_q        = a.nhead_stride_q * 2;
+    args.BAs_q       = a.batch_stride_q * 2;
+    args.Seqs_q      = a.stride_q * 2;
+    args.Hs_k        = a.nhead_stride_k * 2;
+    args.BAs_k       = a.batch_stride_k * 2;
+    args.Seqs_k      = a.stride_k * 2;
+    args.Hs_v        = a.nhead_stride_v * 2;
+    args.BAs_v       = a.batch_stride_v * 2;
+    args.Seqs_v      = a.stride_v * 2;
+    args.Hs_do       = a.nhead_stride_do * 2;
+    args.BAs_do      = a.batch_stride_do * 2;
+    args.Seqs_do     = a.stride_do * 2;
+    args.Hs_dk       = a.nhead_stride_dk * 2;
+    args.BAs_dk      = a.batch_stride_dk * 2;
+    args.Seqs_dk     = a.stride_dk * 2;
+    args.Hs_dv       = a.nhead_stride_dv * 2;
+    args.BAs_dv      = a.batch_stride_dv * 2;
+    args.Seqs_dv     = a.stride_dv * 2;
+    args.Hs_lsed     = a.nhead_stride_lsed * 4;
+
+    if (a.cu_seqlen_k_ptr && a.seqstart_k_ptr) {
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+        args.ptr_kseq           = a.cu_seqlen_k_ptr;
+    } else {
+        args.ptr_kseq           = a.seqstart_k_ptr;
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+    }
+
+    if (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) {
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+        args.ptr_qseq           = a.cu_seqlen_q_ptr;
+    } else {
+        args.ptr_qseq           = a.seqstart_q_ptr;
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+    }
+
+    // convert l/r to x/y HERE
+    if (a.window_size_left == -1 && a.window_size_right == 0) {
+        args.mask_y = 0;
+        args.mask_x = 0; 
+    } else {
+        auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k, (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) || a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+        args.mask_y = generic_mask.at(ck_tile::number<0>{});
+        args.mask_x = generic_mask.at(ck_tile::number<1>{});
+    }
+
+    auto traits = fmha_bwd_v3_traits{a.batch,
+                                      a.nhead_q,
+                                      a.max_seqlen_q, // when batch mode, max_seqlen equal to seqlen
+                                      a.max_seqlen_k, // when batch mode, max_seqlen equal to seqlen
+                                      a.hdim_q,
+                                      a.mask_type,
+                                      FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
+                                      FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv};
+    static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    return ck_tile::launch_kernel(s,
+        [=](const ck_tile::stream_config& s_){ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); },
+        [=](const ck_tile::stream_config& s_){ impl.launch_kernel(traits, args, s_); },
+        [=](const ck_tile::stream_config& s_){ fmha_bwd_convert_dq_oneshot_<convert_dq_trait_>(s_, a); }
+    );
+}
+
 template <typename dq_dk_dv_v3_traits_>
 float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, bool is_v3_api_check)
 {
@@ -1203,7 +1288,7 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
         std::cout << ", " << dot_o_do_traits::kernel_name() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << ", " << post_kernel_traits::kernel_name() << std::flush;
     if (is_v3_api_check) return 1;
 
-    fmha_bwd_v3_args_gfx950 args;
+    fmha_bwd_v3_args_universal args;
     args.ptr_dq             = a.dq_acc_ptr;
     args.ptr_dk             = a.dk_ptr;
     args.ptr_dv             = a.dv_ptr;
@@ -1347,7 +1432,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
                             else if((((t.mask_type != mask_enum::no_mask) && (a.seqlen_q == a.seqlen_k)) || ((a.seqlen_q != a.seqlen_k) && (t.mask_type == mask_enum::mask_top_left))) &&
@@ -1359,7 +1444,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
                             else if((t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left == -1) && (a.window_size_right == 0))){
@@ -1370,7 +1455,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
                         }
@@ -1383,7 +1468,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
                             else if(((a.window_size_left == -1) && (a.window_size_right == 0)) && (t.mask_type == mask_enum::mask_top_left)){
@@ -1394,7 +1479,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
                             else if(((a.window_size_left == -1) && (a.window_size_right == 0)) && (t.mask_type == mask_enum::mask_bottom_right)){
@@ -1405,7 +1490,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
                         }
@@ -1421,7 +1506,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
@@ -1432,7 +1517,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 2){
@@ -1443,7 +1528,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                             }
@@ -1457,7 +1542,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
@@ -1468,7 +1553,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 2){
@@ -1479,7 +1564,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                             }
@@ -1492,7 +1577,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
@@ -1503,7 +1588,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 2){
@@ -1514,7 +1599,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
                             }
@@ -1529,7 +1614,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
@@ -1538,7 +1623,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 2){
@@ -1547,7 +1632,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
 
@@ -1561,7 +1646,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
@@ -1570,7 +1655,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 2){
@@ -1579,7 +1664,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                             }
@@ -1592,7 +1677,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
@@ -1601,7 +1686,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 2){
@@ -1610,7 +1695,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                             }
@@ -1788,7 +1873,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
                                     else if((a.seqlen_q % 64 != 0) && (a.hdim_q == 128)){
@@ -1799,7 +1884,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
                                     else if((a.seqlen_q % 64 == 0) && (a.hdim_q != 128)){
@@ -1810,7 +1895,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
                                     else if((a.seqlen_q % 64 != 0) && (a.hdim_q != 128)){
@@ -1821,7 +1906,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
                                 }
@@ -2040,7 +2125,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 != 0) && (a.hdim_q == 128)){
@@ -2051,7 +2136,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 == 0) && (a.hdim_q != 128)){
@@ -2062,7 +2147,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 != 0) && (a.hdim_q != 128)){
@@ -2073,7 +2158,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                     }
@@ -2086,7 +2171,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 != 0) && (a.hdim_q == 128)){
@@ -2097,7 +2182,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 == 0) && (a.hdim_q != 128)){
@@ -2108,7 +2193,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 != 0) && (a.hdim_q != 128)){
@@ -2119,7 +2204,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                     }
@@ -2132,7 +2217,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 != 0) && (a.hdim_q == 128)){
@@ -2143,7 +2228,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 == 0) && (a.hdim_q != 128)){
@@ -2154,7 +2239,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else if((a.seqlen_q % 64 != 0) && (a.hdim_q != 128)){
@@ -2165,7 +2250,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                     }
@@ -2226,7 +2311,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
                                     else{
@@ -2237,7 +2322,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
                                 }
@@ -2249,7 +2334,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
                             }
@@ -2262,7 +2347,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
                         }
@@ -2278,7 +2363,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else{
@@ -2289,7 +2374,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                     }
@@ -2302,7 +2387,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else{
@@ -2313,7 +2398,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                     }
@@ -2327,7 +2412,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                         return r;
                                     }
                                     else if(t.mask_type == mask_enum::mask_bottom_right){
@@ -2338,7 +2423,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                         return r;
                                     }
                                 }
@@ -2352,7 +2437,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
                         }
@@ -2370,7 +2455,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else{
@@ -2381,7 +2466,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                     }
@@ -2394,7 +2479,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else{
@@ -2405,7 +2490,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                     }
@@ -2418,7 +2503,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                         else{
@@ -2429,7 +2514,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                             return r;
                                         }
                                     }
@@ -2442,21 +2527,21 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     }
                                     else if(t.how_v3_bf16_cvt == 1){
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, 64, FmhaBwdBf16, false, true, 1, true, false, true, GPUArch::gfx950>;
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     }
                                     else{
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, 64, FmhaBwdBf16, false, true, 2, true, false, true, GPUArch::gfx950>;
                                         if (is_v3_api_check) {
                                             return 1;
                                         }
-                                        r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                        r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     }
                                     return r;
                                 }
@@ -2471,7 +2556,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
@@ -2481,7 +2566,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 2){
@@ -2491,7 +2576,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
                             }
@@ -2509,7 +2594,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                             else{
@@ -2520,7 +2605,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                         }
@@ -2533,7 +2618,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                             else{
@@ -2544,7 +2629,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                         }
@@ -2557,7 +2642,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                             else{
@@ -2568,7 +2653,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                         }
@@ -2583,7 +2668,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                             else{
@@ -2594,7 +2679,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                         }
@@ -2607,7 +2692,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                             else{
@@ -2618,7 +2703,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                         }
@@ -2631,7 +2716,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                             else{
@@ -2642,7 +2727,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                                 if (is_v3_api_check) {
                                                     return 1;
                                                 }
-                                                r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                                r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                                 return r;
                                             }
                                         }
@@ -2657,21 +2742,21 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                         }
                                         else if(t.how_v3_bf16_cvt == 1){
                                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, 64, FmhaBwdBf16, true, true, 1, true, false, true, GPUArch::gfx950>;
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                         }
                                         else{
                                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, 64, FmhaBwdBf16, true, true, 2, true, false, true, GPUArch::gfx950>;
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                         }
                                         return r;
                                     }
@@ -2681,21 +2766,21 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                         }
                                         else if(t.how_v3_bf16_cvt == 1){
                                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, 64, FmhaBwdBf16, 3, true, 1, true, false, true, GPUArch::gfx950>;
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                         }
                                         else{
                                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, 64, FmhaBwdBf16, 3, true, 2, true, false, true, GPUArch::gfx950>;
                                             if (is_v3_api_check) {
                                                 return 1;
                                             }
-                                            r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
+                                            r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                         }
                                         return r;
                                     }
@@ -2711,7 +2796,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
@@ -2721,7 +2806,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
                                 else if(t.how_v3_bf16_cvt == 2){
@@ -2731,7 +2816,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                    r = fmha_bwd_v3_genl_gfx942<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
                             }

@@ -19,8 +19,6 @@ FMHA_BWD_API = """#include <hip/hip_fp16.h>
 
 namespace aiter {
 
-
-
 // ########################################################|HDim_q|HDim_v|    DataType| MaskType|kIsAtomic32|BF16Cvt|kIsSEQPad|kIsHDPad|kIsGroupMode|         GPUArch|
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<  128,   128, FmhaBwdBf16,        0,      false,      0,    false,   false,       false, GPUArch::gfx942>> { static constexpr const char * bwd_v3_name = "fmha_bwd_hd128_bf16_a16_rtne"; };
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<  128,   128, FmhaBwdBf16,        0,      false,      1,    false,   false,       false, GPUArch::gfx942>> { static constexpr const char * bwd_v3_name = "fmha_bwd_hd128_bf16_a16_rtna"; };
