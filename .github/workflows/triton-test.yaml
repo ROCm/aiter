@@ -13,7 +13,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check-signal:
@@ -29,7 +29,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-mi300-1gpu
     needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
@@ -49,9 +49,15 @@ jobs:
         run: |
           set -ex
           echo "Starting container: triton_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
           docker run -dt \
-          --device=/dev/dri \
-          --device=/dev/kfd \
+          --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
@@ -68,6 +74,11 @@ jobs:
           -w /workspace \
           triton_test \
           bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root triton_test bash -c "pip config set global.retries 10"
 
       - name: Setup Aiter and Triton
         run: |

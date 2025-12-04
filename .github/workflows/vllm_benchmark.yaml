@@ -9,12 +9,12 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
-  BASE_IMAGE: rocm/vllm-dev:nightly@sha256:9ed6489aa34b70f8dbd1b2e93f2c8bf8c2f2806c2c28c1b89ed4754057213066
+  BASE_IMAGE: rocm/vllm-dev:nightly
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -34,7 +34,7 @@ jobs:
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-k8s-build
 
     steps:
       - name: Checkout aiter repo
@@ -60,6 +60,9 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
+          RUN pip config set global.default-timeout 60 \
+              && pip config set global.retries 10
+          RUN pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
@@ -78,7 +81,7 @@ jobs:
       - name: Build Docker image
         run: |
           IMAGE_TAG=rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
-          docker build -t $IMAGE_TAG -f Dockerfile.mod .
+          docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
       - name: Push Docker image
         run: |
@@ -114,7 +117,7 @@ jobs:
         uses: nick-fields/retry@v2
         with:
           timeout_minutes: 20
-          max_attempts: 3
+          max_attempts: 10
           command: |
             git clone --depth=1 --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
 

@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
@@ -36,22 +36,23 @@ jobs:
 
     steps:
       - name: Define whether runs on MI35X
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         id: machines
         run: |
           set -euo pipefail
-          pr_title="${{ github.event.pull_request.title }}"
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "It's main branch, running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
-          elif echo "$pr_title" | grep -qi "mi35x"; then
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+          elif echo "${PR_TITLE}" | grep -qi "mi35x"; then
             echo "PR title contains 'MI35X', running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           else
             echo "Not main branch and PR title does not contain mi35x, only running on MI325..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           fi
           echo "$GITHUB_OUTPUT"
     
@@ -93,16 +94,28 @@ jobs:
         run: |
           set -ex
           echo "Starting container: aiter_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
           docker run -dt \
-          --device=/dev/dri \
-          --device=/dev/kfd \
+          --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
+          --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
 
       - name: Setup Aiter
         run: |
@@ -119,7 +132,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/aiter_test.sh 
+          bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
       
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -172,10 +185,17 @@ jobs:
         run: |
           set -ex
           echo "Starting container: aiter_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
           docker run -dt \
-          --device=/dev/dri \
-          --device=/dev/kfd \
+          --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
+          --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
@@ -183,15 +203,20 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup-Triton
+      - name: Setup pip config
+        run: |
+          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
+
+      - name: Setup-Aiter
         run: |
           set -ex
-          echo "Setting up Triton..."
+          echo "Setting up Aiter..."
           docker exec \
           -w /workspace \
           aiter_test \
           bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
-      
+
       - name: Tests
         run: |
           set -ex
@@ -199,7 +224,7 @@ jobs:
           -e MULTIGPU=TRUE \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/aiter_test.sh
+          bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh"
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
