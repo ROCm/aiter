@@ -17,11 +17,13 @@ from aiter.ops.triton.utils.gmm_common import (
     DTYPE,
     is_power_of_2,
     check_input_device_dtype,
+    check_bias_shape_stride,
     get_gmm_shape,
     get_gmm_output,
     get_gmm_transposition,
     get_tgmm_shape,
     get_tgmm_output,
+    get_tgmm_bias_grad,
     get_tgmm_transposition,
 )
 
@@ -138,16 +140,13 @@ def gmm(
     - out must be row-major (out.stride() == (N, 1)).
     - bias must be row-major (bias.stride() == (N, 1)) if provided.
     """
-    check_input_device_dtype(lhs, rhs, group_sizes)
+    use_bias = bias is not None
+    check_input_device_dtype(lhs, rhs, group_sizes, bias)
 
     M, K, N, G = get_gmm_shape(lhs, rhs, group_sizes)
 
-    use_bias = bias is not None
     if use_bias:
-        assert bias.shape == (G, N), f"bias must have shape (G, N) = ({G}, {N}), got {bias.shape}."
-        assert bias.device == lhs.device, "bias must be on the same device as lhs."
-        assert bias.dtype == lhs.dtype, "bias dtype must match lhs dtype."
-        assert bias.stride() == (N, 1), "bias must be row-major (bias.stride() == (N, 1))."
+        check_bias_shape_stride(bias, G, N)
 
     out = get_gmm_output(
         M,
@@ -244,7 +243,6 @@ def ptgmm(
     existing_out: Tensor | None = None,
     config: dict[str, int] | None = None,
     bias_grad: Tensor | None = None,
-    compute_bias_grad: bool | None = None,
     accumulate: bool = False,
 ) -> Tensor:
     """
@@ -291,6 +289,15 @@ def ptgmm(
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
+    bias_grad : torch.Tensor or None, optional
+        Optional bias gradient output tensor. Shape: (G, K).
+        If provided, the kernel will compute and accumulate the bias gradient into this tensor.
+        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
+        must be on the same device as other tensors, and must be row-major with stride (K, 1).
+    accumulate : bool, optional
+        Whether to accumulate into existing bias_grad values. Default is False.
+        If False and bias_grad is provided, bias_grad will be zeroed before computation.
+        If True and bias_grad is provided, gradients will be accumulated into existing values.
 
     Returns
     -------
@@ -346,42 +353,15 @@ def ptgmm(
 
     # Bias gradient handling.
     # -----------------------
-    # By default, compute bias gradient iff a bias_grad buffer is provided.
-    if compute_bias_grad is None:
-        compute_bias_grad = bias_grad is not None
-
-    if compute_bias_grad:
-        assert (
-            bias_grad is not None
-        ), "bias_grad buffer must be provided when compute_bias_grad is True."
-        # Expected layout: (G, K), row-major, float32 (to match atomic_add).
-        expected_shape = (G, K)
-        assert (
-            tuple(bias_grad.shape) == expected_shape
-        ), f"bias_grad must have shape {expected_shape}, got {tuple(bias_grad.shape)}."
-        assert (
-            bias_grad.device == lhs.device
-        ), "bias_grad must be on the same device as other tensors."
-        assert (
-            bias_grad.dtype == torch.float32
-        ), "bias_grad must be torch.float32 (kernel accumulates bias gradient in float32)."
-        assert bias_grad.stride() == (
-            K,
-            1,
-        ), "bias_grad must be row-major with stride (K, 1)."
-
-        # If not accumulating into an existing buffer, zero it first.
-        if not accumulate:
-            bias_grad.zero_()
-
-        bias_grad_ptr = bias_grad
-    else:
-        # Dummy pointer; kernel won't touch it when COMPUTE_BIAS_GRAD is False.
-        # Must still be float32 because atomic_add does not support bf16/fp16,
-        # and Triton validates the pointer dtype even in dead branches.
-        bias_grad_ptr = torch.empty(
-            (1, 1), device=lhs.device, dtype=torch.float32
-        )
+    # Get or validate bias gradient tensor.
+    compute_bias_grad = bias_grad is not None
+    bias_grad_ptr = get_tgmm_bias_grad(
+        K,
+        G,
+        device=lhs.device,
+        existing_bias_grad=bias_grad,
+        accumulate=accumulate,
+    )
 
     grid = _ptgmm_grid(
         K,

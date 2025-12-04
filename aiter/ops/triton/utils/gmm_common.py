@@ -81,7 +81,9 @@ def is_power_of_2(x: int) -> bool:
     return (x > 0) and (x & (x - 1) == 0)
 
 
-def check_input_device_dtype(lhs: Tensor, rhs: Tensor, group_sizes: Tensor) -> None:
+def check_input_device_dtype(
+    lhs: Tensor, rhs: Tensor, group_sizes: Tensor, bias: Tensor | None = None
+) -> None:
     assert (
         lhs.device == rhs.device == group_sizes.device
     ), f"All input tensors must be in the same device (lhs = {lhs.device}, rhs = {rhs.device}, group_sizes = {group_sizes.device})."
@@ -89,6 +91,19 @@ def check_input_device_dtype(lhs: Tensor, rhs: Tensor, group_sizes: Tensor) -> N
         lhs.dtype == rhs.dtype
     ), f"lhs and rhs types must match (lhs = {lhs.dtype}, rhs = {rhs.dtype})."
     assert group_sizes.dtype == torch.int32, "group_sizes type must be int32."
+    
+    if bias is not None:
+        assert (
+            bias.device == lhs.device
+        ), f"bias must be on the same device as lhs (bias = {bias.device}, lhs = {lhs.device})."
+        assert (
+            bias.dtype == lhs.dtype
+        ), f"bias dtype must match lhs dtype (bias = {bias.dtype}, lhs = {lhs.dtype})."
+
+
+def check_bias_shape_stride(bias: Tensor, G: int, N: int) -> None:
+    assert bias.shape == (G, N), f"bias must have shape (G, N) = ({G}, {N}), got {bias.shape}."
+    assert bias.stride() == (N, 1), "bias must be row-major (bias.stride() == (N, 1))."
 
 
 # Generation of group sizes.
@@ -507,6 +522,22 @@ def gen_tgmm_output(
 
     return out
 
+def gen_tgmm_bias_grad(
+    K: int,
+    G: int,
+    device: torch.device | str = DEVICE,
+    with_bias_grad: bool = False,
+) -> Tensor:
+    if with_bias_grad:
+        assert K > 0, f"Number of bias_grad rows K must be positive (K = {K})."
+        assert G > 0, f"Number of groups G must be positive (G = {G})."
+        return torch.empty((G, K), device=device, dtype=torch.float32)
+    else:
+        # Return dummy pointer when bias_grad is not needed.
+        # Must be float32 because atomic_add does not support bf16/fp16,
+        # and Triton validates the pointer dtype even in dead branches.
+        return torch.empty((1, 1), device=device, dtype=torch.float32)
+
 
 def gen_tgmm_tensors(
     M: int,
@@ -521,6 +552,7 @@ def gen_tgmm_tensors(
     trans_rhs: bool = False,
     rng_seed: int | None = RNG_SEED,
     unif_group_sizes: bool = False,
+    with_bias_grad: bool = False,
 ) -> tuple[Tensor, Tensor, list[Tensor], Tensor]:
     lhs, rhs, group_sizes_0 = gen_tgmm_input(
         M,
@@ -537,7 +569,11 @@ def gen_tgmm_tensors(
         num_group_sizes, M, G, device=device, rng_seed=None, group_sizes_0=group_sizes_0
     )
     out = gen_tgmm_output(K, N, G, device=device, preferred_element_type=output_type)
-    return lhs, rhs, multiple_group_sizes, out
+    if with_bias_grad:
+        bias_grad = gen_tgmm_bias_grad(K, G, device=device, with_bias_grad=True)
+    else:
+        bias_grad = None
+    return lhs, rhs, multiple_group_sizes, out, bias_grad
 
 
 # TGMM helpers: get information from tensors.
@@ -604,6 +640,66 @@ def get_tgmm_output(
         preferred_element_type=preferred_element_type,
     )
 
+def get_tgmm_bias_grad(
+    K: int,
+    G: int,
+    device: torch.device | str = DEVICE,
+    existing_bias_grad: Tensor | None = None,
+    accumulate: bool = False,
+) -> Tensor:
+    """ 
+    Get or validate bias gradient tensor for TGMM.
+    
+    If existing_bias_grad is provided, validates its shape, device, dtype, and stride.
+    If not accumulating, zeros the tensor before returning.
+    If existing_bias_grad is None, returns a dummy tensor (for use when COMPUTE_BIAS_GRAD=False).
+    
+    Parameters
+    ----------
+    K : int
+        Number of rows in the bias gradient tensor.
+    G : int
+        Number of groups.
+    device : torch.device or str
+        Device for the tensor.
+    existing_bias_grad : torch.Tensor or None
+        Existing bias gradient tensor to validate and use.
+    accumulate : bool
+        If False and existing_bias_grad is provided, zeros the tensor before returning.
+        
+    Returns
+    -------
+    torch.Tensor
+        Valid bias gradient tensor or dummy tensor.
+    """
+    assert K > 0, f"Number of bias_grad rows K must be positive (K = {K})."
+    assert G > 0, f"Number of groups G must be positive (G = {G})."
+    
+    if existing_bias_grad is not None:
+        # Validate existing bias_grad tensor.
+        expected_shape = (G, K)
+        assert (
+            tuple(existing_bias_grad.shape) == expected_shape
+        ), f"bias_grad must have shape {expected_shape}, got {tuple(existing_bias_grad.shape)}."
+        assert (
+            existing_bias_grad.device == device
+        ), f"bias_grad must be on the same device (bias_grad = {existing_bias_grad.device}, device = {device})."
+        assert (
+            existing_bias_grad.dtype == torch.float32
+        ), f"bias_grad must be torch.float32 (kernel uses atomic_add which requires float32), got {existing_bias_grad.dtype}."
+        assert existing_bias_grad.stride() == (
+            K,
+            1,
+        ), f"bias_grad must be row-major with stride (K, 1) = ({K}, 1), got {existing_bias_grad.stride()}."
+        
+        # Zero the tensor if not accumulating.
+        if not accumulate:
+            existing_bias_grad.zero_()
+        
+        return existing_bias_grad
+    
+    else:
+        return gen_tgmm_bias_grad(K, G, device=device, with_bias_grad=False)
 
 def get_tgmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool, int]:
     assert lhs.dim() == 2, f"lhs must have 2 dimensions (it's {lhs.dim()})."
