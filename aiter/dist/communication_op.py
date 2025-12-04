@@ -24,7 +24,7 @@ from .parallel_state import get_tp_group
 
 
 def tensor_model_parallel_all_reduce(
-    input_: torch.Tensor, use_new: bool = False, open_fp8_quant: bool = False
+    input_: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
 ) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_, use_new, open_fp8_quant)

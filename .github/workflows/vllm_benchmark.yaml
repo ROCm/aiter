@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   VLLM_BRANCH: "main"
@@ -94,7 +94,7 @@ jobs:
 
   vllm_benchmark:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-mi325-8gpu-bm
+    runs-on: aiter-8gpu-runner
     needs: build_vllm_image
     strategy:
       fail-fast: false
