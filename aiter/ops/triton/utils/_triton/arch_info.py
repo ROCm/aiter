@@ -17,11 +17,6 @@ def get_arch():
     return arch
 
 
-@lru_cache(maxsize=1)
-def get_device():
-    return _ARCH_TO_DEVICE[get_arch()]
-
-
 def is_fp4_avail():
     return get_arch() in ("gfx950")
 
