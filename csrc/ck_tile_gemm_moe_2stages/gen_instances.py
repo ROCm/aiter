@@ -227,9 +227,9 @@ template torch::Tensor
             ).write_text(intsance)
 
         if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
-            fill_template(k.name, self.ab_dtype, "pk_int4", self.acc_dtype, self.c_dtype)
-            # for _ in ["pk_int4", "pk_fp4"]:
-            #     fill_template(k.name, self.ab_dtype, _, self.acc_dtype, self.c_dtype)
+            # fill_template(k.name, self.ab_dtype, "pk_int4", self.acc_dtype, self.c_dtype)
+            for _ in ["pk_int4", "pk_fp4"]:
+                fill_template(k.name, self.ab_dtype, _, self.acc_dtype, self.c_dtype)
         else:
             for CDtype in ["bf16", "fp16"]:
                 for ABDtype in ["fp8"]:  # "bf16", "fp16",
