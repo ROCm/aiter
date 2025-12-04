@@ -1,5 +1,4 @@
 {
-  "_config_type": "BATCHED_GEMM_PREQUANT",
   "small": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 64,
