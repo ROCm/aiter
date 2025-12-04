@@ -11,14 +11,16 @@ using fptr_t = int64_t;
 
 namespace trtllm {
 
-fptr_t
-init_ar_fusion(int64_t device_id, int64_t rank, int64_t world_size, int64_t max_size_in_bytes);
+fptr_t init_ar_fusion(int64_t device_id,
+                      int64_t rank,
+                      int64_t world_size,
+                      int64_t max_size_in_bytes,
+                      int64_t comm_ptrs_buf_len);
 void destroy_ar_fusion(fptr_t fptr);
 Tensor get_ar_fusion_barrier_handle(fptr_t fptr);
 Tensor get_ar_fusion_data_handle(fptr_t fptr);
 void open_ar_fusion_barrier_handles(fptr_t fptr, std::vector<Tensor> handles);
 void open_ar_fusion_data_handles(fptr_t fptr, std::vector<Tensor> handles);
-void ar_fusion_capture(fptr_t fptr, const Tensor& input);
 void ar_fusion_capture_clear(fptr_t fptr);
 std::vector<Tensor> get_ar_fusion_captured_handles(fptr_t fptr);
 Tensor get_ar_fusion_captured_offsets(fptr_t fptr);

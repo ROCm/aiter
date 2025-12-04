@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from contextlib import contextmanager
 from ..jit.core import compile_ops
 from ..utility.dtypes import fp8
 
@@ -27,6 +28,7 @@ def trtllm_init_ar_fusion(
     rank: int,
     world_size: int,
     max_size_in_bytes: int,
+    comm_ptrs_buf_len: int,
 ) -> int: ...
 
 
@@ -59,13 +61,6 @@ def trtllm_open_ar_fusion_barrier_handles(
 def trtllm_open_ar_fusion_data_handles(
     fptr_t: int,
     handles: list[Tensor],
-) -> None: ...
-
-
-@compile_ops("module_trtllm_all_reduce_fusion")
-def trtllm_ar_fusion_capture(
-    fptr_t: int,
-    input: Tensor,
 ) -> None: ...
 
 
@@ -118,6 +113,7 @@ class AiterDistEnv:
         group: ProcessGroup = None,
         device_id: int = None,
         max_size_in_bytes=16384 * 16384,
+        comm_ptrs_buf_len=1024 * 256,
         dtype: torch.dtype=torch.bfloat16,
     ) -> None:
         self.group = group
@@ -133,7 +129,7 @@ class AiterDistEnv:
         if self.world_size not in AiterDistEnv._SUPPORTED_WORLD_SIZES:
             return
 
-        self.fptr = trtllm_init_ar_fusion(self.device_id, self.rank, self.world_size, max_size_in_bytes)
+        self.fptr = trtllm_init_ar_fusion(self.device_id, self.rank, self.world_size, max_size_in_bytes, comm_ptrs_buf_len)
         barrier_handle = trtllm_get_ar_fusion_barrier_handle(self.fptr)
         data_handle = trtllm_get_ar_fusion_data_handle(self.fptr)
         self.barrier()
@@ -144,7 +140,9 @@ class AiterDistEnv:
         trtllm_open_ar_fusion_barrier_handles(self.fptr, barrier_handle_list)
         trtllm_open_ar_fusion_data_handles(self.fptr, data_handle_list)
         self.barrier()
+        self._IS_CAPTURING = False
         self._IS_CAPTURED = False
+        self.disabled = False
 
     def barrier(self):
         torch.cuda.set_device(self.device_id)
@@ -165,18 +163,24 @@ class AiterDistEnv:
         trtllm_ar_fusion_capture_clear(self.fptr)
         self.barrier()
 
-    def capture(self, input: torch.Tensor):
+    @contextmanager
+    def capture(self):
+        try:
+            self._IS_CAPTURING = True
+            yield
+        finally:
+            self._IS_CAPTURING = False
+            if not self.disabled:
+                self.consume_capture()
+
+    def capture_(self, input: torch.Tensor):
         if torch.cuda.is_current_stream_capturing():
-            trtllm_ar_fusion_capture(self.fptr, input)
+            pass
             self._IS_CAPTURED = True
         else:
             if self._IS_CAPTURED:
                 self.consume_capture()
                 self._IS_CAPTURED = False
-
-    def force_capture(self, input: torch.Tensor):
-        trtllm_ar_fusion_capture(self.fptr, input)
-        self.consume_capture()
 
     def __del__(self):
         if self.fptr:
@@ -213,11 +217,10 @@ class AiterDistEnv:
     def allreduce_add_rms_fused(
         self, allreduce_in, residual_in, rms_weight, eps, fp8_out=False
     ):
-        self.capture(allreduce_in)
+        self.capture_(allreduce_in)
         residual_out = torch.empty_like(residual_in)
-        norm_out = torch.empty_like(allreduce_in)
         if fp8_out:
-            norm_out = norm_out.to(fp8)
+            norm_out = torch.empty_like(allreduce_in, dtype=fp8)
             scale_out = torch.empty(
                 allreduce_in.shape[0],
                 1,
@@ -225,6 +228,7 @@ class AiterDistEnv:
                 device=allreduce_in.device,
             )
         else:
+            norm_out = torch.empty_like(allreduce_in)
             scale_out = torch.empty(1, dtype=torch.float32, device=allreduce_in.device)
         trtllm_allreduce_rms(
             self.fptr,

@@ -74,6 +74,9 @@ __device__ __forceinline__ int ld_flag(int *addr) {
 #define gpuIpcMemLazyEnablePeerAccess hipIpcMemLazyEnablePeerAccess
 #define gpuDeviceptr_t hipDeviceptr_t
 #define gpuPointerGetAttribute hipPointerGetAttribute
+#define gpuStreamCaptureStatus hipStreamCaptureStatus
+#define gpuStreamIsCapturing hipStreamIsCapturing
+#define gpuStreamCaptureStatusActive hipStreamCaptureStatusActive
 
 namespace kernel_utils {
 
@@ -263,32 +266,36 @@ __device__ __forceinline__ void vec_add_r_(vec_t<T, VEC_SIZE> (&self)[NRanks]) {
 using namespace kernel_utils;
 
 #define WARP_SIZE 32
+#define MAX_RANKS 8
 
 template <int NRanks>
-struct CommPtrs {
-    std::array<void *, NRanks> barrier_flag_ptrs;
-    std::array<void *, NRanks> data_ptrs;
-    void *sync_clock;
-    int rank;
-};
-
-struct HostCommPtrs {
-    std::vector<void *> barrier_flag_ptrs;
-    std::vector<void *> data_ptrs;
+struct CommDeviceMeta {
+    void *barrier_flag_ptrs[NRanks];
     void *sync_clock;
     int rank;
     int nranks;
 };
 
+struct CommMeta {
+    void *barrier_flag_ptrs[MAX_RANKS];
+    void *sync_clock;
+    int rank;
+    int nranks;
+};
+
+struct CommPtrs {
+    void *data_ptrs[MAX_RANKS];
+};
+
 template <int NRanks>
 struct SyncComm {
-    __device__ __forceinline__ SyncComm(CommPtrs<NRanks> &cptrs) {
+    __device__ __forceinline__ SyncComm(CommDeviceMeta<NRanks> &meta) {
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
-            barrier_flags[r] = cptrs.barrier_flag_ptrs[r];
+            barrier_flags[r] = meta.barrier_flag_ptrs[r];
         }
-        flag_ptr = ((int *)cptrs.sync_clock) + blockIdx.x;
-        int rank = cptrs.rank;
+        flag_ptr = ((int *)meta.sync_clock) + blockIdx.x;
+        int rank = meta.rank;
         __syncthreads();
         if (threadIdx.x < NRanks) {
             int target_rank = threadIdx.x;
@@ -423,7 +430,7 @@ __device__ __forceinline__ void epilogue(
 }
 
 template <typename T, int NRanks>
-__global__ void allreduce_fusion_kernel_twoshot(AllReduceFusionParams<T> params, CommPtrs<NRanks> cptrs) {
+__global__ void allreduce_fusion_kernel_twoshot(AllReduceFusionParams<T> params, CommDeviceMeta<NRanks> meta, CommPtrs *cptrs) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
 
     int access_id_in_token = threadIdx.x * VEC_SIZE;
@@ -433,7 +440,7 @@ __global__ void allreduce_fusion_kernel_twoshot(AllReduceFusionParams<T> params,
     vec_t<T, VEC_SIZE> gamma;
     gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
 
-    SyncComm<NRanks> comm(cptrs);
+    SyncComm<NRanks> comm(meta);
     comm.sync();
 
     // allreduce
@@ -442,12 +449,12 @@ __global__ void allreduce_fusion_kernel_twoshot(AllReduceFusionParams<T> params,
         vec_t<T, VEC_SIZE> vals[NRanks];
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
-            vals[r].load(reinterpret_cast<T *>(cptrs.data_ptrs[r]) + idx);
+            vals[r].load(reinterpret_cast<T *>(cptrs->data_ptrs[r]) + idx);
         }
         vec_add_r_<T, VEC_SIZE, NRanks>(vals);
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
-            vals[0].store(reinterpret_cast<T *>(cptrs.data_ptrs[r]) + params.size + idx);
+            vals[0].store(reinterpret_cast<T *>(cptrs->data_ptrs[r]) + params.size + idx);
         }
     }
 
@@ -460,7 +467,7 @@ __global__ void allreduce_fusion_kernel_twoshot(AllReduceFusionParams<T> params,
              idx < params.size; idx += gridDim.x * NRanks * params.hidden_dim, tidx += gridDim.x * NRanks) {
             vec_t<T, VEC_SIZE> data[2];
             data[0].load(reinterpret_cast<T *>(params.residual_in) + idx);
-            data[1].load(reinterpret_cast<T *>(cptrs.data_ptrs[params.rank]) + params.size + idx);
+            data[1].load(reinterpret_cast<T *>(cptrs->data_ptrs[params.rank]) + params.size + idx);
             vec_add_<T, VEC_SIZE>(data[0], data[1]);
             epilogue<T, VEC_SIZE>(params, data[0], gamma, idx, tidx);
         }
@@ -468,10 +475,10 @@ __global__ void allreduce_fusion_kernel_twoshot(AllReduceFusionParams<T> params,
 }
 
 template <typename T, int NRanks, int BLOCK_SIZE, bool USE_EPILOGUE>
-__global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_w(AllReduceFusionParams<T> params, CommPtrs<NRanks> cptrs) {
+__global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_w(AllReduceFusionParams<T> params, CommDeviceMeta<NRanks> meta, CommPtrs *cptrs) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
     constexpr int WARP_SIZE_ = BLOCK_SIZE / NRanks;
-    SyncComm<NRanks> comm(cptrs);
+    SyncComm<NRanks> comm(meta);
 
     __shared__ T shared[NRanks * WARP_SIZE_ * VEC_SIZE];
     int warp_id = threadIdx.x / WARP_SIZE_;
@@ -485,7 +492,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_w(AllRe
         idx < params.size;
         idx += gridDim.x * NRanks * WARP_SIZE_ * VEC_SIZE) {
         vec_t<T, VEC_SIZE> val;
-        val.load(reinterpret_cast<T *>(cptrs.data_ptrs[warp_id]) + idx);
+        val.load(reinterpret_cast<T *>(cptrs->data_ptrs[warp_id]) + idx);
         val.store(&shared[0] + threadIdx.x * VEC_SIZE);
         __syncthreads();
         if (warp_id == 0) {
@@ -504,7 +511,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_w(AllRe
         vec_t<T, VEC_SIZE> res;
         res.load(reinterpret_cast<T *>(params.residual_in) + idx);
         vec_add_<T, VEC_SIZE>(val, res);
-        val.store(reinterpret_cast<T *>(cptrs.data_ptrs[warp_id]) + idx);
+        val.store(reinterpret_cast<T *>(cptrs->data_ptrs[warp_id]) + idx);
     }
 
     if constexpr (USE_EPILOGUE) {
@@ -517,7 +524,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_w(AllRe
             idx < params.size;
             idx += gridDim.x * params.hidden_dim, tidx += gridDim.x) {
             vec_t<T, VEC_SIZE> val;
-            val.load(reinterpret_cast<T *>(cptrs.data_ptrs[params.rank]) + idx);
+            val.load(reinterpret_cast<T *>(cptrs->data_ptrs[params.rank]) + idx);
             epilogue<T, VEC_SIZE, true>(params, val, gamma, idx, tidx);
         }
     } else {
@@ -528,7 +535,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_w(AllRe
 template <typename T, int NRanks>
 void allreduce_fusion_kernel_twoshot_launcher(
     AllReduceFusionParams<T> const &params,
-    CommPtrs<NRanks> const &cptrs,
+    CommDeviceMeta<NRanks> const &meta,
+    CommPtrs *cptrs,
     gpuStream_t stream) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
     assert(params.size % params.hidden_dim == 0);
@@ -542,13 +550,14 @@ void allreduce_fusion_kernel_twoshot_launcher(
     }
     // void *args[] = {(void *)&params};
     dim3 numBlocks(nblocks);
-    allreduce_fusion_kernel_twoshot<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params, cptrs);
+    allreduce_fusion_kernel_twoshot<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params, meta, cptrs);
 }
 
 template <typename T, int NRanks, int HIDDEN_DIM>
 void allreduce_fusion_kernel_w_launcher(
     AllReduceFusionParams<T> const &params,
-    CommPtrs<NRanks> const &cptrs,
+    CommDeviceMeta<NRanks> const &meta,
+    CommPtrs *cptrs,
     gpuStream_t stream) {
     constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
     constexpr int BLOCK_SIZE = HIDDEN_DIM / VEC_SIZE;
@@ -559,42 +568,43 @@ void allreduce_fusion_kernel_w_launcher(
     dim3 threadsPerBlock(BLOCK_SIZE);
     token_num = token_num <= 2 ? 1 : token_num;
     dim3 numBlocks(token_num);
-    allreduce_fusion_kernel_w<T, NRanks, BLOCK_SIZE, true><<<numBlocks, threadsPerBlock, 0, stream>>>(params, cptrs);
+    allreduce_fusion_kernel_w<T, NRanks, BLOCK_SIZE, true><<<numBlocks, threadsPerBlock, 0, stream>>>(params, meta, cptrs);
 }
 
 template <typename T, int NRanks>
 void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params,
-                                      CommPtrs<NRanks> const &cptrs,
+                                      CommDeviceMeta<NRanks> const &meta,
+                                      CommPtrs *cptrs,
                                       gpuStream_t stream) {
     int token_num = params.size / params.hidden_dim;
     if (token_num <= 1024) {
         switch (params.hidden_dim) {
         case 4096:
-            allreduce_fusion_kernel_w_launcher<T, NRanks, 4096>(params, cptrs, stream);
+            allreduce_fusion_kernel_w_launcher<T, NRanks, 4096>(params, meta, cptrs, stream);
             return;
         case 2048:
-            allreduce_fusion_kernel_w_launcher<T, NRanks, 2048>(params, cptrs, stream);
+            allreduce_fusion_kernel_w_launcher<T, NRanks, 2048>(params, meta, cptrs, stream);
             return;
         case 1024:
-            allreduce_fusion_kernel_w_launcher<T, NRanks, 1024>(params, cptrs, stream);
+            allreduce_fusion_kernel_w_launcher<T, NRanks, 1024>(params, meta, cptrs, stream);
             return;
         default:
             break;
         }
     }
-    allreduce_fusion_kernel_twoshot_launcher<T, NRanks>(params, cptrs, stream);
+    allreduce_fusion_kernel_twoshot_launcher<T, NRanks>(params, meta, cptrs, stream);
 }
 
 template <typename T>
-void allreduce_rms_fusion_impl(HostCommPtrs host_cptrs, int size,
+void allreduce_rms_fusion_impl(CommMeta meta, CommPtrs *cptrs, int size,
                                int hidden_dim, void *allreduce_in,
                                void *residual_in, void *residual_out,
                                void *norm_out, void *rms_gamma, float eps,
                                int quant_type = 0, void *scale_out = nullptr,
                                gpuStream_t stream = 0) {
     AllReduceFusionParams<T> params;
-    params.nranks = host_cptrs.nranks;
-    params.rank = host_cptrs.rank;
+    params.nranks = meta.nranks;
+    params.rank = meta.rank;
     params.size = size;
     params.hidden_dim = hidden_dim;
     params.allreduce_in = allreduce_in;
@@ -606,19 +616,19 @@ void allreduce_rms_fusion_impl(HostCommPtrs host_cptrs, int size,
     params.scale_out = scale_out;
     params.quant_type = (QuantType)quant_type;
 
-#define DISPATCH_NRANKS(NRANKS)                                             \
-    {                                                                       \
-        CommPtrs<NRANKS> cptrs;                                             \
-        for (int i = 0; i < NRANKS; ++i) {                                  \
-            cptrs.barrier_flag_ptrs[i] = host_cptrs.barrier_flag_ptrs[i];   \
-            cptrs.data_ptrs[i] = host_cptrs.data_ptrs[i];                   \
-        }                                                                   \
-        cptrs.sync_clock = host_cptrs.sync_clock;                           \
-        cptrs.rank = host_cptrs.rank;                                       \
-        allreduce_fusion_kernel_launcher<T, NRANKS>(params, cptrs, stream); \
+#define DISPATCH_NRANKS(NRANKS)                                                    \
+    {                                                                              \
+        CommDeviceMeta<NRANKS> dmeta;                                              \
+        for (int i = 0; i < NRANKS; ++i) {                                         \
+            dmeta.barrier_flag_ptrs[i] = meta.barrier_flag_ptrs[i];                \
+        }                                                                          \
+        dmeta.sync_clock = meta.sync_clock;                                        \
+        dmeta.rank = meta.rank;                                                    \
+        dmeta.nranks = meta.nranks;                                                \
+        allreduce_fusion_kernel_launcher<T, NRANKS>(params, dmeta, cptrs, stream); \
     }
 
-    int nranks = host_cptrs.nranks;
+    int nranks = meta.nranks;
     if (nranks == 8) {
         DISPATCH_NRANKS(8)
     } else if (nranks == 4) {
@@ -664,29 +674,45 @@ void open_handles(int rank, std::vector<Tensor> &handles, void *ptr, std::vector
     }
 }
 
+void create_base_ptr(void **base_ptr, void *ptr) {
+    if (gpuPointerGetAttribute(base_ptr, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR, (gpuDeviceptr_t)ptr) != gpuSuccess) {
+        throw std::runtime_error("failed to get pointer attr");
+    }
+}
+
 } // namespace ipc_details
 
 class CommWorkspace {
 public:
-    CommWorkspace(int64_t device_id, int64_t rank, int64_t world_size, int64_t size_in_bytes, int64_t max_thread_blocks = NBLOCKS_PER_GPU) {
+    CommWorkspace(
+        int64_t device_id,         // assign device
+        int64_t rank,              // rank in group
+        int64_t world_size,        // group size
+        int64_t size_in_bytes,     // private data size
+        int64_t comm_ptrs_buf_len, // cached ptrs size
+        int64_t max_thread_blocks = NBLOCKS_PER_GPU) {
         TORCH_CHECK(rank < world_size);
         gpuSetDevice(device_id);
         device_id_ = device_id;
         rank_ = rank;
         world_size_ = world_size;
         size_in_bytes_ = size_in_bytes;
+        comm_ptrs_buf_len_ = comm_ptrs_buf_len;
         max_thread_blocks_ = max_thread_blocks;
         gpuMalloc(&sync_clock_, max_thread_blocks_ * sizeof(int));
         gpuMalloc(&barrier_flags_, max_thread_blocks_ * world_size_ * sizeof(int));
         gpuMalloc(&data_, size_in_bytes_ * 2);
+        gpuMalloc(&comm_ptrs_, comm_ptrs_buf_len_ * sizeof(CommPtrs));
         gpuMemset(sync_clock_, 0, max_thread_blocks_ * sizeof(int));
         gpuMemset(barrier_flags_, 0, max_thread_blocks_ * world_size_ * sizeof(int));
+        used_comm_ptrs_ = 0;
     }
 
     ~CommWorkspace() {
         gpuFree(sync_clock_);
         gpuFree(barrier_flags_);
         gpuFree(data_);
+        gpuFree(comm_ptrs_);
     }
 
     Tensor get_barrier_handle() {
@@ -703,69 +729,73 @@ public:
 
     void open_data_handles(std::vector<Tensor> handles) {
         ipc_details::open_handles(rank_, handles, data_, ipc_data_);
+        CommPtrs cptrs;
+        for (int i = 0; i < world_size_; ++i) {
+            cptrs.data_ptrs[i] = ipc_data_[i];
+        }
+        gpuMemcpy(comm_ptrs_ + 0, &cptrs, sizeof(CommPtrs), gpuMemcpyHostToDevice);
+        used_comm_ptrs_ = 1;
     }
 
-    HostCommPtrs get_cptrs(const Tensor &input, gpuStream_t stream) {
-        HostCommPtrs cptrs;
-        cptrs.data_ptrs.resize(world_size_);
-        cptrs.barrier_flag_ptrs.resize(world_size_);
+    std::tuple<CommMeta, CommPtrs *> get_comm_data(const Tensor &input, gpuStream_t stream) {
+        int64_t size = input.numel() * input.element_size();
         void *ptr = (void *)input.data_ptr();
-        auto it = cached_ipc_data_.find(ptr);
-        if (it != cached_ipc_data_.end()) {
-            for (int r = 0; r < world_size_; ++r) {
-                cptrs.data_ptrs[r] = (it->second)[r];
-            }
-        } else {
-            gpuMemcpyAsync(data_, ptr, input.numel() * input.element_size(), gpuMemcpyDeviceToDevice, stream);
-            for (int r = 0; r < world_size_; ++r) {
-                cptrs.data_ptrs[r] = ipc_data_[r];
-            }
-        }
+
+        CommMeta meta;
         for (int r = 0; r < world_size_; ++r) {
-            cptrs.barrier_flag_ptrs[r] = ipc_barrier_flags_[r];
+            meta.barrier_flag_ptrs[r] = ipc_barrier_flags_[r];
         }
-        cptrs.sync_clock = sync_clock_;
-        cptrs.rank = rank_;
-        cptrs.nranks = world_size_;
-        return cptrs;
-    }
+        meta.sync_clock = sync_clock_;
+        meta.rank = rank_;
+        meta.nranks = world_size_;
 
-    void capture(const Tensor &input) {
-        if (input.numel() * input.element_size() > 1024 * 4096 * 16) {
-            return;
+        CommPtrs *cptrs;
+        auto it = ptr_to_comm_ptrs_.find(ptr);
+        if (it != ptr_to_comm_ptrs_.end()) {
+            cptrs = it->second;
+        } else {
+            gpuStreamCaptureStatus status;
+            gpuStreamIsCapturing(stream, &status);
+            int remaining = comm_ptrs_buf_len_ - used_comm_ptrs_ - unregistered_ptrs_.size();
+            if (status == gpuStreamCaptureStatusActive && size < 1024 * 4096 * 16 && remaining > 0) {
+                unregistered_ptrs_.push_back(ptr);
+                cptrs = comm_ptrs_ + used_comm_ptrs_ + unregistered_ptrs_.size() - 1;
+            } else {
+                cptrs = comm_ptrs_ + 0;
+                gpuMemcpyAsync(data_, ptr, size, gpuMemcpyDeviceToDevice, stream);
+            }
         }
-        void *ptr = (void *)input.data_ptr();
-        void *base_ptr;
-        if (gpuPointerGetAttribute(&base_ptr, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR, (gpuDeviceptr_t)ptr) != gpuSuccess) {
-            throw std::runtime_error("failed to get pointer attr");
-        }
-        cached_ptrs_.push_back(ptr);
-        cached_base_ptrs_.push_back(base_ptr);
-        cached_offsets_.push_back(((char *)ptr) - ((char *)base_ptr));
+
+        return {meta, cptrs};
     }
 
     void capture_clear() {
-        cached_ptrs_.clear();
-        cached_base_ptrs_.clear();
-        cached_offsets_.clear();
+        unregistered_ptrs_.clear();
     }
 
     std::vector<Tensor> get_captured_handles() {
-        int num_datas = cached_ptrs_.size();
+        int num_datas = unregistered_ptrs_.size();
         std::vector<Tensor> ipc_handles;
         ipc_handles.reserve(num_datas);
         for (int i = 0; i < num_datas; ++i) {
-            ipc_handles.push_back(ipc_details::get_handle(cached_base_ptrs_[i]));
+            void *ptr = unregistered_ptrs_[i];
+            void *base_ptr;
+            ipc_details::create_base_ptr(&base_ptr, ptr);
+            ipc_handles.push_back(ipc_details::get_handle(base_ptr));
         }
         return ipc_handles;
     }
 
     Tensor get_captured_offsets() {
-        int num_datas = cached_ptrs_.size();
+        int num_datas = unregistered_ptrs_.size();
         std::vector<int64_t> offsets;
         offsets.reserve(num_datas);
         for (int i = 0; i < num_datas; ++i) {
-            offsets.push_back(cached_offsets_[i]);
+            void *ptr = unregistered_ptrs_[i];
+            void *base_ptr;
+            ipc_details::create_base_ptr(&base_ptr, ptr);
+            int64_t offset = ((char *)ptr) - ((char *)base_ptr);
+            offsets.push_back(offset);
         }
         auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
         auto t = torch::tensor(offsets, options);
@@ -773,14 +803,19 @@ public:
     }
 
     void open_captured_handles(std::vector<Tensor> &handles, std::vector<int64_t> &offsets, int64_t ptr_idx) {
-        auto ptr = cached_ptrs_[ptr_idx];
-        auto base_ptr = cached_base_ptrs_[ptr_idx];
+        auto ptr = unregistered_ptrs_[ptr_idx];
+        void *base_ptr;
+        ipc_details::create_base_ptr(&base_ptr, ptr);
         std::vector<void *> ipc_data;
         ipc_details::open_handles(rank_, handles, base_ptr, ipc_data);
+        CommPtrs cptrs;
         for (int i = 0; i < offsets.size(); ++i) {
             ipc_data[i] = (void *)((char *)ipc_data[i] + offsets[i]);
+            cptrs.data_ptrs[i] = ipc_data[i];
         }
-        cached_ipc_data_[ptr] = ipc_data;
+        gpuMemcpy(comm_ptrs_ + used_comm_ptrs_, &cptrs, sizeof(CommPtrs), gpuMemcpyHostToDevice);
+        ptr_to_comm_ptrs_[ptr] = comm_ptrs_ + used_comm_ptrs_;
+        used_comm_ptrs_++;
     }
 
 private:
@@ -788,20 +823,21 @@ private:
     int rank_;
     int world_size_;
     int size_in_bytes_;
+    int comm_ptrs_buf_len_;
     int max_thread_blocks_;
     void *sync_clock_;
     void *barrier_flags_;
     void *data_;
     std::vector<void *> ipc_barrier_flags_;
     std::vector<void *> ipc_data_;
-    // capture
-    std::vector<void *> cached_ptrs_;
-    std::vector<void *> cached_base_ptrs_;
-    std::vector<int64_t> cached_offsets_;
-    std::unordered_map<void *, std::vector<void *>> cached_ipc_data_;
+    // graph
+    std::vector<void *> unregistered_ptrs_;
+    CommPtrs *comm_ptrs_;
+    int used_comm_ptrs_;
+    std::unordered_map<void *, CommPtrs *> ptr_to_comm_ptrs_;
 };
 
-fptr_t init_ar_fusion(int64_t device_id, int64_t rank, int64_t world_size, int64_t max_size_in_bytes) {
+fptr_t init_ar_fusion(int64_t device_id, int64_t rank, int64_t world_size, int64_t max_size_in_bytes, int64_t comm_ptrs_buf_len) {
     switch (world_size) {
     case 8:
     case 4:
@@ -812,7 +848,7 @@ fptr_t init_ar_fusion(int64_t device_id, int64_t rank, int64_t world_size, int64
     }
     if (rank < 0 || rank >= world_size)
         throw std::invalid_argument("invalid rank passed in");
-    return (fptr_t) new CommWorkspace(device_id, rank, world_size, max_size_in_bytes);
+    return (fptr_t) new CommWorkspace(device_id, rank, world_size, max_size_in_bytes, comm_ptrs_buf_len);
 }
 
 void destroy_ar_fusion(fptr_t fptr) {
@@ -838,11 +874,6 @@ void open_ar_fusion_barrier_handles(fptr_t fptr, std::vector<Tensor> handles) {
 void open_ar_fusion_data_handles(fptr_t fptr, std::vector<Tensor> handles) {
     auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
     ptr->open_data_handles(handles);
-}
-
-void ar_fusion_capture(fptr_t fptr, const Tensor &input) {
-    auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
-    ptr->capture(input);
 }
 
 void ar_fusion_capture_clear(fptr_t fptr) {
@@ -887,7 +918,7 @@ void allreduce_rms(fptr_t fptr, Tensor &allreduce_in, Tensor &residual_in,
     int size = allreduce_in.numel();
     int hidden_dim = allreduce_in.size(-1);
     auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
-    auto cptrs = ptr->get_cptrs(allreduce_in, stream);
+    auto comm_data = ptr->get_comm_data(allreduce_in, stream);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         kHalf,
         kBFloat16,
@@ -895,7 +926,8 @@ void allreduce_rms(fptr_t fptr, Tensor &allreduce_in, Tensor &residual_in,
         "allreduce_rms", [&] {
             using k_scalar_t = KernelElementType<scalar_t>::type;
             allreduce_rms_fusion_impl<k_scalar_t>(
-                cptrs,
+                std::get<0>(comm_data),
+                std::get<1>(comm_data),
                 size,
                 hidden_dim,
                 (void *)allreduce_in.data_ptr<scalar_t>(),
