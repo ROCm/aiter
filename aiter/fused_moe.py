@@ -1229,7 +1229,7 @@ def torch_moe_stage2(
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_1x32 and w2.dtype == dtypes.fp4x2
+    if quant_type == QuantType.per_1x32 and w2.dtype == dtypes.fp4x2:
         from aiter.utility import fp4_utils
 
         w2 = fp4_utils.mxfp4_to_f32(w2)

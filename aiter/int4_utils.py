@@ -37,28 +37,6 @@ def convert_int8_to_uint32_int4(tensor: torch.Tensor) -> torch.Tensor:
     )
     return merged.view(dtype=torch.uint32)
 
-
-def convert_int8_to_uint32_int4_hack(tensor: torch.Tensor) -> torch.Tensor:
-    assert tensor.dtype == dtypes.i8, "input should be int8"
-
-    if tensor.shape[-1] % 8 != 0:
-        raise ValueError("k % 8 should be zero")
-
-    tensor_reshaped = tensor.reshape(*tensor.shape[:-1], tensor.shape[-1] // 8, 8)
-    high_bits = tensor_reshaped & 0x0F
-    merged = (
-        (high_bits[:, :, :, 7].to(dtypes.i32) << 28)
-        | (high_bits[:, :, :, 6].to(dtypes.i32) << 24)
-        | (high_bits[:, :, :, 5].to(dtypes.i32) << 20)
-        | (high_bits[:, :, :, 4].to(dtypes.i32) << 16)
-        | (high_bits[:, :, :, 3].to(dtypes.i32) << 12)
-        | (high_bits[:, :, :, 2].to(dtypes.i32) << 8)
-        | (high_bits[:, :, :, 1].to(dtypes.i32) << 4)
-        | high_bits[:, :, :, 0].to(dtypes.i32)
-    )
-    return merged.view(dtype=torch.uint8)
-
-2
 def rearrange_4bit_elements(tensor):
     """
     GPU-optimized version for rearranging 4-bit segments within 32-bit integers
