@@ -7,7 +7,6 @@ import torch
 import triton.language as tl
 import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
-import triton.experimental.gluon.language.amd.cdna4.async_copy as acp
 
 from ...utils._triton import arch_info
 from ...utils.core import AITER_TRITON_CONFIGS_PATH
@@ -104,13 +103,13 @@ def _load_fn_with_smem(
 
     mask = _create_mask(offset_first, offset_second, boundary_first, boundary_second)
     offsets = _create_offsets(offset_first, offset_second, stride_first, stride_second)
-    acp.buffer_load_to_shared(
-        dest=smem.index(load_idx % NUM_STAGES),
+    val = gl.amd.cdna4.buffer_load(
         ptr=base_ptr,
         offsets=offsets,
         mask=mask,
         other=0.0,
     )
+    smem.index(load_idx % NUM_STAGES).store(val)
 
 
 @gluon.jit
@@ -176,7 +175,6 @@ def _attn_fwd_loads(
         None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
         NUM_STAGES,
     )
-    acp.commit_group()
 
     return k_base_ptr + BLOCK_N * stride_kn, v_base_ptr + BLOCK_N * stride_vn
 
@@ -256,9 +254,6 @@ def _attn_fwd_compute(
             HAS_PE,
             NUM_STAGES,
         )
-
-        # Wait for the oldest load to complete before doing any computation
-        acp.wait_group(NUM_STAGES - 1)
 
         # Load current blocks from shared memory
         dot_k = smem_k.index((load_idx - 1) % NUM_STAGES).load(layout=DOT_RIGHT_LAYOUT)
@@ -540,7 +535,6 @@ def _attn_fwd_inner(
 
     # Finish up remaining computations; if pipelining is disabled, this is skipped
     for i in gl.static_range(NUM_STAGES - 1):
-        acp.wait_group(NUM_STAGES - 2 - i)
         acc, l_i, m_i = _attn_fwd_compute(
             i + gl.cdiv(block_max - block_min, BLOCK_N) - (NUM_STAGES - 1),
             acc,
