@@ -32,11 +32,14 @@ namespace py = pybind11;
     m.def("causal_conv1d_fwd",                          \
           &aiter::causal_conv1d_fwd,                    \
           "Causal 1D convolution forward pass.",        \
-          py::arg("out"),                               \
           py::arg("x"),                                 \
           py::arg("weight"),                            \
           py::arg("bias"),                              \
-          py::arg("use_silu"));
+          py::arg("seq_idx"),                           \
+          py::arg("initial_states"),                    \
+          py::arg("out"),                               \
+          py::arg("final_states_out"),                  \
+          py::arg("silu_activation"));
 
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                               \
     m.def("causal_conv1d_update",                                                 \

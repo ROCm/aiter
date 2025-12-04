@@ -12,27 +12,47 @@ MD_NAME = "module_causal_conv1d"
 
 @compile_ops("module_causal_conv1d")
 def causal_conv1d_fwd(
-    out: Tensor,      # [batch, dim, seqlen]
-    x: Tensor,        # [batch, dim, seqlen]
-    weight: Tensor,   # [dim, width]
-    bias: Tensor,     # [dim] or empty tensor
-    use_silu: bool    # whether to apply SiLU activation
+    x: Tensor,                    # [batch, dim, seqlen]
+    weight: Tensor,               # [dim, width]
+    bias: Optional[Tensor],       # [dim] or None
+    seq_idx: Optional[Tensor],    # [batch, seqlen] int32 or None
+    initial_states: Optional[Tensor],  # [batch, dim, width-1] or None
+    out: Tensor,                  # [batch, dim, seqlen]
+    final_states_out: Optional[Tensor],  # [batch, dim, width-1] or None
+    silu_activation: bool         # whether to apply SiLU activation
 ) -> None:
     """
     Causal 1D convolution forward pass.
     
     Args:
-        out: Output tensor [batch, dim, seqlen]
         x: Input tensor [batch, dim, seqlen]
         weight: Weight tensor [dim, width]
-        bias: Bias tensor [dim] (can be empty)
-        use_silu: Whether to apply SiLU activation
+        bias: Bias tensor [dim] or None
+        seq_idx: Optional sequence index [batch, seqlen] int32
+                 Used to mark boundaries between sub-sequences within a batch.
+                 Only supported for channel-last layout.
+        initial_states: Optional initial convolution states [batch, dim, width-1]
+                       Used for streaming/chunked processing.
+                       Only supported for channel-last layout.
+        out: Output tensor [batch, dim, seqlen]
+        final_states_out: Optional output for final states [batch, dim, width-1]
+                         Written to if initial_states is provided.
+                         Only supported for channel-last layout.
+        silu_activation: Whether to apply SiLU activation
+    
+    Layout Support:
+        - Channel-first (contiguous): x.stride(2) == 1
+          * Basic convolution only
+        - Channel-last: x.stride(1) == 1 and x.stride(2) > 1
+          * Requires dim % 8 == 0
+          * Supports all optional parameters (seq_idx, states)
     
     Note:
         - Supports fp16, bf16, and fp32 data types
         - Implements causal convolution (only looks at current and past)
         - Uses optimized BlockLoad/BlockStore for memory coalescing
-        - Supports kernel sizes: 2, 3, 4 (optimized), others (naive fallback)
+        - Supports kernel widths: 2, 3, 4
+        - Automatically detects layout from tensor strides
     """
     ...
 
