@@ -1123,6 +1123,7 @@ def torch_moe_stage1(
     w1_scale=None,  # [expert, inter_dim, 1]
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
+    WQDType=None,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
@@ -1203,7 +1204,7 @@ def torch_moe_stage1(
     use_swiglu = (
         (a1_scale is None)
         and (quant_type == QuantType.per_1x32)
-        and w1.dtype == dtypes.fp4x2
+        and WQDType == dtypes.fp4x2
     )
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
@@ -1229,6 +1230,7 @@ def torch_moe_stage2(
     a2_scale=None,  # [expert]]'
     w2_bias=None,
     doweight=True,
+    WQDType=None,
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)

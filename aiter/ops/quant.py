@@ -62,12 +62,12 @@ def pertoken_quant(
         per_token_scale[per_token_scale == 0] = 1
 
     # quant hidden_states
-    y = torch.clamp(
-        (hidden_states / per_token_scale).to(dtype=quant_dtype),
-        min=(-1 * dtypeMax),
-        max=dtypeMax,
-    )
-    # y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
+    # y = torch.clamp(
+    #     (hidden_states / per_token_scale).to(dtype=quant_dtype),
+    #     min=(-1 * dtypeMax),
+    #     max=dtypeMax,
+    # )
+    y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
     y_scale = per_token_scale.to(scale_dtype)
     return y, y_scale
 

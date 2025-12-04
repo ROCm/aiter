@@ -70,7 +70,7 @@ def test_fmoe(
         and WQDType == dtypes.fp4x2
     ):
         return
-    torch_quant = aiter.get_torch_quant(qType, dtypes.i4x2)
+    torch_quant = aiter.get_torch_quant(qType, WQDType)
     input = torch.randn((token, model_dim), dtype=dtype)
     aiter.logger.info(
         f"input_dim {token} model_dim {model_dim} hidden_pad {hidden_pad} intermediate_pad {intermediate_pad} use {use_g1u1}"
