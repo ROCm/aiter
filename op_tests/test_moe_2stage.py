@@ -52,37 +52,31 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=False,
 ):
-    if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
-        # return
-        pass
+    if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32 and WQDType == dtypes.fp4x2:
+        return
     torch_quant = aiter.get_torch_quant(qType, dtypes.i4x2)
     input = torch.randn((token, model_dim), dtype=dtype)
     aiter.logger.info(f'input_dim {token} model_dim {model_dim} hidden_pad {hidden_pad} intermediate_pad {intermediate_pad} use {use_g1u1}')
     if use_g1u1:
-        w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype)
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         # generate w1 with 32 dim then broadcast to (E, inter_dim*2, model_dim)
         # w1 = torch.randn(32).repeat(model_dim // 32).view(1, 1, model_dim).expand(E, inter_dim * 2, model_dim).contiguous()
-        
         # w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype)
         if hidden_pad != 0 and intermediate_pad != 0:
             w1[:, :, -hidden_pad:] = 0
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
-        exp_bias1 = torch.clamp(torch.zeros((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
-        # exp_bias1 = torch.clamp(torch.ones((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
+        exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
-        w1 = torch.zeros((E, inter_dim, model_dim), dtype=dtype)
-        exp_bias1 = torch.zeros(torch.zeros((E * inter_dim), dtype=dtype), -1.0, 1.0)
+        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+        exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
         # w1 = torch.ones((E, inter_dim, model_dim), dtype=dtype)
         # exp_bias1 = torch.clamp(torch.ones((E * inter_dim), dtype=dtype), -1.0, 1.0)
-    # w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
-    # w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
-    # w2 = torch.randn(32).repeat(inter_dim // 32).view(1, 1, inter_dim).expand(E, model_dim, inter_dim).contiguous()
     w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
-    exp_bias2 = torch.clamp(torch.ones((E, model_dim), dtype=dtype), -1.0, 1.0)
+    exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     # exp_bias2 = torch.clamp(torch.ones((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -126,7 +120,7 @@ def test_fmoe(
         w1_qt, w1_scale = weight_per_128x128_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = weight_per_128x128_quant(w2, quant_dtype=WQDType)
     else:
-        if False:
+        if WQDType == dtypes.fp4x2:
             w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
             w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
         else:
@@ -136,14 +130,16 @@ def test_fmoe(
             w2_qt = w2_qt.view(*w2.shape[:-1], -1)
             w1_scale = w1_scale.view(w1.shape[0] * w1.shape[1], -1)
             w2_scale = w2_scale.view(w2.shape[0] * w2.shape[1], -1)
-        aiter.logger.info(f'w1_shape {w1.shape}')
-        aiter.logger.info(f'w2_shape {w2.shape}')
-        aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
-        aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
-        aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
-        aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
-        aiter.logger.info(w1_qt)
-        aiter.logger.info(w1_scale)
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale).float()
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale).float()
+            aiter.logger.info(f'w1_shape {w1.shape}')
+            aiter.logger.info(f'w2_shape {w2.shape}')
+            aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
+            aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
+            aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
+            aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
+            aiter.logger.info(w1_qt)
+            aiter.logger.info(w1_scale)
         # assert False, "temp stop here"
 
 
@@ -408,7 +404,7 @@ l_quant = [
     # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     # (aiter.QuantType.per_127x128, dtypes.fp8, dtypes.fp8),  # a8w8
     # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
-    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4
+    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4, int4
 ]
 # l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_act = [aiter.ActivationType.Swiglu]
