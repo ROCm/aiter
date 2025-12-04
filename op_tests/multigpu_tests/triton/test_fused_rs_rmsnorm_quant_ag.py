@@ -15,7 +15,6 @@ import multiprocessing as mp
 import sys
 import traceback
 import logging
-import math
 
 import aiter
 from aiter.test_common import checkAllclose, perftest
