@@ -225,8 +225,8 @@ parser.add_argument(
     "-nk",
     "--nheads_k",
     type=int,
-    default=5,
-    help="""Number of heads. Default is 5.
+    default=-1,
+    help="""Number of heads. -1 means equal to n (nheads).
     e.g.: -nk 1""",
 )
 parser.add_argument(
@@ -241,17 +241,25 @@ parser.add_argument(
     "-k",
     "--seqlen_k",
     type=int,
-    default=512,
-    help="""Sequence length for key. Default is 512.
+    default=-1,
+    help="""Sequence length for key. -1 means equal to q (seqlen_q).
     e.g.: -k 1024""",
 )
 parser.add_argument(
     "-d",
-    "--d_qkv",
+    "--d_qk",
     type=int,
     default=128,
     help="""Dimension of query and key. Default is 128.
     e.g.: -d 128""",
+)
+parser.add_argument(
+    "-dv",
+    "--d_v",
+    type=int,
+    default=-1,
+    help="""Dimension of query and key. -1 means equal to d (d_qk).
+    e.g.: -dv 128""",
 )
 parser.add_argument(
     "-msq",
@@ -279,14 +287,19 @@ parser.add_argument(
 
 if __name__ == "__main__":
     args = parser.parse_args()
+
+    nheads_k = args.nheads_k if args.nheads_k > 0 else args.nheads
+    seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
+    d_v = args.d_v if args.d_v > 0 else args.d_qk
+
     test_flash_attn_varlen_output(
         args.batch_size,
         args.nheads,
-        args.nheads_k,
+        nheads_k,
         args.seqlen_q,
-        args.seqlen_k,
-        args.d_qkv,
-        args.d_qkv,
+        seqlen_k,
+        args.d_qk,
+        d_v,
         args.min_seqlen_q,
         args.causal,
         args.local,
