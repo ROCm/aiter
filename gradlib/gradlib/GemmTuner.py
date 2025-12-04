@@ -91,7 +91,7 @@ def generate_data(
     scaleAB,
     is_shuffle=False,
     seed=0,
-    bias=None,
+    bias=False,
     device="cuda:0",
 ):
     torch.manual_seed(seed)
@@ -134,7 +134,11 @@ def get_gemm_ref(inp, weights, bias, scale, indtype, outdtype):
         if type(ref) is tuple and len(ref) == 2:
             ref = ref[0]
     else:
-        ref = F.linear(inp, weights, bias).to(outdtype)
+        ref = (
+            F.linear(inp, weights).to(outdtype) + bias.to(outdtype)
+            if bias is not None
+            else F.linear(inp, weights).to(outdtype)
+        )
     return ref
 
 
@@ -168,12 +172,13 @@ class Gemm:
         self.k = k
         self.n = n
         self.bias = torch.randn(n, device="cuda").to(outdtype) if bias else None
+
         self.indtype = indtype
         self.outdtype = outdtype
         self.scaleAB = scaleAB
         self.nb = CACHE_INVALIDATE_BUFFERS
         (self.inp, self.weights, _, self.bias, _, scaleA, _) = generate_data(
-            m, n, k, indtype, outdtype, scaleAB, 0, bias
+            m, n, k, indtype, outdtype, scaleAB, is_shuffle, 0, bias
         )
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
         self.topn = 20  # number of top solutions from each source
@@ -194,6 +199,7 @@ class Gemm:
         # self.inbpe = self.inp.element_size()
         # self.outbpe = self.ref.element_size()
         self.asm_map = {}
+        self.has_bias = bias
 
     def find_hipblas_sols(self):
         sols = aiter.hipb_findallsols(
@@ -267,6 +273,9 @@ class Gemm:
         return kernel_dict
 
     def asm_gemm_all_solutions(self):
+        if self.bias is not None:
+            print("[Warning]: asm not support bias")
+            return []
         if (
             self.scaleAB or self.k % 64 != 0 or self.indtype != dtypes.bf16
         ) and get_gfx() == "gfx942":
@@ -312,7 +321,7 @@ class Gemm:
                         self.m,
                         self.n,
                         self.k,
-                        False if self.bias is None else True,
+                        self.has_bias,
                         str(self.indtype),
                         str(self.outdtype),
                         self.scaleAB,
@@ -337,6 +346,8 @@ class Gemm:
                             self.outdtype,
                             self.scaleAB,
                             self.is_shuffle,
+                            0,
+                            self.has_bias,
                         ),
                         run_gemm_bf16_asm,
                         ([0, 6, 5, 3], splitK, kernelName, self.is_shuffle),
@@ -372,7 +383,6 @@ class Gemm:
         task = []
         scaleA = HALF if self.scaleAB else None
         scaleB = HALF if self.scaleAB else None
-
         gtimes = {}
         for solidx in solutions:
             info = (
@@ -380,7 +390,7 @@ class Gemm:
                     self.m,
                     self.n,
                     self.k,
-                    True if self.bias is not None else False,
+                    self.has_bias,
                     str(self.indtype),
                     str(self.outdtype),
                     self.scaleAB,
@@ -403,6 +413,8 @@ class Gemm:
                         self.outdtype,
                         self.scaleAB,
                         self.is_shuffle,
+                        0,
+                        self.has_bias,
                     ),
                     call_hipb_mm,
                     ([0, 6, 3, 4, 4], solidx, self.outdtype),

@@ -72,6 +72,7 @@ from .ops.rmsnorm import *
 from .ops.communication import *
 from .ops.rope import *
 from .ops.topk import *
+from .ops.topk_plain import topk_plain
 from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
