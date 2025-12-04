@@ -1267,20 +1267,23 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
 )
 
 
+import math
 from typing import Tuple
 def int8_per_block_quantize_bshd(
     x: torch.Tensor,
     int8_dtype: torch.dtype,
     clamp_val: float = 1e-9,
     block_size: int = 128,
+    include_sqrt_scale: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a tensor to INT8 format, returning an INT8 tensor and a descale factor.
     Quantization is done per block on the seqlen dimension.
     x: [batch, seqlen, heads, dim] (bshd)
+    include_sqrt_scale: if True, include 1/sqrt(head_dim) in descale for attention's Q
     Returns:
         x_int8: same shape as x, stored as int8_dtype
-        descale_factor: [batch, num_blocks, heads, 1] scale to dequantize:
+        descale_factor: [batch, heads, num_blocks, 1] scale to dequantize:
                         x_fp32 ≈ x_int8 * descale_factor
     """
     if len(x.shape) != 4:
@@ -1313,7 +1316,13 @@ def int8_per_block_quantize_bshd(
     # Reshape back to [b, s, h, d]
     x_int8 = x_int8.view(batch, seqlen, num_heads, head_dim)
     # Descale factor for dequantization: x_fp32 ≈ x_int8 * descale_factor
-    descale_factor = 1.0 / scale  # [b, n_blocks, h, 1]
+    descale_factor = 1.0 / scale
+    # Include 1/sqrt(head_dim) for attention scaling (applied to Q's descale)
+    if include_sqrt_scale:
+        descale_factor = descale_factor / math.sqrt(head_dim)
+    # Kernel expects scale in [b, h, n_blocks, 1] format, so permute from [b, n_blocks, h, 1]
+    # Must call contiguous() after permute so kernel's pointer arithmetic (+= 1) works correctly
+    descale_factor = descale_factor.permute(0, 2, 1, 3).contiguous()  # [b, h, n_blocks, 1]
     return x_int8, descale_factor
 
 
@@ -1349,10 +1358,12 @@ def test_attn_qk_int8_per_block(
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
 
     int8_dtype = torch.int8
-    q_fp8, q_scale = int8_per_block_quantize_bshd(q, int8_dtype, block_size=config["BLOCK_SIZE_M"])
+    # include_sqrt_scale=True for Q to include 1/sqrt(head_dim) in the descale factor
+    # This is needed because the kernel doesn't divide by sqrt(d) like standard attention
+    q_fp8, q_scale = int8_per_block_quantize_bshd(q, int8_dtype, block_size=config["BLOCK_SIZE_M"], include_sqrt_scale=True)
     k_fp8, k_scale = int8_per_block_quantize_bshd(k, int8_dtype, block_size=config["BLOCK_SIZE_N"])
 
-    triton_out, lse = attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, output_dtype=torch.bfloat16, config=config)
+    triton_out, lse = attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, tensor_layout="NHD", output_dtype=torch.bfloat16, config=config)
 
     torch_out = attention_ref(
         q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
