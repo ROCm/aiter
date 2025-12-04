@@ -63,7 +63,6 @@ def pertoken_quant(
         per_token_scale[per_token_scale == 0] = 1
 
     # quant hidden_states
-    aiter.logger.info(quant_dtype)
     per_token_scale = fp4_utils.e8m0_to_f32(fp4_utils.f32_to_e8m0(per_token_scale))
     y = torch.clamp((hidden_states / per_token_scale).to(dtype=quant_dtype), min=-8, max=7)
     y_scale = per_token_scale.to(scale_dtype)
@@ -142,13 +141,8 @@ def per_block_quant_wrapper_int4(block_shape=(1, 128)):
                 x.shape[-1] % blk_n == 0
             ), f"block size {blk_n} not match {x.shape[-1]}"
             assert blk_m == 1, "only support 1xN block, TODO: support MxN"
-            # print(x.shape)
-            # print('call here!!')
-            # print(quant_dtype)
-            # m, n = x.shape
             x = x.view(-1, blk_n)
             y, scale = per_token_quant_func(x, scale=scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
-            # return y.view(m, n), scale.view(m, n // blk_n)
             scale_shape = list(x.shape)
             scale_shape[-1] = scale_shape[-1] // blk_n
             return y.view(x.shape), scale.view(scale_shape)
