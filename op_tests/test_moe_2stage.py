@@ -66,7 +66,7 @@ def test_fmoe(
             w1[:, :, -hidden_pad:] = 0
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
-        exp_bias1 = torch.clamp(torch.zeros((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
+        exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
@@ -74,7 +74,7 @@ def test_fmoe(
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
-    exp_bias2 = torch.clamp(torch.zeros((E, model_dim), dtype=dtype), -1.0, 1.0)
+    exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
@@ -144,11 +144,6 @@ def test_fmoe(
             w1_qt_aiter = w1_qt_aiter.clone() + 8
             w2_qt_aiter = w2_qt_aiter.clone() + 8
 
-    # aiter.logger.info(f'w1_qt = {w1_qt}')
-    # aiter.logger.info(f'w1_qt_aiter = {w1_qt_aiter}')
-    # aiter.logger.info(f'w2_qt = {w2_qt}')
-    # aiter.logger.info(f'w2_qt_aiter = {w2_qt_aiter}')
-
     # Quant-ing a
     aiter.logger.info(f"quantize a qType {qType} {AQDType} {WQDType}")
     if qType == aiter.QuantType.per_128x128:
@@ -182,12 +177,6 @@ def test_fmoe(
     # pre-shuffle
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
-    aiter.logger.info(
-        f"before shuffle w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}"
-    )
-    aiter.logger.info(
-        f"before shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}"
-    )
     if (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16])
