@@ -201,11 +201,6 @@ def test_fmoe(
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
         w1_scale_aiter = w1_scale_aiter.bfloat16()
         w2_scale_aiter = w2_scale_aiter.bfloat16()
-        # aiter.logger.info(f'after shuff/le w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
-        # aiter.logger.info(f'after shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
-        # aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
-        # aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
-        # assert False, "temp stop here"
     elif WQDType == torch.int4:  # int4 w quant
         aiter.logger.info("shuffle as int4")
         w1_qt_aiter = rearrange_4bit_elements(
@@ -237,22 +232,6 @@ def test_fmoe(
     else:
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
-
-    # aiter.logger.info('w1_scale_aiter')
-    # aiter.logger.info(w1_scale_aiter)
-    # aiter.logger.info('w1_scale')
-    # aiter.logger.info(w1_scale)
-
-    # aiter.logger.info(f'w1_shape {w1.shape}')
-    # aiter.logger.info(f'w2_shape {w2.shape}')
-    # aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
-    # aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
-    # aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
-    # aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
-    # aiter.logger.info(f'w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
-    # aiter.logger.info(f'w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
-    # aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
-    # aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
 
     # # ######################## stage 1 start ###########
     out1_ref = torch_moe_stage1(
@@ -368,13 +347,13 @@ l_tokenNum = [
     163840,
 ]
 l_quant = [
-    # (aiter.QuantType.No, None, None),  # a16w16
-    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    (aiter.QuantType.No, None, None),  # a16w16
+    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4, int4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
