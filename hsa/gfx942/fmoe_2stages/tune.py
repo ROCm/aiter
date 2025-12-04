@@ -1539,6 +1539,7 @@ class FmoeTuner(TunerCommon):
             int(q_type),
             str(act_type).split(".")[-1].lower(),
             doweight_stage1,
+            False,  # bpreshuffle
         )
         _, ck_stage2_kernels = get_gemm2_kernels_list(
             dtype2str_dict[q_dtype_a],
@@ -1547,6 +1548,7 @@ class FmoeTuner(TunerCommon):
             False,
             int(q_type),
             not doweight_stage1,
+            False,  # bpreshuffle
         )
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
