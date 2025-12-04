@@ -200,5 +200,7 @@ def _get_config(
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
-
+    # TODO: use /app/aiter/aiter/ops/triton/_triton_kernels/gemm_afp4wfp4.py::_get_config as an example,
+    #       include an addtional layer of dict under _get_config._config_dict[key] where the key = f"{N}_{K}",
+    #       so that aiter/ops/triton/utils/_triton/gemm_tune_check.py::gemm_tune_check is able to check if the GEMM is tunned for a particular N, K shape
     return _get_config._config_dict["any"]
