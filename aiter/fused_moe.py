@@ -224,7 +224,7 @@ def fused_moe_(
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     if quant_type == QuantType.per_1x32:
-        if q_dtype_w == torch.uint8 or activation == activation.Swiglu
+        if q_dtype_w == torch.uint8 or activation == activation.Swiglu:
             q_dtype_a = torch.bfloat16
         else:
             q_dtype_a = dtypes.fp4x2
