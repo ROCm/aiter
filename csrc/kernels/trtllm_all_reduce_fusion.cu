@@ -352,7 +352,7 @@ __device__ __forceinline__ vec_t<QuantT, VEC_SIZE> convert_to_fp8(vec_t<T, VEC_S
     vec_t<QuantT, VEC_SIZE> out_vec;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-        volatile float out = static_cast<float>(in_vec[i]) / scale;
+        float out = static_cast<float>(in_vec[i]) / scale;
         out_vec[i] = static_cast<QuantT>(out);
     }
     return out_vec;
