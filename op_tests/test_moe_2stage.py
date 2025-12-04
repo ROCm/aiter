@@ -11,8 +11,6 @@ from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
-import os
-import numpy as np
 import logging
 
 from aiter.fused_moe import (
@@ -28,7 +26,6 @@ from aiter.ops.shuffle import (
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
 )
-from aiter import ActivationType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
@@ -52,11 +49,17 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=False,
 ):
-    if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32 and WQDType == dtypes.fp4x2:
+    if (
+        get_gfx() not in ["gfx950"]
+        and qType == aiter.QuantType.per_1x32
+        and WQDType == dtypes.fp4x2
+    ):
         return
     torch_quant = aiter.get_torch_quant(qType, dtypes.i4x2)
     input = torch.randn((token, model_dim), dtype=dtype)
-    aiter.logger.info(f'input_dim {token} model_dim {model_dim} hidden_pad {hidden_pad} intermediate_pad {intermediate_pad} use {use_g1u1}')
+    aiter.logger.info(
+        f"input_dim {token} model_dim {model_dim} hidden_pad {hidden_pad} intermediate_pad {intermediate_pad} use {use_g1u1}"
+    )
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         if hidden_pad != 0 and intermediate_pad != 0:
@@ -135,7 +138,7 @@ def test_fmoe(
         if WQDType == dtypes.fp4x2:
             w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-        else :
+        else:
             w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2])
             w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2])
             w1_qt_aiter = w1_qt_aiter.clone() + 8
@@ -147,7 +150,7 @@ def test_fmoe(
     # aiter.logger.info(f'w2_qt_aiter = {w2_qt_aiter}')
 
     # Quant-ing a
-    aiter.logger.info(f'quantize a qType {qType} {AQDType} {WQDType}')
+    aiter.logger.info(f"quantize a qType {qType} {AQDType} {WQDType}")
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
             input.view(token, -1, 128), quant_dtype=AQDType
@@ -157,7 +160,7 @@ def test_fmoe(
     elif (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16])
-        and WQDType in [ dtypes.fp4x2, dtypes.i4x2 ]
+        and WQDType in [dtypes.fp4x2, dtypes.i4x2]
     ):  # a16w4
         a1_qt = input.to(AQDType)
         a1_scale = None
@@ -179,8 +182,12 @@ def test_fmoe(
     # pre-shuffle
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
-    aiter.logger.info(f'before shuffle w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
-    aiter.logger.info(f'before shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
+    aiter.logger.info(
+        f"before shuffle w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}"
+    )
+    aiter.logger.info(
+        f"before shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}"
+    )
     if (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16])
@@ -200,7 +207,7 @@ def test_fmoe(
         # aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
         # assert False, "temp stop here"
     elif WQDType == torch.int4:  # int4 w quant
-        aiter.logger.info(f'shuffle as int4')
+        aiter.logger.info("shuffle as int4")
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
                 shuffle_weight(w1_qt_aiter, (16, 16), use_int4=True)
@@ -231,9 +238,6 @@ def test_fmoe(
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
-
-    # w1_scale_aiter = fp4_utils.f32_to_e8m0(w1_scale_aiter)
-    # w2_scale_aiter = fp4_utils.f32_to_e8m0(w2_scale_aiter)
     # aiter.logger.info('w1_scale_aiter')
     # aiter.logger.info(w1_scale_aiter)
     # aiter.logger.info('w1_scale')
@@ -297,8 +301,10 @@ def test_fmoe(
         doweight=not doweight_stage1,
     )
 
-    aiter.logger.info('ref stage 2 done')
-    aiter.logger.info(f'out2_ref {out2_ref} with info {out2_ref.shape} {out2_ref.dtype}')
+    aiter.logger.info("ref stage 2 done")
+    aiter.logger.info(
+        f"out2_ref {out2_ref} with info {out2_ref.shape} {out2_ref.dtype}"
+    )
 
     # ######################## stage 2 end ###########
     out2_ck, us2 = run_perftest(
@@ -320,7 +326,7 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
-    aiter.logger.info(f'run pertest done')
+    aiter.logger.info("run pertest done")
     err = checkAllclose(
         out2_ref,
         out2_ck,
@@ -515,7 +521,11 @@ for (
         dtypes.bf16,
         dtypes.fp4x2,
     ):
-        act_type = aiter.ActivationType.Swiglu if wq_dtype == dtypes.fp4x2 else aiter.ActivationType.Silu
+        act_type = (
+            aiter.ActivationType.Swiglu
+            if wq_dtype == dtypes.fp4x2
+            else aiter.ActivationType.Silu
+        )
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
             for m in l_tokenNum:
                 ret = test_fmoe(
