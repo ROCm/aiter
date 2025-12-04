@@ -71,7 +71,6 @@ def pertoken_quant(
 
 
 def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
-    print(x.shape)
     assert quant_dtype == dtypes.fp4x2
     block_size = 32
     F8E8M0_EXP_BIAS = 127
