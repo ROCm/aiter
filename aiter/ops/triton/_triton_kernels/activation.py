@@ -25,9 +25,11 @@ def _gelu(x):
     ALPHA = M_SQRT1_2
     return 0.5 * x * (1.0 + tl.erf(x * ALPHA))
 
+
 @triton.jit
 def _sigmoid(x):
     return tl.sigmoid(x)
+
 
 @triton.jit
 def _gelu_tanh(x):
