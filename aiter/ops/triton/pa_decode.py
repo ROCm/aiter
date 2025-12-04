@@ -48,7 +48,7 @@ def paged_attention_decode(
 ) -> None:
     """
     Paged attention decode with automatic V1/V2 dispatch and quantization support.
-    V1 for short sequences (≤8192), V2 with sequence partitioning for longer sequences.
+    V1 for short sequences (<=8192), V2 with sequence partitioning for longer sequences.
 
     Args:
         output (torch.Tensor): Pre-allocated output with shape (num_seqs, num_q_heads, head_dim).

@@ -784,10 +784,10 @@ def flash_attn_with_kvcache(
         window_size: (left, right) local attention window; (-1,-1) = full.
         softcap: (float) currently must be 0.0 (backend limitation).
         num_splits: 0 or 1 only (backend limitation >1).
-        rotary_cos/rotary_sin: Optional rotary embeddings (applied if provided) – interleaving flag unused here.
+        rotary_cos/rotary_sin: Optional rotary embeddings (applied if provided) - interleaving flag unused here.
         cache_batch_idx/cache_leftpad: Optional indexing / left padding metadata.
             block_table: Optional paging table mapping logical blocks for paged KV cache.
-        alibi_slopes: (nheads,) or (batch,nheads) bias slopes (currently ignored if provided – placeholder).
+        alibi_slopes: (nheads,) or (batch,nheads) bias slopes (currently ignored if provided - placeholder).
         rotary_interleaved: Flag kept for parity (currently forwarded as True constant to backend which ignores it).
             return_softmax_lse: If True returns (out, lse) else out.
 

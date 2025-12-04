@@ -90,7 +90,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
     const int64_t query_loc = static_cast<int64_t>(seq_idx * MTP);
     const int* block_table_seq = kv_page_indices + kv_indptr[seq_idx];
-    
+
     if constexpr (VERSION_ID == 0) // 0: GOLDEN VERSION
     {
         _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, false>
