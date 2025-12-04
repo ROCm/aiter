@@ -63,7 +63,7 @@ def pertoken_quant(
         per_token_scale[per_token_scale == 0] = 1
 
     # quant hidden_states
-    per_token_scale = fp4_utils.e8m0_to_f32(fp4_utils.f32_to_e8m0(per_token_scale))
+    # per_token_scale = fp4_utils.e8m0_to_f32(fp4_utils.f32_to_e8m0(per_token_scale))
     y = torch.clamp((hidden_states / per_token_scale).to(dtype=quant_dtype), min=(-1 * dtypeMax), max=dtypeMax)
     # aiter.logger.info(f'debug here y = {y}, dtypeMax = {dtypeMax}')
     y_scale = per_token_scale.to(scale_dtype)
