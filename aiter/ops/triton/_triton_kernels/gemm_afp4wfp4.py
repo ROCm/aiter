@@ -721,7 +721,7 @@ def _get_config(
     if not hasattr(_get_config, "_config_dict") or not hasattr(
         _get_config._config_dict, f"default{shuffle_filename_suffix}"
     ):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}.json"
         with open(fpath, "r") as file:
@@ -730,7 +730,7 @@ def _get_config(
 
     key = f"{N}_{K}{shuffle_filename_suffix}"
     if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}-N={N}-K={2*K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:
