@@ -3,7 +3,9 @@
 
 import torch
 import pytest
-from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import fused_gemm_a8w8_blockscale_split_cat
+from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
+    fused_gemm_a8w8_blockscale_split_cat,
+)
 
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
@@ -15,12 +17,7 @@ block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_device()
 
 
-def run_torch(
-    x, w, y,
-    x_scale, w_scale,
-    S1, S2, D,
-    dtype=torch.bfloat16
-):
+def run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
     block_shape_n, block_shape_k = block_shape
     m, c1 = x.shape
     n = w.shape[0]
@@ -42,19 +39,11 @@ def run_torch(
     return c1.to(dtype), c2.to(dtype)
 
 
-def run_triton(
-    x, w, y,
-    x_scale, w_scale,
-    S1, S2, D,
-    dtype=torch.bfloat16
-):
+def run_triton(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
     m = x.shape[0]
 
     return fused_gemm_a8w8_blockscale_split_cat(
-        x, w, y.expand(m, D, -1),
-        x_scale, w_scale,
-        S1, S2,
-        dtype
+        x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype
     )
 
 
@@ -63,10 +52,7 @@ e5m2_type, e4m3_type = get_fp8_dtypes()
 
 def get_shapes():
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [
-        (4864, 4096, 8192),
-        (9728, 8192, 65536)
-    ]
+    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
     x_vals += [
         (1, 1280, 8192),
         (32, 1280, 8192),
@@ -158,9 +144,7 @@ def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
         )
 
     if layout[1] == "N":
-        w = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
-            e4m3_type
-        )
+        w = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
     else:
         w = (
             (torch.rand((K, N), dtype=torch.float16, device="cuda") / 10)
@@ -200,9 +184,7 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout):
             " infinite hang when EVEN_K is false. Try seeing if it's fixed if it's been a while."
         )
     if N % D != 0:
-        pytest.skip(
-            "N must be divisible by D as N = D * (S1 + S2)"
-        )
+        pytest.skip("N must be divisible by D as N = D * (S1 + S2)")
 
     # deconstruct N
     S = N // D
