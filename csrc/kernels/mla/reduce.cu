@@ -25,6 +25,7 @@ struct MlaReduceKernelV1Traits
     static constexpr int32_t kMaxVgprLocalLse    = 16;             // scratch buffer will be used with larger value
     static constexpr bool    kOutputLse          = kOutputLse_;
     static constexpr int32_t kNumThreadGroupPerSeq = kNumThreadGroupPerSeq_;
+    static constexpr int32_t kMassiveThreshold   = 4;              // use massive pipeline if #splits >= this value
     // There is no reduce final map. In this case, qo len is uniform and
     // implicitly set by reduce_partial_map[1] - reduce_partial_map[0].
     static constexpr bool    kOmitReduceFinalMap = kOmitReduceFinalMap_;
@@ -137,7 +138,7 @@ private:
 };
 
 template <typename Traits, typename LocalLse, typename lse_t>
-CK_TILE_DEVICE void reduce_lse(
+CK_TILE_DEVICE void reduce_lse_massive(
     const MlaReduceKernelV1Params& params,
     const int32_t                  seq_idx,
     const int32_t                  reduce_tile_start,
@@ -263,7 +264,7 @@ CK_TILE_DEVICE void reduce_lse(
 }
 
 template <typename Traits, typename out_t>
-CK_TILE_DEVICE void reduce_output(
+CK_TILE_DEVICE void reduce_output_massive(
     const MlaReduceKernelV1Params& params,
     const int32_t                  seq_idx,
     const int32_t                  reduce_tile_start,
@@ -310,7 +311,7 @@ CK_TILE_DEVICE void reduce_output(
 }
 
 template <typename Traits, typename lse_t, typename out_t>
-CK_TILE_DEVICE void mla_reduce_v1_impl(
+CK_TILE_DEVICE void mla_reduce_v1_impl_massive(
     const MlaReduceKernelV1Params& params,
     const int32_t                  head_idx,
     const int32_t                  block_idx,
@@ -319,78 +320,168 @@ CK_TILE_DEVICE void mla_reduce_v1_impl(
     const int32_t                  reduce_tile_end,
     float*                         p_lds_lse_scale)
 {
-    // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata should be in charge of
-    // getting rid of this kind of scenaro.
-    if (reduce_tile_start + 1 < reduce_tile_end)
+    const int32_t reduce_partial_map_0 = params.p_reduce_partial_map[reduce_tile_start];
+    const int32_t reduce_partial_map_1 = params.p_reduce_partial_map[reduce_tile_start + 1];
+    const MlaPartialTileInfo final_loc = [&]()
     {
-        const int32_t reduce_partial_map_0 = params.p_reduce_partial_map[reduce_tile_start];
-        const int32_t reduce_partial_map_1 = params.p_reduce_partial_map[reduce_tile_start + 1];
-        const MlaPartialTileInfo final_loc = [&]()
+        if constexpr (Traits::kOmitReduceFinalMap)
         {
-            if constexpr (Traits::kOmitReduceFinalMap)
-            {
-                const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
-                return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
-            }
-            else
-            {
-                return params.p_reduce_final_map[tile_idx];
-            }
-        }();
-
-        // Assuming that the layout of LSE final output is in [bs, h].
-        // Thus, stride of head is 1 and stride of b/s is #heads.
-        lse_t* p_final_lse_base = reinterpret_cast<lse_t*>(params.p_final_lse) + head_idx;
-        const float* p_partial_lse_base =
-            reinterpret_cast<const float*>(params.p_partial_lse) + head_idx;
-
-        // Assuming that the layout of partial output is in [bs, h, d].
-        // Thus, stride of hidden dim is 1, head is Traits::kSizeDV and b/s is Traits::kSizeDV * #heads
-        // while the strides are 1, params.stride_h_o and params.stride_s_o for final output.
-        out_t* p_final_out_base = reinterpret_cast<out_t*>(params.p_final_output) + head_idx * params.stride_h_o;
-        const float* p_partial_output_base =
-            reinterpret_cast<float*>(params.p_partial_output) + head_idx * Traits::kSizeDV;
-
-        static_assert((ck_tile::get_warp_size() & (ck_tile::get_warp_size() - 1)) == 0);
-        const int32_t num_lse_per_thr =
-            integer_divide_ceil_power2(
-                params.max_splits, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
-
-        for (int32_t seq_idx = final_loc.q_start + block_idx; seq_idx < final_loc.q_end; seq_idx += Traits::kNumThreadGroupPerSeq)
+            const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
+            return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
+        }
+        else
         {
-            const int32_t local_seqlen_idx = seq_idx - final_loc.q_start;
-            const float* p_partial_lse_seq_base = p_partial_lse_base + local_seqlen_idx * Traits::kNumHeadQ;
-            const float* p_partial_output_seq_base =
-                p_partial_output_base + local_seqlen_idx * Traits::kNumHeadQ * Traits::kSizeDV;
+            return params.p_reduce_final_map[tile_idx];
+        }
+    }();
 
-            float* p_local_lse = p_lds_lse_scale + params.max_splits;
-            LocalLseLds<float> local_lse(p_local_lse, ck_tile::get_warp_size(), ck_tile::get_lane_id());
-            reduce_lse<Traits>(
-                params,
-                seq_idx,
-                reduce_tile_start,
-                reduce_tile_end,
-                reduce_partial_map_0,
-                reduce_partial_map_1,
-                num_lse_per_thr,
-                p_partial_lse_seq_base,
-                local_lse,
-                p_lds_lse_scale,
-                p_final_lse_base);
+    // Assuming that the layout of LSE final output is in [bs, h].
+    // Thus, stride of head is 1 and stride of b/s is #heads.
+    lse_t* p_final_lse_base = reinterpret_cast<lse_t*>(params.p_final_lse) + head_idx;
+    const float* p_partial_lse_base =
+        reinterpret_cast<const float*>(params.p_partial_lse) + head_idx;
 
-            __builtin_amdgcn_sched_barrier(0);
-            ck_tile::block_sync_lds();
+    // Assuming that the layout of partial output is in [bs, h, d].
+    // Thus, stride of hidden dim is 1, head is Traits::kSizeDV and b/s is Traits::kSizeDV * #heads
+    // while the strides are 1, params.stride_h_o and params.stride_s_o for final output.
+    out_t* p_final_out_base = reinterpret_cast<out_t*>(params.p_final_output) + head_idx * params.stride_h_o;
+    const float* p_partial_output_base =
+        reinterpret_cast<float*>(params.p_partial_output) + head_idx * Traits::kSizeDV;
 
-            reduce_output<Traits>(
-                params,
-                seq_idx,
-                reduce_tile_start,
-                reduce_tile_end,
-                reduce_partial_map_0,
-                reduce_partial_map_1,
-                p_lds_lse_scale,
-                p_partial_output_seq_base,
-                p_final_out_base);
+    static_assert((ck_tile::get_warp_size() & (ck_tile::get_warp_size() - 1)) == 0);
+    const int32_t num_lse_per_thr =
+        integer_divide_ceil_power2(
+            params.max_splits, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
+
+    for (int32_t seq_idx = final_loc.q_start + block_idx; seq_idx < final_loc.q_end; seq_idx += Traits::kNumThreadGroupPerSeq)
+    {
+        const int32_t local_seqlen_idx = seq_idx - final_loc.q_start;
+        const float* p_partial_lse_seq_base = p_partial_lse_base + local_seqlen_idx * Traits::kNumHeadQ;
+        const float* p_partial_output_seq_base =
+            p_partial_output_base + local_seqlen_idx * Traits::kNumHeadQ * Traits::kSizeDV;
+
+        float* p_local_lse = p_lds_lse_scale + params.max_splits;
+        LocalLseLds<float> local_lse(p_local_lse, ck_tile::get_warp_size(), ck_tile::get_lane_id());
+        reduce_lse_massive<Traits>(
+            params,
+            seq_idx,
+            reduce_tile_start,
+            reduce_tile_end,
+            reduce_partial_map_0,
+            reduce_partial_map_1,
+            num_lse_per_thr,
+            p_partial_lse_seq_base,
+            local_lse,
+            p_lds_lse_scale,
+            p_final_lse_base);
+
+        __builtin_amdgcn_sched_barrier(0);
+        ck_tile::block_sync_lds();
+
+        reduce_output_massive<Traits>(
+            params,
+            seq_idx,
+            reduce_tile_start,
+            reduce_tile_end,
+            reduce_partial_map_0,
+            reduce_partial_map_1,
+            p_lds_lse_scale,
+            p_partial_output_seq_base,
+            p_final_out_base);
+    }
+}
+
+template <typename Traits, typename lse_t, typename out_t>
+CK_TILE_DEVICE void mla_reduce_v1_impl_simple(
+    const MlaReduceKernelV1Params& params,
+    const int32_t                  head_idx,
+    const int32_t                  block_idx,
+    const int32_t                  tile_idx,
+    const int32_t                  reduce_tile_start,
+    const int32_t                  reduce_tile_end)
+{
+    const int32_t reduce_partial_map_0 = params.p_reduce_partial_map[reduce_tile_start];
+    const int32_t reduce_partial_map_1 = params.p_reduce_partial_map[reduce_tile_start + 1];
+    const MlaPartialTileInfo final_loc = [&]()
+    {
+        if constexpr (Traits::kOmitReduceFinalMap)
+        {
+            const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
+            return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
+        }
+        else
+        {
+            return params.p_reduce_final_map[tile_idx];
+        }
+    }();
+
+    // Assuming that the layout of LSE final output is in [bs, h].
+    // Thus, stride of head is 1 and stride of b/s is #heads.
+    lse_t* p_final_lse_base = reinterpret_cast<lse_t*>(params.p_final_lse) + head_idx;
+    const float* p_partial_lse_base =
+        reinterpret_cast<const float*>(params.p_partial_lse) + head_idx;
+
+    // Assuming that the layout of partial output is in [bs, h, d].
+    // Thus, stride of hidden dim is 1, head is Traits::kSizeDV and b/s is Traits::kSizeDV * #heads
+    // while the strides are 1, params.stride_h_o and params.stride_s_o for final output.
+    out_t* p_final_out_base = reinterpret_cast<out_t*>(params.p_final_output) + head_idx * params.stride_h_o;
+    const float* p_partial_output_base =
+        reinterpret_cast<float*>(params.p_partial_output) + head_idx * Traits::kSizeDV;
+
+    auto oaccu_window = ck_tile::make_tile_window(MakeTileWindow<Traits, const float>(nullptr),
+                                                    MakeOutputTileDistribution<Traits, const float>());
+
+    for (int32_t seq_idx = final_loc.q_start + block_idx; seq_idx < final_loc.q_end; seq_idx += Traits::kNumThreadGroupPerSeq)
+    {
+        const int32_t local_seqlen_idx = seq_idx - final_loc.q_start;
+        const float* p_partial_lse_seq_base = p_partial_lse_base + local_seqlen_idx * Traits::kNumHeadQ;
+        const float* p_partial_output_seq_base =
+            p_partial_output_base + local_seqlen_idx * Traits::kNumHeadQ * Traits::kSizeDV;
+        out_t* p_final_out = p_final_out_base + seq_idx * params.stride_s_o;
+
+        const int64_t reduce_tile_pos_lse_start =
+            params.p_reduce_partial_map[reduce_tile_start] * int64_t(Traits::kNumHeadQ);
+        const int64_t reduce_tile_pos_out_start = reduce_tile_pos_lse_start * Traits::kSizeDV;
+
+        oaccu_window.set_bottom_tensor_view_data_ptr(p_partial_output_seq_base + reduce_tile_pos_out_start);
+        auto reg_out = ck_tile::load_tile(oaccu_window);
+        const float lse = p_partial_lse_seq_base[reduce_tile_pos_lse_start];
+        float max_lse = lse;
+        float sum_e_lse = 1.0f;
+
+        for (int32_t tile_idx = reduce_tile_start + 1; tile_idx < reduce_tile_end; ++tile_idx)
+        {
+            const int64_t reduce_tile_pos_lse = params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ);
+            const int64_t reduce_tile_pos_out = reduce_tile_pos_lse * Traits::kSizeDV;
+
+            oaccu_window.set_bottom_tensor_view_data_ptr(p_partial_output_seq_base + reduce_tile_pos_out);
+            auto oaccu = ck_tile::load_tile(oaccu_window);
+
+            const float lse = p_partial_lse_seq_base[reduce_tile_pos_lse];
+            const float new_max_lse = ck_tile::max(max_lse, lse);
+            const float old_scale = expf(max_lse - new_max_lse);
+            const float new_scale = expf(lse - new_max_lse);
+
+            ck_tile::sweep_tile(oaccu, [&](auto idx) {
+                reg_out(idx) = old_scale * reg_out(idx) + new_scale * oaccu(idx);
+            });
+
+            max_lse = new_max_lse;
+            sum_e_lse = sum_e_lse * old_scale + new_scale;
+        }
+
+        reg_out = ck_tile::tile_elementwise_in(
+            [&](const auto& elem) { return elem / sum_e_lse; },
+            reg_out);
+
+        auto dram_out = MakeTileWindow<Traits, out_t>(p_final_out);
+        ck_tile::store_tile(dram_out, ck_tile::cast_tile<out_t>(reg_out));
+
+        if constexpr(Traits::kOutputLse)
+        {
+            const float final_lse =
+                ((sum_e_lse == 0.f) || (sum_e_lse != sum_e_lse)) ? INFINITY : (logf(sum_e_lse) + max_lse);
+            p_final_lse_base[seq_idx * Traits::kNumHeadQ] = ck_tile::type_convert<lse_t>(final_lse);
         }
     }
 }
@@ -419,8 +510,19 @@ __global__ void kn_mla_reduce_v1_ps(
             break;
         }
 
-        mla_reduce_v1_impl<Traits, lse_t, out_t>(
-            params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds_lse_scale);
+        const int32_t num_splits = reduce_tile_end - reduce_tile_start;
+        if (num_splits >= Traits::kMassiveThreshold)
+        {
+            mla_reduce_v1_impl_massive<Traits, lse_t, out_t>(
+                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds_lse_scale);
+        }
+        // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata should be in
+        // charge of getting rid of this kind of scenaro.
+        else if (num_splits > 1)
+        {
+            mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
+                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end);
+        }
     }
 }
 
@@ -438,8 +540,19 @@ __global__ void kn_mla_reduce_v1(
     const int32_t reduce_tile_start = params.p_reduce_indptr[tile_idx];
     const int32_t reduce_tile_end = params.p_reduce_indptr[tile_idx + 1];
 
-    mla_reduce_v1_impl<Traits, lse_t, out_t>(
-        params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds_lse_scale);
+    const int32_t num_splits = reduce_tile_end - reduce_tile_start;
+    if (num_splits >= Traits::kMassiveThreshold)
+    {
+        mla_reduce_v1_impl_massive<Traits, lse_t, out_t>(
+            params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds_lse_scale);
+    }
+    // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata should be in charge
+    // of getting rid of this kind of scenaro.
+    else if (num_splits > 1)
+    {
+        mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
+            params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end);
+    }
 }
 
 #define MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NUM_WG_PER_SEQ_C, NAME, ...)     \
@@ -465,13 +578,9 @@ __global__ void kn_mla_reduce_v1(
     {                                                                                                       \
         MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 4, NAME, __VA_ARGS__)            \
     }                                                                                                       \
-    else if ((NUM_WG_PER_SEQ) == 32)                                                                        \
+    else if ((NUM_WG_PER_SEQ) == 64)                                                                        \
     {                                                                                                       \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 32, NAME, __VA_ARGS__)           \
-    }                                                                                                       \
-    else if ((NUM_WG_PER_SEQ) == 128)                                                                       \
-    {                                                                                                       \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 128, NAME, __VA_ARGS__)          \
+        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 64, NAME, __VA_ARGS__)           \
     }                                                                                                       \
     else if ((NUM_WG_PER_SEQ) == 256)                                                                       \
     {                                                                                                       \
@@ -646,7 +755,7 @@ int32_t get_num_work_group_per_seq(
     if ((num_cu * factor) > num_reduce_tile)
     {
         // WARNING: Please make sure that the content in this array must correspond to MLA_REDUCE_CASE().
-        static constexpr int32_t kSupportedNum[] = { 1, 2, 4, 32, 128, 256 };
+        static constexpr int32_t kSupportedNum[] = { 1, 2, 4, 64, 256 };
         static constexpr int32_t kLastSupported = kSupportedNum[sizeof(kSupportedNum) / sizeof(int32_t) - 1];
 
         const int32_t wg_per_seq_hw = ck_tile::integer_divide_ceil(num_cu * factor, num_reduce_tile);
