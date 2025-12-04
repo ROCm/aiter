@@ -688,7 +688,8 @@ def get_2stage_cfgs(
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        # and activation == ActivationType.Swiglu
+        and q_dtype_w in [dtypes.fp4x2, torch.uint8]
     ):
         return MOEMetadata(
             functools.partial(
@@ -814,11 +815,12 @@ def fused_moe_2stages(
         bias1,
         bias2,
     )
+
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
-        and w1.dtype == dtypes.fp4x2
-        and activation == ActivationType.Swiglu
+        and w1.dtype in [dtypes.fp4x2, torch.uint8]
+        # and activation == ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
@@ -892,8 +894,8 @@ def fused_moe_2stages(
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
-        and w1.dtype == dtypes.fp4x2
-        and activation == ActivationType.Swiglu
+        and w1.dtype in [dtypes.fp4x2, torch.uint8]
+        # and activation == ActivationType.Swiglu
     ):
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
@@ -942,6 +944,7 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    sorted_weights_value = sorted_weights if not doweight_stage1 else None
     metadata.stage2(
         a2,
         w1,
@@ -1127,7 +1130,7 @@ def torch_moe_stage1(
     topk = topk_weight.shape[1]
     N = w1.shape[1]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_1x32:
+    if quant_type == QuantType.per_1x32 and w1.dtype == dtypes.fp4x2:
         from aiter.utility import fp4_utils
 
         w1 = fp4_utils.mxfp4_to_f32(w1)
@@ -1141,7 +1144,6 @@ def torch_moe_stage1(
     else:
         hidden_states = hidden_states.to(ctype)
         w1 = w1.to(ctype)
-
     if quant_type in [QuantType.per_Token, QuantType.per_Tensor]:
         w1 = w1 * w1_scale.view(w1_scale.shape[0], -1, 1)
         hidden_states = hidden_states * a1_scale
@@ -1198,7 +1200,11 @@ def torch_moe_stage1(
             if w1_bias is not None:
                 out[mask] = out[mask] + w1_bias[E_id].view(1, -1)
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
-    use_swiglu = (a1_scale is None) and (quant_type == QuantType.per_1x32)
+    use_swiglu = (
+        (a1_scale is None)
+        and (quant_type == QuantType.per_1x32)
+        and w1.dtype == dtypes.fp4x2
+    )
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
@@ -1226,7 +1232,7 @@ def torch_moe_stage2(
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_1x32:
+    if quant_type == QuantType.per_1x32 and w2.dtype == dtypes.fp4x2:
         from aiter.utility import fp4_utils
 
         w2 = fp4_utils.mxfp4_to_f32(w2)
