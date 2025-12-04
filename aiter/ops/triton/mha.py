@@ -21,6 +21,10 @@ _USE_FUSED_BWD_KERNEL = False
 
 
 def mha_set_use_fused_bwd_kernel(value: bool):
+    """
+    Set whether to use fused backward kernel (with atomics) or one-kernel backward (without atomics).
+    Fused backward is faster but doesn't support positional encoding.
+    """
     global _USE_FUSED_BWD_KERNEL
     _USE_FUSED_BWD_KERNEL = value
 
@@ -45,7 +49,7 @@ def _flash_attn_forward(
     window_size_right: int,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
-    return_lse: bool,
+    return_lse: bool,  # Not used
     return_softmax: bool,
     max_seqlen_q: int,
     max_seqlen_k: int,
@@ -780,10 +784,10 @@ def flash_attn_with_kvcache(
         window_size: (left, right) local attention window; (-1,-1) = full.
         softcap: (float) currently must be 0.0 (backend limitation).
         num_splits: 0 or 1 only (backend limitation >1).
-        rotary_cos/rotary_sin: Optional rotary embeddings (applied if provided) – interleaving flag unused here.
+        rotary_cos/rotary_sin: Optional rotary embeddings (applied if provided) - interleaving flag unused here.
         cache_batch_idx/cache_leftpad: Optional indexing / left padding metadata.
             block_table: Optional paging table mapping logical blocks for paged KV cache.
-        alibi_slopes: (nheads,) or (batch,nheads) bias slopes (currently ignored if provided – placeholder).
+        alibi_slopes: (nheads,) or (batch,nheads) bias slopes (currently ignored if provided - placeholder).
         rotary_interleaved: Flag kept for parity (currently forwarded as True constant to backend which ignores it).
             return_softmax_lse: If True returns (out, lse) else out.
 

@@ -19,6 +19,16 @@
 #include "ck_tile/ops/flatmm.hpp"
 #include "ck_tile/ops/gemm.hpp"
 #include "deepgemm.h"
+#include "flatmm_basic.hpp"
+template <class scaleM = ck_tile::FlatmmScalePointer<-1>,
+          class scaleN = ck_tile::FlatmmScalePointer<-1>>
+using m_grouped_flatmm_args = ck_tile::MaskedGroupedFlatmmHostArgs<scaleM, scaleN>;
+using ck_stream_config      = ck_tile::stream_config;
+using row_major             = ck_tile::tensor_layout::gemm::RowMajor;
+using col_major             = ck_tile::tensor_layout::gemm::ColumnMajor;
+using bf16                  = ck_tile::bf16_t;
+using fp16                  = ck_tile::half_t;
+using fp8                   = ck_tile::fp8_t;
 
 template <typename DataType,
           int M_Tile_,
