@@ -54,9 +54,8 @@ def test_fmoe(
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         # return
         pass
-    torch_quant = aiter.get_torch_quant(qType)
-    input = torch.ones((token, model_dim), dtype=dtype)
-    # input = torch.ones((token, model_dim), dtype=dtype)
+    torch_quant = aiter.get_torch_quant(qType, dtypes.i4x2)
+    input = torch.randn((token, model_dim), dtype=dtype)
     aiter.logger.info(f'input_dim {token} model_dim {model_dim} hidden_pad {hidden_pad} intermediate_pad {intermediate_pad} use {use_g1u1}')
     if use_g1u1:
         w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype)
