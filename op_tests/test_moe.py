@@ -118,6 +118,7 @@ def test_fmoe(
     shared_E=0,
     activation=ActivationType.Silu,
 ):
+    torch.cuda.empty_cache()
     quantAlgoId = quant_algo.index(quant)
     if quantAlgoId not in [0, 3] and not use_g1u1:
         print("g1u0 only could test no quant and int8smoothquant")
