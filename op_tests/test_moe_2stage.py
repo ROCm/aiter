@@ -113,7 +113,7 @@ def test_fmoe(
 
         w1_qt, w1_scale = weight_per_128x128_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = weight_per_128x128_quant(w2, quant_dtype=WQDType)
-    else:
+    elif qType == aiter.QuantType.per_1x32:
         if WQDType == dtypes.fp4x2:
             w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
             w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
@@ -124,9 +124,9 @@ def test_fmoe(
             w2_qt = w2_qt.view(*w2.shape[:-1], -1)
             w1_scale = w1_scale.view(w1.shape[0] * w1.shape[1], -1)
             w2_scale = w2_scale.view(w2.shape[0] * w2.shape[1], -1)
-            w1_scale_aiter = w1_scale.bfloat16()
-            w2_scale_aiter = w1_scale.bfloat16()
-
+    else:
+        w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
+        w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
@@ -140,11 +140,11 @@ def test_fmoe(
             w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2])
             w1_qt_aiter = w1_qt_aiter.clone() + 8
             w2_qt_aiter = w2_qt_aiter.clone() + 8
-    
-    aiter.logger.info(f'w1_qt = {w1_qt}')
-    aiter.logger.info(f'w1_qt_aiter = {w1_qt_aiter}')
-    aiter.logger.info(f'w2_qt = {w2_qt}')
-    aiter.logger.info(f'w2_qt_aiter = {w2_qt_aiter}')
+
+    # aiter.logger.info(f'w1_qt = {w1_qt}')
+    # aiter.logger.info(f'w1_qt_aiter = {w1_qt_aiter}')
+    # aiter.logger.info(f'w2_qt = {w2_qt}')
+    # aiter.logger.info(f'w2_qt_aiter = {w2_qt_aiter}')
 
     # Quant-ing a
     aiter.logger.info(f'quantize a qType {qType} {AQDType} {WQDType}')
@@ -181,22 +181,23 @@ def test_fmoe(
     w2_scale_aiter = w2_scale
     aiter.logger.info(f'before shuffle w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
     aiter.logger.info(f'before shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
-    if True:
-        # w1_qt_aiter = rearrange_4bit_elements(w1_qt_aiter)
-        # w2_qt_aiter = rearrange_4bit_elements(w2_qt_aiter)
-        # assuming tensor with shape (s0, s1, s2) with uint8, pack 2uint8 into one uint8, and ignore high 4bits
-        w1_qt_aiter = convert_int8_to_uint32_int4_hack(w1_qt_aiter)
-        w2_qt_aiter = convert_int8_to_uint32_int4_hack(w2_qt_aiter)
-        aiter.logger.info(f'after pack w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
-        aiter.logger.info(f'after pack w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
+    if (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (WQDType == dtypes.i4x2)
+    ):
+        w1_qt_aiter = convert_int8_to_uint32_int4(w1_qt_aiter).view(torch.uint8)
+        w2_qt_aiter = convert_int8_to_uint32_int4(w2_qt_aiter).view(torch.uint8)
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
-        aiter.logger.info(f'after shuff/le w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
-        aiter.logger.info(f'after shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
-        aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
-        aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
+        w1_scale_aiter = w1_scale_aiter.bfloat16()
+        w2_scale_aiter = w2_scale_aiter.bfloat16()
+        # aiter.logger.info(f'after shuff/le w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
+        # aiter.logger.info(f'after shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
+        # aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
+        # aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
         # assert False, "temp stop here"
     elif WQDType == torch.int4:  # int4 w quant
         aiter.logger.info(f'shuffle as int4')
@@ -233,24 +234,22 @@ def test_fmoe(
 
     # w1_scale_aiter = fp4_utils.f32_to_e8m0(w1_scale_aiter)
     # w2_scale_aiter = fp4_utils.f32_to_e8m0(w2_scale_aiter)
-    w1_scale_aiter = w1_scale_aiter.bfloat16()
-    w2_scale_aiter = w2_scale_aiter.bfloat16()
-    aiter.logger.info('w1_scale_aiter')
-    aiter.logger.info(w1_scale_aiter)
-    aiter.logger.info('w1_scale')
-    aiter.logger.info(w1_scale)
+    # aiter.logger.info('w1_scale_aiter')
+    # aiter.logger.info(w1_scale_aiter)
+    # aiter.logger.info('w1_scale')
+    # aiter.logger.info(w1_scale)
 
-    aiter.logger.info(f'w1_shape {w1.shape}')
-    aiter.logger.info(f'w2_shape {w2.shape}')
-    aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
-    aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
-    aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
-    aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
-    aiter.logger.info(f'w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
-    aiter.logger.info(f'w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
-    aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
-    aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
-    
+    # aiter.logger.info(f'w1_shape {w1.shape}')
+    # aiter.logger.info(f'w2_shape {w2.shape}')
+    # aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
+    # aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
+    # aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
+    # aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
+    # aiter.logger.info(f'w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
+    # aiter.logger.info(f'w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
+    # aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
+    # aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
+
     # # ######################## stage 1 start ###########
     out1_ref = torch_moe_stage1(
         a1_qt,
@@ -259,18 +258,13 @@ def test_fmoe(
         topk_weights,
         topk_ids,
         dtype=dtype,
-        activation=aiter.ActivationType.Silu,
+        activation=actType,
         quant_type=qType,
         a1_scale=a1_scale,
         w1_scale=w1_scale,
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
     )
-    
-    aiter.logger.info('ref stage 1 done')
-    aiter.logger.info(f'out1_ref {out1_ref} with info {out1_ref.shape} {out1_ref.dtype}')
-    
-
 
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_128x128:
@@ -302,7 +296,7 @@ def test_fmoe(
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
     )
-    
+
     aiter.logger.info('ref stage 2 done')
     aiter.logger.info(f'out2_ref {out2_ref} with info {out2_ref.shape} {out2_ref.dtype}')
 
@@ -323,8 +317,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
-        num_iters=1,
-        num_warmup=0,
+        num_iters=5,
+        num_warmup=2,
     )
     aiter.logger.info(f'run pertest done')
     err = checkAllclose(
@@ -372,16 +366,14 @@ l_quant = [
     # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
     # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
     # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
+    (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4, int4
 ]
-# l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
-l_act = [aiter.ActivationType.Swiglu]
+l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
-# l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
-l_hidden_intermediate_pad = [(0, 0)]
+l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
 l_preshuffle = [False, True]
 
 
