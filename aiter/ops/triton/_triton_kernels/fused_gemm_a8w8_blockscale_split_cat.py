@@ -177,7 +177,7 @@ def _fused_gemm_a8w8_blockscale_split_cat(
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
-        c = accumulator.to(c1_ptr.type.element_ty) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        c = accumulator.to(c1_ptr.type.element_ty)  # [BLOCK_SIZE_M, BLOCK_SIZE_N]
 
         if NUM_KSPLIT == 1:
             offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -193,16 +193,14 @@ def _fused_gemm_a8w8_blockscale_split_cat(
                 + stride_c1_n * offs_s[None, :]
             )
             c1_mask = (
-                (offs_m[:, None] < M)
-                & (offs_d[None, :] < D)
-                & (offs_s[None, :] < S1)
+                (offs_m[:, None] < M) & (offs_d[None, :] < D) & (offs_s[None, :] < S1)
             )
             tl.store(c1_ptrs, c, mask=c1_mask)
 
             # Write back the block of the output matrix C2 with masks.
             c2_ptrs = (
                 c2_ptr
-                + stride_c2_m * offs_m[:, None] 
+                + stride_c2_m * offs_m[:, None]
                 + stride_c2_d * offs_d[None, :]
                 + stride_c2_s * (offs_s[None, :] - S1)
             )
@@ -227,9 +225,7 @@ def _fused_gemm_a8w8_blockscale_split_cat(
                 + stride_y_s * offs_s[None, :]
             )
             y_mask = (
-                (offs_m[:, None] < M)
-                & (offs_d[None, :] < D)
-                & (offs_s[None, :] < S3)
+                (offs_m[:, None] < M) & (offs_d[None, :] < D) & (offs_s[None, :] < S3)
             )
             y = tl.load(y_ptrs, mask=y_mask)
 
@@ -334,17 +330,13 @@ def _fused_gemm_a8w8_blockscale_split_cat_reduce(
         + stride_c1_d * offs_d[None, :]
         + stride_c1_s * offs_s[None, :]
     )
-    c1_mask = (
-        (offs_m[:, None] < M)
-        & (offs_d[None, :] < D)
-        & (offs_s[None, :] < S1)
-    )
+    c1_mask = (offs_m[:, None] < M) & (offs_d[None, :] < D) & (offs_s[None, :] < S1)
     tl.store(c1_ptrs, c, mask=c1_mask)
 
     # store c to output matrix c2
     c2_ptrs = (
         c2_ptr
-        + stride_c2_m * offs_m[:, None] 
+        + stride_c2_m * offs_m[:, None]
         + stride_c2_d * offs_d[None, :]
         + stride_c2_s * (offs_s[None, :] - S1)
     )
@@ -368,11 +360,7 @@ def _fused_gemm_a8w8_blockscale_split_cat_reduce(
         + stride_y_d * offs_d[None, :]
         + stride_y_s * offs_s[None, :]
     )
-    y_mask = (
-        (offs_m[:, None] < M)
-        & (offs_d[None, :] < D)
-        & (offs_s[None, :] < S3)
-    )
+    y_mask = (offs_m[:, None] < M) & (offs_d[None, :] < D) & (offs_s[None, :] < S3)
     y = tl.load(y_ptrs, mask=y_mask)
 
     # concat y to c1
