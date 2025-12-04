@@ -178,11 +178,15 @@ class IrisCommContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Clean up when exiting context manager.
-        Used by: Python's with statement (automatically called)
-        with IrisCommContext(...) as ctx:
-          pass
-        # __exit__() is called here automatically
+        """
+        Clean up when exiting context manager.
+
+        Used by Python's with statement (automatically called).
+
+        Example:
+            with IrisCommContext(...) as ctx:
+                pass
+            # __exit__() is called here automatically
         """
         # Iris context cleanup is handled automatically
         pass
