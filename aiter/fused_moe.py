@@ -223,7 +223,7 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
+    # q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -688,7 +688,7 @@ def get_2stage_cfgs(
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        # and activation == ActivationType.Swiglu
+        and q_dtype_a != dtypes.fp4x2
         and q_dtype_w in [dtypes.fp4x2, torch.uint8]
     ):
         return MOEMetadata(
@@ -820,7 +820,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype in [dtypes.fp4x2, torch.uint8]
-        # and activation == ActivationType.Swiglu
+        and q_dtype_a != dtypes.fp4x2
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
@@ -895,7 +895,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype in [dtypes.fp4x2, torch.uint8]
-        # and activation == ActivationType.Swiglu
+        and a1.dtypes != dtypes.fp4x2
     ):
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
