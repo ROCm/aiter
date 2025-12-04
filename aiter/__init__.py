@@ -93,4 +93,3 @@ try:
 except ImportError:
     # Iris not available, skip import
     IRIS_COMM_AVAILABLE = False
-    pass
