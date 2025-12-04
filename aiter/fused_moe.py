@@ -1137,8 +1137,7 @@ def torch_moe_stage1(
     topk = topk_weight.shape[1]
     N = w1.shape[1]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    # if quant_type == QuantType.per_1x32:
-    if False:
+    if quant_type == QuantType.per_1x32 and w1.dtype = dtypes.fp4x2:
         from aiter.utility import fp4_utils
 
         w1 = fp4_utils.mxfp4_to_f32(w1)
