@@ -220,7 +220,8 @@ class AITER_CONFIG(object):
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
-            keys = untunedf.columns
+            keys = untunedf.columns.to_list()
+            keys.append("cu_num")
             merge_df = (
                 merge_df.sort_values("us")
                 .drop_duplicates(subset=keys, keep="first")
@@ -295,12 +296,19 @@ if find_aiter is not None:
 
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
-    # install mode
     else:
         AITER_META_DIR = os.path.abspath(f"{AITER_ROOT_DIR}/aiter_meta/")
 else:
     AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
+
+# honor environment override and fallback if missing
+env_meta = os.environ.get("AITER_META_DIR")
+if env_meta:
+    AITER_META_DIR = os.path.abspath(env_meta)
+if not os.path.exists(os.path.join(AITER_META_DIR, "csrc")):
+    AITER_META_DIR = AITER_ROOT_DIR
+
 sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
@@ -356,6 +364,13 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1103",
+        "gfx1150",
+        "gfx1151",
+        "gfx1152",
+        "gfx1153",
         "gfx950",
     ]
 
