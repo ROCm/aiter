@@ -227,7 +227,6 @@ template torch::Tensor
             ).write_text(intsance)
 
         if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
-            # fill_template(k.name, self.ab_dtype, "pk_int4", self.acc_dtype, self.c_dtype)
             for _ in ["pk_int4", "pk_fp4"]:
                 fill_template(k.name, self.ab_dtype, _, self.acc_dtype, self.c_dtype)
         else:
@@ -564,7 +563,6 @@ if __name__ == "__main__":
         act_type,
         False,
     )
-    print(gemm1_kernel_list)
     tag, gemm2_kernel_list = get_gemm2_kernels_list(
         a_type,
         b_type,
@@ -572,8 +570,6 @@ if __name__ == "__main__":
         "",
         True,
     )
-    print(gemm2_kernel_list)
-    print(tag)
     # merge gemm1/gemm2 dict with key = {stage, key}
     kernel_dict_merge = {
         **{(1, key): value for key, value in gemm1_kernel_list.items()},
