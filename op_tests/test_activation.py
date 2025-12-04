@@ -41,6 +41,8 @@ def test_scaled_silu_and_mul(m, n, dtype):
     err = checkAllclose(ref.to(torch.float), out.to(torch.float))
     ret["us"] = us_aiter
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
+    ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
     ret["err"] = err
     return ret
 
@@ -63,6 +65,8 @@ def test_silu_and_mul(m, n, dtype):
     err = checkAllclose(ref, out)
     ret["us"] = us_aiter
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
+    ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
     ret["err"] = err
     return ret
 
