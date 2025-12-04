@@ -323,7 +323,7 @@ def get_default_config_moe_e2e(persistent: bool) -> Dict[str, int]:
 def quantize_fp8(
     tensor: torch.Tensor, dim=()
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dev = arch_info.get_device()
+    dev = arch_info.get_arch()
     if dev == "gfx950":
         fp8_type = torch.float8_e4m3fn
     else:

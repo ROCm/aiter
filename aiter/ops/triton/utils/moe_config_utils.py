@@ -52,7 +52,7 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     # First look up if an optimized configuration is available in the configs
     # directory
     dtype_str = "DEFAULT" if dtype is None else dtype
-    dev = arch_info.get_device()
+    dev = arch_info.get_arch()
     config_file_path = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json"
 
     if os.path.exists(config_file_path):
