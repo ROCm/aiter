@@ -68,6 +68,7 @@ void mla_reduce_v1(const torch::Tensor& partial_output,
                    const torch::Tensor& reduce_indptr,
                    const std::optional<torch::Tensor>& reduce_final_map,
                    const torch::Tensor& reduce_partial_map,
+                   const int max_seqlen_q,
                    torch::Tensor& final_output,
                    std::optional<torch::Tensor>& final_lse);
 

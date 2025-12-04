@@ -321,6 +321,7 @@ def mla_decode_fwd(
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
+            max_seqlen_q,
             o,
             final_lse,
         )
