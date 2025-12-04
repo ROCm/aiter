@@ -327,15 +327,6 @@ def test_fmoe(
         num_warmup=0,
     )
     aiter.logger.info(f'run pertest done')
-    
-    '''
-    err = checkAllclose(
-        out1_ref,
-        out2_ck,
-        msg=f"ck_moe_2stages subtensor 0 :{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    )
-
-    '''    
     err = checkAllclose(
         out2_ref,
         out2_ck,
@@ -382,7 +373,7 @@ l_quant = [
     # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
     # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    # (aiter.QuantType.per_127x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4, int4
 ]
@@ -532,6 +523,7 @@ for (
         dtypes.bf16,
         dtypes.fp4x2,
     ):
+        act_type = aiter.ActivationType.Swiglu if wq_dtype == dtype.fp4x2 else aiter.ActivationType.Silu
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
             for m in l_tokenNum:
                 ret = test_fmoe(
@@ -541,7 +533,7 @@ for (
                     inter_dim,
                     args.expert,
                     args.topk,
-                    aiter.ActivationType.Swiglu,
+                    act_type,
                     quant_type,
                     aq_dtype,
                     wq_dtype,
