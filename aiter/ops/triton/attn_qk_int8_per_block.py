@@ -17,43 +17,53 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
+# @functools.lru_cache(maxsize=1024)
+# def _get_config(
+#     batch_size: int,
+#     num_heads: int,
+#     seq_len: int,
+#     head_dim: int,
+# ):
+    # if not hasattr(_get_config, "_config_dict"):
+    #     dev = arch_info.get_device()
+    #     _get_config._config_dict = {}
+    #     fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-ATTN-QK-INT8-PER-BLOCK.json"
+    #     with open(fpath, "r") as file:
+    #         config = json.load(file)
+    #     _get_config._config_dict["default"] = config
 
-@functools.lru_cache(maxsize=1024)
-def _get_config(
-    batch_size: int,
-    num_heads: int,
-    seq_len: int,
-    head_dim: int,
-):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-ATTN-QK-INT8-PER-BLOCK.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
+    # key = "default"
 
-    key = "default"
+    # # Select config based on sequence length
+    # if seq_len < 8192 and "small" in _get_config._config_dict[key]:
+    #     return _get_config._config_dict[key]["small"]
+    # elif seq_len <= 32768:
+    #     # Check for M-specific medium configs based on BLOCK_SIZE_M
+    #     if seq_len < 29760.0 and "medium_1" in _get_config._config_dict[key]:
+    #         return _get_config._config_dict[key]["medium_1"]
+    #     elif seq_len >= 29760.0 and "medium_2" in _get_config._config_dict[key]:
+    #         return _get_config._config_dict[key]["medium_2"]
+    # elif seq_len <= 65536 and "large" in _get_config._config_dict[key]:
+    #     return _get_config._config_dict[key]["large"]
+    # elif seq_len > 65536:
+    #     BLK_M = triton.next_power_of_2(min(seq_len // 512, 256))
+    #     if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
+    #         return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
+    #     elif "xlarge" in _get_config._config_dict[key]:
+    #         return _get_config._config_dict[key]["xlarge"]
 
-    # Select config based on sequence length
-    if seq_len < 8192 and "small" in _get_config._config_dict[key]:
-        return _get_config._config_dict[key]["small"]
-    elif seq_len <= 32768:
-        # Check for M-specific medium configs based on BLOCK_SIZE_M
-        if seq_len < 29760.0 and "medium_1" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["medium_1"]
-        elif seq_len >= 29760.0 and "medium_2" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["medium_2"]
-    elif seq_len <= 65536 and "large" in _get_config._config_dict[key]:
-        return _get_config._config_dict[key]["large"]
-    elif seq_len > 65536:
-        BLK_M = triton.next_power_of_2(min(seq_len // 512, 256))
-        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
-        elif "xlarge" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["xlarge"]
+    # return _get_config._config_dict[key]["any"]
 
-    return _get_config._config_dict[key]["any"]
+def _get_config():
+    return {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 64,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 2,
+        "cache_modifier": None
+    }
+
 
 
 def attn_qk_int8_per_block(
@@ -89,6 +99,8 @@ def attn_qk_int8_per_block(
     Returns:
         tuple: (output tensor, lse tensor) if return_lse=True, else (output tensor, empty tensor).
     """
+    assert config is not None, "config must be provided because the scales are per-block."
+    
     _LOGGER.info(
         f"ATTN_QK_INT8_PER_BLOCK: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)} "
         f"q_scale={tuple(q_scale.shape)} k_scale={tuple(k_scale.shape)} layout={tensor_layout}"
@@ -133,10 +145,7 @@ def attn_qk_int8_per_block(
     else:
         lse = torch.empty([0], dtype=torch.float32, device="cpu")
 
-    if config is None:
-        config = _get_config(b, h_qo, qo_len, head_dim)
-
-    grid = (triton.cdiv(qo_len, config["BLOCK_SIZE_M"]), h_qo, b)
+    grid = (triton.cdiv(qo_len, config["BLOCK_SIZE_M"]) * h_qo * b, )
     _attn_fwd[grid](
         q,
         k,
@@ -168,6 +177,7 @@ def attn_qk_int8_per_block(
         num_kv_groups,
         HEAD_DIM=HEAD_DIM_K,
         RETURN_LSE=return_lse,
+        BATCH=b,
         **config
     )
 

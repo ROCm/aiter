@@ -18,6 +18,7 @@ import torch, math
 import triton
 import triton.language as tl
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils._triton.pid_preprocessing import remap_xcd
 
 
 _attn_fwd_repr = make_kernel_repr(
@@ -102,11 +103,24 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
               num_stages: tl.constexpr,
               RETURN_LSE: tl.constexpr,
               cache_modifier: tl.constexpr,
+              BATCH,
               ):
-    start_m = tl.program_id(0)
-
-    off_z = tl.program_id(2).to(tl.int64)
-    off_h = tl.program_id(1).to(tl.int64)
+    # start_m = tl.program_id(0)
+    # off_z = tl.program_id(2).to(tl.int64)
+    # off_h = tl.program_id(1).to(tl.int64)
+    pid = tl.program_id(0)
+    num_pids_m = tl.cdiv(qo_len, BLOCK_SIZE_M)
+    if mask is not None and (H % 8 == 0): # can solve the workload imbalance between pids by traversing the head first
+        offs_h = pid % H # each XCD gets pid with the same start_m, i.e. pid with the same workload
+        offs_h = remap_xcd(offs_h, H, NUM_XCDS=8) # map it so that that contiguous heads are at the same XCD
+        start_m = (pid // H) % num_pids_m
+        off_z = pid // (H * num_pids_m)
+    else:
+        num_pids_total = BATCH * H * num_pids_m
+        pid = remap_xcd(pid, num_pids_total, NUM_XCDS=8)
+        start_m = pid % num_pids_m
+        off_h = (pid // num_pids_m) % H
+        off_z = pid // (num_pids_m * H)
 
     q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_SIZE_M)
     k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_SIZE_N)  

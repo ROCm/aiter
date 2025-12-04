@@ -19,9 +19,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 from typing import Tuple
 
 
-def get_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Load actual config to get BLOCK_SIZE_M and BLOCK_SIZE_N for scale tensor generation
-    config = _get_config(batch_size, num_heads, seq_len, head_dim)
+def get_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int, config) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
     BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
 
@@ -49,7 +47,8 @@ def bench_attn_fn(batch_size: int, num_heads: int, seq_len: int, head_dim: int, 
     Returns:
         The requested metric value
     """
-    q, k, v, q_scale, k_scale = get_tensors(batch_size, num_heads, seq_len, head_dim)
+    config = _get_config()
+    q, k, v, q_scale, k_scale = get_tensors(batch_size, num_heads, seq_len, head_dim, config)
     
     # Calculate FLOPs: 4 * num_heads * batch_size * head_dim * seq_len * seq_len
     flops = 4.0 * num_heads * batch_size * head_dim * seq_len * seq_len
@@ -68,7 +67,7 @@ def bench_attn_fn(batch_size: int, num_heads: int, seq_len: int, head_dim: int, 
     mem = mem_read + mem_write
     
     # Benchmark
-    forward_fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, output_dtype=torch.bfloat16)
+    forward_fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, output_dtype=torch.bfloat16, config=config)
     ms = triton.testing.do_bench(forward_fn, warmup=25, rep=100)
     
     # Return exactly one scalar depending on which metric is active
@@ -104,11 +103,11 @@ def run_shape_benchmark(args):
     x_vals_list = [[batch_size, num_heads, seq_len, head_dim]]
     
     if args.metric == "time":
-        ylabel = "Time (ms)"
+        ylabel = "Time_(ms)"
     elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
+        ylabel = "Throughput_(TFLOPS)"
     elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
+        ylabel = "Bandwidth_(GB/s)"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
     

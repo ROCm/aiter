@@ -1259,3 +1259,116 @@ def test_mha_backward_varlen_with_pe(
         rtol=bwd_rtol,
         msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
     )
+
+
+from aiter.ops.triton.attn_qk_int8_per_block import (
+    attn_qk_int8_per_block,
+    _get_config,
+)
+
+
+from typing import Tuple
+def int8_per_block_quantize_bshd(
+    x: torch.Tensor,
+    int8_dtype: torch.dtype,
+    clamp_val: float = 1e-9,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a tensor to INT8 format, returning an INT8 tensor and a descale factor.
+    Quantization is done per block on the seqlen dimension.
+    x: [batch, seqlen, heads, dim] (bshd)
+    Returns:
+        x_int8: same shape as x, stored as int8_dtype
+        descale_factor: [batch, num_blocks, heads, 1] scale to dequantize:
+                        x_fp32 ≈ x_int8 * descale_factor
+    """
+    if len(x.shape) != 4:
+        raise ValueError(
+            f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}"
+        )
+    batch, seqlen, num_heads, head_dim = x.shape
+    if seqlen % block_size != 0:
+        raise ValueError(
+            f"seqlen={seqlen} must be divisible by block_size={block_size} for per-block quantization"
+        )
+    # Reshape to expose blocks along seqlen: [b, n_blocks, block_size, h, d]
+    n_blocks = seqlen // block_size
+    x_reshaped = x.view(batch, n_blocks, block_size, num_heads, head_dim)
+    # Compute max absolute value per block (reduce over block_size and dim)
+    # Shape: [b, n_blocks, num_heads, 1]
+    max_abs = x_reshaped.abs().amax(dim=2)        # [b, n_blocks, h, d]
+    max_abs = max_abs.amax(dim=-1, keepdim=True)  # [b, n_blocks, h, 1]
+    # Avoid division by zero
+    max_abs = torch.clamp(max_abs, min=clamp_val)
+    # Symmetric INT8 range
+    qmax = torch.iinfo(torch.int8).max  # 127
+    # Scale used for quantization (fp32 -> int8)
+    scale = qmax / max_abs  # [b, n_blocks, h, 1]
+    # Apply scale per block
+    # Broadcast scale over block_size and dim
+    x_scaled = x_reshaped * scale.unsqueeze(2)  # [b, n_blocks, block_size, h, d]
+    # Quantize and clamp to valid INT8 range
+    x_int8 = torch.round(x_scaled).clamp(-qmax - 1, qmax).to(int8_dtype)
+    # Reshape back to [b, s, h, d]
+    x_int8 = x_int8.view(batch, seqlen, num_heads, head_dim)
+    # Descale factor for dequantization: x_fp32 ≈ x_int8 * descale_factor
+    descale_factor = 1.0 / scale  # [b, n_blocks, h, 1]
+    return x_int8, descale_factor
+
+
+@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+)
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+
+def test_attn_qk_int8_per_block(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    dtype=torch.float16,
+):
+    torch.cuda.empty_cache()
+    config = _get_config()
+    # Ensure sequence lengths are multiples of block sizes
+    block_m = config["BLOCK_SIZE_M"]
+    block_n = config["BLOCK_SIZE_N"]
+    SEQLEN_Q = ((SEQLEN_Q + block_m - 1) // block_m) * block_m
+    SEQLEN_K = ((SEQLEN_K + block_n - 1) // block_n) * block_n
+
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+
+    int8_dtype = torch.int8
+    q_fp8, q_scale = int8_per_block_quantize_bshd(q, int8_dtype, block_size=config["BLOCK_SIZE_M"])
+    k_fp8, k_scale = int8_per_block_quantize_bshd(k, int8_dtype, block_size=config["BLOCK_SIZE_N"])
+
+    triton_out, lse = attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, output_dtype=torch.bfloat16, config=config)
+
+    torch_out = attention_ref(
+        q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
+    )
+    torch_out, attention_scores, _ = torch_out
+
+    fp8_assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+    )
+
+if __name__ == "__main__":
+    test_attn_qk_int8_per_block(
+        BATCH=1,
+        SEQLEN_Q=512,
+        SEQLEN_K=512,
+        NUM_Q_HEADS=16,
+        NUM_K_HEADS=16,
+        HEAD_SZ=128
+    )
