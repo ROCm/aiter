@@ -18,7 +18,7 @@ _LOGGER = AiterTritonLogger()
 def gemm_a16w16_atomic(
     x,
     w,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
 ):

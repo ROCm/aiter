@@ -5,7 +5,7 @@ import os
 import time
 import triton
 from datetime import datetime
-
+from typing import List, Dict, Any, Union, Tuple, Optional
 import torch
 from tqdm import tqdm
 
@@ -24,7 +24,48 @@ DTYPE_MAP = {
 }
 
 
-def get_configs_compute_bound():
+# def get_configs_compute_bound():
+#     configs = []
+#     for num_stages in [2]:
+#         for block_m in [
+#             16,
+#         ]:
+#             for block_k in [
+#                 64,
+#             ]:
+#                 for block_n in [
+#                     32,
+#                 ]:
+#                     for num_warps in [
+#                         4,
+#                     ]:
+#                         for group_size in [
+#                             1,
+#                         ]:
+#                             for num_ksplit in [
+#                                 1,
+#                             ]:  # Atomic kernel specific parameter
+#                                 for waves_per_eu in [3]:
+#                                     configs.append(
+#                                         {
+#                                             "BLOCK_SIZE_M": block_m,
+#                                             "BLOCK_SIZE_N": block_n,
+#                                             "BLOCK_SIZE_K": block_k,
+#                                             "GROUP_SIZE_M": group_size,
+#                                             "num_warps": num_warps,
+#                                             "num_stages": num_stages,
+#                                             "waves_per_eu": waves_per_eu,  # TODO check if compatible
+#                                             "matrix_instr_nonkdim": 16,  # TODO
+#                                             "cache_modifier": "",  # Empty string for atomic kernel
+#                                             "NUM_KSPLIT": num_ksplit,  # Atomic kernel specific
+#                                             "kpack": 1,  # TODO
+#                                             "SPLITK_BLOCK_SIZE": 1,  # Will be set dynamically
+#                                         }
+#                                     )
+#     return configs
+
+
+def get_configs_compute_bound() -> List[Dict[str, int | str]]:
     configs = []
     for num_stages in [2]:
         for block_m in [
@@ -46,6 +87,19 @@ def get_configs_compute_bound():
                                 1,
                             ]:  # Atomic kernel specific parameter
                                 for waves_per_eu in [3]:
+                                    # for num_stages in [2, 3, 4, 5]:
+                                    #     for block_m in [16, 32, 64, 128, 256]:
+                                    #         for block_k in [64, 128]:
+                                    #             for block_n in [32, 64, 128, 256]:
+                                    #                 for num_warps in [4, 8]:
+                                    #                     for group_size in [1, 8, 16, 32, 64]:
+                                    #                         for num_ksplit in [
+                                    #                             1,
+                                    #                             2,
+                                    #                             4,
+                                    #                             8,
+                                    #                         ]:  # Atomic kernel specific parameter
+                                    #                             for waves_per_eu in [1, 2, 3, 4]:
                                     configs.append(
                                         {
                                             "BLOCK_SIZE_M": block_m,
@@ -65,36 +119,7 @@ def get_configs_compute_bound():
     return configs
 
 
-# def get_configs_compute_bound():
-#     configs = []
-#     for num_stages in [2, 3, 4, 5]:
-#         for block_m in [16, 32, 64, 128, 256]:
-#             for block_k in [64, 128]:
-#                 for block_n in [32, 64, 128, 256]:
-#                     for num_warps in [4, 8]:
-#                         for group_size in [1, 8, 16, 32, 64]:
-#                             for num_ksplit in [1, 2, 4, 8]:  # Atomic kernel specific parameter
-#                                 for waves_per_eu in [1,2,3,4]:
-#                                     configs.append(
-#                                         {
-#                                             "BLOCK_SIZE_M": block_m,
-#                                             "BLOCK_SIZE_N": block_n,
-#                                             "BLOCK_SIZE_K": block_k,
-#                                             "GROUP_SIZE_M": group_size,
-#                                             "num_warps": num_warps,
-#                                             "num_stages": num_stages,
-#                                             "waves_per_eu": waves_per_eu, # TODO check if compatible
-#                                             "matrix_instr_nonkdim": 16, # TODO
-#                                             "cache_modifier": None, # TODO
-#                                             "NUM_KSPLIT": num_ksplit, # Atomic kernel specific
-#                                             "kpack": 1, # TODO
-#                                             "SPLITK_BLOCK_SIZE": 1, # Will be set dynamically
-#                                         }
-#                                 )
-#     return configs
-
-
-def get_weight_shapes(tp_size):
+def get_weight_shapes(tp_size: int) -> List[Tuple[int, int]]:
     total = [
         (1024, 1024),
         (4096, 1024),
@@ -103,14 +128,48 @@ def get_weight_shapes(tp_size):
         (1024, 3072),
     ]
 
-    weight_shapes = []
+    weight_shapes: List[Tuple[int, int]] = []
     for t in total:
         weight_shapes.append(t)
 
     return weight_shapes
 
 
-def benchmark_config(x, w, dtype, y, config, num_iters=10):
+def benchmark_config(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    dtype: torch.dtype,
+    config: Dict[str, Union[str, int]],
+    y: Optional[torch.Tensor] = None,
+    num_iters=10,
+) -> float:
+    """
+    Benchmark the performance of a GEMM operation with a specific configuration.
+
+    This function measures the execution time of the gemm_a16w16_atomic kernel by running
+    it multiple times with synchronization points to ensure accurate timing. It performs
+    warmup runs before the actual benchmarking to account for JIT compilation overhead.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape (M, K) representing the first matrix operand.
+        w (torch.Tensor): Weight tensor of shape (N, K) representing the second matrix operand.
+        dtype (torch.dtype): Data type for the computation (e.g., torch.bfloat16).
+        config (Dict[str, Union[str, int]]): Configuration dictionary containing kernel
+            parameters such as block sizes, number of warps, etc.
+        y (Optional[torch.Tensor], optional): Output tensor to store the result. If None,
+            a new tensor will be allocated. Defaults to None.
+        num_iters (int, optional): Number of benchmark iterations to run. Defaults to 10.
+
+    Returns:
+        float: Average execution time in microseconds (us) per iteration.
+
+    Note:
+        The function performs 5 warmup iterations before benchmarking to account for
+        JIT compilation and GPU warmup effects. The timing is measured using CUDA events
+        for accurate GPU kernel timing.
+    """
+
+    # run the kernel
     def run():
         gemm_a16w16_atomic(x, w, dtype, y, config)
 
@@ -135,20 +194,23 @@ def benchmark_config(x, w, dtype, y, config, num_iters=10):
     return avg
 
 
-def tune(M, N, K, out_dtype, search_space, input_type):
+def tune(
+    M: int, N: int, K: int, search_space: List[Dict[str, int | str]], input_type: str
+):
     if input_type == "bfloat16":
-        fp16_info = torch.finfo(torch.bfloat16)
-        fp16_max, fp16_min = fp16_info.max, fp16_info.min
+        bf16_info = torch.finfo(torch.bfloat16)
+        bf16_max, bf_16_max = bf16_info.max, bf16_info.min
 
+        # create random weights downcasted from torch.float32 to torch.bf16
         x_fp32 = (
-            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp16_max
+            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * bf16_max
         )
-        x = x_fp32.clamp(min=fp16_min, max=fp16_max).to(torch.bfloat16)
+        x = x_fp32.clamp(min=bf_16_max, max=bf16_max).to(torch.bfloat16)
 
         w_fp32 = (
-            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp16_max
+            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * bf16_max
         )
-        w = w_fp32.clamp(min=fp16_min, max=fp16_max).to(torch.bfloat16)
+        w = w_fp32.clamp(min=bf_16_max, max=bf16_max).to(torch.bfloat16)
     else:
         raise RuntimeError("Currently, only support tune w16a16 block fp16 kernel.")
 
@@ -164,7 +226,9 @@ def tune(M, N, K, out_dtype, search_space, input_type):
                 config=config,
                 num_iters=10,
             )
-        except triton.runtime.autotuner.OutOfResources:
+        except triton.runtime.autotuner.OutOfResources as e:
+            print("config failed!", config)
+            print("error: ", e)
             # Some configurations may be invalid and fail to compile.
             continue
 
@@ -195,27 +259,25 @@ def save_configs(
         f.write("\n")
 
 
-def tune_on_gpu(args_dict):
+def tune_on_gpu(
+    gpu_id: int,
+    batch_sizes: List[int],
+    weight_shapes: List[Tuple[int, int]],
+    input_type: str,
+) -> None:
     """Run tuning on a specific GPU."""
-    gpu_id = args_dict["gpu_id"]
-    batch_sizes = args_dict["batch_sizes"]
-    weight_shapes = args_dict["weight_shapes"]
-    args = args_dict["args"]
-
     torch.cuda.set_device(gpu_id)
     print(f"Starting tuning on GPU {gpu_id} with batch sizes {batch_sizes}")
 
-    out_dtype = DTYPE_MAP[args.out_dtype]
     save_path = AITER_TRITON_CONFIGS_PATH + "/gemm/"
-    input_type = args.input_type
 
     search_space = get_configs_compute_bound()
 
     start = time.time()
-    
+
     # Collect all configs to determine best overall config
-    all_configs = []
-    
+    all_configs: List[Dict[str, Dict[str, int | str]]] = []
+
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
         N, K = shape[0], shape[1]
         print(f"[GPU {gpu_id}] Tune for weight shape of `N: {N}, K: {K}`")
@@ -224,13 +286,12 @@ def tune_on_gpu(args_dict):
                 batch_size,
                 N,
                 K,
-                out_dtype,
                 search_space,
                 input_type,
             )
             for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
         ]
-        best_configs = {}
+        best_configs: Dict[str, Dict[str, int | str]] = {}
         # Create configs for different M size categories as expected by the atomic kernel
         for i, (M, config) in enumerate(zip(batch_sizes, benchmark_results)):
             if i == len(batch_sizes) - 1:
@@ -252,7 +313,7 @@ def tune_on_gpu(args_dict):
         # Store configs for later analysis
         all_configs.append(best_configs)
         save_configs(N, K, best_configs, save_path)
-    
+
     # Create a default config file (without N,K parameters) by selecting most common config
     default_config = create_default_config(all_configs)
     save_default_config(default_config, save_path)
@@ -261,10 +322,12 @@ def tune_on_gpu(args_dict):
     print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
 
 
-def create_default_config(all_configs):
+def create_default_config(
+    all_configs: List[Dict[str, Dict[str, Union[int, str]]]],
+) -> Dict[str, Dict[str, Union[int, str]]]:
     """Create a default config by selecting the most common config across all shapes."""
     from collections import Counter
-    
+
     # Collect all configs for each category
     category_configs = {
         "small": [],
@@ -273,43 +336,45 @@ def create_default_config(all_configs):
         "medium_M128": [],
         "large": [],
         "xlarge": [],
-        "any": []
+        "any": [],
     }
-    
+
     for config in all_configs:
         for category, params in config.items():
             if category in category_configs:
                 # Convert config to a hashable tuple for counting
                 config_tuple = tuple(sorted(params.items()))
                 category_configs[category].append(config_tuple)
-    
+
     # Find the most common config for each category
-    default_config = {}
+    default_config: Dict[str, Dict[str, Union[int, str]]] = {}
     for category, configs in category_configs.items():
         if configs:
             most_common = Counter(configs).most_common(1)[0][0]
             default_config[category] = dict(most_common)
-    
+
     return default_config
 
 
-def save_default_config(config, save_path):
+def save_default_config(
+    config: Dict[str, Dict[str, Union[int, str]]], save_path: str
+) -> None:
     """Save the default config file (without N,K parameters)."""
     os.makedirs(save_path, exist_ok=True)
     device_name = "R9700"  # TODO: Hardcoded, make it dynamic
     json_file_name = f"{device_name}-GEMM-A16W16-ATOMIC.json"
-    
+
     config_file_path = os.path.join(save_path, json_file_name)
     print(f"Writing default config to {config_file_path}...")
-    
+
     with open(config_file_path, "w") as f:
         json.dump(config, f, indent=4)
         f.write("\n")
 
 
-def distribute_batch_sizes(batch_sizes, num_gpus):
+def distribute_batch_sizes(batch_sizes: List[int], num_gpus: int) -> List[List[int]]:
     """Distribute batch sizes across available GPUs."""
-    batches_per_gpu = []
+    batches_per_gpu: List[List[int]] = []
     for i in range(num_gpus):
         start_idx = i * len(batch_sizes) // num_gpus
         end_idx = (i + 1) * len(batch_sizes) // num_gpus
@@ -345,20 +410,21 @@ def main(args):
 
     batches_per_gpu = distribute_batch_sizes(batch_sizes, 1)
 
+    # Prepare arguments for each GPU process
     process_args = []
     for gpu_id in range(1):
         process_args.append(
-            {
-                "gpu_id": gpu_id,
-                "batch_sizes": batches_per_gpu[gpu_id],
-                "weight_shapes": weight_shapes,  # Each GPU processes all weight shapes
-                "args": args,
-            }
+            (
+                gpu_id,
+                batches_per_gpu[gpu_id],
+                weight_shapes,  # Each GPU processes all weight shapes
+                args.input_type
+            )
         )
 
     ctx = mp.get_context("spawn")
     with ctx.Pool(1) as pool:
-        pool.map(tune_on_gpu, process_args)
+        pool.starmap(tune_on_gpu, process_args)
 
     print("Multi-GPU tuning completed")
 
