@@ -58,8 +58,8 @@ def fused_gemm_a16w16_2o(
 
     if config is None:
         _get_config.cache_clear()
-        if hasattr(_get_config, '_config_dict'):
-            delattr(_get_config, '_config_dict')
+        if hasattr(_get_config, "_config_dict"):
+            delattr(_get_config, "_config_dict")
         config = _get_config(M, N, K)
 
     if config["NUM_KSPLIT"] > 1:

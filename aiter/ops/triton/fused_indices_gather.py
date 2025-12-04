@@ -13,9 +13,8 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-def fuse_indices_and_gather(
-    x, E, a, D, config: Optional[dict] = None, num_ctas=1
-):
+
+def fuse_indices_and_gather(x, E, a, D, config: Optional[dict] = None, num_ctas=1):
     (B, T, D) = x.shape
     x2d = x.view(-1, D)
     idx1d = torch.empty(E * a, dtype=torch.long, device=x.device)
@@ -30,8 +29,8 @@ def fuse_indices_and_gather(
 
     if config is None:
         _get_config.cache_clear()
-        if hasattr(_get_config, '_config_dict'):
-            delattr(_get_config, '_config_dict')
+        if hasattr(_get_config, "_config_dict"):
+            delattr(_get_config, "_config_dict")
         config = _get_config(B, E)
 
     grid = (triton.cdiv(E * a, config["BLOCK_M"]), triton.cdiv(D, config["BLOCK_N"]))

@@ -6,6 +6,7 @@ import triton.language as tl
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
+
 @triton.jit
 def _fused_indices_and_gather_kernel(
     x2d,
