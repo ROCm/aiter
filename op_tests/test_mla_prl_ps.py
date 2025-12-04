@@ -266,14 +266,16 @@ padded_num_tokens = num_q_tile * tile_q  # 3 * 256 = 768
 
 reduce_indptr = torch.tensor([0, 2], dtype=torch.int32)
 # [<qo_start, qo_end, q_head_start, q_head_end>]
-reduce_final_map = torch.tensor([[256, 512, 0, 1]], dtype=torch.int32)
+reduce_final_map = torch.tensor([[256, 512]], dtype=torch.int32)
 
 # [<partial_qo_loc, q_head_start, q_head_end>]
 reduce_partial_map = torch.tensor(
     [
+        [0],   # partial_qo_loc=0
+        [256], # partial_qo_loc=256
         # [-1, 0, 1],   # partial_qo_loc=-1
-        [0, 0, 1],   # partial_qo_loc=0
-        [256, 0, 1], # partial_qo_loc=256
+        # [0, 0, 1],   # partial_qo_loc=0
+        # [256, 0, 1], # partial_qo_loc=256
         # [-1, 0, 1],   # partial_qo_loc=-1
     ],
     dtype=torch.int32
