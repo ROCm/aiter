@@ -1,6 +1,5 @@
 import argparse
 import json
-import multiprocessing as mp
 import os
 import time
 import triton
@@ -14,8 +13,6 @@ from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 from utils.core import AITER_TRITON_CONFIGS_PATH  # type: ignore
-
-mp.set_start_method("spawn", force=True)
 
 
 def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False):
@@ -67,10 +64,10 @@ def get_configs_compute_bound():
                                         "num_warps": num_warps,
                                         "num_stages": num_stages,
                                         "waves_per_eu": waves_per_eu,
+                                        "matrix_instr_nonkdim": 16,
                                         "NUM_KSPLIT": 1,
                                         "kpack": 1,
-                                        "SPLITK_BLOCK_SIZE": 1, # Why are those 2 needed for gfx1201
-                                        "cache_modifier": None  # but does not exist in other configs?
+                                        "cache_modifier": None, 
                                     }
                                 )
     return configs
@@ -93,9 +90,13 @@ def get_weight_shapes():
 
 
 def benchmark_config(x, w, bias, dtype, y, config, activation, num_iters=10):
+    torch_out = torch.nn.functional.linear(x, w, bias=bias) # Ground truth
+
     def run():
-        gemm_a16w16(x, w, bias=bias, dtype=dtype, y=y, config=config, activation=activation)
-    
+        return gemm_a16w16(
+            x, w, bias=bias, dtype=dtype, y=y, config=config, activation=None
+        )
+
     torch.cuda.synchronize()
     # JIT complication & warmup
     for _ in range(5):
@@ -109,45 +110,41 @@ def benchmark_config(x, w, bias, dtype, y, config, activation, num_iters=10):
     for i in range(num_iters):
         torch.cuda.synchronize()
         start_event.record()
-        run()
+        triton_out = run()
         end_event.record()
         end_event.synchronize()
         latencies.append(start_event.elapsed_time(end_event))
+        torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
     avg = sum(latencies) / (num_iters * 10) * 1000  # us
     return avg
 
 
 def tune(M, N, K, dtype, search_space):
-    (
-        x,
-        w,
-        _,
-        _,
-        _,
-    ) = generate_gemm_a16w16_inputs(
-        M,
-        N,
-        K,
-        dtype,
-        output=False,
+    x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, dtype, output=True, bias=True
     )
 
     best_config = None
     best_time = float("inf")
     for config in tqdm(search_space):
+        config["SPLITK_BLOCK_SIZE"]= triton.cdiv(K, config["NUM_KSPLIT"])
         try:
             kernel_time = benchmark_config(
                 x=x,
                 w=w,
-                bias=None,
-                dtype=dtype,
-                y=None,
+                bias=bias,
+                dtype=out_dtype,
+                y=y,
                 config=config,
                 activation=None,
                 num_iters=10,
             )
         except triton.runtime.autotuner.OutOfResources:
+            print("OutOfResources encountered during tuning.")
             # Some configurations may be invalid and fail to compile.
+            continue
+        except AssertionError:
+            print("AssertionError encountered during tuning.")
             continue
 
         if kernel_time < best_time:
@@ -221,7 +218,7 @@ def main(args):
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
         raise RuntimeError("No GPU available for tuning")
-    print(f"Found {num_gpus} GPUs for parallel tuning")
+    print(f"Found {num_gpus} GPUs for tuning")
 
     torch.cuda.init()
 
@@ -236,22 +233,17 @@ def main(args):
 
     weight_shapes = get_weight_shapes()
 
-    process_args = []
-    for gpu_id in range(1):
-        process_args.append(
-            {
-                "gpu_id": gpu_id,
-                "batch_sizes": batch_sizes,
-                "weight_shapes": weight_shapes,  # Each GPU processes all weight shapes
-                "args": args,
-            }
-        )
+    # Run tuning sequentially on GPU 0
+    tune_on_gpu(
+        {
+            "gpu_id": 0,
+            "batch_sizes": batch_sizes,
+            "weight_shapes": weight_shapes,
+            "args": args,
+        }
+    )
 
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(1) as pool:
-        pool.map(tune_on_gpu, process_args)
-
-    print("Multi-GPU tuning completed")
+    print("Tuning completed")
 
 
 if __name__ == "__main__":
