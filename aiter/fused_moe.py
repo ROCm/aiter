@@ -819,7 +819,7 @@ def fused_moe_2stages(
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
-        # and w1.dtype == dtypes.fp4x2
+        and w1.dtype in [dtypes.fp4x2, torch.uint8]
         and activation == ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtype)
@@ -894,7 +894,7 @@ def fused_moe_2stages(
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
-        # and w1.dtype == dtypes.fp4x2
+        and w1.dtype in [ dtypes.fp4x2, torch.uint8]
         and activation == ActivationType.Swiglu
     ):
         a2_scale = None
