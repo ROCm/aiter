@@ -6,15 +6,17 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.fused_indices_gather import (
-    _fused_indices_and_gather_kernel
+    _fused_indices_and_gather_kernel,
+    _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 def fuse_indices_and_gather(
-    x, E, a, D, BLOCK_M=8, BLOCK_N=128, num_warps=8, num_stages=2, num_ctas=1
+    x, E, a, D, config: Optional[dict] = None, num_ctas=1
 ):
+    (B, T, D) = x.shape
     x2d = x.view(-1, D)
     idx1d = torch.empty(E * a, dtype=torch.long, device=x.device)
     gather_out = torch.empty([E * a, D], device=x.device, dtype=x.dtype)
@@ -26,7 +28,13 @@ def fuse_indices_and_gather(
     sgatherout0 = gather_out.stride(0)
     sgatherout1 = gather_out.stride(1)
 
-    grid = (triton.cdiv(E * a, BLOCK_M), triton.cdiv(D, BLOCK_N))
+    if config is None:
+        _get_config.cache_clear()
+        if hasattr(_get_config, '_config_dict'):
+            delattr(_get_config, '_config_dict')
+        config = _get_config(B, E)
+
+    grid = (triton.cdiv(E * a, config["BLOCK_M"]), triton.cdiv(D, config["BLOCK_N"]))
 
     _fused_indices_and_gather_kernel[grid](
         x2d,
@@ -40,10 +48,10 @@ def fuse_indices_and_gather(
         sgatherout0,
         sgatherout1,
         sidx,
-        BLOCK_M,
-        BLOCK_N,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        config["BLOCK_M"],
+        config["BLOCK_N"],
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
         num_ctas=num_ctas,
     )
 

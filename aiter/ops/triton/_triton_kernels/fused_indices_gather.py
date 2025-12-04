@@ -49,3 +49,28 @@ def _fused_indices_and_gather_kernel(
     if pid_n == 0:
         dst_idx = offs_m * strideidx
         tl.store(idx1d + dst_idx, row_vals.to(tl.int32), mask=mask_m)
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    B: int,
+    E: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/MI350X-FUSED-INDICES-GATHER.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    key = f"B{B}E{E}"
+    if key in _get_config._config_dict:
+        temp_config = _get_config._config_dict[key]
+    else:
+        temp_config = _get_config._config_dict["default"]
+
+    # Copy to avoid mutating the cached config
+    chosen_config = dict(temp_config)
+
+    return chosen_config

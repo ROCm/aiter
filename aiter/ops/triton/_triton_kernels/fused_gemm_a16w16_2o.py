@@ -244,7 +244,6 @@ def _get_config(
             key = "default"  # fall back to default config
     bounds = [2, 4, 8, 16, 32, 64, 128, 256, 512, 2048]
     for bound in bounds:
-        print("value of M is:", M)
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
             temp_config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
             break
