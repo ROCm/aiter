@@ -34,7 +34,6 @@ def bench_gemm_fn(
     metric: str,
     layout: str,
     impl: callable,
-    use_async_copy: Optional[bool],
 ):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
@@ -53,22 +52,7 @@ def bench_gemm_fn(
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        (
-            (lambda: impl(x, w, x_scale, w_scale, bias, c_dtype, YQ=y))
-            if use_async_copy is None
-            else (
-                lambda: impl(
-                    x,
-                    w,
-                    x_scale,
-                    w_scale,
-                    bias,
-                    c_dtype,
-                    YQ=y,
-                    use_async_copy=use_async_copy,
-                )
-            )
-        ),
+        lambda: impl(x, w, x_scale, w_scale, bias, c_dtype, YQ=y),
         warmup=25,
         rep=100,
     )
@@ -119,7 +103,6 @@ def run_model_benchmark(args, impl):
             metric,
             args.layout,
             impl,
-            not args.no_async_copy if args.gluon else None,
         )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
@@ -142,7 +125,6 @@ def run_shape_benchmark(args, impl):
             metric,
             args.layout,
             impl,
-            not args.no_async_copy if args.gluon else None,
         )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
@@ -194,11 +176,6 @@ def parse_args():
         "-gluon",
         action="store_true",
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
-    )
-    parser.add_argument(
-        "-no_async_copy",
-        action="store_true",
-        help="Do not use async_copy loads for Gluon implementation (experimental, requires latest Triton from main). This implementation uses registers to load blocks, and is restricted to 2 stages for pipelining.",
     )
     return get_ff_args(parser)
 
