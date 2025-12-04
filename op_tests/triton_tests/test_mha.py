@@ -505,13 +505,25 @@ def test_mha_backward(
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
-    # TODO: Enable these test cases once this is fixed
-    if arch == "gfx942":
+    # TODO: Enable these tests once this is fixed
+    # As of torch 2.9.1+rocm7.1.1, these test cases aren't working
+    # on gfx942 machines. They are confirmed to work on torch 2.7.1+rocm 7.0.
+    # This was tested with the same Triton compiler version:
+    # https://github.com/triton-lang/triton/commit/ecbb77c
+    if (
+        arch == "gfx942"
+        and not FUSED
+        and HEAD_SZ == 128
+        and (DROPOUT, CAUSAL) == (0.2, False)
+        and (SEQLEN_Q, SEQLEN_K) in [(4, 4), (2, 1)]
+    ):
         pytest.skip(
-            "Backward accuracy issues due to Triton compiler on gfx942 architecture"
+            "triton_dv and torch_dv are not matching for these test cases on gfx942 architecture"
         )
+
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
+
     mha_set_use_fused_bwd_kernel(FUSED)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)

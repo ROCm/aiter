@@ -322,7 +322,7 @@ def _get_config(
     K: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM_PREQUANT-AFP4WFP4.json"
         with open(fpath, "r") as file:
@@ -331,7 +331,7 @@ def _get_config(
 
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM_PREQUANT-AFP4WFP4-N={N}-K={2*K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:

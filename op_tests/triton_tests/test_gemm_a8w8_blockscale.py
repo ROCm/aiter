@@ -16,7 +16,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 block_shape = (128, 128)
-DEVICE_ARCH = arch_info.get_device()
+DEVICE_ARCH = arch_info.get_arch()
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):

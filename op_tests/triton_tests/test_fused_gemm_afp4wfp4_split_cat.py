@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
-DEVICE_ARCH = arch_info.get_device()
+DEVICE_ARCH = arch_info.get_arch()
 
 SCALE_GROUP_SIZE = 32
 

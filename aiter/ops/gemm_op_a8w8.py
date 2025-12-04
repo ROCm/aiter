@@ -222,7 +222,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
 ) -> Tensor: ...
 
 
-def gen_mi350_a8w8_blockscale_asm_fake_tensors(
+def gen_gfx950_a8w8_blockscale_asm_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -233,11 +233,11 @@ def gen_mi350_a8w8_blockscale_asm_fake_tensors(
 
 
 @compile_ops(
-    "module_gemm_mi350_a8w8_blockscale_asm",
-    fc_name="mi350_a8w8_blockscale_asm",
-    gen_fake=gen_mi350_a8w8_blockscale_asm_fake_tensors,
+    "module_gemm_gfx950_a8w8_blockscale_asm",
+    fc_name="gfx950_a8w8_blockscale_asm",
+    gen_fake=gen_gfx950_a8w8_blockscale_asm_fake_tensors,
 )
-def mi350_a8w8_blockscale_asm(
+def gfx950_a8w8_blockscale_asm(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -561,7 +561,7 @@ def gemm_a8w8_blockscale(
 
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
-            return mi350_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+            return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
@@ -618,7 +618,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
-def mi350_a8w8_blockscale_ASM(
+def gfx950_a8w8_blockscale_ASM(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -629,7 +629,7 @@ def mi350_a8w8_blockscale_ASM(
     assert dtype in [
         dtypes.bf16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    return mi350_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
+    return gfx950_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gen_gemm_a8w8_tune_fake_tensors(

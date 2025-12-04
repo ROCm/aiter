@@ -164,7 +164,7 @@ def _flash_attn_forward(
         config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
     """
-    # Tuned for MI300x
+    # Tuned for gfx942
     config = {
         "BLOCK_M": 128,
         "BLOCK_N": 64,
