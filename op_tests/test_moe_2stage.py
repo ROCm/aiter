@@ -31,6 +31,21 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 
 
+def add_bias(tensor, bias):
+    return tensor + bias
+
+
+def uint8_swap_high_low_4bits(tensor):
+    """
+    swap 4bits grain because ck default exchange H/L 4bits
+    """
+    assert tensor.dtype == torch.uint8
+    low4 = tensor & 0x0F
+    high4 = (tensor >> 4) & 0x0F
+    swapped = (low4 << 4) | high4
+    return swapped
+
+
 @benchmark()
 def test_fmoe(
     dtype,
@@ -141,8 +156,6 @@ def test_fmoe(
         else:
             w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2])
             w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2])
-            w1_qt_aiter = w1_qt_aiter.clone() + 8
-            w2_qt_aiter = w2_qt_aiter.clone() + 8
 
     # Quant-ing a
     aiter.logger.info(f"quantize a qType {qType} {AQDType} {WQDType}")
@@ -182,8 +195,13 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16])
         and (WQDType == dtypes.i4x2)
     ):
+        w1_qt_aiter = add_bias(w1_qt_aiter.clone(), 8)
+        w2_qt_aiter = add_bias(w2_qt_aiter.clone(), 8)
         w1_qt_aiter = convert_int8_to_uint32_int4(w1_qt_aiter).view(torch.uint8)
         w2_qt_aiter = convert_int8_to_uint32_int4(w2_qt_aiter).view(torch.uint8)
+        # swap low 4bits and high 4bits to align ck implement
+        w1_qt_aiter = uint8_swap_high_low_4bits(w1_qt_aiter)
+        w2_qt_aiter = uint8_swap_high_low_4bits(w2_qt_aiter)
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
