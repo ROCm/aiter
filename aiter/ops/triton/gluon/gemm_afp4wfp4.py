@@ -217,7 +217,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     )
     
     dot_b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma_layout, k_width=16
+        operand_index=1, parent=mfma_layout, k_width=16
     )
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
@@ -387,7 +387,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
                     .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // 2)
                     .trans(1, 0)
                 )
-            cur_b = gl.convert_layout(value=cur_b, layout=dot_b_layout, assert_trivial=False)
+            cur_b = gl.convert_layout(value=cur_b, layout=dot_b_layout, assert_trivial=True)
             # cur_b = gl.convert_layout(cur_b, dot_b_layout, False)
             # cur_b = cur_b.reshape(1, BLOCK_SIZE_N // 16, BLOCK_SIZE_K // 64, 2, 16, 16)
             # cur_b = gl.convert_layout(
@@ -456,7 +456,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
                 .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // 2)
                 .trans(1, 0)
             )
-        cur_b = gl.convert_layout(value=cur_b, layout=dot_b_layout, assert_trivial=False)
+        cur_b = gl.convert_layout(value=cur_b, layout=dot_b_layout, assert_trivial=True)
         # cur_b = gl.convert_layout(
         #     value=cur_b,
         #     layout=linear9,
