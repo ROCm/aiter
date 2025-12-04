@@ -1125,11 +1125,6 @@ def torch_moe_stage1(
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
 ):
-    logger.info('torch_moe_stage1 w1 dtype {w1.dtype}, hidden_states dtype {hidden_states.dtype}') 
-    logger.info(hidden_states)
-    logger.info(w1)
-    logger.info(w1_scale)
-    # assert False
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
     B, D = hidden_states.shape
@@ -1150,7 +1145,6 @@ def torch_moe_stage1(
     else:
         hidden_states = hidden_states.to(ctype)
         w1 = w1.to(ctype)
-    logger.info(hidden_states.shape) 
     if quant_type in [QuantType.per_Token, QuantType.per_Tensor]:
         w1 = w1 * w1_scale.view(w1_scale.shape[0], -1, 1)
         hidden_states = hidden_states * a1_scale
@@ -1235,10 +1229,7 @@ def torch_moe_stage2(
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    aiter.logger.info('moe stage2')
-    aiter.logger.info(f'context {quant_type} {E} {model_dim} {inter_dim} {w1.shape} {w2.shape} {w1.dtype} {w2.dtype}')
-    aiter.logger.info(f'tag2.1 {w1.shape} {w2.shape} {w1.dtype} {w2.dtype}')
-    if quant_type == QuantType.per_1x32 and w2.dtype == torch.float4_e2m1fn_x2:
+    if quant_type == QuantType.per_1x32 and w2.dtype == dtypes.fp4x2
         from aiter.utility import fp4_utils
 
         w2 = fp4_utils.mxfp4_to_f32(w2)
@@ -1251,7 +1242,6 @@ def torch_moe_stage2(
     else:
         hidden_states = hidden_states.to(ctype)
         w2 = w2.to(ctype)
-    aiter.logger.info(f'tag2.2 {w1.shape} {w2.shape} {w1.dtype} {w2.dtype}')
 
     token_num, topk = topk_ids.shape
     hidden_states = hidden_states.view(token_num, topk, inter_dim)
@@ -1282,8 +1272,6 @@ def torch_moe_stage2(
         hidden_states = hidden_states.view(a2_shape)
 
         w2_shape = w2.shape
-        aiter.logger.info(f'dims {E}, {model_dim}, {inter_dim}')
-        aiter.logger.info(f'w2_shape {w2_shape} {w2.dtype}')
         w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
             E, model_dim, inter_dim // 32, 1
         )
