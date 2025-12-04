@@ -19,7 +19,10 @@ from torch import Tensor
 import triton
 import triton.language as tl
 import logging
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..iris import IrisCommContext
 
 try:
     import iris
@@ -231,8 +234,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     input_tensor: Tensor,
     gamma: Tensor,
     epsilon: float = 1e-6,
-    ctx=None,
-    heap_size: int = 1 << 30,
+    ctx: "IrisCommContext" = None,
     quant_mode: str = "none",
     do_allgather: bool = True,
     # Pre-allocated buffers (optional, for reuse across iterations)
@@ -248,8 +250,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         input_tensor (Tensor): Input tensor of shape [M, N] in Iris shared memory
         gamma (Tensor): RMSNorm weight of shape [N]
         epsilon (float): RMSNorm epsilon value. Default: 1e-6
-        ctx: Optional IrisCommContext. If None, a global context will be used.
-        heap_size (int): Heap size for Iris context if ctx is None
+        ctx (IrisCommContext): Iris communication context (required)
         quant_mode (str): Quantization mode - "none", "fp8_per_token". Default: "none"
         do_allgather (bool): Whether to perform all-gather stage. Default: True
         rs_buffer (Tensor, optional): Pre-allocated reduce-scatter buffer [M_shard, N]
@@ -279,9 +280,12 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         )
 
     if ctx is None:
-        from ..iris import _get_or_create_iris_context
-
-        ctx = _get_or_create_iris_context(heap_size=heap_size)
+        raise ValueError(
+            "ctx is required. Use IrisCommContext as a context manager:\n"
+            "  with IrisCommContext() as ctx:\n"
+            "      input_tensor = ctx.iris_ctx.ones((M, N), dtype=...)\n"
+            "      result = reduce_scatter_rmsnorm_quant_all_gather(input_tensor, gamma, ctx=ctx)"
+        )
 
     if not ctx._initialized:
         raise RuntimeError(
