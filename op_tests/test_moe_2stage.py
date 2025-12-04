@@ -124,8 +124,8 @@ def test_fmoe(
             w2_qt = w2_qt.view(*w2.shape[:-1], -1)
             w1_scale = w1_scale.view(w1.shape[0] * w1.shape[1], -1)
             w2_scale = w2_scale.view(w2.shape[0] * w2.shape[1], -1)
-            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale).float()
-            w2_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale).float()
+            w1_scale_aiter = w1_scale.bfloat16()
+            w2_scale_aiter = w1_scale.bfloat16()
 
 
     if qType != aiter.QuantType.per_1x32:
