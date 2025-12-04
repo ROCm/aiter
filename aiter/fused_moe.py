@@ -944,7 +944,6 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    
     sorted_weights_value = sorted_weights if not doweight_stage1 else None
     metadata.stage2(
         a2,
@@ -960,7 +959,6 @@ def fused_moe_2stages(
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
     )
-
 
     return moe_out
 
@@ -1137,7 +1135,7 @@ def torch_moe_stage1(
     topk = topk_weight.shape[1]
     N = w1.shape[1]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_1x32 and w1.dtype = dtypes.fp4x2:
+    if quant_type == QuantType.per_1x32 and w1.dtype == dtypes.fp4x2:
         from aiter.utility import fp4_utils
 
         w1 = fp4_utils.mxfp4_to_f32(w1)
