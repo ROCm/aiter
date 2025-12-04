@@ -789,7 +789,7 @@ class fmha_bwd_v3_kernel
         int gdx = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
-        if(fmha_v3_traits.mask > 0)
+        if(fmha_v3_traits.mask > 0 && args.mask_x == 0 && args.mask_y == 0)
         {
             int num_tg = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
             gdx        = (num_tg % 2) ? (num_tg / 2 + 1) : (num_tg / 2);

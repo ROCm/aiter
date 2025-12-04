@@ -340,6 +340,98 @@ struct __attribute__((packed)) fmha_bwd_v3_swa_genl_args
     p1 _p26;
 };
 
+struct __attribute__((packed)) fmha_bwd_v3_args_universal
+{
+    void *ptr_dq;                   // 0x00: dq or dq_acc
+    p2 _p0;
+    void *ptr_dk;                   // 0x10
+    p2 _p1;
+    void *ptr_dv;                   // 0x20
+    p2 _p2;
+    const void *ptr_q;              // 0x30
+    p2 _p3;
+    const void *ptr_k;              // 0x40
+    p2 _p4;
+    const void *ptr_v;              // 0x50
+    p2 _p5;
+    const void *ptr_do;             // 0x60
+    p2 _p6;
+    const void *ptr_lse;            // 0x70
+    p2 _p7;
+    const void *ptr_d;              // 0x80
+    p2 _p8;
+    float scalar;                   // 0x90
+    p3 _p9;
+    float log2e;                    // 0xa0
+    p3 _p10;
+    unsigned int seqlen_q;          // 0xb0: s_seq_len_q
+    p3 _p11;
+    unsigned int Ts;                // 0xc0: s_Seqs_k*sub_K
+    p3 _p12;
+    unsigned int Hs_q;              // 0xd0: s_Hs_q
+    p3 _p13;
+    unsigned int BAs_q;             // 0xe0: s_BAs_q
+    p3 _p14;
+    unsigned int Seqs_q;            // 0xf0: s_Seqs_q
+    p3 _p15;
+    unsigned int ratio;             // 0x100
+    p3 _p16;
+    unsigned int Hs_k;              // 0x110: s_Hs_k
+    p3 _p17;
+    unsigned int BAs_k;             // 0x120: s_BAs_k
+    p3 _p18;
+    unsigned int Seqs_k;            // 0x130: s_Seqs_k
+    p3 _p19;
+    unsigned int Seqs_dk;           // 0x140: s_Seqs_dk
+    p3 _p20;
+    unsigned int seqlen_k;          // 0x150: batch mode
+    p3 _p21;
+    unsigned int head_dim_q;        // 0x160: batch&group mode for headdim padding
+    p3 _p22;
+    unsigned int head_dim_v;        // 0x170: batch&group mode for headdim padding
+    p3 _p23;
+    unsigned int nhead_q;           // 0x180: batch mode lsed([B,H,S]) addr = batch_idx * nhead_q * seqlen_q * 4 + head_idx * seqlen_q * 4
+    p3 _p24;
+    unsigned int Hs_v;              // 0x190: batch&group mode
+    p3 _p25;
+    unsigned int BAs_v;             // 0x1a0: batch mode
+    p3 _p26;
+    unsigned int Seqs_v;            // 0x1b0: batch&group mode
+    p3 _p27;
+    unsigned int Hs_do;             // 0x1c0: batch&group mode
+    p3 _p28;
+    unsigned int BAs_do;            // 0x1d0: group mode
+    p3 _p29;
+    unsigned int Seqs_do;           // 0x1e0: batch&group mode
+    p3 _p30;
+    unsigned int Hs_dk;             // 0x1f0: batch&group mode
+    p3 _p31;
+    unsigned int BAs_dk;            // 0x200: group mode
+    p3 _p32;
+    unsigned int Hs_dv;             // 0x210: batch&group mode
+    p3 _p33;
+    unsigned int BAs_dv;            // 0x220: group mode
+    p3 _p34;
+    unsigned int Seqs_dv;           // 0x230: batch&group mode
+    p3 _p35;
+    unsigned int Hs_lsed;           // 0x240: group mode lsed([H,TotalValid_Q(90)]) addr = seqstart_q[batch_idx] * 4 + head_idx * nhead_stride_lsed(s_Hs_lsed)
+    p3 _p36;
+    const void *ptr_qseq;                 // 0x250: group mode seqstart_q [0, 20, 50, 90]
+    p2 _p37;
+    const void *ptr_kseq;                 // 0x260: group mode seqstart_k [0, 50, 110, 180]
+    p2 _p38;
+    const void *ptr_qseq_padded;          // 0x270: group mode seqstart_q_padded [0, 30(20+10), 70(20+10+30+10), 120(20+10+30+10+40+10)] if 10 is padded after each seqlen[30(20+10), 40(30+10), 50(40+10)]
+    p2 _p39;
+    const void *ptr_kseq_padded;          // 0x280: group mode seqstart_k_padded [0, 60(50+10), 130(50+10+60+10), 200(50+10+60+10+70+10)] if 10 is padded after each seqlen[60(50+10), 70(60+10), 80(70+10)]
+    p2 _p40;
+    unsigned int max_seqlen_dq;    // 0x290: gorup mode max seqlen q for a16 dq_acc store, padding to 16x
+    p3 _p41;
+    int mask_x;                     // 0x2a0
+    p3 _p42;
+    int mask_y;                     // 0x2b0
+    p3 _p43;
+};
+
 struct __attribute__((packed)) fmha_bwd_odo_args
 {
     const void *ptr_o;
