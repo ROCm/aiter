@@ -113,8 +113,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                                FlatmmConfig::NumWaveGroups,
                                                                true>; // Preshuffle_
 
-    // constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t>;
-    static constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t> || std::is_same_v<BDataType, ck_tile::pk_int4_t>;
+    static constexpr bool IsInt4 = std::is_same_v<BDataType, ck_tile::pk_int4_t>;
+    static constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t> || IsInt4;
 
     if constexpr(!MXFP4_Pipeline && moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)
     {
@@ -141,12 +141,6 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
     float ave_time{0};
-
-    // auto Info = [&]()
-    // {
-    //     return concat(
-    //         '_', "moe_flatmm", gemm_prec_str<ADataType, BDataType>, FlatmmPipeline::GetName());
-    // }
 
     const auto Run = [&](const auto has_hot_loop_,
                          const auto tail_number_,
@@ -210,11 +204,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
             ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
-        // using FusedAct =
-        //    std::conditional_t<MXFP4_Pipeline, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
-
         using FusedAct =
-            std::conditional_t<MXFP4_Pipeline, ck_tile::moe::MoeSilu, ck_tile::moe::MoeSilu>;
+            std::conditional_t<MXFP4_Pipeline, std::conditional_t<IsInt4, ck_tile::moe::MoeSilu, ck_tile::moe::Swiglu>, ck_tile::moe::MoeSilu>;
 
         using Kernel = ck_tile::MoeFlatmmKernel<TilePartitioner,
                                                 CodegenFlatmmPipeline,
