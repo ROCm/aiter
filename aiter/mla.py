@@ -460,26 +460,26 @@ def mla_ps_prefill_fwd(
     )
 
     # This is triton kernel
-    # mla_prefill_reduce(
-    #     logits,
-    #     attn_lse,
-    #     reduce_indptr,
-    #     reduce_final_map,
-    #     reduce_partial_map,
-    #     output,
-    #     tile_q=256,
-    #     use_triton=True,  # Set to False to use PyTorch fallback
-    # )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
-    aiter.mla_reduce_v1(
+    mla_prefill_reduce(
         logits,
         attn_lse,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
         output,
-        final_lse,
+        tile_q=256,
+        use_triton=True,  # Set to False to use PyTorch fallback
     )
+    # final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    # aiter.mla_reduce_v1(
+    #     logits,
+    #     attn_lse,
+    #     reduce_indptr,
+    #     reduce_final_map,
+    #     reduce_partial_map,
+    #     output,
+    #     final_lse,
+    # )
 
 
     return output.view(total_s, nhead, v_head_dim), attn_lse
@@ -493,8 +493,8 @@ def _mla_prefill_reduce_kernel(
     partial_lse_ptr,        # [padded_num_tokens * available_tgs, num_head_q]
     # Metadata tensors
     reduce_indptr_ptr,      # [num_reduce_groups + 1]
-    reduce_final_map_ptr,   # [num_reduce_groups, 4]: [qo_start, qo_end, q_head_start, q_head_end]
-    reduce_partial_map_ptr, # [num_partial_tiles, 3]: [partial_qo_loc, q_head_start, q_head_end]
+    reduce_final_map_ptr,   # [num_reduce_groups, 2]: [qo_start, qo_end]
+    reduce_partial_map_ptr, # [num_partial_tiles]: [partial_qo_loc]
     # Output tensor
     output_ptr,             # [total_tokens, num_head_q, v_head_dim]
     # Strides
@@ -516,8 +516,7 @@ def _mla_prefill_reduce_kernel(
     Each program processes one (reduce_group, head, token) combination.
     Grid: (num_reduce_groups, num_heads, TILE_Q)
 
-    Optimized to have each thread block process a full row (all dimensions),
-    so LSE and metadata are only read once per token.
+    All heads are uniformly split and reduced together.
     """
     group_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -531,17 +530,10 @@ def _mla_prefill_reduce_kernel(
     if num_partials == 0:
         return
 
-    # Load final map: [qo_start, qo_end, q_head_start, q_head_end] (read once per block)
-    final_map_offset = group_id * 4
+    # Load final map: [qo_start, qo_end]
+    final_map_offset = group_id * 2
     qo_start = tl.load(reduce_final_map_ptr + final_map_offset + 0)
     qo_end = tl.load(reduce_final_map_ptr + final_map_offset + 1)
-    q_head_start = tl.load(reduce_final_map_ptr + final_map_offset + 2)
-    q_head_end = tl.load(reduce_final_map_ptr + final_map_offset + 3)
-
-    # Check if this head is in range
-    actual_head_id = q_head_start + head_id
-    if actual_head_id >= q_head_end:
-        return
 
     q_len = qo_end - qo_start
     tok_id = tok_offset
@@ -550,15 +542,14 @@ def _mla_prefill_reduce_kernel(
     if tok_id >= q_len:
         return
 
-    # Load all partial_qo_loc onc
+    # Load all partial_qo_loc
     partial_qo_locs = tl.zeros([MAX_PARTIALS], dtype=tl.int32)
     for p_idx in range(MAX_PARTIALS):
         if p_idx < num_partials:
             partial_map_idx = start_idx + p_idx
-            partial_map_offset = partial_map_idx * 3
             partial_qo_locs = tl.where(
                 p_idx == tl.arange(0, MAX_PARTIALS),
-                tl.load(reduce_partial_map_ptr + partial_map_offset + 0),
+                tl.load(reduce_partial_map_ptr + partial_map_idx),
                 partial_qo_locs
             )
 
@@ -568,9 +559,9 @@ def _mla_prefill_reduce_kernel(
 
     for p_idx in range(MAX_PARTIALS):
         if p_idx < num_partials:
-            partial_qo_loc = tl.load(reduce_partial_map_ptr + (start_idx + p_idx) * 3 + 0)
+            partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
 
-            lse_offset = (partial_qo_loc + tok_id) * stride_lse_tok + actual_head_id * stride_lse_head
+            lse_offset = (partial_qo_loc + tok_id) * stride_lse_tok + head_id * stride_lse_head
             lse = tl.load(partial_lse_ptr + lse_offset)
 
             is_valid = lse == lse
@@ -608,7 +599,7 @@ def _mla_prefill_reduce_kernel(
 
         for p_idx in range(MAX_PARTIALS):
             if p_idx < num_partials:
-                partial_qo_loc = tl.load(reduce_partial_map_ptr + (start_idx + p_idx) * 3 + 0)
+                partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
 
                 # reuse LSE value
                 lse = tl.sum(tl.where(p_idx == tl.arange(0, MAX_PARTIALS), lse_values, 0.0))
@@ -616,7 +607,7 @@ def _mla_prefill_reduce_kernel(
                 scale = tl.exp(lse - final_lse)
 
                 # load partial output
-                out_offset = (partial_qo_loc + tok_id) * stride_po_tok + actual_head_id * stride_po_head + dim_offs * stride_po_dim
+                out_offset = (partial_qo_loc + tok_id) * stride_po_tok + head_id * stride_po_head + dim_offs * stride_po_dim
                 partial_out = tl.load(partial_output_ptr + out_offset, mask=dim_mask, other=0.0)
 
                 # Handle NaN in output (NaN != NaN)
@@ -625,7 +616,7 @@ def _mla_prefill_reduce_kernel(
 
                 acc += scale * partial_out
 
-        output_offset = (qo_start + tok_id) * stride_o_tok + actual_head_id * stride_o_head + dim_offs * stride_o_dim
+        output_offset = (qo_start + tok_id) * stride_o_tok + head_id * stride_o_head + dim_offs * stride_o_dim
         tl.store(output_ptr + output_offset, acc.to(output_ptr.dtype.element_ty), mask=dim_mask)
 
 
@@ -633,14 +624,13 @@ def mla_prefill_reduce_triton(
     partial_output: torch.Tensor,      # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
     partial_lse: torch.Tensor,         # [padded_num_tokens * available_tgs, num_head_q]
     reduce_indptr: torch.Tensor,       # [num_reduce_groups + 1], int32
-    reduce_final_map: torch.Tensor,    # [num_reduce_groups, 4], int32
-                                       # [qo_start, qo_end, q_head_start, q_head_end]
-    reduce_partial_map: torch.Tensor,  # [num_partial_tiles, 3], int32
-                                       # [partial_qo_loc, q_head_start, q_head_end]
+    reduce_final_map: torch.Tensor,    # [num_reduce_groups, 2], int32: [qo_start, qo_end]
+    reduce_partial_map: torch.Tensor,  # [num_partial_tiles], int32: [partial_qo_loc]
     output: torch.Tensor,              # [total_tokens, num_head_q, v_head_dim], output buffer
     tile_q: int = 256,                 # Q tile size (for padding)
 ) -> None:
-    """Triton version of mla_prefill_reduce
+    """Triton version of mla_prefill_reduce.
+    All heads are uniformly split and reduced together.
     """
 
     num_reduce_groups = reduce_indptr.shape[0] - 1
@@ -692,10 +682,8 @@ def mla_prefill_reduce(
     partial_output: torch.Tensor,      # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
     partial_lse: torch.Tensor,         # [padded_num_tokens * available_tgs, num_head_q]
     reduce_indptr: torch.Tensor,       # [num_reduce_groups + 1], int32
-    reduce_final_map: torch.Tensor,    # [num_reduce_groups, 4], int32
-                                       # [qo_start, qo_end, q_head_start, q_head_end]
-    reduce_partial_map: torch.Tensor,  # [num_partial_tiles, 3], int32
-                                       # [partial_qo_loc, q_head_start, q_head_end]
+    reduce_final_map: torch.Tensor,    # [num_reduce_groups, 2], int32: [qo_start, qo_end]
+    reduce_partial_map: torch.Tensor,  # [num_partial_tiles], int32: [partial_qo_loc]
     output: torch.Tensor,              # [total_tokens, num_head_q, v_head_dim], output buffer
     tile_q: int = 256,                 # Q tile size (for padding)
     use_triton: bool = True,           # Whether to use Triton kernel
@@ -714,6 +702,7 @@ def mla_prefill_reduce(
     num_reduce_groups = reduce_indptr.shape[0] - 1
     device = partial_output.device
     dtype = partial_output.dtype
+    _, num_heads, v_head_dim = partial_output.shape
 
     for group_id in range(num_reduce_groups):
         start_idx = reduce_indptr[group_id].item()  # 0
@@ -726,46 +715,31 @@ def mla_prefill_reduce(
         final_map = reduce_final_map[group_id]
         qo_start = final_map[0].item()
         qo_end = final_map[1].item()
-        q_head_start = final_map[2].item()
-        q_head_end = final_map[3].item()
 
         q_len = qo_end - qo_start  # actual length (may be < tile_q for last tile)
-        num_heads = q_head_end - q_head_start
-        v_head_dim = partial_output.shape[2]
-
         read_len = tile_q
 
+        # Collect partial indices
         partial_indices = []
-        partial_heads = []
-
         for partial_idx in range(start_idx, end_idx):
-            partial_map = reduce_partial_map[partial_idx]
-            partial_qo_loc = partial_map[0].item()
-            partial_q_head_start = partial_map[1].item()
-            partial_q_head_end = partial_map[2].item()
-
+            partial_qo_loc = reduce_partial_map[partial_idx].item()
             partial_indices.append(partial_qo_loc)
-            partial_heads.append((partial_q_head_start, partial_q_head_end))
 
-        for head_offset in range(num_heads):
-            head_idx = q_head_start + head_offset
-
+        # Process all heads together
+        for head_idx in range(num_heads):
             partial_lses = []
             partial_outputs = []
 
-            for i, (partial_qo_loc, (ph_start, ph_end)) in enumerate(
-                zip(partial_indices, partial_heads)
-            ):
-                if ph_start <= head_idx < ph_end:
-                    lse = partial_lse[
-                        partial_qo_loc : partial_qo_loc + read_len, head_idx
-                    ]
-                    partial_lses.append(lse)
+            for partial_qo_loc in partial_indices:
+                lse = partial_lse[
+                    partial_qo_loc : partial_qo_loc + read_len, head_idx
+                ]
+                partial_lses.append(lse)
 
-                    out = partial_output[
-                        partial_qo_loc : partial_qo_loc + read_len, head_idx, :
-                    ]
-                    partial_outputs.append(out)
+                out = partial_output[
+                    partial_qo_loc : partial_qo_loc + read_len, head_idx, :
+                ]
+                partial_outputs.append(out)
 
             if len(partial_lses) == 0:
                 continue
@@ -796,9 +770,6 @@ def mla_prefill_reduce(
 
             nan_output_mask = torch.isnan(partial_outputs)  # [K, tile_q, D]
             partial_outputs_clean = torch.where(nan_output_mask, zero, partial_outputs)
-
-            # nan_scale_mask = torch.isnan(scales) | torch.isinf(scales)
-            # scales_clean = torch.where(nan_scale_mask, zero, scales)
 
             final_output = torch.sum(partial_outputs_clean * scales, dim=0)  # [tile_q, v_head_dim]
 
