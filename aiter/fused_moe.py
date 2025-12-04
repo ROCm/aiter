@@ -670,7 +670,9 @@ def get_2stage_cfgs(
         run_1stage = cfg.get("run_1stage", False)
 
     tag = f"({kernelName1=}, {kernelName2=})"
-
+    logger.info(
+        f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
+    )
     if run_1stage:
         return MOEMetadata(
             functools.partial(
@@ -740,8 +742,6 @@ def get_2stage_cfgs(
     if block_m not in tmpList:
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
-
-    block_m = 128 # yadai force
 
     return MOEMetadata(
         functools.partial(
@@ -890,8 +890,6 @@ def fused_moe_2stages(
         w1_scale=w1_scale,
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
-    
-    aiter.logger.info(f'a2 = {a2}')
 
     if (
         quant_type == QuantType.per_1x32
@@ -1243,7 +1241,7 @@ def torch_moe_stage2(
     aiter.logger.info('moe stage2')
     aiter.logger.info(f'context {quant_type} {E} {model_dim} {inter_dim} {w1.shape} {w2.shape} {w1.dtype} {w2.dtype}')
     aiter.logger.info(f'tag2.1 {w1.shape} {w2.shape} {w1.dtype} {w2.dtype}')
-    if quant_type == QuantType.per_1x32 and False:
+    if quant_type == QuantType.per_1x32 and w2.dtype == torch.float4_e2m1fn_x2:
         from aiter.utility import fp4_utils
 
         w2 = fp4_utils.mxfp4_to_f32(w2)
