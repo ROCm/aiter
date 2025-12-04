@@ -517,7 +517,7 @@ __global__ void kn_mla_reduce_v1_ps(
                 params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds_lse_scale);
         }
         // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata should be in
-        // charge of getting rid of this kind of scenaro.
+        // charge of getting rid of this kind of scenario.
         else if (num_splits > 1)
         {
             mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
@@ -547,7 +547,7 @@ __global__ void kn_mla_reduce_v1(
             params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds_lse_scale);
     }
     // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata should be in charge
-    // of getting rid of this kind of scenaro.
+    // of getting rid of this kind of scenario.
     else if (num_splits > 1)
     {
         mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
@@ -726,7 +726,7 @@ void dispatch_mla_reduce_v1(
     if (lds_size <= (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
     {
         const int32_t ps_grid_size = num_cu * Traits::kOccupancy * 2;
-        if (Traits::kNumHeadQ * Traits::kNumThreadGroupPerSeq* params.num_reduce_tile <= ps_grid_size)
+        if (Traits::kNumHeadQ * Traits::kNumThreadGroupPerSeq * params.num_reduce_tile <= ps_grid_size)
         {
             const dim3 grid = dim3(Traits::kNumHeadQ, Traits::kNumThreadGroupPerSeq, params.num_reduce_tile);
             kn_mla_reduce_v1<Traits, lse_t, out_t><<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
