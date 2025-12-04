@@ -1466,7 +1466,7 @@ namespace aiter
      * will cause contention on NVLink bus.
      */
     template <typename T>
-    void allreduce(hipStream_t stream, T *input, T *output, int size, bool use_new = false,
+    void allreduce(hipStream_t stream, T *input, T *output, int size, bool use_new = true,
 #ifndef USE_ROCM
                    int threads = 512, int block_limit = 20){
 #else
