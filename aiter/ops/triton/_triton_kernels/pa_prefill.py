@@ -110,9 +110,7 @@ def _fwd_kernel(
         + offs_d[None, :] * stride_qd
     )
 
-    dim_mask = tl.where(tl.arange(0, BLOCK_DMODEL_PADDED) < BLOCK_DMODEL, 1, 0).to(
-        tl.int1
-    )  # [D]
+    dim_mask = tl.arange(0, BLOCK_DMODEL_PADDED) < BLOCK_DMODEL  # [D]
 
     q = tl.load(
         Q + off_q,
@@ -399,9 +397,7 @@ def _fwd_kernel_alibi(
         + offs_d[None, :] * stride_qd
     )
 
-    dim_mask = tl.where(tl.arange(0, BLOCK_DMODEL_PADDED) < BLOCK_DMODEL, 1, 0).to(
-        tl.int1
-    )
+    dim_mask = tl.arange(0, BLOCK_DMODEL_PADDED) < BLOCK_DMODEL
 
     q = tl.load(
         Q + off_q,

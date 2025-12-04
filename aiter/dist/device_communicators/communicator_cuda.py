@@ -140,7 +140,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self._all2all_manager_created = True
 
     def all_reduce(
-        self, input_, use_new: bool = False, ca_fp8_quant: bool = False
+        self, input_, use_new: bool = True, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)

@@ -97,7 +97,7 @@ def _fwd_kernel_stage2_asm(
             )
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache()
 def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     if num_kv_splits is None:
         cu_num = get_cu_num()
@@ -116,8 +116,6 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         ]
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
-    get_mgc = {16: 16, 128: 16}
-
     get_block_n_fp8 = {
         16: 128,
         32: 128,
@@ -135,16 +133,11 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
             num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
         )
 
-    assert nhead in get_mgc, f"{nhead=} not supported"
-    mgc = get_mgc[nhead]
-    if max_seqlen_q == 1 and nhead == 16:
-        mgc = 64
-
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
     )
 
-    return num_kv_splits, mgc, num_kv_splits_indptr
+    return num_kv_splits, num_kv_splits_indptr
 
 
 def mla_decode_fwd(
@@ -185,9 +178,12 @@ def mla_decode_fwd(
     io_transformed = False
 
     if not persistent_mode:
-        num_kv_splits, mgc, num_kv_splits_indptr = get_meta_param(
-            num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
-        )
+        if num_kv_splits is None or num_kv_splits_indptr is None:
+            num_kv_splits, num_kv_splits_indptr = get_meta_param(
+                num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
+            )
+
+        mgc = 64 if max_seqlen_q == 1 and nhead == 16 else 16
 
         MAYBE_FINAL_OUT = True
 
