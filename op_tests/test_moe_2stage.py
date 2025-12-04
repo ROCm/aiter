@@ -254,6 +254,7 @@ def test_fmoe(
         w1_scale=w1_scale,
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
+        WQDType=WQDType,
     )
 
     # ######################## stage 2 start ###########
@@ -285,6 +286,7 @@ def test_fmoe(
         a2_scale=a2_scale,
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
+        WQDType=WQDType,
     )
 
     aiter.logger.info("ref stage 2 done")
