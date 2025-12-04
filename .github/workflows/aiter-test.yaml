@@ -61,7 +61,7 @@ jobs:
       - name: Show output variable
         run: |
           echo "Standard: ${{ steps.machines.outputs.standard_runners }}"
-          echo "Multipe: ${{ steps.machines.outputs.multigpu_runners }}"
+          echo "Multiple: ${{ steps.machines.outputs.multigpu_runners }}"
 
   build_aiter_image:
     runs-on: aiter-k8s-build
@@ -70,11 +70,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Show current directory
-        run: |
-          echo "Current directory: $(pwd)"
-          echo "ls -a $(pwd)"
-
       - name: Generate Dockerfile
         run: |
           cat <<EOF > Dockerfile.mod
