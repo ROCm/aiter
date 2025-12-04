@@ -77,8 +77,6 @@ with IrisCommContext(heap_size=heap_size) as ctx:
     pass
 ```
 
-For more details, see [docs/iris_communication.md](docs/iris_communication.md)
-
 ## Run operators supported by aiter
 
 There are number of op test, you can run them with: `python3 op_tests/test_layernorm2d.py`
