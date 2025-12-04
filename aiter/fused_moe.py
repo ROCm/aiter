@@ -222,9 +222,12 @@ def fused_moe_(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-    # q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    # q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
-    q_dtype_a = hidden_states.dtype
+    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    if quant_type == QuantType.per_1x32:
+        if q_dtype_w == torch.uint8 or activation == activation.Swiglu
+            q_dtype_a = torch.bfloat16
+        else:
+            q_dtype_a = dtypes.fp4x2
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
