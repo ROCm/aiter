@@ -374,7 +374,7 @@ l_quant = [
     # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4, int4
 ]
 # l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
@@ -523,7 +523,7 @@ for (
         dtypes.bf16,
         dtypes.fp4x2,
     ):
-        act_type = aiter.ActivationType.Swiglu if wq_dtype == dtype.fp4x2 else aiter.ActivationType.Silu
+        act_type = aiter.ActivationType.Swiglu if wq_dtype == dtypes.fp4x2 else aiter.ActivationType.Silu
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
             for m in l_tokenNum:
                 ret = test_fmoe(
