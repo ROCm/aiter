@@ -302,12 +302,6 @@ def test_fused_with_fp8_quant(tp_size, M, N, dtype, heap_size=1 << 30):
         x = torch.randn(M, N, dtype=dtype) * (i + 1)
         inputs.append(x)
 
-    # Compute reference
-    epsilon = 1e-6
-    ref_normed_shards = reference_reduce_scatter_rmsnorm(
-        inputs, gamma, epsilon, M_shard
-    )
-
     # Run fused kernel on each GPU
     pool = mp.Pool(processes=tp_size)
     results = []
