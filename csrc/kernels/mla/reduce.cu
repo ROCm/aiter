@@ -10,9 +10,7 @@
 
 template <int32_t kSizeDV_,
           int32_t kNumHeadQ_,
-          int32_t kNumThreadGroupPerSeq_,
-          bool    kOutputLse_,
-          bool    kOmitReduceFinalMap_>
+          int32_t kNumThreadGroupPerSeq_>
 struct MlaReduceKernelV1Traits
 {
     static constexpr int32_t kSizeDV             = kSizeDV_;       // hidden dimension size of value/output
@@ -21,12 +19,8 @@ struct MlaReduceKernelV1Traits
     static constexpr int32_t kNumThreads         = kNumWarps * ck_tile::get_warp_size();
     static constexpr int32_t kOccupancy          = 8;
     static constexpr int32_t kMaxVgprLocalLse    = 16;             // scratch buffer will be used with larger value
-    static constexpr bool    kOutputLse          = kOutputLse_;
     static constexpr int32_t kNumThreadGroupPerSeq = kNumThreadGroupPerSeq_;
     static constexpr int32_t kMassiveThreshold   = 4;              // use massive pipeline if #splits >= this value
-    // There is no reduce final map. In this case, qo len is uniform and
-    // implicitly set by reduce_partial_map[1] - reduce_partial_map[0].
-    static constexpr bool    kOmitReduceFinalMap = kOmitReduceFinalMap_;
 
     static_assert(kNumThreadGroupPerSeq > 0);
 };
@@ -46,6 +40,9 @@ struct MlaReduceKernelV1Params
     int32_t stride_h_o;
     int32_t max_splits;
     int32_t num_reduce_tile;
+    bool    output_lse;
+    bool    use_reduce_final_map;   // If true, qo len is uniform and implicitly set by
+                                    // reduce_partial_map[1] - reduce_partial_map[0].
 };
 
 template <typename T>
@@ -239,7 +236,7 @@ CK_TILE_DEVICE void reduce_lse_massive(
 
         // Get global LSE
         float global_lse = ((sum_lse == 0.f) || (sum_lse != sum_lse)) ? INFINITY : (logf(sum_lse) + max_lse);
-        if constexpr (Traits::kOutputLse)
+        if (params.output_lse)
         {
             if (lane_idx == 0)
             {
@@ -322,14 +319,14 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_massive(
     const int32_t reduce_partial_map_1 = params.p_reduce_partial_map[reduce_tile_start + 1];
     const MlaPartialTileInfo final_loc = [&]()
     {
-        if constexpr (Traits::kOmitReduceFinalMap)
+        if (params.use_reduce_final_map)
         {
-            const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
-            return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
+            return params.p_reduce_final_map[tile_idx];
         }
         else
         {
-            return params.p_reduce_final_map[tile_idx];
+            const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
+            return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
         }
     }();
 
@@ -402,14 +399,14 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_simple(
     const int32_t reduce_partial_map_1 = params.p_reduce_partial_map[reduce_tile_start + 1];
     const MlaPartialTileInfo final_loc = [&]()
     {
-        if constexpr (Traits::kOmitReduceFinalMap)
+        if (params.use_reduce_final_map)
         {
-            const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
-            return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
+            return params.p_reduce_final_map[tile_idx];
         }
         else
         {
-            return params.p_reduce_final_map[tile_idx];
+            const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
+            return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
         }
     }();
 
@@ -475,7 +472,7 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_simple(
         auto dram_out = MakeTileWindow<Traits, out_t>(p_final_out);
         ck_tile::store_tile(dram_out, ck_tile::cast_tile<out_t>(reg_out));
 
-        if constexpr(Traits::kOutputLse)
+        if (params.output_lse)
         {
             const float final_lse =
                 ((sum_e_lse == 0.f) || (sum_e_lse != sum_e_lse)) ? INFINITY : (logf(sum_e_lse) + max_lse);
@@ -553,168 +550,114 @@ __global__ void kn_mla_reduce_v1(
     }
 }
 
-#define MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NUM_WG_PER_SEQ_C, NAME, ...)     \
-    constexpr int32_t NumHeads  = (NUM_HEAD_C);                                                             \
-    constexpr int32_t HeadDim   = (HEAD_DIM_C);                                                             \
-    constexpr int32_t NumWgPerSeq = (NUM_WG_PER_SEQ_C);                                                     \
-    constexpr bool    OutputLse = (OUTPUT_LSE_C);                                                           \
-    constexpr bool    NoReduceFinalMap = (NRFM_C);                                                          \
-    using Traits = MlaReduceKernelV1Traits<HeadDim, NumHeads, NumWgPerSeq, OutputLse, NoReduceFinalMap>;    \
+#define MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_SEQ_C, NAME, ...)   \
+    constexpr int32_t NumHeads  = (NUM_HEAD_C);                                     \
+    constexpr int32_t HeadDim   = (HEAD_DIM_C);                                     \
+    constexpr int32_t NumWgPerSeq = (NUM_WG_PER_SEQ_C);                             \
+    using Traits = MlaReduceKernelV1Traits<HeadDim, NumHeads, NumWgPerSeq>;         \
     __VA_ARGS__;
 
 // NRFM: No Reduce Final Map
-#define MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NUM_WG_PER_SEQ, NAME, ...)            \
-    if ((NUM_WG_PER_SEQ) == 1)                                                                              \
-    {                                                                                                       \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 1, NAME, __VA_ARGS__)            \
-    }                                                                                                       \
-    else if ((NUM_WG_PER_SEQ) == 2)                                                                         \
-    {                                                                                                       \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 2, NAME, __VA_ARGS__)            \
-    }                                                                                                       \
-    else if ((NUM_WG_PER_SEQ) == 4)                                                                         \
-    {                                                                                                       \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 4, NAME, __VA_ARGS__)            \
-    }                                                                                                       \
-    else if ((NUM_WG_PER_SEQ) == 64)                                                                        \
-    {                                                                                                       \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 64, NAME, __VA_ARGS__)           \
-    }                                                                                                       \
-    else if ((NUM_WG_PER_SEQ) == 256)                                                                       \
-    {                                                                                                       \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, 256, NAME, __VA_ARGS__)          \
-    }                                                                                                       \
-    else                                                                                                    \
-    {                                                                                                       \
-        std::stringstream ss;                                                                               \
-        ss << "NUM_WG_PER_SEQ=" << (NUM_WG_PER_SEQ);                                                        \
-        TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");        \
+#define MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_SEQ, NAME, ...)                              \
+    if ((NUM_WG_PER_SEQ) == 1)                                                                          \
+    {                                                                                                   \
+        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 1, NAME, __VA_ARGS__)                              \
+    }                                                                                                   \
+    else if ((NUM_WG_PER_SEQ) == 2)                                                                     \
+    {                                                                                                   \
+        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 2, NAME, __VA_ARGS__)                              \
+    }                                                                                                   \
+    else if ((NUM_WG_PER_SEQ) == 4)                                                                     \
+    {                                                                                                   \
+        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 4, NAME, __VA_ARGS__)                              \
+    }                                                                                                   \
+    else if ((NUM_WG_PER_SEQ) == 64)                                                                    \
+    {                                                                                                   \
+        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 64, NAME, __VA_ARGS__)                             \
+    }                                                                                                   \
+    else if ((NUM_WG_PER_SEQ) == 256)                                                                   \
+    {                                                                                                   \
+        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 256, NAME, __VA_ARGS__)                            \
+    }                                                                                                   \
+    else                                                                                                \
+    {                                                                                                   \
+        std::stringstream ss;                                                                           \
+        ss << "NUM_WG_PER_SEQ=" << (NUM_WG_PER_SEQ);                                                    \
+        TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");    \
     }
 
-#define MLA_REDUCE_CASE_IF(NUM_HEAD, NUM_HEAD_C,                                                            \
-                          HEAD_DIM, HEAD_DIM_C,                                                             \
-                          OUTPUT_LSE, OUTPUT_LSE_C,                                                         \
-                          NRFM, NRFM_C,                                                                     \
-                          NUM_WG_PER_SEQ,                                                                   \
-                          NAME, ...)                                                                        \
-    if (((NUM_HEAD) == (NUM_HEAD_C)) &&                                                                     \
-        ((HEAD_DIM) == (HEAD_DIM_C)) &&                                                                     \
-        ((OUTPUT_LSE) == (OUTPUT_LSE_C)) &&                                                                 \
-        ((NRFM) == (NRFM_C)))                                                                               \
-    {                                                                                                       \
-        MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+#define MLA_REDUCE_CASE_IF(NUM_HEAD, NUM_HEAD_C,                                    \
+                          HEAD_DIM, HEAD_DIM_C,                                     \
+                          NUM_WG_PER_SEQ,                                           \
+                          NAME, ...)                                                \
+    if (((NUM_HEAD) == (NUM_HEAD_C)) &&                                             \
+        ((HEAD_DIM) == (HEAD_DIM_C)))                                               \
+    {                                                                               \
+        MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)  \
     }
 
-#define MLA_REDUCE_CASE_EF(NUM_HEAD, NUM_HEAD_C,                                                            \
-                          HEAD_DIM, HEAD_DIM_C,                                                             \
-                          OUTPUT_LSE, OUTPUT_LSE_C,                                                         \
-                          NRFM, NRFM_C,                                                                     \
-                          NUM_WG_PER_SEQ,                                                                   \
-                          NAME, ...)                                                                        \
-    else if (((NUM_HEAD) == (NUM_HEAD_C)) &&                                                                \
-             ((HEAD_DIM) == (HEAD_DIM_C)) &&                                                                \
-             ((OUTPUT_LSE) == (OUTPUT_LSE_C)) &&                                                            \
-             ((NRFM) == (NRFM_C)))                                                                          \
-    {                                                                                                       \
-        MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+#define MLA_REDUCE_CASE_EF(NUM_HEAD, NUM_HEAD_C,                                    \
+                           HEAD_DIM, HEAD_DIM_C,                                    \
+                           NUM_WG_PER_SEQ,                                          \
+                           NAME, ...)                                               \
+    else if (((NUM_HEAD) == (NUM_HEAD_C)) &&                                        \
+             ((HEAD_DIM) == (HEAD_DIM_C)))                                          \
+    {                                                                               \
+        MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)  \
     }
 
-#define MLA_REDUCE_ERROR(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME)                                        \
-    {                                                                                                       \
-        std::stringstream ss;                                                                               \
-        ss << "#heads: " << (NUM_HEAD)                                                                      \
-           << ", head dimension: " << (HEAD_DIM)                                                            \
-           << ", Output LSE: " << (OUTPUT_LSE)                                                              \
-           << ", Has reduce final map: " << (!NRFM);                                                        \
-        TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");        \
+#define MLA_REDUCE_ERROR(NUM_HEAD, HEAD_DIM, NAME)                                                      \
+    {                                                                                                   \
+        std::stringstream ss;                                                                           \
+        ss << "#heads: " << (NUM_HEAD)                                                                  \
+           << ", head dimension: " << (HEAD_DIM);                                                       \
+        TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");    \
     }
 
-#define MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NUM_WG_PER_SEQ, NAME, ...)                   \
-    MLA_REDUCE_CASE_IF(                                                                                      \
-        NUM_HEAD,   1, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   1, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   1, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   1, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD, 128, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD, 128, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD, 128, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD, 128, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD, 128, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD, 128, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, true,  NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD, 128, HEAD_DIM, 512, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    MLA_REDUCE_CASE_EF(                                                                                      \
-        NUM_HEAD, 128, HEAD_DIM, 512, OUTPUT_LSE, false, NRFM, false, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)     \
-    else MLA_REDUCE_ERROR(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME);                                       \
+#define MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_SEQ, NAME, ...)    \
+    MLA_REDUCE_CASE_IF(                                                     \
+        NUM_HEAD,   1, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,   8, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  10, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  16, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  16, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD, 128, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD, 128, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    else MLA_REDUCE_ERROR(NUM_HEAD, HEAD_DIM, NAME);
 
-#define DISPATCH_MLA_REDUCE_KERNEL(LSE_TYPE, OUT_TYPE, NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NUM_WG_PER_SEQ, NAME, ...) \
-    switch ((LSE_TYPE))                                                                                                 \
-    {                                                                                                                   \
-        case at::ScalarType::Float:                                                                                     \
-        {                                                                                                               \
-            using lse_t = float;                                                                                        \
-            switch ((OUT_TYPE))                                                                                         \
-            {                                                                                                           \
-                case at::ScalarType::BFloat16:                                                                          \
-                {                                                                                                       \
-                    using out_t = ck_tile::bf16_t;                                                                      \
-                    MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)          \
-                }                                                                                                       \
-                break;                                                                                                  \
-                case at::ScalarType::Half:                                                                              \
-                {                                                                                                       \
-                    using out_t = ck_tile::fp16_t;                                                                      \
-                    MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)          \
-                }                                                                                                       \
-                break;                                                                                                  \
-                default:                                                                                                \
-                    TORCH_CHECK(false, NAME " doesn't support output type ", toString((OUT_TYPE)), ".");                \
-            }                                                                                                           \
-        }                                                                                                               \
-        break;                                                                                                          \
-        default:                                                                                                        \
-            TORCH_CHECK(false, NAME " doesn't support output LSE type ", toString((LSE_TYPE)), ".");                    \
+#define DISPATCH_MLA_REDUCE_KERNEL(LSE_TYPE, OUT_TYPE, NUM_HEAD, HEAD_DIM, NUM_WG_PER_SEQ, NAME, ...)       \
+    switch ((LSE_TYPE))                                                                                     \
+    {                                                                                                       \
+        case at::ScalarType::Float:                                                                         \
+        {                                                                                                   \
+            using lse_t = float;                                                                            \
+            switch ((OUT_TYPE))                                                                             \
+            {                                                                                               \
+                case at::ScalarType::BFloat16:                                                              \
+                {                                                                                           \
+                    using out_t = ck_tile::bf16_t;                                                          \
+                    MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)                \
+                }                                                                                           \
+                break;                                                                                      \
+                case at::ScalarType::Half:                                                                  \
+                {                                                                                           \
+                    using out_t = ck_tile::fp16_t;                                                          \
+                    MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)                \
+                }                                                                                           \
+                break;                                                                                      \
+                default:                                                                                    \
+                    TORCH_CHECK(false, NAME " doesn't support output type ", toString((OUT_TYPE)), ".");    \
+            }                                                                                               \
+        }                                                                                                   \
+        break;                                                                                              \
+        default:                                                                                            \
+            TORCH_CHECK(false, NAME " doesn't support output LSE type ", toString((LSE_TYPE)), ".");        \
     }
 
 template <typename Traits, typename lse_t, typename out_t>
@@ -827,14 +770,14 @@ void mla_reduce_v1(
         params.stride_h_o = final_output.stride(-2);
         params.max_splits = dev_prop.multiProcessorCount;
         params.num_reduce_tile = num_reduce_tile;
+        params.output_lse = output_lse;
+        params.use_reduce_final_map = !no_reduce_final_map;
 
         DISPATCH_MLA_REDUCE_KERNEL(
             output_lse ? final_lse.value().scalar_type() : at::ScalarType::Float,
             final_output.scalar_type(),
             num_heads,
             head_dim,
-            output_lse,
-            no_reduce_final_map,
             num_work_group_per_seq,
             "kn_mla_reduce_v1",
             dispatch_mla_reduce_v1<Traits, lse_t, out_t>(params, dev_prop.multiProcessorCount, stream)
