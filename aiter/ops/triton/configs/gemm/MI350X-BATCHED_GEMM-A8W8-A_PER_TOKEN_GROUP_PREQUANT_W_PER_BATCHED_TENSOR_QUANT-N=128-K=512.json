@@ -7,7 +7,7 @@
     "num_stages": 2,
     "waves_per_eu": 4,
     "matrix_instr_nonkdim": 16,
-    "kpack": 2,
+    "kpack": 1,
     "cache_modifier": ".cg"
   },
   "medium_M32" : {
@@ -18,7 +18,7 @@
     "num_stages": 2,
     "waves_per_eu": 1,
     "matrix_instr_nonkdim": 16,
-    "kpack": 2,
+    "kpack": 1,
     "cache_modifier": ".cg"
   },
   "medium_M64" : {
@@ -29,7 +29,7 @@
     "num_stages": 2,
     "waves_per_eu": 1,
     "matrix_instr_nonkdim": 16,
-    "kpack": 2,
+    "kpack": 1,
     "cache_modifier": ".cg"
   },
   "medium_M128" : {
@@ -40,7 +40,7 @@
     "num_stages": 2,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
-    "kpack": 2,
+    "kpack": 1,
     "cache_modifier": ".cg"
   },
   "large" : {
@@ -51,7 +51,7 @@
     "num_stages": 2,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
-    "kpack": 2,
+    "kpack": 1,
     "cache_modifier": ".cg"
   },
   "xlarge" : {
@@ -62,7 +62,7 @@
     "num_stages": 2,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
-    "kpack": 2,
+    "kpack": 1,
     "cache_modifier": ".cg"
   },
   "any" : {
@@ -73,7 +73,7 @@
     "num_stages": 2,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
-    "kpack": 2,
+    "kpack": 1,
     "cache_modifier": ".cg"
   }
 }

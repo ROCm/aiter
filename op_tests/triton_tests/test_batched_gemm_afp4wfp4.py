@@ -121,12 +121,12 @@ def get_x_vals():
             b = 1
         x_vals_with_batch.append((b, m, n, k))
 
-    # x_vals_with_batch += [
-    #     (b, 2**m, n, k)
-    #     for b in range(1, 17)
-    #     for m in range(0, 9)
-    #     for (n, k) in [(512, 128), (128, 512)]
-    # ]
+    x_vals_with_batch += [
+        (b, 2**m, n, k)
+        for b in range(1, 17)
+        for m in range(0, 9)
+        for (n, k) in [(512, 128), (128, 512)]
+    ]
     return x_vals_with_batch
 
 
