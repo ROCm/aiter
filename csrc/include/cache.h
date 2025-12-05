@@ -85,4 +85,22 @@ void cp_gather_indexer_k_quant_cache(
     torch::Tensor& dst_scale,          // [num_tokens, head_dim / quant_block_size * 4]
     const torch::Tensor& block_table,  // [batch_size, num_blocks]
     const torch::Tensor& cu_seq_lens); // [batch_size + 1]
+
+void fused_qk_rope_concat_and_cache_mla(
+    torch::Tensor& q_nope,       // [num_tokens, num_heads, qk_lora_rank]
+    torch::Tensor& q_pe,         // [num_tokens, num_heads, pe_dim]
+    torch::Tensor& kv_c,         // [num_tokens, kv_lora_rank]
+    torch::Tensor& k_pe,         // [num_tokens, pe_dim]
+    torch::Tensor& kv_cache,     // [num_blocks, block_size, (kv_lora_rank +
+                                 // pe_dim)]
+    torch::Tensor& q_out,        // [num_tokens, num_heads, qk_lora_rank+pe_dim]
+    torch::Tensor& slot_mapping, // [num_tokens] or [num_actual_tokens]
+    torch::Tensor& k_scale,
+    torch::Tensor& q_scale,
+    torch::Tensor& positions, // [num_tokens]
+    torch::Tensor& cos_cache, // [max_positions, pe_dim//2]
+    torch::Tensor& sin_cache, // [max_positions, pe_dim//2]
+    bool is_neox,
+    bool is_nope_first);
+
 } // namespace aiter
