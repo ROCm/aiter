@@ -205,10 +205,11 @@ def attn_qk_int8_per_block(
     
     assert (q_scale is None) == (k_scale is None), "Both q_scale and k_scale must be provided or both must be None"
     scales_provided = (q_scale is not None) and (k_scale is not None)
-    if scales_provided is None:
+    if not scales_provided:
         if config is None:
             config = _get_config()
        
+        head_dim = q.shape[-1]
         sm_scale = math.sqrt(head_dim)
         q, q_scale, k, k_scale = per_block_int8(
             q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
