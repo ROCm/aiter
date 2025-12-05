@@ -83,8 +83,6 @@ jobs:
           RUN pip install --upgrade "ninja>=1.11.1"
           RUN pip list
 
-          RUN echo "=== GPU ARCH LIST ===" && echo ${{ env.GPU_ARCH_LIST }}
-
           RUN rm -rf aiter \
            && git clone ${{ env.GITHUB_REPO_URL }} aiter \
            && cd aiter \
