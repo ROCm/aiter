@@ -551,39 +551,28 @@ __global__ void kn_mla_reduce_v1(
 }
 
 #define MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_SEQ_C, NAME, ...)   \
+{                                                                                   \
     constexpr int32_t NumHeads  = (NUM_HEAD_C);                                     \
     constexpr int32_t HeadDim   = (HEAD_DIM_C);                                     \
     constexpr int32_t NumWgPerSeq = (NUM_WG_PER_SEQ_C);                             \
     using Traits = MlaReduceKernelV1Traits<HeadDim, NumHeads, NumWgPerSeq>;         \
-    __VA_ARGS__;
+    __VA_ARGS__;                                                                    \
+}
 
 // NRFM: No Reduce Final Map
-#define MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_SEQ, NAME, ...)                              \
-    if ((NUM_WG_PER_SEQ) == 1)                                                                          \
-    {                                                                                                   \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 1, NAME, __VA_ARGS__)                              \
-    }                                                                                                   \
-    else if ((NUM_WG_PER_SEQ) == 2)                                                                     \
-    {                                                                                                   \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 2, NAME, __VA_ARGS__)                              \
-    }                                                                                                   \
-    else if ((NUM_WG_PER_SEQ) == 4)                                                                     \
-    {                                                                                                   \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 4, NAME, __VA_ARGS__)                              \
-    }                                                                                                   \
-    else if ((NUM_WG_PER_SEQ) == 64)                                                                    \
-    {                                                                                                   \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 64, NAME, __VA_ARGS__)                             \
-    }                                                                                                   \
-    else if ((NUM_WG_PER_SEQ) == 256)                                                                   \
-    {                                                                                                   \
-        MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 256, NAME, __VA_ARGS__)                            \
-    }                                                                                                   \
-    else                                                                                                \
-    {                                                                                                   \
-        std::stringstream ss;                                                                           \
-        ss << "NUM_WG_PER_SEQ=" << (NUM_WG_PER_SEQ);                                                    \
-        TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");    \
+#define MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_SEQ, NAME, ...)                                  \
+    if      ((NUM_WG_PER_SEQ) ==   1) MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C,   1, NAME, __VA_ARGS__)  \
+    else if ((NUM_WG_PER_SEQ) ==   2) MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C,   2, NAME, __VA_ARGS__)  \
+    else if ((NUM_WG_PER_SEQ) ==   4) MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C,   4, NAME, __VA_ARGS__)  \
+    else if ((NUM_WG_PER_SEQ) ==   8) MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C,   8, NAME, __VA_ARGS__)  \
+    else if ((NUM_WG_PER_SEQ) ==  16) MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C,  16, NAME, __VA_ARGS__)  \
+    else if ((NUM_WG_PER_SEQ) ==  64) MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C,  64, NAME, __VA_ARGS__)  \
+    else if ((NUM_WG_PER_SEQ) == 256) MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 256, NAME, __VA_ARGS__)  \
+    else                                                                                                    \
+    {                                                                                                       \
+        std::stringstream ss;                                                                               \
+        ss << "NUM_WG_PER_SEQ=" << (NUM_WG_PER_SEQ);                                                        \
+        TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");        \
     }
 
 #define MLA_REDUCE_CASE_IF(NUM_HEAD, NUM_HEAD_C,                                    \
@@ -704,7 +693,7 @@ int32_t get_num_work_group_per_seq(
     if ((num_cu * factor) > num_reduce_tile)
     {
         // WARNING: Please make sure that the content in this array must correspond to MLA_REDUCE_CASE().
-        static constexpr int32_t kSupportedNum[] = { 1, 2, 4, 64, 256 };
+        static constexpr int32_t kSupportedNum[] = { 1, 2, 4, 8, 16, 64, 256 };
         static constexpr int32_t kLastSupported = kSupportedNum[sizeof(kSupportedNum) / sizeof(int32_t) - 1];
 
         const int32_t wg_per_seq_hw = ck_tile::integer_divide_ceil(num_cu * factor, num_reduce_tile);
