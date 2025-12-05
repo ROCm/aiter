@@ -148,7 +148,7 @@ auto create_args(int argc, char* argv[])
                 "0",
                 "if set to 1 will use multi-buffer reduction strategy for dq, atomic opeartion "
                 "will not be used")
-        .insert("bwd_v3", "0", "if set to 1, some cases will call the bwd v3 dqdkdv kernel")
+        .insert("bwd_v3", "0", "0: default(asm first)   1: force asm   2: force ck")
         .insert(
             "v3_atomic_fp32",
             "1",
@@ -156,7 +156,7 @@ auto create_args(int argc, char* argv[])
         .insert("v3_bf16_cvt",
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
-        .insert("is_v3_check", "0", "if set to 1, check whether the input scenarios is supported by the asm kernel.");
+        .insert("v3_api_check", "0", "if set to 1, check whether the input scenarios is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -263,7 +263,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     bool bwd_v3         = arg_parser.get_bool("bwd_v3");
     bool v3_atomic_fp32 = arg_parser.get_bool("v3_atomic_fp32");
     int v3_bf16_cvt     = arg_parser.get_int("v3_bf16_cvt");
-    bool is_v3_check    = arg_parser.get_bool("is_v3_check");
+    bool v3_api_check    = arg_parser.get_bool("v3_api_check");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -504,7 +504,24 @@ bool run(const ck_tile::ArgParser& arg_parser)
                   << " MByte memory workspace allocated" << std::endl;
     }
 
-    auto fmha_args = [&]() {
+    auto get_mask_type = [&]() {
+        if (mask.type == mask_enum::no_mask) {
+            return 0;
+        } else {
+            if (mask.type == mask_enum::window_generic) {
+                assert(false);
+                return 0;
+            } else {
+                if ((mask.left == -1) && (mask.right == 0)) {
+                    return (mask.type == mask_enum::mask_top_left) ? 1 : 2;
+                } else {
+                    return 3;
+                }
+            }
+        }
+    };
+
+    auto mha_args = [&]() {
         assert(nhead % nhead_k == 0);
         /// NOTE: we broadcast bias from [1, 1, seqlen_q, seqlen_k] to [batch, nhead, seqlen_q,
         ///       seqlen_k] in this example, hence both the 'batch_stride_bias' &
@@ -561,7 +578,24 @@ bool run(const ck_tile::ArgParser& arg_parser)
             }
         }();
 
-        return fmha_bwd_args{q_buf.GetDeviceBuffer(),
+        return fmha_bwd_args{stream_config,
+                             get_mask_type(),
+                             bwd_v3,
+                             v3_atomic_fp32,
+                             v3_bf16_cvt,
+                             v3_api_check,
+
+                             hdim_q,
+                             hdim_v,
+                             data_type,
+                             mode == mode_enum::group,
+                             mask.type,
+                             bias.type,
+                             use_dbias,
+                             s_randval,
+                             deterministic,
+
+                             q_buf.GetDeviceBuffer(),
                              k_buf.GetDeviceBuffer(),
                              v_buf.GetDeviceBuffer(),
                              bias.type == bias_enum::alibi ? alibi_slope_buf.GetDeviceBuffer()
@@ -640,21 +674,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              drop_seed_offset};
     }();
 
-    float ave_time = aiter::mha_bwd(fmha_args,
-                                    stream_config,
-                                    data_type,
-                                    mode == mode_enum::group,
-                                    mask.type,
-                                    bias.type,
-                                    use_dbias,
-                                    s_randval,
-                                    deterministic,
-                                    bwd_v3,
-                                    v3_atomic_fp32,
-                                    v3_bf16_cvt,
-                                    nullptr,
-                                    nullptr,
-                                    is_v3_check);
+    float ave_time = aiter::mha_bwd(mha_args);
     if(ave_time < 0)
     {
         std::cout << ", not supported yet" << std::flush << std::endl;
@@ -891,18 +911,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     ck_tile::stream_config stream_config_v{
         nullptr, true, 0, 0, 1, arg_parser.get_str("timer") == std::string("gpu")};
-    aiter::mha_bwd(fmha_args,
-                   stream_config_v,
-                   data_type,
-                   mode == mode_enum::group,
-                   mask.type,
-                   bias.type,
-                   use_dbias,
-                   s_randval,
-                   deterministic,
-                   bwd_v3,
-                   v3_atomic_fp32,
-                   v3_bf16_cvt);
+    aiter::mha_bwd(mha_args);
 
     dq_buf.FromDevice(dq_host.data());
     dk_buf.FromDevice(dk_host.data());
