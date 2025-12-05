@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  DOCKER_IMAGE: "rocm/sgl-dev:v0.5.6-rocm700-mi35x-20251203"
+  DOCKER_IMAGE: "rocm/pytorch:latest"
   GPU_ARCH_LIST: "gfx942,gfx950"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
@@ -82,6 +82,8 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip install --upgrade "ninja>=1.11.1"
           RUN pip list
+
+          RUN echo "=== GPU ARCH LIST ===" && echo ${{ env.GPU_ARCH_LIST }}
 
           RUN rm -rf aiter \
            && git clone ${{ env.GITHUB_REPO_URL }} aiter \
