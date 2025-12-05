@@ -13,7 +13,7 @@ concurrency:
 
 env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
-  GPU_ARCH_LIST: "gfx942,gfx950"
+  GPU_ARCH_LIST: "gfx942;gfx950"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
