@@ -184,9 +184,9 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
 
     block_shape_n, block_shape_k = block_shape
 
-    if impl == "gluon" and int(DEVICE_ARCH.split("MI")[1].replace("X", "")) < 350:
+    if impl == "gluon" and DEVICE_ARCH not in ("gfx950",):
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
+            "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
         )
 
     dtype = str_to_torch_dtype[dtype]
