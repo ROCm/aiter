@@ -1100,7 +1100,7 @@ template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_>
 float fmha_bwd_v3_genl_gfx942(const ck_tile::stream_config& s, fmha_bwd_args a, const void* seqlen_q_padded = nullptr, const void* seqlen_k_padded = nullptr)
 {    
     if(s.log_level_ > 0)
-        std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name << std::flush;
+        std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << std::flush;
 
     fmha_bwd_v3_args_universal args;
     args.ptr_dq  = a.dq_ptr;
@@ -1180,7 +1180,7 @@ float fmha_bwd_v3_genl_gfx942(const ck_tile::stream_config& s, fmha_bwd_args a, 
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv};
 
-    static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::file_name); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); },
         [=](const ck_tile::stream_config& s_){ impl.launch_kernel(traits, args, s_); }
@@ -1191,7 +1191,7 @@ template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_, typename conve
 float fmha_bwd_v3_genl_gfx942(const ck_tile::stream_config& s, fmha_bwd_args a, const void* seqlen_q_padded = nullptr, const void* seqlen_k_padded = nullptr)
 {
     if(s.log_level_ > 0)
-        std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name << ", " << fmha_bwd_convert_dq_get_name_<convert_dq_trait_>() << std::flush;
+        std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << ", " << fmha_bwd_convert_dq_get_name_<convert_dq_trait_>() << std::flush;
     fmha_bwd_v3_args_universal args;
     args.ptr_dq      = a.dq_acc_ptr;
     args.ptr_dk      = a.dk_ptr;
@@ -1265,7 +1265,7 @@ float fmha_bwd_v3_genl_gfx942(const ck_tile::stream_config& s, fmha_bwd_args a, 
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv};
-    static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::file_name); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); },
         [=](const ck_tile::stream_config& s_){ impl.launch_kernel(traits, args, s_); },
@@ -1916,24 +1916,24 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             if (t.mask_type == mask_enum::no_mask) {
                                 if (t.is_v3_atomic_fp32 == true){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdFp16, false, true, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_fp16_a32_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_fp16_a32_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 } else {
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdFp16, false, false, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_fp16_a16_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_fp16_a16_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 }
                             } else if ((t.mask_type == mask_enum::mask_top_left) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                                 if (t.is_v3_atomic_fp32 == true){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdFp16, true, true, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_fp16_causal_a32_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_a32_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 } else {
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdFp16, true, false, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_fp16_causal_a16_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_a16_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 }
@@ -1941,12 +1941,12 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 if (t.is_v3_atomic_fp32 == true){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdFp16, 3, true, 0, true, true, true, GPUArch::gfx950>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, true, true, true, false, 0>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_fp16_causal_br_a32_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_br_a32_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 } else {
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdFp16, 3, false, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_fp16_causal_br_a16_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_br_a16_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 }
@@ -2261,36 +2261,36 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             if (t.mask_type == mask_enum::no_mask) {
                                 if (t.is_v3_atomic_fp32 == true){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdBf16, false, true, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_bf16_a32_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_bf16_a32_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 } else {
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdBf16, false, false, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_bf16_a16_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_bf16_a16_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 }
                             } else if ((t.mask_type == mask_enum::mask_top_left) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                                 if (t.is_v3_atomic_fp32 == true){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdBf16, true, true, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_a32_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_bf16_causal_a32_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 } else {
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdBf16, true, false, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_a16_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_bf16_causal_a16_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 }
                             } else if ((t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                                 if (t.is_v3_atomic_fp32 == true){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdBf16, 3, true, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_br_a32_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_bf16_causal_br_a32_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 } else {
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, 128, FmhaBwdBf16, 3, false, 0, true, true, true, GPUArch::gfx950>;
-                                    // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_br_a16_psskddv_group";
+                                    // const std::string kernel_name = "bwd_hd128_bf16_causal_br_a16_psskddv_group";
                                     r = fmha_bwd_v3_genl_gfx950<dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 }
