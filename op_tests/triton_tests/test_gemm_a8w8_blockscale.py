@@ -16,7 +16,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 block_shape = (128, 128)
-DEVICE_ARCH = arch_info.get_device()
+DEVICE_ARCH = arch_info.get_arch()
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
@@ -184,9 +184,9 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
 
     block_shape_n, block_shape_k = block_shape
 
-    if impl == "gluon" and int(DEVICE_ARCH.split("MI")[1].replace("X", "")) < 350:
+    if impl == "gluon" and DEVICE_ARCH not in ("gfx950",):
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
+            "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
         )
 
     dtype = str_to_torch_dtype[dtype]

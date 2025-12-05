@@ -579,7 +579,7 @@ class MessageQueue:
             group_world_size = pg.world_size
             global_ranks = list(range(pg.world_size))
 
-        from vllm.distributed.parallel_state import in_the_same_node_as
+        from aiter.dist.parallel_state import in_the_same_node_as
 
         status = in_the_same_node_as(pg, source_rank=writer_rank)
         same_node_ranks = [i for i, s in enumerate(status) if s]
