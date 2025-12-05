@@ -84,10 +84,15 @@ AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_cktile_tuned_gemm.csv",
 )
 
-AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
-    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
-    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+AITER_CONFIG_LEGACY_GEMM_A8W8_BLOCKSCALE = os.getenv(
+    "AITER_CONFIG_LEGACY_GEMM_A8W8_BLOCKSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_legacy_gemm.csv",
 )
+AITER_CONFIG_TILE_GEMM_A8W8_BLOCKSCALE = os.getenv(
+    "AITER_CONFIG_TILE_GEMM_A8W8_BLOCKSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_tile_gemm.csv",
+)
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
@@ -142,7 +147,7 @@ class AITER_CONFIG(object):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
-            "a8w8_blockscale_tuned_gemm",
+            "a8w8_blockscale_tuned_legacy_gemm",
         )
 
     @property

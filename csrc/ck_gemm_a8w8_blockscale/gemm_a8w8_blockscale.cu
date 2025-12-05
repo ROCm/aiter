@@ -3,8 +3,8 @@
 
 #include "gemm_a8w8_blockscale_common.cuh"
 #include "gemm_a8w8_blockscale_lookup.h"
-#include "gemm_common.h"
 #include "gemm_a8w8_blockscale_manifest.h"
+#include "gemm_common.h"
 
 #include <cmath>
 
@@ -65,7 +65,7 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
-  
+
     // Fine-grained search
     padded_m = getPaddedM(M, N, K, 0);
 
@@ -76,15 +76,15 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     {
         return it->second;
     }
-  
+
     // Coarse-grained search
     padded_m = getPaddedM(M, N, K, 1);
-    it = lookup.find({padded_m, N, K});
-    if (it != lookup.end())
+    it       = lookup.find({padded_m, N, K});
+    if(it != lookup.end())
     {
-      return it->second;
+        return it->second;
     }
-  
+
     // Otherwise, use heuristics.
     return a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1<
         DDataType,

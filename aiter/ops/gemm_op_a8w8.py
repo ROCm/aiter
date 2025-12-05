@@ -149,6 +149,7 @@ def gemm_a8w8_blockscale_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    Type: List[str] = ["legacy", "tile"],
 ) -> torch.Tensor: ...
 
 
@@ -516,6 +517,7 @@ def gemm_a8w8_blockscale(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
+    Type: str = "both", # "legacy", "tile", "both"
 ) -> torch.Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -534,7 +536,14 @@ def gemm_a8w8_blockscale(
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
         get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
-        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+        CKType = []
+        if Type == "both":
+            CKType = ["legacy", "tile"]
+        elif Type in ["legacy", "tile"]:
+            CKType = [Type]
+        else:
+            raise ValueError(f"Invalid CKType: {CKType}. Must be 'legacy', 'tile', or 'both'.")
+        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y, CKType)
 
 
 def flatmm_a8w8_blockscale_ASM(

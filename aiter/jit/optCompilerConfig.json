@@ -223,6 +223,7 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
+        // default generate both legacy and tile type CK gemm a8w8 blockscale kernels
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle": {

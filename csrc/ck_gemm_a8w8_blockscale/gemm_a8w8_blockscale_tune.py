@@ -82,7 +82,15 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     }
 
     def _setup_specific_arguments(self):
-        pass
+        parser = self.parser
+        parser.add_argument(
+            "--ck_type",
+            type=str,
+            default="both",
+            choices=["legacy", "tile", "both"],
+            help="CK gemm a8w8 blockscale type to tune: legacy, tile or both",
+        )
+        return parser
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))

@@ -46,7 +46,20 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
+    # test legacy gemm
+    res_legacy = aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, Type=["legacy"])
+    # test tile gemm
+    res_tile = aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, Type=["tile"])
+    # assert the two results are close
+    checkAllclose(
+        res_legacy,
+        res_tile,
+        msg="legacy and tile gemm_a8w8_blockscale results not match",
+        rtol=1e-2,
+        atol=0.01,
+    )
+    # return both results
+    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, Type=["legacy", "tile"])
 
 
 @perftest()

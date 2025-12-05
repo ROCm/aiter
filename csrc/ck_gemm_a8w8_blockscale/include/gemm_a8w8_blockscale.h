@@ -8,7 +8,9 @@ torch::Tensor gemm_a8w8_blockscale(
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y);
+    torch::Tensor &Y,
+    std::vector<std::string> Type, // "legacy" or "tile"
+);
 
 torch::Tensor gemm_a8w8_blockscale_tune(
     torch::Tensor &XQ,
@@ -16,5 +18,6 @@ torch::Tensor gemm_a8w8_blockscale_tune(
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
+    std::vector<std::string> Type, // "legacy" or "tile"
     int kernelId,
     int splitK);
