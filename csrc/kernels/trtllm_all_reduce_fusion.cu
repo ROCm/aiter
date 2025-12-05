@@ -566,7 +566,7 @@ void allreduce_fusion_kernel_w_launcher(
     assert(params.hidden_dim == HIDDEN_DIM);
     int token_num = params.size / params.hidden_dim;
     dim3 threadsPerBlock(BLOCK_SIZE);
-    token_num = token_num <= 2 ? 1 : token_num;
+    token_num = std::min(token_num, NBLOCKS_PER_GPU);
     dim3 numBlocks(token_num);
     allreduce_fusion_kernel_w<T, NRanks, BLOCK_SIZE, true><<<numBlocks, threadsPerBlock, 0, stream>>>(params, meta, cptrs);
 }
