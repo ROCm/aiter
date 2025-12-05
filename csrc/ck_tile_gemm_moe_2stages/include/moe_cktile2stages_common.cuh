@@ -142,7 +142,12 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
 
-    const ck_tile::amd_buffer_coherence_enum b_mem_nt_type = BaseGemmPipeline::GetBMemNTType(args.N, args.K);
+    const ck_tile::amd_buffer_coherence_enum b_mem_nt_type =
+        BaseGemmPipeline::GetBMemNTType(
+            args.NumTokens,
+            args.N,
+            args.K);
+
     float ave_time{0};
 
     const auto Run = [&](const auto has_hot_loop_,
