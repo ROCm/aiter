@@ -277,8 +277,8 @@ def test_mla(
         uni_seqlen_qo=decode_qlen,
         fast_mode=True,
         max_split_per_batch=max_split_per_batch,
-        dtype_q=q.dtype,
-        dtype_kv=kv_buffer.dtype,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
     )
 
     def test_absorb_decode_bf16():
@@ -393,7 +393,8 @@ def test_mla(
         (nhead in [16]) or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
     ):
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
+    elif kvtype == dtypes.fp8 and (
+        nhead in [16, 128] or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))):
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
@@ -472,7 +473,7 @@ parser.add_argument(
     type=str,
     choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    default=["bf16", "fp8"],
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
@@ -482,7 +483,7 @@ parser.add_argument(
     type=str,
     choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    default=["bf16", "fp8"],
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
