@@ -110,6 +110,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
     # off_h = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0)
     num_pids_m = tl.cdiv(qo_len, BLOCK_SIZE_M)
+    # mask causes workload imbalance between pids because each start_m has different amount of non skipped kv blocks
     if mask is not None and (H % 8 == 0): # can solve the workload imbalance between pids by traversing the head first
         offs_h = pid % H # each XCD gets pid with the same start_m, i.e. pid with the same workload
         offs_h = remap_xcd(offs_h, H, NUM_XCDS=8) # map it so that that contiguous heads are at the same XCD
@@ -122,6 +123,9 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         off_h = (pid // num_pids_m) % H
         off_z = pid // (num_pids_m * H)
 
+    off_z = off_z.to(tl.int64)
+    off_h = off_h.to(tl.int64)
+    
     q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_SIZE_M)
     k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_SIZE_N)  
     

@@ -13,6 +13,11 @@ from aiter.ops.triton.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
+from aiter.ops.triton.attn_qk_int8_per_block import (
+    attn_qk_int8_per_block,
+    per_block_int8,
+    _get_config,
+)
 from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
@@ -490,6 +495,10 @@ def run_benchmark(custom, args):
                         return_attn_probs=return_attn_probs,
                     )
 
+        
+        
+        
+        
         if mode == "bwd":
             with torch.enable_grad():
                 triton_out = fn()[0]
@@ -504,6 +513,18 @@ def run_benchmark(custom, args):
                     )
                     return grads
 
+        if args.qk_int8:
+            assert args.layout == "bshd", "int8 quantization only supports bshd layout."
+            tensor_layout = "NHD" # corresponds to bshd
+            config = _get_config()
+            k_mean = None
+            sm_scale = D_HEAD**-0.5
+            q_fp8, q_scale, k_fp8, k_scale = per_block_int8(
+                q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+            )
+            v = v.to(torch.float16)
+            fn = lambda: attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, tensor_layout="NHD", output_dtype=torch.bfloat16, config=config)
+        
         ms = triton.testing.do_bench(fn)
 
         if mode == "bwd":
@@ -587,6 +608,7 @@ def parse_args():
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
+    parser.add_argument("-qk_int8", action="store_true", default=False)
     parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)

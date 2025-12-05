@@ -5,6 +5,7 @@ import torch
 import pytest
 import logging
 import numpy as np
+import math
 from aiter.ops.triton.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -20,6 +21,14 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
 )
+
+from aiter.ops.triton.attn_qk_int8_per_block import (
+    attn_qk_int8_per_block,
+    _get_config,
+    int8_per_block_quantize_bshd,
+    per_block_int8,
+)
+
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -1260,73 +1269,6 @@ def test_mha_backward_varlen_with_pe(
         msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
     )
 
-
-
-from aiter.ops.triton.attn_qk_int8_per_block import (
-    attn_qk_int8_per_block,
-    _get_config,
-)
-
-
-import math
-from typing import Tuple
-def int8_per_block_quantize_bshd(
-    x: torch.Tensor,
-    int8_dtype: torch.dtype,
-    clamp_val: float = 1e-9,
-    block_size: int = 128,
-    include_sqrt_scale: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert a tensor to INT8 format, returning an INT8 tensor and a descale factor.
-    Quantization is done per block on the seqlen dimension.
-    x: [batch, seqlen, heads, dim] (bshd)
-    include_sqrt_scale: if True, include 1/sqrt(head_dim) in descale for attention's Q
-    Returns:
-        x_int8: same shape as x, stored as int8_dtype
-        descale_factor: [batch, heads, num_blocks, 1] scale to dequantize:
-                        x_fp32 ≈ x_int8 * descale_factor
-    """
-    if len(x.shape) != 4:
-        raise ValueError(
-            f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}"
-        )
-    batch, seqlen, num_heads, head_dim = x.shape
-    if seqlen % block_size != 0:
-        raise ValueError(
-            f"seqlen={seqlen} must be divisible by block_size={block_size} for per-block quantization"
-        )
-    # Reshape to expose blocks along seqlen: [b, n_blocks, block_size, h, d]
-    n_blocks = seqlen // block_size
-    x_reshaped = x.view(batch, n_blocks, block_size, num_heads, head_dim)
-    # Compute max absolute value per block (reduce over block_size and dim)
-    # Shape: [b, n_blocks, num_heads, 1]
-    max_abs = x_reshaped.abs().amax(dim=2)        # [b, n_blocks, h, d]
-    max_abs = max_abs.amax(dim=-1, keepdim=True)  # [b, n_blocks, h, 1]
-    # Avoid division by zero
-    max_abs = torch.clamp(max_abs, min=clamp_val)
-    # Symmetric INT8 range
-    qmax = torch.iinfo(torch.int8).max  # 127
-    # Scale used for quantization (fp32 -> int8)
-    scale = qmax / max_abs  # [b, n_blocks, h, 1]
-    # Apply scale per block
-    # Broadcast scale over block_size and dim
-    x_scaled = x_reshaped * scale.unsqueeze(2)  # [b, n_blocks, block_size, h, d]
-    # Quantize and clamp to valid INT8 range
-    x_int8 = torch.round(x_scaled).clamp(-qmax - 1, qmax).to(int8_dtype)
-    # Reshape back to [b, s, h, d]
-    x_int8 = x_int8.view(batch, seqlen, num_heads, head_dim)
-    # Descale factor for dequantization: x_fp32 ≈ x_int8 * descale_factor
-    descale_factor = 1.0 / scale
-    # Include 1/sqrt(head_dim) for attention scaling (applied to Q's descale)
-    if include_sqrt_scale:
-        descale_factor = descale_factor / math.sqrt(head_dim)
-    # Kernel expects scale in [b, h, n_blocks, 1] format, so permute from [b, n_blocks, h, 1]
-    # Must call contiguous() after permute so kernel's pointer arithmetic (+= 1) works correctly
-    descale_factor = descale_factor.permute(0, 2, 1, 3).contiguous()  # [b, h, n_blocks, 1]
-    return x_int8, descale_factor
-
-
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -1354,17 +1296,18 @@ def test_attn_qk_int8_per_block(
     SEQLEN_Q = ((SEQLEN_Q + block_m - 1) // block_m) * block_m
     SEQLEN_K = ((SEQLEN_K + block_n - 1) // block_n) * block_n
 
+    tensor_layout = "NHD" # corresponds to bshd
+
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    # Quantization
+    sm_scale = HEAD_SZ**-0.5
+    q_fp8, q_scale, k_fp8, k_scale = per_block_int8(
+        q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+    )
 
-    int8_dtype = torch.int8
-    # include_sqrt_scale=True for Q to include 1/sqrt(head_dim) in the descale factor
-    # This is needed because the kernel doesn't divide by sqrt(d) like standard attention
-    q_fp8, q_scale = int8_per_block_quantize_bshd(q, int8_dtype, block_size=config["BLOCK_SIZE_M"], include_sqrt_scale=True)
-    k_fp8, k_scale = int8_per_block_quantize_bshd(k, int8_dtype, block_size=config["BLOCK_SIZE_N"])
-
-    triton_out, lse = attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, tensor_layout="NHD", output_dtype=torch.bfloat16, config=config)
+    triton_out, lse = attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
 
     torch_out = attention_ref(
         q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
