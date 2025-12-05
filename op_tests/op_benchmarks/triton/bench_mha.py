@@ -519,11 +519,11 @@ def run_benchmark(custom, args):
             config = _get_config()
             k_mean = None
             sm_scale = D_HEAD**-0.5
-            q_fp8, q_scale, k_fp8, k_scale = per_block_int8(
+            q, q_scale, k, k_scale = per_block_int8(
                 q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
             )
             v = v.to(torch.float16)
-            fn = lambda: attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, tensor_layout="NHD", output_dtype=torch.bfloat16, config=config)
+            fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout="NHD", output_dtype=torch.bfloat16, config=config)
         
         ms = triton.testing.do_bench(fn)
 
