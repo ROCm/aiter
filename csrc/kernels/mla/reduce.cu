@@ -13,14 +13,14 @@ template <int32_t kSizeDV_,
           int32_t kNumThreadGroupPerSeq_>
 struct MlaReduceKernelV1Traits
 {
-    static constexpr int32_t kSizeDV             = kSizeDV_;       // hidden dimension size of value/output
-    static constexpr int32_t kNumHeadQ           = kNumHeadQ_;     // head count of q
+    static constexpr int32_t kSizeDV             = kSizeDV_;    // hidden dimension size of value/output
+    static constexpr int32_t kNumHeadQ           = kNumHeadQ_;  // head count of q
     static constexpr int32_t kNumWarps           = 2;
     static constexpr int32_t kNumThreads         = kNumWarps * ck_tile::get_warp_size();
     static constexpr int32_t kOccupancy          = 8;
-    static constexpr int32_t kMaxVgprLocalLse    = 16;             // scratch buffer will be used with larger value
+    static constexpr int32_t kMaxVgprLocalLse    = 16;          // scratch buffer will be used with larger value
     static constexpr int32_t kNumThreadGroupPerSeq = kNumThreadGroupPerSeq_;
-    static constexpr int32_t kMassiveThreshold   = 4;              // use massive pipeline if #splits >= this value
+    static constexpr int32_t kMassiveThreshold   = 6;           // use massive pipeline if #splits >= this value
 
     static_assert(kNumThreadGroupPerSeq > 0);
 };
@@ -162,8 +162,7 @@ CK_TILE_DEVICE void reduce_lse_massive(
                 const int32_t reduce_partial_map = ((lane_idx == 0) ? reduce_partial_map_0 : reduce_partial_map_1);
                 const int64_t reduce_tile_pos = reduce_partial_map * int64_t(Traits::kNumHeadQ);
                 lse = p_partial_lse_seq_base[reduce_tile_pos];
-                if (!std::isnan(lse))
-                    max_lse = ck_tile::max(max_lse, lse);
+                max_lse = ck_tile::max(max_lse, lse);
             }
             local_lse[0] = lse;
 
@@ -184,8 +183,7 @@ CK_TILE_DEVICE void reduce_lse_massive(
                     const int64_t reduce_tile_pos =
                         params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ);
                     lse = p_partial_lse_seq_base[reduce_tile_pos];
-                    if (!std::isnan(lse))
-                        max_lse = ck_tile::max(max_lse, lse);
+                    max_lse = ck_tile::max(max_lse, lse);
                 }
                 return lse;
             };
@@ -214,8 +212,7 @@ CK_TILE_DEVICE void reduce_lse_massive(
         for (int32_t offset = ck_tile::get_warp_size() / 2; offset > 0; offset /= 2)
         {
             const int32_t srd_lane = (offset ^ ck_tile::get_warp_size()) ^ ck_tile::get_lane_id();
-            if (!std::isnan(max_lse))
-                max_lse = ck_tile::max(max_lse, ck_tile::warp_shuffle(max_lse, srd_lane));
+            max_lse = ck_tile::max(max_lse, ck_tile::warp_shuffle(max_lse, srd_lane));
         }
 
         // Get sum of LSE
@@ -223,15 +220,13 @@ CK_TILE_DEVICE void reduce_lse_massive(
         #pragma unroll 2
         for (int32_t i = 0; i < num_lse_per_thr; ++i)
         {
-            if (!std::isnan(local_lse[i]))
-                sum_lse += expf(local_lse[i] - max_lse);
+            sum_lse += expf(local_lse[i] - max_lse);
         }
         #pragma unroll
         for (int32_t offset = ck_tile::get_warp_size() / 2; offset > 0; offset /= 2)
         {
             const int32_t srd_lane = (offset ^ ck_tile::get_warp_size()) ^ ck_tile::get_lane_id();
-            if (!std::isnan(sum_lse))
-                sum_lse += ck_tile::warp_shuffle(sum_lse, srd_lane);
+            sum_lse += ck_tile::warp_shuffle(sum_lse, srd_lane);
         }
 
         // Get global LSE
@@ -285,10 +280,7 @@ CK_TILE_DEVICE void reduce_output_massive(
         const float lse_scale = p_lds_lse_scale[split_idx];
         auto oaccu = ck_tile::load_tile(oaccu_window);
         ck_tile::sweep_tile(oaccu, [&](auto idx) {
-            if (std::isnan(oaccu(idx)) || std::isnan(lse_scale))
-                reg_out(idx) += 0;
-            else
-                reg_out(idx) += lse_scale * oaccu(idx);
+            reg_out(idx) += lse_scale * oaccu(idx);
         });
     };
 
