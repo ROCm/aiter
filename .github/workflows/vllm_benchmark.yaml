@@ -121,6 +121,10 @@ jobs:
           command: |
             git clone --depth=1 --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
 
+      - name: Pull the aiter image
+        run: |
+          docker pull rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
+
       - name: Download the vLLM image
         run: |
           docker pull rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
