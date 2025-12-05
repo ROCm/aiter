@@ -353,6 +353,44 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                    params.p_kv_indices,
                                    kv_idx,
                                    kv_idx + T::kBlockN);
+
+            __builtin_amdgcn_s_waitcnt(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Debug: load k nope to test tensor
+            {
+                const int32_t tot_elem = T::kBlockN * T::kQkNopeHeadDim; // 32 * 512 = 16384
+                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
+                {
+                    uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_nope + idx);
+                    const float4 f4          = convert_fp8x4_to_float4(FUI{data});
+                    const int32_t row        = kv_idx + idx / T::kQkNopeHeadDim;
+                    const int32_t col        = idx % T::kQkNopeHeadDim;
+                    const int32_t offset     = row * T::kQkHeadDim + col;
+                    params.p_dbg[offset]     = f4.x;
+                    params.p_dbg[offset + 1] = f4.y;
+                    params.p_dbg[offset + 2] = f4.z;
+                    params.p_dbg[offset + 3] = f4.w;
+                }
+            }
+
+            // Debug: load k rope to test tensor
+            {
+                const int32_t tot_elem = T::kBlockN * T::kQkRopeHeadDim; // 32 * 64 = 2048
+                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
+                {
+                    uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_rope + idx);
+                    const float4 f4          = convert_fp8x4_to_float4(FUI{data});
+                    const int32_t row        = kv_idx + idx / T::kQkRopeHeadDim;
+                    const int32_t col        = idx % T::kQkRopeHeadDim;
+                    const int32_t offset     = row * T::kQkHeadDim + col + T::kQkNopeHeadDim;
+                    params.p_dbg[offset]     = f4.x;
+                    params.p_dbg[offset + 1] = f4.y;
+                    params.p_dbg[offset + 2] = f4.z;
+                    params.p_dbg[offset + 3] = f4.w;
+                }
+            }
         }
 
         if(((kv_end - kv_start) % T::kBlockN) != 0)
@@ -364,6 +402,44 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                   params.p_kv_indices,
                                   kv_idx,
                                   kv_end);
+
+            __builtin_amdgcn_s_waitcnt(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Debug: load k nope to test tensor
+            {
+                const int32_t tot_elem = T::kBlockN * T::kQkNopeHeadDim; // 32 * 512 = 16384
+                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
+                {
+                    uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_nope + idx);
+                    const float4 f4          = convert_fp8x4_to_float4(FUI{data});
+                    const int32_t row        = kv_idx + idx / T::kQkNopeHeadDim;
+                    const int32_t col        = idx % T::kQkNopeHeadDim;
+                    const int32_t offset     = row * T::kQkHeadDim + col;
+                    params.p_dbg[offset]     = f4.x;
+                    params.p_dbg[offset + 1] = f4.y;
+                    params.p_dbg[offset + 2] = f4.z;
+                    params.p_dbg[offset + 3] = f4.w;
+                }
+            }
+
+            // Debug: load k rope to test tensor
+            {
+                const int32_t tot_elem = T::kBlockN * T::kQkRopeHeadDim; // 32 * 64 = 2048
+                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
+                {
+                    uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_rope + idx);
+                    const float4 f4          = convert_fp8x4_to_float4(FUI{data});
+                    const int32_t row        = kv_idx + idx / T::kQkRopeHeadDim;
+                    const int32_t col        = idx % T::kQkRopeHeadDim;
+                    const int32_t offset     = row * T::kQkHeadDim + col + T::kQkNopeHeadDim;
+                    params.p_dbg[offset]     = f4.x;
+                    params.p_dbg[offset + 1] = f4.y;
+                    params.p_dbg[offset + 2] = f4.z;
+                    params.p_dbg[offset + 3] = f4.w;
+                }
+            }
         }
 
         // QK Gemm
@@ -390,13 +466,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             // }
             // hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
         });
-
-        // Loop start from 2nd iter
-        for(int32_t kv_begin_idx = kv_start + T::kBlockN; kv_begin_idx < kv_end;
-            kv_begin_idx += T::kBlockN)
-        {
-            // Async load K from VRAM to LDS
-        }
 
         ///
         /// Outputs
