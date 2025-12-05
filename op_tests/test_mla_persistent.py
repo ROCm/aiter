@@ -70,7 +70,7 @@ def ref_masked_attention(
     l = attn_weights_exp.sum(-1)
 
     if is_fp8_q:
-        attn_weights_fp8 = attn_weights_exp.to(get_fp8_e4m3_dtype())
+        attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
@@ -282,9 +282,10 @@ def test_mla(
         fast_mode=True if not non_persistent_mode else False,
         max_split_per_batch=max_split_per_batch,
         intera_batch_mode=non_persistent_mode,
-        dtype_q=q.dtype,
-        dtype_kv=kv_buffer.dtype,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
     )
+    # import pdb;pdb.set_trace()
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -327,10 +328,10 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
-        q_fp8 = q.to(get_fp8_e4m3_dtype())
+        q_fp8 = q.to(dtypes.fp8)
         q_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        kv_buffer_fp8 = kv_buffer.to(get_fp8_e4m3_dtype())
+        kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
@@ -376,7 +377,6 @@ def test_mla(
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
-        # import pdb;pdb.set_trace()
         err = checkAllclose(
             out_ref,
             out_asm,

@@ -180,6 +180,13 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         num_batches *= qk_batch_ratio;
     }
 
+    if(num_heads == 128)
+    {
+        qk_batch_ratio = uni_seqlen_qo;
+        uni_seqlen_qo = 1;
+        num_batches *= qk_batch_ratio;
+    }
+
     TORCH_CHECK((num_heads == 16) || (num_heads == 128),
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
