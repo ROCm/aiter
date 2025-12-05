@@ -22,7 +22,7 @@ def gemm_a8w8(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
 ):
