@@ -224,6 +224,11 @@ def test_mla(
         dtype=out_dtype,
     )
 
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    max_split_per_batch = min((cu_num + batch_size - 1) // batch_size, max_split_per_batch)
+
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),
