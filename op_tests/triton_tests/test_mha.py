@@ -1290,11 +1290,6 @@ def test_attn_qk_int8_per_block(
 ):
     torch.cuda.empty_cache()
     config = _get_config()
-    # Ensure sequence lengths are multiples of block sizes
-    block_m = config["BLOCK_SIZE_M"]
-    block_n = config["BLOCK_SIZE_N"]
-    SEQLEN_Q = ((SEQLEN_Q + block_m - 1) // block_m) * block_m
-    SEQLEN_K = ((SEQLEN_K + block_n - 1) // block_n) * block_n
 
     tensor_layout = "NHD" # corresponds to bshd
 
