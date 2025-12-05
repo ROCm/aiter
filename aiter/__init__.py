@@ -22,7 +22,8 @@ def getLogger():
             )
         else:
             formatter = logging.Formatter(
-                fmt="[%(name)s] %(message)s",
+                fmt="[%(name)s %(levelname)s] %(asctime)s.%(msecs)03d - %(processName)s:%(process)d - %(pathname)s:%(lineno)d - %(funcName)s\n%(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
             )
         console_handler.setFormatter(formatter)
         console_handler.setLevel(logging.INFO)
