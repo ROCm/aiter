@@ -176,6 +176,7 @@ def pa_reduce_v1(
     reduce_indptr: torch.Tensor,
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None:
@@ -185,6 +186,7 @@ def pa_reduce_v1(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        max_seqlen_q,
         final_output,
         final_lse,
     )
@@ -252,6 +254,7 @@ def pa_persistent_fwd(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        max_qlen,
         output,
         final_lse,
     )
@@ -777,6 +780,7 @@ def mla_reduce_v1(
     reduce_indptr: torch.Tensor,
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None: ...
