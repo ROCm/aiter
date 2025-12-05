@@ -54,7 +54,7 @@ void get_mla_metadata_v1(
     const bool                          fast_mode,
     const int32_t                       topk,
     const int32_t                       max_split_per_batch,
-    const bool                          intera_batch_mode,
+    const bool                          intra_batch_mode,
     const std::optional<at::ScalarType> dtype_q,
     const std::optional<at::ScalarType> dtype_kv)
 {
@@ -96,7 +96,7 @@ void get_mla_metadata_v1(
             reduce_final_map,
             reduce_partial_map);
     }
-    else if (intera_batch_mode)
+    else if (intra_batch_mode)
     {
         get_mla_metadata_v1_0_device(
             seqlens_qo_indptr,
@@ -108,6 +108,7 @@ void get_mla_metadata_v1(
             max_seqlen_qo,
             uni_seqlen_qo,
             max_split_per_batch,
+            q_dtype,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,

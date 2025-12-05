@@ -1427,7 +1427,7 @@ namespace py = pybind11;
           py::arg("fast_mode")           = true,          \
           py::arg("topk")                = -1,            \
           py::arg("max_split_per_batch") = -1,            \
-          py::arg("intera_batch_mode")   = false,         \
+          py::arg("intra_batch_mode")   = false,         \
           py::arg("dtype_q")             = std::nullopt,  \
           py::arg("dtype_kv")            = std::nullopt); \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);

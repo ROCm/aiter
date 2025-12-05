@@ -17,6 +17,7 @@ __device__ int32_t get_local_splits(int32_t seqlen_kv,
 #endif
 }
 
+template<bool DP_MODE=false>
 __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
 {
@@ -45,20 +46,31 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
     {
         const int32_t bid_ori = bid / params.qk_batch_ratio;
 
-        const int32_t kv_begin  = params.p_seqlens_kv_indptr[bid_ori];
-        const int32_t kv_end    = params.p_seqlens_kv_indptr[bid_ori + 1];
-        const int32_t seqlen_kv = kv_end - kv_begin;
+        const int32_t kv_begin = params.p_seqlens_kv_indptr[bid_ori];
+        const int32_t kv_end   = params.p_seqlens_kv_indptr[bid_ori + 1];
+
+        int32_t kv_tail = [&](){
+            if constexpr(DP_MODE)
+            {
+               return bid % params.ori_seqlen_qo - params.ori_seqlen_qo + 1;
+            }
+            else
+            {
+                return 0;
+            }
+        }();
+        const int32_t seqlen_kv = kv_end - kv_begin + kv_tail;
 
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_splits = get_local_splits(seqlen_kv, params.num_splits, num_splits_per_cu);
         const int32_t payload = ck_tile::integer_divide_ceil(num_blocks, num_splits);
         int32_t split_local = ck_tile::integer_divide_ceil(num_blocks, payload);
-	int32_t tail = seqlen_kv % (payload * params.kv_granularity);
-        if (tail <= 4 && tail != 0)
+        int32_t tail = seqlen_kv % (payload * params.kv_granularity);
+        if (tail <= 4 && tail != 0 && split_local > 1)
         {
-	    split_local--;
-	}
+            split_local--;
+        }
         p_lds_split[bid] = split_local;
         p_lds_payload[bid] = payload;
         p_lds_kv_seqlen[bid_ori + 1] = kv_end;
@@ -86,24 +98,35 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
         const int32_t bid_ori = bid / params.qk_batch_ratio;
 
         const int32_t kv_begin  = p_lds_kv_seqlen[bid_ori];
-        const int32_t kv_end    = p_lds_kv_seqlen[bid_ori + 1];
+        int32_t kv_end = p_lds_kv_seqlen[bid_ori + 1];
+        int32_t kv_tail  = [&](){
+            if constexpr(DP_MODE)
+            {
+               return bid % params.ori_seqlen_qo - params.ori_seqlen_qo + 1;
+            }
+            else
+            {
+                return 0;
+            }
+        }();
+        kv_end += kv_tail;
         MlaWorkInfo work_info{};
         const int32_t split_start = p_lds_shift[bid];
         const int32_t split_local = p_lds_split[bid];
-        const int32_t payload = p_lds_payload[bid];
+        const int32_t payload     = p_lds_payload[bid];
 
         for(int32_t sid = 0; sid < split_local; sid++)
         {
             const int32_t work_index = split_start + sid;
 
-            work_info.batch_idx = bid;
+            work_info.batch_idx      = bid;
             work_info.partial_qo_loc = split_local == 1 ? -1 : work_index * params.uni_seqlen_qo;
-            work_info.qo_start  = bid * params.uni_seqlen_qo;
-            work_info.qo_end    = work_info.qo_start + params.uni_seqlen_qo;
-            work_info.kv_start  = kv_begin + (sid * payload * params.kv_granularity);
-            work_info.kv_end    = ck_tile::min(work_info.kv_start + payload * params.kv_granularity, kv_end);
-            work_info.kv_offset = kv_end - work_info.kv_end;
-            if (work_info.kv_offset <= 4)
+            work_info.qo_start       = bid * params.uni_seqlen_qo;
+            work_info.qo_end         = work_info.qo_start + params.uni_seqlen_qo;
+            work_info.kv_start       = kv_begin + (sid * payload * params.kv_granularity);
+            work_info.kv_end         = ck_tile::min(work_info.kv_start + payload * params.kv_granularity, kv_end);
+            work_info.kv_offset      = kv_end - work_info.kv_end;
+            if (work_info.kv_offset <= 4 && split_local > 1)
             {
                 work_info.kv_end = kv_end;
                 work_info.kv_offset = 0;
@@ -112,7 +135,7 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
             params.p_reduce_partial_map[work_index] = work_info.partial_qo_loc;
         }
 
-        params.p_reduce_indptr[bid + 1] = split_start + split_local;
+        params.p_reduce_indptr[bid + 1]        = split_start + split_local;
         params.p_reduce_final_map[bid * 2]     = work_info.qo_start;
         params.p_reduce_final_map[bid * 2 + 1] = work_info.qo_end;
     }
@@ -145,6 +168,7 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   const int32_t max_seqlen_qo,
                                   const int32_t ori_uni_seqlen_qo,
                                   const int32_t num_splits,
+                                  const at::ScalarType q_dtype,
                                   torch::Tensor& work_metadata_ptrs,
                                   torch::Tensor& work_info_set,
                                   torch::Tensor& work_indptr,
@@ -216,5 +240,12 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
-	kn_get_mla_metadata_v1_0<<<grid, dev_prop.warpSize, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    if(num_heads == 128 && q_dtype != at::ScalarType::BFloat16)
+    {
+        kn_get_mla_metadata_v1_0<true><<<grid, dev_prop.warpSize, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    }
+    else
+    {
+        kn_get_mla_metadata_v1_0<false><<<grid, dev_prop.warpSize, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    }
 }

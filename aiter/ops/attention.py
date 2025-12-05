@@ -679,7 +679,7 @@ def get_mla_metadata_v1(
     fast_mode: bool = True,
     topk: int = -1,
     max_split_per_batch: int = -1,
-    intera_batch_mode: bool = False,
+    intra_batch_mode: bool = False,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
 ) -> None:
@@ -697,6 +697,7 @@ def get_mla_metadata_v1(
                            length is not fixed.
             fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
                        mode may lead to bad overall performance.
+            intra_batch_mode: default=False. Fake non persistent mode. Same splits for each batch.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
