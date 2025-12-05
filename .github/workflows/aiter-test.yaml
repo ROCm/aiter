@@ -98,7 +98,7 @@ jobs:
               fi \
            && pip install -r requirements.txt \
            && ls -al \
-           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH_LIST }} python setup.py develop
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
