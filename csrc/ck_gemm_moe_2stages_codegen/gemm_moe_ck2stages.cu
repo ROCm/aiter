@@ -65,7 +65,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                 "Out dtype only support BFloat16/Float16!")
 
     int tokens = hidden_states.size(0);
-    int sorted_size = sorted_token_ids.size(0);
+    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
     int N = w1.size(1) / 2;
     int K = hidden_states.size(-1);
@@ -122,7 +122,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                 "Out dtype only support BFloat16/Float16!")
 
     int tokens = inter_states.size(0);
-    int sorted_size = sorted_token_ids.size(0);
+    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
     int N = w2.size(1);
     int K = inter_states.size(-1);
