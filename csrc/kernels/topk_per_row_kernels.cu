@@ -1019,13 +1019,6 @@ __global__ void radix_kernel(T const* in,
             counter->previous_len = current_len;
             // not necessary for the last pass, but put it here anyway
             counter->filter_cnt = 0;
-
-            counter->finished_block_cnt = 0;
-            if(pass == num_passes - 2)  // Before the last pass
-            {
-                counter->out_cnt = 0;
-                counter->out_back_cnt = 0;
-            }
         }
 
         if(pass == num_passes - 1)

@@ -95,6 +95,32 @@ void topk_per_row_kernel_launcher(const float* in,
                                int k,
                                hipStream_t stream);
 
+// Helper function to determine if topk_per_row kernel should be used
+// Based on: n + K log²K ≥ 3 × Factor(n) × n
+// where Factor(n) = 1/3 + 1.6/(log₂(n) - 9.5)
+// Simplifies to: K log²K ≥ 4.8n/(log₂(n) - 9.5)
+template <typename IdxT>
+__forceinline__ __host__ bool should_use_topk_radix(IdxT len, IdxT k)
+{
+    const double n = static_cast<double>(len);
+    const double K = static_cast<double>(k);
+
+    if (K <= 1.0) {
+        return false;
+    }
+
+    const double log_n = std::log2(n);
+
+    const double denom = std::max(0.0001, log_n - 9.5);
+
+    const double rhs = (4.8 * n) / denom;
+
+    const double log_k = std::log2(K);
+    const double lhs = K * log_k * log_k;
+
+    return lhs >= rhs;
+}
+
 // Gather kernel to extract values based on indices (uniform length)
 template <typename T, typename IdxT>
 __global__ void gather_topk_values_kernel(const T* __restrict__ in,
@@ -607,7 +633,7 @@ __forceinline__ __device__ constexpr T get_guard(const bool x)
         // Use bit patterns to avoid __truncsfbf2 in debug builds
         constexpr uint16_t pos_inf_bits = 0x7F80;  // +infinity
         constexpr uint16_t neg_inf_bits = 0xFF80;  // -infinity
-        return x ? __builtin_bit_cast(__bf16, neg_inf_bits) 
+        return x ? __builtin_bit_cast(__bf16, neg_inf_bits)
                  : __builtin_bit_cast(__bf16, pos_inf_bits);
     }
     else if constexpr(!std::is_floating_point_v<T>)
@@ -2100,16 +2126,13 @@ void AdaptiveTopK(int batch_size,
 
     constexpr bool is_float = std::is_same_v<T, float>;
     if constexpr(is_float) {
-        if (k > 128 && greater) {
+        // Use topk_per_row kernel when:
+        // n + K log²K ≥ 3 × Factor(n) × n
+        // where Factor(n) = 1/3 + 1.6/(log₂(n) - 9.5)
+        if (should_use_topk_radix(len, k) && greater) {
             topk_per_row_kernel_launcher<IdxT>(
                 in, nullptr, nullptr, out_idx,
                 out, batch_size, static_cast<int>(len), 1, k, stream);
-
-            // topk_per_row only outputs indices, we need to gather values manually
-            // const int threads = 256;
-            // const int blocks = batch_size;
-            // gather_topk_values_kernel<T, IdxT><<<blocks, threads, 0, stream>>>(
-            //     in, out_idx, out, batch_size, len, k);
 
             return;
         }
@@ -2155,22 +2178,17 @@ void AdaptiveTopK(int batch_size,
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
 
-    // Use topk_per_row kernel when k >= 128 and type is float and finding largest
+    // Use topk_per_row kernel when: n + K log²K ≥ 3 × Factor(n) × n
+    // where Factor(n) = 1/3 + 1.6/(log₂(n) - 9.5)
     constexpr bool is_float = std::is_same_v<T, float>;
     if constexpr(is_float)
     {
-        if(k > 128 && greater)  // topk_per_row only supports descending (largest)
+        // Note: topk_per_row only supports descending (largest)
+        if(should_use_topk_radix(max_len, k) && greater)
         {
             topk_per_row_kernel_launcher<IdxT>(
                 in, rowStarts, rowEnds, out_idx, out,
                 batch_size, static_cast<int>(stride0), static_cast<int>(stride1), k, stream);
-
-            // topk_per_row only outputs indices, we need to gather values manually
-            // const int threads = 256;
-            // const int blocks = batch_size;
-            // gather_topk_values_strided_kernel<T, IdxT><<<blocks, threads, 0, stream>>>(
-            //     in, out_idx, out, rowStarts, batch_size,
-            //     static_cast<int>(stride0), static_cast<int>(stride1), k);
 
             return;
         }
