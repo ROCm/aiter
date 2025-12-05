@@ -577,7 +577,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params,
                                       CommPtrs *cptrs,
                                       gpuStream_t stream) {
     int token_num = params.size / params.hidden_dim;
-    if (token_num <= 1024) {
+    if (true) {
         switch (params.hidden_dim) {
         case 4096:
             allreduce_fusion_kernel_w_launcher<T, NRanks, 4096>(params, meta, cptrs, stream);
