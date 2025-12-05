@@ -12,19 +12,22 @@ SEQ_LENS=(75600 16452 118808 29760)
 for i in ${!BATCH_SIZES[@]}; do
     echo "Running benchmark $((i+1))/4: batch_size=${BATCH_SIZES[i]}, num_heads=${NUM_HEADS[i]}, seq_len=${SEQ_LENS[i]}"
     # bench_attn_qk_int8_per_block.py
+    echo "Running benchmark for attn_qk_int8_per_block.py"
     python op_tests/op_benchmarks/triton/bench_attn_qk_int8_per_block.py \
         --batch_size ${BATCH_SIZES[i]} \
         --num_heads ${NUM_HEADS[i]} \
         --seq_len ${SEQ_LENS[i]} \
-        --metric time
+        --metric throughput \
+        --real-quant
     # bench_mha.py
+    echo "Running benchmark for bench_mha.py"
     python op_tests/op_benchmarks/triton/bench_mha.py \
         -b ${BATCH_SIZES[i]} \
         -hq ${NUM_HEADS[i]} \
         -sq ${SEQ_LENS[i]} \
         -d 128 \
         -qk_int8 \
-        -metric time
+        -metric throughput
 done
 
 # echo "Benchmarks complete. Results saved to ${OUTPUT_JSON}"

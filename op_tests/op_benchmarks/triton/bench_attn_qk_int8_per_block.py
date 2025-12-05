@@ -6,6 +6,7 @@ import torch
 import triton
 from aiter.ops.triton.attn_qk_int8_per_block import (
     attn_qk_int8_per_block,
+    per_block_int8,
     _get_config,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -19,21 +20,35 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 from typing import Tuple
 
 
-def get_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int, config) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def get_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int, config, real_quant: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
     BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
 
-    # Triton has seq_len after head_dim (HND layout)
-    q = torch.randint(-100, 100, (batch_size, num_heads, seq_len, head_dim), dtype=torch.int8, device='cuda')
-    k = torch.randint(-100, 100, (batch_size, num_heads, seq_len, head_dim), dtype=torch.int8, device='cuda')
+    # Triton uses HND layout (batch, heads, seq, dim)
     v = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device='cuda')
-    q_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_M), 1, dtype=torch.float16, device='cuda')
-    k_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_N), 1, dtype=torch.float16, device='cuda')
+    
+    if real_quant:
+        # Proper quantization: create float tensors and quantize via per_block_int8
+        q = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device='cuda')
+        k = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device='cuda')
+        sm_scale = head_dim ** -0.5
+        q, q_scale, k, k_scale = per_block_int8(
+            q, k, km=None, BLKQ=BLOCK_SIZE_M, BLKK=BLOCK_SIZE_N, sm_scale=sm_scale, tensor_layout="HND"
+        )
+        # Convert scales to float16 with trailing dimension
+        q_scale = q_scale.to(torch.float16).unsqueeze(-1).contiguous()
+        k_scale = k_scale.to(torch.float16).unsqueeze(-1).contiguous()
+    else:
+        # Default: create random int8 tensors and scales directly (faster)
+        q = torch.randint(-100, 100, (batch_size, num_heads, seq_len, head_dim), dtype=torch.int8, device='cuda')
+        k = torch.randint(-100, 100, (batch_size, num_heads, seq_len, head_dim), dtype=torch.int8, device='cuda')
+        q_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_M), 1, dtype=torch.float16, device='cuda')
+        k_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_N), 1, dtype=torch.float16, device='cuda')
     
     return q, k, v, q_scale, k_scale
 
 
-def bench_attn_fn(batch_size: int, num_heads: int, seq_len: int, head_dim: int, metric: str):
+def bench_attn_fn(batch_size: int, num_heads: int, seq_len: int, head_dim: int, metric: str, real_quant: bool = False):
     """
     Benchmark function for attention kernel.
     
@@ -43,12 +58,13 @@ def bench_attn_fn(batch_size: int, num_heads: int, seq_len: int, head_dim: int, 
         seq_len: Sequence length
         head_dim: Head dimension
         metric: Metric to report ('time', 'throughput', or 'bandwidth')
+        real_quant: If True, use per_block_int8 quantization. If False, use random int8 tensors (faster).
     
     Returns:
         The requested metric value
     """
     config = _get_config()
-    q, k, v, q_scale, k_scale = get_tensors(batch_size, num_heads, seq_len, head_dim, config)
+    q, k, v, q_scale, k_scale = get_tensors(batch_size, num_heads, seq_len, head_dim, config, real_quant)
     
     # Calculate FLOPs: 4 * num_heads * batch_size * head_dim * seq_len * seq_len
     flops = 4.0 * num_heads * batch_size * head_dim * seq_len * seq_len
@@ -128,12 +144,12 @@ def run_shape_benchmark(args):
         styles=[("green", "-")],
         ylabel=ylabel,
         plot_name=get_caller_name_no_ext(),
-        args={"metric": args.metric},
+        args={"metric": args.metric, "real_quant": args.real_quant},
     )
     
     @triton.testing.perf_report([benchmark])
-    def bench_attn_qk_int8_per_block(batch_size, num_heads, seq_len, head_dim, metric, **kwargs):
-        return bench_attn_fn(batch_size, num_heads, seq_len, head_dim, metric)
+    def bench_attn_qk_int8_per_block(batch_size, num_heads, seq_len, head_dim, metric, real_quant, **kwargs):
+        return bench_attn_fn(batch_size, num_heads, seq_len, head_dim, metric, real_quant)
     
     bench_attn_qk_int8_per_block.run(save_path="." if args.o else None, print_data=True)
 
@@ -169,6 +185,12 @@ def parse_args():
         type=int,
         default=128,
         help="Head dimension",
+    )
+    parser.add_argument(
+        "--real-quant",
+        action="store_true",
+        default=False,
+        help="Use per_block_int8 for proper quantization. If not specified, uses fake int8 tensors (faster).",
     )
     
     args = parser.parse_args()
