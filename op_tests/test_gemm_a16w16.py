@@ -106,8 +106,8 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
     if scaleB is not None:
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
-    (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
-    (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
+    a, avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
+    b, avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
     if (
         n % 16 == 0
         and k % 32 == 0
@@ -117,7 +117,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     ):
         init_hipblas()
         weight_bpreshuffle = shuffle_weight(weight, layout=(16, 16), use_int4=False)
-        (c, *_), avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
+        c, avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
         if bias is not None:
             c = c + bias
     else:
@@ -154,13 +154,13 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
         wshuffle = shuffle_weight(weight, layout=(16, 16))
-        # (d, *_), avg_d = run_bf16gemm_asm(
+        # d, avg_d = run_bf16gemm_asm(
         #     x,
         #     weight,
         #     out_asm,
         #     splitK=None,
         # )
-        (d, *_), avg_d = run_bf16gemm_asm(
+        d, avg_d = run_bf16gemm_asm(
             x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
         )
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
@@ -176,7 +176,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         "asm err (vs tgemm)": locals().get("err_asm", ""),
     }
 
-    (a, *_), us = run_gemm_triton(x, weight, bias, otype, scaleA, scaleB)
+    a, us = run_gemm_triton(x, weight, bias, otype, scaleA, scaleB)
     err = checkAllclose(b, a)
     ret["triton us"] = us
 
