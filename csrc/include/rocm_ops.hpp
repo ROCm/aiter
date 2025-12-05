@@ -1470,5 +1470,10 @@ namespace py = pybind11;
           &topk_plain,              \
           py::arg("values"),        \
           py::arg("topk_ids"),      \
+          py::arg("topk_out"),      \
           py::arg("topk"),          \
-          py::arg("largest"));
+          py::arg("largest") = true, \
+          py::arg("rowStarts") = torch::Tensor(), \
+          py::arg("rowEnds") = torch::Tensor(), \
+          py::arg("stride0") = -1,  \
+          py::arg("stride1") = 1); 

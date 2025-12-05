@@ -39,6 +39,7 @@
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
+#include "ck_tile/core.hpp"
 #include "dispatch_utils.h"
 #include "opus/opus.hpp"
 #include "py_itfs_common.h"
@@ -48,6 +49,103 @@
     {                                                 \
         utils::hip_check_((val), __FILE__, __LINE__); \
     }
+
+// Forward declaration of topk_per_row kernel from topk_per_row_kernels.cu
+namespace aiter {
+template <int kNumThreadsPerBlock, bool useRadixSort, int Vector>
+__global__ void topk_per_row(const float* logits,
+                              const int* rowStarts,
+                              const int* rowEnds,
+                              int* outIndices,
+                              int stride0,
+                              int stride1,
+                              int rowOffset);
+
+// Forward declaration of standalone_stable_radix_11bits from topk_per_row_kernels.cu
+template <typename T, typename IdxT, bool WRITE_TOPK_VALUES, bool sorted = false>
+void standalone_stable_radix_11bits(void* buf,
+                                    size_t& buf_size,
+                                    T const* in,
+                                    int batch_size,
+                                    int64_t len,
+                                    IdxT* rowStarts,
+                                    IdxT* rowEnds,
+                                    IdxT k,
+                                    T* out,
+                                    IdxT* out_idx,
+                                    bool greater,
+                                    hipStream_t stream);
+
+} // namespace aiter
+
+// Forward declaration of workspace size calculation function (at global scope)
+template <typename T>
+int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0);
+
+// Forward declaration of helper function to call topk_per_row kernel
+template <typename IdxT>
+void topk_per_row_kernel_launcher(const float* in,
+                               const IdxT* rowStarts,
+                               const IdxT* rowEnds,
+                               IdxT* out_idx,
+                               const float* out,
+                               int batch_size,
+                               int stride0,
+                               int stride1,
+                               int k,
+                               hipStream_t stream);
+
+// Gather kernel to extract values based on indices (uniform length)
+template <typename T, typename IdxT>
+__global__ void gather_topk_values_kernel(const T* __restrict__ in,
+                                          const IdxT* __restrict__ indices,
+                                          T* __restrict__ out,
+                                          int batch_size,
+                                          int len,
+                                          int k)
+{
+    int batch_id = blockIdx.x;
+    if(batch_id >= batch_size) return;
+
+    const T* in_row = in + batch_id * len;
+    const IdxT* idx_row = indices + batch_id * k;
+    T* out_row = out + batch_id * k;
+
+    for(int i = threadIdx.x; i < k; i += blockDim.x) {
+        IdxT idx = idx_row[i];
+        if(idx >= 0 && idx < len) {
+            out_row[i] = in_row[idx];
+        }
+    }
+}
+
+// Gather kernel for variable length with strides
+template <typename T, typename IdxT>
+__global__ void gather_topk_values_strided_kernel(const T* __restrict__ in,
+                                                   const IdxT* __restrict__ indices,
+                                                   T* __restrict__ out,
+                                                   const IdxT* __restrict__ rowStarts,
+                                                   int batch_size,
+                                                   int stride0,
+                                                   int stride1,
+                                                   int k)
+{
+    int batch_id = blockIdx.x;
+    if(batch_id >= batch_size) return;
+
+    IdxT start = rowStarts[batch_id];
+    const T* in_row = in + batch_id * stride0;
+    const IdxT* idx_row = indices + batch_id * k;
+    T* out_row = out + batch_id * k;
+
+    for(int i = threadIdx.x; i < k; i += blockDim.x) {
+        IdxT idx = idx_row[i];
+        if(idx >= 0) {
+            // idx is relative to rowStart, need to add start and apply stride1
+            out_row[i] = in_row[(start + idx) * stride1];
+        }
+    }
+}
 
 namespace topk {
 namespace utils {
@@ -205,7 +303,7 @@ namespace numeric {
  * value for all other arithmetic types.
  */
 template <typename T>
-__inline__ constexpr T get_lower_bound()
+__inline__ __host__ __device__ constexpr T get_lower_bound()
 {
     static_assert(utils::is_supported_type_v<T>,
                   "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
@@ -219,7 +317,9 @@ __inline__ constexpr T get_lower_bound()
     }
     else if constexpr(std::is_same_v<T, __bf16>)
     {
-        return -__bf16(0x7F80);
+        // Use bit pattern for -inf to avoid __truncsfbf2 calls in debug builds
+        constexpr uint16_t neg_inf_bits = 0xFF80;  // -infinity for bfloat16
+        return __builtin_bit_cast(__bf16, neg_inf_bits);
     }
     else
     {
@@ -234,7 +334,7 @@ __inline__ constexpr T get_lower_bound()
  * value for all other arithmetic types.
  */
 template <typename T>
-__inline__ constexpr T get_upper_bound()
+__inline__ __host__ __device__ constexpr T get_upper_bound()
 {
     static_assert(utils::is_supported_type_v<T>,
                   "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
@@ -248,7 +348,9 @@ __inline__ constexpr T get_upper_bound()
     }
     else if constexpr(std::is_same_v<T, __bf16>)
     {
-        return __bf16(0x7F80);
+        // Use bit pattern for +inf to avoid __truncsfbf2 calls in debug builds
+        constexpr uint16_t pos_inf_bits = 0x7F80;  // +infinity for bfloat16
+        return __builtin_bit_cast(__bf16, pos_inf_bits);
     }
     else
     {
@@ -265,7 +367,7 @@ __inline__ constexpr T get_upper_bound()
  * @tparam T The numeric type.
  */
 template <bool FindLargest, typename T>
-__inline__ constexpr T get_sentinel_value()
+__inline__ __host__ __device__ constexpr T get_sentinel_value()
 {
     if constexpr(FindLargest)
     {
@@ -502,8 +604,11 @@ __forceinline__ __device__ constexpr T get_guard(const bool x)
     }
     else if constexpr(std::is_same_v<T, __bf16>)
     {
-        auto inf = __bf16(0x7F80);
-        return x ? -inf : inf;
+        // Use bit patterns to avoid __truncsfbf2 in debug builds
+        constexpr uint16_t pos_inf_bits = 0x7F80;  // +infinity
+        constexpr uint16_t neg_inf_bits = 0xFF80;  // -infinity
+        return x ? __builtin_bit_cast(__bf16, neg_inf_bits) 
+                 : __builtin_bit_cast(__bf16, pos_inf_bits);
     }
     else if constexpr(!std::is_floating_point_v<T>)
     {
@@ -709,7 +814,7 @@ struct BitonicMerge<64, ascending, T, idxT>
 
 namespace buffer_load_helpers {
 
-constexpr int MAX_CAPACITY = 512;
+constexpr int MAX_CAPACITY = 2048;
 
 using int32x4_t = int __attribute__((ext_vector_type(4)));
 using floatx4_t = float __attribute__((ext_vector_type(4)));
@@ -868,7 +973,7 @@ struct WaveMergeHelper
 };
 
 // Forward declarations for kernel wrapper functions
-template <int capacity, bool greater, typename T, typename IdxT>
+template <int capacity, bool greater, typename T, typename IdxT, bool UseBufferAddressing = true>
 __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const T* __restrict__ in,
                                                              const IdxT* __restrict__ in_idx,
                                                              int batch_size,
@@ -903,7 +1008,10 @@ template <typename T, typename IdxT>
 using KernelFuncPtr = void (*)(const T*, const IdxT*, int, IdxT, IdxT, T*, IdxT*, T);
 
 // Helper: Map block-level strategy class to its corresponding kernel function template
-template <template <int, bool, typename, typename> class StrategyClass>
+// UseBufferAddressing: Controls whether BlockTopkFilter uses buffer addressing (limited to
+// UINT_MAX)
+template <template <int, bool, typename, typename> class StrategyClass,
+          bool UseBufferAddressing = true>
 struct StrategyKernelSelector
 {
     template <int capacity, bool greater, typename T, typename IdxT>
@@ -912,7 +1020,7 @@ struct StrategyKernelSelector
         if constexpr(std::is_same_v<StrategyClass<64, greater, T, IdxT>,
                                     BlockTopkFilter<64, greater, T, IdxT>>)
         {
-            return topk_filter_kernel<capacity, greater, T, IdxT>;
+            return topk_filter_kernel<capacity, greater, T, IdxT, UseBufferAddressing>;
         }
         else if constexpr(std::is_same_v<StrategyClass<64, greater, T, IdxT>,
                                          BlockTopkSort<64, greater, T, IdxT>>)
@@ -927,7 +1035,7 @@ struct StrategyKernelSelector
         else
         {
             static_assert(sizeof(T) == 0, "Unsupported strategy class");
-            return topk_filter_kernel<capacity, greater, T, IdxT>;
+            return topk_filter_kernel<capacity, greater, T, IdxT, UseBufferAddressing>;
         }
     }
 };
@@ -936,22 +1044,34 @@ template <bool greater,
           template <int, bool, typename, typename>
           class StrategyClass,
           typename T,
-          typename IdxT>
+          typename IdxT,
+          bool UseBufferAddressing = true>
 __forceinline__ KernelFuncPtr<T, IdxT> get_kernel_function_pointer(int capacity)
 {
     switch(capacity)
     {
     case 64:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<64, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<64, greater, T, IdxT>();
     case 128:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<128, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<128, greater, T, IdxT>();
     case 256:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<256, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<256, greater, T, IdxT>();
     case 512:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<512, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<512, greater, T, IdxT>();
+    case 1024:
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<1024, greater, T, IdxT>();
+    case 2048:
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<2048, greater, T, IdxT>();
     default:
         assert(false && "Unsupported capacity");
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<64, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<64, greater, T, IdxT>();
     }
 }
 
@@ -1330,14 +1450,60 @@ struct WaveTopkFilter
             reinterpret_cast<IdxT*>(lds_buf + vals_size) + wave_id * opus::get_warp_size();
     }
 
-    __device__ void
-    sort(const T* __restrict__ in, IdxT batch_start, IdxT start, IdxT end, IdxT total_len)
+    __device__ void sort(const T* __restrict__ in, uint64_t batch_start, IdxT start, IdxT end)
     {
         static_assert(utils::is_supported_type_v<T>,
                       "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
 
-        // AmdBufferCoherence slc
-        constexpr auto cache_policy = 2;
+        constexpr auto cache_policy = ck_tile::amd_buffer_coherence_enum::slc;
+        const IdxT n                = end - start;
+        const IdxT tid              = threadIdx.x;
+        const IdxT stride           = blockDim.x;
+        constexpr IdxT elements     = 16 / sizeof(T);
+
+        if constexpr(std::is_same_v<T, _Float16>)
+        {
+            const IdxT block_tile  = blockDim.x;
+            const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
+
+            in += batch_start;
+
+            T val[2];
+            val[0] = (start + tid < end) ? in[start + tid] : buffer_.sentinel;
+            for(IdxT i = start + tid; i < end_aligned; i += stride)
+            {
+                val[1] = (i + stride < end) ? in[i + stride] : buffer_.sentinel;
+                filter_and_stage(val[0], i);
+                val[0] = val[1];
+            }
+        }
+        else if constexpr(std::is_same_v<T, float> || std::is_same_v<T, int>)
+        {
+            const IdxT block_tile  = blockDim.x;
+            const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
+
+            in += batch_start;
+
+            T val[2];
+            val[0] = (start + tid < end) ? in[start + tid] : buffer_.sentinel;
+            for(IdxT i = start + tid; i < end_aligned; i += stride)
+            {
+                val[1] = (i + stride < end) ? in[i + stride] : buffer_.sentinel;
+                filter_and_stage(val[0], i);
+                val[0] = val[1];
+            }
+        }
+
+        finalize();
+    }
+
+    __device__ void sort_buffer_addressing(
+        const T* __restrict__ in, uint64_t batch_start, IdxT start, IdxT end, IdxT total_len)
+    {
+        static_assert(utils::is_supported_type_v<T>,
+                      "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
+
+        constexpr auto cache_policy = ck_tile::amd_buffer_coherence_enum::slc;
         const IdxT n                = end - start;
         const IdxT tid              = threadIdx.x;
         const IdxT stride           = blockDim.x;
@@ -1382,11 +1548,11 @@ struct WaveTopkFilter
                 filter_and_stage(val, i);
             }
         }
-        else if(std::is_same_v<T, float> || std::is_same_v<T, int>)
+        else if constexpr(std::is_same_v<T, float> || std::is_same_v<T, int>)
         {
-            constexpr IdxT tile       = elements;
-            const IdxT block_tile     = blockDim.x * tile;
-            const IdxT end_aligned    = start + utils::round_up_to_multiple_of(n, block_tile);
+            constexpr IdxT tile    = elements;
+            const IdxT block_tile  = blockDim.x * tile;
+            const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
 
             using VecType = std::conditional_t<std::is_same_v<T, float>,
                                                buffer_load_helpers::floatx4_t,
@@ -1557,24 +1723,37 @@ struct BlockTopkFilter
             utils::round_up_to_multiple_of<16>(num_waves / 2 * sizeof(T) * k_));
     }
 
+    template <bool UseBufferAddressing = true>
     __device__ void operator()(const T* __restrict__ in,
-                               IdxT batch_start,
+                               uint64_t batch_start,
                                T* __restrict__ out,
                                IdxT* __restrict__ out_idx,
                                IdxT start,
                                IdxT end,
                                IdxT total_len)
     {
-        sort(in, batch_start, start, end, total_len);
+        if constexpr(UseBufferAddressing)
+        {
+            sort_buffer_addressing(in, batch_start, start, end, total_len);
+        }
+        else
+        {
+            sort(in, batch_start, start, end);
+        }
         reduce();
         store(out, out_idx);
     }
 
     // Sort the results within each wave
-    __device__ void
-    sort(const T* __restrict__ in, IdxT batch_start, IdxT start, IdxT end, IdxT total_len)
+    __device__ void sort(const T* __restrict__ in, uint64_t batch_start, IdxT start, IdxT end)
     {
-        wave_topk_.sort(in, batch_start, start, end, total_len);
+        wave_topk_.sort(in, batch_start, start, end);
+    }
+
+    __device__ void sort_buffer_addressing(
+        const T* __restrict__ in, uint64_t batch_start, IdxT start, IdxT end, IdxT total_len)
+    {
+        wave_topk_.sort_buffer_addressing(in, batch_start, start, end, total_len);
     }
 
     // Reduce the results via LDS
@@ -1617,7 +1796,7 @@ struct BlockTopkFilter
     IdxT* pos;
 };
 
-template <int capacity, bool greater, typename T, typename IdxT>
+template <int capacity, bool greater, typename T, typename IdxT, bool UseBufferAddressing>
 __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const T* __restrict__ in,
                                                              const IdxT* __restrict__ in_idx,
                                                              int batch_size,
@@ -1628,23 +1807,23 @@ __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const T* __restrict
                                                              T sentinel)
 {
     extern __shared__ char lds_buf[];
-    const int block_per_batch     = gridDim.x / batch_size;
-    const int batch_id            = blockIdx.x / block_per_batch;
-    const int block_id_in_a_batch = blockIdx.x % block_per_batch;
+    const IdxT block_per_batch     = gridDim.x / batch_size;
+    const IdxT batch_id            = blockIdx.x / block_per_batch;
+    const IdxT block_id_in_a_batch = blockIdx.x % block_per_batch;
     // TODO: Consider multiple blocks
     const IdxT len_per_block = len;
-    const IdxT batch_start   = batch_id * len;
+    const uint64_t batch_start = static_cast<uint64_t>(batch_id) * len;
     IdxT start               = block_id_in_a_batch * len_per_block;
     IdxT end                 = std::min(start + len_per_block, len);
 
     BlockTopkFilter<capacity, greater, T, IdxT> topk(k, sentinel, lds_buf);
-    topk(in,
-         batch_start,
-         out + static_cast<size_t>(blockIdx.x) * k,
-         out_idx + static_cast<size_t>(blockIdx.x) * k,
-         start,
-         end,
-         batch_size * len);
+    topk.template operator()<UseBufferAddressing>(in,
+                                                  batch_start,
+                                                  out + static_cast<size_t>(blockIdx.x) * k,
+                                                  out_idx + static_cast<size_t>(blockIdx.x) * k,
+                                                  start,
+                                                  end,
+                                                  batch_size * len);
 }
 
 // WaveTopkMerge: Iteratively merges pre-sorted k-sized chunks
@@ -1856,7 +2035,34 @@ void topk_kernel_launcher(int block_per_batch,
     int lds_size = calc_lds_size_for_block_wide<T, IdxT>(wave_per_block, k);
 
     const int capacity = utils::calc_capacity(k);
-    auto topk_kernel   = get_kernel_function_pointer<greater, StrategyClass, T, IdxT>(capacity);
+
+    // For BlockTopkFilter: check if buffer addressing can be used (limited to UINT_MAX)
+    // For other strategies: always use default behavior (they don't use buffer addressing)
+    constexpr bool is_filter =
+        std::is_same_v<StrategyClass<64, greater, T, IdxT>, BlockTopkFilter<64, greater, T, IdxT>>;
+
+    KernelFuncPtr<T, IdxT> topk_kernel;
+    if constexpr(is_filter)
+    {
+        // BlockTopkFilter: dispatch based on total size
+        const uint64_t total_size = static_cast<uint64_t>(batch_size) * len * sizeof(T);
+        if(total_size < static_cast<uint64_t>(UINT32_MAX))
+        {
+            topk_kernel =
+                get_kernel_function_pointer<greater, StrategyClass, T, IdxT, true>(capacity);
+        }
+        else
+        {
+            topk_kernel =
+                get_kernel_function_pointer<greater, StrategyClass, T, IdxT, false>(capacity);
+        }
+    }
+    else
+    {
+        // BlockTopkSort / BlockTopkMerge: always use default
+        topk_kernel = get_kernel_function_pointer<greater, StrategyClass, T, IdxT>(capacity);
+    }
+
     topk_kernel<<<batch_size * block_per_batch, block_dim, lds_size, stream>>>(
         in, static_cast<IdxT*>(nullptr), batch_size, len, k, result_val, result_idx, sentinel);
 
@@ -1880,6 +2086,7 @@ void topk_kernel_launcher(int block_per_batch,
     }
 }
 
+// Uniform length version of AdaptiveTopK
 template <bool greater, typename T, typename IdxT>
 void AdaptiveTopK(int batch_size,
                   IdxT len,
@@ -1890,6 +2097,24 @@ void AdaptiveTopK(int batch_size,
                   hipStream_t stream = 0)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
+
+    constexpr bool is_float = std::is_same_v<T, float>;
+    if constexpr(is_float) {
+        if (k > 128 && greater) {
+            topk_per_row_kernel_launcher<IdxT>(
+                in, nullptr, nullptr, out_idx,
+                out, batch_size, static_cast<int>(len), 1, k, stream);
+
+            // topk_per_row only outputs indices, we need to gather values manually
+            // const int threads = 256;
+            // const int blocks = batch_size;
+            // gather_topk_values_kernel<T, IdxT><<<blocks, threads, 0, stream>>>(
+            //     in, out_idx, out, batch_size, len, k);
+
+            return;
+        }
+    }
+
     const int capacity = utils::calc_capacity(k);
     int block_per_batch = 0;
     int wave_per_block  = 0;
@@ -1914,19 +2139,147 @@ void AdaptiveTopK(int batch_size,
     }
 }
 
+// Overload for variable length support with rowStarts/rowEnds
+template <bool greater, typename T, typename IdxT>
+void AdaptiveTopK(int batch_size,
+                  IdxT max_len,
+                  IdxT k,
+                  const T* __restrict__ in,
+                  T* __restrict__ out,
+                  IdxT* __restrict__ out_idx,
+                  const IdxT* __restrict__ rowStarts,
+                  const IdxT* __restrict__ rowEnds,
+                  int64_t stride0,
+                  int64_t stride1,
+                  hipStream_t stream = 0)
+{
+    assert(k <= buffer_load_helpers::MAX_CAPACITY);
+
+    // Use topk_per_row kernel when k >= 128 and type is float and finding largest
+    constexpr bool is_float = std::is_same_v<T, float>;
+    if constexpr(is_float)
+    {
+        if(k > 128 && greater)  // topk_per_row only supports descending (largest)
+        {
+            topk_per_row_kernel_launcher<IdxT>(
+                in, rowStarts, rowEnds, out_idx, out,
+                batch_size, static_cast<int>(stride0), static_cast<int>(stride1), k, stream);
+
+            // topk_per_row only outputs indices, we need to gather values manually
+            // const int threads = 256;
+            // const int blocks = batch_size;
+            // gather_topk_values_strided_kernel<T, IdxT><<<blocks, threads, 0, stream>>>(
+            //     in, out_idx, out, rowStarts, batch_size,
+            //     static_cast<int>(stride0), static_cast<int>(stride1), k);
+
+            return;
+        }
+    }
+
+    // Fall back to processing each batch separately for other cases
+    for(int batch_id = 0; batch_id < batch_size; ++batch_id)
+    {
+        IdxT start = rowStarts[batch_id];
+        IdxT end   = rowEnds[batch_id];
+        IdxT len   = end - start;
+
+        if(len <= 0) continue;
+
+        // Call the uniform length version for each batch
+        AdaptiveTopK<greater, T, IdxT>(
+            1,  // single batch
+            len,
+            k,
+            in + batch_id * stride0 + start * stride1,
+            out + batch_id * k,
+            out_idx + batch_id * k,
+            stream);
+    }
+}
+
 } // namespace topk
 
-void topk_plain(torch::Tensor& values,   // [batch, len]
-                torch::Tensor& topk_ids, // [batch, k]
-                int topk,
-                bool largest)
+// Helper function to call topk_per_row kernel (outside topk namespace)
+template <typename IdxT>
+void topk_per_row_kernel_launcher(const float* in,
+                               const IdxT* rowStarts,
+                               const IdxT* rowEnds,
+                               IdxT* out_idx,
+                               const float* out,
+                               int batch_size,
+                               int stride0,
+                               int stride1,
+                               int k,
+                               hipStream_t stream)
 {
-    const int32_t len   = values.size(-1);
-    const int32_t batch = values.numel() / len;
+
+    size_t buf_size = 0; // will be overwritten by the kernel
+
+    static constexpr bool is_largest = true;
+
+    int64_t workspace_size = invokeComputeTopkLastDimWorkspaceSize<float>(batch_size, stride0);
+
+
+    auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    torch::Tensor workspace = torch::empty({workspace_size}, options);
+
+
+    if(out)
+    {
+        aiter::standalone_stable_radix_11bits<float, int, true, true>(
+            static_cast<void*>(workspace.data_ptr<uint8_t>()),
+            buf_size,
+            in,
+            batch_size,
+            stride0,
+            const_cast<IdxT*>(rowStarts),
+            const_cast<IdxT*>(rowEnds),
+            k,
+            const_cast<float*>(out),
+            out_idx,
+            is_largest,
+            stream);
+    }
+    else
+    {
+        aiter::standalone_stable_radix_11bits<float, int, false, true>(
+            static_cast<void*>(workspace.data_ptr<uint8_t>()),
+            buf_size,
+            in,
+            batch_size,
+            stride0,
+            const_cast<IdxT*>(rowStarts),
+            const_cast<IdxT*>(rowEnds),
+            k,
+            nullptr,
+            out_idx,
+            is_largest,
+            stream);
+    }
+}
+
+void topk_plain(torch::Tensor& values,      // [batch, len]
+                torch::Tensor& topk_ids,    // [batch, k]
+                torch::Tensor& topk_out,    // [batch, k]
+                int topk,
+                bool largest,
+                torch::Tensor rowStarts,
+                torch::Tensor rowEnds,
+                int64_t stride0,
+                int64_t stride1)
+{
+    const int32_t max_len = values.size(-1);
+    const int32_t batch   = values.size(0);
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    torch::Tensor topk_out = torch::empty({batch, topk}, values.options());
+    // Check if we're using variable length mode
+    // Empty tensors have defined() = true but numel() = 0, so check both
+    const bool use_variable_length = rowStarts.defined() && rowEnds.defined() &&
+                                     rowStarts.numel() > 0 && rowEnds.numel() > 0;
+
+    // Set default stride values if not specified
+    if(stride0 < 0) stride0 = max_len;
 
     // Dispatch based on value tensor dtype
     VLLM_DISPATCH_FLOATING_TYPES(values.scalar_type(), "topk_plain", [&] {
@@ -1947,15 +2300,37 @@ void topk_plain(torch::Tensor& values,   // [batch, len]
         const input_dtype* values_kernel_ptr = reinterpret_cast<const input_dtype*>(values_ptr);
         input_dtype* topk_out_kernel_ptr     = reinterpret_cast<input_dtype*>(topk_out_ptr);
 
-        if(largest)
+        if(use_variable_length)
         {
-            topk::AdaptiveTopK<true, input_dtype, IdxT>(
-                batch, len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr, stream);
+            // Variable length mode: use rowStarts/rowEnds
+            const IdxT* rowStarts_ptr = rowStarts.data_ptr<IdxT>();
+            const IdxT* rowEnds_ptr   = rowEnds.data_ptr<IdxT>();
+
+            if(largest)
+            {
+                topk::AdaptiveTopK<true, input_dtype, IdxT>(
+                    batch, max_len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr,
+                    rowStarts_ptr, rowEnds_ptr, stride0, stride1, stream);
+            }
+            else
+            {
+                topk::AdaptiveTopK<false, input_dtype, IdxT>(
+                    batch, max_len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr,
+                    rowStarts_ptr, rowEnds_ptr, stride0, stride1, stream);
+            }
         }
         else
         {
-            topk::AdaptiveTopK<false, input_dtype, IdxT>(
-                batch, len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr, stream);
+            if(largest)
+            {
+                topk::AdaptiveTopK<true, input_dtype, IdxT>(
+                    batch, max_len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr, stream);
+            }
+            else
+            {
+                topk::AdaptiveTopK<false, input_dtype, IdxT>(
+                    batch, max_len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr, stream);
+            }
         }
     });
 }
