@@ -156,13 +156,14 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
+    if COMPUTE_TYPE == gl.float8e4nv:
+        FP8_MAX_VALUE: gl.constexpr = 448
+    else:
+        FP8_MAX_VALUE: gl.constexpr = 240
+
     # ==================== Constants and Configuration ====================
     if COMPUTE_TYPE.is_fp8():
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
-        if COMPUTE_TYPE == gl.float8e4nv:
-            FP8_MAX_VALUE: gl.constexpr = 448
-        else:
-            FP8_MAX_VALUE: gl.constexpr = 240
     else:
         OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential calculations
@@ -860,12 +861,13 @@ def paged_attention_decode_v2_gluon_fp8(
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
+    if COMPUTE_TYPE == gl.float8e4nv:
+        FP8_MAX_VALUE: gl.constexpr = 448
+    else:
+        FP8_MAX_VALUE: gl.constexpr = 240
+
     # ==================== CONSTANTS AND CONFIGURATION ====================
     if COMPUTE_TYPE.is_fp8():
-        if COMPUTE_TYPE == gl.float8e4nv:
-            FP8_MAX_VALUE: gl.constexpr = 448
-        else:
-            FP8_MAX_VALUE: gl.constexpr = 240
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
     else:
         OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
@@ -1061,10 +1063,10 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # ==================== PROGRAM ID AND INITIALIZATION ====================
     sequence_idx = gl.program_id(0)
-    context_length = gl.load(context_lengths_ptr + sequence_idx)
     kv_head_idx = gl.program_id(1)
     sequence_partition_idx = gl.program_id(2)
 
+    context_length = gl.load(context_lengths_ptr + sequence_idx)
     # Load query tensor with appropriate masking
     query_offsets_base = (
         sequence_idx * stride_query_seq
@@ -1075,6 +1077,10 @@ def paged_attention_decode_v2_gluon_fp8(
     query_mask = (query_group_offsets[:, None] < query_group_size) & (
         head_size_offsets[None, :] < head_size
     )
+    # if sequence_idx == 669 and kv_head_idx == 0:
+    #     print("query_offsets_base=", query_offsets_base)
+    #     print("query_mask=", query_mask)
+
     query_tensor = gl.amd.cdna3.buffer_load(
         ptr=query_ptr, offsets=query_offsets_base, mask=query_mask
     )
@@ -1187,7 +1193,7 @@ def paged_attention_decode_v2_gluon_fp8(
     kv_block_numbers = gl.amd.cdna3.buffer_load(
         ptr=block_table_start_ptr + kv_block_start_idx, offsets=block_indices
     )
-
+    # kv_block_numbers = kv_block_numbers.to(tl.uint64)
     # ==================== KEY LOADING AND PROCESSING ====================
     # Calculate key cache offsets and load keys
     key_block_offsets = (
@@ -1205,6 +1211,9 @@ def paged_attention_decode_v2_gluon_fp8(
         offsets=key_block_offsets,
         mask=valid_block_mask[:, None, None, None],
     )
+
+    # if sequence_idx == 669 and kv_head_idx == 0:
+    #     print("key_block_offsets=", key_block_offsets)
     # Prepare QK MFMA while key loads (these don't depend on key data)
     qk_accumulator = gl.zeros(
         (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
@@ -1272,7 +1281,8 @@ def paged_attention_decode_v2_gluon_fp8(
     # ==================== VALUE LOADING WITH QK MFMA OVERLAP ====================
     # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
     key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
-
+    key_converted = key_converted.to(COMPUTE_TYPE)
+    query_converted = query_converted.to(COMPUTE_TYPE)
     if VALUE_TRANSPOSED:
         # Load values from transposed cache layout
         kv_block_numbers_reshaped = gl.convert_layout(
@@ -1300,7 +1310,7 @@ def paged_attention_decode_v2_gluon_fp8(
             offsets=value_block_offsets,
             mask=valid_block_mask[:, None, None, None],
         )
-        value_tensor = value_tensor.to(COMPUTE_TYPE)
+        # value_tensor = value_tensor.to(COMPUTE_TYPE)
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
@@ -1395,7 +1405,6 @@ def paged_attention_decode_v2_gluon_fp8(
     # Compute attention probabilities
     attention_probs = tl.math.exp2((attention_scores - max_logits[:, None]) * LOG2_E)
     exp_sums = gl.sum(attention_probs, axis=1)
-
     # ==================== VALUE ACCUMULATION ====================
     # Handle value quantization scaling for FP8
     if KV_QUANT_MODE >= 0:
@@ -1416,10 +1425,9 @@ def paged_attention_decode_v2_gluon_fp8(
             probability_scale = value_scale_max / float(FP8_MAX_VALUE)
         elif KV_QUANT_MODE == 0:
             # Per-tensor quantization scaling
-            # attention_probs *= float(FP8_MAX_VALUE)
-            # probability_scale = value_scale_value / float(FP8_MAX_VALUE)
             attention_probs *= float(FP8_MAX_VALUE)
             probability_scale = value_scale_value / float(FP8_MAX_VALUE)
+            # probability_scale = 1
         else:
             raise ValueError(f"Invalid KV_QUANT_MODE: {KV_QUANT_MODE}")
 
@@ -2379,7 +2387,6 @@ def pa_decode_gluon(
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
 
     if sliding_window > 0 and sliding_window <= context_partition_size:
-
         _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             grid,
             exp_sums,
