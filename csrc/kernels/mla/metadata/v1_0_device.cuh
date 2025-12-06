@@ -52,7 +52,8 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
         int32_t kv_tail = [&](){
             if constexpr(DP_MODE)
             {
-               return bid % params.ori_seqlen_qo - params.ori_seqlen_qo + 1;
+                // max(*, 0) for cuda graph capture: kvlen < mtp+1
+                return max(bid % params.ori_seqlen_qo - params.ori_seqlen_qo + 1, 0);
             }
             else
             {
@@ -91,7 +92,6 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
     int32_t work_end = p_lds_shift[params.num_batches - 1] + p_lds_split[params.num_batches - 1];
     int32_t work_per_cu = work_end / params.num_cu;
     int32_t work_res = work_end % params.num_cu;
-    // int32_t used_cu = (work_end + work_per_cu - 1) / work_per_cu;
 
     for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
@@ -102,7 +102,8 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
         int32_t kv_tail  = [&](){
             if constexpr(DP_MODE)
             {
-               return bid % params.ori_seqlen_qo - params.ori_seqlen_qo + 1;
+                // max(*, 0) for cuda graph capture: kvlen < mtp+1
+                return max(bid % params.ori_seqlen_qo - params.ori_seqlen_qo + 1, 0);
             }
             else
             {
