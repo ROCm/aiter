@@ -407,9 +407,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     )
 
     # Synchronize
-    torch.cuda.synchronize()
-    if dist.is_initialized():
-        dist.barrier()
+    ctx.iris_ctx.barrier()
 
     logger.info(f"Rank {cur_rank}: Fused pipeline complete")
 
