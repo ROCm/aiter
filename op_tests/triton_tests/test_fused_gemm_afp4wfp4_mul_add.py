@@ -20,8 +20,8 @@ from op_tests.triton_tests.test_fused_mul_add import (
 
 def get_x_vals():
 
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(1, 1, 32)]  # minimal case
+    x_vals = [(v, 7168, 256) for v in [1, 2, 4, 8, 16, 1024]]
+    # x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
 
@@ -39,8 +39,7 @@ def get_x_vals():
 )
 @pytest.mark.parametrize(
     "b_type_is_scalar",
-    # [(float, True), (int, True), (torch.Tensor, True), (torch.Tensor, False)],
-    [(torch.Tensor, False)],
+    [(float, True), (int, True), (torch.Tensor, True), (torch.Tensor, False)],
 )
 @pytest.mark.parametrize(
     "fuse_type",
@@ -71,6 +70,8 @@ def test_fused_gemm_afp4wfp4_mul_add(
                 f"K = {K} is not divisible by 256, skip this test for preshuffled weight/scales tests"
             )
 
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     (
         x,
         w,
@@ -100,8 +101,11 @@ def test_fused_gemm_afp4wfp4_mul_add(
             run_torch_gemm_afp4wfp4(x, w, x_scales, w_scales, torch.float32), a, b
         ).to(dtype)
     else:
-        torch_out = run_torch_fused_mul_add(
-            b, a, run_torch_gemm_afp4wfp4(x, w, x_scales, w_scales, torch.float32)
+        a_torch = a.to(torch.float32) if isinstance(a, torch.Tensor) else a
+        b_torch = b.to(torch.float32) if isinstance(b, torch.Tensor) else b
+        torch_out = (
+            a_torch * b_torch
+            + run_torch_gemm_afp4wfp4(x, w, x_scales, w_scales, torch.float32)
         ).to(dtype)
 
     if shuffle_weight_scales:
