@@ -249,6 +249,7 @@ def create_kv_cache(
     model_dtype: Optional[Union[str, torch.dtype]] = None,
     seed: int = 0,
     device: Optional[str] = "cuda",
+    itemsize: int = 1,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Create key and value cache tensors."""
     if cache_dtype == "fp8" and head_size % 16:
@@ -257,7 +258,7 @@ def create_kv_cache(
         )
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
-    elements_per_vector = 16 // torch_dtype.itemsize
+    elements_per_vector = 16 // itemsize
     key_cache_shape = (
         num_blocks,
         num_heads,
@@ -1301,13 +1302,11 @@ def run_pa_gluon_test(
         data_type,
         seed,
         device,
+        1 if quant_kv else 2,
     )
     key_cache, value_cache = key_caches[0], value_caches[0]
-    query = torch.ones_like(query)
-    key_cache = torch.ones_like(key_cache)
-    value_cache = torch.ones_like(value_cache)
     softmax_scale = 1.0 / (head_size**0.5)
-    quant_kv = False
+
     # Quantization based on mode and flags
     if quant_mode == "per_token":
         # Per-token quantization for query (if enabled)
