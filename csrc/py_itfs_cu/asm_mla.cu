@@ -78,7 +78,7 @@ void mla_decode_stage1_asm_fwd(
     int kv_split        = splitData.size(1);
     const int gqa_ratio = num_heads / num_kv_heads;
 
-    bool persistent = work_meta_data.has_value() || (work_indptr.has_value() && work_info_set.has_value());
+    bool persistent = !num_kv_splits_indptr.has_value();
 
     int stride_Q       = Q.stride(0) * Q.itemsize() * max_seqlen_q;
     int stride_Page    = KV.stride(0) * KV.itemsize();
@@ -342,7 +342,7 @@ void mla_decode_stage1_asm_fwd(
         gdy = 1;
         gdz = 1;
     }
-    // printf("gdx: %d \n", gdx);
+    // printf("gdz: %d \n", gdz);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

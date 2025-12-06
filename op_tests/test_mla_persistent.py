@@ -16,7 +16,6 @@ torch.set_printoptions(sci_mode=False)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
 # qdtype fp8, kdtype bf16: nhead16
-import functools
 
 
 def cal_diff(
@@ -26,11 +25,11 @@ def cal_diff(
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
-    print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
-    # if use_fp8:
-    #     assert cos_diff < 3e-2
-    # else:
-    #     assert cos_diff < 1e-5
+    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    if use_fp8:
+        assert cos_diff < 3e-2
+    else:
+        assert cos_diff < 1e-5
 
 
 def ref_masked_attention(
@@ -484,7 +483,7 @@ parser.add_argument(
     type=str,
     choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    default=["bf16", "fp8"],
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
@@ -494,7 +493,7 @@ parser.add_argument(
     type=str,
     choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    default=["bf16", "fp8"],
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
@@ -503,7 +502,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[i for i in range(500, 1000)],
+    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
     help="""Context length.
     e.g.: -c 21""",
 )

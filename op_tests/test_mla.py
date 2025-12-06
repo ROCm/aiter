@@ -210,11 +210,11 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
-    # if (
-    #     dtype == torch.bfloat16 and kvtype == torch.bfloat16
-    # ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
-    #     us_aiter = test_normal_prefill()
-    #     ret["prefill:ck_192"] = us_aiter
+    if (
+        dtype == torch.bfloat16 and kvtype == torch.bfloat16
+    ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+        us_aiter = test_normal_prefill()
+        ret["prefill:ck_192"] = us_aiter
 
     torch.cuda.empty_cache()
     # absorb init
@@ -298,11 +298,11 @@ def test_mla(
         return us_asm
 
     us_asm = None
-    # if (
-    #     dtype == torch.bfloat16 and kvtype == torch.bfloat16
-    # ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
-    #     us_asm = test_absorb_prefill()
-    #     ret["prefill:asm_576"] = us_asm
+    if (
+        dtype == torch.bfloat16 and kvtype == torch.bfloat16
+    ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
+        us_asm = test_absorb_prefill()
+        ret["prefill:asm_576"] = us_asm
 
     torch.cuda.empty_cache()
 
