@@ -478,6 +478,7 @@ __device__ void filter_and_histogram(T const* in_buf,
                     {
                         out[pos] = value;
                     }
+
                     out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
                 }
                 else
