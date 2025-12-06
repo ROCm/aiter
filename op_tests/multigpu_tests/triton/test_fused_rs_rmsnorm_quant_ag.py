@@ -93,8 +93,7 @@ def run_fused_kernel(
                 gather_out = None
 
             # Ensure data is synchronized across GPUs
-            torch.cuda.synchronize()
-            dist.barrier()
+            ctx.iris_ctx.barrier()
 
             @perftest()
             def run_fused():
