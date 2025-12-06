@@ -156,7 +156,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
-    if COMPUTE_TYPE == gl.float8e4nv:
+    if CDNA_VERSION == 4:
         FP8_MAX_VALUE: gl.constexpr = 448
     else:
         FP8_MAX_VALUE: gl.constexpr = 240
@@ -861,7 +861,7 @@ def paged_attention_decode_v2_gluon_fp8(
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
-    if COMPUTE_TYPE == gl.float8e4nv:
+    if CDNA_VERSION == 4:
         FP8_MAX_VALUE: gl.constexpr = 448
     else:
         FP8_MAX_VALUE: gl.constexpr = 240
@@ -1403,7 +1403,7 @@ def paged_attention_decode_v2_gluon_fp8(
     # accumulator_scale = tl.math.exp2((max_logits - max_logits) * LOG2_E)
 
     # Compute attention probabilities
-    attention_probs = tl.math.exp2((attention_scores - max_logits[:, None]) * LOG2_E)
+    attention_probs = tl.math.exp(attention_scores - max_logits[:, None])
     exp_sums = gl.sum(attention_probs, axis=1)
     # ==================== VALUE ACCUMULATION ====================
     # Handle value quantization scaling for FP8
@@ -1425,19 +1425,17 @@ def paged_attention_decode_v2_gluon_fp8(
             probability_scale = value_scale_max / float(FP8_MAX_VALUE)
         elif KV_QUANT_MODE == 0:
             # Per-tensor quantization scaling
-            attention_probs *= float(FP8_MAX_VALUE)
-            probability_scale = value_scale_value / float(FP8_MAX_VALUE)
-            # probability_scale = 1
+            # attention_probs *= float(FP8_MAX_VALUE)
+            # probability_scale = value_scale_value / float(FP8_MAX_VALUE)
+            probability_scale = value_scale_value
         else:
             raise ValueError(f"Invalid KV_QUANT_MODE: {KV_QUANT_MODE}")
 
     # Convert attention probabilities to compute type for MFMA operation
-
-    attention_probs = attention_probs.to(COMPUTE_TYPE)
-
     # Convert layouts for PV MFMA operation
     probs_converted = gl.convert_layout(attention_probs, layout=pv_lhs_operand_layout)
     values_converted = gl.convert_layout(value_tensor, layout=pv_rhs_operand_layout)
+    probs_converted = probs_converted.to(COMPUTE_TYPE)
     values_converted = values_converted.to(COMPUTE_TYPE)
 
     # Scale previous accumulator and compute new attention output
