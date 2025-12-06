@@ -515,15 +515,45 @@ def run_benchmark(custom, args):
 
         if args.qk_int8:
             assert args.layout == "bshd", "int8 quantization only supports bshd layout."
-            tensor_layout = "NHD" # corresponds to bshd
+            # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
+            tensor_layout = args.qk_int8_layout
             config = _get_config()
-            k_mean = None
-            sm_scale = D_HEAD**-0.5
-            q, q_scale, k, k_scale = per_block_int8(
-                q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
-            )
-            v = v.to(torch.float16)
-            fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout="NHD", output_dtype=torch.float16, config=config)
+            
+            if args.real_quant:
+                # Real quantization: use per_block_int8 for proper quantization
+                # Original tensors are in NHD format (batch, seq, heads, dim)
+                if tensor_layout == "HND":
+                    # Convert from NHD to HND for better memory access
+                    q = q.transpose(1, 2).contiguous()
+                    k = k.transpose(1, 2).contiguous()
+                    v = v.transpose(1, 2).contiguous().to(torch.float16)
+                else:  # NHD
+                    # Keep original layout
+                    v = v.to(torch.float16)
+                k_mean = None
+                sm_scale = D_HEAD**-0.5
+                q, q_scale, k, k_scale = per_block_int8(
+                    q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+                )
+                q_scale = q_scale.to(torch.float16).unsqueeze(-1).contiguous()
+                k_scale = k_scale.to(torch.float16).unsqueeze(-1).contiguous()
+            else:
+                # Fake quantization: use random int8 tensors directly (faster, for benchmarking kernel only)
+                if tensor_layout == "HND":
+                    # HND format: (batch, heads, seq, dim)
+                    q = torch.randint(-100, 100, (BATCH, HQ, N_CTX_Q, D_HEAD), dtype=torch.int8, device=device)
+                    k = torch.randint(-100, 100, (BATCH, HK, N_CTX_K, D_HEAD), dtype=torch.int8, device=device)
+                    v = torch.randn(BATCH, HQ, N_CTX_Q, D_HEAD_V, dtype=torch.float16, device=device)
+                    q_scale = torch.randn(BATCH, HQ, (N_CTX_Q // config["BLOCK_SIZE_M"]), 1, dtype=torch.float16, device=device)
+                    k_scale = torch.randn(BATCH, HK, (N_CTX_K // config["BLOCK_SIZE_N"]), 1, dtype=torch.float16, device=device)
+                else:  # NHD
+                    # NHD format: (batch, seq, heads, dim)
+                    q = torch.randint(-100, 100, (BATCH, N_CTX_Q, HQ, D_HEAD), dtype=torch.int8, device=device)
+                    k = torch.randint(-100, 100, (BATCH, N_CTX_K, HK, D_HEAD), dtype=torch.int8, device=device)
+                    v = torch.randn(BATCH, N_CTX_Q, HQ, D_HEAD_V, dtype=torch.float16, device=device)
+                    q_scale = torch.randn(BATCH, HQ, (N_CTX_Q // config["BLOCK_SIZE_M"]), 1, dtype=torch.float16, device=device)
+                    k_scale = torch.randn(BATCH, HK, (N_CTX_K // config["BLOCK_SIZE_N"]), 1, dtype=torch.float16, device=device)
+            fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
         
         ms = triton.testing.do_bench(fn)
 
@@ -612,6 +642,10 @@ def parse_args():
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-qk_int8", action="store_true", default=False)
+    parser.add_argument("-real_quant", action="store_true", default=False,
+        help="Use real per_block_int8 quantization. If not specified, uses fake int8 (random tensors). Only valid with -qk_int8.")
+    parser.add_argument("-qk_int8_layout", type=str, default="HND", choices=["HND", "NHD"],
+        help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")
     parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)
