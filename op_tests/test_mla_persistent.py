@@ -227,7 +227,9 @@ def test_mla(
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
-    max_split_per_batch = min((cu_num + batch_size - 1) // batch_size, max_split_per_batch)
+    max_split_per_batch = min(
+        (cu_num + batch_size - 1) // batch_size, max_split_per_batch
+    )
 
     (
         (work_meta_data_size, work_meta_data_type),
@@ -290,7 +292,6 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
-    # import pdb;pdb.set_trace()
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -394,7 +395,6 @@ def test_mla(
         )
 
         cal_diff(out_ref, out_asm, "out", True)
-        # import pdb;pdb.set_trace()
         return err, us_asm_decode
 
     err = None
