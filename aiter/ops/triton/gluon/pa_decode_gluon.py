@@ -827,7 +827,7 @@ def paged_attention_decode_v2_gluon_fp8(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-    if COMPUTE_TYPE.is_fp8():
+    if KV_QUANT_MODE>=0:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
@@ -1495,6 +1495,7 @@ def paged_attention_decode_v2_gluon_fp8(
             offsets=max_logits_offsets,
             mask=max_logits_group_mask,
         )
+    # attention_accumulator = gl.clamp(attention_accumulator, min=-float(FP8_MAX_VALUE), max=float(FP8_MAX_VALUE))
     gl.amd.cdna3.buffer_store(
         stored_value=attention_accumulator.to(OUTPUT_DTYPE),
         ptr=output_ptr,
