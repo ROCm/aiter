@@ -465,7 +465,7 @@ __device__ void filter_and_histogram(T const* in_buf,
                   kth_value_bits,
                   p_filter_cnt,
                   p_out_cnt,
-                  early_stop, 
+                  early_stop,
                   k](T value, IdxT i, int&, int&, bool) {
             const auto previous_bits = (twiddle_in(value, select_min) >> previous_start_bit)
                                        << previous_start_bit;
@@ -474,14 +474,11 @@ __device__ void filter_and_histogram(T const* in_buf,
                 if(early_stop)
                 {
                     IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-                    if (pos < k)
+                    if(WRITE_TOPK_VALUES)
                     {
-                        if(WRITE_TOPK_VALUES)
-                        {
-                            out[pos] = value;
-                        }
-                        out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
+                        out[pos] = value;
                     }
+                    out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
                 }
                 else
                 {
@@ -506,14 +503,11 @@ __device__ void filter_and_histogram(T const* in_buf,
             else if((out_buf || early_stop) && previous_bits < kth_value_bits)
             {
                 IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-                if (pos < k)
+                if(WRITE_TOPK_VALUES)
                 {
-                    if(WRITE_TOPK_VALUES)
-                    {
-                        out[pos] = value;
-                    }
-                    out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
+                    out[pos] = value;
                 }
+                out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
             }
         };
         vectorized_process(static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x,
@@ -659,17 +653,14 @@ __device__ void last_filter(T const* in_buf,
             if(bits < kth_value_bits)
             {
                 IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-                if (pos < k)
+                if(WRITE_TOPK_VALUES)
                 {
-                    if(WRITE_TOPK_VALUES)
-                    {
-                        out[pos] = value;
-                    }
-                    // For one-block version, `in_idx_buf` could be nullptr at pass 0.
-                    // For non one-block version, if writing has been skipped, `in_idx_buf`
-                    // could be nullptr if `in_buf` is `in`
-                    out_idx[pos] = in_idx_buf[i];
+                    out[pos] = value;
                 }
+                // For one-block version, `in_idx_buf` could be nullptr at pass 0.
+                // For non one-block version, if writing has been skipped, `in_idx_buf`
+                // could be nullptr if `in_buf` is `in`
+                out_idx[pos] = in_idx_buf[i];
             }
             else if(bits == kth_value_bits)
             {
@@ -701,17 +692,14 @@ __device__ void last_filter(T const* in_buf,
             if(bits < kth_value_bits)
             {
                 IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-                if (pos < k)
+                if(WRITE_TOPK_VALUES)
                 {
-                    if(WRITE_TOPK_VALUES)
-                    {
-                        out[pos] = value;
-                    }
-                    // For one-block version, `in_idx_buf` could be nullptr at pass 0.
-                    // For non one-block version, if writing has been skipped, `in_idx_buf`
-                    // could be nullptr if `in_buf` is `in`
-                    out_idx[pos] = i;
+                    out[pos] = value;
                 }
+                // For one-block version, `in_idx_buf` could be nullptr at pass 0.
+                // For non one-block version, if writing has been skipped, `in_idx_buf`
+                // could be nullptr if `in_buf` is `in`
+                out_idx[pos] = i;
             }
             else if(bits == kth_value_bits)
             {
@@ -795,14 +783,11 @@ __global__ void last_filter_kernel(T const* in,
         if(bits < kth_value_bits)
         {
             IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-            if (pos < k)
+            if(WRITE_TOPK_VALUES)
             {
-                if(WRITE_TOPK_VALUES)
-                {
-                    out[pos] = value;
-                }
-                out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
+                out[pos] = value;
             }
+            out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
         }
         else if(bits == kth_value_bits)
         {
@@ -1312,14 +1297,11 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
                 else if(previous_bits < kth_value_bits)
                 {
                     IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-                    if (pos < k)
+                    if(WRITE_TOPK_VALUES)
                     {
-                        if(WRITE_TOPK_VALUES)
-                        {
-                            out[pos] = value;
-                        }
-                        out_idx[pos] = in_idx_buf[i];
+                        out[pos] = value;
                     }
+                    out_idx[pos] = in_idx_buf[i];
                 }
             }
         }
@@ -1343,14 +1325,11 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
                 else if(previous_bits < kth_value_bits)
                 {
                     IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-                    if(pos < k)
+                    if(WRITE_TOPK_VALUES)
                     {
-                        if(WRITE_TOPK_VALUES)
-                        {
-                            out[pos] = value;
-                        }
-                        out_idx[pos] = i;
+                        out[pos] = value;
                     }
+                    out_idx[pos] = i;
                 }
             }
         }

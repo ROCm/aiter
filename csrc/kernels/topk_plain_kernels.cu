@@ -39,7 +39,6 @@
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
-#include "ck_tile/core.hpp"
 #include "dispatch_utils.h"
 #include "opus/opus.hpp"
 #include "py_itfs_common.h"
@@ -1481,7 +1480,8 @@ struct WaveTopkFilter
         static_assert(utils::is_supported_type_v<T>,
                       "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
 
-        constexpr auto cache_policy = ck_tile::amd_buffer_coherence_enum::slc;
+        // AmdBufferCoherence slc
+        constexpr auto cache_policy = 2;
         const IdxT n                = end - start;
         const IdxT tid              = threadIdx.x;
         const IdxT stride           = blockDim.x;
