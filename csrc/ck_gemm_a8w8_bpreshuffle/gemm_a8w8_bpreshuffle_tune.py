@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
+import sys
 import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, AITER_CSRC_DIR
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.ops.shuffle import shuffle_weight
-from gemm_a8w8_bpreshuffle_common import kernels_list
+from gemm_a8w8_bpreshuffle_common import kernels_list as kernels_list_ck
+
 import argparse
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.jit.core import get_asm_dir
+
+sys.path.insert(0, f"{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/")
+from gemm_a8w8_bpreshuffle_cktile_common import kernels_list as kernels_list_cktile
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -39,6 +44,15 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
 
 def run_gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
     aiter.gemm_a8w8_bpreshuffle_tune(
+        x, weight, x_scale, w_scale, out, kernel_id, splitK
+    )
+    return out
+
+
+def run_gemm_a8w8_bpreshuffle_cktile(
+    x, weight, x_scale, w_scale, out, kernel_id, splitK=0
+):
+    aiter.gemm_a8w8_bpreshuffle_cktile_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
     )
     return out
@@ -104,6 +118,14 @@ def generate_data_asm(
     return x, weight, weight_shuffle, x_scale, w_scale, out, bias_f32
 
 
+def libtype_list(string):
+    values = string.split(",")
+    for value in values:
+        if value not in ["all", "asm", "ck", "cktile"]:
+            raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
+    return values
+
+
 class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -112,16 +134,32 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     }
 
     def _setup_specific_arguments(self):
-        pass
+        self.parser.add_argument(
+            "--libtype",
+            # nargs='+',
+            # choices=['all', 'asm', 'ck', 'cktile'],
+            type=libtype_list,
+            default=["all"],
+            required=False,
+            help="choose libtype to be tuned, support ['all', 'asm', 'ck', 'cktile']",
+        )
 
     def calculate(self, results, bpes=(1, 1, 2)):
         ## bpes = (inbpe, w_bpe, outbpe)
         return super().calculate(results, bpes=bpes)
 
-    def getKernelName(self, kernelId):
-        if kernelId < 0 or kernelId > len(kernels_list):
+    def getKernelName(self, kernelId, libtype="ck"):
+        if libtype == "ck":
+            if kernelId < 0 or kernelId > len(kernels_list_ck):
+                return None
+            kernelList = kernels_list_ck
+        elif libtype == "cktile":
+            if kernelId < 0 or kernelId > len(kernels_list_cktile):
+                return None
+            kernelList = kernels_list_cktile
+        else:
             return None
-        return kernels_list[kernelId].name
+        return kernelList[kernelId].name
 
     def get_asm_kernels(self, file):
         if not os.path.exists(file):
@@ -163,7 +201,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 maxsplitK = 1
             for splitK in range(1, maxsplitK + 1):
                 kernel_name = kernelName[0]
-                info = (info_keys, asm_kernels_id, splitK, kernel_name)
+                info = (info_keys, asm_kernels_id, splitK, kernel_name, "asm")
                 task.append(
                     (
                         info,
@@ -195,7 +233,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             asm_kernels_id = asm_kernels_id + 1
         return task
 
-    def get_ck_gemm_a8w8_bpreshuffle_tune_task(
+    def get_cktile_gemm_a8w8_bpreshuffle_tune_task(
         self,
         info_keys,
         useSplitK,
@@ -207,12 +245,12 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
             )
             return []
-        kernels_num = len(kernels_list)
+        kernels_num = len(kernels_list_cktile)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 5, 2, 3, 6]
         tasks_ck = []
         for i in range(kernels_num):
-            kernel = kernels_list[i]
+            kernel = kernels_list_cktile[i]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -226,7 +264,64 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 else 0
             )
             for splitK in range(maxsplitK + 1):
-                info = (info_keys, i, splitK, "")
+                info = (info_keys, i, splitK, "", "cktile")
+                tasks_ck.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
+                        run_gemm_a8w8_bpreshuffle_cktile,
+                        (
+                            gemm_a8w8_idx,
+                            i,
+                            splitK,
+                        ),
+                        {},
+                        run_torch,
+                        (
+                            ref_data_idx,
+                            dtypes.bf16,
+                        ),
+                        {},
+                        None,
+                        1e-2,
+                        0.01,
+                    )
+                )
+        return tasks_ck
+
+    def get_ck_gemm_a8w8_bpreshuffle_tune_task(
+        self,
+        info_keys,
+        useSplitK,
+        seed,
+    ):
+        (cu_num, M, N, K, q_dtype_w) = info_keys
+        if eval(q_dtype_w) != dtypes.fp8:
+            print(
+                f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
+            )
+            return []
+        kernels_num = len(kernels_list_ck)
+        gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
+        ref_data_idx = [0, 5, 2, 3, 6]
+        tasks_ck = []
+        for i in range(kernels_num):
+            kernel = kernels_list_ck[i]
+            maxsplitK = (
+                aiter.compute_gemm_SplitK(
+                    M,
+                    N,
+                    K,
+                    kernel.MPerBLOCK,
+                    kernel.NPerBLOCK,
+                    kernel.KPerBLOCK,
+                )
+                if useSplitK
+                else 0
+            )
+            for splitK in range(maxsplitK + 1):
+                info = (info_keys, i, splitK, "", "ck")
                 tasks_ck.append(
                     (
                         info,
@@ -274,19 +369,26 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
             seed = seed + 1
             total_kernel_nums = 0
-            kernels_num = len(kernels_list)
+            # kernels_num = len(kernels_list_ck)
             info_keys = (cu_num, M, N, K, q_dtype_w)
-            task.extend(
-                self.get_ck_gemm_a8w8_bpreshuffle_tune_task(
-                    info_keys,
-                    useSplitK,
-                    seed,
+            if "all" in args.libtype or "ck" in args.libtype:
+                task.extend(
+                    self.get_ck_gemm_a8w8_bpreshuffle_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
+                    )
                 )
-            )
-
-            task.extend(
-                self.get_asm_gemm_i8_tasks(info_keys, useSplitK, kernels_num + 1, seed)
-            )
+            if "all" in args.libtype or "cktile" in args.libtype:
+                task.extend(
+                    self.get_cktile_gemm_a8w8_bpreshuffle_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
+                    )
+                )
+            if "all" in args.libtype or "asm" in args.libtype:
+                task.extend(self.get_asm_gemm_i8_tasks(info_keys, useSplitK, 0, seed))
 
             total_kernel_nums = len(task)
 
@@ -297,10 +399,60 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
 
         return ret
 
+    def result_to_df(self, results):
+        resultdf = pd.DataFrame(columns=self.columns)
+        for el in results:
+            info, time, err_ratio = el
+            keys, kernelId, splitK, kernelName, libtype = info
+            kernelName = (
+                "None"
+                if time == self.INVALID_TIME
+                else (
+                    self.getKernelName(kernelId, libtype)
+                    if kernelName == ""
+                    else kernelName
+                )
+            )
+            tflops, bw = self.calculate(el)
+            key_dict = dict(zip(self.keys, keys))
+
+            if len(results) == self.topk:
+                print(
+                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                )
+            key_dict.update(
+                {
+                    "libtype": [libtype],
+                    "kernelId": [kernelId],
+                    "splitK": [splitK],
+                    "us": [time],
+                    "kernelName": [kernelName],
+                    "errRatio": [err_ratio],
+                    "tflops": [tflops],
+                    "bw": [bw],
+                }
+            )
+            temp = pd.DataFrame(key_dict)
+            if resultdf.empty:
+                resultdf = temp
+            else:
+                resultdf = pd.concat([resultdf, temp], ignore_index=True)
+        return resultdf
+
 
 if __name__ == "__main__":
     ## use default key and resultList
     key = ["cu_num", "M", "N", "K", "q_dtype_w"]
+    resultList = [
+        "libtype",
+        "kernelId",
+        "splitK",
+        "us",
+        "kernelName",
+        "tflops",
+        "bw",
+        "errRatio",
+    ]
     tuner = GemmA8W8BpreShuffleTuner(
         "GemmA8W8BpreShuffleTuner",
         key=key,
