@@ -223,12 +223,15 @@ def test_mla(
         dtype=out_dtype,
     )
 
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-    max_split_per_batch = min(
-        (cu_num + batch_size - 1) // batch_size, max_split_per_batch
-    )
+    # It is necessary to limit the size of the tensor in the DP mode
+    # so reduce the split_num in the DP mode.
+    if nhead >= 128:
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+        max_split_per_batch = min(
+            (cu_num + batch_size - 1) // batch_size, max_split_per_batch
+        )
 
     (
         (work_meta_data_size, work_meta_data_type),
@@ -289,7 +292,9 @@ def test_mla(
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
         dtype_q=dtype,
-        dtype_kv=kvtype,
+        dtype_kv=(
+            kvtype if dtype == kvtype else dtype
+        ),  # if q bf16 k fp8 should be same as bf16bf16 for dp mode
     )
 
     def test_absorb_decode_bf16():
@@ -340,7 +345,7 @@ def test_mla(
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
-            q_fp8,
+            q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8,
             qo_indptr,
             kv_indptr,
@@ -356,7 +361,7 @@ def test_mla(
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
-            q_fp8,
+            q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
             qo_indptr,
@@ -403,7 +408,9 @@ def test_mla(
     ):
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and (
-        (nhead in [16, 128]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
+        (dtype == dtypes.fp8 and nhead in [16, 128])
+        or (dtype == dtypes.bf16 and nhead in [16])
+        or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
     ):
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err

@@ -266,7 +266,9 @@ def mla_decode_fwd(
     else:
         if num_kv_splits is None:
             num_kv_splits = get_cu_num()
-        if nhead == 16 or (nhead == 128 and kv_buffer.dtype == dtypes.fp8):
+        if nhead == 16 or (
+            nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
+        ):
             # Natively support cases
             pass
         elif nhead in range(32, 128 + 1, 16) and persistent_mode and max_seqlen_q == 1:
