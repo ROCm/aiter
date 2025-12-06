@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from aiter.jit.utils.torch_guard import torch_compile_guard
 import torch
 from torch import Tensor
-from typing import Optional
+from typing import Optional, Tuple
 from ..jit.core import compile_ops
 import torch.nn.functional as F
 import functools
@@ -181,13 +182,14 @@ def get_triton_quant(qType):
     return tmp.get(qType, raise_NotImplementedError)
 
 
+@torch_compile_guard()
 def per_token_quant_hip(
-    x,
-    scale=None,
-    quant_dtype=dtypes.i8,
-    num_rows: Optional[torch.tensor] = None,
-    num_rows_factor=1,
-):
+    x: Tensor,
+    scale: Optional[Tensor] = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    num_rows: Optional[Tensor] = None,
+    num_rows_factor: int = 1,
+) -> Tuple[Tensor, Tensor]:
     shape = x.shape
     device = x.device
     if scale is None:
@@ -213,15 +215,16 @@ def per_token_quant_hip(
     return y, scale
 
 
+@torch_compile_guard()
 def per_group_quant_hip(
-    x,
-    scale=None,
-    quant_dtype=dtypes.i8,
-    group_size=128,
-    transpose_scale=False,
-    num_rows: Optional[torch.tensor] = None,
-    num_rows_factor=1,
-):
+    x: Tensor,
+    scale: Optional[Tensor] = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    group_size: int = 128,
+    transpose_scale: bool = False,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor: int = 1,
+) -> Tuple[Tensor, Tensor]:
     shape = x.shape
     device = x.device
     if scale is None:
@@ -252,7 +255,7 @@ def per_1x32_f4_quant_hip(
     scale=None,
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
-    num_rows: Optional[torch.tensor] = None,
+    num_rows: Optional[torch.Tensor] = None,
     num_rows_factor=1,
 ):
     m, n = x.shape
@@ -302,7 +305,7 @@ def per_tensor_quant_hip(
     x,
     scale=None,
     quant_dtype=dtypes.i8,
-    num_rows: Optional[torch.tensor] = None,
+    num_rows: Optional[torch.Tensor] = None,
     num_rows_factor=1,
 ):
     assert num_rows is None, "num_rows is not supported for per_tensor_quant_hip"
