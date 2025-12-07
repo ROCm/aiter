@@ -252,7 +252,6 @@ def reduce_scatter(
     )
 
     # Synchronize
-    torch.cuda.synchronize()
     iris_ctx.barrier()
 
     logger.info(
