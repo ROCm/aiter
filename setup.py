@@ -42,7 +42,9 @@ def getMaxJobs():
     import psutil
 
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    free_memory_gb = psutil.virtual_memory().available / (
+        1024**3
+    )  # free memory in GB
     max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
@@ -290,12 +292,13 @@ setup(
     ],
     extras_require={
         # Triton-based communication using Iris
+        # Pinned to commit 905ec1c (Nov 18, 2024) for reproducibility and API stability
         "triton_comms": [
-            "iris @ git+https://github.com/ROCm/iris.git",
+            "iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429",
         ],
         # Install all optional dependencies
         "all": [
-            "iris @ git+https://github.com/ROCm/iris.git",
+            "iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429",
         ],
     },
     setup_requires=setup_requires,
