@@ -701,6 +701,7 @@ head_dim = 128
 l_block_size = [1024]
 l_dtype = ["bf16"]
 l_num_heads = [
+    (8, 1),
     (10, 1),
     # (16, 1),
 ]  # num_query_heads must be multiple of 16 for get_mla_metadata_info_v1
@@ -854,4 +855,4 @@ for dtype in l_dtype:
         df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
-    df.to_csv("mla_prefill.csv")
+    df.to_csv("pa_ps.csv")
