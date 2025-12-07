@@ -95,7 +95,9 @@ def run_fused_kernel(
             # Ensure data is synchronized across GPUs
             ctx.iris_ctx.barrier()
 
-            @perftest()
+            # Use fixed iterations for distributed tests to prevent deadlocks
+            # (dynamic iteration count would differ across ranks due to different free memory)
+            @perftest(num_rotate_args=10)
             def run_fused():
                 return reduce_scatter_rmsnorm_quant_all_gather(
                     input_tensor,
