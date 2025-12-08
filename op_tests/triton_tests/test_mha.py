@@ -1448,8 +1448,8 @@ def test_mha_with_sink(
     torch.testing.assert_close(
         triton_dsink,
         torch_dsink,
-        atol=1e-1,  # higher tolerance due to atomic add
-        rtol=1e-1,  # higher tolerance due to atomic add
+        atol=5e-2,  # higher tolerance due to summation over exp
+        rtol=5e-2,  # higher tolerance due to summation over exp
         msg=lambda msg: f"bwd dsink mismatch\n\n{msg}\n",
     )
 
@@ -1631,7 +1631,7 @@ def test_mha_varlen_with_sink(
     torch.testing.assert_close(
         triton_dsink,
         torch_dsink,
-        atol=1e-1,  # higher tolerance due to atomic add
-        rtol=1e-1,  # higher tolerance due to atomic add
+        atol=5e-2,  # higher tolerance due to summation over exp
+        rtol=5e-2,  # higher tolerance due to summation over exp
         msg=lambda msg: f"bwd dsink mismatch\n\n{msg}\n",
     )
