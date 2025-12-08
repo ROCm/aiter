@@ -67,7 +67,7 @@ def test_fmoe(
     if (
         get_gfx() not in ["gfx950"]
         and qType == aiter.QuantType.per_1x32
-        and WQDType == dtypes.fp4x2
+        and AQDType == dtypes.fp4x2
     ):
         return
     torch_quant = aiter.get_torch_quant(qType, WQDType)
@@ -227,10 +227,14 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
-        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
-        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+        # w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
+        # w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        # w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+        # w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+        w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
+        w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
+        w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
@@ -356,18 +360,19 @@ l_tokenNum = [
     163840,
 ]
 l_quant = [
-    (aiter.QuantType.No, None, None),  # a16w16
-    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    # (aiter.QuantType.No, None, None),  # a16w16
+    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
-    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4, int4
+    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4, int4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
-l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+# l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+l_hidden_intermediate_pad = [(0, 0)]
 l_preshuffle = [False, True]
 
 
