@@ -106,6 +106,7 @@ def quant_per_block_int8_kernel(Input, Output, Scale, L,
     tl.store(scale_ptrs, scale)
 
 def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layout="NHD"):
+    
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 
@@ -205,7 +206,7 @@ def attn_qk_int8_per_block(
     
     assert (q_scale is None) == (k_scale is None), "Both q_scale and k_scale must be provided or both must be None"
     scales_provided = (q_scale is not None) and (k_scale is not None)
-    if scales_provided is None:
+    if not scales_provided:
         if config is None:
             config = _get_config()
        
