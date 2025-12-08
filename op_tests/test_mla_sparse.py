@@ -597,7 +597,9 @@ def test_mla(
     ):
         err, us_asm_decode = test_sparse_mla_bf16()
     elif kvtype == dtypes.fp8 and (
-        (nhead in [16, 128]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
+        (dtype == dtypes.fp8 and nhead in [16, 128])
+        or (dtype == dtypes.bf16 and nhead in [16])
+        or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
     ):
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
