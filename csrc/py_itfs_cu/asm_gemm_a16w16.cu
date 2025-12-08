@@ -202,8 +202,8 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     int is_out_b16   = 0;
     int add_bias = bias.has_value() ? 1 : 0;
     // A row major, B col major, C row major
-    strideA0 = strideA1 = A.stride(0) * 2; // in bytes
-    strideB0 = strideB1 = B.stride(0) * 2;
+    strideA0 = strideA1 = A.stride(0) * A.element_size(); // in bytes
+    strideB0 = strideB1 = B.stride(0) * B.element_size();
     const auto elem_bytes = out.element_size(); 
     strideC0 = strideC1 = strideD0 = strideD1 = Ndim * elem_bytes; // inbytes
     if (out.dtype() == torch::ScalarType::BFloat16)
