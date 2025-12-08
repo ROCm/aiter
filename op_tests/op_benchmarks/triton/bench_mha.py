@@ -535,8 +535,8 @@ def run_benchmark(custom, args):
                 q, q_scale, k, k_scale = per_block_int8(
                     q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
                 )
-                q_scale = q_scale.to(torch.float16).unsqueeze(-1).contiguous()
-                k_scale = k_scale.to(torch.float16).unsqueeze(-1).contiguous()
+                q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
+                k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
             else:
                 # Fake quantization: use random int8 tensors directly (faster, for benchmarking kernel only)
                 if tensor_layout == "HND":
@@ -544,15 +544,15 @@ def run_benchmark(custom, args):
                     q = torch.randint(-100, 100, (BATCH, HQ, N_CTX_Q, D_HEAD), dtype=torch.int8, device=device)
                     k = torch.randint(-100, 100, (BATCH, HK, N_CTX_K, D_HEAD), dtype=torch.int8, device=device)
                     v = torch.randn(BATCH, HQ, N_CTX_Q, D_HEAD_V, dtype=torch.float16, device=device)
-                    q_scale = torch.randn(BATCH, HQ, (N_CTX_Q // config["BLOCK_SIZE_M"]), 1, dtype=torch.float16, device=device)
-                    k_scale = torch.randn(BATCH, HK, (N_CTX_K // config["BLOCK_SIZE_N"]), 1, dtype=torch.float16, device=device)
+                    q_scale = torch.randn(BATCH, HQ, (N_CTX_Q // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
+                    k_scale = torch.randn(BATCH, HK, (N_CTX_K // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
                 else:  # NHD
                     # NHD format: (batch, seq, heads, dim)
                     q = torch.randint(-100, 100, (BATCH, N_CTX_Q, HQ, D_HEAD), dtype=torch.int8, device=device)
                     k = torch.randint(-100, 100, (BATCH, N_CTX_K, HK, D_HEAD), dtype=torch.int8, device=device)
                     v = torch.randn(BATCH, N_CTX_Q, HQ, D_HEAD_V, dtype=torch.float16, device=device)
-                    q_scale = torch.randn(BATCH, HQ, (N_CTX_Q // config["BLOCK_SIZE_M"]), 1, dtype=torch.float16, device=device)
-                    k_scale = torch.randn(BATCH, HK, (N_CTX_K // config["BLOCK_SIZE_N"]), 1, dtype=torch.float16, device=device)
+                    q_scale = torch.randn(BATCH, HQ, (N_CTX_Q // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
+                    k_scale = torch.randn(BATCH, HK, (N_CTX_K // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
             fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
         
         ms = triton.testing.do_bench(fn)
