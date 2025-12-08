@@ -361,7 +361,7 @@ def test_tgmm(
         trans_lhs=trans_lhs,
         rng_seed=rng_seed,
         unif_group_sizes=True,  # 1st group_sizes in test is evenly distributed
-        with_bias_grad=with_bias_grad,
+        use_bias=with_bias_grad,
     )
     out_triton = torch.empty_like(out_torch)
     bias_grad_triton = torch.empty_like(bias_grad_torch) if with_bias_grad else None
@@ -388,26 +388,15 @@ def test_tgmm(
         )
 
         # Triton kernel.
-        if persistent:
-            kernel_wrapper(
-                lhs,
-                rhs,
-                group_sizes,
-                preferred_element_type=out_dtype,
-                existing_out=out_triton,
-                bias_grad=bias_grad_triton,
-                accumulate=False,
-            )
-        else:
-            # Non-persistent TGMM doesn't accept bias_grad parameters.
-            kernel_wrapper(
-                lhs,
-                rhs,
-                group_sizes,
-                preferred_element_type=out_dtype,
-                existing_out=out_triton,
-            )
-
+        kernel_wrapper(
+            lhs,
+            rhs,
+            group_sizes,
+            preferred_element_type=out_dtype,
+            existing_out=out_triton,
+            bias_grad=bias_grad_triton,
+            accumulate=False,
+        )
         non_empty_groups = group_sizes > 0
 
         # Compare TGMM outputs.
@@ -426,7 +415,7 @@ def test_tgmm(
         # become dominated by reduction-order noise rather than meaningful
         # correctness checks, so we skip bias_grad comparison there and rely
         # only on the output tensor check above.
-        if with_bias_grad and persistent and M <= 1e6:
+        if with_bias_grad and M <= 1e6:
             bias_atol = 1.5
             bias_rtol = 0.1
 
@@ -438,8 +427,10 @@ def test_tgmm(
                 rtol=bias_rtol,
             )
 
-
-def test_tgmm_accumulate():
+@pytest.mark.parametrize("persistent_str", {"p", "np"})
+def test_tgmm_accumulate(persistent_str: str):
+    persistent: bool = persistent_str == "p"
+    
     """Test ACCUMULATE semantics for persistent TGMM on a small, focused case."""
     # Use the smallest TEST_ONLY_SHAPES entry to keep runtime low.
     M, K, N, G = TEST_ONLY_SHAPES[0]
@@ -482,16 +473,26 @@ def test_tgmm_accumulate():
     expected = base_out.clone()
     expected[non_empty_groups] = expected[non_empty_groups] + delta_ref[non_empty_groups]
 
-    # Triton persistent TGMM with ACCUMULATE=True.
+    # Triton PTGMM/NPTGMM with ACCUMULATE=True.
     out_triton = base_out.clone()
-    triton_ptgmm(
-        lhs,
-        rhs,
-        group_sizes,
-        preferred_element_type=out_dtype,
-        existing_out=out_triton,
-        accumulate=True,
-    )
+    if persistent:
+        triton_ptgmm(
+            lhs,
+            rhs,
+            group_sizes,
+            preferred_element_type=out_dtype,
+            existing_out=out_triton,
+            accumulate=True,
+        )
+    else:
+        triton_nptgmm(
+            lhs,
+            rhs,
+            group_sizes,
+            preferred_element_type=out_dtype,
+            existing_out=out_triton,
+            accumulate=True,
+        )
 
     check_tensors(
         out_triton[non_empty_groups],

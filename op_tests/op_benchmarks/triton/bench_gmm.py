@@ -187,9 +187,9 @@ def benchmark_gmm(
                 "existing_out": out,
             }
 
-            if gmm_type == "gmm" and use_bias:
+            if gmm_type == "gmm":
                 kwargs["bias"] = bias
-            elif gmm_type == "ptgmm" and use_bias:
+            elif gmm_type == "ptgmm" or gmm_type == "nptgmm":
                 kwargs["bias_grad"] = bias
                 kwargs["accumulate"] = accumulate
 

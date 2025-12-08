@@ -427,6 +427,8 @@ def nptgmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
     config: dict[str, int] | None = None,
+    bias_grad: Tensor | None = None,
+    accumulate: bool = False,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -472,6 +474,17 @@ def nptgmm(
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
+    bias_grad : torch.Tensor or None, optional
+        Optional bias gradient output tensor. Shape: (G, K).
+        If provided, the kernel will compute and accumulate the bias gradient into this tensor.
+        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
+        must be on the same device as other tensors, and must be row-major with stride (K, 1).
+    accumulate : bool, optional
+        Whether to accumulate into existing bias_grad values and output tensor. Default is False.
+        If False and bias_grad is provided, bias_grad will be zeroed before computation and the
+        output tensor will be overwritten. If True and bias_grad is provided, gradients will be
+        accumulated into existing values and the output tensor will be accumulated into instead
+        of overwritten.
 
     Returns
     -------
@@ -505,6 +518,18 @@ def nptgmm(
 
     trans_lhs, _ = get_tgmm_transposition(lhs, rhs, out)
 
+    # Bias gradient handling.
+    # -----------------------
+    # Get or validate bias gradient tensor.
+    compute_bias_grad = bias_grad is not None
+    bias_grad_ptr = get_tgmm_bias_grad(
+        K,
+        G,
+        device=lhs.device,
+        existing_bias_grad=bias_grad,
+        accumulate=accumulate,
+    )
+
     if config is None:
         config = get_config("nptgmm", M, K, N, G)
 
@@ -535,11 +560,13 @@ def nptgmm(
     # fmt: off
     tgmm_non_persistent_kernel[grid](
         # Tensor pointers:
-        lhs, rhs, group_sizes, out,
+        lhs, rhs, group_sizes, out, bias_grad_ptr,
         # Tensor shapes:
         M, K, N, G,
         # Meta-parameters:
         TRANS_LHS=trans_lhs,
+        COMPUTE_BIAS_GRAD=compute_bias_grad,
+        ACCUMULATE=accumulate,
         **config,
     )
     # fmt: on
