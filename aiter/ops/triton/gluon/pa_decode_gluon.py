@@ -827,7 +827,7 @@ def paged_attention_decode_v2_gluon_fp8(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-    if KV_QUANT_MODE>=0:
+    if KV_QUANT_MODE >= 0:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
@@ -1148,9 +1148,9 @@ def paged_attention_decode_v2_gluon_fp8(
     # Initialize attention state variables
     # max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float("inf")
     # exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
-    attention_accumulator = gl.zeros(
-        (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
-    )
+    # attention_accumulator = gl.zeros(
+    #     (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
+    # )
 
     # ==================== SEQUENCE PROCESSING ====================
 
@@ -1192,7 +1192,7 @@ def paged_attention_decode_v2_gluon_fp8(
     block_table_start_ptr = block_tables_ptr + sequence_idx * stride_block_table_seq
     kv_block_numbers = gl.amd.cdna3.buffer_load(
         ptr=block_table_start_ptr + kv_block_start_idx, offsets=block_indices
-    )
+    ).to(gl.uint32)
     # kv_block_numbers = kv_block_numbers.to(tl.uint64)
     # ==================== KEY LOADING AND PROCESSING ====================
     # Calculate key cache offsets and load keys
@@ -1204,7 +1204,6 @@ def paged_attention_decode_v2_gluon_fp8(
         * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
         + contiguous_kv_element_offsets[None, None, None, :]
     )
-
     # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
     key_tensor = gl.amd.cdna3.buffer_load(
         ptr=key_cache_ptr,
@@ -1283,6 +1282,7 @@ def paged_attention_decode_v2_gluon_fp8(
     key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
     key_converted = key_converted.to(COMPUTE_TYPE)
     query_converted = query_converted.to(COMPUTE_TYPE)
+
     if VALUE_TRANSPOSED:
         # Load values from transposed cache layout
         kv_block_numbers_reshaped = gl.convert_layout(
@@ -1312,6 +1312,7 @@ def paged_attention_decode_v2_gluon_fp8(
         )
         # value_tensor = value_tensor.to(COMPUTE_TYPE)
         # Compute QK attention scores using MFMA (overlaps with value load)
+
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
         )
@@ -1433,9 +1434,9 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # Convert attention probabilities to compute type for MFMA operation
     # Convert layouts for PV MFMA operation
+    attention_probs = attention_probs.to(COMPUTE_TYPE)
     probs_converted = gl.convert_layout(attention_probs, layout=pv_lhs_operand_layout)
     values_converted = gl.convert_layout(value_tensor, layout=pv_rhs_operand_layout)
-    probs_converted = probs_converted.to(COMPUTE_TYPE)
     values_converted = values_converted.to(COMPUTE_TYPE)
 
     # Scale previous accumulator and compute new attention output
@@ -1454,9 +1455,9 @@ def paged_attention_decode_v2_gluon_fp8(
     )
 
     if KV_QUANT_MODE >= 0:
-        attention_accumulator += probability_scale * attention_output
+        attention_accumulator = probability_scale * attention_output
     else:
-        attention_accumulator += attention_output
+        attention_accumulator = attention_output
 
     # Update running maximum for next iteration
     # max_logits = new_max_logits
@@ -1549,7 +1550,7 @@ def paged_attention_decode_v2_reduce_gluon(
     """
 
     # ==================== INITIALIZATION AND LAYOUT CONFIGURATION ====================
-    MAX_CONTEXT_PARTITION_NUM: gl.constexpr = 8
+    MAX_CONTEXT_PARTITION_NUM: gl.constexpr = CONTEXT_PARTITION_SIZE // 16
     sequence_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     context_length = gl.load(context_lengths_ptr + sequence_idx)
