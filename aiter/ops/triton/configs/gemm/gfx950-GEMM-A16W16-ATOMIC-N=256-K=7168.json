@@ -1,5 +1,5 @@
 {
-  "small": {
+  "M_LEQ_16": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 256,
@@ -12,7 +12,7 @@
     "matrix_instr_nonkdim": 16,
     "kpack": 1
   },
-  "medium_M32": {
+  "M_LEQ_32": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 256,
@@ -25,7 +25,7 @@
     "matrix_instr_nonkdim": 16,
     "kpack": 1
   },
-  "medium_M64": {
+  "M_LEQ_64": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 256,
@@ -38,7 +38,7 @@
     "matrix_instr_nonkdim": 16,
     "kpack": 1
   },
-  "medium_M128": {
+  "M_LEQ_128": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 128,
@@ -51,7 +51,7 @@
     "matrix_instr_nonkdim": 16,
     "kpack": 1
   },
-  "large": {
+  "M_LEQ_256": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 128,
@@ -63,13 +63,13 @@
     "waves_per_eu": 4,
     "matrix_instr_nonkdim": 16,
     "kpack": 1
-  }, 
-   "xlarge": {
+  },
+  "any": {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 64,
     "GROUP_SIZE_M": 4,
-    "NUM_KSPLIT":1,
+    "NUM_KSPLIT": 1,
     "cache_modifier": null,
     "num_warps": 8,
     "num_stages": 2,

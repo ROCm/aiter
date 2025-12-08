@@ -1,5 +1,5 @@
 {
-  "large": {
+  "M_GEQ_4096": {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 64,
@@ -9,7 +9,7 @@
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16
   },
-  "small" : {
+  "any": {
     "BLOCK_SIZE_M": 128,
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 32,
@@ -20,5 +20,3 @@
     "matrix_instr_nonkdim": 16
   }
 }
-
-  
