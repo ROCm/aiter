@@ -465,8 +465,7 @@ __device__ void filter_and_histogram(T const* in_buf,
                   kth_value_bits,
                   p_filter_cnt,
                   p_out_cnt,
-                  early_stop,
-                  k](T value, IdxT i, int&, int&, bool) {
+                  early_stop](T value, IdxT i, int&, int&, bool) {
             const auto previous_bits = (twiddle_in(value, select_min) >> previous_start_bit)
                                        << previous_start_bit;
             if(previous_bits == kth_value_bits)
