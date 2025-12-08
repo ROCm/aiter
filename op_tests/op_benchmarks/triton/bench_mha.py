@@ -151,31 +151,36 @@ def create_benchmark_configs(custom, args):
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
-    if args.metric == "time":
-        unit = "ms"
-    elif args.metric == "throughput":
-        unit = "TFLOPS"
-    elif args.metric == "bandwidth":
-        unit = "GB/s"
+    
+    if args.metric == "all":
+        unit = ""
+        line_vals = ["time(ms)", "throughput(TFLOPS)", "bandwidth(GB/s)", "arithmetic_intensity(FLOP/byte)"]
     else:
-        raise ValueError("Unknown metric: " + args.metric)
-
-    if mode == "bwd":
-        if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
+        if args.metric == "time":
+            unit = "ms"
+        elif args.metric == "throughput":
+            unit = "TFLOPS"
+        elif args.metric == "bandwidth":
+            unit = "GB/s"
         else:
-            line_vals = [f"onekernel-bwd({unit})"]
-    else:
-        line_vals = [f"fwd({unit})"]
+            raise ValueError("Unknown metric: " + args.metric)
 
-    if args.bench_torch:
-        line_vals = [f"Triton({unit})", f"Torch({unit})"]
-
-    if args.test_mode:
-        if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
+        if mode == "bwd":
+            if args.fused_bwd:
+                line_vals = [f"fused-bwd({unit})"]
+            else:
+                line_vals = [f"onekernel-bwd({unit})"]
         else:
-            line_vals = [f"onekernel-bwd({unit})"]
+            line_vals = [f"fwd({unit})"]
+
+        if args.bench_torch:
+            line_vals = [f"Triton({unit})", f"Torch({unit})"]
+
+        if args.test_mode:
+            if args.fused_bwd:
+                line_vals = [f"fused-bwd({unit})"]
+            else:
+                line_vals = [f"onekernel-bwd({unit})"]
 
     configs.append(
         triton.testing.Benchmark(
@@ -184,7 +189,7 @@ def create_benchmark_configs(custom, args):
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_vals,
-            styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
+            styles=[("red", "-"), ("green", "-"), ("yellow", "-"), ("blue", "-")],
             ylabel=unit,
             plot_name=plot_name,
             args=extra_args,
@@ -437,7 +442,6 @@ def run_benchmark(custom, args):
         # Benchmark mode
         if varlen:
             if args.fp8:
-
                 def fn():
                     return flash_attn_varlen_fp8_func(
                         q_input,
@@ -495,10 +499,6 @@ def run_benchmark(custom, args):
                         return_attn_probs=return_attn_probs,
                     )
 
-        
-        
-        
-        
         if mode == "bwd":
             with torch.enable_grad():
                 triton_out = fn()[0]
@@ -523,7 +523,7 @@ def run_benchmark(custom, args):
                 q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
             )
             v = v.to(torch.float16)
-            fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout="NHD", output_dtype=torch.bfloat16, config=config)
+            fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout="NHD", output_dtype=torch.float16, config=config)
         
         ms = triton.testing.do_bench(fn)
 
@@ -557,8 +557,11 @@ def run_benchmark(custom, args):
             return ms
         elif "TFLOPS" in provider:
             return total_flops / ms * 1e-9
-        else:  # GB/s
+        elif "GB/s" in provider:  # GB/s
             return mem / ms * 1e-6
+        elif "arithmetic_intensity" in provider:
+            return total_flops / mem
+
 
     bench_mha.run(save_path="." if args.o else None, print_data=True)
 
@@ -626,7 +629,7 @@ def parse_args():
         "-metric",
         nargs="?",
         const="throughput",
-        choices=["time", "throughput", "bandwidth"],
+        choices=["all", "time", "throughput", "bandwidth"],
         default=None,
         help="Metrics for the kernel benchmark.",
     )

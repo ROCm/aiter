@@ -36,14 +36,14 @@ def get_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int, co
             q, k, km=None, BLKQ=BLOCK_SIZE_M, BLKK=BLOCK_SIZE_N, sm_scale=sm_scale, tensor_layout="HND"
         )
         # Convert scales to float16 with trailing dimension
-        q_scale = q_scale.to(torch.float16).unsqueeze(-1).contiguous()
-        k_scale = k_scale.to(torch.float16).unsqueeze(-1).contiguous()
+        q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
+        k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
     else:
         # Default: create random int8 tensors and scales directly (faster)
         q = torch.randint(-100, 100, (batch_size, num_heads, seq_len, head_dim), dtype=torch.int8, device='cuda')
         k = torch.randint(-100, 100, (batch_size, num_heads, seq_len, head_dim), dtype=torch.int8, device='cuda')
-        q_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_M), 1, dtype=torch.float16, device='cuda')
-        k_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_N), 1, dtype=torch.float16, device='cuda')
+        q_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_M), 1, dtype=torch.float32, device='cuda')
+        k_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_N), 1, dtype=torch.float32, device='cuda')
     
     return q, k, v, q_scale, k_scale
 
@@ -95,6 +95,8 @@ def bench_attn_fn(batch_size: int, num_heads: int, seq_len: int, head_dim: int, 
     elif metric == "bandwidth":
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         return bandwidth
+    elif metric == "arithmetic_intensity":
+        return flops / mem
     else:
         raise ValueError("Unknown metric: " + metric)
 
@@ -118,33 +120,40 @@ def run_shape_benchmark(args):
     x_names = ["batch_size", "num_heads", "seq_len", "head_dim"]
     x_vals_list = [[batch_size, num_heads, seq_len, head_dim]]
     
-    if args.metric == "time":
-        ylabel = "Time_(ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput_(TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth_(GB/s)"
+    if args.metric == "all":
+        metrics = ["time", "throughput", "bandwidth", "arithmetic_intensity"]
+        # line_vals = ["ms", "TFLOPS", "GB/s", "FLOP/byte"]
+        ylabel = ""
     else:
-        raise NotImplementedError(f"{args.metric} is not supported")
-    
-    evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",
-    }
+        if args.metric == "time":
+            ylabel = "Time_(ms)"
+        elif args.metric == "throughput":
+            ylabel = "Throughput_(TFLOPS)"
+        elif args.metric == "bandwidth":
+            ylabel = "Bandwidth_(GB/s)"
+        else:
+            raise NotImplementedError(f"{args.metric} is not supported")
+        
+        evaluation_metric_to_unit = {
+            "throughput": "TFLOPS",
+            "time": "Time_(ms)",
+            "bandwidth": "Bandwidth_(GB/s)",
+        }
+        metrics = [args.metric]
+        # line_vals = evaluation_metric_to_unit[args.metric]
     
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         x_log=False,
         y_log=False,
-        line_arg="unit",
-        line_vals=[evaluation_metric_to_unit[args.metric]],
-        line_names=[evaluation_metric_to_unit[args.metric]],
-        styles=[("green", "-")],
+        line_arg="metric",
+        line_vals=metrics,
+        line_names=metrics,
+        styles=[("green", "-"), ("blue", "-"), ("red", "-"), ("yellow", "-")],
         ylabel=ylabel,
         plot_name=get_caller_name_no_ext(),
-        args={"metric": args.metric, "real_quant": args.real_quant},
+        args={"real_quant": args.real_quant},
     )
     
     @triton.testing.perf_report([benchmark])
@@ -160,6 +169,14 @@ def parse_args():
     """
     parser = get_parser(kernel_name="QK Int8 Per Block Attention")
     parser = add_argparse_ff(parser)  # Adds -print_vgpr, -o, --shape, and other common flags
+    
+    parser.add_argument(
+        "-metric",
+        type=str,
+        choices=["all", "time", "throughput", "bandwidth"],
+        default="throughput",
+        help="metric to plot",
+    )
     
     # Add attention-specific arguments
     parser.add_argument(
