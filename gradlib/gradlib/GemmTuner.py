@@ -320,7 +320,7 @@ class Gemm:
                 )  # if self.splitK else 1
             else:
                 maxSplitK = 1
-            maxSplitK = min(maxSplitK, 2)
+            maxSplitK = min(maxSplitK, 8)
             # maxSplitK = 1
             if not bias and self.bias is not None:
                 continue
