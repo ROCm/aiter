@@ -21,8 +21,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
 from file_baton import FileBaton
-from hipify import hipify_python
-from hipify.hipify_python import GeneratedFileCleaner
+from .hipify import hipify_python
+from .hipify.hipify_python import GeneratedFileCleaner
 from packaging.version import Version
 from setuptools.command.build_ext import build_ext
 
