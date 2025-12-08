@@ -1,0 +1,78 @@
+name: Test Connection to PyPI and GitHub
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner to use for the test, e.g. aiter-mi355-1gpu, aiter-1gpu-runner, etc.'
+        required: true
+        default: 'aiter-mi355-1gpu'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test-pypi:
+    runs-on: aiter-mi355-1gpu
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: test_pypi"
+          docker run -dt \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name test_pypi \
+          python:3.10-slim \
+    
+      - name: Test network speed and latency
+        run: |
+          set -ex
+          # ==== Network speed test with speedtest-cli ====
+          echo -e "\033[1;34m==== Network Speed Test (speedtest-cli) ====\033[0m"
+
+          docker exec -u root test_pypi bash -c "pip config set global.default-timeout 60"
+          docker exec -u root test_pypi bash -c "pip config set global.retries 10"
+
+          # Install and show speedtest-cli results
+          docker exec \
+          -w /workspace \
+          test_pypi \
+          bash -c "pip install -q speedtest-cli && echo -e '\033[1;33mSpeedtest-cli quick summary:\033[0m' && speedtest-cli --simple || true"
+
+          # ==== DNS and latency test for pypi.org and github.com ====
+          echo -e "\033[1;34m==== Checking DNS and Latency for pypi.org and github.com ====\033[0m"
+          docker exec \
+          -w /workspace \
+          test_pypi \
+          bash -c "apt-get update && apt-get install -y dnsutils iputils-ping curl"
+
+          # DNS lookup for pypi.org
+          echo -e "\033[1;36m[pypi.org] DNS lookup:\033[0m"
+          docker exec test_pypi bash -c "nslookup pypi.org || true"
+
+          # DNS lookup for github.com
+          echo -e "\033[1;36m[github.com] DNS lookup:\033[0m"
+          docker exec test_pypi bash -c "nslookup github.com || true"
+
+          # Ping test for pypi.org and github.com
+          echo -e "\033[1;36m[pypi.org] Ping latency:\033[0m"
+          docker exec test_pypi bash -c "ping -c 4 pypi.org || true"
+          echo -e "\033[1;36m[github.com] Ping latency:\033[0m"
+          docker exec test_pypi bash -c "ping -c 4 github.com || true"
+
+          # ==== Download speed test for pypi.org ====
+          echo -e "\033[1;34m==== Testing Download Speed from pypi.org ====\033[0m"
+          docker exec \
+          test_pypi \
+          bash -c "curl -o /dev/null -L --max-time 60 https://files.pythonhosted.org/packages/source/p/pip/pip-24.0.tar.gz -w 'pypi.org download: %{speed_download} bytes/sec\n'"
+
+          # ==== Download speed test for github.com ====
+          echo -e "\033[1;34m==== Testing Download Speed from github.com ====\033[0m"
+          docker exec \
+          test_pypi \
+          bash -c "curl -o /dev/null -L --max-time 60 https://github.com/git/git/archive/refs/tags/v2.42.0.tar.gz -w 'github.com download: %{speed_download} bytes/sec\n'"

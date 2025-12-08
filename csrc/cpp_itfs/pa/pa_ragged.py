@@ -25,6 +25,15 @@ def compile(
     logits_soft_cap_enabled: bool = False,
     func_name: str = None,
 ):
+    import os
+
+    version = os.getenv("QKV_VERSION", "GOLDEN")
+    if version == "EXPERIMENTAL":
+        if head_size != 128 or kv_dtype != "__hip_bfloat16":
+            print(
+                "EXPERIMENTAL pa_ragged kernel requires head_size=128 and kv_dtype=bf16. Fallback to original kernel"
+            )
+
     return compile_template_op(
         src_template,
         MD_NAME,
@@ -49,6 +58,8 @@ def compile(
         alibi_enabled=alibi_enabled,
         logits_soft_cap_enabled=logits_soft_cap_enabled,
         func_name=func_name,
+        # choice: [GOLDEN, EXPERIMENTAL]. Classify original kernel and experimental kernel
+        version=version,
     )
 
 

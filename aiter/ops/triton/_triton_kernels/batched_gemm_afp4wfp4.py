@@ -9,6 +9,33 @@ import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_batched_gemm_afp4_wfp4_repr = make_kernel_repr(
+    "_batched_gemm_afp4_wfp4_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+    ],
+)
+
+_batched_gemm_afp4_wfp4_reduce_repr = make_kernel_repr(
+    "_batched_gemm_afp4_wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
 
 
 @triton.heuristics(
@@ -20,7 +47,7 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_batched_gemm_afp4_wfp4_repr)
 def _batched_gemm_afp4_wfp4_kernel(
     a_ptr,
     b_ptr,
@@ -210,7 +237,7 @@ def _batched_gemm_afp4_wfp4_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_batched_gemm_afp4_wfp4_reduce_repr)
 def _batched_gemm_afp4_wfp4_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
@@ -304,7 +331,7 @@ def _get_config(
     K: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-AFP4WFP4.json"
         with open(fpath, "r") as file:
@@ -313,7 +340,7 @@ def _get_config(
 
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-AFP4WFP4-N={N}-K={2*K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:

@@ -104,10 +104,11 @@ def run_ck(
         bias,
         alibi_slopes,
         deterministic,
-        return_lse,
-        return_attn_probs,
-        cu_seqlens_q,
-        cu_seqlens_kv,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+        how_v3_bf16_cvt=2,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
         num_rotate_args=1,
     )
 
@@ -179,6 +180,7 @@ def run_ck(
         (192, 192),
         (224, 224),
         (256, 256),
+        (192, 128),
     ],
 )
 @pytest.mark.parametrize(
@@ -458,6 +460,7 @@ def flash_attn_output_benchmark(
         (192, 192),
         (224, 224),
         (256, 256),
+        (192, 128),
     ],
 )
 @pytest.mark.parametrize(
@@ -719,7 +722,15 @@ parser.add_argument(
     "-d_qk_v",
     type=dtypes.str2tuple,
     nargs="+",
-    default=[(32, 32), (40, 40), (64, 64), (111, 111), (128, 128), (160, 160)],
+    default=[
+        (32, 32),
+        (40, 40),
+        (64, 64),
+        (111, 111),
+        (128, 128),
+        (160, 160),
+        (192, 128),
+    ],
     help="""Dimension of query and key. Default is None.
     e.g.: -qk_v 256,256""",
 )

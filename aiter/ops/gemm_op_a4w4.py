@@ -2,9 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import os
 from typing import Optional
 
+from aiter.jit.utils.torch_guard import torch_compile_guard
 import pandas as pd
 import torch
 from torch import Tensor
@@ -12,9 +12,8 @@ from torch import Tensor
 from aiter import logger
 
 from ..jit.core import (
-    AITER_CONFIG_GEMM_A4W4_FILE,
+    AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
-    AITER_ROOT_DIR,
     compile_ops,
 )
 from ..jit.utils.chip_info import get_cu_num, get_gfx
@@ -37,7 +36,9 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config(M: int, N: int, K: int):
     if not hasattr(get_GEMM_config, "gemm_dict"):
-        gemm_dict = pd.read_csv(AITER_CONFIG_GEMM_A4W4_FILE).drop_duplicates()
+        gemm_dict = pd.read_csv(
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
+        ).drop_duplicates()
         get_GEMM_config.gemm_dict = gemm_dict.set_index(
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
@@ -50,7 +51,7 @@ def get_GEMM_config(M: int, N: int, K: int):
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
-                    f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+                    f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
                 )
             break
     else:
@@ -60,6 +61,21 @@ def get_GEMM_config(M: int, N: int, K: int):
     return config
 
 
+def gemm_a4w4_fake(
+    A: Tensor,  # A:[M, K/2] f4x2
+    B: Tensor,  # B:[N, K/2] f4x2
+    A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
+    B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
+    out: Tensor,  # Out:[M, N] bf16
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    alpha: Optional[float] = 1.0,
+    beta: Optional[float] = 0.0,
+    bpreshuffle: Optional[bool] = True,
+) -> torch.Tensor:
+    return out
+
+
+@torch_compile_guard(gen_fake=gemm_a4w4_fake)
 def gemm_a4w4(
     A: Tensor,  # A:[M, K/2] f4x2
     B: Tensor,  # B:[N, K/2] f4x2

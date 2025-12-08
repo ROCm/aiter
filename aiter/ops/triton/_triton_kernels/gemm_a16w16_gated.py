@@ -10,6 +10,23 @@ from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from .activation import _get_activation_from_str
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_gemm_a16w16_gated_repr = make_kernel_repr(
+    "_gemm_a16_w16_gated_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+        "activation",
+        "use_activation",
+    ],
+)
 
 
 @triton.heuristics(
@@ -19,7 +36,7 @@ from .activation import _get_activation_from_str
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_gemm_a16w16_gated_repr)
 def _gemm_a16_w16_gated_kernel(
     a_ptr,
     b_ptr,
@@ -144,7 +161,7 @@ def _get_config(
     K: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-gated.json"
         with open(fpath, "r") as file:
@@ -153,7 +170,7 @@ def _get_config(
 
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = (
             f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-gated-N={N}-K={K}.json"
         )

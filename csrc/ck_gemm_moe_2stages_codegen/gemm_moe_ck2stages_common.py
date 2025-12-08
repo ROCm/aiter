@@ -173,7 +173,7 @@ a8w8_gemm1_kernels_list= {
 }
 # gemm1 blockscale out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_blockscale_kernels_list= {
-     #0: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
+     1: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
      0: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
 }
@@ -191,10 +191,18 @@ a8w4_gemm1_kernels_list= {
 
 # gemm1 out:bf16/fp16 A:mxfp4 B:mxfp4
 a4w4_gemm1_kernels_list= {
+     0: kernelInstanceGEMM1(       256,       32,          128,       128,     1,       4,        3,),
+     1: kernelInstanceGEMM1(       256,       64,          128,       128,     1,       4,        3,),
+     2: kernelInstanceGEMM1(       256,      128,          128,       128,     1,       4,        3,),
+     4: kernelInstanceGEMM1(        64,       32,           32,       128,     1,       1,        3,),
+    #  3: kernelInstanceGEMM1(       256,      256,         128,       128,     2,       2,        3,),
+}
+
+# bns gemm1 out:bf16/fp16 A:mxfp4 B:mxfp4
+a4w4_bns_gemm1_kernels_list= {
      0: kernelInstanceGEMM1(       256,       32,         128,       128,     1,       4,        3,),
      1: kernelInstanceGEMM1(       256,       64,          64,       128,     2,       2,        3,),
      2: kernelInstanceGEMM1(       256,      128,          64,       128,     2,       2,        3,),
-    #  3: kernelInstanceGEMM1(       256,      256,         128,       128,     2,       2,        3,),
 }
 
 gemm1_kernels_dict = {
@@ -205,6 +213,7 @@ gemm1_kernels_dict = {
     "a8w8blkscale": a8w8_gemm1_blockscale_kernels_list,
     "a8w4": a8w4_gemm1_kernels_list,
     "a4w4": a4w4_gemm1_kernels_list,
+    "a4w4_bns": a4w4_bns_gemm1_kernels_list,
 }
 
 
@@ -259,7 +268,7 @@ a8w8_gemm2_kernels_list= {
 
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
 a8w8_gemm2_blockscale_kernels_list= {
-     #0: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
+     0: kernelInstanceGEMM2(       256,       16,        128,       256,     1,       4,        1,),
      1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
 }
@@ -276,13 +285,22 @@ a8w4_gemm2_kernels_list= {
 }
 # gemm2 out:bf16/fp16 A:fp8 B:in4
 a4w4_gemm2_kernels_list= {
+     0: kernelInstanceGEMM2(       256,        32,        128,       128,     1,       4,         3,),
+     1: kernelInstanceGEMM2(       256,        64,        128,       128,     1,       4,         3,),
+     2: kernelInstanceGEMM2(       256,       128,        128,       128,     1,       4,         3,),
+     4: kernelInstanceGEMM2(        64,        32,         32,       128,     1,       1,         1,),
+     5: kernelInstanceGEMM2(        64,        64,         128,       128,     1,       1,         3,),
+     6: kernelInstanceGEMM2(        64,       128,        128,       128,     1,       1,         3,),
+    #  7: kernelInstanceGEMM2(      256,       256,         64,       128,     2,       2,         3,),
+}
+# gemm2 out:bf16/fp16 A:fp8 B:in4
+a4w4_bns_gemm2_kernels_list= {
      0: kernelInstanceGEMM2(       64,        32,         32,       128,     1,       1,         1,),
      1: kernelInstanceGEMM2(       64,        64,         64,       128,     1,       1,         1,),
      2: kernelInstanceGEMM2(       64,       128,        128,       128,     1,       1,         1,),
      4: kernelInstanceGEMM2(      256,        32,        128,       128,     1,       4,         3,),
      5: kernelInstanceGEMM2(      256,        64,         64,       128,     2,       2,         3,),
      6: kernelInstanceGEMM2(      256,       128,         64,       128,     2,       2,         3,),
-    #  7: kernelInstanceGEMM2(      256,       256,         64,       128,     2,       2,         3,),
 }
 
 # fmt: on
@@ -294,6 +312,7 @@ gemm2_kernels_dict = {
     "a8w8blkscale": a8w8_gemm2_blockscale_kernels_list,
     "a8w4": a8w4_gemm2_kernels_list,
     "a4w4": a4w4_gemm2_kernels_list,
+    "a4w4_bns": a4w4_bns_gemm2_kernels_list,
 }
 
 
@@ -311,6 +330,7 @@ def get_gemm1_kernels_list(
     QuantType: str,
     ActOP: str,
     MulRoutedWeight: bool,
+    preshuffle: bool = False,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -337,7 +357,10 @@ def get_gemm1_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        tag = "a4w4"
+        if preshuffle:
+            tag = "a4w4"
+        else:
+            tag = "a4w4_bns"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
@@ -354,7 +377,7 @@ def get_gemm1_kernels_list(
             kernel.CDEElementOp = "MulABScaleWint4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4":
+        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScale"
         elif tag == "a16w16":
             if MulRoutedWeight:
@@ -371,6 +394,7 @@ def get_gemm2_kernels_list(
     Nswizzle: bool,
     QuantType: str,
     MulRoutedWeight: bool,
+    preshuffle: bool = False,
 ) -> list:
     arch = get_gfx()
 
@@ -398,7 +422,10 @@ def get_gemm2_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        tag = "a4w4"
+        if preshuffle:
+            tag = "a4w4"
+        else:
+            tag = "a4w4_bns"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm2_kernels_dict[tag]
@@ -414,7 +441,7 @@ def get_gemm2_kernels_list(
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4":
+        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScaleExpertWeight"
         elif tag == "a16w16":
             if MulRoutedWeight:
