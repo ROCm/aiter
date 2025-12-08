@@ -229,7 +229,7 @@ inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
 
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
-    __attribute__((amdgpu_num_vgpr(64))) void kn_ml_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
+    __attribute__((amdgpu_num_vgpr(64))) void kn_mla_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
 {
     using q_t    = T::q_t;
     using kv_t   = T::kv_t;
@@ -343,16 +343,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         hk::load<2, T::kQkNopeHeadDim>(
             q_rope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
 
-        int kv_idx = kv_start;
-        for(; kv_idx < (kv_end + 1 - T::kBlockN); kv_idx += T::kBlockN)
-        {
+        auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_start,
+                                                             const int32_t kv_end) {
             // Async load K from VRAM to LDS
-            async_load_k<T, false>(reinterpret_cast<uintptr_t>(p_lds_k_nope),
-                                   reinterpret_cast<uintptr_t>(p_lds_k_rope),
-                                   params.kv_buffer,
-                                   params.p_kv_indices,
-                                   kv_idx,
-                                   kv_idx + T::kBlockN);
+            async_load_k<T, kIsTail>(reinterpret_cast<uintptr_t>(p_lds_k_nope),
+                                     reinterpret_cast<uintptr_t>(p_lds_k_rope),
+                                     params.kv_buffer,
+                                     params.p_kv_indices,
+                                     kv_start,
+                                     kv_end);
 
             __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_s_barrier();
@@ -360,12 +359,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
             // Debug: load k nope to test tensor
             {
-                const int32_t tot_elem = T::kBlockN * T::kQkNopeHeadDim; // 32 * 512 = 16384
+                const int32_t tot_elem =
+                    ckt::min(T::kBlockN, kv_end - kv_start) * T::kQkNopeHeadDim; // 32 * 512 = 16384
                 for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
                 {
                     uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_nope + idx);
                     const float4 f4          = convert_fp8x4_to_float4(FUI{data});
-                    const int32_t row        = kv_idx + idx / T::kQkNopeHeadDim;
+                    const int32_t row        = kv_start + idx / T::kQkNopeHeadDim;
                     const int32_t col        = idx % T::kQkNopeHeadDim;
                     const int32_t offset     = row * T::kQkHeadDim + col;
                     params.p_dbg[offset]     = f4.x;
@@ -377,12 +377,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
             // Debug: load k rope to test tensor
             {
-                const int32_t tot_elem = T::kBlockN * T::kQkRopeHeadDim; // 32 * 64 = 2048
+                const int32_t tot_elem =
+                    ckt::min(T::kBlockN, kv_end - kv_start) * T::kQkRopeHeadDim; // 32 * 64 = 2048
                 for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
                 {
                     uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_rope + idx);
                     const float4 f4          = convert_fp8x4_to_float4(FUI{data});
-                    const int32_t row        = kv_idx + idx / T::kQkRopeHeadDim;
+                    const int32_t row        = kv_start + idx / T::kQkRopeHeadDim;
                     const int32_t col        = idx % T::kQkRopeHeadDim;
                     const int32_t offset     = row * T::kQkHeadDim + col + T::kQkNopeHeadDim;
                     params.p_dbg[offset]     = f4.x;
@@ -391,54 +392,27 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     params.p_dbg[offset + 3] = f4.w;
                 }
             }
+        };
+
+        const int32_t kv_len = kv_end - kv_start;
+        if(kv_len < T::kBlockN)
+        {
+            mla_main.template operator()<true, true>(kv_start, kv_end);
         }
-
-        if(((kv_end - kv_start) % T::kBlockN) != 0)
+        else
         {
-            // Async load K from VRAM to LDS
-            async_load_k<T, true>(reinterpret_cast<uintptr_t>(p_lds_k_nope),
-                                  reinterpret_cast<uintptr_t>(p_lds_k_rope),
-                                  params.kv_buffer,
-                                  params.p_kv_indices,
-                                  kv_idx,
-                                  kv_end);
+            const int32_t kv_1st_end = kv_start + T::kBlockN;
+            mla_main.template operator()<true, false>(kv_start, kv_1st_end);
 
-            __builtin_amdgcn_s_waitcnt(0);
-            __builtin_amdgcn_s_barrier();
-            __builtin_amdgcn_sched_barrier(0);
-
-            // Debug: load k nope to test tensor
+            int32_t kv_idx = kv_1st_end;
+            for(; kv_idx < (kv_end + 1 - T::kBlockN); kv_idx += T::kBlockN)
             {
-                const int32_t tot_elem = T::kBlockN * T::kQkNopeHeadDim; // 32 * 512 = 16384
-                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
-                {
-                    uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_nope + idx);
-                    const float4 f4          = convert_fp8x4_to_float4(FUI{data});
-                    const int32_t row        = kv_idx + idx / T::kQkNopeHeadDim;
-                    const int32_t col        = idx % T::kQkNopeHeadDim;
-                    const int32_t offset     = row * T::kQkHeadDim + col;
-                    params.p_dbg[offset]     = f4.x;
-                    params.p_dbg[offset + 1] = f4.y;
-                    params.p_dbg[offset + 2] = f4.z;
-                    params.p_dbg[offset + 3] = f4.w;
-                }
+                mla_main.template operator()<false, false>(kv_idx, kv_idx + T::kBlockN);
             }
 
-            // Debug: load k rope to test tensor
+            if((kv_len % T::kBlockN) != 0)
             {
-                const int32_t tot_elem = T::kBlockN * T::kQkRopeHeadDim; // 32 * 64 = 2048
-                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
-                {
-                    uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_rope + idx);
-                    const float4 f4          = convert_fp8x4_to_float4(FUI{data});
-                    const int32_t row        = kv_idx + idx / T::kQkRopeHeadDim;
-                    const int32_t col        = idx % T::kQkRopeHeadDim;
-                    const int32_t offset     = row * T::kQkHeadDim + col + T::kQkNopeHeadDim;
-                    params.p_dbg[offset]     = f4.x;
-                    params.p_dbg[offset + 1] = f4.y;
-                    params.p_dbg[offset + 2] = f4.z;
-                    params.p_dbg[offset + 3] = f4.w;
-                }
+                mla_main.template operator()<false, true>(kv_idx, kv_end);
             }
         }
 
@@ -540,7 +514,7 @@ void dispatch_mla_decode_fwd_n128(torch::Tensor& query,
     const dim3 grid        = dim3(dev_prop.multiProcessorCount);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
 
-    kn_ml_decode_fwd_n128<Traits><<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
+    kn_mla_decode_fwd_n128<Traits><<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
 }
 
 void hk_mi35x_mla_decode_fwd_n128(torch::Tensor& query,
