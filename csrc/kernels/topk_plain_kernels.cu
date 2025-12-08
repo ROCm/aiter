@@ -98,6 +98,9 @@ void topk_per_row_kernel_launcher(const float* in,
 // Based on: n + K log²K ≥ 3 × Factor(n) × n
 // where Factor(n) = 1/3 + 1.6/(log₂(n) - 9.5)
 // Simplifies to: K log²K ≥ 4.8n/(log₂(n) - 9.5)
+// TODO: We need to confirm whether, when n <= 2048, we might choose
+// radix sort because the denominator becomes very small; does that
+// still yield the best performance?
 template <typename IdxT>
 __forceinline__ __host__ bool should_use_topk_radix(IdxT len, IdxT k)
 {
