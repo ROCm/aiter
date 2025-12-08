@@ -1476,4 +1476,4 @@ namespace py = pybind11;
           py::arg("rowStarts") = torch::Tensor(), \
           py::arg("rowEnds") = torch::Tensor(), \
           py::arg("stride0") = -1,  \
-          py::arg("stride1") = 1); 
+          py::arg("stride1") = 1);
