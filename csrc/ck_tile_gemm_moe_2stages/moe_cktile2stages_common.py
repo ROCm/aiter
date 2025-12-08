@@ -161,10 +161,10 @@ a16w4_gemm2_kernels_list_gfx950= {
 # gemm1 out:bf16/fp16 AB:fp8/fp4
 a8w4_gemm1_kernels_list_gfx950= {
     #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
-    0: kernelInstance(       2,        256,       16,        128,       256,           16,         16,          128,          1,        4,            2,),
+    0: kernelInstance(       1,        256,       16,        128,       256,           16,         16,          128,          1,        4,            2,),
     # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            4,),
-    1: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          128,          1,        4,            2,),
-    3: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          128,          1,        4,            1,),
+    1: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          128,          1,        4,            2,),
+    3: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          128,          1,        4,            1,),
     # 4: kernelInstance(       2,        256,      128,        256,       128,           16,         16,          32,          1,        4,            1,),
     # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
     # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
@@ -388,14 +388,14 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     {{
         return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    else if (block_m == 32)
-    {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
+    // else if (block_m == 32)
+    // {{
+    //     return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+    // }}
+    // else if (block_m == 64)
+    // {{
+    //     return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+    // }}
     else
     {{
         TORCH_CHECK(
@@ -413,14 +413,14 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
     {{
         return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    else if (block_m == 32)
-    {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
+    // else if (block_m == 32)
+    // {{
+    //     return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+    // }}
+    // else if (block_m == 64)
+    // {{
+    //     return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+    // }}
     else
     {{
         TORCH_CHECK(

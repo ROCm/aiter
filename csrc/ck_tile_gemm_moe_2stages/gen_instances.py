@@ -228,6 +228,8 @@ template torch::Tensor
 
         if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
             fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
+        elif (k.QuantType == "1x32") and (self.ab_dtype in ["fp8", "bf8"]):
+            fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
         else:
             for CDtype in ["bf16", "fp16"]:
                 for ABDtype in ["fp8"]:  # "bf16", "fp16",
@@ -339,7 +341,8 @@ template torch::Tensor
 #include <torch/extension.h>
 """
         MAINFEST_template = """
-template <typename ADataType, typename BDataType, typename DDataType, typename EDataType>
+// template <typename ADataType, typename BDataType, typename DDataType, typename EDataType>
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
 torch::Tensor
 {kernel_name}(
     torch::Tensor& XQ,
@@ -544,7 +547,8 @@ if __name__ == "__main__":
     # b_type = "fp8"
     # quant_type = "per_token"
 
-    a_type = "bf16"
+    a_type = "fp8"
+    # a_type = "bf16"
     b_type = "fp4"
     quant_type = "1x32"
 
