@@ -17,7 +17,7 @@ struct PaMetadataV12Traits
     // ==  0: read from PaMetadataV1KernelParameter::uni_seqlen_qo
     // >=  1: read from PaMetadataV12Traits::kUniSeqlenQo
     static constexpr int32_t kUniSeqlenQo            = kUniSeqlenQo_;
-    static constexpr int32_t kFixedOverheadNumBlocks = 1;
+    static constexpr int32_t kFixedOverheadNumBlocks = 0;
     static constexpr int32_t kIsSparse               = kIsSparse_;
     static constexpr int32_t kLdsBatchInfo           = kLdsBatchInfo_;
 };
@@ -82,8 +82,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     // expected payload handled by each cu part.
-    const int32_t payload = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
-                            Traits::kFixedOverheadNumBlocks;
+    const int32_t average = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
+                        Traits::kFixedOverheadNumBlocks;
+    const int32_t reminder = std::max(sum_blocks - params.num_splits * average, 0);
 
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
@@ -104,7 +105,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     for(int32_t cid = 0; cid < params.num_cu; ++cid)
     {
-        int32_t remain_payload = payload;
+        int32_t remain_payload = (cid < reminder) ? (average + 1) : average;
         while(curr_batch < params.num_batches)
         {
             const int32_t packed_qo_len = qo_state.get_seqlen(curr_batch) * params.num_heads;
