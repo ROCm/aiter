@@ -525,11 +525,11 @@ __device__ void filter_and_histogram(T const* in_buf,
     // merge histograms produced by individual blocks
     for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
     {
-        // if(histogram_smem[i] != 0)
-        // {
-        //     atomicAdd(histogram + i, histogram_smem[i]);
-        // }
-        *(histogram + i) = histogram_smem[i];
+        if(histogram_smem[i] != 0)
+        {
+            atomicAdd(histogram + i, histogram_smem[i]);
+        }
+        // *(histogram + i) = histogram_smem[i];
     }
 }
 
@@ -734,11 +734,14 @@ __global__ void last_filter_kernel(T const* in,
                                    T* out,
                                    IdxT* out_idx,
                                    IdxT len,
+                                   const IdxT* rowStarts,
+                                   const IdxT* rowEnds,
                                    IdxT k,
                                    Counter<T, IdxT>* counters,
                                    bool const select_min)
 {
     const int64_t batch_id = blockIdx.y; // size_t to avoid multiplication overflow
+    const IdxT row_len     = rowEnds[batch_id] - rowStarts[batch_id];
 
     Counter<T, IdxT>* counter = counters + batch_id;
     IdxT previous_len         = counter->previous_len;
@@ -746,12 +749,12 @@ __global__ void last_filter_kernel(T const* in,
     {
         return;
     }
-    const IdxT buf_len = calc_buf_len<T>(len);
+    const IdxT buf_len = calc_buf_len<T>(row_len);
     if(previous_len > buf_len || in_buf == in)
     {
         in_buf       = in + batch_id * len;
         in_idx_buf   = in_idx ? (in_idx + batch_id * len) : nullptr;
-        previous_len = len;
+        previous_len = row_len;
     }
     else
     {
@@ -990,13 +993,13 @@ __global__ void radix_kernel(T const* in,
 
         constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
         // reset for next pass
-        // if(pass != num_passes - 1)
-        // {
-        //     for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
-        //     {
-        //         histogram[i] = 0;
-        //     }
-        // }
+        if(pass != num_passes - 1)
+        {
+            for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+            {
+                histogram[i] = 0;
+            }
+        }
         if(threadIdx.x == 0)
         {
             // `last_filter_kernel()` requires setting previous_len even in the last
@@ -1552,17 +1555,14 @@ void standalone_stable_radix_topk_(void* buf,
     T* buf2                    = nullptr;
     IdxT* idx_buf2             = nullptr;
 
-    IdxT* topk_out_idx = nullptr;
-
     {
-        IdxT len_candidates       = calc_buf_len<T>(len);
+        IdxT len_candidates       = calc_buf_len<T, IdxT>(len);
         std::vector<size_t> sizes = {sizeof(*counters) * batch_size,
                                      sizeof(*histograms) * num_buckets * batch_size,
                                      sizeof(*buf1) * len_candidates * batch_size,
                                      sizeof(*idx_buf1) * len_candidates * batch_size,
                                      sizeof(*buf2) * len_candidates * batch_size,
-                                     sizeof(*idx_buf2) * len_candidates * batch_size,
-                                     sizeof(*topk_out_idx) * k * batch_size};
+                                     sizeof(*idx_buf2) * len_candidates * batch_size};
 
         size_t total_size = calc_aligned_size(sizes);
         if(!buf)
@@ -1578,7 +1578,6 @@ void standalone_stable_radix_topk_(void* buf,
         idx_buf1     = static_cast<decltype(idx_buf1)>(aligned_pointers[3]);
         buf2         = static_cast<decltype(buf2)>(aligned_pointers[4]);
         idx_buf2     = static_cast<decltype(idx_buf2)>(aligned_pointers[5]);
-        topk_out_idx = static_cast<decltype(topk_out_idx)>(aligned_pointers[6]);
 
         HIP_CALL(hipMemsetAsync(aligned_pointers[0],
                                 0,
@@ -1637,9 +1636,9 @@ void standalone_stable_radix_topk_(void* buf,
 
     if(!fused_last_filter)
     {
-        last_filter_kernel<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, true>
+        last_filter_kernel<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>
             <<<blocks, BlockSize, 0, stream>>>(
-                in, in_idx, out_buf, out_idx_buf, out, out_idx, len, k, counters, select_min);
+                in, in_idx, out_buf, out_idx_buf, out, out_idx, len, rowStarts, rowEnds, k, counters, select_min);
     }
 }
 
@@ -1731,7 +1730,7 @@ void standalone_stable_radix_11bits(void* buf,
         unsigned grid_dim =
             calc_grid_dim<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES>(batch_size, len, sm_cnt);
 
-        if(grid_dim == 1)
+        if(1) // faster
         {
             standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES>(
                 buf,
@@ -2330,7 +2329,7 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
     unsigned grid_dim =
         aiter::calc_grid_dim<T, IdxT, 11, block_dim, false>(numRows, stride0, sm_cnt);
 
-    if(grid_dim == 1)
+    if(1) 
     {
         aiter::standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim, false>(
             workspace,
