@@ -179,14 +179,28 @@ if IS_ROCM:
 
     exclude_ops = get_exclude_ops()
 
-    if PREBUILD_KERNELS != 0:
+    has_torch = True
+    try:
+        import torch as _torch
+    except Exception:
+        has_torch = False
+
+    if PREBUILD_KERNELS != 0 and not has_torch:
+        print("[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment")
+    elif PREBUILD_KERNELS != 0:
         all_opts_args_build, prebuild_link_param = core.get_args_of_build(
             "all", exclude=exclude_ops
         )
-        os.system(f"rm -rf {core.get_user_jit_dir()}/build")
-        os.system(f"rm -rf {core.get_user_jit_dir()}/*.so")
+        import glob
+        bd = f"{core.get_user_jit_dir()}/build"
+        shutil.rmtree(bd, ignore_errors=True)
+        for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
         prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
-        os.makedirs(prebuild_dir + "/srcs")
+        os.makedirs(prebuild_dir + "/srcs", exist_ok=True)
 
         def build_one_module(one_opt_args):
             flags_cc = list(one_opt_args["flags_extra_cc"]) + [
@@ -218,14 +232,42 @@ if IS_ROCM:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-            list(executor.map(build_one_module, all_opts_args_build))
+        if PREBUILD_KERNELS != 4:
+            with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+                list(executor.map(build_one_module, all_opts_args_build))
+        agg_flags_cc = list(prebuild_link_param["flags_extra_cc"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
+        agg_flags_hip = list(prebuild_link_param["flags_extra_hip"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
+        agg_srcs = sorted(set(
+            s
+            for one in all_opts_args_build
+            for s in one["srcs"]
+            if ("/pybind/" not in s and not s.endswith("_pybind.cu"))
+        )) + [os.path.join(this_dir, "csrc", "rocm_ops.cpp")]
+        core.build_module(
+            md_name="aiter_",
+            srcs=agg_srcs,
+            flags_extra_cc=agg_flags_cc,
+            flags_extra_hip=agg_flags_hip,
+            blob_gen_cmd=prebuild_link_param["blob_gen_cmd"],
+            extra_include=prebuild_link_param["extra_include"],
+            extra_ldflags=None,
+            verbose=False,
+            is_python_module=True,
+            is_standalone=False,
+            torch_exclude=False,
+        )
 
 else:
     raise NotImplementedError("Only ROCM is supported")
 
 
 # aiter_meta prepared above
+if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+    shutil.rmtree("aiter_meta")
+## link "3rdparty", "hsa", "csrc" into "aiter_meta"
+shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+shutil.copytree("hsa", "aiter_meta/hsa")
+shutil.copytree("csrc", "aiter_meta/csrc")
 
 
 class NinjaBuildExtension(BuildExtension):
@@ -265,32 +307,35 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-setup(
-    name=PACKAGE_NAME,
-    use_scm_version=True,
-    packages=["aiter_meta", "aiter"],
-    include_package_data=True,
-    package_data={
-        "": ["*"],
-    },
-    classifiers=[
-        "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: BSD License",
-        "Operating System :: Unix",
-    ],
-    # ext_modules=ext_modules,
-    cmdclass={"build_ext": NinjaBuildExtension},
-    python_requires=">=3.8",
-    install_requires=[
-        "pybind11>=3.0.1",
-        "ninja",
-        "pandas",
-        "einops",
-        "psutil",
-    ],
-    setup_requires=setup_requires,
-    distclass=ForcePlatlibDistribution,
-)
+if is_develop_mode() and PREBUILD_KERNELS > 0:
+    print("[aiter] PREBUILD_KERNELS>0 + develop: do prebuild only and skip editable install")
+else:
+    setup(
+        name=PACKAGE_NAME,
+        use_scm_version=True,
+        packages=["aiter_meta", "aiter"],
+        include_package_data=True,
+        package_data={
+            "": ["*"],
+        },
+        classifiers=[
+            "Programming Language :: Python :: 3",
+            "License :: OSI Approved :: BSD License",
+            "Operating System :: Unix",
+        ],
+        # ext_modules=ext_modules,
+        cmdclass={"build_ext": NinjaBuildExtension},
+        python_requires=">=3.8",
+        install_requires=[
+            "pybind11>=3.0.1",
+            "ninja",
+            "pandas",
+            "einops",
+            "psutil",
+        ],
+        setup_requires=setup_requires,
+        distclass=ForcePlatlibDistribution,
+    )
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")

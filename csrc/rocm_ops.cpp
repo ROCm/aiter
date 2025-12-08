@@ -13,7 +13,9 @@
 #include "attention_ck.h"
 #include "attention_ragged.h"
 #include "attention_v1.h"
+#if PREBUILD_KERNELS != 3
 #include "batched_gemm_a8w8.h"
+#endif
 #include "cache.h"
 #include "communication_asm.h"
 #include "custom.h"
@@ -44,39 +46,51 @@
 #include "topk_plain.h"
 #include <torch/extension.h>
 
-// #include "torch/mha_batch_prefill.h"
-// #include "torch/mha_bwd.h"
-// #include "torch/mha_fwd.h"
-// #include "torch/mha_v3_bwd.h"
-// #include "torch/mha_v3_fwd.h"
-// #include "torch/mha_v3_varlen_bwd.h"
-// #include "torch/mha_varlen_bwd.h"
-// #include "torch/mha_varlen_fwd.h"
+#include "torch/mha_batch_prefill.h"
+#include "torch/mha_bwd.h"
+#include "torch/mha_fwd.h"
+#include "torch/mha_v3_bwd.h"
+#include "torch/mha_v3_fwd.h"
+#include "torch/mha_v3_varlen_bwd.h"
+#include "torch/mha_varlen_bwd.h"
+#include "torch/mha_varlen_fwd.h"
 
 #include "rocm_ops.hpp"
 
 #ifdef PREBUILD_KERNELS
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    // remove *TUNE* , MHA*
-    // GEMM_A8W8_TUNE_PYBIND;
+#if PREBUILD_KERNELS != 3
+    GEMM_A8W8_TUNE_PYBIND;
     AITER_ENUM_PYBIND;
     RMSNORM_PYBIND;
     GEMM_COMMON_PYBIND;
-    // MHA_VARLEN_FWD_PYBIND;
-    // MHA_VARLEN_BWD_PYBIND;
-    // MHA_FWD_PYBIND;
-    // MHA_BWD_PYBIND;
-    // MHA_BATCH_PREFILL_PYBIND;
-    // MHA_FWD_ASM_PYBIND
-    // MHA_BWD_ASM_PYBIND;
-    // MHA_VARLEN_BWD_ASM_PYBIND;
+#if PREBUILD_KERNELS == 2
+    MHA_VARLEN_FWD_PYBIND;
+    MHA_FWD_PYBIND;
+    MHA_FWD_ASM_PYBIND;
+#endif
+#if PREBUILD_KERNELS == 4
+    MHA_VARLEN_FWD_PYBIND;
+    MHA_VARLEN_BWD_PYBIND;
+    MHA_FWD_PYBIND;
+    MHA_BWD_PYBIND;
+    MHA_BATCH_PREFILL_PYBIND;
+    MHA_FWD_ASM_PYBIND;
+    MHA_BWD_ASM_PYBIND;
+    MHA_VARLEN_BWD_ASM_PYBIND;
+#endif
     GEMM_A8W8_PYBIND;
     GEMM_A8W8_BPRESHUFFLE_PYBIND;
     CUSTOM_PYBIND;
     SMOOTHQUANT_PYBIND;
+#if PREBUILD_KERNELS == 4
     BATCHED_GEMM_A8W8_PYBIND;
-    // BATCHED_GEMM_A8W8_TUNE_PYBIND;
+    BATCHED_GEMM_A8W8_TUNE_PYBIND;
+    GEMM_A8W8_TUNE_PYBIND;
+    GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
+    GEMM_A8W8_BPRESHUFFLE_TUNE_PYBIND;
+#endif
     GEMM_A8W8_ASM_PYBIND;
     GEMM_A4W4_ASM_PYBIND;
     GEMM_A16W16_ASM_PYBIND;
@@ -98,7 +112,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     ROPE_GENERAL_BWD_PYBIND;
     ROPE_POS_FWD_PYBIND;
     FUSED_MROPE_RMS_PYBIND;
-    // GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
+#if PREBUILD_KERNELS == 4
+    GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
+    GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND;
+#endif
     GEMM_A4W4_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND;
@@ -114,6 +131,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     MLA_REDUCE_PYBIND;
     DEEPGEMM_PYBIND;
     TOPK_PLAIN_PYBIND;
+#if PREBUILD_KERNELS == 4
+    TOP_K_PER_ROW_PYBIND;
+#endif
     PA_METADATA_PYBIND;
-}
+#endif }
 #endif
