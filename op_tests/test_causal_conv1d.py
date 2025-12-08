@@ -26,6 +26,12 @@ def torch_causal_conv1d(x, weight, bias=None, use_silu=False, initial_states=Non
         out: [batch, dim, seqlen]
         final_states: [batch, dim, width-1] if initial_states provided, else None
     """
+    # Save original dtype and convert x to weight's dtype (like original causal-conv1d)
+    dtype_in = x.dtype
+    x = x.to(weight.dtype)
+    if initial_states is not None:
+        initial_states = initial_states.to(weight.dtype)
+    
     batch, dim, seqlen = x.shape
     width = weight.shape[1]
 
@@ -58,6 +64,11 @@ def torch_causal_conv1d(x, weight, bias=None, use_silu=False, initial_states=Non
     if use_silu:
         out = F.silu(out)
 
+    # Convert back to original dtype
+    out = out.to(dtype_in)
+    if final_states is not None:
+        final_states = final_states.to(dtype_in)
+
     if initial_states is not None:
         return out, final_states
     else:
@@ -85,8 +96,10 @@ def test_causal_conv1d_fwd(batch, dim, seqlen, width, dtype, use_silu=False, is_
 
     # Create input tensors
     x = torch.randn(batch, dim, seqlen, dtype=dtype, device="cuda")
-    weight = torch.randn(dim, width, dtype=dtype, device="cuda")
-    bias = torch.randn(dim, dtype=dtype, device="cuda")
+    # Use fp32 for weight and bias to match original causal-conv1d implementation
+    # This will automatically upcast computation to fp32 for bf16/fp16 inputs
+    weight = torch.randn(dim, width, dtype=torch.float32, device="cuda")
+    bias = torch.randn(dim, dtype=torch.float32, device="cuda")
     
     # Optional parameters (only valid for channel-last)
     seq_idx = None
@@ -190,8 +203,9 @@ def test_causal_conv1d_no_bias(batch, dim, seqlen, width, dtype, use_silu=False,
     ret = {}
 
     x = torch.randn(batch, dim, seqlen, dtype=dtype, device="cuda")
-    weight = torch.randn(dim, width, dtype=dtype, device="cuda")
-    bias = torch.empty(0, dtype=dtype, device="cuda")  # Empty tensor
+    # Use fp32 for weight to match original causal-conv1d implementation
+    weight = torch.randn(dim, width, dtype=torch.float32, device="cuda")
+    bias = torch.empty(0, dtype=torch.float32, device="cuda")  # Empty tensor
     
     # Convert to channel-last layout if needed
     if is_channel_last:
@@ -240,7 +254,7 @@ def test_causal_conv1d_no_bias(batch, dim, seqlen, width, dtype, use_silu=False,
 
 
 # Test configurations (默认使用小规模配置快速验证)
-l_dtype = ["float32"]
+l_dtype = ["float32", "float16", "bfloat16"]  # 测试所有支持的数据类型
 l_batch = [2, 4]
 l_dim = [64, 256]
 l_seqlen = [2048]

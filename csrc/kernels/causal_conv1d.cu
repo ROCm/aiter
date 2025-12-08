@@ -96,6 +96,11 @@ struct half8_t {
     __half2 x, y, z, w;
 };
 
+// Custom bfloat16_8_t for BF16
+struct bfloat16_8_t {
+    __hip_bfloat162 x, y, z, w;
+};
+
 // SiLU activation
 template <typename T>
 __device__ __forceinline__ float silu(const T& x) {
@@ -177,9 +182,13 @@ struct Causal_conv1d_fwd_kernel_traits {
     
     // Vector type for vectorized loads
     using vec_t = typename std::conditional<
-        std::is_same<input_t, __half>::value,
+        std::is_same<input_t, at::Half>::value,
         half8_t,
-        typename BytesToType<kNBytes * kNElts>::Type
+        typename std::conditional<
+            std::is_same<input_t, at::BFloat16>::value,
+            bfloat16_8_t,
+            typename BytesToType<kNBytes * kNElts>::Type
+        >::type
     >::type;
     
     // BlockLoad and BlockStore for coalesced memory access
@@ -432,31 +441,42 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, hipStream_t stream) {
 
 // ==================== Kernel Traits ====================
 
-template<int kNThreads_, int kWidth_, int kChunkSizeL_>
+template<int kNThreads_, int kWidth_, int kChunkSizeL_, typename input_t_, typename weight_t_>
 struct Causal_conv1d_channellast_fwd_kernel_traits {
-    using input_t = float;
-    using weight_t = float;
+    using input_t = input_t_;
+    using weight_t = weight_t_;
     
     static constexpr int kNThreads = kNThreads_;
     static_assert(kNThreads % 64 == 0, "MI308 uses 64-wide wavefronts");
     static constexpr int kNWarps = kNThreads / 64;  // AMD MI308 wavefront size
     static constexpr int kWidth = kWidth_;
     static constexpr int kChunkSizeL = kChunkSizeL_;
-    static constexpr int kNBytes = sizeof(input_t);  // 4 for float
+    static constexpr int kNBytes = sizeof(input_t);
+    static_assert(kNBytes == 2 || kNBytes == 4, "Only FP16/BF16 and FP32 are supported");
     
-    // Vectorization: 128-byte cache line, 16 bytes per load (float4)
-    static constexpr int kNElts = 4;  // float4
-    static constexpr int kNEltsPerRow = 128 / kNBytes;  // 32 elements per cache line
-    static constexpr int kNThreadsPerRow = kNEltsPerRow / kNElts;  // 8 threads per row
+    // Vectorization: 128-byte cache line
+    // For FP32: 4 elements (16 bytes per load), 32 elements per cache line
+    // For FP16/BF16: 8 elements (16 bytes per load), 64 elements per cache line
+    static constexpr int kNElts = kNBytes == 4 ? 4 : 8;
+    static constexpr int kNEltsPerRow = 128 / kNBytes;
+    static constexpr int kNThreadsPerRow = kNEltsPerRow / kNElts;
     static_assert(kNThreadsPerRow * kNBytes * kNElts == 128, "Cache line alignment");
     
-    static constexpr int kNColsPerWarp = 64 / kNThreadsPerRow;  // MI308: 64-wide wavefront, so 8 cols per warp
+    static constexpr int kNColsPerWarp = 64 / kNThreadsPerRow;  // MI308: 64-wide wavefront
     static_assert(kNColsPerWarp * kNThreadsPerRow == 64, "Wavefront coverage");
     static constexpr int kNColsPerLoad = kNColsPerWarp * kNWarps;
     static constexpr int kNLoads = kChunkSizeL / kNColsPerLoad;
     static_assert(kNLoads * kNColsPerLoad == kChunkSizeL, "Chunk coverage");
     
-    using vec_t = typename BytesToType<kNBytes * kNElts>::Type;  // float4
+    using vec_t = typename std::conditional<
+        std::is_same<input_t, at::Half>::value,
+        half8_t,
+        typename std::conditional<
+            std::is_same<input_t, at::BFloat16>::value,
+            bfloat16_8_t,
+            typename BytesToType<kNBytes * kNElts>::Type
+        >::type
+    >::type;
 };
 
 // ==================== Channel-Last Forward Kernel ====================
@@ -674,9 +694,9 @@ void causal_conv1d_channellast_fwd_kernel(ConvParamsBase params) {
 // ==================== Launch Helper ====================
 
 // Internal launch function with explicit width template parameter
-template<int kNThreads, int kWidth>
+template<int kNThreads, int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_channellast_fwd_launch_impl(ConvParamsBase &params, hipStream_t stream) {
-    using Ktraits = Causal_conv1d_channellast_fwd_kernel_traits<kNThreads, kWidth, 64>;
+    using Ktraits = Causal_conv1d_channellast_fwd_kernel_traits<kNThreads, kWidth, 64, input_t, weight_t>;
     
     constexpr int kChunkSizeL = Ktraits::kChunkSizeL;
     constexpr int kChunkSizeC = Ktraits::kNEltsPerRow;
@@ -711,13 +731,13 @@ void causal_conv1d_channellast_fwd_launch(ConvParamsBase &params, hipStream_t st
     // Dispatch based on width
     switch (params.width) {
         case 2:
-            causal_conv1d_channellast_fwd_launch_impl<kNThreads, 2>(params, stream);
+            causal_conv1d_channellast_fwd_launch_impl<kNThreads, 2, input_t, weight_t>(params, stream);
             break;
         case 3:
-            causal_conv1d_channellast_fwd_launch_impl<kNThreads, 3>(params, stream);
+            causal_conv1d_channellast_fwd_launch_impl<kNThreads, 3, input_t, weight_t>(params, stream);
             break;
         case 4:
-            causal_conv1d_channellast_fwd_launch_impl<kNThreads, 4>(params, stream);
+            causal_conv1d_channellast_fwd_launch_impl<kNThreads, 4, input_t, weight_t>(params, stream);
             break;
         default:
             TORCH_CHECK(false, "Unsupported width. Only 2, 3, 4 are supported.");

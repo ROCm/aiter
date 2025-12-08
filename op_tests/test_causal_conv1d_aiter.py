@@ -2,10 +2,10 @@
 #
 # AIter causal_conv1d 测试
 #
-# 已知问题：
-# 1. float16/bfloat16 在 channel_last=True + silu_activation=True 时会产生 NaN 输出
-#    - 这是 AIter kernel 实现的 bug，需要在 C++ 代码中修复
-#    - 暂时只测试 float32，float16/bfloat16 的测试已被注释
+# 已修复问题：
+# 1. float16/bfloat16 支持已添加到 causal_conv1d_channellast_fwd_kernel_traits
+#    - 修改了 kernel traits 以支持模板化的 input_t 和 weight_t
+#    - 现在可以正确处理 FP16/BF16 数据类型
 # 2. 当 has_bias=False 时，需要传递形状为 (dim,) 的零张量而非 None
 #
 
@@ -102,10 +102,8 @@ def causal_conv1d_update_ref(x, conv_state, weight, bias=None, activation=None, 
 # @pytest.mark.parametrize("has_initial_states", [False])
 @pytest.mark.parametrize("channel_last", [False, True])
 # @pytest.mark.parametrize('channel_last', [True])
-# 注意：float16 和 bfloat16 在 channel_last=True + silu_activation=True 时会产生 NaN
-# 这是 AIter kernel 实现的已知问题，暂时只测试 float32
-@pytest.mark.parametrize("itype", [torch.float32])
-# @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])  # float16/bfloat16 暂时有问题
+@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("itype", [torch.float32])  # 已修复，现在支持 float16/bfloat16
 # @pytest.mark.parametrize('itype', [torch.float16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 # @pytest.mark.parametrize('silu_activation', [True])
@@ -403,8 +401,8 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
 
 @pytest.mark.parametrize("channel_last", [False, True])
 # @pytest.mark.parametrize('channel_last', [True])
-# @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize('itype', [torch.float32])  # 改用 float32 避免崩溃
+@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize('itype', [torch.float32])  # 已修复，现在支持 float16/bfloat16
 @pytest.mark.parametrize("silu_activation", [False, True])  # 测试两种
 # @pytest.mark.parametrize('silu_activation', [True])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -454,7 +452,7 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
 
 
 # @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize('itype', [torch.float32])
+@pytest.mark.parametrize('itype', [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 # @pytest.mark.parametrize('silu_activation', [False])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -535,7 +533,7 @@ def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, ity
     #     assert torch.allclose(bias.grad, bias_ref.grad, rtol=rtolw, atol=atolw)
 
 # @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize('itype', [torch.float32])
+@pytest.mark.parametrize('itype', [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 # @pytest.mark.parametrize('silu_activation', [True])
 @pytest.mark.parametrize("has_bias", [False, True])
