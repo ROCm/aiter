@@ -100,6 +100,40 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     return y, scale.view(dtypes.fp8_e8m0)
 
 
+def per_1x32_f8_scale_f8_quant(x, scale=None, quant_dtype=dtypes.fp8, shuffle=False):
+    assert quant_dtype == dtypes.fp8
+    block_size = 32
+    F8E8M0_EXP_BIAS = 127
+    # F4E2M1_MAX = 6.0
+    # MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
+    # # dtypeMax = F4E2M1_MAX
+    # dtypeMax = 2.0**MAX_POW2
+    dtypeMax = get_dtype_max(quant_dtype)
+
+    shape_original = x.shape
+    x = x.view(-1, shape_original[-1])
+
+    m, n = x.shape
+    x = x.view(-1, block_size)
+    max_abs = torch.amax(torch.abs(x.float()), 1)
+    # max_abs = max_abs.view(torch.int32)
+    # max_abs = ((max_abs + 0x200000) & 0xFF800000).view(torch.float32)
+
+    # fp8e8m0fnu_from_fp32_value
+    scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+
+    # Float8_e8m0fnu to float
+    scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
+
+    y = x.float() / scale_f32.view(-1, 1)
+    y = fp4_utils.f32_to_mxfp4(y)
+    y = y.view(*shape_original[:-1], -1)
+    scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
+    if shuffle:
+        scale = fp4_utils.e8m0_shuffle(scale)
+    return y, scale.view(dtypes.fp8_e8m0)
+
+
 def per_tensor_quant(
     x, scale=None, scale_dtype=dtypes.fp32, quant_dtype=dtypes.i8, dtypeMax=None
 ):

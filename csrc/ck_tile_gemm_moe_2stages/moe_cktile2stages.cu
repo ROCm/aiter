@@ -111,6 +111,16 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         //     moe_dispatch<fp8, fp8, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
         //     sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
         // }
+        if (WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<fp8, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
+            sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
+        }
+        // else if (WQ.dtype() == torch_fp4x2 && Y.dtype() == torch_fp8)
+        // {
+        //     moe_dispatch<fp8, pk_fp4, float, fp8, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
+        //     sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
+        // }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
             (WQ.dtype() == torch_fp4x2)) // a16w4
@@ -184,6 +194,11 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         //     moe_dispatch<fp8, fp8, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
         //     sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
         // }
+        if (WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<fp8, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
+            sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
+        }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
             (WQ.dtype() == torch_fp4x2)) // a16w4
@@ -192,6 +207,11 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         // {
         //    moe_dispatch<fp16, pk_fp4, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
         //    sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
+        // }
+        // else if (WQ.dtype() == torch_fp4x2 && Y.dtype() == torch_fp8)
+        // {
+        //     moe_dispatch<fp8, pk_fp4, float, fp8, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
+        //     sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
         // }
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
