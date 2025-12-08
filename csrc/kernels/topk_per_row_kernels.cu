@@ -1365,7 +1365,7 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     IdxT rowStart    = 0;
     IdxT rowEnd      = len;
 
-    if (rowStart && rowEnds)
+    if (rowStarts && rowEnds)
     {
         rowStart = rowStarts[batch_id];
         rowEnd   = rowEnds[batch_id];
