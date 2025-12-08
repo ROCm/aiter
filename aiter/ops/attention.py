@@ -176,6 +176,7 @@ def pa_reduce_v1(
     reduce_indptr: torch.Tensor,
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None:
@@ -185,6 +186,7 @@ def pa_reduce_v1(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        max_seqlen_q,
         final_output,
         final_lse,
     )
@@ -252,6 +254,7 @@ def pa_persistent_fwd(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        max_qlen,
         output,
         final_lse,
     )
@@ -600,8 +603,10 @@ def get_mla_metadata_info_v1(
     num_head_qo: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
-    is_sparse: int,
+    is_sparse: bool,
     fast_mode: bool = True,
+    num_kv_splits: int = 32,
+    intra_batch_mode: bool = False,
 ):
     """
     Returns:
@@ -614,7 +619,6 @@ def get_mla_metadata_info_v1(
     """
 
     assert num_head_qo % 16 == 0
-
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
@@ -636,14 +640,24 @@ def get_mla_metadata_info_v1(
         max_work = tile_cnt * cu_num
         max_split_tiles = tile_cnt * cu_num
 
-    return (
-        ((2), torch.uint64),  # work_metadata_ptrs
-        ((cu_num + 1), torch.int32),  # work_indptr
-        ((max_work, 8), torch.int32),  # work_info_set
-        ((tile_cnt + 1), torch.int32),  # reduce_indptr
-        ((tile_cnt, 2), torch.int32),  # reduce_final_map
-        (max_split_tiles, torch.int32),  # reduce_partial_map
-    )
+    if not intra_batch_mode:
+        return (
+            ((2), torch.uint64),  # work_metadata_ptrs
+            ((cu_num + 1), torch.int32),  # work_indptr
+            ((max_work, 8), torch.int32),  # work_info_set
+            ((tile_cnt + 1), torch.int32),  # reduce_indptr
+            ((tile_cnt, 2), torch.int32),  # reduce_final_map
+            (max_split_tiles, torch.int32),  # reduce_partial_map
+        )
+    else:
+        return (
+            ((2), torch.uint64),  # work_metadata_ptrs
+            (cu_num + 1, torch.int32),  # work_indptr
+            ((tile_cnt * num_kv_splits, 8), torch.int32),  # work_info_set
+            ((tile_cnt + 1), torch.int32),  # reduce_indptr
+            ((tile_cnt, 2), torch.int32),  # reduce_final_map
+            (tile_cnt * num_kv_splits, torch.int32),  # reduce_partial_map
+        )
 
 
 @compile_ops("module_mla_metadata")
@@ -665,6 +679,7 @@ def get_mla_metadata_v1(
     fast_mode: bool = True,
     topk: int = -1,
     max_split_per_batch: int = -1,
+    intra_batch_mode: bool = False,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
 ) -> None:
@@ -682,6 +697,7 @@ def get_mla_metadata_v1(
                            length is not fixed.
             fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
                        mode may lead to bad overall performance.
+            intra_batch_mode: default=False. Fake non persistent mode. Same splits for each batch.
             topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
@@ -757,6 +773,7 @@ def mla_reduce_v1(
     reduce_indptr: torch.Tensor,
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None: ...
