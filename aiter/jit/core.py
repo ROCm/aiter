@@ -14,6 +14,7 @@ import time
 import traceback
 import types
 import typing
+import torch
 from typing import Any, Callable, List, Optional
 
 from packaging.version import Version, parse
@@ -226,8 +227,10 @@ class AITER_CONFIG(object):
         config_path = Path("/tmp/aiter_configs/")
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
-        new_file_path = f"{config_path}/{merge_name}.csv"
-        lock_path = f"{new_file_path}.lock"
+        # avoid read/write racing between different devices
+        current_deivce_id = torch.cuda.current_device()
+        new_file_path = f"{config_path}/{merge_name}_{current_deivce_id}.csv"
+        lock_path = f"{new_file_path}_{current_deivce_id}.lock"
 
         def write_config():
             merge_df.to_csv(new_file_path, index=False)
