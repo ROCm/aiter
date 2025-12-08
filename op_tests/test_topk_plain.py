@@ -57,7 +57,7 @@ def test_topk(
         )
 
         id_triton, _triton = torch.sort(res_triton_index)
-        err = checkAllclose(
+        checkAllclose(
             ref_value.gather(1, _ref),
             res_triton_value.gather(1, _triton),
             msg="topk_values [golden vs triton]",
