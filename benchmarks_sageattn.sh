@@ -48,6 +48,12 @@ NUM_HEADS=(5 24 3 2)
 SEQ_LENS=(75600 16452 118808 29760)
 OUTPUT_DIR=./debug
 
+# Only save outputs if comparison is enabled
+SAVE_OUTPUT_ARGS=""
+if [[ "$RUN_COMPARE" == "true" ]]; then
+    SAVE_OUTPUT_ARGS="--save_output --output_dir ${OUTPUT_DIR}"
+fi
+
 # Helper function to echo and run a command
 run_cmd() {
     echo "$@"
@@ -71,7 +77,7 @@ if [[ "$RUN_BENCHMARK" == "true" ]]; then
             -qk_int8 \
             -real_quant \
             -metric all \
-            --save_output --output_dir ${OUTPUT_DIR}
+            ${SAVE_OUTPUT_ARGS}
         
         echo ""
         echo "--- FAv3 FP8 (i.e -fp8) ---"
@@ -83,7 +89,7 @@ if [[ "$RUN_BENCHMARK" == "true" ]]; then
             -causal False \
             -fp8 \
             -metric all \
-            --save_output --output_dir ${OUTPUT_DIR}
+            ${SAVE_OUTPUT_ARGS}
         
         echo ""
     done
