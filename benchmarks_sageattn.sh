@@ -66,6 +66,27 @@ if [[ "$RUN_BENCHMARK" == "true" ]]; then
         echo "=========================================="
         echo "Running benchmark $((i+1))/4: batch_size=${BATCH_SIZES[i]}, num_heads=${NUM_HEADS[i]}, seq_len=${SEQ_LENS[i]}"
         echo "=========================================="
+
+        echo ""
+        echo "--- SageAttnV1 (i.e direct call with random scales) ---"
+        run_cmd python op_tests/op_benchmarks/triton/bench_attn_qk_int8_per_block.py \
+            -b ${BATCH_SIZES[i]} \
+            -hq ${NUM_HEADS[i]} \
+            -sq ${SEQ_LENS[i]} \
+            -d 128 \
+            -metric all \
+            ${SAVE_OUTPUT_ARGS}
+
+        echo ""
+        echo "--- SageAttnV1 (i.e direct call with correct scales) ---"
+        run_cmd python op_tests/op_benchmarks/triton/bench_attn_qk_int8_per_block.py \
+            -b ${BATCH_SIZES[i]} \
+            -hq ${NUM_HEADS[i]} \
+            -sq ${SEQ_LENS[i]} \
+            -d 128 \
+            -real_quant \
+            -metric all \
+            ${SAVE_OUTPUT_ARGS}
         
         echo ""
         echo "--- SageAttnV1 (i.e -qk_int8) ---"

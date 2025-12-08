@@ -181,30 +181,34 @@ def parse_args():
     # Add attention-specific arguments
     parser.add_argument(
         "--batch_size",
+        "-b",
         type=int,
         default=1,
         help="Batch size",
     )
     parser.add_argument(
         "--num_heads",
+        "-hq",
         type=int,
         default=5,
         help="Number of attention heads",
     )
     parser.add_argument(
         "--seq_len",
+        "-sq",
         type=int,
         default=75600,
         help="Sequence length",
     )
     parser.add_argument(
         "--head_dim",
+        "-d",
         type=int,
         default=128,
         help="Head dimension",
     )
     parser.add_argument(
-        "--real-quant",
+        "-real_quant",
         action="store_true",
         default=False,
         help="Use per_block_int8 for proper quantization. If not specified, uses fake int8 tensors (faster).",
