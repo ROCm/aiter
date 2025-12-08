@@ -51,6 +51,7 @@ def ck_moe_stage1(
     Activation=ActivationType.Gelu,
     quant_type=aiter.QuantType.No,
     sorted_weights=None,  # [max_num_tokens_padded]
+    splitk=1,
 ):
     token_num = hidden_states.shape[0]
     D = w2.shape[-1]
@@ -60,6 +61,7 @@ def ck_moe_stage1(
         D = D * 8
 
     out = torch.empty((token_num, topk, D), dtype=dtype)
+    tmp_out = torch.zeros((token_num, topk, w1.shape[1]), dtype=dtypes.fp32) if splitk > 1 else out
     aiter.ck_moe_stage1_fwd(
         hidden_states,
         w1,
@@ -67,7 +69,7 @@ def ck_moe_stage1(
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
-        out,
+        tmp_out,
         topk,
         "",
         w1_scale,
@@ -76,7 +78,14 @@ def ck_moe_stage1(
         sorted_weights,
         aiter.QuantType.per_1x128,
         Activation,
+        splitk,
+        dtype,
     )
+    if splitk > 1:
+        if Activation == ActivationType.Silu:
+            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32).to(dtype))
+        else:
+            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32).to(dtype))
     return out
 
 
@@ -247,8 +256,64 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
     )
+    
+    
+    BLOCK_SIZE_M = 16
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+        topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
+    )
+    
+    ############################ ck ########################
+    splitk = 1
+    out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
+    out1_ck = ck_moe_stage1(
+        a1_qt,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        w1_scale,
+        a1_scale,
+        dtype,
+        topk,
+        BLOCK_SIZE_M,
+        actType,
+        quant_type=qType,
+        sorted_weights=sorted_weights if doweight_stage1 else None,
+        splitk=splitk,
+    )
+    _, us1_ck = run_perftest(
+        ck_moe_stage1,
+        a1_qt,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        w1_scale,
+        a1_scale,
+        dtype,
+        topk,
+        BLOCK_SIZE_M,
+        actType,
+        quant_type=qType,
+        sorted_weights=sorted_weights if doweight_stage1 else None,
+        splitk=splitk,
+        # needTrace=True,
+        # num_warmup=0,
+        # num_iters=2,
+    )
+    print("out1_ref: ", out1_ref.flatten()[0])
+    err = checkAllclose(
+        out1_ref,
+        out1_ck,
+        msg=f"[perf]  ck_moe_stage1:{us1_ck:>8.2f} us, {token*model_dim*inter_dim*2*topk*2/us1_ck/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+    )
+    
 
-    # ######################## stage 2 start ###########
+
+   # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_128x128:
         a2_qt, a2_scale = aiter.pertoken_quant(
             out1_ref.view(token, -1, 128), quant_dtype=AQDType
@@ -280,46 +345,6 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    BLOCK_SIZE_M = 16
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-        topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
-    )
-    
-    ############################ ck ########################
-    out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
-
-    out1_ck, us1_ck = run_perftest(
-        ck_moe_stage1,
-        a1_qt,
-        w1_qt_aiter,
-        w2_qt_aiter,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        w1_scale,
-        a1_scale,
-        dtype,
-        topk,
-        BLOCK_SIZE_M,
-        actType,
-        quant_type=qType,
-        sorted_weights=sorted_weights if doweight_stage1 else None,
-        needTrace=True,
-    )
-    err = checkAllclose(
-        out1_ref,
-        out1_ck,
-        msg=f"[perf]  ck_moe_stage1:{us1_ck:>8.2f} us, {token*model_dim*inter_dim*2*topk*2/us1_ck/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    )
-
-
-
-
-
-
-
-
-
 
     ############################## asm ####################
     # out1_asm = torch.empty((token, topk, inter_dim), dtype=dtype)
@@ -385,7 +410,7 @@ l_dtype = ["bf16", "fp16"][:1]
 l_dim = [(7168, 256)]
 # l_dim = [(3072, 3072)]
 l_tokenNum = [
-    1,
+    4,
     # 3,
     # 5,
     # 16,
@@ -489,7 +514,7 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=8,
+    default=128,
     help="""Number of experts.
     e.g.: -e 8""",
 )
@@ -498,7 +523,7 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=2,
+    default=8,
     help="""Number of top experts.
     e.g.: -k 2""",
 )
