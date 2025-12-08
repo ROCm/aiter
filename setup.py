@@ -10,6 +10,7 @@ from setuptools import Distribution, setup
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
+os.environ["AITER_META_DIR"] = this_dir
 sys.path.insert(0, f"{this_dir}/aiter/")
 from concurrent.futures import ThreadPoolExecutor
 
@@ -72,13 +73,6 @@ if IS_ROCM:
     assert os.path.exists(
         ck_dir
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
-
-    if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
-        shutil.rmtree("aiter_meta")
-    shutil.copytree("3rdparty", "aiter_meta/3rdparty")
-    shutil.copytree("hsa", "aiter_meta/hsa")
-    shutil.copytree("gradlib", "aiter_meta/gradlib")
-    shutil.copytree("csrc", "aiter_meta/csrc")
 
     def get_exclude_ops():
         if PREBUILD_KERNELS == 1:
@@ -174,6 +168,8 @@ if IS_ROCM:
                 "module_mla_metadata",
                 "module_mla_reduce",
             ]
+        elif PREBUILD_KERNELS == 4:
+            return []
         else:
             return []
 
@@ -225,7 +221,13 @@ else:
     raise NotImplementedError("Only ROCM is supported")
 
 
-# aiter_meta prepared above
+if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+    shutil.rmtree("aiter_meta")
+## link "3rdparty", "hsa", "csrc" into "aiter_meta"
+shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+shutil.copytree("hsa", "aiter_meta/hsa")
+shutil.copytree("gradlib", "aiter_meta/gradlib")
+shutil.copytree("csrc", "aiter_meta/csrc")
 
 
 class NinjaBuildExtension(BuildExtension):
