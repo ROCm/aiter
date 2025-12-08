@@ -418,7 +418,6 @@ def test_pa_mtp(
     seq_lens_qo = torch.randint(
         1, 5, (batch_size,), dtype=torch.int, device=device
     ).fill_(qlen)
-    # print(seq_lens_qo)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_qo = qo_indptr[-1].item()
     max_qlen = seq_lens_qo.max().item()

@@ -518,7 +518,8 @@ def get_pa_metadata_info_v1(
     if fast_mode:
         max_work = tile_cnt + 2 * cu_num - 1
         max_split_tiles = (
-            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch + cu_num
+            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+            + cu_num
         )
     else:
         max_work = tile_cnt * cu_num
