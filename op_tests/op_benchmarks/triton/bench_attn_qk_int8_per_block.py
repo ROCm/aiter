@@ -42,8 +42,8 @@ def get_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int, co
         # Default: create random int8 tensors and scales directly (faster)
         q = torch.randint(-100, 100, (batch_size, num_heads, seq_len, head_dim), dtype=torch.int8, device='cuda')
         k = torch.randint(-100, 100, (batch_size, num_heads, seq_len, head_dim), dtype=torch.int8, device='cuda')
-        q_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_M), 1, dtype=torch.float32, device='cuda')
-        k_scale = torch.randn(batch_size, num_heads, (seq_len // BLOCK_SIZE_N), 1, dtype=torch.float32, device='cuda')
+        q_scale = torch.randn(batch_size, num_heads, ((seq_len + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M), 1, dtype=torch.float32, device='cuda')
+        k_scale = torch.randn(batch_size, num_heads, ((seq_len + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N), 1, dtype=torch.float32, device='cuda')
     
     return q, k, v, q_scale, k_scale
 
