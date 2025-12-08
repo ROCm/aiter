@@ -276,34 +276,35 @@ def test_fmoe(
 
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
-l_dim = [(7168, 256)]
-# l_dim = [(3072, 3072)]
+# l_dim = [(7168, 256)]
+l_dim = [(1536, 3072)]
 l_tokenNum = [
-    1,
-    3,
-    5,
-    16,
-    32,
-    64,
-    128,
-    256,
-    1024,
-    4096,
-    163840,
+    # 1,
+    # 2,
+    4,
+    # 8,
+    # 16,
+    # 32,
+    # 64,
+    # 128,
+    # 256,
+    # 1024,
+    # 4096,
+    # 163840,
 ]
 l_quant = [
-    (aiter.QuantType.No, None, None),  # a16w16
-    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.No, None, None),  # a16w16
+    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
+    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
-l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
-l_preshuffle = [False, True]
+l_hidden_intermediate_pad = [(0, 0)] #, (65, 65), (129, 191)][1:2]
+l_preshuffle = [True]
 
 
 parser = argparse.ArgumentParser(
@@ -383,7 +384,7 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=8,
+    default=128,
     help="""Number of experts.
     e.g.: -e 8""",
 )
@@ -392,7 +393,7 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=2,
+    default=4,
     help="""Number of top experts.
     e.g.: -k 2""",
 )

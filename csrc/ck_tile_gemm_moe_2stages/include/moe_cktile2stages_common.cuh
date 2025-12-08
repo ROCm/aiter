@@ -115,11 +115,11 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 
     constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t>;
 
-    if constexpr(!MXFP4_Pipeline && moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)
+    constexpr int NRepeat = FlatmmConfig::N_Tile / FlatmmConfig::N_Warp / FlatmmConfig::N_Warp_Tile;
+    static_assert(NRepeat == 1 || NRepeat % 2 == 0);
+    if constexpr(moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)
     {
-        static_assert(
-            FlatmmConfig::N_Tile % (FlatmmConfig::N_Warp * FlatmmConfig::N_Warp_Tile * 2) == 0,
-            "requires NRepeat is multiple of 2 for FFN_gemm1_gate_up");
+        static_assert(NRepeat % 2 == 0, "requires NRepeat is multiple of 2 for FFN_gemm1_gate_up");
     }
 
     using ComputeDataType = ADataType;
@@ -169,9 +169,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                               tail_number_v>>;
 
         constexpr int BlockedXDLN_PerWarp =
-            (MXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up))
-                ? 2
-                : 1; // determined by scale shuffle pattern
+            NRepeat == 1 ? 1 : 2; // determined by scale shuffle pattern
 
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ComputeDataType,
@@ -222,15 +220,15 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         // }
 
         // if(s.log_level_ > 0)
-        // {
-        //     std::cout << "Launching kernel with args:" << CodegenFlatmmShape::GetName() << "\n"
-        //               << "Shape: " << CodegenFlatmmShape::GetName() << "\n"
-        //               << "problem: " << CodegenPipelineProblem::GetName() << "\n"
-        //               << "pipeline: " << CodegenFlatmmPipeline::GetName() << "\n"
-        //               << "grid: {" << grids.x << ", " << grids.y << ", " << grids.z << "}"
-        //               << ", blocks: {" << blocks.x << ", " << blocks.y << ", " << blocks.z << "}"
-        //               << std::endl;
-        // }
+        {
+            std::cout << "Launching kernel with args:" << CodegenFlatmmShape::GetName() << "\n"
+                      << "Shape: " << CodegenFlatmmShape::GetName() << "\n"
+                      << "problem: " << CodegenPipelineProblem::GetName() << "\n"
+                      << "pipeline: " << CodegenFlatmmPipeline::GetName() << "\n"
+                      << "grid: {" << grids.x << ", " << grids.y << ", " << grids.z << "}"
+                      << ", blocks: {" << blocks.x << ", " << blocks.y << ", " << blocks.z << "}"
+                      << std::endl;
+        }
         //
         // if(s.flush_cache_)
         // {

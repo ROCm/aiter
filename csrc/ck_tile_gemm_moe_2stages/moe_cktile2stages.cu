@@ -86,7 +86,8 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         TORCH_CHECK(x_scale.value().dtype() == w_scale.value().dtype(),
                     "Scales should have the same dtype!");
     }
-    int M         = sorted_ids.size(0);
+    int tokens    = XQ.size(0);
+    int M         = std::min(int64_t(tokens * topk * block_m.value()), sorted_ids.size(0));
     int N         = WQ.size(1);
     int K         = XQ.size(-1);
     int MPerBlock = block_m.value();
@@ -159,7 +160,8 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                                std::optional<torch::Tensor> exp_bias,
                                std::optional<int> block_m)
 {
-    int M         = sorted_ids.size(0);
+    int tokens    = XQ.size(0);
+    int M         = std::min(int64_t(tokens * topk * block_m.value()), sorted_ids.size(0));
     int N         = WQ.size(1);
     int K         = XQ.size(-1);
     int MPerBlock = block_m.value();

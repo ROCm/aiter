@@ -82,7 +82,7 @@ torch::Tensor
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
     int NumTokens = XQ.size(0);
-    int M = sorted_ids.size(0);
+    int M = std::min(int64_t(NumTokens * topk * {k.MPerBlock}), sorted_ids.size(0));
     int N = WQ.size(1);
     int K = XQ.size(-1);
     int E = WQ.size(0);
