@@ -286,8 +286,6 @@ def get_available_models(config_file="utils/model_configs.json", filter=None):
 
 
 def parse_vgpr_usage(file_path, table_start="result-table-name"):
-    from prettytable import PrettyTable
-
     with open(file_path, "r") as f:
         lines = f.readlines()
 
@@ -316,13 +314,7 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
 
     # Print extracted information
     print("\n".join(vgpr_info))
-    table = PrettyTable()
-    table.field_names = re.split(r" {1,}", table_lines[0].strip())
-    print("table.field_names:", table.field_names)
-    print(table_lines)
-    [table.add_row(line.split()[1:]) for line in table_lines[1:]]
-
-    print(table)
+    print("".join(lines[-2:]))
 
 
 def print_vgpr(fun, table_start="result-table-name"):
