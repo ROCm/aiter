@@ -104,6 +104,7 @@ def test_topk(
             f"  {'aiter':<10} {us_aiter:>12.2f}\n"
         ),
     )
+    # TODO: uncomment this when the aiter topk supports value return
     # err = checkAllclose(
     #     ref_value.gather(1, _ref),
     #     topk_value.gather(1, _aiter),
