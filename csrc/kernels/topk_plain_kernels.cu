@@ -2218,23 +2218,25 @@ void AdaptiveTopK(int batch_size,
     }
 
     // Fall back to processing each batch separately for other cases
-    for(int batch_id = 0; batch_id < batch_size; ++batch_id)
-    {
-        IdxT start = rowStarts[batch_id];
-        IdxT end   = rowEnds[batch_id];
-        IdxT len   = end - start;
+    if (rowStarts != nullptr && rowEnds != nullptr) {
+        for(int batch_id = 0; batch_id < batch_size; ++batch_id)
+        {
+            IdxT start = rowStarts[batch_id];
+            IdxT end   = rowEnds[batch_id];
+            IdxT len   = end - start;
 
-        if(len <= 0)
-            continue;
+            if(len <= 0)
+                continue;
 
-        // Call the uniform length version for each batch
-        AdaptiveTopK<greater, T, IdxT>(1, // single batch
-                                       len,
-                                       k,
-                                       in + batch_id * stride0 + start * stride1,
-                                       out + batch_id * k,
-                                       out_idx + batch_id * k,
-                                       stream);
+            // Call the uniform length version for each batch
+            AdaptiveTopK<greater, T, IdxT>(1, // single batch
+                                           len,
+                                           k,
+                                           in + batch_id * stride0 + start * stride1,
+                                           out + batch_id * k,
+                                           out_idx + batch_id * k,
+                                           stream);
+        }
     }
 }
 
