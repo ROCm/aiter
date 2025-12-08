@@ -351,12 +351,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         page_offset = 2 * CONTEXT_PARTITION_SIZE
     elif sequence_partition_idx % 4 == 3:
         page_offset = 3 * CONTEXT_PARTITION_SIZE
-    if SLIDING_WINDOW > 0:
-        skiped_context_partition_num = (
-            context_length - SLIDING_WINDOW
-        ) // CONTEXT_PARTITION_SIZE
-        sequence_partition_idx += skiped_context_partition_num
-    # ==================== Query Loading ====================
+
     # Calculate query tensor offsets
     query_offsets_base = (
         sequence_idx * stride_query_seq
@@ -434,7 +429,12 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # ==================== Sequence Length Handling ====================
     context_length = gl.load(context_lengths_ptr + sequence_idx)
-
+    if SLIDING_WINDOW > 0:
+        skiped_context_partition_num = (
+            context_length - SLIDING_WINDOW
+        ) // CONTEXT_PARTITION_SIZE
+        sequence_partition_idx += skiped_context_partition_num
+    # ==================== Query Loading ====================
     kv_sequence_start_index = sequence_partition_idx * CONTEXT_PARTITION_SIZE
     # Early return if this partition is beyond sequence length
     if kv_sequence_start_index >= context_length:
@@ -831,6 +831,8 @@ def paged_attention_decode_v2_gluon_fp8(
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
+    #ONE_SHOT: gl.constexpr = SLIDING_WINDOW > 0 and SLIDING_WINDOW <= CONTEXT_PARTITION_SIZE
+    ONE_SHOT: gl.constexpr = False
     query_group_size = query_seq_len * query_group_size_original
     # ==================== VALIDATION CHECKS ====================
     gl.static_assert(
@@ -1106,11 +1108,7 @@ def paged_attention_decode_v2_gluon_fp8(
     max_logits_base_offsets = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
     )
-    if SLIDING_WINDOW > 0:
-        skiped_context_partition_num = (
-            context_length - SLIDING_WINDOW
-        ) // CONTEXT_PARTITION_SIZE
-        sequence_partition_idx += skiped_context_partition_num
+
 
     max_logits_offsets = (
         sequence_idx * stride_max_logits_seq
@@ -1129,7 +1127,7 @@ def paged_attention_decode_v2_gluon_fp8(
     output_mask = (output_group_offsets[:, None] < query_group_size) & (
         output_head_size_offsets[None, :] < head_size
     )
-    if SLIDING_WINDOW > 0 and SLIDING_WINDOW <= CONTEXT_PARTITION_SIZE:
+    if ONE_SHOT:
         output_offsets = (
             sequence_idx * stride_output_seq
             + (kv_head_idx * query_group_size + output_group_offsets[:, None])
@@ -1153,7 +1151,11 @@ def paged_attention_decode_v2_gluon_fp8(
     # )
 
     # ==================== SEQUENCE PROCESSING ====================
-
+    if SLIDING_WINDOW > 0:
+        skiped_context_partition_num = (
+            context_length - SLIDING_WINDOW
+        ) // CONTEXT_PARTITION_SIZE
+        sequence_partition_idx += skiped_context_partition_num
     kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
     if kv_sequence_start_idx >= context_length:
         return  # No computation needed for this partition
@@ -1464,7 +1466,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
-    if SLIDING_WINDOW > 0 and SLIDING_WINDOW <= CONTEXT_PARTITION_SIZE:
+    if ONE_SHOT:
         if sinks_ptr is not None:
             sinks_values = gl.load(
                 sinks_ptr + (kv_head_idx * query_group_size + query_group_offsets),
@@ -1480,7 +1482,7 @@ def paged_attention_decode_v2_gluon_fp8(
         exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
-    if not (SLIDING_WINDOW > 0 and SLIDING_WINDOW <= CONTEXT_PARTITION_SIZE):
+    if not ONE_SHOT:
         # Store results to global memory
         gl.amd.cdna3.buffer_store(
             stored_value=max_logits,
@@ -1764,20 +1766,22 @@ def paged_attention_decode_v2_reduce_kernel(
     sequence_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     context_length = tl.load(context_lengths_ptr + sequence_idx)
-    context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
+    
     if SLIDING_WINDOW > 0:
         MAX_CONTEXT_PARTITION_NUM: tl.constexpr = triton.next_power_of_2(
             SLIDING_WINDOW // CONTEXT_PARTITION_SIZE
         )
-        skiped_context_partition_num = (
-            context_length - SLIDING_WINDOW
-        ) // CONTEXT_PARTITION_SIZE
-        skiped_num_iterations = (
-            skiped_context_partition_num // MAX_CONTEXT_PARTITION_NUM
-        )
+        # skiped_context_partition_num = (
+        #     context_length - SLIDING_WINDOW
+        # ) // CONTEXT_PARTITION_SIZE
+        # skiped_num_iterations = (
+        #     skiped_context_partition_num // MAX_CONTEXT_PARTITION_NUM
+        # )
+        context_partition_num = triton.cdiv(SLIDING_WINDOW, CONTEXT_PARTITION_SIZE)
     else:
         MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
-        skiped_num_iterations = 0
+        # skiped_num_iterations = 0
+        context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
     # Generate coordinate ranges
     query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
     head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
@@ -1793,7 +1797,7 @@ def paged_attention_decode_v2_reduce_kernel(
 
     # ==================== FIRST PASS: FIND GLOBAL MAX ====================
     # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM
-    for iter_idx in range(skiped_num_iterations, num_iterations):
+    for iter_idx in range(num_iterations):
         partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
         partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
 
@@ -1838,7 +1842,7 @@ def paged_attention_decode_v2_reduce_kernel(
         global_exp_sum += gl.exp(sink_token_values - global_max)
 
     # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
-    for iter_idx in range(skiped_num_iterations, num_iterations):
+    for iter_idx in range(num_iterations):
         partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
         partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
 
@@ -2386,7 +2390,7 @@ def pa_decode_gluon(
     #     temporary_output = output
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
 
-    if sliding_window > 0 and sliding_window <= context_partition_size:
+    if False:
         _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             grid,
             exp_sums,
@@ -2406,8 +2410,8 @@ def pa_decode_gluon(
             exp_sums.stride(2),
             output.stride(0),
             output.stride(1),
-            1,
-            1,
+            0,
+            0,
             query.stride(0),
             query.stride(1),
             key_cache.stride(0),
@@ -2437,6 +2441,7 @@ def pa_decode_gluon(
         )
         return
     else:
+
         _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             grid,
             exp_sums,
