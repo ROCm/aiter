@@ -611,7 +611,6 @@ mha_varlen_fwd(
                     drop_seed_offset,
                     const_cast<std::optional<const at::Tensor>&>(cu_seqlens_q_padded_),
                     const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_));
-
             float t = aiter::mha_fwd(args,
                                      stream_config,
                                      q_dtype_str,
@@ -619,8 +618,8 @@ mha_varlen_fwd(
                                      mask.type,
                                      bias_type,
                                      has_lse,
-                                     has_sink,
                                      false, // use_ext_asm
+                                     has_sink,
                                      1);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
