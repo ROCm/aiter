@@ -1301,6 +1301,8 @@ def test_attn_qk_int8_per_block(
     q_fp8, q_scale, k_fp8, k_scale = per_block_int8(
         q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
     )
+    # q_fp8, q_scale = int8_per_block_quantize_bshd(q, torch.int8, block_size=config["BLOCK_SIZE_M"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd", include_sqrt_scale=True)
+    # k_fp8, k_scale = int8_per_block_quantize_bshd(k, torch.int8, block_size=config["BLOCK_SIZE_N"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd")
 
     triton_out, lse = attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
 

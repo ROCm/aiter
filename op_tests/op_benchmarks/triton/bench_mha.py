@@ -31,6 +31,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
+from aiter.ops.triton.attn_qk_int8_per_block import int8_per_block_quantize_bshd
 
 
 def nonvarlen_benchmark_configs():
@@ -541,6 +542,8 @@ def run_benchmark(custom, args):
                 )
                 q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
                 k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
+                # q, q_scale = int8_per_block_quantize_bshd(q, torch.int8, block_size=config["BLOCK_SIZE_M"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd", include_sqrt_scale=True)
+                # k, k_scale = int8_per_block_quantize_bshd(k, torch.int8, block_size=config["BLOCK_SIZE_N"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd")
             else:
                 # Fake quantization: use random int8 tensors directly (faster, for benchmarking kernel only)
                 if tensor_layout == "HND":
