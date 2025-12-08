@@ -3,6 +3,7 @@
 BATCH_SIZES=(1 1 1 2)
 NUM_HEADS=(5 24 3 2)
 SEQ_LENS=(75600 16452 118808 29760)
+OUTPUT_DIR=./debug
 
 # Helper function to echo and run a command
 run_cmd() {
@@ -25,7 +26,8 @@ for i in ${!BATCH_SIZES[@]}; do
         -d 128 \
         -qk_int8 \
         -real_quant \
-        -metric all
+        -metric all \
+        --save_output --output_dir ${OUTPUT_DIR}
     
     echo ""
     echo "--- FAv3 FP8 (i.e -fp8) ---"
@@ -36,9 +38,27 @@ for i in ${!BATCH_SIZES[@]}; do
         -d 128 \
         -causal False \
         -fp8 \
-        -metric all
+        -metric all \
+        --save_output --output_dir ${OUTPUT_DIR}
     
     echo ""
 done
 
 echo "Benchmarks complete."
+
+
+echo "=========================================="
+echo "Comparing outputs between FP8 and QK-INT8 implementations..."
+echo "=========================================="
+
+# Compare each fp8 output file against its qk-int8 counterpart when both exist.
+for fp8_file in ${OUTPUT_DIR}/*_fp8.pt; do
+    [[ -e "${fp8_file}" ]] || continue
+    base_path=${fp8_file%_fp8.pt}
+    int8_file="${base_path}_qk-int8.pt"
+    if [[ -f "${int8_file}" ]]; then
+        run_cmd python compare_outputs.py "${fp8_file}" "${int8_file}"
+    else
+        echo "Skipping ${fp8_file}: missing ${int8_file}"
+    fi
+done
