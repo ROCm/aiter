@@ -672,6 +672,9 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
+    print(dtype)
+    print(q_type)
+    print(activation)
     if run_1stage:
         return MOEMetadata(
             functools.partial(

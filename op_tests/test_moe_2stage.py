@@ -25,7 +25,10 @@ from aiter.fused_moe import (
     get_inter_dim,
     moe_sorting,
 )
-from aiter.ops.quant import get_hip_quant
+from aiter.ops.quant import (
+    get_hip_quant,
+    per_1x32_f8_scale_f8_quant,
+)
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 
@@ -144,7 +147,7 @@ def test_fmoe(
         a1_qt = input.to(AQDType)
         a1_scale = None
     else:
-        a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
+        a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType)
 
     # bias dtype convert
     if (
@@ -208,22 +211,22 @@ def test_fmoe(
     #     doweight=doweight_stage1,
     # )
 
-    # ######################## stage 2 start ###########
-    if qType == aiter.QuantType.per_128x128:
-        a2_qt, a2_scale = aiter.pertoken_quant(
-            out1_ref.view(token, -1, 128), quant_dtype=AQDType
-        )
-        a2_scale = a2_scale.view(token, topk, -1)
-    elif (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
-        a2_qt = out1_ref
-        a2_scale = None
-    else:
-        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
-    a2_qt = a2_qt.view(token, topk, -1)
+    # # ######################## stage 2 start ###########
+    # if qType == aiter.QuantType.per_128x128:
+    #     a2_qt, a2_scale = aiter.pertoken_quant(
+    #         out1_ref.view(token, -1, 128), quant_dtype=AQDType
+    #     )
+    #     a2_scale = a2_scale.view(token, topk, -1)
+    # elif (
+    #     qType == aiter.QuantType.per_1x32
+    #     and (AQDType in [dtypes.bf16, dtypes.fp16])
+    #     and (WQDType == dtypes.fp4x2)
+    # ):  # a16w4
+    #     a2_qt = out1_ref
+    #     a2_scale = None
+    # else:
+    #     a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
+    # a2_qt = a2_qt.view(token, topk, -1)
 
     # out2_ref = torch_moe_stage2(
     #     a2_qt,
@@ -251,7 +254,7 @@ def test_fmoe(
         E,
         topk,
         dtype,
-        w1_qt_aiter.dtype if w1_qt_aiter.dtype != torch.uint32 else dtypes.fp8, # q_dtype_a approximation
+        a1_qt.dtype,
         w1_qt_aiter.dtype, # q_dtype_w
         qType,
         use_g1u1,
@@ -292,27 +295,28 @@ def test_fmoe(
     ):
         a1 = input.to(dtype)
         a1_scale_stage1 = None
-    elif qType == aiter.QuantType.per_1x32:
-        a1, a1_scale_stage1 = quant_func(
-            input,
-            scale=None,
-            quant_dtype=q_dtype_a,
-            num_rows=None,
-        )
-        a1_scale_stage1 = moe_mxfp4_sort(
-            a1_scale_stage1,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=block_size_M,
-        )
+    # elif qType == aiter.QuantType.per_1x32:
+    #     a1, a1_scale_stage1 = quant_func(
+    #         input,
+    #         scale=None,
+    #         quant_dtype=q_dtype_a,
+    #         num_rows=None,
+    #     )
+    #     a1_scale_stage1 = moe_mxfp4_sort(
+    #         a1_scale_stage1,
+    #         sorted_ids=sorted_ids,
+    #         num_valid_ids=num_valid_ids,
+    #         token_num=token_num,
+    #         block_size=block_size_M,
+    #     )
     elif input.dtype != q_dtype_a:
-        a1, a1_scale_stage1 = quant_func(
-            input,
-            scale=None,
-            quant_dtype=q_dtype_a,
-            num_rows=None,
-        )
+        # a1, a1_scale_stage1 = quant_func(
+        #     input,
+        #     scale=None,
+        #     quant_dtype=q_dtype_a,
+        #     num_rows=None,
+        # )
+        a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType)
     else:
         a1 = input
         a1_scale_stage1 = None
@@ -451,6 +455,7 @@ l_tokenNum = [
 ]
 l_quant = [
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a16w4
+    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
@@ -596,6 +601,30 @@ for (
     if (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
         dtypes.bf16,
+        dtypes.fp4x2,
+    ):
+        for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
+            for m in l_tokenNum:
+                ret = test_fmoe(
+                    dtype,
+                    m,
+                    model_dim,
+                    inter_dim,
+                    args.expert,
+                    args.topk,
+                    aiter.ActivationType.Swiglu,
+                    quant_type,
+                    aq_dtype,
+                    wq_dtype,
+                    use_g1u1=True,
+                    doweight_stage1=doweight_stage1,
+                    hidden_pad=hidden_pad,
+                    intermediate_pad=intermediate_pad,
+                )
+                df.append(ret)
+    if (quant_type, aq_dtype, wq_dtype) == (
+        aiter.QuantType.per_1x32,
+        dtypes.fp8,
         dtypes.fp4x2,
     ):
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:

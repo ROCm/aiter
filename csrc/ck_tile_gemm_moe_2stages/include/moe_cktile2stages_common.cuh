@@ -214,7 +214,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
             std::conditional_t<
                 AQUANT_Pipeline,
                 ck_tile::F8xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>,
-                ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>,
+                ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
         using FusedAct =

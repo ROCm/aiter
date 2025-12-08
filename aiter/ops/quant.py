@@ -120,18 +120,13 @@ def per_1x32_f8_scale_f8_quant(x, scale=None, quant_dtype=dtypes.fp8, shuffle=Fa
     # max_abs = ((max_abs + 0x200000) & 0xFF800000).view(torch.float32)
 
     # fp8e8m0fnu_from_fp32_value
-    scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+    scale_f32 = max_abs / dtypeMax
 
     # Float8_e8m0fnu to float
-    scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
-
     y = x.float() / scale_f32.view(-1, 1)
-    y = fp4_utils.f32_to_mxfp4(y)
     y = y.view(*shape_original[:-1], -1)
-    scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
-    if shuffle:
-        scale = fp4_utils.e8m0_shuffle(scale)
-    return y, scale.view(dtypes.fp8_e8m0)
+    scale = scale_f32.view(m, -1)
+    return y.to(quant_dtype), scale
 
 
 def per_tensor_quant(
