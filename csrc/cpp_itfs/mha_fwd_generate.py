@@ -37,9 +37,9 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bias_enum bias_type,
                                   bool has_lse,
                                   bool has_dropout,
-                                  bool has_sink,
                                   quant_scale_enum qscale_type,
                                   bool use_ext_asm,
+                                  bool has_sink,
                                   int how_v3_bf16_cvt = 1,
                                   bool skip_min_seqlen_q = false)
 {{
@@ -93,9 +93,9 @@ float mha_fwd(mha_fwd_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
-              bool has_sink,
               quant_scale_enum qscale_type,
               bool use_ext_asm,
+              bool has_sink,
               int how_v3_bf16_cvt,
               const void* seqstart_q_padding_ptr,
               const void* seqstart_k_padding_ptr,
@@ -113,9 +113,9 @@ float mha_fwd(mha_fwd_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
-                                     has_sink,
                                      qscale_type,
                                      use_ext_asm,
+                                     has_sink,
                                      how_v3_bf16_cvt,
                                      args.min_seqlen_q != 0);
     float t = -1;
@@ -171,7 +171,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      has_dropout,
                                      false,
                                      quant_scale_enum::no_scale,
-                                     use_ext_asm);
+                                     use_ext_asm,
+                                     has_sink);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 

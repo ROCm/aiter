@@ -20,11 +20,11 @@ struct mha_fwd_traits : public fmha_fwd_traits
                    bias_enum bias_type,
                    bool has_lse,
                    bool has_dropout,
-                   bool has_sink,
                    quant_scale_enum qscale_type,
                    bool use_ext_asm,
                    int how_v3_bf16_cvt,
-                   bool skip_min_seqlen_q)
+                   bool skip_min_seqlen_q,
+                   bool has_sink)
         : fmha_fwd_traits{head_size_q,
                           head_size_v,
                           dtype,
@@ -35,11 +35,9 @@ struct mha_fwd_traits : public fmha_fwd_traits
                           bias_type,
                           has_lse,
                           has_dropout,
-                          false, // do_fp8_static_quant
+                          qscale_type,
                           skip_min_seqlen_q,
                           has_sink},
-                          qscale_type,
-                          skip_min_seqlen_q},
           use_ext_asm(use_ext_asm),
           how_v3_bf16_cvt(how_v3_bf16_cvt)
     {
