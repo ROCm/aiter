@@ -235,21 +235,21 @@ def get_filename_diff(source_branch: str | None, target_branch: str) -> set[Path
 class Visitor(ast.NodeVisitor):
     imports_to_ignore: frozenset[str] = frozenset(
         [
-            "os.path",
-            "numpy",
-            "pandas",
-            "matplotlib.pyplot",
-            "torch",
             "einops",
-            "triton",
-            "pytest",
+            "jax",
+            "jinja2",
+            "matplotlib",
+            "numpy",
+            "packaging",
+            "pandas",
             "prettytable",
+            "psutil",
+            "pybind11",
+            "pytest",
+            "setuptools",
+            "torch",
+            "triton",
         ]
-    )
-    import_prefixes_to_ignore: tuple[str, ...] = (
-        "torch.",
-        "triton.",
-        "jax.",
     )
     json_strings_to_ignore: frozenset[str] = frozenset(
         [".json", "empty_kernel.json", "f'{kernel_name}.json'"]
@@ -262,7 +262,10 @@ class Visitor(ast.NodeVisitor):
             import_ not in sys.stdlib_module_names
             and import_ not in cls.imports_to_ignore
             and not any(
-                import_.startswith(prefix) for prefix in cls.import_prefixes_to_ignore
+                import_.startswith(module + ".") for module in cls.imports_to_ignore
+            )
+            and not any(
+                import_.startswith(module + ".") for module in sys.stdlib_module_names
             )
         )
 
