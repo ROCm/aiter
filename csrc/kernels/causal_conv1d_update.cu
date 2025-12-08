@@ -26,6 +26,34 @@
         }                                                                   \
     } while (0)
 
+#define DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(ITYPE, NAME, ...)                    \
+    if (ITYPE == at::ScalarType::Half) {                                            \
+        using input_t = at::Half;                                                   \
+        __VA_ARGS__();                                                              \
+    } else if (ITYPE == at::ScalarType::BFloat16) {                                 \
+        using input_t = at::BFloat16;                                               \
+        __VA_ARGS__();                                                              \
+    } else if (ITYPE == at::ScalarType::Float)  {                                   \
+        using input_t = float;                                                      \
+        __VA_ARGS__();                                                              \
+    } else {                                                                        \
+        AT_ERROR(#NAME, " not implemented for input type '", toString(ITYPE), "'"); \
+    }
+
+#define DISPATCH_WTYPE_FLOAT_AND_HALF_AND_BF16(WTYPE, NAME, ...)                     \
+    if (WTYPE == at::ScalarType::Half) {                                             \
+        using weight_t = at::Half;                                                   \
+        __VA_ARGS__();                                                               \
+    } else if (WTYPE == at::ScalarType::BFloat16) {                                  \
+        using weight_t = at::BFloat16;                                               \
+        __VA_ARGS__();                                                               \
+    } else if (WTYPE == at::ScalarType::Float)  {                                    \
+        using weight_t = float;                                                      \
+        __VA_ARGS__();                                                               \
+    } else {                                                                         \
+        AT_ERROR(#NAME, " not implemented for weight type '", toString(WTYPE), "'"); \
+    }
+
 namespace aiter {
 
 // ============================================================================
@@ -519,10 +547,11 @@ void causal_conv1d_update(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(x));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    // Type dispatching
-    VLLM_DISPATCH_FLOATING_TYPES(x.scalar_type(), "causal_conv1d_update", [&] {
-        using dtype = typename t2ck<scalar_t>::type;
-        causal_conv1d_update_dispatch<dtype, dtype>(params, stream);
+    // Type dispatching - use PyTorch native types (at::Half, at::BFloat16, float)
+    DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_update", [&] {
+        DISPATCH_WTYPE_FLOAT_AND_HALF_AND_BF16(weight.scalar_type(), "causal_conv1d_update", [&] {
+            causal_conv1d_update_dispatch<input_t, weight_t>(params, stream);
+        });
     });
 
     HIP_CHECK(hipGetLastError());

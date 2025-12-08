@@ -16,6 +16,50 @@ import pytest
 from einops import rearrange
 import aiter
 
+
+def causal_conv1d_update(x, conv_state, weight, bias=None, activation=None, cache_seqlens=None, conv_state_indices=None):
+    """
+    Wrapper function to match the original causal_conv1d_update signature.
+    Adapts the call to aiter's causal_conv1d_update interface.
+    """
+    batch, dim, seqlen = x.shape
+    
+    # Create output tensor
+    out = torch.empty_like(x)
+    
+    # Convert weight to input dtype if needed
+    weight_tensor = weight.to(dtype=x.dtype) if weight.dtype != x.dtype else weight
+    
+    # Convert bias to empty tensor if None, otherwise convert to input dtype
+    if bias is None:
+        bias_tensor = torch.empty(0, dtype=x.dtype, device=x.device)
+    else:
+        bias_tensor = bias.to(dtype=x.dtype) if bias.dtype != x.dtype else bias
+    
+    # Convert cache_seqlens to empty tensor if None
+    if cache_seqlens is None:
+        cache_seqlens_tensor = torch.empty(0, dtype=torch.int32, device=x.device)
+    else:
+        cache_seqlens_tensor = cache_seqlens
+    
+    # Convert conv_state_indices to empty tensor if None
+    if conv_state_indices is None:
+        conv_state_indices_tensor = torch.empty(0, dtype=torch.int32, device=x.device)
+    else:
+        conv_state_indices_tensor = conv_state_indices
+    
+    # Convert activation string to bool
+    use_silu = (activation in ["silu", "swish"])
+    
+    # Call aiter's causal_conv1d_update
+    aiter.causal_conv1d_update(
+        x, conv_state, weight_tensor, bias_tensor, out, use_silu,
+        cache_seqlens_tensor, conv_state_indices_tensor
+    )
+    
+    return out
+
+
 def causal_conv1d_ref(
     x,
     weight,
@@ -215,50 +259,50 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
     #     assert torch.allclose(initial_states.grad, initial_states_ref.grad.to(dtype=itype), rtol=rtol, atol=atol)
 
 
-# @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-# # @pytest.mark.parametrize('itype', [torch.float16])
-# @pytest.mark.parametrize("silu_activation", [False, True])
-# # @pytest.mark.parametrize('silu_activation', [True])
-# @pytest.mark.parametrize("has_bias", [False, True])
-# # @pytest.mark.parametrize('has_bias', [True])
-# @pytest.mark.parametrize("has_cache_seqlens", [False, True])
-# # @pytest.mark.parametrize('has_cache_seqlens', [True])
-# @pytest.mark.parametrize("seqlen", [1, 4, 5])
-# # @pytest.mark.parametrize('seqlen', [4])
-# @pytest.mark.parametrize("width", [2, 3, 4])
-# # @pytest.mark.parametrize('width', [4])
-# @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
-# # @pytest.mark.parametrize("dim", [2048])
-# def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
-#     device = "cuda"
-#     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
-#     if itype == torch.bfloat16:
-#         rtol, atol = 1e-2, 5e-2
-#     rtolw, atolw = (1e-3, 1e-3)
-#     # set seed
-#     torch.random.manual_seed(0)
-#     batch = 64
-#     # batch = 1
-#     # dim = 64
-#     x = torch.randn(batch, seqlen, dim, device=device, dtype=itype).transpose(-1, -2)
-#     state_len = torch.randint(width - 1, width + 10, (1,)).item()
-#     conv_state = torch.randn(batch, state_len, dim, device=device, dtype=itype).transpose(-1, -2)
-#     weight = torch.randn(dim, width, device=device, dtype=torch.float32, requires_grad=True)
-#     if has_bias:
-#         bias = torch.randn(dim, device=device, dtype=torch.float32, requires_grad=True)
-#     else:
-#         bias = None
-#     conv_state_ref = conv_state.detach().clone()
-#     activation = None if not silu_activation else "silu"
-#     cache_seqlens = (torch.randint(0, 1024, (batch,), dtype=torch.int32, device=device)
-#                      if has_cache_seqlens else None)
-#     out = causal_conv1d_update(x, conv_state, weight, bias, activation=activation, cache_seqlens=cache_seqlens)
-#     out_ref = causal_conv1d_update_ref(x, conv_state_ref, weight, bias, activation=activation, cache_seqlens=cache_seqlens)
+@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize('itype', [torch.float16])
+@pytest.mark.parametrize("silu_activation", [False, True])
+# @pytest.mark.parametrize('silu_activation', [True])
+@pytest.mark.parametrize("has_bias", [False, True])
+# @pytest.mark.parametrize('has_bias', [True])
+@pytest.mark.parametrize("has_cache_seqlens", [False, True])
+# @pytest.mark.parametrize('has_cache_seqlens', [True])
+@pytest.mark.parametrize("seqlen", [1, 4, 5])
+# @pytest.mark.parametrize('seqlen', [4])
+@pytest.mark.parametrize("width", [2, 3, 4])
+# @pytest.mark.parametrize('width', [4])
+@pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
+# @pytest.mark.parametrize("dim", [2048])
+def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
+    device = "cuda"
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+    if itype == torch.bfloat16:
+        rtol, atol = 1e-2, 5e-2
+    rtolw, atolw = (1e-3, 1e-3)
+    # set seed
+    torch.random.manual_seed(0)
+    batch = 64
+    # batch = 1
+    # dim = 64
+    x = torch.randn(batch, seqlen, dim, device=device, dtype=itype).transpose(-1, -2)
+    state_len = torch.randint(width - 1, width + 10, (1,)).item()
+    conv_state = torch.randn(batch, state_len, dim, device=device, dtype=itype).transpose(-1, -2)
+    weight = torch.randn(dim, width, device=device, dtype=torch.float32, requires_grad=True)
+    if has_bias:
+        bias = torch.randn(dim, device=device, dtype=torch.float32, requires_grad=True)
+    else:
+        bias = None
+    conv_state_ref = conv_state.detach().clone()
+    activation = None if not silu_activation else "silu"
+    cache_seqlens = (torch.randint(0, 1024, (batch,), dtype=torch.int32, device=device)
+                     if has_cache_seqlens else None)
+    out = causal_conv1d_update(x, conv_state, weight, bias, activation=activation, cache_seqlens=cache_seqlens)
+    out_ref = causal_conv1d_update_ref(x, conv_state_ref, weight, bias, activation=activation, cache_seqlens=cache_seqlens)
 
-#     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-#     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-#     assert torch.equal(conv_state, conv_state_ref)
-#     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    assert torch.equal(conv_state, conv_state_ref)
+    assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 # @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
 # # @pytest.mark.parametrize('itype', [torch.float16])
