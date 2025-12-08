@@ -266,7 +266,7 @@ class CustomAllreduce:
         inp: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
-        use_new: bool = False,
+        use_new: bool = True,
         open_fp8_quant: bool = False,
         registered: bool = False,
     ):
@@ -289,7 +289,7 @@ class CustomAllreduce:
         return out
 
     def custom_all_reduce(
-        self, input: torch.Tensor, use_new: bool = False, open_fp8_quant: bool = False
+        self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -366,7 +366,7 @@ class CustomAllreduce:
             eps,
             None if registered else self.buffer,
         )
-        return res_out, out
+        return out, res_out
 
     def custom_fused_ar_rms(
         self,
