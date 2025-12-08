@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "ck_tile/host.hpp"
+#include "fmha_bwd.hpp"
 #include "mha_bwd.h"
 #include "utils.hpp"
 
@@ -493,7 +494,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
               << ", h:" << nhead << "/" << nhead_k << ", s:" << seqlen_q << "/" << seqlen_k
               << ", d:" << hdim_q << "/" << hdim_v << ", scale:" << scale << ", bias:" << bias
               << ", dbias:" << use_dbias << ", p_drop:" << p_drop << ", s_randval:" << s_randval
-              << ", deterministic:" << deterministic << ", mask:" << mask << std::flush;
+              << ", deterministic:" << deterministic << ", mask:" << mask << std::flush << std::endl;
 
     std::size_t workspace_size =
         dq_acc_host.get_element_space_size_in_bytes() * sizeof(AccDataType) / (1024 * 1024);
@@ -578,7 +579,15 @@ bool run(const ck_tile::ArgParser& arg_parser)
             }
         }();
 
-        return fmha_bwd_args{stream_config,
+        return aiter::mha_bwd_args{nullptr, // stream_id_
+                             true, // time_kernel_
+                             /* log_level = */ (kname ? 1 : 0), // log_level_
+                             stream_warmup, // cold_niters_
+                             stream_repeat, // nrepeat_
+                             arg_parser.get_str("timer") == std::string("gpu"), // is_gpu_timer_
+                             false, // flush_cache_
+                             1, // rotating_count_
+
                              get_mask_type(),
                              bwd_v3,
                              v3_atomic_fp32,
@@ -589,9 +598,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              hdim_v,
                              data_type,
                              mode == mode_enum::group,
-                             mask.type,
-                             bias.type,
+                             static_cast<int>(mask.type),
+                             static_cast<int>(bias.type),
                              use_dbias,
+                             p_drop > 0,
                              s_randval,
                              deterministic,
 
@@ -621,8 +631,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              batch,
                              max_seqlen_q,
                              max_seqlen_k,
-                             hdim_q,
-                             hdim_v,
                              nhead,
                              nhead_k,
                              scale,
@@ -668,7 +676,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              split_stride_dq_acc,
                              mask.left,
                              mask.right,
-                             static_cast<ck_tile::index_t>(mask.type),
                              p_drop,
                              p_undrop,
                              drop_seed_offset};
@@ -677,7 +684,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     float ave_time = aiter::mha_bwd(mha_args);
     if(ave_time < 0)
     {
-        std::cout << ", not supported yet" << std::flush << std::endl;
+        std::cout << "not supported yet" << std::flush << std::endl;
         return false;
     }
 
@@ -685,7 +692,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     float gb_per_sec = num_byte / 1.E6 / ave_time;
 
-    std::cout << std::fixed << ", " << std::setprecision(3) << ave_time << " ms, "
+    std::cout << std::setprecision(3) << ave_time << " ms, "
               << std::setprecision(2) << tflops << " TFlops, " << std::setprecision(2) << gb_per_sec
               << " GB/s" << std::flush;
 
