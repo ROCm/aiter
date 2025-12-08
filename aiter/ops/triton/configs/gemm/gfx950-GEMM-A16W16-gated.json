@@ -59,7 +59,7 @@
     "cache_modifier": null,
     "kpack": 1
   },
-  "M_GEQ_4096": {
+  "any": {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 64,
