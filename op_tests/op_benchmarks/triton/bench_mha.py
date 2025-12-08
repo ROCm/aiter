@@ -1,10 +1,11 @@
-import os
-import torch
 import sys
 import warnings
 import argparse
 import itertools
+
+import torch
 import triton
+
 from aiter.ops.triton.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -23,81 +24,13 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
 )
+from compare_outputs import save_benchmark_output
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
 )
-
-
-def _sanitize_file_component(value):
-    return str(value).replace(os.sep, "-").replace(" ", "-")
-
-
-def _move_to_cpu(obj):
-    if isinstance(obj, torch.Tensor):
-        return obj.detach().cpu()
-    if isinstance(obj, (list, tuple)):
-        return type(obj)(_move_to_cpu(item) for item in obj)
-    if isinstance(obj, dict):
-        return {key: _move_to_cpu(val) for key, val in obj.items()}
-    return obj
-
-
-def _primary_output(result):
-    if isinstance(result, torch.Tensor):
-        return result
-    if (
-        isinstance(result, (list, tuple))
-        and len(result) == 2
-        and all(isinstance(item, torch.Tensor) for item in result)
-    ):
-        return result[0]
-    return result
-
-
-def _build_output_path(
-    args,
-    model,
-    batch,
-    hq,
-    hk,
-    sq,
-    sk,
-    d_head,
-    d_head_v,
-    dtype,
-    causal,
-    mode,
-    varlen,
-):
-    dtype_str = str(dtype).split(".")[-1]
-    parts = []
-    if model:
-        parts.append(f"model-{_sanitize_file_component(model)}")
-    parts.extend(
-        [
-            f"B{batch}",
-            f"HQ{hq}",
-            f"HK{hk}",
-            f"SQ{sq}",
-            f"SK{sk}",
-            f"D{d_head}",
-            f"DV{d_head_v}",
-            f"causal-{int(bool(causal))}",
-            f"mode-{mode}",
-            f"layout-{args.layout}",
-            f"dtype-{dtype_str}",
-            "varlen" if varlen else "dense",
-        ]
-    )
-    if args.fp8:
-        parts.append("fp8")
-    if args.qk_int8:
-        parts.append("qk-int8")
-    filename = "_".join(parts) + ".pt"
-    return os.path.join(args.output_dir, filename)
 
 
 def nonvarlen_benchmark_configs():
@@ -629,46 +562,11 @@ def run_benchmark(custom, args):
         ms = triton.testing.do_bench(fn)
 
         if args.save_output:
-            save_key = (
-                BATCH,
-                HQ,
-                HK,
-                N_CTX_Q,
-                N_CTX_K,
-                D_HEAD,
-                D_HEAD_V,
-                str(dtype),
-                bool(causal),
-                mode,
-                args.layout,
-                args.fp8,
-                args.qk_int8,
-                varlen,
-                model,
+            save_benchmark_output(
+                args, fn, saved_output_keys, model,
+                BATCH, HQ, HK, N_CTX_Q, N_CTX_K,
+                D_HEAD, D_HEAD_V, dtype, causal, mode, varlen,
             )
-            if save_key not in saved_output_keys:
-                saved_output_keys.add(save_key)
-                output_value = fn()
-                primary = _primary_output(output_value)
-                prepared = _move_to_cpu(primary)
-                os.makedirs(args.output_dir, exist_ok=True)
-                output_path = _build_output_path(
-                    args,
-                    model,
-                    BATCH,
-                    HQ,
-                    HK,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    D_HEAD,
-                    D_HEAD_V,
-                    dtype,
-                    causal,
-                    mode,
-                    varlen,
-                )
-                torch.save(prepared, output_path)
-                print(f"Saved output tensor to {output_path}")
 
         if mode == "bwd":
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
