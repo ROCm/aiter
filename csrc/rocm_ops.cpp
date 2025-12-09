@@ -23,8 +23,8 @@
 #include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
-#include "gemm_a8w8_bpreshuffle.h"
 #include "gemm_a8w8_blockscale_bpreshuffle.h"
+#include "gemm_a8w8_bpreshuffle.h"
 #include "gemm_a8w8_bpreshuffle_cktile.h"
 #include "gemm_common.h"
 #include "hipbsolgemm.cuh"
@@ -42,6 +42,7 @@
 #include "sample.h"
 #include "smoothquant.h"
 #include "trtllm_all_reduce_fusion.h"
+#include "topk_plain.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
@@ -114,5 +115,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     MLA_METADATA_PYBIND;
     MLA_REDUCE_PYBIND;
     DEEPGEMM_PYBIND;
+    TOPK_PLAIN_PYBIND;
+    PA_METADATA_PYBIND;
 }
 #endif
