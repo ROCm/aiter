@@ -261,7 +261,7 @@ void fused_rope_rms(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
     bool is_neox_style, double eps, hipStream_t stream) {
-    assert(head_size == 64 || head_size == 128 || head_size == 256);
+    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int block_size = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k);
     auto num_warps_per_block = block_size / 32;
