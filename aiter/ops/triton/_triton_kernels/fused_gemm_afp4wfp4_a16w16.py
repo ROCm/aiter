@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
@@ -815,8 +816,12 @@ def _get_config(
     shuffle: bool = False,
 ):
     from ..utils.gemm_config_utils import get_gemm_config
-    
-    config_name = "FUSED-GEMM-AFP4WFP4-A16W16" if not shuffle else "FUSED-GEMM-AFP4WFP4_PRESHUFFLED-A16W16"
+
+    config_name = (
+        "FUSED-GEMM-AFP4WFP4-A16W16"
+        if not shuffle
+        else "FUSED-GEMM-AFP4WFP4_PRESHUFFLED-A16W16"
+    )
     # Custom file naming: N4={N_fp4}-N16={N_bf16}-K={2*K}
     specialized_filename = f"N4={N_fp4}-N16={N_bf16}-K={2*K}"
     return get_gemm_config(config_name, M, specialized_filename=specialized_filename)

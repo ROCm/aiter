@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
-import warnings
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from .activation import _get_activation_from_str
 
 
 @triton.heuristics(
@@ -157,8 +154,6 @@ def _ff_a16w16_fused_ungated(
             y_ptrs += BLOCK_SIZE_K * stride_yk
 
 
-@functools.lru_cache(maxsize=1024)
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
