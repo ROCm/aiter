@@ -40,8 +40,6 @@ using BF16 = ck::bhalf_t;
 using B16  = ck::bhalf_t;
 using FP8  = ck::f8_t;
 using F32  = float;
-using I8   = int8_t;
-using I32  = int;
 using F16  = ck::half_t;
 
 using Row = ck::tensor_layout::gemm::RowMajor;

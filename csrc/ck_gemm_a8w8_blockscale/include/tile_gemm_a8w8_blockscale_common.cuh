@@ -25,10 +25,14 @@
 #include "ck_tile/ops/gemm.hpp"
 #include "ck_tile/ops/gemm_quant.hpp"
 
-using ADataType   = ck_tile::fp8_t;
-using BDataType   = ck_tile::fp8_t;
-using CDataType   = ck_tile::half_t;
-using AccDataType = float;
+using TILE_F32 = float;
+using TILE_F16 = ck_tile::half_t;
+using TILE_B16 = ck_tile::bf16_t;
+using TILE_FP8 = ck_tile::fp8_t;
+
+using ADataType   = TILE_FP8;
+using BDataType   = TILE_FP8;
+using AccDataType = TILE_F32;
 
 using ALayout = ck_tile::tensor_layout::gemm::RowMajor;
 using BLayout = ck_tile::tensor_layout::gemm::ColumnMajor;
@@ -38,15 +42,15 @@ using CDEElementWise = ck_tile::element_wise::PassThrough;
 
 template <typename AB1DataType,
           typename EDataType,
-          ck::index_t M_Tile,
-          ck::index_t N_Tile,
-          ck::index_t K_Tile,
-          ck::index_t M_Warp,
-          ck::index_t N_Warp,
-          ck::index_t K_Warp,
-          ck::index_t M_Warp_Tile,
-          ck::index_t N_Warp_Tile,
-          ck::index_t K_Warp_Tile,
+          ck_tile::index_t M_Tile,
+          ck_tile::index_t N_Tile,
+          ck_tile::index_t K_Tile,
+          ck_tile::index_t M_Warp,
+          ck_tile::index_t N_Warp,
+          ck_tile::index_t K_Warp,
+          ck_tile::index_t M_Warp_Tile,
+          ck_tile::index_t N_Warp_Tile,
+          ck_tile::index_t K_Warp_Tile,
           bool kPadM,
           bool kPadN,
           bool kPadK,
@@ -89,7 +93,7 @@ struct TileGemmTileHelperF8BlockScale
                                             BDataType,
                                             ck_tile::tuple<>,
                                             AccDataType,
-                                            CDataType,
+                                            EDataType,
                                             ck_tile::tuple<>,
                                             CLayout,
                                             CDEElementWise,
