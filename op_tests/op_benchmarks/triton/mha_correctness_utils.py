@@ -72,7 +72,7 @@ def run_sage_reference(q, k, v, args, d_head, d_head_v):
 
     sm_scale = d_head ** -0.5
     k_mean = None
-    q_int8, q_scale, k_int8, k_scale = per_block_int8(
+    q_int8, q_scale, k_int8, k_scale, _ = per_block_int8(
         q_ref,
         k_ref,
         km=k_mean,

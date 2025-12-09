@@ -32,7 +32,7 @@ def get_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int, co
         q = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device='cuda')
         k = torch.randn(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device='cuda')
         sm_scale = head_dim ** -0.5
-        q, q_scale, k, k_scale = per_block_int8(
+        q, q_scale, k, k_scale, _ = per_block_int8(
             q, k, km=None, BLKQ=BLOCK_SIZE_M, BLKK=BLOCK_SIZE_N, sm_scale=sm_scale, tensor_layout="HND"
         )
         # Convert scales to float16 with trailing dimension
