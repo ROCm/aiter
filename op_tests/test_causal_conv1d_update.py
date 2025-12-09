@@ -2,6 +2,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+"""
+AIter causal_conv1d_update test
+
+Known Issues (TODO: verify and fix):
+  ❌ Scenario 1 & 2 (Non-Circular mode): FAILED
+     - Max error ~0.99 (>> tolerance 1e-3)
+     - ~96-98% elements mismatch with reference
+  ✅ Scenario 3 (Circular buffer mode): PASSED
+     - Max error 0.0
+
+Possible causes:
+  - conv_state update logic incorrect in non-circular mode
+  - State buffer indexing issue
+  - Data alignment problem during convolution
+"""
+
 import torch
 import torch.nn.functional as F
 import aiter
@@ -641,6 +657,8 @@ def main():
     print("  ✓ Scenario 2: test_batch_text_generation (Non-Circular)")
     print("  ✓ Scenario 3: test_circular_buffer_performance (Circular)")
     print("=" * 80)
+    print("\n⚠️  NOTE: Scenarios 1-2 (non-circular mode) currently failing.")
+    print("   Max error ~0.99 >> tolerance. Needs investigation. See file header.\n")
 
 
 if __name__ == "__main__":

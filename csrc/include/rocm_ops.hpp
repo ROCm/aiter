@@ -29,8 +29,8 @@ namespace py = pybind11;
           py::arg("input"));
 
 #define CAUSAL_CONV1D_PYBIND                            \
-    m.def("causal_conv1d_fwd",                          \
-          &aiter::causal_conv1d_fwd,                    \
+    m.def("causal_conv1d_fn",                           \
+          &aiter::causal_conv1d_fn,                     \
           "Causal 1D convolution forward pass.",        \
           py::arg("x"),                                 \
           py::arg("weight"),                            \

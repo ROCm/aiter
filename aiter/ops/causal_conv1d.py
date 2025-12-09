@@ -11,7 +11,7 @@ MD_NAME = "module_causal_conv1d"
 
 
 @compile_ops("module_causal_conv1d")
-def causal_conv1d_fwd(
+def causal_conv1d_fn(
     x: Tensor,                    # [batch, dim, seqlen]
     weight: Tensor,               # [dim, width]
     bias: Optional[Tensor],       # [dim] or None

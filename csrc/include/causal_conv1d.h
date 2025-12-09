@@ -5,7 +5,7 @@
 
 namespace aiter {
 
-void causal_conv1d_fwd(
+void causal_conv1d_fn(
     const torch::Tensor &x,
     const torch::Tensor &weight,
     const c10::optional<torch::Tensor> &bias_,

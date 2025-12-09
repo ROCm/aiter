@@ -196,7 +196,7 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
     activation = None if not silu_activation else "silu"
     
     # 准备 AIter 调用的参数
-    # 签名: causal_conv1d_fwd(x, weight, bias, seq_idx, initial_states, out, final_states_out, silu_activation)
+    # 签名: causal_conv1d_fn(x, weight, bias, seq_idx, initial_states, out, final_states_out, silu_activation)
     out = torch.empty_like(x)
     if return_final_states:
         # final_states 需要是 channel-last 布局，即 stride(1) == 1
@@ -210,7 +210,7 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
     bias_aiter = bias if bias is not None else torch.zeros(dim, device=device, dtype=torch.float32)
     
     # 调用 AIter 实现
-    aiter.causal_conv1d_fwd(
+    aiter.causal_conv1d_fn(
         x,                  # input
         weight,             # weight
         bias_aiter,         # bias
@@ -234,7 +234,7 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
-    # 注意：aiter.causal_conv1d_fwd 目前不支持反向传播
+    # 注意：aiter.causal_conv1d_fn 目前不支持反向传播
     # 跳过梯度检查
     # if return_final_states:
     #     out += F.sigmoid(final_states).sum(dim=-1, keepdim=True)
@@ -485,13 +485,13 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
     
     # 第一次运行
     out0 = torch.empty_like(x)
-    aiter.causal_conv1d_fwd(x, weight, bias_aiter, None, None, out0, None, silu_activation)
+    aiter.causal_conv1d_fn(x, weight, bias_aiter, None, None, out0, None, silu_activation)
     
     # 注意：aiter 不支持反向传播，跳过梯度检查
     # 只测试前向一致性
     for i in range(100):  # 减少迭代次数到 100
         out = torch.empty_like(x)
-        aiter.causal_conv1d_fwd(x, weight, bias_aiter, None, None, out, None, silu_activation)
+        aiter.causal_conv1d_fn(x, weight, bias_aiter, None, None, out, None, silu_activation)
         assert torch.equal(out, out0), f"Iteration {i}: output mismatch"
 
 
@@ -546,7 +546,7 @@ def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, ity
     
     # AIter 实现
     out = torch.empty_like(x)
-    aiter.causal_conv1d_fwd(x, weight, bias_aiter, seq_idx, None, out, None, silu_activation)
+    aiter.causal_conv1d_fn(x, weight, bias_aiter, seq_idx, None, out, None, silu_activation)
     
     # 参考实现
     out_ref = []
@@ -650,7 +650,7 @@ def test_causal_conv1d_varlen_padding(dim, seqlen, width, has_bias, silu_activat
 
     # Run forward pass with padding
     out = torch.empty_like(x)
-    aiter.causal_conv1d_fwd(x, weight, bias_aiter, seq_idx, None, out, None, silu_activation)
+    aiter.causal_conv1d_fn(x, weight, bias_aiter, seq_idx, None, out, None, silu_activation)
 
     # Manual reference calculation
     out_ref = torch.zeros_like(x_ref)

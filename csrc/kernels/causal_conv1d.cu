@@ -211,7 +211,7 @@ struct Causal_conv1d_fwd_kernel_traits {
 
 template<typename Ktraits>
 __global__ __launch_bounds__(Ktraits::kNThreads)
-void causal_conv1d_fwd_kernel(ConvParamsBase params) {
+void causal_conv1d_fn_kernel(ConvParamsBase params) {
     constexpr int kWidth = Ktraits::kWidth;
     constexpr int kNThreads = Ktraits::kNThreads;
     constexpr int kNElts = Ktraits::kNElts;
@@ -394,7 +394,7 @@ void set_conv_params_fwd(ConvParamsBase &params,
 }
 
 template<typename input_t, typename weight_t>
-void causal_conv1d_fwd_launch(ConvParamsBase &params, hipStream_t stream) {
+void causal_conv1d_fn_launch(ConvParamsBase &params, hipStream_t stream) {
     // Determine if we can use vectorized load (seqlen must be multiple of kNElts)
     const int kNElts = sizeof(input_t) == 4 ? 4 : 8;
     const bool can_use_vec_load = params.seqlen % kNElts == 0;
@@ -409,7 +409,7 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, hipStream_t stream) {
             case 2: {
                 using Ktraits = Causal_conv1d_fwd_kernel_traits<kNThreads, 2, kIsVecLoad, input_t, weight_t>;
                 hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(causal_conv1d_fwd_kernel<Ktraits>),
+                    HIP_KERNEL_NAME(causal_conv1d_fn_kernel<Ktraits>),
                     grid, kNThreads, Ktraits::kSmemSize, stream,
                     params
                 );
@@ -418,7 +418,7 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, hipStream_t stream) {
             case 3: {
                 using Ktraits = Causal_conv1d_fwd_kernel_traits<kNThreads, 3, kIsVecLoad, input_t, weight_t>;
                 hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(causal_conv1d_fwd_kernel<Ktraits>),
+                    HIP_KERNEL_NAME(causal_conv1d_fn_kernel<Ktraits>),
                     grid, kNThreads, Ktraits::kSmemSize, stream,
                     params
                 );
@@ -427,7 +427,7 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, hipStream_t stream) {
             case 4: {
                 using Ktraits = Causal_conv1d_fwd_kernel_traits<kNThreads, 4, kIsVecLoad, input_t, weight_t>;
                 hipLaunchKernelGGL(
-                    HIP_KERNEL_NAME(causal_conv1d_fwd_kernel<Ktraits>),
+                    HIP_KERNEL_NAME(causal_conv1d_fn_kernel<Ktraits>),
                     grid, kNThreads, Ktraits::kSmemSize, stream,
                     params
                 );
@@ -723,7 +723,7 @@ void causal_conv1d_channellast_fwd_launch_impl(ConvParamsBase &params, hipStream
     }
 }
 
-// Overloaded launch function that dispatches based on width (like causal_conv1d_fwd_launch)
+// Overloaded launch function that dispatches based on width (like causal_conv1d_fn_launch)
 template<typename input_t, typename weight_t>
 void causal_conv1d_channellast_fwd_launch(ConvParamsBase &params, hipStream_t stream) {
     constexpr int kNThreads = 128;  // Standard block size
@@ -748,7 +748,7 @@ void causal_conv1d_channellast_fwd_launch(ConvParamsBase &params, hipStream_t st
 // PyTorch Interface
 // ============================================================================
 
-void causal_conv1d_fwd(
+void causal_conv1d_fn(
     const torch::Tensor &x,
     const torch::Tensor &weight,
     const c10::optional<torch::Tensor> &bias_,
@@ -846,10 +846,10 @@ void causal_conv1d_fwd(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(x));
     auto stream = at::hip::getCurrentHIPStream();
     
-    DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_fwd", [&] {
-        DISPATCH_WTYPE_FLOAT_AND_HALF_AND_BF16(weight.scalar_type(), "causal_conv1d_fwd", [&] {
+    DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_fn", [&] {
+        DISPATCH_WTYPE_FLOAT_AND_HALF_AND_BF16(weight.scalar_type(), "causal_conv1d_fn", [&] {
             if (!is_channel_last) {
-                causal_conv1d_fwd_launch<input_t, weight_t>(params, stream);
+                causal_conv1d_fn_launch<input_t, weight_t>(params, stream);
             } else {
                 causal_conv1d_channellast_fwd_launch<input_t, weight_t>(params, stream);
             }

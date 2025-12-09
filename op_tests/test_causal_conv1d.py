@@ -76,7 +76,7 @@ def torch_causal_conv1d(x, weight, bias=None, use_silu=False, initial_states=Non
 
 
 @benchmark()
-def test_causal_conv1d_fwd(batch, dim, seqlen, width, dtype, use_silu=False, is_channel_last=False, 
+def test_causal_conv1d_fn(batch, dim, seqlen, width, dtype, use_silu=False, is_channel_last=False, 
                            test_seq_idx=False, test_states=False):
     """
     Test causal conv1d forward pass.
@@ -152,9 +152,9 @@ def test_causal_conv1d_fwd(batch, dim, seqlen, width, dtype, use_silu=False, is_
         final_states_ref = None
 
     # Run AIter implementation
-    # New signature: causal_conv1d_fwd(x, weight, bias, seq_idx, initial_states, out, final_states_out, use_silu)
+    # New signature: causal_conv1d_fn(x, weight, bias, seq_idx, initial_states, out, final_states_out, use_silu)
     _, us_aiter = run_perftest(
-        aiter.causal_conv1d_fwd,
+        aiter.causal_conv1d_fn,
         x,                    # input
         weight,               # weight
         bias,                 # bias
@@ -224,9 +224,9 @@ def test_causal_conv1d_no_bias(batch, dim, seqlen, width, dtype, use_silu=False,
     x_ref = x.contiguous() if is_channel_last else x
     ref = torch_causal_conv1d(x_ref, weight, None, use_silu)
 
-    # New signature: causal_conv1d_fwd(x, weight, bias, seq_idx, initial_states, out, final_states_out, use_silu)
+    # New signature: causal_conv1d_fn(x, weight, bias, seq_idx, initial_states, out, final_states_out, use_silu)
     _, us_aiter = run_perftest(
-        aiter.causal_conv1d_fwd,
+        aiter.causal_conv1d_fn,
         x,           # input
         weight,      # weight
         bias,        # bias (empty tensor for no bias)
@@ -369,7 +369,7 @@ def main():
                                                 batch, dim, seqlen, width, dtype, use_silu, is_channel_last
                                             )
                                         else:
-                                            result = test_causal_conv1d_fwd(
+                                            result = test_causal_conv1d_fn(
                                                 batch, dim, seqlen, width, dtype, use_silu, is_channel_last,
                                                 test_seq_idx, test_states
                                             )
