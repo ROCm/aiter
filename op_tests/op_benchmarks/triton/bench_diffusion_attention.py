@@ -34,11 +34,25 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
+from op_tests.triton_tests.test_mha import check_attention_outputs
+from op_tests.op_benchmarks.triton.mha_correctness_utils import (
+    primary_output,
+    restore_tensor_layout,
+    print_output_comparison_stats,
+    run_sage_reference,
+)
 
 
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.mha_v3 import _quantize_bshd
+
+
+# test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
+import logging
+logging.getLogger().setLevel(logging.INFO)
+
+
 def fav3_fp8_forward_func(
         q: torch.Tensor,  # High precision (BF16/FP32)
         k: torch.Tensor,  # High precision (BF16/FP32)
@@ -292,15 +306,67 @@ def run_benchmark(custom, args):
                     return_lse=return_lse,
                     return_attn_probs=return_attn_probs,
                 )
-        
+
+        metric_choice = args.metric or "all"
+        metric_is_all = metric_choice == "all"
+        primary_provider = "time(ms)" if metric_is_all else provider
+        run_correctness_check = (
+            args.check_correctness_FAv3FP8_SageAttnV1
+            and args.fp8
+            and not varlen
+            and (
+                not metric_is_all
+                or provider == primary_provider
+            )
+        )
+        if args.check_correctness_FAv3FP8_SageAttnV1 and args.fp8 and varlen:
+            raise ValueError("--check_correctness_FAv3FP8_SageAttnV1 currently supports only dense (bshd) layout.")
+
         ms = triton.testing.do_bench(fn)
 
+        needs_output_value = args.save_output or run_correctness_check
+        cached_output = fn() if needs_output_value else None
+
         if args.save_output:
+            assert cached_output is not None
             save_benchmark_output(
-                args, fn, saved_output_keys, model,
-                BATCH, HQ, HK, N_CTX_Q, N_CTX_K,
-                D_HEAD, D_HEAD_V, dtype, causal, mode, varlen,
+                args,
+                lambda output=cached_output: output,
+                saved_output_keys,
+                model or "",
+                BATCH,
+                HQ,
+                HK,
+                N_CTX_Q,
+                N_CTX_K,
+                D_HEAD,
+                D_HEAD_V,
+                dtype,
+                causal,
+                mode,
+                varlen,
             )
+
+        if run_correctness_check:
+            assert cached_output is not None
+            current_primary = primary_output(cached_output).contiguous()
+            reference_primary = primary_output(
+                run_sage_reference(
+                    q_input,
+                    k_input,
+                    v_input,
+                    args,
+                    D_HEAD,
+                    D_HEAD_V,
+                )
+            )
+            reference_primary = restore_tensor_layout(
+                reference_primary,
+                args.qk_int8_layout,
+            )
+            print("Asserting FP8 output matches SageAttnV1 reference...")
+            print_output_comparison_stats(current_primary, reference_primary)
+            check_attention_outputs(current_primary, reference_primary, fp8=True)
 
         total_num_tokens_q = BATCH * N_CTX_Q
         total_num_tokens_k = BATCH * N_CTX_K
@@ -375,8 +441,6 @@ def parse_args():
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-qk_int8", action="store_true", default=False)
-    parser.add_argument("-real_quant", action="store_true", default=False,
-        help="Use real per_block_int8 quantization. If not specified, uses fake int8 (random tensors). Only valid with -qk_int8.")
     parser.add_argument("-qk_int8_layout", type=str, default="HND", choices=["HND", "NHD"],
         help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")
     parser.add_argument("-quantize_p", action="store_true", default=False)
@@ -422,6 +486,11 @@ def parse_args():
         type=str,
         default="outputs",
         help="Directory to store tensors when --save_output is used.",
+    )
+    parser.add_argument(
+        "--check_correctness_FAv3FP8_SageAttnV1",
+        action="store_true",
+        help="For -fp8 runs, also execute the SageAttn reference kernel and assert outputs match.",
     )
     return parser.parse_args()
 

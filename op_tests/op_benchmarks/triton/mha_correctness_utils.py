@@ -57,7 +57,6 @@ def print_output_comparison_stats(current, reference):
 def run_sage_reference(q, k, v, args, d_head, d_head_v):
     """Execute the SageAttn reference kernel for correctness checking."""
     assert args.layout == "bshd", "Reference run only supports dense layout (bshd)."
-    assert args.real_quant, "--check_correctness_FAv3FP8_SageAttnV1 requires -real_quant to quantize SageAttn inputs."
 
     tensor_layout = args.qk_int8_layout
     config = _get_config()
