@@ -203,7 +203,8 @@ if IS_ROCM:
                 "module_gemm_a8w8_blockscale_bpreshuffle_tune",
                 "module_gemm_a4w4_blockscale_tune",
                 "module_gemm_a8w8_bpreshuffle_tune",
-                "module_gemm_a8w8_bpreshuffle_cktile_tune",]
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+            ]
 
     exclude_ops = get_exclude_ops()
 
