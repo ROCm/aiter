@@ -263,27 +263,28 @@ if IS_ROCM:
         if PREBUILD_KERNELS != 4:
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
                 list(executor.map(build_one_module, all_opts_args_build))
-        agg_flags_cc = list(prebuild_link_param["flags_extra_cc"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
-        agg_flags_hip = list(prebuild_link_param["flags_extra_hip"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
-        agg_srcs = sorted(set(
-            s
-            for one in all_opts_args_build
-            for s in one["srcs"]
-            if ("/pybind/" not in s and not s.endswith("_pybind.cu"))
-        )) + [os.path.join(this_dir, "csrc", "rocm_ops.cpp")]
-        core.build_module(
-            md_name="aiter_",
-            srcs=agg_srcs,
-            flags_extra_cc=agg_flags_cc,
-            flags_extra_hip=agg_flags_hip,
-            blob_gen_cmd=prebuild_link_param["blob_gen_cmd"],
-            extra_include=prebuild_link_param["extra_include"],
-            extra_ldflags=None,
-            verbose=False,
-            is_python_module=True,
-            is_standalone=False,
-            torch_exclude=False,
-        )
+        if os.environ.get("AITER_SKIP_AGGREGATE", "1") != "1":
+            agg_flags_cc = list(prebuild_link_param["flags_extra_cc"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
+            agg_flags_hip = list(prebuild_link_param["flags_extra_hip"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
+            agg_srcs = sorted(set(
+                s
+                for one in all_opts_args_build
+                for s in one["srcs"]
+                if ("/pybind/" not in s and not s.endswith("_pybind.cu"))
+            )) + [os.path.join(this_dir, "csrc", "rocm_ops.cpp")]
+            core.build_module(
+                md_name="aiter_",
+                srcs=agg_srcs,
+                flags_extra_cc=agg_flags_cc,
+                flags_extra_hip=agg_flags_hip,
+                blob_gen_cmd=prebuild_link_param["blob_gen_cmd"],
+                extra_include=prebuild_link_param["extra_include"],
+                extra_ldflags=None,
+                verbose=False,
+                is_python_module=True,
+                is_standalone=False,
+                torch_exclude=False,
+            )
 
 else:
     raise NotImplementedError("Only ROCM is supported")
