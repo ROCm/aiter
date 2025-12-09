@@ -43,7 +43,7 @@ def gen_pa_fwd_native_fake(
     if out is not None:
         return out
     else:
-        return torch.empty_like(query)
+        return torch.zeros_like(query)
 
 
 def gen_pa_fwd_asm(
@@ -66,7 +66,7 @@ def gen_pa_fwd_asm(
     if out_ is not None:
         return out_
     else:
-        return torch.empty_like(Q)
+        return torch.zeros_like(Q)
 
 
 @compile_ops("module_attention", gen_fake=gen_pa_fwd_native_fake)
@@ -140,7 +140,7 @@ def gen_pa_ps_fwd_asm(
     if out_ is not None:
         return out_
     else:
-        return torch.empty_like(Q)
+        return torch.zeros_like(Q)
 
 
 @compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
@@ -217,17 +217,18 @@ def pa_persistent_fwd(
     total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
-    logits = torch.empty(
+    output = torch.zeros_like(Q)
+    logits = torch.zeros(
         (reduce_partial_map.size(0) * max_qlen, 1, nhead, v_head_dim),
         dtype=dtypes.fp32,
         device=device,
     )
-    splitLse = torch.empty(
+    splitLse = torch.zeros(
         (reduce_partial_map.size(0) * max_qlen, 1, nhead, 1),
         dtype=dtypes.fp32,
         device=device,
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
 
     pa_ps_fwd_asm(
         Q,
@@ -248,6 +249,12 @@ def pa_persistent_fwd(
         splitLse,
         mask,
     )
+    torch.set_printoptions(precision=9, threshold=99999999, sci_mode=False)
+    print(f"==>after pa_ps check output nan, {torch.isnan(output).any()}")
+    print(f"==>after pa_ps check logits nan, {torch.isnan(logits).any()}")
+    print(f"==>after pa_ps check splitLse nan, {torch.isnan(splitLse).any()}")
+    print(f"==>after pa_ps check final_lse nan, {torch.isnan(final_lse).any()}")
+
     pa_reduce_v1(
         logits,
         splitLse,
@@ -258,6 +265,10 @@ def pa_persistent_fwd(
         output,
         final_lse,
     )
+    print(f"==>after reduce check output nan, {torch.isnan(output).any()}")
+    print(f"==>after reduce check logits nan, {torch.isnan(logits).any()}")
+    print(f"==>after reduce check splitLse nan, {torch.isnan(splitLse).any()}")
+    print(f"==>after reduce check final_lse nan, {torch.isnan(final_lse).any()}")
 
     return logits, final_lse
 

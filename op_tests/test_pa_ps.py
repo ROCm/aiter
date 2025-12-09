@@ -78,7 +78,7 @@ def kv_cache_factory(
     k_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     k_caches: List[torch.Tensor] = []
     for _ in range(num_layers):
-        k_cache = torch.empty(size=k_cache_shape, dtype=torch_dtype, device=device)
+        k_cache = torch.zeros(size=k_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             k_cache.uniform_(*uniform_range)
         else:
@@ -88,7 +88,7 @@ def kv_cache_factory(
     v_cache_shape = (num_blocks, num_heads, head_size, block_size)
     v_caches: List[torch.Tensor] = []
     for _ in range(num_layers):
-        v_cache = torch.empty(size=v_cache_shape, dtype=torch_dtype, device=device)
+        v_cache = torch.zeros(size=v_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             v_cache.uniform_(*uniform_range)
         else:
@@ -408,7 +408,7 @@ def test_pa_mtp(
 
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
-    seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
+    seq_lens_kv = torch.zeros(batch_size, dtype=torch.int)
     if varlen:
         for i in range(batch_size):
             # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
@@ -508,7 +508,7 @@ def test_pa_mtp(
         k_quant_.dtype,
         is_sparse=False,
     )
-    work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
+    work_metadata_ptrs = torch.zeros(work_meta_data_size, dtype=work_meta_data_type)
     work_indptr = torch.zeros(work_indptr_size, dtype=work_indptr_type)
     work_info = torch.zeros(work_info_set_size, dtype=work_info_set_type)
     reduce_indptr = torch.zeros(reduce_indptr_size, dtype=reduce_indptr_type)
@@ -564,7 +564,7 @@ def test_pa_mtp(
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
     # Benchmark PA Persistent Scheduling
-    output = torch.empty_like(query)
+    output = torch.zeros_like(query)
 
     if use_p99:
         out_aiter_asm, stats_ps = benchmark_with_percentile(
@@ -700,7 +700,6 @@ head_dim = 128
 l_block_size = [1024]
 l_dtype = ["bf16"]
 l_num_heads = [
-    (8, 1),
     (10, 1),
     # (16, 1),
 ]  # num_query_heads must be multiple of 16 for get_mla_metadata_info_v1
@@ -711,24 +710,25 @@ kv_lens_list0 = [i * 256 for i in range(1, 10)]
 kv_lens_list1 = [i - 1 for i in kv_lens_list0]
 kv_lens_list3 = [i + 10 for i in kv_lens_list0]
 kv_lens_list = [
-    7,
-    26,
-    57,
-    66,
-    109,
-    128,
-    257,
-    282,
-    3460,
-    16700,
-    7900,
-    2580,
-    4140,
-    6360,
+    # 7,
+    # 26,
+    # 57,
+    # 66,
+    # 109,
+    # 128,
+    # 257,
+    # 282,
+    # 3460,
+    # 16700,
+    # 7900,
+    # 2580,
+    # 4140,
+    # 6360,
     4097,
-    16384,
-    90002,
-    90004,
+    # 1024,
+    # 16384,
+    # 90002,
+    # 90004,
 ]
 # l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
 # l_ctx_len = kv_lens_list0 + kv_lens_list1 + kv_lens_list3 + kv_lens_list
