@@ -267,7 +267,7 @@ def _get_config(
     K: int,
 ):
     from ..utils.gemm_config_utils import get_gemm_config
-    
+
     config = get_gemm_config("GEMM-A8WFP4", M, N, K)
 
     if M <= 128:
