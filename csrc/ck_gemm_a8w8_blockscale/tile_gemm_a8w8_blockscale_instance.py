@@ -21,7 +21,6 @@ class TileKernelInstance:
     kPadK: bool
     
     Scheduler: str # Default, Intrawave, Interwave
-    MemoryOperation: str # set, atomic_add, atomic_max, add  
     
     TransposeC: bool
     DoubleSmemBuffer: bool
@@ -57,7 +56,6 @@ class TileKernelInstance:
                     )
                 ),
                 self.Scheduler.lower(),
-                self.MemoryOperation.lower(),
                 ("x").join(
                     map(
                         lambda x: str(int(x)),
@@ -73,8 +71,8 @@ class TileKernelInstance:
 # This is to ensure that when both legacy and tile kernels are tuned, the tile kernels are
 # preferred during selection.
 tile_candidate_kernels_dict = {
-    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile | kPadM | kPadN | kPadK |   Scheduler   | MemoryOperation | TransposeC | DoubleSmemBuffer | UsePersistentKernel |
-    1:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      False,  False,  False,   "Intrawave",       "Set",         False,          False,            False             )   
+    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile | kPadM | kPadN | kPadK |   Scheduler   | TransposeC | DoubleSmemBuffer | UsePersistentKernel |
+    1:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      False,  False,  False,   "Intrawave",     False,          False,            False             )   
 }
 
 

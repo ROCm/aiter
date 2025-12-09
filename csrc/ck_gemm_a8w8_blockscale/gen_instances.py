@@ -514,24 +514,6 @@ if __name__ == "__main__":
         "--tune", action="store_true", required=False, help="generated tune instances"
     )
 
-    # parser.add_argument(
-    #     "--out_type",
-    #     default="all",
-    #     required=False,
-    #     help="Specifie the type of scale\n \
-    #         all: [bf16, fp16] \n  \
-    #         bf16, fp16"
-    # )
-
-    # parser.add_argument(
-    #     "--scale_type",
-    #     default="all",
-    #     required=False,
-    #     help="Specifie the type of scale\n \
-    #         all: [fp32, same as out] \n  \
-    #         same: [same as out]"
-    # )
-
     args = parser.parse_args()
     codegen = gemm_a8w8_blockscale_codegen(args.libtype, args.working_path, args.tune, args.tune_file)
     codegen.run()
