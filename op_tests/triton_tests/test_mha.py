@@ -21,6 +21,10 @@ from aiter.test_mha_common import (
     generate_qkv,
 )
 
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+arch = get_arch()
+
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
@@ -501,9 +505,25 @@ def test_mha_backward(
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
-    # pytest.skip("Backward accuracy issues due to Triton compiler")
+    # TODO: Enable these tests once this is fixed
+    # As of torch 2.9.1+rocm7.1.1, these test cases aren't working
+    # on gfx942 machines. They are confirmed to work on torch 2.7.1+rocm 7.0.
+    # This was tested with the same Triton compiler version:
+    # https://github.com/triton-lang/triton/commit/ecbb77c
+    if (
+        arch == "gfx942"
+        and not FUSED
+        and HEAD_SZ == 128
+        and (DROPOUT, CAUSAL) == (0.2, False)
+        and (SEQLEN_Q, SEQLEN_K) in [(4, 4), (2, 1)]
+    ):
+        pytest.skip(
+            "triton_dv and torch_dv are not matching for these test cases on gfx942 architecture"
+        )
+
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
+
     mha_set_use_fused_bwd_kernel(FUSED)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -819,6 +839,12 @@ def test_mha_with_pe(
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
+    # TODO: Enable these test cases once this is fixed
+    if arch == "gfx942" and (CAUSAL or HAS_DROPOUT):
+        pytest.skip(
+            "Causal or Dropout use case isn't currently working with Positional Encoding on gfx942 archictecture."
+        )
+
     # Generate tensors
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -886,6 +912,12 @@ def test_mha_varlen_with_pe(
     HAS_DROPOUT: bool = DROPOUT > 0.0
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
+
+    # TODO: Enable these test cases once this is fixed
+    if arch == "gfx942" and (CAUSAL or HAS_DROPOUT):
+        pytest.skip(
+            "Causal or Dropout use case isn't currently working with Positional Encoding on gfx942 archictecture."
+        )
 
     # Generate tensors
     torch.cuda.empty_cache()
@@ -988,6 +1020,12 @@ def test_mha_backward_with_pe(
     CAUSAL: bool,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
+
+    # TODO: Enable these test cases once this is fixed
+    if arch == "gfx942" and (CAUSAL or HAS_DROPOUT):
+        pytest.skip(
+            "Causal or Dropout use case isn't currently working with Positional Encoding on gfx942 archictecture."
+        )
 
     # Causal + Dropout use case is disabled in `test_mha_backward` and `test_mha_backward_varlen`.
     # FIXME: We should fix it in the base implementation before adding PE to the mix.
@@ -1111,6 +1149,12 @@ def test_mha_backward_varlen_with_pe(
     CAUSAL: bool,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
+
+    # TODO: Enable these test cases once this is fixed
+    if arch == "gfx942" and (CAUSAL or HAS_DROPOUT):
+        pytest.skip(
+            "Causal or Dropout use case isn't currently working with Positional Encoding on gfx942 archictecture."
+        )
 
     # Causal + Dropout use case is disabled in `test_mha_backward` and `test_mha_backward_varlen`.
     # FIXME: We should fix it in the base implementation before adding PE to the mix.

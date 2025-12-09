@@ -70,24 +70,22 @@ AITER_CONFIG_GEMM_A4W4 = os.getenv(
     "AITER_CONFIG_GEMM_A4W4",
     f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
 )
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
 )
+
 AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
-)
-
-AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE = os.getenv(
-    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE",
-    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_cktile_tuned_gemm.csv",
 )
 
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
 )
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
@@ -142,7 +140,7 @@ class AITER_CONFIG(object):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
-            "a8w8_blockscale_tuned_gemm",
+            "a8w8_blockscale_tuned_legacy_gemm",
         )
 
     @property
@@ -181,14 +179,6 @@ class AITER_CONFIG(object):
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
         )
 
-    @property
-    def AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE",
-            AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE,
-            "a8w8_bpreshuffle_cktile_tuned_gemm",
-        )
-
     def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
@@ -220,7 +210,8 @@ class AITER_CONFIG(object):
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
-            keys = untunedf.columns
+            keys = untunedf.columns.to_list()
+            keys.append("cu_num")
             merge_df = (
                 merge_df.sort_values("us")
                 .drop_duplicates(subset=keys, keep="first")
@@ -295,12 +286,19 @@ if find_aiter is not None:
 
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
-    # install mode
     else:
         AITER_META_DIR = os.path.abspath(f"{AITER_ROOT_DIR}/aiter_meta/")
 else:
     AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
+
+# honor environment override and fallback if missing
+env_meta = os.environ.get("AITER_META_DIR")
+if env_meta:
+    AITER_META_DIR = os.path.abspath(env_meta)
+if not os.path.exists(os.path.join(AITER_META_DIR, "csrc")):
+    AITER_META_DIR = AITER_ROOT_DIR
+
 sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
@@ -356,6 +354,13 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1103",
+        "gfx1150",
+        "gfx1151",
+        "gfx1152",
+        "gfx1153",
         "gfx950",
     ]
 

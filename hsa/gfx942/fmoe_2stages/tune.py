@@ -1539,6 +1539,7 @@ class FmoeTuner(TunerCommon):
             int(q_type),
             str(act_type).split(".")[-1].lower(),
             doweight_stage1,
+            False,  # bpreshuffle
         )
         _, ck_stage2_kernels = get_gemm2_kernels_list(
             dtype2str_dict[q_dtype_a],
@@ -1547,6 +1548,7 @@ class FmoeTuner(TunerCommon):
             False,
             int(q_type),
             not doweight_stage1,
+            False,  # bpreshuffle
         )
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
@@ -1815,6 +1817,10 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
+            ## remove invalid candidate
+            profileDF = profileDF[
+                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf"))
+            ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
             )
@@ -1895,14 +1901,6 @@ class FmoeTuner(TunerCommon):
             )
             profileDF["run_1stage"] = 0
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
-            ## remove invalid candidate
-            profileDF = profileDF[
-                (profileDF["err1"] < args.errRatio)
-                & (profileDF["err2"] < args.errRatio)
-            ]
-            profileDF = profileDF[
-                (profileDF["us1"] != float("inf")) & (profileDF["us2"] != float("-inf"))
-            ]
             if len(profileDF) == 0:
                 print(
                     f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"
