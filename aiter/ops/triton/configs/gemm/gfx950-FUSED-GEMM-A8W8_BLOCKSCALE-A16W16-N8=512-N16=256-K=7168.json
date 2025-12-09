@@ -1,5 +1,5 @@
 {
-  "small": {
+  "M_LEQ_8": {
     "BLOCK_SIZE_M": 8,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 128,
@@ -11,7 +11,7 @@
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 14
   },
-  "small_M16": {
+  "M_LEQ_16": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 128,
@@ -23,7 +23,7 @@
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 14
   },
-  "medium_M32": {
+  "M_LEQ_32": {
     "BLOCK_SIZE_M": 8,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 128,
@@ -35,7 +35,7 @@
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 14
   },
-  "medium_M64": {
+  "M_LEQ_64": {
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 128,
@@ -47,7 +47,7 @@
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 14
   },
-  "medium_M128": {
+  "M_LEQ_128": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 64,
     "BLOCK_SIZE_K": 128,
@@ -59,7 +59,7 @@
     "cache_modifier": null,
     "NUM_KSPLIT": 7
   },
-  "large": {
+  "M_LEQ_256": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 64,
     "BLOCK_SIZE_K": 128,
@@ -71,7 +71,7 @@
     "cache_modifier": null,
     "NUM_KSPLIT": 7
   },
-  "xlarge_M1024": {
+  "M_LEQ_1024": {
     "BLOCK_SIZE_M": 128,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 128,
@@ -83,7 +83,7 @@
     "cache_modifier": null,
     "NUM_KSPLIT": 1
   },
-  "xlarge_M2048": {
+  "M_LEQ_2048": {
     "BLOCK_SIZE_M": 128,
     "BLOCK_SIZE_N": 16,
     "BLOCK_SIZE_K": 128,
@@ -95,7 +95,7 @@
     "cache_modifier": null,
     "NUM_KSPLIT": 1
   },
-  "xlarge": {
+  "any": {
     "BLOCK_SIZE_M": 128,
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 128,

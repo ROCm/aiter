@@ -1,5 +1,5 @@
 {
-  "small": {
+  "M_LEQ_16": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 256,
@@ -11,7 +11,7 @@
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 4
   },
-  "medium_M32": {
+  "M_LEQ_32": {
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 512,
@@ -23,7 +23,7 @@
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 2
   },
-  "medium_M64": {
+  "M_LEQ_64": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 512,
@@ -35,7 +35,7 @@
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 2
   },
-  "medium_M128": {
+  "M_LEQ_128": {
     "BLOCK_SIZE_M": 128,
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 256,
@@ -47,7 +47,7 @@
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 2
   },
-  "large": {
+  "M_LEQ_256": {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 256,
@@ -58,8 +58,8 @@
     "matrix_instr_nonkdim": 16,
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 4
-  }, 
-   "xlarge": {
+  },
+  "any": {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 256,
@@ -71,5 +71,4 @@
     "cache_modifier": null,
     "NUM_KSPLIT": 1
   }
-
 }

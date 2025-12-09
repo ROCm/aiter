@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-from typing import Optional
-import functools
-import json
-import os
 import triton
 import triton.language as tl
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
 
 
@@ -188,17 +182,11 @@ def _gemm_a8w8_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
+    from ..utils.gemm_config_utils import get_gemm_config
 
-    return _get_config._config_dict["any"]
+    return get_gemm_config("GEMM-A8W8", M, N, K)
