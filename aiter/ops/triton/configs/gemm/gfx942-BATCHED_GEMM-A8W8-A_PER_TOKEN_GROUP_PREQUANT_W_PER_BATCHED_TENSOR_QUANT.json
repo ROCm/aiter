@@ -1,5 +1,5 @@
 {
-  "M_LEQ_8" : {
+  "M_LEQ_16" : {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 128,
     "GROUP_SIZE_M": 1,
