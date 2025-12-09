@@ -19,6 +19,7 @@ def get_gemm_config(
     N=None,
     K=None,
     bounds=None,
+    specialized_filename=None,
 ):
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
@@ -27,6 +28,7 @@ def get_gemm_config(
     It uses the following logic:
     1. Load default config file: {arch}-{config_name}.json
     2. If N and K are provided, try to load specialized config: {arch}-{config_name}-N={N}-K={K}.json
+       Or if specialized_filename is provided, use: {arch}-{config_name}-{specialized_filename}.json
     3. Search for M_LEQ_x keys in order of bounds (default: STANDARD_M_BOUNDS)
     4. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
     5. Fall back to "any" if no bounds match
@@ -37,6 +39,7 @@ def get_gemm_config(
         N: N dimension of the GEMM (optional)
         K: K dimension of the GEMM (optional)
         bounds: Custom bounds to use instead of STANDARD_M_BOUNDS (optional)
+        specialized_filename: Custom specialized filename suffix (optional)
 
     Returns:
         Dictionary with the config params
@@ -59,7 +62,22 @@ def get_gemm_config(
 
     # Determine which config dict to use (default or specialized)
     config_dict_key = "default"
-    if N is not None and K is not None:
+    
+    # Handle custom specialized filename (for fused kernels with multiple N dims)
+    if specialized_filename is not None:
+        spec_key = specialized_filename
+        if spec_key not in get_gemm_config._config_cache[cache_key]:
+
+            fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-{specialized_filename}.json"
+            if os.path.exists(fpath):
+                with open(fpath, "r") as file:
+                    config = json.load(file)
+                get_gemm_config._config_cache[cache_key][spec_key] = config
+                config_dict_key = spec_key
+        else:
+            config_dict_key = spec_key
+
+    elif N is not None and K is not None:
         nk_key = f"{N}_{K}"
         if nk_key not in get_gemm_config._config_cache[cache_key]:
             # load specialized config

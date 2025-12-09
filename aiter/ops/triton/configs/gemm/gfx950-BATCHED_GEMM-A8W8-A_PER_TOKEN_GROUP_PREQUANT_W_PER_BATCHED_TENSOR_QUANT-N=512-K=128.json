@@ -1,5 +1,5 @@
 {
-  "small" : {
+  "M_LEQ_8" : {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 128,
     "GROUP_SIZE_M": 1,
@@ -10,7 +10,7 @@
     "kpack": 1,
     "cache_modifier": ".cg"
   },
-  "medium_M32" : {
+  "M_LEQ_32" : {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 128,
     "GROUP_SIZE_M": 1,
@@ -21,7 +21,7 @@
     "kpack": 1,
     "cache_modifier": ".cg"
   },
-  "medium_M64" : {
+  "M_LEQ_64" : {
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 128,
     "GROUP_SIZE_M": 1,
@@ -32,7 +32,7 @@
     "kpack": 1,
     "cache_modifier": ".cg"
   },
-  "medium_M128" : {
+  "M_LEQ_128" : {
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 128,
     "GROUP_SIZE_M": 1,
@@ -43,7 +43,7 @@
     "kpack": 1,
     "cache_modifier": ".cg"
   },
-  "large" : {
+  "M_LEQ_256" : {
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 128,
     "GROUP_SIZE_M": 1,
@@ -54,7 +54,7 @@
     "kpack": 1,
     "cache_modifier": ".cg"
   },
-  "xlarge" : {
+  "any" : {
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 128,
     "GROUP_SIZE_M": 1,
