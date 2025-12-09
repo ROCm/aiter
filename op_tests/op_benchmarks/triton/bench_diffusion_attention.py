@@ -26,6 +26,7 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
 from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
+    attention_ref,
 )
 from compare_outputs import save_benchmark_output
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
@@ -52,100 +53,144 @@ from aiter.ops.triton.mha_v3 import _quantize_bshd
 import logging
 logging.getLogger().setLevel(logging.INFO)
 
-
+# taken from mha_v3.py
 def fav3_fp8_forward_func(
-        q: torch.Tensor,  # High precision (BF16/FP32)
-        k: torch.Tensor,  # High precision (BF16/FP32)
-        v: torch.Tensor,  # High precision (BF16/FP32)
-        softmax_scale: Optional[float],
-        causal: bool,
-        window_size: Tuple[int, int],
-        attention_chunk: int,
-        softcap: float,
-        deterministic: bool,
-        sm_margin: int,
-    ):
-        batch, seqlen, num_q_heads, head_dim = q.shape
-        _, _, num_kv_heads, _ = k.shape
+    q: torch.Tensor,  # High precision (BF16/FP32)
+    k: torch.Tensor,  # High precision (BF16/FP32)
+    v: torch.Tensor,  # High precision (BF16/FP32)
+    softmax_scale: Optional[float],
+    causal: bool,
+    window_size: Tuple[int, int],
+    attention_chunk: int,
+    softcap: float,
+    deterministic: bool,
+    sm_margin: int,
+):
+    batch, seqlen, num_q_heads, head_dim = q.shape
+    _, _, num_kv_heads, _ = k.shape
 
-        # Quantize inputs to FP8
-        fp8_dtype = torch.float8_e4m3fnuz
+    # Quantize inputs to FP8
+    fp8_dtype = torch.float8_e4m3fnuz
 
-        # For GQA/MQA: quantize query with grouped scaling
-        group_size = (
-            num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
+    # For GQA/MQA: quantize query with grouped scaling
+    group_size = (
+        num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
+    )
+    q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
+    k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
+    v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+
+    # Verify descale shapes for GQA/MQA
+    assert q_descale.shape == (
+        batch,
+        num_kv_heads,
+    ), f"q_descale shape {q_descale.shape} != expected {(batch, num_kv_heads)}"
+    assert k_descale.shape == (
+        batch,
+        num_kv_heads,
+    ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads)}"
+    assert v_descale.shape == (
+        batch,
+        num_kv_heads,
+    ), f"v_descale shape {v_descale.shape} != expected {(batch, num_kv_heads)}"
+
+    # Derive softmax scale if not provided
+    if softmax_scale is None:
+        softmax_scale = head_dim ** (-0.5)
+
+    # Validate unsupported features
+    if attention_chunk not in (0, 1):
+        raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
+    if softcap != 0.0:
+        raise NotImplementedError(
+            "softcap not implemented in FP8 high-precision API"
         )
-        q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
-        k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
-        v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
-
-        # Verify descale shapes for GQA/MQA
-        assert q_descale.shape == (
-            batch,
-            num_kv_heads,
-        ), f"q_descale shape {q_descale.shape} != expected {(batch, num_kv_heads)}"
-        assert k_descale.shape == (
-            batch,
-            num_kv_heads,
-        ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads)}"
-        assert v_descale.shape == (
-            batch,
-            num_kv_heads,
-        ), f"v_descale shape {v_descale.shape} != expected {(batch, num_kv_heads)}"
-
-        # Derive softmax scale if not provided
-        if softmax_scale is None:
-            softmax_scale = head_dim ** (-0.5)
-
-        # Validate unsupported features
-        if attention_chunk not in (0, 1):
-            raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
-        if softcap != 0.0:
-            raise NotImplementedError(
-                "softcap not implemented in FP8 high-precision API"
-            )
-        if sm_margin != 0:
-            raise NotImplementedError(
-                "sm_margin != 0 not supported in FP8 high-precision API"
-            )
-
-        # Call flash attention forward
-        return lambda: flash_attn_3.fwd(
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            None,
-            None,
-            None,
-            None,  # k_new, v_new, qv, out
-            None,
-            None,
-            None,  # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
-            None,
-            None,
-            None,
-            None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
-            None,
-            None,
-            None,  # page_table, kv_batch_idx, leftpad_k
-            None,
-            None,
-            None,  # rotary_cos, rotary_sin, seqlens_rotary
-            q_descale,
-            k_descale,
-            v_descale,
-            softmax_scale,
-            causal,
-            int(window_size[0]),
-            int(window_size[1]),
-            attention_chunk,
-            softcap,
-            False,  # rotary_interleaved
-            None,
-            1,
-            None,
-            sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+    if sm_margin != 0:
+        raise NotImplementedError(
+            "sm_margin != 0 not supported in FP8 high-precision API"
         )
+
+    # Call flash attention forward
+    return lambda: flash_attn_3.fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        None,
+        None,
+        None,
+        None,  # k_new, v_new, qv, out
+        None,
+        None,
+        None,  # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
+        None,
+        None,
+        None,
+        None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
+        None,
+        None,
+        None,  # page_table, kv_batch_idx, leftpad_k
+        None,
+        None,
+        None,  # rotary_cos, rotary_sin, seqlens_rotary
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        int(window_size[0]),
+        int(window_size[1]),
+        attention_chunk,
+        softcap,
+        False,  # rotary_interleaved
+        None,
+        1,
+        None,
+        sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+    )
+
+def qk_int8_forward_func(q, k, v, tensor_layout, sm_scale):
+    # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
+    # tensor_layout = args.qk_int8_layout
+    config = _get_config()
+    # Original tensors are in NHD format (batch, seq, heads, dim)
+    if tensor_layout == "HND":
+        # Convert from NHD to HND for better memory access
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous().to(torch.float16)
+    else:  # NHD
+        # Keep original layout
+        v = v.to(torch.float16)
+    k_mean = None
+    # sm_scale = D_HEAD**-0.5
+    q, q_scale, k, k_scale = per_block_int8(
+        q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+    )
+    q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
+    k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
+    return lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
+
+
+def fav2_forward_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: Optional[float],
+    causal: bool,
+    return_lse: bool,
+    return_attn_probs: bool,
+):
+    return lambda: flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+    )
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
@@ -225,8 +270,9 @@ def run_benchmark(custom, args):
         Benchmark or test function for multi-head attention backward pass.
         In test_mode, verifies output matching with non-varlen inputs.
         """
+        assert args.qk_int8_layout=="NHD"
+        assert args.layout == "bshd"
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
-        requires_grad = mode == "bwd" or args.test_mode
         return_lse = True
         return_attn_probs = False
         varlen = args.layout == "thd"
@@ -247,15 +293,12 @@ def run_benchmark(custom, args):
         q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
         k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
         v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD_V), device=device, dtype=dtype)
-        q.requires_grad = requires_grad
-        k.requires_grad = requires_grad
-        v.requires_grad = requires_grad
+        q.requires_grad = False
+        k.requires_grad = False
+        v.requires_grad = False
 
         # FLOPS calculation variables
         total_flops = 0.0
-
-        # Input preparation
-        q_input, k_input, v_input = q, k, v
         total_flops += (
             2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
         )
@@ -273,65 +316,33 @@ def run_benchmark(custom, args):
                 sm_margin=0,
             )
         elif args.qk_int8: # sage v1
-            assert args.layout == "bshd", "int8 quantization only supports bshd layout."
-            # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
-            tensor_layout = args.qk_int8_layout
-            config = _get_config()
-            # Original tensors are in NHD format (batch, seq, heads, dim)
-            if tensor_layout == "HND":
-                # Convert from NHD to HND for better memory access
-                q = q.transpose(1, 2).contiguous()
-                k = k.transpose(1, 2).contiguous()
-                v = v.transpose(1, 2).contiguous().to(torch.float16)
-            else:  # NHD
-                # Keep original layout
-                v = v.to(torch.float16)
-            k_mean = None
-            sm_scale = D_HEAD**-0.5
-            q, q_scale, k, k_scale = per_block_int8(
-                q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+            fn = qk_int8_forward_func(
+                q,
+                k,
+                v,
+                tensor_layout=args.qk_int8_layout,
+                sm_scale=sm_scale,
             )
-            q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
-            k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
-            fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
         else: # fav2 (no quantization)
-            def fn():
-                return flash_attn_func(
-                    q_input,
-                    k_input,
-                    v_input,
-                    dropout_p=dropout,
-                    softmax_scale=sm_scale,
-                    causal=causal,
-                    return_lse=return_lse,
-                    return_attn_probs=return_attn_probs,
-                )
-
-        metric_choice = args.metric or "all"
-        metric_is_all = metric_choice == "all"
-        primary_provider = "time(ms)" if metric_is_all else provider
-        run_correctness_check = (
-            args.check_correctness_FAv3FP8_SageAttnV1
-            and args.fp8
-            and not varlen
-            and (
-                not metric_is_all
-                or provider == primary_provider
+            fn = fav2_forward_func(
+                q,
+                k,
+                v,
+                dropout_p=dropout,
+                softmax_scale=sm_scale,
+                causal=causal,
+                return_lse=return_lse,
+                return_attn_probs=return_attn_probs,
             )
-        )
-        if args.check_correctness_FAv3FP8_SageAttnV1 and args.fp8 and varlen:
-            raise ValueError("--check_correctness_FAv3FP8_SageAttnV1 currently supports only dense (bshd) layout.")
 
         ms = triton.testing.do_bench(fn)
-
-        needs_output_value = args.save_output or run_correctness_check
-        cached_output = fn() if needs_output_value else None
+        current_output = fn()
 
         if args.save_output:
-            assert cached_output is not None
+            assert current_output is not None
             save_benchmark_output(
                 args,
-                lambda output=cached_output: output,
+                lambda output=current_output: output,
                 saved_output_keys,
                 model or "",
                 BATCH,
@@ -347,26 +358,54 @@ def run_benchmark(custom, args):
                 varlen,
             )
 
-        if run_correctness_check:
-            assert cached_output is not None
-            current_primary = primary_output(cached_output).contiguous()
+        if args.compare_to_ref:
+            assert current_output is not None
+            current_primary = primary_output(current_output)
+            def reference_output():
+                if args.ref=="fav3_fp8": #  fav3 fp8
+                    fn = fav3_fp8_forward_func(
+                        q,
+                        k,
+                        v,
+                        softmax_scale=sm_scale,
+                        causal=False,
+                        window_size=(-1, -1),
+                        attention_chunk=0,
+                        softcap=0.0,
+                        deterministic=False,
+                        sm_margin=0,
+                    )
+                elif args.ref=="qk_int8": # sage v1
+                    fn = qk_int8_forward_func(
+                        q,
+                        k,
+                        v,
+                        tensor_layout=args.qk_int8_layout,
+                        sm_scale=sm_scale,
+                    )
+                elif args.ref=="fav2": # fav2 (no quantization)
+                    fn = fav2_forward_func(
+                        q,
+                        k,
+                        v,
+                        dropout_p=dropout,
+                        softmax_scale=sm_scale,
+                        causal=causal,
+                        return_lse=return_lse,
+                        return_attn_probs=return_attn_probs,
+                    )
+                else:
+                    fn = attention_ref(
+                        q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
+                    )
+                return fn()
+            
             reference_primary = primary_output(
-                run_sage_reference(
-                    q_input,
-                    k_input,
-                    v_input,
-                    args,
-                    D_HEAD,
-                    D_HEAD_V,
-                )
+                reference_output()
             )
-            reference_primary = restore_tensor_layout(
-                reference_primary,
-                args.qk_int8_layout,
-            )
-            print("Asserting FP8 output matches SageAttnV1 reference...")
-            print_output_comparison_stats(current_primary, reference_primary)
-            check_attention_outputs(current_primary, reference_primary, fp8=True)
+            check_attention_outputs(current_primary, reference_primary, fp8=False)
+            if args.print_compare_stats:
+                print_output_comparison_stats(current_primary, reference_primary)
 
         total_num_tokens_q = BATCH * N_CTX_Q
         total_num_tokens_k = BATCH * N_CTX_K
@@ -441,21 +480,17 @@ def parse_args():
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-qk_int8", action="store_true", default=False)
-    parser.add_argument("-qk_int8_layout", type=str, default="HND", choices=["HND", "NHD"],
+    parser.add_argument("-qk_int8_layout", type=str, default="NHD", choices=["HND", "NHD"],
         help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")
     parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument(
-        "-test_mode",
-        action="store_true",
-        default=False,
-        help="Tests correctness of the Triton provider comparing the output to the Torch sdpa.",
-    )
+    parser.add_argument("-print_compare_stats", action="store_true", default=False)
 
     parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
+    parser.add_argument("-ref", type=str, default=None, help="fp8, qk_int8, fav2 or torch ref (default).")
     parser.add_argument(
         "-metric",
         nargs="?",
@@ -488,9 +523,9 @@ def parse_args():
         help="Directory to store tensors when --save_output is used.",
     )
     parser.add_argument(
-        "--check_correctness_FAv3FP8_SageAttnV1",
+        "--compare_to_ref",
         action="store_true",
-        help="For -fp8 runs, also execute the SageAttn reference kernel and assert outputs match.",
+        help="also execute the reference kernel (-ref) and assert outputs match.",
     )
     return parser.parse_args()
 
