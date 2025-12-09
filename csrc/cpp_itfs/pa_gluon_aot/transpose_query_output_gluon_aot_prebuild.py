@@ -221,32 +221,6 @@ def _run_single_test_wrapper(test_args):
         return {"status": "failed", "config": test_config, "error": str(e)}
 
 
-def clean_directory_except_so(directory: str):
-    """Clean directory but keep only .so files."""
-    if not os.path.exists(directory):
-        print(f"Directory {directory} does not exist, skipping cleanup.")
-        return
-
-    for root, dirs, files in os.walk(directory):
-        # Remove all non-.so files
-        for file in files:
-            if not file.endswith(".so"):
-                file_path = os.path.join(root, file)
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    print(f"Warning: Could not remove {file_path}: {e}")
-
-        # Remove empty directories (but don't remove the root BUILD_DIR)
-        for dir_name in dirs:
-            dir_path = os.path.join(root, dir_name)
-            try:
-                if not os.listdir(dir_path):  # If directory is empty
-                    os.rmdir(dir_path)
-            except Exception as e:
-                pass  # Directory may not be empty or may not exist
-
-
 def prebuild_transpose_query_gluon_aot_so(num_processes=None):
     """Prebuild all .so files for transpose_query_gluon_aot and transpose_output_gluon_aot."""
 
@@ -413,28 +387,6 @@ def prebuild_transpose_query_gluon_aot_so(num_processes=None):
                     f"seq_len={config['seq_len']}, head_dim={config['head_dim']}"
                 )
                 print(f"    Error: {result['error']}")
-
-    # Clean current directory cache
-    current_dir = os.getcwd()
-    print(
-        f"\nCleaning current directory cache: {current_dir}/transpose_*_gluon_kernel_*"
-    )
-    clean_current_dir_cache_cmd = [
-        "sh",
-        "-c",
-        f"rm -rf {current_dir}/transpose_query_gluon_kernel_* {current_dir}/transpose_output_gluon_kernel_*",
-    ]
-    result = subprocess.run(
-        clean_current_dir_cache_cmd, capture_output=True, text=True, timeout=100
-    )
-    if result.returncode != 0 and result.stderr:
-        print(f"Warning: {result.stderr}")
-    print(f"Cleaning current directory cache completed!")
-
-    # Clean aiter build directory cache, only *.so files are left
-    print(f"\nCleaning aiter build directory cache: {BUILD_DIR}")
-    clean_directory_except_so(BUILD_DIR)
-    print("Cleaning aiter build directory cache completed, only *.so files are left!")
 
     # Get the total size of so files in aiter build directory
     try:

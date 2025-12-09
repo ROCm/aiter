@@ -1,5 +1,7 @@
 import os
 import time
+import shutil
+import subprocess
 import hashlib
 from pathlib import Path
 from typing import Optional
@@ -24,6 +26,7 @@ from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
 )
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
 from csrc.cpp_itfs.utils import (
+    BUILD_DIR,
     AITER_CORE_DIR,
     get_default_func_name,
     compile_template_op,
@@ -93,6 +96,10 @@ def compile_query(
             raise RuntimeError(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
+
+        from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
+            clean_directory_except_so,
+        )
 
         # Determine signature based on data type
         if data_type == torch.bfloat16:
@@ -176,7 +183,7 @@ def compile_query(
             ) as f:
                 src_template = Template(f.read())
 
-            return compile_template_op(
+            compiled_func = compile_template_op(
                 src_template,
                 MD_NAME_QUERY,
                 [triton_header],
@@ -186,6 +193,7 @@ def compile_query(
                 triton_kernel=triton_kernel,
                 func_name=func_name,
             )
+            return compiled_func
 
         def final_func():
             """Final function called after compilation completes."""
@@ -198,6 +206,22 @@ def compile_query(
             lock_path=lock_path, main_func=main_func, final_func=final_func
         )
         if main_func_result is not None:
+            print(f"Cleaning aot temporary files: {aot_file_dir}")
+            clean_aot_temporary_files_cmd = ["sh", "-c", f"rm -rf {aot_file_dir}"]
+            result = subprocess.run(
+                clean_aot_temporary_files_cmd,
+                capture_output=True,
+                text=True,
+                timeout=100,
+            )
+            if result.returncode != 0 and result.stderr:
+                print(f"Warning: {result.stderr}")
+            print(f"Cleaning aot temporary files completed!")
+            print(f"Cleaning aiter build cache directory: {BUILD_DIR}/{func_name}")
+            clean_directory_except_so(f"{BUILD_DIR}/{func_name}")
+            print(
+                f"Cleaning aiter build cache directory completed, only *.so files are left!"
+            )
             return main_func_result
         else:
             logger.info(f"{func_name} already built by another process")
@@ -394,6 +418,10 @@ def compile_output(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
 
+        from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
+            clean_directory_except_so,
+        )
+
         # Determine signature based on data type
         if data_type == torch.bfloat16:
             data_sig = "*bf16:16"
@@ -475,7 +503,7 @@ def compile_output(
             ) as f:
                 src_template = Template(f.read())
 
-            return compile_template_op(
+            compiled_func = compile_template_op(
                 src_template,
                 MD_NAME_OUTPUT,
                 [triton_header],
@@ -485,6 +513,7 @@ def compile_output(
                 triton_kernel=triton_kernel,
                 func_name=func_name,
             )
+            return compiled_func
 
         def final_func():
             """Final function called after compilation completes."""
@@ -497,6 +526,22 @@ def compile_output(
             lock_path=lock_path, main_func=main_func, final_func=final_func
         )
         if main_func_result is not None:
+            print(f"Cleaning aot temporary files: {aot_file_dir}")
+            clean_aot_temporary_files_cmd = ["sh", "-c", f"rm -rf {aot_file_dir}"]
+            result = subprocess.run(
+                clean_aot_temporary_files_cmd,
+                capture_output=True,
+                text=True,
+                timeout=100,
+            )
+            if result.returncode != 0 and result.stderr:
+                print(f"Warning: {result.stderr}")
+            print(f"Cleaning aot temporary files completed!")
+            print(f"Cleaning aiter build cache directory: {BUILD_DIR}/{func_name}")
+            clean_directory_except_so(f"{BUILD_DIR}/{func_name}")
+            print(
+                f"Cleaning aiter build cache directory completed, only *.so files are left!"
+            )
             return main_func_result
         else:
             logger.info(f"{func_name} already built by another process")

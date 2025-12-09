@@ -2654,63 +2654,126 @@ def pa_decode_gluon(
     Paged Attention Decode with FP8/BF16/FP16 Support.
 
     Implements the attention mechanism for transformer decoding with paged KV caches,
-    supporting various quantization schemes and data types.
+    supporting various quantization schemes and data types. This function performs
+    attention computation in two phases: a partitioned attention kernel followed
+    by a reduction kernel.
 
     Parameters
     ----------
     output : torch.Tensor
-        Output tensor for attention results
-        Shape: [num_seqs * query_length, num_query_heads, head_size]
+        Output tensor for final attention results.
+        - Shape: [num_seqs * query_length, num_query_heads, head_size]
+        - Dtype: torch.bfloat16, torch.float16
+
+    output_gluon : torch.Tensor
+        Intermediate output tensor in gluon layout for internal computation.
+        - Shape: [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
+        - Dtype: torch.bfloat16, torch.float16 (same as output)
 
     query : torch.Tensor
-        Input query tensor
-        Shape: [num_seqs * query_length, num_query_heads, head_size]
+        Input query tensor in standard layout.
+        - Shape: [num_seqs * query_length, num_query_heads, head_size]
+        - Dtype: torch.float8_e4m3fnuz (fp8), torch.bfloat16, torch.float16
+
+    query_gluon : torch.Tensor
+        Query tensor in gluon layout for internal computation.
+        - Shape: [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
+        - Dtype: torch.float8_e4m3fnuz (fp8), torch.bfloat16, torch.float16 (same as query)
+
+    query_scale_gluon : torch.Tensor
+        Quantization scales for query in gluon layout.
+        - Shape: [1] (per-tensor) or [num_seqs, num_kv_heads * query_length * query_group_size, 1] (per-token)
+        - Dtype: torch.float32
 
     key_cache : torch.Tensor
-        Paged key cache in block layout
-        Shape: [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
+        Paged key cache in block layout with interleaved head dimension.
+        - Shape: [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
+          where x = 16 // dtype.itemsize (e.g., x=16 for fp8, x=8 for bf16/fp16)
+        - Dtype: torch.float8_e4m3fnuz (fp8), torch.bfloat16, torch.float16
 
     value_cache : torch.Tensor
-        Paged value cache in block layout
-        Shape: [num_blocks, num_kv_heads, head_size, kv_block_size] or
-               [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+        Paged value cache in block layout. Supports two layouts:
+        - Non-transposed shape: [num_blocks, num_kv_heads, head_size, kv_block_size]
+        - Transposed shape: [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+          where x = 16 // dtype.itemsize
+        - Dtype: torch.float8_e4m3fnuz (fp8), torch.bfloat16, torch.float16
 
     context_lengths : torch.Tensor
-        Current context lengths for each sequence
-        Shape: [num_seqs]
+        Current context lengths (KV cache lengths) for each sequence.
+        - Shape: [num_seqs]
+        - Dtype: torch.int32
 
     block_tables : torch.Tensor
-        Mapping from sequences to physical cache blocks
-        Shape: [num_seqs, max_num_blocks_per_seq]
+        Mapping from sequences to physical cache block indices.
+        - Shape: [num_seqs, max_num_blocks_per_seq]
+        - Dtype: torch.int32
 
     softmax_scale : float
-        Scaling factor for attention scores
+        Scaling factor for attention scores, typically 1/sqrt(head_size).
 
     query_length : int
-        Length of query sequences
+        Length of query sequences. Must be <= 4.
 
     max_context_length : int
-        Maximum sequence length supported
+        Maximum sequence length supported in the KV cache.
 
-    compute_type
-        Data type for computation (tl.float8e4b8, tl.bfloat16, tl.float16)
+    context_partition_size : int
+        Size of each context partition for partitioned attention computation.
+
+    compute_type : tl.dtype
+        Triton data type for computation.
+        - Supported: tl.float8e4b8, tl.bfloat16, tl.float16
 
     query_scale : torch.Tensor
-        Quantization scales for queries
-        Shape: [1] (per-tensor) or [num_seqs * query_length, num_query_heads, 1] (per-token)
+        Quantization scales for queries in standard layout. Required for FP8 queries.
+        - Shape: [1] (per-tensor) or [num_seqs * query_length, num_query_heads, 1] (per-token)
+        - Dtype: torch.float32
 
     key_scale : torch.Tensor
-        Quantization scales for keys
-        Shape: [1] (per-tensor) or [num_blocks, num_kv_heads, kv_block_size, 1] (per-token)
+        Quantization scales for keys. Required for FP8 keys.
+        - Shape: [1] (per-tensor) or [num_blocks, num_kv_heads, kv_block_size, 1] (per-token)
+        - Dtype: torch.float32
 
     value_scale : torch.Tensor
-        Quantization scales for values
-        Shape: [1] (per-tensor) or [num_blocks, num_kv_heads, kv_block_size, 1] (per-token)
+        Quantization scales for values. Must have same shape as key_scale.
+        - Shape: [1] (per-tensor) or [num_blocks, num_kv_heads, kv_block_size, 1] (per-token)
+        - Dtype: torch.float32
+
+    exp_sums : torch.Tensor
+        Buffer for exponential sums used in online softmax computation.
+        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+          where max_context_partition_num = ceil(max_context_length / context_partition_size)
+        - Dtype: torch.float32
+
+    max_logits : torch.Tensor
+        Buffer for maximum logits used in online softmax computation.
+        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+        - Dtype: torch.float32
+
+    temporary_output : torch.Tensor
+        Buffer for partial attention outputs from each context partition.
+        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
+        - Dtype: torch.float32
+
+    alibi_slopes : torch.Tensor, optional
+        ALiBi (Attention with Linear Biases) slopes for positional encoding.
+        - Shape: [num_query_heads]
+        - Dtype: torch.float32
+        - Default: None (no ALiBi)
 
     Returns
     -------
-    dict
-        Dictionary containing timing information and intermediate tensors
+    None
+        Results are written directly to the output tensor.
+
+    Notes
+    -----
+    - query_length * query_group_size must be <= 64
+    - kv_block_size must be one of [16, 64, 1024]
+    - When query_length > 1, automatic transpose operations are performed
+      between standard and gluon layouts
+    - For FP8 computation, query_scale and key_scale/value_scale are required
+    - For BF16/FP16 computation, scales can be None
     """
     if not GLUON_JIT_KERNEL_ENABLED:
         raise RuntimeError(

@@ -951,59 +951,6 @@ def parse_arg_and_run_test():
     print("All the so under different configurations have been built successfully!")
 
 
-def clean_directory_except_so(directory_path):
-    """
-    Delete all files and folders in the specified directory except for .so files.
-
-    Args:
-        directory_path (str): Path to the directory to clean
-    """
-    # Check if the directory exists
-    if not os.path.exists(directory_path):
-        print(f"Error: Directory '{directory_path}' does not exist.")
-        return
-
-    # Check if the path is actually a directory
-    if not os.path.isdir(directory_path):
-        print(f"Error: '{directory_path}' is not a directory.")
-        return
-
-    # Walk through all files and directories
-    for root, dirs, files in os.walk(directory_path, topdown=False):
-        # Process files first
-        for file in files:
-            file_path = os.path.join(root, file)
-            # Skip .so files
-            if not file.endswith(".so"):
-                try:
-                    os.remove(file_path)
-                    # print(f"Deleted file: {file_path}")
-                except Exception as e:
-                    print(f"Error deleting file {file_path}: {e}")
-
-        # Process directories (after files have been processed)
-        for dir_name in dirs:
-            dir_path = os.path.join(root, dir_name)
-            # Check if directory contains any .so files
-            has_so_files = False
-            try:
-                for item in os.listdir(dir_path):
-                    if item.endswith(".so"):
-                        has_so_files = True
-                        break
-            except Exception as e:
-                print(f"Error accessing directory {dir_path}: {e}")
-                continue
-
-            # Only delete directory if it doesn't contain .so files
-            if not has_so_files:
-                try:
-                    shutil.rmtree(dir_path)
-                    # print(f"Deleted directory: {dir_path}")
-                except Exception as e:
-                    print(f"Error deleting directory {dir_path}: {e}")
-
-
 def prebuild_pa_decode_gluon_aot_so():
     """Run tests for multiple compute types and quantization types."""
     global BLOCK_SIZE_OPTIONS
@@ -1054,21 +1001,6 @@ def prebuild_pa_decode_gluon_aot_so():
 
     parse_arg_and_run_test()
 
-    # Clean current directory cache
-    current_dir = os.getcwd()
-    print(f"Cleaning current directory cache: {current_dir}/{MD_NAME}_*")
-    clean_current_dir_cache_cmd = ["sh", "-c", f"rm -rf {current_dir}/{MD_NAME}_*"]
-    result = subprocess.run(
-        clean_current_dir_cache_cmd, capture_output=True, text=True, timeout=100
-    )
-    if result.returncode != 0 and result.stderr:
-        print(f"Warning: {result.stderr}")
-    print(f"Cleaning current directory cache completed!")
-    # Clean aiter build directory cache, only *.so files are left
-    print(f"Cleaning aiter build directory cache: {BUILD_DIR}")
-    clean_directory_except_so(BUILD_DIR)
-    print("Cleaning aiter build directory cache completed, only *.so files are left!")
-    # Get the total size of so files in aiter build directory
     try:
         du_result = subprocess.run(
             ["du", "-sh", BUILD_DIR], capture_output=True, text=True, timeout=100
