@@ -1,23 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
-import aiter
+import argparse
+
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import argparse
+from einops import rearrange
+
+import aiter
 from aiter import dtypes
 from aiter.test_common import perftest
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 from aiter.utility.base_tuner import GemmCommonTuner
-from gemm_a8w8_blockscale_common import kernels_list
-import argparse
-from einops import rearrange
 from aiter.utility.mp_tuner import mp_tuner
+
+from legacy_gemm_a8w8_blockscale_instance import legacy_candidate_kernels_dict
+from tile_gemm_a8w8_blockscale_instance import tile_candidate_kernels_dict
 
 block_shape = (128, 128)
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    """
+    Run the reference GEMM operation using PyTorch.
+    """
+    
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape
     n = weight.shape[0]
@@ -47,18 +56,19 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-@perftest()
-def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
-    aiter.gemm_a8w8_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
-    return out
-
-
-def run_gemm_a8w8_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
-    aiter.gemm_a8w8_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
-    return out
+def run_ck_gemm_a8w8_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
+    """
+    Run gemm a8w8 blockscale tuned kernel for ck_tile type.
+    """
+    
+    return aiter.gemm_a8w8_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
 
 
 def generate_data(m, n, k, seed, device="cuda"):
+    """
+    Generate random data for testing the gemm a8w8 blockscale kernel.
+    """
+    
     torch.manual_seed(seed)
     block_shape_n, block_shape_k = block_shape
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -80,17 +90,158 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         "batch": 100,
         "profile_file": "",  # for all results
     }
+    
+    def __init__(self, name, keys, resultList, description=""):
+        """
+        Initialize the Gemm A8W8 BlockScale Tuner.
+        """
+        
+        super().__init__(name, keys, resultList, description)
 
     def _setup_specific_arguments(self):
-        pass
+        """
+        Setup specific arguments for the tuner.
+        """
+        
+        self.parser.add_argument(
+            "--libtype",
+            type=str,
+            default="all",
+            choices=["ck_legacy", "ck_tile", "all"],
+            required=False,
+            help="CK gemm a8w8 blockscale type to tune: ck_legacy, ck_tile or all",
+        )
 
     def calculate(self, results, bpes=(1, 1, 2)):
+        """
+        Calculate performance metrics based on results.
+        """
+        
         return super().calculate(results, bpes=(1, 1, 2))
 
-    def getKernelName(self, kernelId):
-        if kernelId >= len(kernels_list) or kernelId < 0:
+    def getKernelName(self, kernelId, type="ck_legacy"):
+        """
+        Get the kernel name based on the kernel ID for different types.
+        """
+        
+        candidate_kernels_dict = {}
+        if type == "ck_legacy":
+            if kernelId >= len(legacy_candidate_kernels_dict) or kernelId < 0:
+                return None
+            candidate_kernels_dict = legacy_candidate_kernels_dict
+        elif type == "ck_tile":
+            if kernelId >= len(tile_candidate_kernels_dict) or kernelId < 0:
+                return None
+            candidate_kernels_dict = tile_candidate_kernels_dict
+        else:
             return None
-        return kernels_list[kernelId].name
+        return candidate_kernels_dict[kernelId].name
+
+    def get_ck_tile_gemm_a8w8_blockscale_tune_task(
+        self,
+        info_keys,
+        useSplitK,
+        seed,
+    ):
+        (cu_num, M, N, K) = info_keys
+        kernels_num = len(tile_candidate_kernels_dict)
+        gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
+        ref_data_idx = [0, 1, 2, 3]
+        tasks_ck_legacy = []
+        for i in range(kernels_num):
+            kernel = tile_candidate_kernels_dict[i]
+            maxsplitK = (
+                aiter.compute_gemm_SplitK(
+                    M,
+                    N,
+                    K,
+                    kernel.MPerBLOCK,
+                    kernel.NPerBLOCK,
+                    kernel.KPerBLOCK,
+                )
+                if useSplitK
+                else 0
+            )
+            for splitK in range(maxsplitK + 1):
+                info = (info_keys, i, splitK, "", "ck_tile")
+                tasks_ck_legacy.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed),
+                        run_ck_gemm_a8w8_blockscale,
+                        (
+                            gemm_a8w8_idx,
+                            i,
+                            splitK,
+                        ),
+                        {},
+                        run_torch,
+                        (
+                            ref_data_idx,
+                            None,
+                            dtypes.bf16,
+                        ),
+                        {},
+                        None,
+                        1e-2,
+                        0.01,
+                    )
+                )
+        return tasks_ck_legacy
+
+    def get_ck_legacy_gemm_a8w8_blockscale_tune_task(
+        self,
+        info_keys,
+        useSplitK,
+        seed,
+    ):
+        (cu_num, M, N, K) = info_keys
+        kernels_num = len(legacy_candidate_kernels_dict)
+        gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
+        ref_data_idx = [0, 1, 2, 3]
+        tasks_ck_legacy = []
+        for i in range(kernels_num):
+            kernel = legacy_candidate_kernels_dict[i]
+            maxsplitK = (
+                aiter.compute_gemm_SplitK(
+                    M,
+                    N,
+                    K,
+                    kernel.MPerBLOCK,
+                    kernel.NPerBLOCK,
+                    kernel.KPerBLOCK,
+                )
+                if useSplitK
+                else 0
+            )
+            for splitK in range(maxsplitK + 1):
+                info = (info_keys, i, splitK, "", "ck_legacy")
+                tasks_ck_legacy.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed),
+                        run_ck_gemm_a8w8_blockscale,
+                        (
+                            gemm_a8w8_idx,
+                            i,
+                            splitK,
+                        ),
+                        {},
+                        run_torch,
+                        (
+                            ref_data_idx,
+                            None,
+                            dtypes.bf16,
+                        ),
+                        {},
+                        None,
+                        1e-2,
+                        0.01,
+                    )
+                )
+        return tasks_ck_legacy
 
     def tune(
         self,
@@ -105,67 +256,104 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
         task = []
-        tasks_data = []
-        gemm_a8w8_data_idx = [0, 1, 2, 3, 4]  # input index in generate_data
-        ref_data_idx = [0, 1, 2, 3]
-        seed = 0
+        tasks_data = []  # [(kernel_nums, datas)]
+        seed = 10000
         for i in range(len(untunedf)):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
-            kernels_num = len(kernels_list)
-
             seed = seed + 1
             total_kernel_nums = 0
-            for i in range(kernels_num):
-                kernel = kernels_list[i]
-                maxsplitK = (
-                    aiter.compute_gemm_SplitK(
-                        M,
-                        N,
-                        K,
-                        kernel.MPerBLOCK,
-                        kernel.NPerBLOCK,
-                        kernel.KPerBLOCK,
+            # kernels_num = len(legacy_candidate_kernels_dict)
+            info_keys = (cu_num, M, N, K)
+            if "all" in args.libtype or "ck_legacy" in args.libtype:
+                task.extend(
+                    self.get_ck_legacy_gemm_a8w8_blockscale_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
                     )
-                    if useSplitK
-                    else 0
                 )
-                for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, M, N, K), i, splitK, "")
-                    task.append(
-                        (
-                            info,
-                            generate_data,
-                            (M, N, K, seed),
-                            run_gemm_a8w8_blockscale,
-                            (
-                                gemm_a8w8_data_idx,
-                                i,
-                                splitK,
-                            ),
-                            {},
-                            run_torch,
-                            (ref_data_idx, None, dtypes.bf16),
-                            {},
-                            None,
-                            1e-2,
-                            0.1,
-                        )
+            if "all" in args.libtype or "ck_tile" in args.libtype:
+                task.extend(
+                    self.get_ck_tile_gemm_a8w8_blockscale_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
                     )
-                    total_kernel_nums = total_kernel_nums + 1
+                )
 
-                tasks_data.append((total_kernel_nums, ()))
+            total_kernel_nums = len(task)
+
+            tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+
         return ret
+    
 
+    def result_to_df(self, results):
+        """
+        post-process the tuning results into a DataFrame.
+        """
 
+        resultdf = pd.DataFrame(columns=self.columns)
+        for el in results:
+            info, time, err_ratio = el
+            keys, kernelId, splitK, kernelName, libtype = info
+            kernelName = (
+                "None"
+                if time == self.INVALID_TIME
+                else (
+                    self.getKernelName(kernelId, libtype)
+                    if kernelName == ""
+                    else kernelName
+                )
+            )
+            tflops, bw = self.calculate(el)
+            key_dict = dict(zip(self.keys, keys))
+
+            if len(results) == self.topk:
+                print(
+                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                )
+            key_dict.update(
+                {
+                    "libtype": [libtype],
+                    "kernelId": [kernelId],
+                    "splitK": [splitK],
+                    "us": [time],
+                    "kernelName": [kernelName],
+                    "errRatio": [err_ratio],
+                    "tflops": [tflops],
+                    "bw": [bw],
+                }
+            )
+            temp = pd.DataFrame(key_dict)
+            if resultdf.empty:
+                resultdf = temp
+            else:
+                resultdf = pd.concat([resultdf, temp], ignore_index=True)
+        return resultdf
+            
+        
 if __name__ == "__main__":
-    ## use default key and resultList
+    key = ["cu_num", "M", "N", "K"]
+    resultList = [
+        "libtype",
+        "kernelId",
+        "splitK",
+        "us",
+        "kernelName",
+        "tflops",
+        "bw",
+        "errRatio",
+    ]
     tuner = GemmA8W8BlockScaleTuner(
-        "GemmA8W8BlockScaleTuner",  # keys, resultList
+        "GemmA8W8BlockScaleTuner",
+        key,
+        resultList,
         description="gen API for CK gemm a8w8 blockscale kernel",
     )
 
