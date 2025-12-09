@@ -144,5 +144,5 @@ def _get_config(
     K: int,
 ):
     from ..utils.gemm_config_utils import get_gemm_config
-    
+
     return get_gemm_config("GEMM-A16W16-ATOMIC", M, N, K)

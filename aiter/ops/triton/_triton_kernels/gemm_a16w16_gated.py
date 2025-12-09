@@ -154,5 +154,7 @@ def _get_config(
     K: int,
 ):
     from ..utils.gemm_config_utils import get_gemm_config
-    
-    return get_gemm_config("GEMM-A16W16-gated", M, N, K, bounds=[64, 128, 256, 512, 2048])
+
+    return get_gemm_config(
+        "GEMM-A16W16-gated", M, N, K, bounds=[64, 128, 256, 512, 2048]
+    )
