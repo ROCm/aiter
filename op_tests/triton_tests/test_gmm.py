@@ -292,7 +292,6 @@ def torch_tgmm(
         G,
         device=lhs.device,
         existing_bias_grad=bias_grad,
-        accumulate=accumulate,
     )
 
     last_col = 0
@@ -424,7 +423,8 @@ def test_tgmm(
             )
 
 @pytest.mark.parametrize("persistent_str", {"p", "np"})
-def test_tgmm_accumulate(persistent_str: str):
+@pytest.mark.parametrize("with_bias_grad", [False, True])
+def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
     persistent: bool = persistent_str == "p"
     
     """Test ACCUMULATE semantics for persistent TGMM on a small, focused case."""
@@ -436,7 +436,7 @@ def test_tgmm_accumulate(persistent_str: str):
     trans_lhs = False
     rng_seed = 77
 
-    lhs, rhs, multiple_group_sizes, out_torch, _ = gen_tgmm_tensors(
+    lhs, rhs, multiple_group_sizes, out_torch, bias_grad_torch = gen_tgmm_tensors(
         M,
         K,
         N,
@@ -447,6 +447,7 @@ def test_tgmm_accumulate(persistent_str: str):
         trans_lhs=trans_lhs,
         rng_seed=rng_seed,
         unif_group_sizes=True,
+        use_bias=with_bias_grad,
     )
 
     # Take a single group_sizes configuration for this targeted test.
@@ -464,6 +465,7 @@ def test_tgmm_accumulate(persistent_str: str):
         group_sizes,
         preferred_element_type=out_dtype,
         existing_out=delta_ref,
+        bias_grad=bias_grad_torch,
         accumulate=False,
     )
     expected = base_out.clone()
@@ -471,6 +473,8 @@ def test_tgmm_accumulate(persistent_str: str):
 
     # Triton PTGMM/NPTGMM with ACCUMULATE=True.
     out_triton = base_out.clone()
+    bias_grad_triton = torch.empty_like(bias_grad_torch) if with_bias_grad else None
+
     if persistent:
         triton_ptgmm(
             lhs,
@@ -478,6 +482,7 @@ def test_tgmm_accumulate(persistent_str: str):
             group_sizes,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
+            bias_grad=bias_grad_triton,
             accumulate=True,
         )
     else:
@@ -487,6 +492,7 @@ def test_tgmm_accumulate(persistent_str: str):
             group_sizes,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
+            bias_grad=bias_grad_triton,
             accumulate=True,
         )
 
@@ -495,3 +501,11 @@ def test_tgmm_accumulate(persistent_str: str):
         expected[non_empty_groups],
         "Triton persistent TGMM ACCUMULATE semantics do not match reference behavior.",
     )
+    
+    # Check bias_grad
+    if with_bias_grad:
+        check_tensors(
+            bias_grad_triton[non_empty_groups],
+            bias_grad_torch[non_empty_groups],
+            "Triton persistent TGMM bias_grad with ACCUMULATE=True does not match reference.",
+        )

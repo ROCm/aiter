@@ -291,13 +291,12 @@ def ptgmm(
         internal tuning database.
     bias_grad : torch.Tensor or None, optional
         Optional bias gradient output tensor. Shape: (G, K).
-        If provided, the kernel will compute and accumulate the bias gradient into this tensor.
+        If provided, the kernel will compute the bias gradient and write it to this tensor.
         bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
-        must be on the same device as other tensors, and must be row-major with stride (K, 1).
     accumulate : bool, optional
-        Whether to accumulate into existing bias_grad values. Default is False.
-        If False and bias_grad is provided, bias_grad will be zeroed before computation.
-        If True and bias_grad is provided, gradients will be accumulated into existing values.
+        Whether to accumulate into existing output tensor values. Default is False.
+        If False, output will be overwritten with fresh computation.
+        If True, results will be added to existing output tensor values.
 
     Returns
     -------
@@ -360,7 +359,6 @@ def ptgmm(
         G,
         device=lhs.device,
         existing_bias_grad=bias_grad,
-        accumulate=accumulate,
     )
 
     grid = _ptgmm_grid(
@@ -476,15 +474,12 @@ def nptgmm(
         internal tuning database.
     bias_grad : torch.Tensor or None, optional
         Optional bias gradient output tensor. Shape: (G, K).
-        If provided, the kernel will compute and accumulate the bias gradient into this tensor.
+        If provided, the kernel will compute the bias gradient and write it to this tensor.
         bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
-        must be on the same device as other tensors, and must be row-major with stride (K, 1).
     accumulate : bool, optional
-        Whether to accumulate into existing bias_grad values and output tensor. Default is False.
-        If False and bias_grad is provided, bias_grad will be zeroed before computation and the
-        output tensor will be overwritten. If True and bias_grad is provided, gradients will be
-        accumulated into existing values and the output tensor will be accumulated into instead
-        of overwritten.
+        Whether to accumulate into existing output tensor values. Default is False.
+        If False, output will be overwritten with fresh computation.
+        If True, results will be added to existing output tensor values.
 
     Returns
     -------
@@ -527,7 +522,6 @@ def nptgmm(
         G,
         device=lhs.device,
         existing_bias_grad=bias_grad,
-        accumulate=accumulate,
     )
 
     if config is None:

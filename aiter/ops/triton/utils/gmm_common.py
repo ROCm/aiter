@@ -651,15 +651,13 @@ def get_tgmm_bias_grad(
     G: int,
     device: torch.device | str = DEVICE,
     existing_bias_grad: Tensor | None = None,
-    accumulate: bool = False,
 ) -> Tensor:
     """ 
     Get or validate bias gradient tensor for TGMM.
     
-    If existing_bias_grad is provided, validates its shape, device, dtype, and stride.
-    If not accumulating, zeros the tensor before returning.
+    If existing_bias_grad is provided, validates its shape, device, dtype, and stride,
+    and always zeros it before returning (since the kernel uses atomic_add).
     If existing_bias_grad is None, returns a dummy tensor (for use when COMPUTE_BIAS_GRAD=False).
-    
     Parameters
     ----------
     K : int
@@ -669,10 +667,7 @@ def get_tgmm_bias_grad(
     device : torch.device or str
         Device for the tensor.
     existing_bias_grad : torch.Tensor or None
-        Existing bias gradient tensor to validate and use.
-    accumulate : bool
-        If False and existing_bias_grad is provided, zeros the tensor before returning.
-        
+        Existing bias gradient tensor to validate and use. 
     Returns
     -------
     torch.Tensor
@@ -698,9 +693,10 @@ def get_tgmm_bias_grad(
             1,
         ), f"bias_grad must be row-major with stride (K, 1) = ({K}, 1), got {existing_bias_grad.stride()}."
         
-        # Zero the tensor if not accumulating.
-        if not accumulate:
-            existing_bias_grad.zero_()
+        # Always zero the tensor since bias_grad represents gradients for the current
+        # computation and should start fresh. The kernel uses atomic_add which adds to
+        # existing values, so we must zero before the kernel runs.
+        existing_bias_grad.zero_()
         
         return existing_bias_grad
     
