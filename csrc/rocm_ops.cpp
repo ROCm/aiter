@@ -20,8 +20,11 @@
 #include "communication_asm.h"
 #include "custom.h"
 #include "custom_all_reduce.h"
+#if PREBUILD_KERNELS != 3
 #include "deepgemm.h"
+#endif
 #include "fused_mrope_rms.h"
+#if PREBUILD_KERNELS != 3
 #include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
@@ -29,7 +32,13 @@
 #include "gemm_a8w8_bpreshuffle.h"
 #include "gemm_a8w8_bpreshuffle_cktile.h"
 #include "gemm_common.h"
+#endif
+#if PREBUILD_KERNELS != 3
+#include "asm_a8w8_blockscale_bpreshuffle.h"
+#include "asm_flatmm_a8w8_blockscale.h"
+#include "batched_gemm_bf16.h"
 #include "hipbsolgemm.cuh"
+#endif
 #include "mla.h"
 #include "moe_ck.h"
 #include "moe_op.h"
@@ -39,7 +48,9 @@
 #include "quant.h"
 #include "quick_all_reduce.h"
 #include "rmsnorm.h"
+#if PREBUILD_KERNELS != 3
 #include "rocsolgemm.cuh"
+#endif
 #include "rope.h"
 #include "sample.h"
 #include "smoothquant.h"
@@ -61,10 +72,10 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
 #if PREBUILD_KERNELS != 3
-    GEMM_A8W8_TUNE_PYBIND;
-    AITER_ENUM_PYBIND;
+    // GEMM_A8W8_TUNE_PYBIND;
     RMSNORM_PYBIND;
     GEMM_COMMON_PYBIND;
+    TOPK_PLAIN_PYBIND;
 #if PREBUILD_KERNELS == 2
     MHA_VARLEN_FWD_PYBIND;
     MHA_FWD_PYBIND;
@@ -84,16 +95,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     GEMM_A8W8_BPRESHUFFLE_PYBIND;
     CUSTOM_PYBIND;
     SMOOTHQUANT_PYBIND;
-#if PREBUILD_KERNELS == 4
     BATCHED_GEMM_A8W8_PYBIND;
-    BATCHED_GEMM_A8W8_TUNE_PYBIND;
-    GEMM_A8W8_TUNE_PYBIND;
-    GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
-    GEMM_A8W8_BPRESHUFFLE_TUNE_PYBIND;
-#endif
+    BATCHED_GEMM_BF16_PYBIND;
+    // BATCHED_GEMM_A8W8_TUNE_PYBIND;
+    // GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
+    // GEMM_A8W8_BPRESHUFFLE_TUNE_PYBIND;
     GEMM_A8W8_ASM_PYBIND;
     GEMM_A4W4_ASM_PYBIND;
     GEMM_A16W16_ASM_PYBIND;
+    FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND;
+    GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_ASM_PYBIND;
     ACTIVATION_PYBIND;
     ATTENTION_ASM_MLA_PYBIND;
     ATTENTION_CK_PYBIND;
@@ -102,6 +113,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     POS_ENCODING_PYBIND;
     ATTENTION_PYBIND;
     MOE_CK_2STAGES_PYBIND;
+    AITER_ENUM_PYBIND;
+#if PREBUILD_KERNELS == 4
+    MOE_CKTILE_2STAGES_PYBIND;
+#endif
     QUANT_PYBIND;
     ATTENTION_ASM_PYBIND;
     ATTENTION_RAGGED_PYBIND;
@@ -113,8 +128,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     ROPE_POS_FWD_PYBIND;
     FUSED_MROPE_RMS_PYBIND;
 #if PREBUILD_KERNELS == 4
-    GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
+    // GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
     GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND;
+    // GEMM_A8W8_BPRESHUFFLE_CKTILE_TUNE_PYBIND;
 #endif
     GEMM_A4W4_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_PYBIND;
@@ -130,10 +146,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     MLA_METADATA_PYBIND;
     MLA_REDUCE_PYBIND;
     DEEPGEMM_PYBIND;
-    TOPK_PLAIN_PYBIND;
-#if PREBUILD_KERNELS == 4
+#if PREBUILD_KERNELS != 3
     TOP_K_PER_ROW_PYBIND;
 #endif
     PA_METADATA_PYBIND;
-#endif }
+#endif
+}
 #endif

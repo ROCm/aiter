@@ -94,6 +94,14 @@ if IS_ROCM:
                 "module_fmha_v3_varlen_fwd",
                 "module_mha_bwd",
                 "module_mha_varlen_bwd",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
             ]
         elif PREBUILD_KERNELS == 2:
             return [
@@ -103,6 +111,14 @@ if IS_ROCM:
                 "module_fmha_v3_varlen_bwd",
                 "module_mha_bwd",
                 "module_mha_varlen_bwd",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
             ]
         elif PREBUILD_KERNELS == 3:
             return [
@@ -173,9 +189,18 @@ if IS_ROCM:
                 "module_top_k_per_row",
                 "module_mla_metadata",
                 "module_mla_reduce",
+                "module_topk_plain",
             ]
         else:
-            return []
+            return [             
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",]
 
     exclude_ops = get_exclude_ops()
 
