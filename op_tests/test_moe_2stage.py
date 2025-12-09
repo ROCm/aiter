@@ -316,7 +316,7 @@ def test_fmoe(
         #     quant_dtype=q_dtype_a,
         #     num_rows=None,
         # )
-        a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType)
+        a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType, scale_type=dtyps.fp8)
     else:
         a1 = input
         a1_scale_stage1 = None

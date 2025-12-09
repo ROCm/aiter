@@ -100,7 +100,7 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     return y, scale.view(dtypes.fp8_e8m0)
 
 
-def per_1x32_f8_scale_f8_quant(x, scale=None, quant_dtype=dtypes.fp8, shuffle=False):
+def per_1x32_f8_scale_f8_quant(x, scale=None, quant_dtype=dtypes.fp8, scale_type=dtypes.fp32, shuffle=False):
     assert quant_dtype == dtypes.fp8
     block_size = 32
     F8E8M0_EXP_BIAS = 127
@@ -120,12 +120,21 @@ def per_1x32_f8_scale_f8_quant(x, scale=None, quant_dtype=dtypes.fp8, shuffle=Fa
     # max_abs = ((max_abs + 0x200000) & 0xFF800000).view(torch.float32)
 
     # fp8e8m0fnu_from_fp32_value
-    scale_f32 = max_abs / dtypeMax
+    if scale_type == dtypes.fp32:
+        scale_f32 = max_abs / dtypeMax
+        scale_e8m0_biased = None
+    else:
+        scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+        scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
 
-    # Float8_e8m0fnu to float
     y = x.float() / scale_f32.view(-1, 1)
     y = y.view(*shape_original[:-1], -1)
-    scale = scale_f32.view(m, -1)
+    if scale_type == dtypes.fp32:
+        scale = scale_f32.view(m, -1)
+    else:
+        scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
+        if shuffle:
+            scale = fp4_utils.e8m0_shuffle(scale)
     return y.to(quant_dtype), scale
 
 
