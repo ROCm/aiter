@@ -40,39 +40,6 @@ MD_NAME_QUERY = "transpose_query_gluon_kernel"
 MD_NAME_OUTPUT = "transpose_output_gluon_kernel"
 
 
-def parse_version(version_str):
-    """Parse version string into comparable tuple format, handling possible development version suffixes"""
-    # Remove potential suffixes like .dev, +git etc.
-    version_str = version_str.split("+")[0].split("-")[0]
-
-    # Split version number and convert to integers
-    parts = []
-    for part in version_str.split("."):
-        try:
-            parts.append(int(part))
-        except ValueError:
-            break
-
-    return tuple(parts)
-
-
-def tensor_to_hash(tensor: torch.Tensor, algorithm: str = "md5") -> str:
-    """
-    Convert a PyTorch tensor to a hash value using the specified algorithm.
-
-    Args:
-        tensor (torch.Tensor): Input tensor
-        algorithm (str): Hash algorithm, defaults to 'md5'
-
-    Returns:
-        str: Hexadecimal string representation of the hash value
-    """
-    hash_func = getattr(hashlib, algorithm)()
-    tensor_data = tensor.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()
-    hash_func.update(tensor_data)
-    return hash_func.hexdigest()
-
-
 def compile_query(
     data_type: torch.dtype,
     merged_block_size: int,

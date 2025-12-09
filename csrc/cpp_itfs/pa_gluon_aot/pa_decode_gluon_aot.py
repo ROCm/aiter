@@ -49,22 +49,6 @@ from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
 MD_NAME = "pa_decode_attention_reduce_kernel"
 
 
-def parse_version(version_str):
-    """Parse version string into comparable tuple format, handling possible development version suffixes"""
-    # Remove potential suffixes like .dev, +git etc.
-    version_str = version_str.split("+")[0].split("-")[0]
-
-    # Split version number and convert to integers
-    parts = []
-    for part in version_str.split("."):
-        try:
-            parts.append(int(part))
-        except ValueError:
-            break
-
-    return tuple(parts)
-
-
 def clean_directory_except_so(directory_path):
     """
     Delete all files and folders in the specified directory except for .so files.
@@ -161,7 +145,6 @@ def compile(
             raise RuntimeError(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
-        TRITON_VERSION = parse_version(triton.__version__)
 
         kv_compute_block_size = 256
         waves_per_eu = 1
@@ -307,11 +290,7 @@ def compile(
             f"{context_partition_size}",
         ]
         reduce_signature = ",".join(reduce_signature_parts)
-
-        reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel_triton34"
-        if TRITON_VERSION > (3, 4, 0):
-            reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
-
+        reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
         reduce_compile_args = CompileArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
             kernel_name=reduce_kernel_name,
