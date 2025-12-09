@@ -320,11 +320,11 @@ class Gemm:
                 )  # if self.splitK else 1
             else:
                 maxSplitK = 1
-            maxSplitK = min(maxSplitK, 8)
+            maxSplitK = min(maxSplitK, 64)
             # maxSplitK = 1
             if not bias and self.bias is not None:
                 continue
-            if bPreshuffle == 0 and self.is_shuffle:
+            if (bPreshuffle == 0 and self.is_shuffle) or (bPreshuffle == 1 and not self.is_shuffle):
                 continue
             solidx = solidx + 1
             self.asm_map[solidx] = kernelName
