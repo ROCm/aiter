@@ -156,12 +156,64 @@ def quant_per_block_int8_kernel(Input, Output, Scale, L,
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
     tl.store(scale_ptrs, scale)
 
-def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layout="NHD"):
+def compute_k_smoothing_factors(k: torch.Tensor, tensor_layout: str = "NHD") -> torch.Tensor:
+    """
+    Compute per-channel smoothing factors for K tensor following SageAttention approach.
     
+    This computes the mean across the sequence dimension for each channel (head_dim)
+    to reduce outliers before quantization, improving INT8 accuracy.
+    
+    Args:
+        k: Key tensor with shape (B, kv_len, H, head_dim) for NHD layout
+           or (B, H, kv_len, head_dim) for HND layout
+        tensor_layout: Either "NHD" or "HND"
+    
+    Returns:
+        k_smooth: Smoothing factors with shape matching k, computed as per-channel mean
+    """
+    if tensor_layout == "NHD":
+        # k shape: [B, kv_len, H, head_dim]
+        # Compute mean across sequence dimension (dim=1), keep dims for broadcasting
+        k_mean = k.mean(dim=1, keepdim=True)  # [B, 1, H, head_dim]
+    elif tensor_layout == "HND":
+        # k shape: [B, H, kv_len, head_dim]
+        # Compute mean across sequence dimension (dim=2), keep dims for broadcasting
+        k_mean = k.mean(dim=2, keepdim=True)  # [B, H, 1, head_dim]
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    
+    return k_mean
+
+def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layout="NHD", smooth_k=True):
+    """
+    Quantize Q and K tensors to INT8 with per-block scaling.
+    
+    Args:
+        q: Query tensor
+        k: Key tensor
+        km: Optional pre-computed K smoothing factors (if None and smooth_k=True, will be computed)
+        BLKQ: Block size for Q quantization
+        BLKK: Block size for K quantization
+        sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
+        tensor_layout: Either "NHD" or "HND"
+        smooth_k: Whether to apply SageAttention-style smoothing to K tensor (default: True)
+    
+    Returns:
+        q_int8: Quantized Q tensor
+        q_scale: Per-block scales for Q
+        k_int8: Quantized K tensor  
+        k_scale: Per-block scales for K
+        k_smooth: K smoothing factors applied (or None if smooth_k=False)
+    """
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 
-    if km is not None:
+    # Apply K tensor smoothing following SageAttention approach
+    k_smooth = None
+    if smooth_k:
+        if km is None:
+            km = compute_k_smoothing_factors(k, tensor_layout)
+            k_smooth = km
         k = k - km
 
     if tensor_layout == "HND":
@@ -209,7 +261,7 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         C=head_dim, BLK=BLKK
     )
 
-    return q_int8, q_scale, k_int8, k_scale
+    return q_int8, q_scale, k_int8, k_scale, k_smooth
 
 def _get_config():
     return {
@@ -263,9 +315,10 @@ def attn_qk_int8_per_block(
             config = _get_config()
        
         sm_scale = math.sqrt(head_dim)
-        q, q_scale, k, k_scale = per_block_int8(
-            q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+        q, q_scale, k, k_scale, k_smooth = per_block_int8(
+            q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout, smooth_k=True
         )
+        # Note: k_smooth factors are applied during quantization to reduce outliers (SageAttention approach)
         # naive torch quantization
         # int8_dtype = torch.int8
         # q, q_scale = int8_per_block_quantize_bshd(q, int8_dtype, block_size=config["BLOCK_SIZE_M"], include_sqrt_scale=True)

@@ -549,7 +549,7 @@ def run_benchmark(custom, args):
                     v = v.to(torch.float16)
                 k_mean = None
                 sm_scale = D_HEAD**-0.5
-                q, q_scale, k, k_scale = per_block_int8(
+                q, q_scale, k, k_scale, _ = per_block_int8(
                     q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
                 )
                 q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
