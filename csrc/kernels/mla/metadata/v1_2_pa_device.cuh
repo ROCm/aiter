@@ -102,6 +102,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     int32_t partial_idx        = 0;
     int32_t tot_qo_tiles       = 0;
     int32_t last_reduce_indptr = 0;
+    int32_t global_reduce_tile_idx = 0;
 
     for(int32_t cid = 0; cid < params.num_cu; ++cid)
     {
@@ -125,7 +126,6 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 const int32_t num_splits = curr_n_split_idx + 1;
 
                 auto fill_work_info = [&](const int32_t qo_tile_idx, const int32_t split_idx) {
-                    const int32_t global_qo_tile_idx = tot_qo_tiles + qo_tile_idx;
 
                     PaWorkInfo work_info{};
                     work_info.batch_idx = curr_batch;
@@ -150,10 +150,13 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
 
                         // set reduce info
-                        params.p_reduce_indptr[global_qo_tile_idx + 1] =
-                            last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
-                        params.p_reduce_final_map[global_qo_tile_idx * 2]     = work_info.qo_start;
-                        params.p_reduce_final_map[global_qo_tile_idx * 2 + 1] = work_info.qo_end;
+                        if (lane_idx == 0) {
+                            params.p_reduce_indptr[global_reduce_tile_idx + 1] =
+                                last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
+                            params.p_reduce_final_map[global_reduce_tile_idx * 2]     = work_info.qo_start;
+                            params.p_reduce_final_map[global_reduce_tile_idx * 2 + 1] = work_info.qo_end;
+                            global_reduce_tile_idx += 1;
+                        }
 
                         if constexpr(Traits::kQoSplits)
                         {
@@ -174,9 +177,6 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     else
                     {
                         work_info.partial_qo_loc                       = -1;
-                        params.p_reduce_indptr[global_qo_tile_idx + 1] = last_reduce_indptr;
-                        // params.p_reduce_final_map[global_qo_tile_idx * 2] = -1;
-                        // params.p_reduce_final_map[global_qo_tile_idx * 2 + 1] = -2;
                     }
 
                     p_work_info_set[num_works + qo_tile_idx] = work_info;
@@ -324,7 +324,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         params.p_work_indptr[cid + 1] = num_works;
     }
 
-    for(int32_t i = tot_qo_tiles + lane_idx; i < params.reduce_indptr_size;
+    global_reduce_tile_idx = __shfl(global_reduce_tile_idx, 0);
+    for(int32_t i = global_reduce_tile_idx + lane_idx; i < params.reduce_indptr_size;
         i += ck_tile::get_warp_size())
     {
         params.p_reduce_indptr[i] = last_reduce_indptr;
