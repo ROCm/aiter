@@ -194,6 +194,7 @@ a4w4_gemm1_kernels_list= {
      0: kernelInstanceGEMM1(       256,       32,          128,       128,     1,       4,        3,),
      1: kernelInstanceGEMM1(       256,       64,          128,       128,     1,       4,        3,),
      2: kernelInstanceGEMM1(       256,      128,          128,       128,     1,       4,        3,),
+     4: kernelInstanceGEMM1(        64,       32,           32,       128,     1,       1,        3,),
     #  3: kernelInstanceGEMM1(       256,      256,         128,       128,     2,       2,        3,),
 }
 
@@ -329,7 +330,7 @@ def get_gemm1_kernels_list(
     QuantType: str,
     ActOP: str,
     MulRoutedWeight: bool,
-    preshuffle: bool,
+    preshuffle: bool = False,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -393,7 +394,7 @@ def get_gemm2_kernels_list(
     Nswizzle: bool,
     QuantType: str,
     MulRoutedWeight: bool,
-    preshuffle: bool,
+    preshuffle: bool = False,
 ) -> list:
     arch = get_gfx()
 

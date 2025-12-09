@@ -72,8 +72,24 @@ from .ops.rmsnorm import *
 from .ops.communication import *
 from .ops.rope import *
 from .ops.topk import *
+from .ops.topk_plain import topk_plain
 from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
+from .ops.fused_mrope_rms import *
 from . import mla
+
+# Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
+try:
+    from .ops.triton.comms import (
+        IrisCommContext,
+        calculate_heap_size,
+        reduce_scatter,
+        all_gather,
+        reduce_scatter_rmsnorm_quant_all_gather,
+        IRIS_COMM_AVAILABLE,
+    )
+except ImportError:
+    # Iris not available, skip import
+    IRIS_COMM_AVAILABLE = False

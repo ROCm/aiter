@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
 from dataclasses import dataclass
@@ -16,9 +16,9 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
 )
 
 
-""" 
+"""
 
-gemm_a8w8_bpreshuffle_cktile instance gen 
+gemm_a8w8_bpreshuffle_cktile instance gen
 
 """
 
@@ -69,9 +69,9 @@ torch::Tensor
 
 """
 
-        INSTANCE_CONTENT_nobias = f"""using FlatmmInstance = CustomConfig<        
-            DDataType, EDataType, 
-            {k.sTransposeC},{k.sUseStructuredSparsity}, {k.sTileParitionerGroupNum}, 
+        INSTANCE_CONTENT_nobias = f"""using FlatmmInstance = CustomConfig<
+            DDataType, EDataType,
+            {k.sTransposeC},{k.sUseStructuredSparsity}, {k.sTileParitionerGroupNum},
             {k.sTileParitionerM01}, {k.sNumWaveGroups}, {k.sDoubleSmemBuffer},
             {k.PadM},  {k.PadN},  {k.PadK},
             {k.BlockPerCu},
@@ -233,13 +233,15 @@ def get_tune_dict(tune_dict_csv):
             gpu = torch.cuda.current_device()
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
+            tune_df = tune_df[(tune_df["cu_num"] == cu_num)].reset_index()
+        tune_df = tune_df[tune_df["libtype"] == "cktile"].reset_index()
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             kid = tune_df.loc[i, "kernelId"]
             if kid < 0 or kid > len(kernels_list):
+                print(f"[Warning]: kernelId {kid} is out of range, skip it")
                 continue
             tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict

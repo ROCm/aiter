@@ -33,7 +33,7 @@ def get_config(gmm_type: str, M: int, K: int, N: int, G: int) -> dict[str, int]:
     }, f"'{gmm_type}' is an invalid GMM variant."
     if not hasattr(get_config, "_config_dict"):
         config_filename = os.path.join(
-            AITER_TRITON_CONFIGS_PATH, f"{arch_info.get_device()}-GMM.json"
+            AITER_TRITON_CONFIGS_PATH, f"{arch_info.get_arch()}-GMM.json"
         )
         assert os.path.exists(config_filename) and os.path.isfile(
             config_filename
