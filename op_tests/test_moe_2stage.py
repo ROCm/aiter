@@ -13,6 +13,7 @@ import argparse
 import pandas as pd
 import os
 import numpy as np
+import logging
 
 from aiter.fused_moe import (
     fused_topk,
@@ -249,8 +250,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
-        num_iters=100,
-        num_warmup=50,
+        num_iters=5,
+        num_warmup=2,
     )
     err = checkAllclose(
         out2_ref,
@@ -265,46 +266,44 @@ def test_fmoe(
         return 1 - sim
 
     logits_diff = calc_diff(out2_ref, out2_ck)
-
-    # (1 + 2"""gate-up""")
-    num_byte = 2 * 128 * 3072 + 3 * 128 * 3072 * 3072 // 2 + 2 * 128 * 3072
-    # assert logits_diff < 1e-3
-    print(f"{num_byte}, {num_byte / us2 / 1e6}")
+    if logits_diff > 1e-3:
+        logging.warning(
+            f"logits_diff: {logits_diff} is too large, please check the implementation"
+        )
 
     return {"us": us2, "err": err}
 
 
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
-# l_dim = [(7168, 256)]
-l_dim = [(3072, 3072)]
+l_dim = [(7168, 256)]
+# l_dim = [(3072, 3072)]
 l_tokenNum = [
-    # 1,
-    # 2,
-    # 4,
-    # 8,
-    # 16,
-    # 32,
-    # 64,
+    1,
+    3,
+    5,
+    16,
+    32,
+    64,
     128,
-    # 256,
-    # 1024,
-    # 4096,
-    # 163840,
+    256,
+    1024,
+    4096,
+    163840,
 ]
 l_quant = [
-    # (aiter.QuantType.No, None, None),  # a16w16
-    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.No, None, None),  # a16w16
+    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
+    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
-l_hidden_intermediate_pad = [(192, 128), (65, 65), (129, 191)][:1]
-l_preshuffle = [False, True][:1]
+l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+l_preshuffle = [False, True]
 
 
 parser = argparse.ArgumentParser(
@@ -384,7 +383,7 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=128,
+    default=8,
     help="""Number of experts.
     e.g.: -e 8""",
 )
@@ -393,7 +392,7 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=4,
+    default=2,
     help="""Number of top experts.
     e.g.: -k 2""",
 )
@@ -439,8 +438,7 @@ for (
     (quant_type, aq_dtype, wq_dtype),
     (model_dim, inter_dim),
     doweight_stage1,
-    preshuffle,
-) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1, l_preshuffle):
+) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1):
     if (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
         dtypes.bf16,
