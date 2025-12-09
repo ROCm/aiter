@@ -214,14 +214,16 @@ if IS_ROCM:
     except Exception:
         has_torch = False
 
-    if PREBUILD_KERNELS != 0 and not has_torch:
-        print("[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment")
-    elif PREBUILD_KERNELS != 0:
-        all_opts_args_build, prebuild_link_param = core.get_args_of_build(
-            "all", exclude=exclude_ops
-        )
-        import glob
+    if PREBUILD_KERNELS != 0:  
+        if not has_torch:  
+            print("[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment")  
+        else:  
+            all_opts_args_build, prebuild_link_param = core.get_args_of_build(  
+                "all", exclude=exclude_ops  
+            )  
+
         bd = f"{core.get_user_jit_dir()}/build"
+        import glob
         shutil.rmtree(bd, ignore_errors=True)
         for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
             try:
