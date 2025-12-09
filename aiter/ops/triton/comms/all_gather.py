@@ -239,7 +239,6 @@ def all_gather(
     )
 
     # Synchronize
-    torch.cuda.synchronize()
     iris_ctx.barrier()
 
     logger.info(
