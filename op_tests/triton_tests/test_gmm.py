@@ -305,7 +305,7 @@ def torch_tgmm(
 
         start_idx = last_col
         end_idx = last_col + m
-        mm = (lhs[:, start_idx:end_idx] @ rhs[start_idx:end_idx, :])
+        mm = lhs[:, start_idx:end_idx] @ rhs[start_idx:end_idx, :]
         out[g] = mm.to(preferred_element_type)
 
         # Bias gradient: sum lhs across m-dimension (columns) for each group.
@@ -339,7 +339,7 @@ def test_tgmm(
 ):
     assert persistent_str in {"p", "np"}
     persistent: bool = persistent_str == "p"
-    
+
     in_dtype = dtype_from_str(in_dtype_str)
     out_dtype = dtype_from_str(out_dtype_str)
     trans_lhs = trans_lhs_from_str(trans_lhs_str)
@@ -422,11 +422,12 @@ def test_tgmm(
                 rtol=bias_rtol,
             )
 
+
 @pytest.mark.parametrize("persistent_str", {"p", "np"})
 @pytest.mark.parametrize("with_bias_grad", [False, True])
 def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
     persistent: bool = persistent_str == "p"
-    
+
     """Test ACCUMULATE semantics for persistent TGMM on a small, focused case."""
     # Use the smallest TEST_ONLY_SHAPES entry to keep runtime low.
     M, K, N, G = TEST_ONLY_SHAPES[0]
@@ -469,7 +470,9 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
         accumulate=False,
     )
     expected = base_out.clone()
-    expected[non_empty_groups] = expected[non_empty_groups] + delta_ref[non_empty_groups]
+    expected[non_empty_groups] = (
+        expected[non_empty_groups] + delta_ref[non_empty_groups]
+    )
 
     # Triton PTGMM/NPTGMM with ACCUMULATE=True.
     out_triton = base_out.clone()
@@ -501,7 +504,7 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
         expected[non_empty_groups],
         "Triton persistent TGMM ACCUMULATE semantics do not match reference behavior.",
     )
-    
+
     # Check bias_grad
     if with_bias_grad:
         check_tensors(

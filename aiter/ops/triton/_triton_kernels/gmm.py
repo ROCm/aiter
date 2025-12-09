@@ -208,14 +208,16 @@ def gmm_kernel(
 
             # Add bias if enabled
             if USE_BIAS:
-                offs_bias_n = tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                offs_bias_n = tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(
+                    0, BLOCK_SIZE_N
+                )
                 bias_ptrs = bias_ptr + g.to(tl.int64) * N + offs_bias_n
                 bias = tl.load(bias_ptrs, mask=offs_bias_n < N, other=0.0)
                 # Convert bias to float32 to match accumulator precision
                 bias = bias.to(tl.float32)
                 # Broadcast bias across M dimension and add in float32
                 acc += bias[None, :]
-            
+
             # Convert to output dtype after all computations
             acc = acc.to(out_ptr.type.element_ty)
 
@@ -349,7 +351,7 @@ def tgmm_persistent_kernel(
                 loop_m -= 1
 
             acc = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
-            
+
             # Initialize bias accumulator
             bias_acc = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
 
@@ -358,10 +360,12 @@ def tgmm_persistent_kernel(
                 rhs = tl.load(rhs_ptrs)
 
                 acc += tl.dot(lhs, rhs, input_precision="ieee")
-                
+
                 # Accumulate for bias gradient: sum lhs across M dimension
                 if COMPUTE_BIAS_GRAD and tile_n == 0:
-                    bias_acc += tl.sum(lhs, axis=1)  # Sum across M dimension [K, M] -> [K]
+                    bias_acc += tl.sum(
+                        lhs, axis=1
+                    )  # Sum across M dimension [K, M] -> [K]
 
                 if TRANS_LHS:
                     lhs_ptrs += BLOCK_SIZE_M * K
@@ -381,7 +385,7 @@ def tgmm_persistent_kernel(
                 lhs = tl.load(lhs_ptrs, mask=offs_m[None, :] < m, other=0)
                 rhs = tl.load(rhs_ptrs, mask=offs_m[:, None] < m, other=0)
                 acc += tl.dot(lhs, rhs, input_precision="ieee")
-                
+
                 # Accumulate last chunk for bias gradient
                 if COMPUTE_BIAS_GRAD and tile_n == 0:
                     bias_acc += tl.sum(lhs, axis=1)
@@ -406,13 +410,15 @@ def tgmm_persistent_kernel(
             else:
                 # Overwrite output (like beta=0 in BLAS)
                 tl.store(out_ptrs, acc, mask=mask)
-            
+
             # Store bias gradient (only for first N tile, sum across all M)
             if COMPUTE_BIAS_GRAD and tile_n == 0:
                 # Keep as float32 for atomic_add (bf16 not supported for atomics)
                 bias_grad_ptrs = bias_grad_ptr + g.to(tl.int64) * K + offs_out_k
                 # Use atomic add since multiple K-tiles may write to same expert's bias
-                tl.atomic_add(bias_grad_ptrs, bias_acc, mask=offs_out_k < K, sem="relaxed")
+                tl.atomic_add(
+                    bias_grad_ptrs, bias_acc, mask=offs_out_k < K, sem="relaxed"
+                )
 
             # Go to the next tile by advancing number of programs.
             tile += GRID_DIM
