@@ -11,7 +11,6 @@ from triton.tools.compile import compile_kernel, CompileArgs
 from jinja2 import Template
 from aiter.test_common import perftest, run_perftest
 from aiter.ops.triton.gluon.pa_decode_gluon import (
-    paged_attention_decode_v2_reduce_kernel_triton34,
     paged_attention_decode_v2_reduce_kernel,
 )
 from csrc.cpp_itfs.torch_utils import torch_to_c_types

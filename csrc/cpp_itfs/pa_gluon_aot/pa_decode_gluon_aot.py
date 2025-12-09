@@ -243,9 +243,9 @@ def compile(
             f"{is_causal}",
         ]
         signature = ",".join(signature_parts)
-        gluon_kernel_name = "paged_attention_decode_v2_gluon_fp8"
+        gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"
         if kv_block_size > context_partition_size:
-            gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
+            gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_dot_kernel"
 
         current_dir = os.getcwd()
         aot_file_dir = f"{current_dir}/{func_name}"

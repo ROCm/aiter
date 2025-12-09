@@ -480,7 +480,7 @@ def transpose_output_gluon(
 
 
 @gluon.jit
-def paged_attention_decode_v2_gluon_large_block_fp8(
+def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
@@ -1122,7 +1122,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 #     key = ['Q_SEQ_LEN', 'QUERY_GRP_SZ_POW2', 'KV_BLK_SZ'],
 # )
 @gluon.jit
-def paged_attention_decode_v2_gluon_fp8(
+def paged_attention_decode_v2_gluon_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
@@ -2253,13 +2253,13 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     # Select kernel implementation based on block size
     if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
         # Use big block kernel for large block sizes
-        paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_fp8
+        paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_dot_kernel
         if VALUE_TRANSPOSED:
             # Use smaller compute block size for better performance with transposed values
             KV_COMPUTE_BLOCK_SIZE = 128
     else:
         # Use standard kernel for normal block sizes
-        paged_attention_kernel = paged_attention_decode_v2_gluon_fp8
+        paged_attention_kernel = paged_attention_decode_v2_gluon_dot_kernel
         # Configure waves per EU based on query group size
         if QUERY_GROUP_SIZE_POW2 == 64:
             waves_per_eu = 3

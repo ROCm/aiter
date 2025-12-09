@@ -29,8 +29,8 @@ from csrc.cpp_itfs.utils import (
     run_lib,
 )
 from aiter.ops.triton.gluon.pa_decode_gluon import (
-    paged_attention_decode_v2_gluon_fp8,
-    paged_attention_decode_v2_gluon_large_block_fp8,
+    paged_attention_decode_v2_gluon_dot_kernel,
+    paged_attention_decode_v2_gluon_large_block_dot_kernel,
 )
 from op_tests.triton_tests.test_pa_decode_gluon import (
     torch_attention_compute,
@@ -266,9 +266,9 @@ def compile_attention_kernel(
             f"{is_causal}",
         ]
         signature = ",".join(signature_parts)
-        gluon_kernel_name = "paged_attention_decode_v2_gluon_fp8"
+        gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"
         if kv_block_size > context_partition_size:
-            gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
+            gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_dot_kernel"
 
         compile_args = CompileGluonArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
@@ -543,7 +543,7 @@ def run_direct_attention_kernel(
     # Debug compilation path - kept for development and debugging purposes
     # if 1:
     if 0:
-        ttgir_file_path = "/mnt/raid0/heyanguang/code/fa_triton/aiter/paged_attention_decode_v2_gluon_fp8.ttgir"
+        ttgir_file_path = "/mnt/raid0/heyanguang/code/fa_triton/aiter/paged_attention_decode_v2_gluon_dot_kernel.ttgir"
         with open(ttgir_file_path, "r") as f:
             ttgir_content = f.read()
         try:
@@ -598,11 +598,11 @@ def run_direct_attention_kernel(
         waves_per_eu = 1
 
         # Use standard kernel
-        kernel = paged_attention_decode_v2_gluon_fp8
+        kernel = paged_attention_decode_v2_gluon_dot_kernel
         # Select kernel implementation based on block size
         if kv_block_size > context_partition_size:
             # Use large block kernel
-            kernel = paged_attention_decode_v2_gluon_large_block_fp8
+            kernel = paged_attention_decode_v2_gluon_large_block_dot_kernel
             if value_transposed:
                 # Use smaller compute block size for better performance with transposed values
                 kv_compute_block_size = 128
