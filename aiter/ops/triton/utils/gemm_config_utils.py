@@ -60,9 +60,8 @@ def get_gemm_config(
             config = json.load(file)
         get_gemm_config._config_cache[cache_key]["default"] = config
 
-    # Determine which config dict to use (default or specialized)
     config_dict_key = "default"
-    
+
     # Handle custom specialized filename (for fused kernels with multiple N dims)
     if specialized_filename is not None:
         spec_key = specialized_filename
@@ -103,7 +102,7 @@ def get_gemm_config(
         if M <= bound and key in config_dict:
             return dict(config_dict[key])
 
-    # Search for M_GEQ_x keys (looking for largest threshold that M exceeds)
+    # Search for M_GEQ_x keys
     for bound in reversed(search_bounds):
         key = f"M_GEQ_{bound}"
         if M >= bound and key in config_dict:
