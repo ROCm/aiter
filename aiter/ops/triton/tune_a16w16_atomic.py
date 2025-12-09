@@ -58,14 +58,20 @@ def get_configs_compute_bound() -> List[Dict[str, int | str]]:
     # Optimize parameters based on kernel analysis
     # Only test parameters that are actually used in the kernel
     # Based on the generated configs, we'll use the optimal values
-    for num_stages in [2,3,4,5]:  # Only 1 stage is used
-        for block_m in [16,32,64,128]:  # Fixed to 64 as in current configs
-            for block_k in [64,128]:  # Fixed to 64 as in current configs
-                for block_n in [32,64,128,256]:  # Fixed to 32 as in current configs
-                    for group_size in [1,8,16,32,64]:  
-                        for num_warps in [4,8]: 
-                            for num_ksplit in [1,2,4,8]:  # Only test 1 since higher values may cause issues
-                                for waves_per_eu in [2,4,8]:  # Fixed to 3 as in current configs
+    for num_stages in [2, 3, 4, 5]:  # Only 1 stage is used
+        for block_m in [16, 32, 64, 128, 256]:  # Fixed to 64 as in current configs
+            for block_n in [32, 64, 128, 256]:  # Fixed to 32 as in current configs
+                for block_k in [64, 128]:  # Fixed to 64 as in current configs
+                    for group_size in [1, 8, 16, 32, 64]:
+                        for num_warps in [4, 8]:
+                            for num_ksplit in [
+                                1,
+                            ]:  # Only test 1 since higher values may cause issues
+                                for waves_per_eu in [
+                                    2,
+                                    4,
+                                    8,
+                                ]:  # Fixed to 3 as in current configs
                                     configs.append(
                                         {
                                             "BLOCK_SIZE_M": block_m,
@@ -87,9 +93,9 @@ def get_configs_compute_bound() -> List[Dict[str, int | str]]:
 
 def get_weight_shapes(tp_size: int) -> List[Tuple[int, int]]:
     total = [
-        (1024, 1024),
-        (4096, 1024),
-        (1024, 2048),
+        # (1024, 1024),
+        # (4096, 1024),
+        # (1024, 2048),
         (6144, 1024),
         (1024, 3072),
     ]
@@ -169,7 +175,7 @@ def tune(
 ):
     if input_type == "bfloat16":
         # Use the same input generation as test file
-        x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
+        x, weight, x_scale, w_scale, y = generate_gemm_a16w16_inputs(
             M, N, K, torch.bfloat16, output=True
         )
     else:
@@ -181,7 +187,7 @@ def tune(
         try:
             kernel_time = benchmark_config(
                 x=x,
-                w=w,
+                w=weight,
                 dtype=torch.float32,
                 y=None,
                 config=config,
