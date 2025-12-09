@@ -194,8 +194,8 @@ if IS_ROCM:
                 "module_topk_plain",
             ]
         else:
-            return [          
-                "module_gemm_mi350_a8w8_blockscale_asm",   
+            return [
+                "module_gemm_mi350_a8w8_blockscale_asm",
                 "module_batched_gemm_bf16_tune",
                 "module_batched_gemm_a8w8_tune",
                 "module_gemm_a8w8_tune",
@@ -214,16 +214,19 @@ if IS_ROCM:
     except Exception:
         has_torch = False
 
-    if PREBUILD_KERNELS != 0:  
-        if not has_torch:  
-            print("[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment")  
-        else:  
-            all_opts_args_build, prebuild_link_param = core.get_args_of_build(  
-                "all", exclude=exclude_ops  
-            )  
+    if PREBUILD_KERNELS != 0:
+        if not has_torch:
+            print(
+                "[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment"
+            )
+        else:
+            all_opts_args_build, prebuild_link_param = core.get_args_of_build(
+                "all", exclude=exclude_ops
+            )
 
         bd = f"{core.get_user_jit_dir()}/build"
         import glob
+
         shutil.rmtree(bd, ignore_errors=True)
         for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
             try:
@@ -267,14 +270,20 @@ if IS_ROCM:
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
                 list(executor.map(build_one_module, all_opts_args_build))
         if os.environ.get("AITER_SKIP_AGGREGATE", "1") != "1":
-            agg_flags_cc = list(prebuild_link_param["flags_extra_cc"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
-            agg_flags_hip = list(prebuild_link_param["flags_extra_hip"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
-            agg_srcs = sorted(set(
-                s
-                for one in all_opts_args_build
-                for s in one["srcs"]
-                if ("/pybind/" not in s and not s.endswith("_pybind.cu"))
-            )) + [os.path.join(this_dir, "csrc", "rocm_ops.cpp")]
+            agg_flags_cc = list(prebuild_link_param["flags_extra_cc"]) + [
+                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+            ]
+            agg_flags_hip = list(prebuild_link_param["flags_extra_hip"]) + [
+                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+            ]
+            agg_srcs = sorted(
+                set(
+                    s
+                    for one in all_opts_args_build
+                    for s in one["srcs"]
+                    if ("/pybind/" not in s and not s.endswith("_pybind.cu"))
+                )
+            ) + [os.path.join(this_dir, "csrc", "rocm_ops.cpp")]
             core.build_module(
                 md_name="aiter_",
                 srcs=agg_srcs,
@@ -340,7 +349,9 @@ class ForcePlatlibDistribution(Distribution):
 
 
 if is_develop_mode() and PREBUILD_KERNELS > 0:
-    print("[aiter] PREBUILD_KERNELS>0 + develop: do prebuild only and skip editable install")
+    print(
+        "[aiter] PREBUILD_KERNELS>0 + develop: do prebuild only and skip editable install"
+    )
 else:
     setup(
         name=PACKAGE_NAME,
