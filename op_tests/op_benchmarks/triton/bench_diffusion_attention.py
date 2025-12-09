@@ -1,9 +1,12 @@
+from __future__ import annotations
+from typing import Optional, Tuple, Union
+import torch
+
 import sys
 import warnings
 import argparse
 import itertools
 
-import torch
 import triton
 
 from aiter.ops.triton.mha import (
@@ -32,6 +35,103 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
 
+
+
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton.mha_v3 import _quantize_bshd
+def fav3_fp8_forward_func(
+        q: torch.Tensor,  # High precision (BF16/FP32)
+        k: torch.Tensor,  # High precision (BF16/FP32)
+        v: torch.Tensor,  # High precision (BF16/FP32)
+        softmax_scale: Optional[float],
+        causal: bool,
+        window_size: Tuple[int, int],
+        attention_chunk: int,
+        softcap: float,
+        deterministic: bool,
+        sm_margin: int,
+    ):
+        batch, seqlen, num_q_heads, head_dim = q.shape
+        _, _, num_kv_heads, _ = k.shape
+
+        # Quantize inputs to FP8
+        fp8_dtype = torch.float8_e4m3fnuz
+
+        # For GQA/MQA: quantize query with grouped scaling
+        group_size = (
+            num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
+        )
+        q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
+        k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
+        v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+
+        # Verify descale shapes for GQA/MQA
+        assert q_descale.shape == (
+            batch,
+            num_kv_heads,
+        ), f"q_descale shape {q_descale.shape} != expected {(batch, num_kv_heads)}"
+        assert k_descale.shape == (
+            batch,
+            num_kv_heads,
+        ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads)}"
+        assert v_descale.shape == (
+            batch,
+            num_kv_heads,
+        ), f"v_descale shape {v_descale.shape} != expected {(batch, num_kv_heads)}"
+
+        # Derive softmax scale if not provided
+        if softmax_scale is None:
+            softmax_scale = head_dim ** (-0.5)
+
+        # Validate unsupported features
+        if attention_chunk not in (0, 1):
+            raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
+        if softcap != 0.0:
+            raise NotImplementedError(
+                "softcap not implemented in FP8 high-precision API"
+            )
+        if sm_margin != 0:
+            raise NotImplementedError(
+                "sm_margin != 0 not supported in FP8 high-precision API"
+            )
+
+        # Call flash attention forward
+        return lambda: flash_attn_3.fwd(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            None,
+            None,
+            None,
+            None,  # k_new, v_new, qv, out
+            None,
+            None,
+            None,  # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
+            None,
+            None,
+            None,
+            None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
+            None,
+            None,
+            None,  # page_table, kv_batch_idx, leftpad_k
+            None,
+            None,
+            None,  # rotary_cos, rotary_sin, seqlens_rotary
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            causal,
+            int(window_size[0]),
+            int(window_size[1]),
+            attention_chunk,
+            softcap,
+            False,  # rotary_interleaved
+            None,
+            1,
+            None,
+            sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+        )
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
@@ -145,63 +245,42 @@ def run_benchmark(custom, args):
         total_flops += (
             2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
         )
-        if args.fp8:
-            def fn():
-                return flash_attn_fp8_func(
-                    q_input,
-                    k_input,
-                    v_input,
-                    softmax_scale=sm_scale,
-                    causal=causal,
-                )
-        elif args.qk_int8:
+        if args.fp8: #  fav3 fp8
+            fn = fav3_fp8_forward_func(
+                q,
+                k,
+                v,
+                softmax_scale=sm_scale,
+                causal=False,
+                window_size=(-1, -1),
+                attention_chunk=0,
+                softcap=0.0,
+                deterministic=False,
+                sm_margin=0,
+            )
+        elif args.qk_int8: # sage v1
             assert args.layout == "bshd", "int8 quantization only supports bshd layout."
             # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
             tensor_layout = args.qk_int8_layout
             config = _get_config()
-            
-            if args.real_quant:
-                # Real quantization: use per_block_int8 for proper quantization
-                # Original tensors are in NHD format (batch, seq, heads, dim)
-                if tensor_layout == "HND":
-                    # Convert from NHD to HND for better memory access
-                    q = q.transpose(1, 2).contiguous()
-                    k = k.transpose(1, 2).contiguous()
-                    v = v.transpose(1, 2).contiguous().to(torch.float16)
-                else:  # NHD
-                    # Keep original layout
-                    v = v.to(torch.float16)
-                k_mean = None
-                sm_scale = D_HEAD**-0.5
-                q, q_scale, k, k_scale = per_block_int8(
-                    q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
-                )
-                
-                q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
-                k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
-                
-                # if I uncomment these lines, it makes the kernel run much faster
-                q_scale = torch.randn(BATCH, HQ, ((N_CTX_Q + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
-                k_scale = torch.randn(BATCH, HK, ((N_CTX_K + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
-            else:
-                # Fake quantization: use random int8 tensors directly (faster, for benchmarking kernel only)
-                if tensor_layout == "HND":
-                    # HND format: (batch, heads, seq, dim)
-                    q = torch.randint(-127, 127, (BATCH, HQ, N_CTX_Q, D_HEAD), dtype=torch.int8, device=device)
-                    k = torch.randint(-127, 127, (BATCH, HK, N_CTX_K, D_HEAD), dtype=torch.int8, device=device)
-                    v = torch.randn(BATCH, HQ, N_CTX_Q, D_HEAD_V, dtype=torch.float16, device=device)
-                    q_scale = torch.randn(BATCH, HQ, ((N_CTX_Q + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
-                    k_scale = torch.randn(BATCH, HK, ((N_CTX_K + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
-                else:  # NHD
-                    # NHD format: (batch, seq, heads, dim)
-                    q = torch.randint(-127, 127, (BATCH, N_CTX_Q, HQ, D_HEAD), dtype=torch.int8, device=device)
-                    k = torch.randint(-127, 127, (BATCH, N_CTX_K, HK, D_HEAD), dtype=torch.int8, device=device)
-                    v = torch.randn(BATCH, N_CTX_Q, HQ, D_HEAD_V, dtype=torch.float16, device=device)
-                    q_scale = torch.randn(BATCH, HQ, ((N_CTX_Q + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
-                    k_scale = torch.randn(BATCH, HK, ((N_CTX_K + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
-            
+            # Original tensors are in NHD format (batch, seq, heads, dim)
+            if tensor_layout == "HND":
+                # Convert from NHD to HND for better memory access
+                q = q.transpose(1, 2).contiguous()
+                k = k.transpose(1, 2).contiguous()
+                v = v.transpose(1, 2).contiguous().to(torch.float16)
+            else:  # NHD
+                # Keep original layout
+                v = v.to(torch.float16)
+            k_mean = None
+            sm_scale = D_HEAD**-0.5
+            q, q_scale, k, k_scale = per_block_int8(
+                q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+            )
+            q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
+            k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
             fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
-        else: # no quantization
+        else: # fav2 (no quantization)
             def fn():
                 return flash_attn_func(
                     q_input,

@@ -68,7 +68,7 @@ if [[ "$RUN_BENCHMARK" == "true" ]]; then
             -sq ${SEQ_LENS[i]} \
             -d 128 \
             -metric all \
-            -print_vgpr \
+            # -print_vgpr \
         
         echo ""
         
@@ -80,7 +80,7 @@ if [[ "$RUN_BENCHMARK" == "true" ]]; then
             -d 128 \
             -qk_int8 \
             -metric all \
-            -print_vgpr \
+            # -print_vgpr \
         
         echo ""
         echo "--- FAv3 FP8 (i.e -fp8) ---"
@@ -91,7 +91,7 @@ if [[ "$RUN_BENCHMARK" == "true" ]]; then
             -d 128 \
             -fp8 \
             -metric all \
-            -print_vgpr \
+            # -print_vgpr \
             
         echo ""
     done
