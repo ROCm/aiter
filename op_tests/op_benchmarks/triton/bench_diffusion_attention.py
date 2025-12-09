@@ -161,7 +161,7 @@ def qk_int8_forward_func(q, k, v, tensor_layout, sm_scale):
     else:  # NHD
         # Keep original layout
         v = v.to(torch.float16)
-    k_mean = None
+    k_mean = k.mean(dim=1, keepdim=True) # None
     # sm_scale = D_HEAD**-0.5
     q, q_scale, k, k_scale = per_block_int8(
         q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
