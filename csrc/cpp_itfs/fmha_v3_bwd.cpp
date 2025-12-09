@@ -76,7 +76,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
 
         if((cfg.dtype == data_type) && (cfg.hdim_q == padded_hdim_q) && (cfg.hdim_v == padded_hdim_v) &&
            (cfg.mask == mask_type) && (cfg.atomic32 == atomic32) &&
-           ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt)) && (cfg.mode == mode))
+           ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))) && (cfg.mode == mode))
         {
             // std::cout << "kernel name: " <<  el.first << std::endl;
             if(ts_kv == 0)
@@ -111,7 +111,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
         const auto& cfg = el.second;
 
         if((cfg.dtype == data_type) && (cfg.hdim_q == padded_hdim_q) && (cfg.mode == mode) &&
-           ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt)))
+           ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))))
         {
             postProcessingKernelName = el.first;
             break;
