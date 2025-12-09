@@ -938,3 +938,50 @@ def _rmsnorm_bwd_dg_reduce_triton(
     tl.store(
         dg_out_ptr + cols, sum_dg.to(dg_out_ptr.type.element_ty), mask=cols < n_cols
     )
+
+
+@triton.jit
+def _rmsnorm_kernel_large_m_small_n(
+    X,
+    Y,
+    W,
+    RSIGMA,
+    M,
+    N,
+    eps,
+    stride_xm,
+    stride_xn,
+    stride_ym,
+    stride_yn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_off = tl.arange(0, BLOCK_N)
+
+    mask_m = m_off < M
+    mask_n = n_off < N
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    x = tl.load(
+        X + m_off[:, None] * stride_xm + n_off[None, :] * stride_xn,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    w = tl.load(W + n_off, mask=mask_n, other=0.0).to(tl.float32)
+
+    x = tl.where(mask, x, 0.0)
+    sum_sq = tl.sum(x * x, axis=1)
+    var = sum_sq / N
+    rsigma = tl.math.rsqrt(var + eps)
+
+    y = x * rsigma[:, None] * w[None, :]
+    tl.store(
+        Y + m_off[:, None] * stride_ym + n_off[None, :] * stride_yn,
+        y.to(Y.dtype.element_ty),
+        mask=mask,
+    )
+
+    if RSIGMA is not None:
+        tl.store(RSIGMA + m_off, rsigma, mask=mask_m)

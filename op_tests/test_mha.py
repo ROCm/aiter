@@ -106,7 +106,7 @@ def run_ck(
         deterministic,
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
-        how_v3_bf16_cvt=1,
+        how_v3_bf16_cvt=2,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
         num_rotate_args=1,

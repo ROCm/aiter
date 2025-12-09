@@ -96,6 +96,11 @@ def get_fwd_configs(autotune: bool):
             "gfx1100",
             "gfx1101",
             "gfx1102",
+            "gfx1103",
+            "gfx1150",
+            "gfx1151",
+            "gfx1152",
+            "gfx1153",
             "gfx1200",
             "gfx1201",
         ):  # RDNA architectures
