@@ -1714,7 +1714,7 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=int(window_size[0]),
             window_size_right=int(window_size[1]),
-            sink_size=int(window_size[2]),
+            sink_size = int(window_size[2]) if len(window_size) == 3 else 0,
             bias=bias,
             alibi_slopes=alibi_slopes,
             q_descale=None,
@@ -2790,6 +2790,7 @@ def flash_attn_fp8_pertensor_func(
         causal=causal,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
+        sink_size = int(window_size[2]) if len(window_size) == 3 else 0,
         bias=None,
         alibi_slopes=None,
         q_descale=q_descale,
@@ -2816,7 +2817,7 @@ def flash_attn_varlen_fp8_pertensor_func(
     min_seqlen_q=0,
     logits_soft_cap=0.0,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window
     softmax_scale=None,
 ):
     if softmax_scale is None:
@@ -2845,6 +2846,7 @@ def flash_attn_varlen_fp8_pertensor_func(
         logits_soft_cap=logits_soft_cap,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
+        sink_size = int(window_size[2]) if len(window_size) == 3 else 0,
         bias=None,
         alibi_slopes=None,
         q_descale=q_descale,
