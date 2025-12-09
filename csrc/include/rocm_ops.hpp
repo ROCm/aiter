@@ -321,7 +321,36 @@ namespace py = pybind11;
           py::arg("dst_k"),                                                         \
           py::arg("dst_scale"),                                                     \
           py::arg("block_table"),                                                   \
-          py::arg("cu_seq_lens"));
+          py::arg("cu_seq_lens"));                                                  \
+    m.def("fused_qk_rope_concat_and_cache_mla",                                     \
+          &aiter::fused_qk_rope_concat_and_cache_mla,                               \
+          "fused_qk_rope_concat_and_cache_mla("                                     \
+          "                     Tensor q_nope, Tensor q_pe,"                        \
+          "                     Tensor kv_c, Tensor k_pe,"                          \
+          "                     Tensor! kv_cache,"                                  \
+          "                     Tensor! q_out, "                                    \
+          "                     Tensor slot_mapping,"                               \
+          "                     Tensor k_scale,"                                    \
+          "                     Tensor q_scale,"                                    \
+          "                     Tensor positions,"                                  \
+          "                     Tensor cos_cache,"                                  \
+          "                     Tensor sin_cache,"                                  \
+          "                     bool is_neox    ,"                                  \
+          "                     bool is_nope_first)->()",                           \
+          py::arg("q_nope"),                                                        \
+          py::arg("q_pe"),                                                          \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("q_out"),                                                         \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("k_scale"),                                                       \
+          py::arg("q_scale"),                                                       \
+          py::arg("positions"),                                                     \
+          py::arg("cos_cache"),                                                     \
+          py::arg("sin_cache"),                                                     \
+          py::arg("is_neox"),                                                       \
+          py::arg("is_nope_first"));
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \
