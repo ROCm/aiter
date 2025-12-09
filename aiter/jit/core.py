@@ -140,7 +140,7 @@ class AITER_CONFIG(object):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
-            "a8w8_blockscale_tuned_legacy_gemm",
+            "a8w8_blockscale_tuned_gemm",
         )
 
     @property
