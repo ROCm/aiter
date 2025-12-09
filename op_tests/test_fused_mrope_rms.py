@@ -214,7 +214,7 @@ def test_mrope_3d_rms(
     if is_mrope:
         pos_shape = (3, num_tokens)
     else:
-        pos_shape = (num_tokens, )
+        pos_shape = (num_tokens,)
     positions = torch.randint(
         0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
     )
@@ -256,9 +256,7 @@ def test_mrope_3d_rms(
 
     info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
     if is_mrope:
-        info += (
-            f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
-        )
+        info += f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
     checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
     checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
