@@ -466,8 +466,10 @@ class GemmCommonTuner(TunerCommon):
             self.get_retune_gemm_list(args)
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
-            self.tunedf = self.get_tuned_gemm_list(args.tune_file)
             self.untunedf["cu_num"] = self.get_cu_num()
+            self.untunedf = self.untunedf[self.keys]
+            self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+
             untunedf_cols = self.untunedf.columns
             if len(self.tunedf) != 0:
                 mask = self.untunedf.apply(tuple, axis=1).isin(
