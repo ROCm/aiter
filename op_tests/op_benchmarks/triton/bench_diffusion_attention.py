@@ -395,7 +395,7 @@ def run_benchmark(custom, args):
                         return_attn_probs=return_attn_probs,
                     )
                 else:
-                    fn = attention_ref(
+                    fn = lambda: attention_ref(
                         q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
                     )
                 return fn()
