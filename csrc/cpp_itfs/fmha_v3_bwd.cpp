@@ -285,6 +285,7 @@ float fmha_v3_bwd(mha_bwd_args a)
                              pre_cfgs,
                              dqdkdv_cfgs,
                              post_cfgs);
+
     auto it_pre = pre_cfgs->find(pre_kernel);
     if(it_pre != pre_cfgs->end())
     {
@@ -361,14 +362,8 @@ float fmha_v3_bwd(mha_bwd_args a)
 
     auto pre_kernel_launch =
         [&]() {
-            void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
-                              &odo_args,
-                              HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                              &arg_size,
-                              HIP_LAUNCH_PARAM_END};
-
             int bdx = 256;
-            int gdx = (a.seqlen_q + ts_odo - 1) / ts_odo;
+            int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
             int gdy = a.nhead_q;
             int gdz = a.batch;
 
@@ -437,8 +432,9 @@ float fmha_v3_bwd(mha_bwd_args a)
         dqdkdv_args.ptr_qseq           = a.seqstart_q_ptr;
         dqdkdv_args.ptr_qseq_padded    = a.seqstart_q_ptr;
     }
-    dqdkdv_args.max_seqlen_dq     = (a.max_seqlen_q + 15) / 16 * 16;
-
+    dqdkdv_args.max_seqlen_dq          = a.v3_atomic_fp32
+                                       ? a.max_seqlen_q
+                                       : (a.max_seqlen_q + 15) / 16 * 16;
     // convert l/r to x/y HERE
     if (a.window_size_left == -1 && a.window_size_right == 0) {
         dqdkdv_args.mask_y = 0;
@@ -451,15 +447,9 @@ float fmha_v3_bwd(mha_bwd_args a)
         dqdkdv_args.mask_y = generic_mask.at(ck_tile::number<0>{});
         dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
     }
-    arg_size                  = sizeof(dqdkdv_args);
+    arg_size = sizeof(dqdkdv_args);
     auto dqdkdv_kernel_launch =
         [&]() {
-            void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
-                              &dqdkdv_args,
-                              HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                              &arg_size,
-                              HIP_LAUNCH_PARAM_END};
-
             int bdx = 256;
             int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
             int gdy = a.nhead_q;
@@ -480,42 +470,44 @@ float fmha_v3_bwd(mha_bwd_args a)
                                             1,
                                             a.stream_id_});
         };
+    ck_tile::stream_config s{a.stream_id_, a.time_kernel_, a.log_level_, a.cold_niters_, a.nrepeat_, a.is_gpu_timer_, a.flush_cache_, a.rotating_count_};
 
     if (!need_post_processing) {
-        return ck_tile::launch_kernel(
-            ck_tile::stream_config{a.stream_id_, a.time_kernel_, a.log_level_, a.cold_niters_, a.nrepeat_, a.is_gpu_timer_, a.flush_cache_, a.rotating_count_},
+        return ck_tile::launch_kernel(s,
             [=](const ck_tile::stream_config& s_) { pre_kernel_launch(); },
             [=](const ck_tile::stream_config& s_) { dqdkdv_kernel_launch(); }
         );
     }
 
+    int dq_acc_element_size = a.v3_atomic_fp32? 4: 2;
+    std::cout << "dq_acc_element_size: " << dq_acc_element_size << std::endl;
     fmha_bwd_post_kernel_args post_args;
-    arg_size                  = sizeof(post_args);
+    arg_size = sizeof(post_args);
     post_args.ptr_dq_acc      = a.dq_acc_ptr;
     post_args.ptr_dq          = a.dq_ptr;
-    post_args.Hs_dq_acc       = a.nhead_stride_dq_acc;
-    post_args.BAs_dq_acc      = a.batch_stride_dq_acc;
-    post_args.Seqs_dq_acc     = a.stride_dq_acc;
-    post_args.Hs_dq           = a.nhead_stride_dq;
-    post_args.BAs_dq          = a.batch_stride_dq;
-    post_args.Seqs_dq         = a.stride_dq;
+    post_args.Hs_dq_acc       = a.nhead_stride_dq_acc * dq_acc_element_size;
+    post_args.BAs_dq_acc      = a.batch_stride_dq_acc * dq_acc_element_size;
+    post_args.Seqs_dq_acc     = a.stride_dq_acc * dq_acc_element_size;
+    post_args.Hs_dq           = a.nhead_stride_dq * 2;
+    post_args.BAs_dq          = a.batch_stride_dq * 2;
+    post_args.Seqs_dq         = a.stride_dq * 2;
     post_args.seqlen_q        = a.seqlen_q;
     post_args.head_dim        = a.hdim_q;
     post_args.ptr_qseq_padded = a.seqstart_q_ptr;
     post_args.ptr_qseq        = (a.cu_seqlen_q_ptr && a.seqstart_q_ptr)
                                 ? a.cu_seqlen_q_ptr
                                 : a.seqstart_q_ptr;
+    std::cout << "Hs_dq_acc: " << post_args.Hs_dq_acc << std::endl
+              << "BAs_dq_acc: " << post_args.BAs_dq_acc << std::endl
+              << "Seqs_dq_acc: " << post_args.Seqs_dq_acc << std::endl
+              << "Hs_dq: " << post_args.Hs_dq << std::endl
+              << "BAs_dq: " << post_args.BAs_dq << std::endl
+              << "Seqs_dq: " << post_args.Seqs_dq << std::endl;
 
     auto post_kernel_launch =
         [&]() {
-            void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
-                              &post_args,
-                              HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                              &arg_size,
-                              HIP_LAUNCH_PARAM_END};
-
             int bdx = 256;
-            int gdx = (a.seqlen_q + ts_dq - 1) / ts_dq;
+            int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
             int gdy = a.nhead_q;
             int gdz = a.batch;
 
@@ -529,7 +521,6 @@ float fmha_v3_bwd(mha_bwd_args a)
                                           1,
                                           a.stream_id_});
         };
-    ck_tile::stream_config s{a.stream_id_, a.time_kernel_, a.log_level_, a.cold_niters_, a.nrepeat_, a.is_gpu_timer_, a.flush_cache_, a.rotating_count_};
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_) { pre_kernel_launch(); },
         [=](const ck_tile::stream_config& s_) { dqdkdv_kernel_launch(); },
