@@ -218,7 +218,8 @@ def _get_config():
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 2,
-        "cache_modifier": None
+        "matrix_instr_nonkdim": 32,
+        "cache_modifier": ".ca"
     }
 
 def attn_qk_int8_per_block(
