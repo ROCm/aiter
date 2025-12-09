@@ -48,6 +48,8 @@ def print_output_comparison_stats(current, reference):
     
     print("Correctness Comparison:")
     print(f"  Mean Absolute Error: {abs_diff.mean().item():.6e}")
+    print(f"  Max Absolute Error: {abs_diff.max().item():.6e}")
+    print(f"  Std Absolute Error: {abs_diff.std().item():.6e}")
     ref_flat = reference_f.reshape(-1)
     test_flat = current_f.reshape(-1)
     cos_sim = torch.nn.functional.cosine_similarity(ref_flat.unsqueeze(0), test_flat.unsqueeze(0))

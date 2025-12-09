@@ -407,12 +407,17 @@ def run_benchmark(custom, args):
             if args.print_compare_stats:
                 print_output_comparison_stats(current_primary, reference_primary)
 
+        q_element_size = 1 if args.qk_int8 or args.fp8 else q.element_size()
+        k_element_size = 1 if args.qk_int8 or args.fp8 else k.element_size()
+        v_element_size = 1 if args.fp8 else v.element_size()
+
+        
         total_num_tokens_q = BATCH * N_CTX_Q
         total_num_tokens_k = BATCH * N_CTX_K
-        q_size = total_num_tokens_q * HQ * D_HEAD * q.element_size()
-        k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
-        v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
-        o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
+        q_size = total_num_tokens_q * HQ * D_HEAD * q_element_size
+        k_size = total_num_tokens_k * HK * D_HEAD * k_element_size
+        v_size = total_num_tokens_k * HK * D_HEAD_V * v_element_size
+        o_size = total_num_tokens_q * HQ * D_HEAD_V * q_element_size
 
         # read q, k, v
         mem_read = q_size + k_size + v_size
