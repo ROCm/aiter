@@ -82,13 +82,13 @@ def get_fwd_configs(autotune: bool):
                 configs.append(
                     triton.Config(
                         {
-                            "BLOCK_M": 128,
+                            "BLOCK_M": 256,
                             "BLOCK_N": 128,
-                            "waves_per_eu": 2,
+                            "waves_per_eu": 1,
                             "PRE_LOAD_V": False,
                         },
                         num_stages=1,
-                        num_warps=4,
+                        num_warps=8,
                     )
                 )
         elif arch in (
