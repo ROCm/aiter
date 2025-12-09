@@ -716,7 +716,5 @@ def _get_config(
     shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
     config_name = f"GEMM-AFP4WFP4{shuffle_suffix}"
 
-    # Note: AFP4WFP4 uses 2*K in the filename for specialized configs
-    # But the get_gemm_config function will handle N and K directly
-    # We need to be careful about this discrepancy
-    return get_gemm_config(config_name, M, N, K)
+    # Note: Config files use K=2*K in their naming
+    return get_gemm_config(config_name, M, N, 2 * K)

@@ -326,7 +326,8 @@ def _get_config(
 ):
     from ..utils.gemm_config_utils import get_gemm_config
 
-    config = get_gemm_config("BATCHED_GEMM-AFP4WFP4", M, N, K)
+    # Note: Config files use K=2*K in their naming
+    config = get_gemm_config("BATCHED_GEMM-AFP4WFP4", M, N, 2 * K)
 
     # Apply custom split-K logic for AFP4WFP4
     if config["NUM_KSPLIT"] > 1:
