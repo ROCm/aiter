@@ -11,7 +11,7 @@ import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.attn_qk_int8_per_block import (
-    _attn_fwd,
+    _attn_fwd_qk_int8_per_block,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -317,7 +317,7 @@ def attn_qk_int8_per_block(
         lse = torch.empty([0], dtype=torch.float32, device="cpu")
 
     grid = (triton.cdiv(qo_len, config["BLOCK_SIZE_M"]) * h_qo * b, )
-    _attn_fwd[grid](
+    _attn_fwd_qk_int8_per_block[grid](
         q,
         k,
         v,
