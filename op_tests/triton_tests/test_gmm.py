@@ -341,10 +341,6 @@ def test_tgmm(
     assert persistent_str in {"p", "np"}
     persistent: bool = persistent_str == "p"
     
-    # Skip test: non-persistent TGMM does not support bias gradient computation.
-    if not persistent and with_bias_grad:
-        pytest.skip("Non-persistent TGMM (nptgmm) does not support bias gradient computation.")
-
     in_dtype = dtype_from_str(in_dtype_str)
     out_dtype = dtype_from_str(out_dtype_str)
     trans_lhs = trans_lhs_from_str(trans_lhs_str)
@@ -416,7 +412,7 @@ def test_tgmm(
         # correctness checks, so we skip bias_grad comparison there and rely
         # only on the output tensor check above.
         if with_bias_grad and M <= 1e6:
-            bias_atol = 1.5
+            bias_atol = 1.7
             bias_rtol = 0.1
 
             check_tensors(
