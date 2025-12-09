@@ -576,7 +576,9 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob"
+                import hashlib
+                subdir = hashlib.sha1(blob_gen_cmd.encode("utf-8")).hexdigest()[:8]
+                blob_dir = f"{op_dir}/blob/{subdir}"
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")

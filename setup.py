@@ -119,6 +119,7 @@ if IS_ROCM:
                 "module_gemm_a4w4_blockscale_tune",
                 "module_gemm_a8w8_bpreshuffle_tune",
                 "module_gemm_a8w8_bpreshuffle_cktile_tune",
+                "module_gemm_mi350_a8w8_blockscale_asm",
             ]
         elif PREBUILD_KERNELS == 3:
             return [
@@ -192,7 +193,8 @@ if IS_ROCM:
                 "module_topk_plain",
             ]
         else:
-            return [             
+            return [          
+                "module_gemm_mi350_a8w8_blockscale_asm",   
                 "module_batched_gemm_bf16_tune",
                 "module_batched_gemm_a8w8_tune",
                 "module_gemm_a8w8_tune",
