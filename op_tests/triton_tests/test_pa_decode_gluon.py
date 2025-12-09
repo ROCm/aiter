@@ -270,6 +270,8 @@ def create_kv_cache(
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             key_cache.uniform_(*UNIFORM_RANGE)
+            # key_cache.uniform_(-72, 88)
+            # key_cache.uniform_(-28, 28)
         else:
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
         # key_cache = torch.randn(size=key_cache_shape, dtype=torch_dtype, device=device)
@@ -284,6 +286,8 @@ def create_kv_cache(
         )
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             value_cache.uniform_(*UNIFORM_RANGE)
+            # value_cache.uniform_(-10, 9)
+            # value_cache.uniform_(-56, 56)
         else:
             raise ValueError(f"Does not support value cache of type {cache_dtype}")
         # value_cache = torch.randn(
@@ -1218,8 +1222,9 @@ def run_pa_gluon_test(
     if compute_type == aiter.dtypes.fp8:
         data_type = torch.bfloat16
     results = {}
-    setup_seed(123)
-    seed = 0
+    seed = 123
+    # seed = 371
+    setup_seed(seed)
     device = "cuda:0"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
@@ -1247,9 +1252,11 @@ def run_pa_gluon_test(
         qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
     )
     query.uniform_(*UNIFORM_RANGE)
+    # query.uniform_(-9.0625, 7.8125)
+    # query.uniform_(-120, 85)
 
     if kv_varlen:
-        random.seed(123)
+        random.seed(seed)
         # kv_len_list = [random.randint(1, context_length) for _ in range(batch_size)]
         kv_len_list = [
             random.randint(query_length, context_length) for _ in range(batch_size)
@@ -1259,7 +1266,7 @@ def run_pa_gluon_test(
     context_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
     # print(f"context_lengths={context_lengths}")
 
-    random.seed(123)
+    random.seed(seed)
     block_tables_list = []
     for _ in range(batch_size):
         block_table = [
@@ -1277,7 +1284,7 @@ def run_pa_gluon_test(
         head_size,
         "auto",
         data_type,
-        seed,
+        0,
         device,
     )
     key_cache, value_cache = key_caches[0], value_caches[0]
@@ -1888,7 +1895,7 @@ def run_multi_pa_gluon_test(
             for ct in compute_types:
                 for quant_q_and_kv_mode in quant_q_and_kv:
                     quant_q, quant_kv = quant_q_and_kv_mode
-                    if ct == aiter.dtypes.bf16:
+                    if ct == aiter.dtypes.bf16 or ct == aiter.dtypes.fp16:
                         quant_q, quant_kv = [False, False]
                     for trans_v_mode in trans_v:
                         for kv_varlen_mode in kv_varlen:
@@ -2093,8 +2100,8 @@ def simple_test():
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-    COMPUTE_TYPE_OPTIONS = ["fp8"]
+    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    # COMPUTE_TYPE_OPTIONS = ["fp8"]
     QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
     QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
     BLOCK_SIZE_OPTIONS = [16, 1024]
@@ -2109,25 +2116,22 @@ def simple_test():
     # USE_AOT_IMPL_OPTIONS = [True]
     # USE_AOT_IMPL_OPTIONS = [False]
 
-    # parse_arg_and_run_test()
-
     HEAD_DIMENSION_OPTIONS = [128]
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
     BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
-    COMPUTE_TYPE_OPTIONS = ["fp8"]
+    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
     QUANT_Q_AND_KV_OPTIONS = [[True, True]]
-    QUANT_MODE_OPTIONS = ["per_token"]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
     HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
-    # HEAD_CONFIGURATIONS = [(10, 1)]
     USE_AOT_IMPL_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
-    # BLOCK_SIZE_OPTIONS = [64]
-    # parse_arg_and_run_test()
+    BLOCK_SIZE_OPTIONS = [64]
+    parse_arg_and_run_test()
+    # HEAD_CONFIGURATIONS = [(10, 1)]
     # BLOCK_SIZE_OPTIONS = [1024]
     # parse_arg_and_run_test()
 

@@ -897,6 +897,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             block_tables_ptr + sequence_idx * stride_block_table_seq
         )
         kv_page_id = tl.load(block_tables_start_ptr + block_table_id)
+        kv_page_id = kv_page_id.to(gl.int64)
 
         # ==================== Key Cache Loading ====================
         # Calculate key cache block offsets [KEY_HEAD_SIZE_POW2_SPLIT, KV_COMPUTE_BLOCK_SIZE, CONTIGUOUS_KV_ELEMENTS_16B_LOAD]
@@ -910,9 +911,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         )
 
         # Load key cache block
-        key_block = gl.amd.cdna3.buffer_load(
-            ptr=key_cache_ptr, offsets=key_block_offsets
-        )
+        key_block = gl.load(key_cache_ptr + key_block_offsets)
 
         # ==================== Key Quantization Scale Handling ====================
         if KV_QUANT_MODE >= 0:
@@ -928,12 +927,8 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                     + current_page_offset
                     + kv_scale_column_offsets
                 )
-                key_scale_value = gl.amd.cdna3.buffer_load(
-                    ptr=key_scale, offsets=key_scale_offsets
-                )
-                value_scale_value = gl.amd.cdna3.buffer_load(
-                    ptr=value_scale, offsets=key_scale_offsets
-                )
+                key_scale_value = gl.load(key_scale + key_scale_offsets)
+                value_scale_value = gl.load(value_scale + key_scale_offsets)
 
         # Reshape key block to [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         key_block = gl.permute(key_block, [0, 2, 1])
@@ -954,9 +949,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                 + value_dim2_offsets[None, None, :]
             )
             # Load transposed value block
-            value_block = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr, offsets=value_block_offsets
-            )
+            value_block = gl.load(value_cache_ptr + value_block_offsets)
             # Reshape to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [0, 2, 1])
             value_block = gl.reshape(
@@ -971,9 +964,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                 + (current_page_offset + value_dim1_offsets)[None, :]
             )
             # Load standard value block
-            value_block = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr, offsets=value_block_offsets
-            )
+            value_block = gl.load(value_cache_ptr + value_block_offsets)
             # Transpose to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [1, 0])
 
@@ -1569,6 +1560,7 @@ def paged_attention_decode_v2_gluon_fp8(
         kv_block_numbers = gl.amd.cdna3.buffer_load(
             ptr=block_table_start_ptr + kv_block_start_idx, offsets=masked_block_indices
         )
+        kv_block_numbers = kv_block_numbers.to(gl.int64)
 
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
@@ -1580,10 +1572,7 @@ def paged_attention_decode_v2_gluon_fp8(
             * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
             + contiguous_kv_element_offsets[None, None, None, :]
         )
-        key_tensor = gl.amd.cdna3.buffer_load(
-            ptr=key_cache_ptr,
-            offsets=key_block_offsets,
-        )
+        key_tensor = gl.load(key_cache_ptr + key_block_offsets)
 
         # Load key quantization scales if needed
         if KV_QUANT_MODE >= 0:
@@ -1604,12 +1593,8 @@ def paged_attention_decode_v2_gluon_fp8(
                 key_scale_offsets = gl.convert_layout(
                     key_scale_offsets, layout=gl.SliceLayout(0, qk_linear_layout)
                 )
-                key_scale_value = gl.amd.cdna3.buffer_load(
-                    ptr=key_scale, offsets=key_scale_offsets
-                )
-                value_scale_value = gl.amd.cdna3.buffer_load(
-                    ptr=value_scale, offsets=key_scale_offsets
-                )
+                key_scale_value = gl.load(key_scale + key_scale_offsets)
+                value_scale_value = gl.load(value_scale + key_scale_offsets)
 
         # Reshape key tensor for matrix multiplication
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
@@ -1632,10 +1617,7 @@ def paged_attention_decode_v2_gluon_fp8(
                 * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
                 + value_dim3_offsets[None, None, None, :]
             )
-            value_tensor = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr,
-                offsets=value_block_offsets,
-            )
+            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
             value_tensor = gl.reshape(
@@ -1653,10 +1635,7 @@ def paged_attention_decode_v2_gluon_fp8(
                 + value_dim1_offsets[None, :, None] * stride_value_head_size
                 + value_dim2_offsets[None, None, :]
             )
-            value_tensor = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr,
-                offsets=value_block_offsets,
-            )
+            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
             value_tensor = gl.reshape(
@@ -1685,6 +1664,7 @@ def paged_attention_decode_v2_gluon_fp8(
         # query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
         query_converted = query_shared.load(qk_lhs_operand_layout)
         key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
+
         query_converted = query_converted.to(COMPUTE_TYPE)
         key_converted = key_converted.to(COMPUTE_TYPE)
 
@@ -2780,10 +2760,6 @@ def pa_decode_gluon(
     # Configure execution grid
     grid = (num_sequences, num_kv_heads, max_context_partition_num)
 
-    # # thre are some precision problems for tl.bfloat16 and tl.float16, so only support tl.float8e4b8 now
-    # assert compute_type in [
-    #     tl.float8e4b8
-    # ], f"compute_type == {compute_type} not in [tl.float8e4b8]"
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
     # Validate input params constraint
     assert query.dtype in [

@@ -1041,17 +1041,16 @@ def prebuild_pa_decode_gluon_aot_so():
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
     BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
-    COMPUTE_TYPE_OPTIONS = ["fp8"]
+    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
     QUANT_Q_AND_KV_OPTIONS = [[True, True]]
-    QUANT_MODE_OPTIONS = ["per_token"]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
-    # HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
-    HEAD_CONFIGURATIONS = [(10, 1)]
+    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
     USE_AOT_IMPL_OPTIONS = [True]
-    # BLOCK_SIZE_OPTIONS = [16, 64]
-    BLOCK_SIZE_OPTIONS = [1024]
+    BLOCK_SIZE_OPTIONS = [16, 64]
+    # HEAD_CONFIGURATIONS = [(10, 1)]
+    # BLOCK_SIZE_OPTIONS = [1024]
 
     parse_arg_and_run_test()
 

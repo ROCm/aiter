@@ -404,11 +404,7 @@ def pa_decode_gluon_aot(
     # Determine if causal masking is needed
     is_causal = query_length > 1
 
-    # # thre are some precision problems for tl.bfloat16 and tl.float16, so only support tl.float8e4b8 now
-    # assert compute_type in [
-    #     tl.float8e4b8
-    # ], f"compute_type == {compute_type} not in [tl.float8e4b8]"
-    # assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
+    assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
     # Validate input params constraint
     assert query.dtype in [
         aiter.dtypes.fp8,
