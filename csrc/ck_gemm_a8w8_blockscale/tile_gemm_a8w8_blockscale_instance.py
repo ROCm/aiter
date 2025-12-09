@@ -77,7 +77,7 @@ tile_candidate_kernels_dict = {
 
 
 tile_default_kernels_dict = {
-    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile | kPadM | kPadN | kPadK |   Scheduler   | MemoryOperation | TransposeC | DoubleSmemBuffer | UsePersistentKernel |
-    -1:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      True,  True,    True,   "Intrawave",       "Set",         False,          False,            True             )   
+    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile | kPadM | kPadN | kPadK |   Scheduler   | TransposeC | DoubleSmemBuffer | UsePersistentKernel |
+    -1:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      True,  True,    True,   "Intrawave",      False,          False,            True             )   
 }
 # fmt: on
