@@ -224,7 +224,76 @@ inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
                                             0,
                                             0);
     }
+    else
+    {
+        uintptr_t p_lds_warp_nope =
+            p_lds_k_nope + warp_idx * kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t);
+        uint4* p_lds_nope                    = reinterpret_cast<uint4*>(p_lds_warp_nope);
+        constexpr uint32_t kNumDw4PerThrNope = kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t) /
+                                               ckt::get_warp_size() / sizeof(uint4);
+#pragma unroll
+        for(uint32_t rid = 0; rid < kNumDw4PerThrNope; ++rid)
+        {
+            p_lds_nope[lane_idx + rid * ckt::get_warp_size()] = uint4(0u);
+        }
+
+        uintptr_t p_lds_warp_rope =
+            p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
+        uint32_t* p_lds_rope                = reinterpret_cast<uint32_t*>(p_lds_warp_rope);
+        constexpr uint32_t kNumDwPerThrRope = kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t) /
+                                              ckt::get_warp_size() / sizeof(uint32_t);
+#pragma unroll
+        for(uint32_t rid = 0; rid < kNumDwPerThrRope; ++rid)
+        {
+            p_lds_rope[lane_idx + rid * ckt::get_warp_size()] = 0u;
+        }
+    }
 #endif
+}
+
+template <typename T, int32_t kNumLdsRows, int32_t kNumLdsCols, hkdart::all RT>
+inline __device__ void load_lds_to_gpr(RT& dst,
+                                       const uintptr_t p_lds_src,
+                                       const int32_t row_offset,
+                                       const int32_t col_offset)
+{
+    constexpr int32_t tile_stride = 0;
+    constexpr int32_t row_stride  = RT::base_tile_rows * kNumLdsCols;
+
+    constexpr int32_t element_per_thr =
+        8; // for mfma_f32_16x16x32_bf16, each thr takes 8 elements with 2 DWs.
+
+    const int32_t lane_idx = ckt::get_lane_id();
+    const int32_t row      = lane_idx % 16;
+    const int32_t col      = (lane_idx / 16) * element_per_thr;
+    const uintptr_t p_lds  = p_lds_src + ((row + row_offset) * kNumLdsCols + (col + col_offset)) *
+                                            sizeof(typename RT::T);
+
+    auto perform_load_at = [&]<int N, int M>() {
+        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, N * RT::width + M>;
+        static_assert(range_type::lo + 1 == range_type::hi,
+                      "ds_read_b64 requires 2 consecutive registers");
+        const int offset = N * row_stride + M * tile_stride;
+        hkm::ds_read_b64<range_type::lo>(p_lds, offset);
+    };
+
+    [&]<std::size_t... Ns>(std::index_sequence<Ns...>)
+    {
+        (
+            [&]<std::size_t N>() {
+                [&]<std::size_t... Ms>(std::index_sequence<Ms...>)
+                {
+                    (
+                        [&]<std::size_t M>() {
+                            perform_load_at.template operator()<N, M>();
+                        }.template operator()<Ms>(),
+                        ...);
+                }
+                (std::make_index_sequence<RT::width>{});
+            }.template operator()<Ns>(),
+            ...);
+    }
+    (std::make_index_sequence<RT::height>{});
 }
 
 template <typename T>
@@ -256,10 +325,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     // manually load data from VRAM to LDS. On loading LDS to GPR, HK function will be used.
     // constexpr int32_t kSzLdsKNope = T::kBlockN * (T::kQkNopeHeadDim + 1);
     // constexpr int32_t kSzLdsKRope = T::kBlockN * (T::kQkRopeHeadDim + 1);
-    constexpr int32_t kSzLdsKNope = T::kBlockN * T::kQkNopeHeadDim;
-    constexpr int32_t kSzLdsKRope = T::kBlockN * T::kQkRopeHeadDim;
-    kv_t* p_lds_k_nope            = reinterpret_cast<kv_t*>(p_lds);
-    kv_t* p_lds_k_rope            = p_lds_k_nope + kSzLdsKNope;
+    constexpr int32_t kSzLdsKNope = T::kBlockN * T::kQkNopeHeadDim * sizeof(kv_t);
+    constexpr int32_t kSzLdsKRope = T::kBlockN * T::kQkRopeHeadDim * sizeof(kv_t);
+    uintptr_t p_lds_k_nope        = reinterpret_cast<uintptr_t>(p_lds);
+    uintptr_t p_lds_k_rope        = p_lds_k_nope + kSzLdsKNope;
 
     // Reg tiles
     constexpr uint32_t k_o_sz      = 128;
@@ -346,8 +415,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_start,
                                                              const int32_t kv_end) {
             // Async load K from VRAM to LDS
-            async_load_k<T, kIsTail>(reinterpret_cast<uintptr_t>(p_lds_k_nope),
-                                     reinterpret_cast<uintptr_t>(p_lds_k_rope),
+            /// TODO: Merge loading Q with K on first iter.
+            async_load_k<T, kIsTail>(p_lds_k_nope,
+                                     p_lds_k_rope,
                                      params.kv_buffer,
                                      params.p_kv_indices,
                                      kv_start,
@@ -357,41 +427,126 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
-            // Debug: load k nope to test tensor
+            // Load 1st part of K from LDS to VGPR
+            for(int k_step = 0; k_step < T::kQkNopeHeadDim / T::kBlockK; ++k_step)
             {
-                const int32_t tot_elem =
-                    ckt::min(T::kBlockN, kv_end - kv_start) * T::kQkNopeHeadDim; // 32 * 512 = 16384
-                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
-                {
-                    uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_nope + idx);
-                    const float4 f4          = convert_fp8x4_to_float4(FUI{data});
-                    const int32_t row        = kv_start + idx / T::kQkNopeHeadDim;
-                    const int32_t col        = idx % T::kQkNopeHeadDim;
-                    const int32_t offset     = row * T::kQkHeadDim + col;
-                    params.p_dbg[offset]     = f4.x;
-                    params.p_dbg[offset + 1] = f4.y;
-                    params.p_dbg[offset + 2] = f4.z;
-                    params.p_dbg[offset + 3] = f4.w;
-                }
+                load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim>(
+                    kv_0, p_lds_k_nope, 0, k_step * T::kBlockK);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+
+                // debug
+                using k0_type   = decltype(kv_0);
+                using k_range_0 = hkdart::get_nth_range_t<typename k0_type::register_ranges, 0>;
+                using k_range_1 = hkdart::get_nth_range_t<typename k0_type::register_ranges, 1>;
+
+                const int32_t row = lane_idx % 16;
+                const int32_t col = (lane_idx / 16) * 8; // 8 = #bytes per thr for each tile
+                uint32_t data_00  = hkm::v_get_gpr<k_range_0::lo>();
+                uint32_t data_01  = hkm::v_get_gpr<k_range_0::lo + 1>();
+                uint32_t data_10  = hkm::v_get_gpr<k_range_1::lo>();
+                uint32_t data_11  = hkm::v_get_gpr<k_range_1::lo + 1>();
+
+                float4 f4_00 = convert_fp8x4_to_float4(FUI{data_00});
+                float4 f4_01 = convert_fp8x4_to_float4(FUI{data_01});
+                float4 f4_10 = convert_fp8x4_to_float4(FUI{data_10});
+                float4 f4_11 = convert_fp8x4_to_float4(FUI{data_11});
+
+                uint32_t row0 = kv_start + row;
+                uint32_t col0 = col + k_step * 32; // 0 = K offset
+                uint32_t off0 = row0 * 576 + col0;
+                uint32_t off1 = off0 + 16 * 576;
+
+                params.p_dbg[off0 + 0] = f4_00.x;
+                params.p_dbg[off0 + 1] = f4_00.y;
+                params.p_dbg[off0 + 2] = f4_00.z;
+                params.p_dbg[off0 + 3] = f4_00.w;
+                params.p_dbg[off0 + 4] = f4_01.x;
+                params.p_dbg[off0 + 5] = f4_01.y;
+                params.p_dbg[off0 + 6] = f4_01.z;
+                params.p_dbg[off0 + 7] = f4_01.w;
+                params.p_dbg[off1 + 0] = f4_10.x;
+                params.p_dbg[off1 + 1] = f4_10.y;
+                params.p_dbg[off1 + 2] = f4_10.z;
+                params.p_dbg[off1 + 3] = f4_10.w;
+                params.p_dbg[off1 + 4] = f4_11.x;
+                params.p_dbg[off1 + 5] = f4_11.y;
+                params.p_dbg[off1 + 6] = f4_11.z;
+                params.p_dbg[off1 + 7] = f4_11.w;
             }
 
-            // Debug: load k rope to test tensor
+            for(int k_step = 0; k_step < T::kQkRopeHeadDim / T::kBlockK; ++k_step)
             {
-                const int32_t tot_elem =
-                    ckt::min(T::kBlockN, kv_end - kv_start) * T::kQkRopeHeadDim; // 32 * 64 = 2048
-                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
-                {
-                    uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_rope + idx);
-                    const float4 f4          = convert_fp8x4_to_float4(FUI{data});
-                    const int32_t row        = kv_start + idx / T::kQkRopeHeadDim;
-                    const int32_t col        = idx % T::kQkRopeHeadDim;
-                    const int32_t offset     = row * T::kQkHeadDim + col + T::kQkNopeHeadDim;
-                    params.p_dbg[offset]     = f4.x;
-                    params.p_dbg[offset + 1] = f4.y;
-                    params.p_dbg[offset + 2] = f4.z;
-                    params.p_dbg[offset + 3] = f4.w;
-                }
+                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
+                    kv_0, p_lds_k_rope, 0, k_step * T::kBlockK);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+
+                // debug
+                using k0_type   = decltype(kv_0);
+                using k_range_0 = hkdart::get_nth_range_t<typename k0_type::register_ranges, 0>;
+                using k_range_1 = hkdart::get_nth_range_t<typename k0_type::register_ranges, 1>;
+
+                const int32_t row  = lane_idx % 16;
+                const int32_t col  = (lane_idx / 16) * 8; // 8 = #bytes per thr for each tile
+                const int32_t addr = p_lds_k_rope + row * 64 + col + k_step * 32;
+                uint32_t data_00   = hkm::v_get_gpr<k_range_0::lo>();
+                uint32_t data_01   = hkm::v_get_gpr<k_range_0::lo + 1>();
+                uint32_t data_10   = hkm::v_get_gpr<k_range_1::lo>();
+                uint32_t data_11   = hkm::v_get_gpr<k_range_1::lo + 1>();
+
+                float4 f4_00 = convert_fp8x4_to_float4(FUI{data_00});
+                float4 f4_01 = convert_fp8x4_to_float4(FUI{data_01});
+                float4 f4_10 = convert_fp8x4_to_float4(FUI{data_10});
+                float4 f4_11 = convert_fp8x4_to_float4(FUI{data_11});
+
+                uint32_t row0 = kv_start + row;
+                uint32_t col0 = col + k_step * 32 + 512;
+                uint32_t off0 = row0 * 576 + col0;
+                uint32_t off1 = off0 + 16 * 576;
+
+                params.p_dbg[off0 + 0] = f4_00.x;
+                params.p_dbg[off0 + 1] = f4_00.y;
+                params.p_dbg[off0 + 2] = f4_00.z;
+                params.p_dbg[off0 + 3] = f4_00.w;
+                params.p_dbg[off0 + 4] = f4_01.x;
+                params.p_dbg[off0 + 5] = f4_01.y;
+                params.p_dbg[off0 + 6] = f4_01.z;
+                params.p_dbg[off0 + 7] = f4_01.w;
+                params.p_dbg[off1 + 0] = f4_10.x;
+                params.p_dbg[off1 + 1] = f4_10.y;
+                params.p_dbg[off1 + 2] = f4_10.z;
+                params.p_dbg[off1 + 3] = f4_10.w;
+                params.p_dbg[off1 + 4] = f4_11.x;
+                params.p_dbg[off1 + 5] = f4_11.y;
+                params.p_dbg[off1 + 6] = f4_11.z;
+                params.p_dbg[off1 + 7] = f4_11.w;
             }
+
+            // // GEMM on NoPE
+            // ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}(
+            // [&](auto idx) {
+            //     using q_range_0 =
+            //         hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value +
+            //         1>>, 2>;
+            //     using q_range_1 =
+            //         hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value
+            //         + 3>>, 2>;
+            //     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+            //     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+
+            //     // Load K from LDS to GPR
+
+            //     if constexpr(idx.value == k_q_nope_begin)
+            //     {
+            //         hk::mma_ABt(p_comp, q_0, kv_0);
+            //     }
+            //     else
+            //     {
+            //         hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
+            //     }
+            //     hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
+            // });
+
+            // GEMM on RoPE
         };
 
         const int32_t kv_len = kv_end - kv_start;
@@ -415,31 +570,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 mla_main.template operator()<false, true>(kv_idx, kv_end);
             }
         }
-
-        // QK Gemm
-        ckt::static_for<k_q_nope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
-            // using q_range_0 =
-            //     hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
-            //     2>;
-            // using q_range_1 =
-            //     hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value +
-            //     3>>,
-            //                          2>;
-            // hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
-            // hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
-
-            // // Load K from LDS to GPR
-
-            // if constexpr(idx.value == k_q_nope_begin)
-            // {
-            //     hk::mma_ABt(p_comp, q_0, kv_0);
-            // }
-            // else
-            // {
-            //     hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
-            // }
-            // hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
-        });
 
         ///
         /// Outputs
@@ -559,23 +689,6 @@ void hk_mi35x_mla_decode_fwd_n128(torch::Tensor& query,
                                              final_output,
                                              dbg_tr);
     }
-    // else if(q_is_bf16 && kv_is_bf16)
-    // {
-    //     using Traits = HkMlaDecodeFwdTraits<hk::bf16, hk::bf16, hk::bf16, 128>;
-    //     dispatch_mla_decode_fwd_n128<Traits>(query,
-    //                                          kv_buffer,
-    //                                          qo_indptr,
-    //                                          kv_indptr,
-    //                                          kv_page_indices,
-    //                                          kv_last_page_lens,
-    //                                          work_indptr,
-    //                                          work_info_set,
-    //                                          max_seqlen_q,
-    //                                          softmax_scale,
-    //                                          split_output,
-    //                                          split_lse,
-    //                                          final_output);
-    // }
     else
     {
         TORCH_CHECK(false,
