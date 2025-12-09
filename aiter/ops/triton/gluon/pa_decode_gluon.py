@@ -615,26 +615,38 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     # ==================== Attention Masking ====================
     # Create boundary mask for valid query groups
     boundary_mask = qk_row_offsets[:, None] < QUERY_GROUP_SIZE
-    if SLIDING_WINDOW > 0:
-        boundary_mask = boundary_mask & (
-            qk_column_offsets[None, :] > context_length - SLIDING_WINDOW
-        )
+    
+    # Compute query token index (0 to query_seq_len-1)
+    query_token_idx = qk_row_offsets // query_group_size_original
+    
+    # Query positions: queries are AFTER the KV cache
+    # query_pos = context_length + query_token_idx
+    # kv_pos = qk_column_offsets
+    
     # Apply causal masking if required
     if IS_CAUSAL:
-        sequence_extension = (
-            query_seq_len - 1 - qk_row_offsets // query_group_size_original
-        )
+        # Causal: qk_column_offsets < context_length + query_token_idx
         causal_mask = (
-            sequence_extension[:, None] + qk_column_offsets[None, :] < context_length
+            qk_column_offsets[None, :] < context_length + query_token_idx[:, None]
         )
     else:
+        # Non-causal: all KV tokens < context_length are visible
         causal_mask = qk_column_offsets[None, :] < context_length
-
-    # Combine masks
-    combined_mask = boundary_mask & causal_mask
+    
+    # Apply sliding window mask
+    if SLIDING_WINDOW > 0:
+        # Sliding window: keep only KV tokens within SLIDING_WINDOW distance from query position
+        # query_pos - kv_pos < SLIDING_WINDOW
+        # OR: qk_column_offsets > context_length + query_token_idx - SLIDING_WINDOW
+        sliding_window_mask = (
+            qk_column_offsets[None, :] > context_length + query_token_idx[:, None] - SLIDING_WINDOW
+        )
+        boundary_mask = boundary_mask & causal_mask & sliding_window_mask
+    else:
+        boundary_mask = boundary_mask & causal_mask
 
     # Apply masking to QK scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-    qk_matrix = tl.where(combined_mask, qk_matrix, float(-3.4e38))
+    qk_matrix = tl.where(boundary_mask, qk_matrix, float(-3.4e38))
 
     # ==================== Softmax Computation ====================
     # Compute new maximum logits
@@ -799,6 +811,7 @@ def paged_attention_decode_v2_gluon_fp8(
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
     sinks_ptr=None,
+    ONE_SHOT: gl.constexpr=False,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -831,8 +844,7 @@ def paged_attention_decode_v2_gluon_fp8(
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
-    #ONE_SHOT: gl.constexpr = SLIDING_WINDOW > 0 and SLIDING_WINDOW <= CONTEXT_PARTITION_SIZE
-    ONE_SHOT: gl.constexpr = False
+
     query_group_size = query_seq_len * query_group_size_original
     # ==================== VALIDATION CHECKS ====================
     gl.static_assert(
@@ -1152,9 +1164,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # ==================== SEQUENCE PROCESSING ====================
     if SLIDING_WINDOW > 0:
-        skiped_context_partition_num = (
-            context_length - SLIDING_WINDOW
-        ) // CONTEXT_PARTITION_SIZE
+        skiped_context_partition_num = (context_length - SLIDING_WINDOW) // CONTEXT_PARTITION_SIZE
         sequence_partition_idx += skiped_context_partition_num
     kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
     if kv_sequence_start_idx >= context_length:
@@ -1375,28 +1385,41 @@ def paged_attention_decode_v2_gluon_fp8(
     # ==================== ATTENTION MASKING ====================
     # Create boundary mask for valid sequence positions
     boundary_mask = qk_row_offsets[:, None] < query_group_size
-    if SLIDING_WINDOW > 0:
-        boundary_mask = boundary_mask & (
-            qk_column_offsets[None, :] > context_length - SLIDING_WINDOW
-        )
+    
+    # Compute query token index (0 to query_seq_len-1)
+    query_token_idx = qk_row_offsets // query_group_size_original
+    
+    # Query positions: queries are AFTER the KV cache
+    # query_pos = context_length + query_token_idx
+    # kv_pos = qk_column_offsets
+    
     # Apply causal masking if required
     if IS_CAUSAL:
-        # Compute causal mask based on sequence positions
-        sequence_position_extension = (
-            query_seq_len - 1 - qk_row_offsets // query_group_size_original
-        )
+        # Causal: qk_column_offsets < context_length + query_token_idx
         causal_mask = (
-            sequence_position_extension[:, None] + qk_column_offsets[None, :]
-            < context_length
+            qk_column_offsets[None, :] < context_length + query_token_idx[:, None]
         )
     else:
+        # Non-causal: all KV tokens < context_length are visible
         causal_mask = qk_column_offsets[None, :] < context_length
-
+    
     boundary_mask = boundary_mask & causal_mask
-
+    
+    # Apply sliding window mask
+    if SLIDING_WINDOW > 0:
+        # Sliding window: keep only KV tokens within SLIDING_WINDOW distance from query position
+        # query_pos - kv_pos < SLIDING_WINDOW
+        # (context_length + query_token_idx) - qk_column_offsets < SLIDING_WINDOW
+        # OR: qk_column_offsets > context_length + query_token_idx - SLIDING_WINDOW
+        sliding_window_mask = (
+            qk_column_offsets[None, :] > context_length + query_token_idx[:, None] - SLIDING_WINDOW
+        )
+        boundary_mask = boundary_mask & sliding_window_mask
+    # if sequence_idx == 0 and kv_head_idx == 7:
+    #     print("boundary_mask=", boundary_mask)
     # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
     attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
-
+    # print("attention_scores=", attention_scores)
     # ==================== SOFTMAX COMPUTATION ====================
     # Update running maximum for numerical stability
     max_logits = gl.max(attention_scores, axis=1)
@@ -1404,7 +1427,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # Compute scaling factor for previous accumulator
     # accumulator_scale = tl.math.exp2((max_logits - max_logits) * LOG2_E)
-
+    
     # Compute attention probabilities
     attention_probs = tl.math.exp(attention_scores - max_logits[:, None])
     exp_sums = gl.sum(attention_probs, axis=1)
@@ -1769,7 +1792,7 @@ def paged_attention_decode_v2_reduce_kernel(
     
     if SLIDING_WINDOW > 0:
         MAX_CONTEXT_PARTITION_NUM: tl.constexpr = triton.next_power_of_2(
-            SLIDING_WINDOW // CONTEXT_PARTITION_SIZE
+            triton.cdiv(SLIDING_WINDOW, CONTEXT_PARTITION_SIZE)
         )
         # skiped_context_partition_num = (
         #     context_length - SLIDING_WINDOW
@@ -1975,6 +1998,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     IS_CAUSAL,
     SLIDING_WINDOW,
     sinks_ptr=None,
+    ONE_SHOT=False,
 ):
     """
     Wrapper function for paged attention decode kernel with dynamic kernel selection.
@@ -2059,6 +2083,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         IS_CAUSAL=IS_CAUSAL,
         SLIDING_WINDOW=SLIDING_WINDOW,
         CDNA_VERSION=CDNA_VERSION,
+        ONE_SHOT=ONE_SHOT,
         sinks_ptr=sinks_ptr,
         waves_per_eu=waves_per_eu,
         num_stages=1,
@@ -2272,10 +2297,6 @@ def pa_decode_gluon(
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
 
-    # Configure execution grid
-    if sliding_window > 0:
-        max_context_partition_num = triton.cdiv(sliding_window, context_partition_size)
-
     grid = (num_sequences, num_kv_heads, max_context_partition_num)
 
     # thre are some precision problems for tl.bfloat16 and tl.float16, so only support tl.float8e4b8 now
@@ -2384,13 +2405,10 @@ def pa_decode_gluon(
         value_transposed = False
     else:
         raise RuntimeError(f"Unsupported value cache shape: {value_cache.shape}")
-    # if sliding_window > 0 and sliding_window <= context_partition_size:
-    #     original_output_shape = output.shape
-    #     output = output.reshape(temporary_output.shape)
-    #     temporary_output = output
-    # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
 
-    if False:
+    # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
+    one_shot = sliding_window > 0 and sliding_window <= context_partition_size
+    if one_shot:
         _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             grid,
             exp_sums,
@@ -2438,6 +2456,7 @@ def pa_decode_gluon(
             IS_CAUSAL=is_causal,
             SLIDING_WINDOW=sliding_window,
             sinks_ptr=sinks,
+            ONE_SHOT=one_shot,
         )
         return
     else:
