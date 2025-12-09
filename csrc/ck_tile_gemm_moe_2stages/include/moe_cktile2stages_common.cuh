@@ -129,8 +129,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     static_assert(sizeof(ComputeDataType) >= sizeof(BDataType),
                   "mixed_prec_flatmm requires ADataType is a wider type than BDataType");
 
-    using GemmPipelineProblem = ck_tile::GemmPipelineProblem<ComputeDataType,
-                                                             ComputeDataType,
+    using GemmPipelineProblem = ck_tile::GemmPipelineProblem<ADataType,
+                                                             BDataType,
                                                              AccDataType,
                                                              CodegenFlatmmShape,
                                                              Traits>;

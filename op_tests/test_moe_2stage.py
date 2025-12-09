@@ -42,6 +42,12 @@ from aiter import ActivationType
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+setup_seed(1)
+
 
 @benchmark()
 def test_fmoe(
@@ -141,10 +147,11 @@ def test_fmoe(
         a1_scale = a1_scale.squeeze(-1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and WQDType == dtypes.fp4x2
     ):  # a16w4
-        a1_qt = input.to(AQDType)
+        # a1_qt = input.to(AQDType)
+        a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     else:
         a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType)
@@ -152,7 +159,7 @@ def test_fmoe(
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
@@ -179,7 +186,7 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
@@ -195,52 +202,51 @@ def test_fmoe(
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
-    # # ######################## stage 1 start ###########
-    # out1_ref = torch_moe_stage1(
-    #     a1_qt,
-    #     w1_qt,
-    #     w2_qt,
-    #     topk_weights,
-    #     topk_ids,
-    #     dtype=dtype,
-    #     activation=actType,
-    #     quant_type=qType,
-    #     a1_scale=a1_scale,
-    #     w1_scale=w1_scale,
-    #     w1_bias=exp_bias1,
-    #     doweight=doweight_stage1,
-    # )
+    # ######################## stage 1 start ###########
+    out1_ref = torch_moe_stage1(
+        a1_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        activation=actType,
+        quant_type=qType,
+        a1_scale=a1_scale,
+        w1_scale=w1_scale,
+        w1_bias=exp_bias1,
+        doweight=doweight_stage1,
+    )
+    # ######################## stage 2 start ###########
+    if qType == aiter.QuantType.per_128x128:
+        a2_qt, a2_scale = aiter.pertoken_quant(
+            out1_ref.view(token, -1, 128), quant_dtype=AQDType
+        )
+        a2_scale = a2_scale.view(token, topk, -1)
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (WQDType == dtypes.fp4x2)
+    ):  # a16w4
+        a2_qt = out1_ref
+        a2_scale = None
+    else:
+        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
+    a2_qt = a2_qt.view(token, topk, -1)
 
-    # # ######################## stage 2 start ###########
-    # if qType == aiter.QuantType.per_128x128:
-    #     a2_qt, a2_scale = aiter.pertoken_quant(
-    #         out1_ref.view(token, -1, 128), quant_dtype=AQDType
-    #     )
-    #     a2_scale = a2_scale.view(token, topk, -1)
-    # elif (
-    #     qType == aiter.QuantType.per_1x32
-    #     and (AQDType in [dtypes.bf16, dtypes.fp16])
-    #     and (WQDType == dtypes.fp4x2)
-    # ):  # a16w4
-    #     a2_qt = out1_ref
-    #     a2_scale = None
-    # else:
-    #     a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
-    # a2_qt = a2_qt.view(token, topk, -1)
-
-    # out2_ref = torch_moe_stage2(
-    #     a2_qt,
-    #     w1_qt,  # E, inter_dim*2, model_dim
-    #     w2_qt,  # E, model_dim, inter_dim
-    #     topk_weights,
-    #     topk_ids,
-    #     dtype=dtype,
-    #     quant_type=qType,
-    #     w2_scale=w2_scale,
-    #     a2_scale=a2_scale,
-    #     w2_bias=exp_bias2,
-    #     doweight=not doweight_stage1,
-    # )
+    out2_ref = torch_moe_stage2(
+        a2_qt,
+        w1_qt,  # E, inter_dim*2, model_dim
+        w2_qt,  # E, model_dim, inter_dim
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        quant_type=qType,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        w2_bias=exp_bias2,
+        doweight=not doweight_stage1,
+    )
 
     # ######################## stage 2 end ###########
     # Replicate fused_moe logic to get metadata
@@ -290,6 +296,7 @@ def test_fmoe(
     if (
         qType == aiter.QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
+        and AQDType == dtypes.bf16
         and w1_qt_aiter.dtype == dtypes.fp4x2
         and actType == aiter.ActivationType.Swiglu
     ):
@@ -309,14 +316,28 @@ def test_fmoe(
     #         token_num=token_num,
     #         block_size=block_size_M,
     #     )
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and dtype in [dtypes.bf16]
+        and AQDType == dtypes.fp8
+        and w1_qt_aiter.dtype == dtypes.fp4x2
+        and actType == aiter.ActivationType.Swiglu
+    ):
+        a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType, scale_type=dtypes.fp8)
+        a1_scale_stage1 = moe_mxfp4_sort(
+            a1_scale_stage1,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            block_size=block_size_M,
+        )
     elif input.dtype != q_dtype_a:
-        # a1, a1_scale_stage1 = quant_func(
-        #     input,
-        #     scale=None,
-        #     quant_dtype=q_dtype_a,
-        #     num_rows=None,
-        # )
-        a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType, scale_type=dtyps.fp8)
+        a1, a1_scale_stage1 = quant_func(
+            input,
+            scale=None,
+            quant_dtype=q_dtype_a,
+            num_rows=None,
+        )
     else:
         a1 = input
         a1_scale_stage1 = None
@@ -346,64 +367,65 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+    import pdb;pdb.set_trace()
     
-    # # Prepare a2 for Stage 2
-    # if (
-    #     qType == aiter.QuantType.per_1x32
-    #     and dtype in [dtypes.bf16, dtypes.fp16]
-    #     and w1_qt_aiter.dtype == dtypes.fp4x2
-    #     and actType == aiter.ActivationType.Swiglu
-    # ):
-    #     a2_scale_stage2 = None
-    # elif qType == aiter.QuantType.per_1x32:
-    #     a2 = a2.view(-1, inter_dim)
-    #     a2, a2_scale_stage2 = quant_func(
-    #         a2,
-    #         scale=None,
-    #         quant_dtype=q_dtype_a,
-    #         num_rows=None,
-    #         num_rows_factor=topk,
-    #     )
-    #     a2 = a2.view(token_num, topk, -1)
-    #     a2_scale_stage2 = moe_mxfp4_sort(
-    #         a2_scale_stage2[: token_num * topk, :].view(token_num, topk, -1),
-    #         sorted_ids=sorted_ids,
-    #         num_valid_ids=num_valid_ids,
-    #         token_num=token_num,
-    #         block_size=block_size_M,
-    #     )
-    # else:
-    #     a2, a2_scale_stage2 = quant_func(
-    #         a2,
-    #         scale=None,
-    #         quant_dtype=q_dtype_a,
-    #         num_rows=None,
-    #         num_rows_factor=topk,
-    #     )
-    #     a2 = a2.view(token_num, topk, inter_dim)
-    #
-    # # Benchmark Stage 2
-    # # Use a dummy buffer for benchmarking to avoid accumulation issues affecting correctness check
-    # moe_out_dummy = torch.zeros((token_num, model_dim), dtype=dtype, device=input.device)
-    # 
-    # _, us2 = run_perftest(
-    #     metadata.stage2,
-    #     a2,
-    #     w1_qt_aiter,
-    #     w2_qt_aiter,
-    #     sorted_ids,
-    #     sorted_expert_ids,
-    #     num_valid_ids,
-    #     moe_out_dummy,
-    #     topk,
-    #     w2_scale=w2_scale_aiter,
-    #     a2_scale=a2_scale_stage2,
-    #     block_m=block_size_M,
-    #     sorted_weights=sorted_weights if not doweight_stage1 else None,
-    #     num_iters=5,
-    #     num_warmup=2,
-    # )
-    # 
+    # Prepare a2 for Stage 2
+    if (
+        qType == aiter.QuantType.per_1x32
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and w1_qt_aiter.dtype == dtypes.fp4x2
+        and actType == aiter.ActivationType.Swiglu
+    ):
+        a2_scale_stage2 = None
+    elif qType == aiter.QuantType.per_1x32:
+        a2 = a2.view(-1, inter_dim)
+        a2, a2_scale_stage2 = quant_func(
+            a2,
+            scale=None,
+            quant_dtype=q_dtype_a,
+            num_rows=None,
+            num_rows_factor=topk,
+        )
+        a2 = a2.view(token_num, topk, -1)
+        a2_scale_stage2 = moe_mxfp4_sort(
+            a2_scale_stage2[: token_num * topk, :].view(token_num, topk, -1),
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            block_size=block_size_M,
+        )
+    else:
+        a2, a2_scale_stage2 = quant_func(
+            a2,
+            scale=None,
+            quant_dtype=q_dtype_a,
+            num_rows=None,
+            num_rows_factor=topk,
+        )
+        a2 = a2.view(token_num, topk, inter_dim)
+    
+    # Benchmark Stage 2
+    # Use a dummy buffer for benchmarking to avoid accumulation issues affecting correctness check
+    moe_out_dummy = torch.zeros((token_num, model_dim), dtype=dtype, device=input.device)
+    
+    _, us2 = run_perftest(
+        metadata.stage2,
+        a2,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_out_dummy,
+        topk,
+        w2_scale=w2_scale_aiter,
+        a2_scale=a2_scale_stage2,
+        block_m=block_size_M,
+        sorted_weights=sorted_weights if not doweight_stage1 else None,
+        num_iters=5,
+        num_warmup=2,
+    )
+    
     # # Run once for correctness
     # moe_out = torch.zeros((token_num, model_dim), dtype=dtype, device=input.device)
     # 
@@ -449,8 +471,6 @@ l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
 l_dim = [(3072, 3072)]
 l_tokenNum = [
-    4,
-    4,
     128,
 ]
 l_quant = [
@@ -542,7 +562,7 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=8,
+    default=128,
     help="""Number of experts.
     e.g.: -e 8""",
 )
@@ -551,7 +571,7 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=2,
+    default=4,
     help="""Number of top experts.
     e.g.: -k 2""",
 )

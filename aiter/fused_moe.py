@@ -706,7 +706,8 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 bias2=bias2,
             ),
-            16 if token < 2048 else 32,
+            # 16 if token < 2048 else 32,
+            32 if token < 2048 else 64,
             ksplit,
             False,
         )
@@ -1321,7 +1322,7 @@ def cktile_moe_stage1(
     if w1.dtype is torch.uint32:
         D = D * 8
     out = torch.empty(
-        (token_num, topk, D), dtype=hidden_states.dtype, device=hidden_states.device
+        (token_num, topk, D), dtype=dtypes.bf16, device=hidden_states.device
     )
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(

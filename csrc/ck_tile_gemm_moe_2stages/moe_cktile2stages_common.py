@@ -388,14 +388,14 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     {{
         return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    // else if (block_m == 32)
-    // {{
-    //     return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    // }}
-    // else if (block_m == 64)
-    // {{
-    //     return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    // }}
+    else if (block_m == 32)
+    {{
+        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
+    else if (block_m == 64)
+    {{
+        return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
     else
     {{
         TORCH_CHECK(
@@ -413,14 +413,14 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
     {{
         return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    // else if (block_m == 32)
-    // {{
-    //     return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    // }}
-    // else if (block_m == 64)
-    // {{
-    //     return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    // }}
+    else if (block_m == 32)
+    {{
+        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
+    else if (block_m == 64)
+    {{
+        return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
     else
     {{
         TORCH_CHECK(

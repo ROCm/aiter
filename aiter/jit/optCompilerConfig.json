@@ -445,7 +445,9 @@
             "f'{AITER_CSRC_DIR}/pybind/moe_cktile_2stages_pybind.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'--save-temps'"
+	],
         "md_name": "'module_moe_cktile2stages'",
         "extra_ldflags": "None",
         "extra_include": [
