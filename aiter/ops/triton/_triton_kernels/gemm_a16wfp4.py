@@ -243,4 +243,5 @@ def _get_config(
 ):
     from ..utils.gemm_config_utils import get_gemm_config
 
-    return get_gemm_config("GEMM-A16WFP4", M, N, K)
+    # Note: Config files use K=2*K in their naming
+    return get_gemm_config("GEMM-A16WFP4", M, N, 2 * K)
