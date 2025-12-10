@@ -500,6 +500,7 @@ def build_module(
     torch_exclude,
     hipify=False,
 ):
+    os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
