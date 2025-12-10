@@ -1,7 +1,13 @@
 import torch
-from diffusers import CogVideoXPipeline
-from diffusers.utils import export_to_video
-from sageattention import sageattn
+try:
+    from diffusers import CogVideoXPipeline
+    from diffusers.utils import export_to_video
+except ImportError:
+    raise ImportError(
+        "diffusers library is not installed. Please install it using:\n"
+        "pip install diffusers"
+    )
+from op_tests.sagev1_tests.core import sageattn
 import torch.nn.functional as F
 
 F.scaled_dot_product_attention = sageattn
