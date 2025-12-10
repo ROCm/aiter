@@ -39,7 +39,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bool has_dropout,
                                   quant_scale_enum qscale_type,
                                   bool use_ext_asm,
-                                  bool has_sink,
+                                  bool has_sink = false,
                                   int how_v3_bf16_cvt = 1,
                                   bool skip_min_seqlen_q = false)
 {{
@@ -170,8 +170,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      has_lse,
                                      has_dropout,
                                      quant_scale_enum::no_scale,
-                                     use_ext_asm,
-                                     has_sink);
+                                     use_ext_asm);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 
