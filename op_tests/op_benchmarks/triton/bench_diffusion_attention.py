@@ -48,6 +48,13 @@ from op_tests.op_benchmarks.triton.mha_correctness_utils import (
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.mha_v3 import _quantize_bshd
 
+from aiter.ops.triton.sage_v1 import (
+    sage_attn_v1_func,
+)
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
+    get_fwd_configs,
+)
+
 
 # test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
 import logging
@@ -190,6 +197,35 @@ def fav2_forward_func(
         causal=causal,
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
+    )
+
+def sagev1_forward_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+):
+    config, _ = get_fwd_configs(False)
+    assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
+    config = config[0].all_kwargs()
+    BLKQ = config["BLOCK_M"]
+    BLKK = config["BLOCK_N"]
+
+    head_dim = q.shape[-1]
+    softmax_scale = head_dim**-0.5
+    k_mean = None
+    ## following quantization already considered softmax scale and RCP_LN2 
+    q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
+        q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout="NHD"
+    )
+    v_fp16 = v.to(torch.float16)
+    return lambda: sage_attn_v1_func(
+        q_int8, 
+        k_int8, 
+        v_fp16,
+        q_descale,
+        k_descale,
+        causal=causal,
     )
 
 def nonvarlen_benchmark_configs():
@@ -338,6 +374,13 @@ def run_benchmark(custom, args):
                 tensor_layout=args.qk_int8_layout,
                 sm_scale=sm_scale,
                 k_smooth=k_smooth,
+            )
+        elif args.sagev1: # sage v1, fused on fa3
+            fn = sagev1_forward_func(
+                q,
+                k,
+                v,
+                causal=False,
             )
         else: # fav2 (no quantization)
             fn = fav2_forward_func(
@@ -502,6 +545,7 @@ def parse_args():
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-qk_int8", action="store_true", default=False)
+    parser.add_argument("-sagev1", action="store_true", default=False)
     parser.add_argument("-no_k_smooth", action="store_true", default=False)
     parser.add_argument("-qk_int8_layout", type=str, default="NHD", choices=["HND", "NHD"],
         help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")

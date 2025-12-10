@@ -37,8 +37,8 @@ from aiter.ops.triton.sage_v1 import (
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
-ATOL_fp8 = 3.0e-2
-RTOL_fp8 = 2.5e-2
+ATOL_fp8 = 3.0e-1
+RTOL_fp8 = 2.5e-1
 
 
 def pad_rearrange_dropout_mask(

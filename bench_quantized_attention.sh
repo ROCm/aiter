@@ -24,7 +24,7 @@ for i in ${!BATCH_SIZES[@]}; do
         -d 128 \
         -metric all \
         # -print_vgpr \
-    
+
     echo ""
     
     echo "--- SageAttnV1 (i.e -qk_int8) ---"
@@ -47,6 +47,18 @@ for i in ${!BATCH_SIZES[@]}; do
         -fp8 \
         -metric all
         
+    echo ""
+
+    echo "--- SageAttnV1 (i.e -sagev1,  fused on fa3 fp8) ---"
+    run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
+        -b ${BATCH_SIZES[i]} \
+        -hq ${NUM_HEADS[i]} \
+        -sq ${SEQ_LENS[i]} \
+        -d 128 \
+        -sagev1 \
+        -metric all \
+        # -print_vgpr \
+    
     echo ""
 done
 

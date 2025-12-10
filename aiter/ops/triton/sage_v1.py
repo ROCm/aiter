@@ -32,7 +32,7 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        k_mean: torch.Tensor,
+        k_mean: torch.Tensor | None,
         softmax_scale: float | None,
         causal: bool,
         qv: Optional[torch.Tensor],
@@ -56,7 +56,7 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
 
         softmax_scale = head_dim**-0.5
         ## following quantization already considered softmax scale and RCP_LN2 
-        q_int8, q_descale, k_int8, k_descale = per_block_int8(
+        q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
             q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout="NHD"
         )
 
