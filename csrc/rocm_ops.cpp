@@ -41,6 +41,7 @@
 #include "rope.h"
 #include "sample.h"
 #include "smoothquant.h"
+#include "trtllm_all_reduce_fusion.h"
 #include "topk_plain.h"
 #include <torch/extension.h>
 
@@ -106,6 +107,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     AITER_UNARY_PYBIND;
     CUSTOM_ALL_REDUCE_PYBIND;
     QUICK_ALL_REDUCE_PYBIND;
+    TRTLLM_ALL_REDUCE_FUSION_PYBIND;
     CACHE_PYBIND;
     SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
