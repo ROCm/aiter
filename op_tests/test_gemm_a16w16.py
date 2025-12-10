@@ -151,20 +151,18 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         and k % 64 == 0
         and n % 64 == 0
     ):
-        # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
+        ### b preshuffle
         wshuffle = shuffle_weight(weight, layout=(16, 16))
-        # d, avg_d = run_bf16gemm_asm(
-        #     x,
-        #     weight,
-        #     out_asm,
-        #     splitK=None,
-        # )
         d, avg_d = run_bf16gemm_asm(
             x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
         )
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
         err_asm = checkAllclose(b, d, msg=msg)
+        ### no shuffle
+        e, avg_e = run_bf16gemm_asm(x, weight, out_asm, bias)
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
+        err_asm_noshuffle = checkAllclose(b, e, msg=msg)
 
     ret = {
         "torch us": avg_a,
@@ -172,8 +170,10 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         "tgemm err (vs torch)": err_tgemm,
         "hipb us": locals().get("avg_c", ""),
         "hipb err (vs torch)": locals().get("err_hipb", ""),
-        "asm us": locals().get("avg_d", ""),
-        "asm err (vs tgemm)": locals().get("err_asm", ""),
+        "asm-bpshuff us": locals().get("avg_d", ""),
+        "asm-bpshuff err (vs tgemm)": locals().get("err_asm", ""),
+        "asm-nshuff us": locals().get("avg_e", ""),
+        "asm-nshuff err (vs tgemm)": locals().get("err_asm_noshuffle", ""),
     }
 
     a, us = run_gemm_triton(x, weight, bias, otype, scaleA, scaleB)
