@@ -1,9 +1,6 @@
-import os
-import sys
 import torch
 import pytest
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 from aiter.ops.triton.fused_kv_cache import (
