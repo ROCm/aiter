@@ -252,7 +252,12 @@ inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
 #endif
 }
 
-template <typename T, int32_t kNumLdsRows, int32_t kNumLdsCols, hkdart::all RT>
+template <typename T,
+          int32_t kNumLdsRows,
+          int32_t kNumLdsCols,
+          int32_t kRowOffset,
+          int32_t kColOffset,
+          hkdart::all RT>
 inline __device__ void load_lds_to_gpr(RT& dst,
                                        const uintptr_t p_lds_src,
                                        const int32_t row_offset,
@@ -260,6 +265,8 @@ inline __device__ void load_lds_to_gpr(RT& dst,
 {
     constexpr int32_t tile_stride = 0;
     constexpr int32_t row_stride  = RT::base_tile_rows * kNumLdsCols;
+    constexpr int32_t const_offset =
+        ((kRowOffset * kNumLdsCols) + kColOffset) * sizeof(typename RT::T);
 
     constexpr int32_t element_per_thr =
         8; // for mfma_f32_16x16x32_bf16, each thr takes 8 elements with 2 DWs.
@@ -274,7 +281,7 @@ inline __device__ void load_lds_to_gpr(RT& dst,
         using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, N * RT::width + M>;
         static_assert(range_type::lo + 1 == range_type::hi,
                       "ds_read_b64 requires 2 consecutive registers");
-        const int offset = N * row_stride + M * tile_stride;
+        const int offset = N * row_stride + M * tile_stride + const_offset;
         hkm::ds_read_b64<range_type::lo>(p_lds, offset);
     };
 
@@ -440,10 +447,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 // Load K from LDS to GPR
                 constexpr int32_t tile_idx = (idx.value - k_q_nope_begin) / 2;
-                load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim>(
-                    kv_0, p_lds_k_nope, 0, tile_idx * T::kBlockK);
-                load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim>(
-                    kv_1, p_lds_k_nope, 0, (tile_idx + 1) * T::kBlockK);
+                load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim, 0, tile_idx * T::kBlockK>(
+                    kv_0, p_lds_k_nope, 0, 0);
+                load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim, 0, (tile_idx + 1) * T::kBlockK>(
+                    kv_1, p_lds_k_nope, 0, 0);
 
                 asm volatile("s_waitcnt lgkmcnt(0)");
 
@@ -458,28 +465,30 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
             });
 
-            // GEMM on RoPE
-            ckt::static_for<k_q_rope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
-                using q_range_0 =
-                    hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
-                                         2>;
-                using q_range_1 = hkdart::
-                    split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>, 2>;
-                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
-                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+            // // GEMM on RoPE
+            // ckt::static_for<k_q_rope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
+            //     using q_range_0 =
+            //         hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value +
+            //         1>>,
+            //                              2>;
+            //     using q_range_1 = hkdart::
+            //         split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>,
+            //         2>;
+            //     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+            //     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
-                // Load K from LDS to GPR
-                constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
-                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
-                    kv_0, p_lds_k_rope, 0, tile_idx * T::kBlockK);
-                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
-                    kv_1, p_lds_k_rope, 0, (tile_idx + 1) * T::kBlockK);
+            //     // Load K from LDS to GPR
+            //     constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
+            //     load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
+            //         kv_0, p_lds_k_rope, 0, tile_idx * T::kBlockK);
+            //     load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
+            //         kv_1, p_lds_k_rope, 0, (tile_idx + 1) * T::kBlockK);
 
-                asm volatile("s_waitcnt lgkmcnt(0)");
+            //     asm volatile("s_waitcnt lgkmcnt(0)");
 
-                hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
-                hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
-            });
+            //     hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
+            //     hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
+            // });
 
             float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
             float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
@@ -490,11 +499,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             float r12 = FUI(hkm::v_get_gpr<k_p_comp_begin + 6>()).f32;
             float r13 = FUI(hkm::v_get_gpr<k_p_comp_begin + 7>()).f32;
 
-            int row0 = qo_start + warp_idx * 16;
-            int row1 = qo_start + warp_idx * 16 + 1;
-            int row2 = qo_start + warp_idx * 16 + 2;
-            int row3 = qo_start + warp_idx * 16 + 3;
-            int col0 = kv_start + (lane_idx % 16);
+            int row0 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4;
+            int row1 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 1;
+            int row2 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 2;
+            int row3 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 3;
+            int col0 = lane_idx % 16;
             int col1 = col0 + 16;
 
             int off00 = row0 * 576 + col0;
