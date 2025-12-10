@@ -148,7 +148,7 @@ def fav3_fp8_forward_func(
         sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
     )
 
-def qk_int8_forward_func(q, k, v, tensor_layout, sm_scale):
+def qk_int8_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
     # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
     # tensor_layout = args.qk_int8_layout
     config = _get_config()
@@ -161,10 +161,10 @@ def qk_int8_forward_func(q, k, v, tensor_layout, sm_scale):
     else:  # NHD
         # Keep original layout
         v = v.to(torch.float16)
-    k_mean = k.mean(dim=1, keepdim=True) # None
+    # k_mean = k.mean(dim=1, keepdim=True) if k_smooth else None # provide km as None and it gets computed inside per_block_int8
     # sm_scale = D_HEAD**-0.5
     q, q_scale, k, k_scale, _ = per_block_int8(
-        q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+        q, k, km=None, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout, smooth_k=k_smooth
     )
     q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
     k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
@@ -228,6 +228,19 @@ def create_benchmark_configs(custom, args):
     unit = ""
     line_vals = ["time(ms)", "throughput(TFLOPS)", "bandwidth(GB/s)", "arithmetic_intensity(FLOP/byte)"]
 
+    # if comparing to reference, or specific metric provided, adjust line_vals accordingly
+    if args.compare_to_ref or (args.metric and args.metric != "all"):
+        if args.compare_to_ref:
+            line_vals = ["time(ms)"] # avoid redundant runs of other metrics when comparing to reference. default to time only.
+        else:
+            metric_map = {
+                "time": "time(ms)",
+                "throughput": "throughput(TFLOPS)",
+                "bandwidth": "bandwidth(GB/s)",
+                "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
+            }
+            line_vals = [metric_map[args.metric]]
+
     configs.append(
         triton.testing.Benchmark(
             x_names=x_names,
@@ -273,9 +286,11 @@ def run_benchmark(custom, args):
         assert args.qk_int8_layout=="NHD"
         assert args.layout == "bshd"
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
+        assert causal == False, "Causal not supported in this benchmark."
         return_lse = True
         return_attn_probs = False
         varlen = args.layout == "thd"
+        k_smooth = not args.no_k_smooth
         has_pe = D_HEAD > D_HEAD_V
         assert not (
             args.fp8 and has_pe
@@ -322,6 +337,7 @@ def run_benchmark(custom, args):
                 v,
                 tensor_layout=args.qk_int8_layout,
                 sm_scale=sm_scale,
+                k_smooth=k_smooth,
             )
         else: # fav2 (no quantization)
             fn = fav2_forward_func(
@@ -382,6 +398,7 @@ def run_benchmark(custom, args):
                         v,
                         tensor_layout=args.qk_int8_layout,
                         sm_scale=sm_scale,
+                        k_smooth=k_smooth,
                     )
                 elif args.ref=="fav2": # fav2 (no quantization)
                     fn = fav2_forward_func(
@@ -390,7 +407,7 @@ def run_benchmark(custom, args):
                         v,
                         dropout_p=dropout,
                         softmax_scale=sm_scale,
-                        causal=causal,
+                        causal=False,
                         return_lse=return_lse,
                         return_attn_probs=return_attn_probs,
                     )
@@ -485,6 +502,7 @@ def parse_args():
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-qk_int8", action="store_true", default=False)
+    parser.add_argument("-no_k_smooth", action="store_true", default=False)
     parser.add_argument("-qk_int8_layout", type=str, default="NHD", choices=["HND", "NHD"],
         help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")
     parser.add_argument("-quantize_p", action="store_true", default=False)
@@ -500,7 +518,7 @@ def parse_args():
         "-metric",
         nargs="?",
         const="throughput",
-        choices=["all", "time", "throughput", "bandwidth"],
+        choices=["all", "time", "throughput", "bandwidth", "arithmetic_intensity"],
         default=None,
         help="Metrics for the kernel benchmark.",
     )
