@@ -1,7 +1,7 @@
 import torch
 import pytest
 from aiter.ops.triton.fused_qkv_split_qk_rope import fused_qkv_split_qk_rope
-from op_tests.triton_tests.misc.test_fused_qk_concat import generate_rope_cached_freqs
+from op_tests.triton_tests.test_fused_qk_concat import generate_rope_cached_freqs
 from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 
 
