@@ -2,18 +2,19 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+from typing import Optional, Tuple
+
 import torch
-from typing import Tuple, Optional
-from ..jit.core import (
-    compile_ops,
-)
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
-from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
+from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
 from aiter import dtypes
+
+from ..jit.core import compile_ops
 
 MD_NAME = "module_attention"
 
@@ -203,14 +204,14 @@ def pa_persistent_fwd(
     kv_indices: torch.Tensor,  # [sum_kvlen], packed kv ids    2
     context_lens: torch.Tensor,  # [batch]                       3
     # work_meta_data: torch.Tensor,
-    work_indptr: Optional[torch.Tensor] = None,
-    work_info: Optional[torch.Tensor] = None,
-    reduce_indptr: Optional[torch.Tensor] = None,
-    reduce_final_map: Optional[torch.Tensor] = None,
-    reduce_partial_map: Optional[torch.Tensor] = None,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
     K_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
     V_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
-    softmax_scale: float = None,
+    softmax_scale: Optional[float] = None,
     mask: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = Q.device
@@ -444,7 +445,7 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size]
     kv_last_page_lens: torch.Tensor,
     num_kv_splits_indptr: Optional[torch.Tensor],
-    work_metadata: Optional[torch.Tensor],
+    work_meta_data: Optional[torch.Tensor],
     work_indptr: Optional[torch.Tensor],
     work_info_set: Optional[torch.Tensor],
     max_seqlen_q: int,
@@ -671,8 +672,8 @@ def get_mla_metadata_v1(
     num_heads_k: int,
     is_causal: bool,
     work_metadata_ptrs: torch.Tensor,
+    work_info_set: torch.Tensor,
     work_indptr: torch.Tensor,
-    work_info: torch.Tensor,
     reduce_indptr: torch.Tensor,
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
