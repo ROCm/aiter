@@ -20,7 +20,8 @@ try:
     IRIS_AVAILABLE = True
 except ImportError:
     IRIS_AVAILABLE = False
-    logging.warning(
+    # Iris is optional - only log at debug level
+    logging.debug(
         "Iris library not available. Reduce-scatter operations will not work."
     )
 
