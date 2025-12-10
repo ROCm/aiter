@@ -29,12 +29,16 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
     per_block_int8,
 )
 
+from aiter.ops.triton.sage_v1 import (
+    sage_attn_v1_wrapper_func,
+)
+
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
-ATOL_fp8 = 3.0e-1
-RTOL_fp8 = 2.5e-1
+ATOL_fp8 = 3.0e-2
+RTOL_fp8 = 2.5e-2
 
 
 def pad_rearrange_dropout_mask(
@@ -1316,3 +1320,52 @@ def test_attn_qk_int8_per_block(
     fp8_assert_close(
         triton_out.to(torch.float32), torch_out.to(torch.float32), atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_percentage=1.0
     )
+
+@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+)
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+@pytest.mark.parametrize("CAUSAL", [(True), (False)])
+def test_sage_v1(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    dtype=torch.float16,
+):
+    torch.cuda.empty_cache()
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+
+    triton_out = sage_attn_v1_wrapper_func(
+        q,
+        k,
+        v,
+        causal=CAUSAL,
+    )
+    if DEBUG_MODE:
+        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+    torch_out = attention_ref(
+        q, k, v, dropout_p=0.0, dropout_mask=None, causal=CAUSAL
+    )
+    torch_out, attention_scores, _ = torch_out
+    if DEBUG_MODE:
+        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+        print(
+            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+        )
+
+    fp8_assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+        )
+
