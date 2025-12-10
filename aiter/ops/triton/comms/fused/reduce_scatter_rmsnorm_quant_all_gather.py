@@ -329,9 +329,10 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         if fp8_out is None:
             fp8_out = ctx.iris_ctx.empty((M_shard, N), dtype=fp8_dtype)
         scales = torch.empty(M_shard, dtype=torch.float32, device=device)
+        # Determine max value based on dtype (use consistent fallback)
         fp8_dtype_max = (
             448.0
-            if fp8_out.dtype == getattr(torch, "float8_e4m3fn", None)
+            if hasattr(torch, "float8_e4m3fn") and fp8_out.dtype == torch.float8_e4m3fn
             else float(torch.iinfo(torch.int8).max)
         )
     else:
