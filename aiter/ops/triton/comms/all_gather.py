@@ -193,7 +193,7 @@ def all_gather(
     if not IRIS_AVAILABLE:
         raise RuntimeError("Iris library is not available. Cannot perform all-gather.")
 
-    if not ctx._initialized:
+    if not ctx.is_initialized:
         raise RuntimeError(
             "Iris context not initialized. Use IrisCommContext as context manager."
         )

@@ -288,7 +288,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
             "      result = reduce_scatter_rmsnorm_quant_all_gather(input_tensor, gamma, ctx=ctx)"
         )
 
-    if not ctx._initialized:
+    if not ctx.is_initialized:
         raise RuntimeError(
             "Iris context not initialized. Use IrisCommContext as context manager."
         )

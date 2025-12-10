@@ -192,8 +192,13 @@ class IrisCommContext:
         # Iris context cleanup is handled automatically
         pass
 
+    @property
+    def is_initialized(self) -> bool:
+        """Check if the Iris context has been initialized."""
+        return self._initialized
+
     def get_heap_bases(self):
         """Get the heap bases tensor for use in Triton kernels."""
-        if not self._initialized:
+        if not self.is_initialized:
             raise RuntimeError("Iris context not initialized. Use as context manager.")
         return self.iris_ctx.heap_bases

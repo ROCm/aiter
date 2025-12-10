@@ -203,7 +203,7 @@ def reduce_scatter(
             "Iris library is not available. Cannot perform reduce-scatter."
         )
 
-    if not ctx._initialized:
+    if not ctx.is_initialized:
         raise RuntimeError(
             "Iris context not initialized. Use IrisCommContext as context manager."
         )
