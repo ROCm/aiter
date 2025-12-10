@@ -2,7 +2,6 @@
 #include "aiter_hip_common.h"
 #include "mha_bwd.h"
 #include <string>
-#define ONLY_FAV3 1
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)

@@ -6,7 +6,7 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import AITER_CSRC_DIR, CK_DIR, compile_ops
+from ..jit.core import AITER_CSRC_DIR, CK_DIR, AITER_META_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
@@ -684,7 +684,8 @@ def cmdGenFunc_mha_bwd(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
         "--receipt 300 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"
+
     ]
     return {
         "md_name": md_name,
@@ -801,9 +802,6 @@ def mha_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
-    only_v3: bool,
-    v3_atomic_fp32: bool,
-    v3_bf16_cvt: int,
     dq: Optional[Tensor] = None,
     dk: Optional[Tensor] = None,
     dv: Optional[Tensor] = None,
@@ -939,11 +937,12 @@ def cmdGenFunc_mha_varlen_bwd(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
         "--receipt 400 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": ["'-DONLY_FAV3=0'"]
     }
 
 
@@ -1586,7 +1585,6 @@ def _flash_attn_backward(
         and hdim_q > 64
         and hdim_q <= 128
         and hdim_q % 8 == 0
-        and not swa
     )
 
     def can_impl_fmha_v3_bwd_gfx950():
@@ -1601,6 +1599,7 @@ def _flash_attn_backward(
             (hdim_q > 64 and hdim_q <= 128)
             or (hdim_q == 192 and hdim_v == 128 and nmask)
         ) and hdim_q % 8 == 0
+        ret &= not swa
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
