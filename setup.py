@@ -216,7 +216,9 @@ if IS_ROCM:
 
     if PREBUILD_KERNELS != 0:
         if not has_torch:
-            print("[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment")
+            print(
+                "[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment"
+            )
         else:
             all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
@@ -231,8 +233,12 @@ if IS_ROCM:
                     pass
 
             def build_one_module(one_opt_args):
-                flags_cc = list(one_opt_args["flags_extra_cc"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
-                flags_hip = list(one_opt_args["flags_extra_hip"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
+                flags_cc = list(one_opt_args["flags_extra_cc"]) + [
+                    f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+                ]
+                flags_hip = list(one_opt_args["flags_extra_hip"]) + [
+                    f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+                ]
 
                 core.build_module(
                     md_name=one_opt_args["md_name"],
