@@ -224,8 +224,8 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t NXDLPerWave = NPerBlock / (MNPerXDL * NWaves);
     static constexpr ck::index_t CShuffleMXDLPerWave = ck::is_same_v<B0DataType, I4> ? 2 : MXDLPerWave;
     static constexpr ck::index_t CShuffleNXDLPerWave = ck::is_same_v<B0DataType, I4> ? 2 : NXDLPerWave;
-    static constexpr ck::index_t CShuffleNLane = ck::is_same_v<B0DataType, I4> ? 32 : NPerBlock / 2 / NXDLPerWave;
-    static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
+    // static constexpr ck::index_t CShuffleNLane = ck::is_same_v<B0DataType, I4> ? 32 : NPerBlock / 2 / NXDLPerWave;
+    // static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
     static constexpr ck::index_t AK1 = 16 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 = ck::is_same_v<B0DataType, I4> ? 32 / sizeof(B0DataType) : 16 / sizeof(B0DataType);
     static constexpr ck::index_t EVec = 2;
@@ -239,6 +239,9 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t Scale_Block_M = 1;
     static constexpr ck::index_t Scale_Block_N = 128;
     static constexpr ck::index_t Scale_Block_K = 128;
+
+    static constexpr ck::index_t CShuffleNLane = 64;
+    static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmBlockScale
         // clang-format off
             < Row, Col, DsLayout, ELayout,
@@ -251,7 +254,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
               MXDLPerWave, NXDLPerWave,
               S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
               S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
-              MXDLPerWave,    NXDLPerWave,   S<1, K0_M, 1, K0_A>, S<2, 1, 1, 1>,
+              MXDLPerWave,    NXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<2, 1, 1, 1>,
               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, false, false, MulRoutedWeight, int32_t, A0DataType>;
 
 
