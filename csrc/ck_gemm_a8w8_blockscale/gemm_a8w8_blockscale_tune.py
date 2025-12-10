@@ -16,10 +16,15 @@ from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
-from legacy_gemm_a8w8_blockscale_instance import legacy_candidate_kernels_dict
-from tile_gemm_a8w8_blockscale_instance import tile_candidate_kernels_dict
+from gemm_a8w8_blockscale_instance_legacy import candidate_kernels_dict_legacy
+from gemm_a8w8_blockscale_instance_tile import candidate_kernels_dict_tile
 
 block_shape = (128, 128)
+
+
+"""
+a8w8_blockscale_gemm tuning for legacy CK and tile CK
+"""
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
@@ -56,12 +61,20 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-def run_ck_gemm_a8w8_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
+def run_ck_gemm_a8w8_blockscale_tile(x, weight, x_scale, w_scale, out, kernel_id, splitK):
     """
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
     """
     
-    return aiter.gemm_a8w8_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
+    return aiter.gemm_a8w8_blockscale_tune_tile(x, weight, x_scale, w_scale, out, kernel_id, splitK)
+
+
+def run_ck_gemm_a8w8_blockscale_legacy(x, weight, x_scale, w_scale, out, kernel_id, splitK):
+    """
+    Run gemm a8w8 blockscale tuned kernel for ck_legacy type.
+    """
+    
+    return aiter.gemm_a8w8_blockscale_tune_legacy(x, weight, x_scale, w_scale, out, kernel_id, splitK)
 
 
 def generate_data(m, n, k, seed, device="cuda"):
@@ -126,13 +139,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         
         candidate_kernels_dict = {}
         if type == "ck_legacy":
-            if kernelId >= len(legacy_candidate_kernels_dict) or kernelId < 0:
+            if kernelId >= len(candidate_kernels_dict_legacy) or kernelId < 0:
                 return None
-            candidate_kernels_dict = legacy_candidate_kernels_dict
+            candidate_kernels_dict = candidate_kernels_dict_legacy
         elif type == "ck_tile":
-            if kernelId >= len(tile_candidate_kernels_dict) + len(legacy_candidate_kernels_dict) or kernelId < 0:
+            if kernelId >= len(candidate_kernels_dict_tile) or kernelId < 0:
                 return None
-            candidate_kernels_dict = tile_candidate_kernels_dict
+            candidate_kernels_dict = candidate_kernels_dict_tile
         else:
             return None
         return candidate_kernels_dict[kernelId].name
@@ -144,15 +157,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         seed,
     ):
         (cu_num, M, N, K) = info_keys
-        kernels_num = len(tile_candidate_kernels_dict)
+        kernels_num = len(candidate_kernels_dict_tile)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 1, 2, 3]
         tasks_ck_legacy = []
         for i in range(kernels_num):
-            # Note: The index of tile kernels should be greater than that of legacy kernels in the manifest file.
-            # This is to ensure that when both legacy and tile kernels are tuned, the tile kernels are
-            # preferred during selection.
-            kernel = tile_candidate_kernels_dict[i+len(legacy_candidate_kernels_dict)]
+            kernel = candidate_kernels_dict_tile[i]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -172,7 +182,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         info,
                         generate_data,
                         (M, N, K, seed),
-                        run_ck_gemm_a8w8_blockscale,
+                        run_ck_gemm_a8w8_blockscale_tile,
                         (
                             gemm_a8w8_idx,
                             i,
@@ -200,12 +210,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         seed,
     ):
         (cu_num, M, N, K) = info_keys
-        kernels_num = len(legacy_candidate_kernels_dict)
+        kernels_num = len(candidate_kernels_dict_legacy)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 1, 2, 3]
         tasks_ck_legacy = []
         for i in range(kernels_num):
-            kernel = legacy_candidate_kernels_dict[i]
+            kernel = candidate_kernels_dict_legacy[i]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -225,7 +235,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         info,
                         generate_data,
                         (M, N, K, seed),
-                        run_ck_gemm_a8w8_blockscale,
+                        run_ck_gemm_a8w8_blockscale_legacy,
                         (
                             gemm_a8w8_idx,
                             i,
@@ -267,7 +277,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             K = untunedf.loc[i, "K"]
             seed = seed + 1
             total_kernel_nums = 0
-            # kernels_num = len(legacy_candidate_kernels_dict)
+            # kernels_num = len(candidate_kernels_dict_legacy)
             info_keys = (cu_num, M, N, K)
             if "both" in args.libtype or "ck_legacy" in args.libtype:
                 task.extend(

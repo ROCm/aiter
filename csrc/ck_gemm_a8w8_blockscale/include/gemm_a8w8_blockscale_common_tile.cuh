@@ -25,14 +25,14 @@
 #include "ck_tile/ops/gemm.hpp"
 #include "ck_tile/ops/gemm_quant.hpp"
 
-using TILE_F32 = float;
-using TILE_F16 = ck_tile::half_t;
-using TILE_B16 = ck_tile::bf16_t;
-using TILE_FP8 = ck_tile::fp8_t;
+using TILE_FP32 = float;
+using TILE_FP16 = ck_tile::half_t;
+using TILE_BF16 = ck_tile::bf16_t;
+using TILE_FP8  = ck_tile::fp8_t;
 
 using ADataType   = TILE_FP8;
 using BDataType   = TILE_FP8;
-using AccDataType = TILE_F32;
+using AccDataType = TILE_FP32;
 
 using ALayout = ck_tile::tensor_layout::gemm::RowMajor;
 using BLayout = ck_tile::tensor_layout::gemm::ColumnMajor;
@@ -80,7 +80,7 @@ struct TileGemmTileHelperF8BlockScale
                                                          DoubleSmemBuffer>;
     using PipelineProblem = ck_tile::GemmRowColTensorQuantPipelineProblem<ADataType,
                                                                           BDataType,
-                                                                          AccDataType,
+                                                                          EDataType,
                                                                           AccDataType,
                                                                           GemmShape,
                                                                           GemmTraits,

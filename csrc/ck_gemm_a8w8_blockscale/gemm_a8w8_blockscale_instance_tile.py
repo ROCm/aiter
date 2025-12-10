@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 @dataclass
 class TileKernelInstance:
-    
     M_Tile: int
     N_Tile: int
     K_Tile: int
@@ -28,6 +27,10 @@ class TileKernelInstance:
     
     @property
     def name(self) -> str:
+        """
+        Generate a unique name for the kernel instance based on its parameters.        
+        """
+        
         return ("_").join(
             [
                 "a8w8_blockscale_tile",
@@ -67,16 +70,15 @@ class TileKernelInstance:
 
 
 # fmt: off
-# Note: The index of tile kernels should be greater than that of legacy kernels in the manifest file.
-# This is to ensure that when both legacy and tile kernels are tuned, the tile kernels are
-# preferred during selection.
-tile_candidate_kernels_dict = {
+# Candidate and default kernel instances for tile gemm a8w8 blockscale
+# These instances are used for generating the kernel code and tuning.
+candidate_kernels_dict_tile = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile | kPadM | kPadN | kPadK |   Scheduler   | TransposeC | DoubleSmemBuffer | UsePersistentKernel |
-    1:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      False,  False,  False,   "Intrawave",     False,          False,            False             )   
+    0:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      False,  False,  False,   "Intrawave",     False,          False,            False             )   
 }
 
 
-tile_default_kernels_dict = {
+default_kernels_dict_tile = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile | kPadM | kPadN | kPadK |   Scheduler   | TransposeC | DoubleSmemBuffer | UsePersistentKernel |
     -1:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      True,  True,    True,   "Intrawave",      False,          False,            True             )   
 }

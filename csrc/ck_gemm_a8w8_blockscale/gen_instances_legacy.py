@@ -8,25 +8,20 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from legacy_gemm_a8w8_blockscale_instance import (
-    legacy_default_kernels_dict,
+from aiter.jit.core import AITER_LOG_TUNED_CONFIG
+from gemm_a8w8_blockscale_instance_legacy import (
+    default_kernels_dict_legacy,
     LegacyKernelInstance,
-    legacy_candidate_kernels_dict,
-)
-from tile_gemm_a8w8_blockscale_instance import (
-    tile_default_kernels_dict,
-    TileKernelInstance,
-    tile_candidate_kernels_dict,
+    candidate_kernels_dict_legacy,
 )
 
 
 """
-a8w8_blockscale_gemm instance gen for legacy and tile CK  
+a8w8_blockscale_gemm instance gen for legacy CK  
 """
 
 class gemm_a8w8_blockscale_codegen:
-    def __init__(self, type: str, working_path: str, istune=False, tune_file=None):
-        self.libtype = type
+    def __init__(self, working_path: str, istune=False, tune_file=None):
         self.working_path = working_path
         if not os.path.exists(working_path):
             os.makedirs(working_path)
@@ -38,62 +33,32 @@ class gemm_a8w8_blockscale_codegen:
 
     def get_tune_dict(self, tune_dict_csv: str):
         """
-        get tune dict from csv file
+        Get tune dict from csv file
         """
-        
-        tune_dict = dict()
-        if self.libtype == "ck_legacy":
-            tune_dict = legacy_default_kernels_dict
-        elif self.libtype == "ck_tile":
-            tune_dict = tile_default_kernels_dict
-        else:
-            # legacy and tile
-            pass
-        
+
+        tune_dict = default_kernels_dict_legacy
+           
         if os.path.exists(tune_dict_csv):
             tune_df = pd.read_csv(tune_dict_csv)
             if torch.cuda.is_available():
                 gpu = torch.cuda.current_device()
                 device_properties = torch.cuda.get_device_properties(gpu)
                 cu_num = device_properties.multi_processor_count
-                if self.libtype == "ck_legacy":   
-                    tune_df = tune_df[
-                        (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck_legacy")
-                    ].reset_index()
-                elif self.libtype == "ck_tile":
-                    tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck_tile")
+                tune_df = tune_df[
+                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck_legacy")
                 ].reset_index()
-                else:
-                    # legacy and tile, mixed
-                    tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"].isin(["ck_legacy","ck_tile"]))
-                ].reset_index()
+                
             for i in range(len(tune_df)):
                 M = int(tune_df.loc[i, "M"])
                 N = int(tune_df.loc[i, "N"])
                 K = int(tune_df.loc[i, "K"])
                 kid = int(tune_df.loc[i, "kernelId"])
                 
-                # Check if kernelId is valid for the current library type
-                if self.libtype == "ck_legacy":
-                    if kid in legacy_candidate_kernels_dict:
-                        tune_dict[(M, N, K)] = legacy_candidate_kernels_dict[kid]
-                    else:
-                        print(f"Warning: kernelId {kid} not found in legacy_candidate_kernels_dict for shape ({M}, {N}, {K})")
-                elif self.libtype == "ck_tile":
-                    if kid in tile_candidate_kernels_dict:
-                        tune_dict[(M, N, K)] = tile_candidate_kernels_dict[kid]
-                    else:
-                        print(f"Warning: kernelId {kid} not found in tile_candidate_kernels_dict for shape ({M}, {N}, {K})")
+                if kid in candidate_kernels_dict_legacy:
+                    tune_dict[(M, N, K)] = candidate_kernels_dict_legacy[kid]
                 else:
-                    # legacy and tile, mixed
-                    if kid in legacy_candidate_kernels_dict:
-                        tune_dict[(M, N, K)] = legacy_candidate_kernels_dict[kid]
-                    elif kid in tile_candidate_kernels_dict:
-                        tune_dict[(M, N, K)] = tile_candidate_kernels_dict[kid]
-                    else:
-                        print(f"Warning: kernelId {kid} not found in either candidate_kernels_dict for shape ({M}, {N}, {K})")
+                    print(f"Warning: kernelId {kid} not found in candidate_kernels_dict_legacy for shape ({M}, {N}, {K})")
+        
         return tune_dict
     
     
@@ -105,7 +70,7 @@ class gemm_a8w8_blockscale_codegen:
         LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "legacy_gemm_a8w8_blockscale_common.cuh"
+#include "gemm_a8w8_blockscale_common_legacy.cuh"
 
 enum class GemmSpecialization {{
     Default    = 0,
@@ -268,8 +233,8 @@ template torch::Tensor
     );
 
 """
-        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="F32, B16")
-        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="F32, F16")
+        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="LEGACY_FP32, LEGACY_BF16")
+        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="LEGACY_FP32, LEGACY_FP16")
         # TODO: dFP8_eFP8
         
         Path(
@@ -279,89 +244,10 @@ template torch::Tensor
             os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
         ).write_text(INSTANCE_dFP32_eFP16)
 
-    def gen_tile_instance(self, k: TileKernelInstance):
-        """
-        Generate kernel instance code for tile gemm a8w8 blockscale
-        """
-        
-        TILE_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
-#include "tile_gemm_a8w8_blockscale_common.cuh"
-
-template <typename DDataType, typename EDataType>
-torch::Tensor
-{k.name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y
-    )
-{{
-    // Get M, N, K from input tensors.
-    int M = XQ.numel() / XQ.size(-1);
-    int N = WQ.size(0);
-    int K = WQ.size(1);
     
-    // Instantiate tile gemm instance.
-    __TILE_INSTANCE_PLACEHOLDER__
-    
-}}
-
-"""    
-        TILE_INSTANCE = f"""using TileGemmInstance = TileGemmTileHelperF8BlockScale<
-            DDataType, EDataType,
-            {k.M_Tile}, {k.N_Tile}, {k.K_Tile},
-            {k.M_Warp}, {k.N_Warp}, {k.K_Warp},
-            {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
-            {str(k.TransposeC).lower()},
-            {str(k.DoubleSmemBuffer).lower()},
-            {str(k.UsePersistentKernel).lower()},
-            {str(k.kPadM).lower()}, {str(k.kPadN).lower()}, {str(k.kPadK).lower()},
-            ck_tile::GemmPipelineScheduler::{k.Scheduler}>;
-            
-        // Run kernel instance.
-        return tile_gemm_a8w8_blockscale_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
-"""
-
-        TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
-            "__TILE_INSTANCE_PLACEHOLDER__", TILE_INSTANCE
-        )
-
-        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-            TILE_INSTANCE_IMPL_str
-        )
-        
-        INSTANCE_template = """// SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
-#include "impl/{name}.cuh"
-
-template torch::Tensor
-{name}<{dtypes}>(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y
-    );
-
-"""
-        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="TILE_F32, TILE_B16")
-        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="TILE_F32, TILE_F16")
-        # TODO: dFP8_eFP8
-        
-        Path(
-            os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
-        ).write_text(INSTANCE_dFP32_eBF16)
-        Path(
-            os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-        ).write_text(INSTANCE_dFP32_eFP16)
-
-    def gen_lookup_dict(self, kernels_dict: dict):
+    def gen_lookup_dict(self, kernels_dict):
         """
-        Generate lookup dictionary for kernel instances, including legacy and tile
+        Generate lookup dictionary for kernel instances
         """
         
         LOOKUP_head = """#pragma once
@@ -383,7 +269,7 @@ template torch::Tensor
 #endif // USE_ROCM
 """
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup_legacy.h"), "w"
         ) as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
@@ -400,6 +286,7 @@ template torch::Tensor
                 elif self.istune and isinstance(mnk, int):
                     f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
             f.write(LOOKUP_end)
+
 
     def gen_manifest_head(self, kernels_dict):
         """
@@ -432,7 +319,7 @@ torch::Tensor
 """
 
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest_legacy.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
             for _, k in kernels_dict.items():
@@ -441,20 +328,17 @@ torch::Tensor
 
     def gen_code(self, kernels_dict: dict):
         """
-        codegen for both legacy and tile gemm a8w8 blockscale
+        Codegen for legacy gemm a8w8 blockscale
         """
         
         # generate instances code
-        # compute number of instances
-        num_instances = len(kernels_dict)
-        print(f"Generating {num_instances} instances for {self.libtype} gemm a8w8 blockscale...")
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"Generating {len(kernels_dict)} instances for legacy gemm a8w8 blockscale...")
         for _, k in kernels_dict.items():
-            if isinstance(k, LegacyKernelInstance):
-                print("Generating legacy instance:", k.name)
-                self.gen_legacy_instance(k)
-            elif isinstance(k, TileKernelInstance):
-                print("Generating tile instance:", k.name)
-                self.gen_tile_instance(k)
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info(f"Generating legacy instance: {k.name}")
+            self.gen_legacy_instance(k)
 
         # generate lookup dict for kernel instances
         self.gen_lookup_dict(kernels_dict)
@@ -465,7 +349,7 @@ torch::Tensor
     
     def run(self):
         """
-        run codegen and generate all the files together
+        Run codegen and generate all the files together
         """
         
         # clean impl and instances path
@@ -477,36 +361,18 @@ torch::Tensor
         os.mkdir(self.instances_path)
         
         # generate code for legacy and tile
-        if self.libtype in ["ck_legacy", "both"]:
-            if self.istune:
-                # generate code for default kernels
-                self.gen_code(legacy_candidate_kernels_dict)
-            else:
-                # generate code for tuned kernels from tune_file
-                self.gen_code(self.get_tune_dict(
-                                                 self.tune_file))
-        if self.libtype in ["ck_tile", "both"]:
-            if self.istune:
-                # generate code for default kernels
-                self.gen_code(tile_candidate_kernels_dict)
-            else:
-                # generate code for tuned kernels from tune_file
-                self.gen_code(self.get_tune_dict(self.tune_file))
+        if self.istune:
+            # generate code for default kernels
+            self.gen_code(candidate_kernels_dict_legacy)
+        else:
+            # generate code for tuned kernels from tune_file
+            self.gen_code(self.get_tune_dict(self.tune_file))
         
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
         description="gen API for CK gemm a8w8 kernel",
-    )
-
-    # use ck_type[ck_legacy, ck_tile, both] to specify which type to generate
-    parser.add_argument(
-        "--libtype",
-        type=str,
-        default="both",
-        choices=["ck_legacy", "ck_tile", "both"],
-        help="CK gemm a8w8 blockscale type to generate: ck_legacy, ck_tile or both",
     )
     
     # the directory for list_blobs/gen_blobs to write files into
@@ -533,7 +399,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    codegen = gemm_a8w8_blockscale_codegen(args.libtype, args.working_path, args.tune, args.tune_file)
+    codegen = gemm_a8w8_blockscale_codegen(args.working_path, args.tune, args.tune_file)
     codegen.run()
     
     
