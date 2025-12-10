@@ -274,6 +274,7 @@ def _get_config(
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-N={N}-K={K}.json"
         if os.path.exists(fpath):
             _LOGGER.info(f"Loading specific GEMM config from: {fpath}")
+            print('config path', fpath)
             with open(fpath, "r") as file:
                 config = json.load(file)
                 _get_config._config_dict[key] = config

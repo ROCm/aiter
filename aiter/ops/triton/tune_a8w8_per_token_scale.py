@@ -429,60 +429,18 @@ def get_configs_compute_bound() -> List[Dict[str, int | str]]:
     configs = []
 
     # Explore optimized parameter space (removed large block sizes that cause slowdowns)
-    # for num_stages in [1, 2, 3, 4]:
-    #         for block_m in [32, 64, 128]:  # Removed 256 (causes slowdowns)
-    #             for block_n in [32, 64, 128]:  # Removed 256 (causes slowdowns)
-    #                 for block_k in [64, 128, 256]:
-    #                     for group_size in [1, 8, 16]:
-    #                         for num_warps in [2, 4, 8]:
-    #                             for num_ksplit in [
-    #                                 1,
-    #                                 2,
-    #                                 4,
-    #                             ]:  # Key parameter for K-splitting
-    #                                 for waves_per_eu in [2, 4, 8]:
-    #                                     for kpack in [2]:
-    #                                         for cache_modifier in ["", ".cg"]:
-    #                                             configs.append(
-    #                                                 {
-    #                                                     "BLOCK_SIZE_M": block_m,
-    #                                                     "BLOCK_SIZE_N": block_n,
-    #                                                     "BLOCK_SIZE_K": block_k,
-    #                                                     "GROUP_SIZE_M": group_size,
-    #                                                     "num_warps": num_warps,
-    #                                                     "num_stages": num_stages,
-    #                                                     "NUM_KSPLIT": num_ksplit,
-    #                                                     "waves_per_eu": waves_per_eu,
-    #                                                     "kpack": kpack,
-    #                                                     "matrix_instr_nonkdim": 16,  # Fixed value from atomic kernel
-    #                                                     "cache_modifier": cache_modifier,
-    #                                                 }
-    #                                             )
-    #     return configs
-    for num_stages in [
-        1,
-    ]:
-        for block_m in [
-            32,
-        ]:  # Removed 256 (causes slowdowns)
-            for block_n in [
-                32,
-            ]:  # Removed 256 (causes slowdowns)
-                for block_k in [
-                    64,
-                ]:
-                    for group_size in [
-                        1,
-                    ]:
-                        for num_warps in [
-                            2,
-                        ]:
+    for num_stages in [1, 2, 3, 4]:
+        for block_m in [32, 64, 128]:  # Removed 256 (causes slowdowns)
+            for block_n in [32, 64, 128]:  # Removed 256 (causes slowdowns)
+                for block_k in [64, 128, 256]:
+                    for group_size in [1, 8, 16]:
+                        for num_warps in [2, 4, 8]:
                             for num_ksplit in [
                                 1,
+                                2,
+                                4,
                             ]:  # Key parameter for K-splitting
-                                for waves_per_eu in [
-                                    2,
-                                ]:
+                                for waves_per_eu in [2, 4, 8]:
                                     for kpack in [2]:
                                         for cache_modifier in ["", ".cg"]:
                                             configs.append(
@@ -501,6 +459,48 @@ def get_configs_compute_bound() -> List[Dict[str, int | str]]:
                                                 }
                                             )
     return configs
+    # for num_stages in [
+    #     1,
+    # ]:
+    #     for block_m in [
+    #         32,
+    #     ]:  # Removed 256 (causes slowdowns)
+    #         for block_n in [
+    #             32,
+    #         ]:  # Removed 256 (causes slowdowns)
+    #             for block_k in [
+    #                 64,
+    #             ]:
+    #                 for group_size in [
+    #                     1,
+    #                 ]:
+    #                     for num_warps in [
+    #                         2,
+    #                     ]:
+    #                         for num_ksplit in [
+    #                             1,
+    #                         ]:  # Key parameter for K-splitting
+    #                             for waves_per_eu in [
+    #                                 2,
+    #                             ]:
+    #                                 for kpack in [2]:
+    #                                     for cache_modifier in ["", ".cg"]:
+    #                                         configs.append(
+    #                                             {
+    #                                                 "BLOCK_SIZE_M": block_m,
+    #                                                 "BLOCK_SIZE_N": block_n,
+    #                                                 "BLOCK_SIZE_K": block_k,
+    #                                                 "GROUP_SIZE_M": group_size,
+    #                                                 "num_warps": num_warps,
+    #                                                 "num_stages": num_stages,
+    #                                                 "NUM_KSPLIT": num_ksplit,
+    #                                                 "waves_per_eu": waves_per_eu,
+    #                                                 "kpack": kpack,
+    #                                                 "matrix_instr_nonkdim": 16,  # Fixed value from atomic kernel
+    #                                                 "cache_modifier": cache_modifier,
+    #                                             }
+    #                                         )
+    # return configs
 
 
 def get_weight_shapes(tp_size: int) -> List[Tuple[int, int]]:
@@ -1200,7 +1200,7 @@ def tune_on_gpu(
             continue
 
         # Initialize benchmark_results with existing results if any
-        benchmark_results :List[Dict[str, str |int]]= []
+        benchmark_results: List[Dict[str, str | int]] = []
         if existing_configs:
             # Reconstruct benchmark_results from existing configs
             # We need to map the configs back to their corresponding batch sizes

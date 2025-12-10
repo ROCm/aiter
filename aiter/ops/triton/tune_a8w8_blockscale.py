@@ -4,23 +4,20 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import sys
 import time
 import triton
 from datetime import datetime
 from typing import List, Dict, Union, Tuple, Optional, Any
 import torch
+import pytz
 from rich.console import Console
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    BarColumn,
-    TaskProgressColumn,
-    TimeElapsedColumn,
-)
 from rich.table import Table
 from rich.panel import Panel
-from tqdm import tqdm
+from rich.columns import Columns
+from rich.live import Live
+from rich.layout import Layout
+from rich.progress import Progress, BarColumn, TextColumn
 
 
 from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale  # type: ignore
@@ -64,9 +61,38 @@ CURRENT_CONFIG: Dict[str, Any] = {
 INTERRUPTED = False
 
 
+class GMT8Formatter(logging.Formatter):
+    """Custom formatter that uses GMT+8 timezone."""
+
+    def __init__(self, fmt=None, datefmt=None):
+        super().__init__(fmt, datefmt)
+        self.gmt8 = pytz.timezone("Asia/Shanghai")  # GMT+8
+
+    def formatTime(self, record, datefmt=None):
+        # Convert timestamp to GMT+8
+        dt = datetime.fromtimestamp(record.created, tz=self.gmt8)
+        if datefmt:
+            return dt.strftime(datefmt)
+        else:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def format(self, record):
+        # Add timezone info to the formatted message
+        original = super().format(record)
+        return original.replace("[GMT+8]", "")  # Remove any existing timezone tag
+
+
+def get_timestamped_filename(base_name: str, extension: str = ".log") -> str:
+    """Generate a filename with timestamp in GMT+8 timezone."""
+    gmt8 = pytz.timezone("Asia/Shanghai")
+    timestamp = datetime.now(gmt8).strftime("%Y%m%d_%H%M%S")
+    return f"{base_name}_{timestamp}{extension}"
+
+
 def sigint_handler(signum, frame):
     """Handle SIGINT (Ctrl+C) gracefully by logging the current configuration."""
     global INTERRUPTED
+    global CURRENT_CONFIG
     INTERRUPTED = True
 
     print("\n" + "=" * 80)
@@ -99,21 +125,55 @@ def sigint_handler(signum, frame):
             print(f"      waves_per_eu: {config.get('waves_per_eu', 'N/A')}")
             print(f"      kpack: {config.get('kpack', 'N/A')}")
             print(f"      cache_modifier: {config.get('cache_modifier', 'N/A')}")
+            print(f"      GROUP_SIZE_M: {config.get('GROUP_SIZE_M', 'N/A')}")
+            print(f"      GROUP_K: {config.get('GROUP_K', 'N/A')}")
+
+            # Show config in same format as console output for consistency
+            config_num = CURRENT_CONFIG["config_index"] + 1
+            console_format = f"   💻 Config {config_num} (INTERRUPTED): | BM:{config.get('BLOCK_SIZE_M')} BN:{config.get('BLOCK_SIZE_N')} BK:{config.get('BLOCK_SIZE_K')} W:{config.get('num_warps')} S:{config.get('num_stages')} KS:{config.get('NUM_KSPLIT')} kpack:{config.get('kpack')} cache:{config.get('cache_modifier')} GSM:{config.get('GROUP_SIZE_M')}"
+            print(console_format)
 
         # Log the interruption to the file if logger is available
         try:
             logger = logging.getLogger("gemm_a8w8_blockscale_tuning")
             if logger.handlers:
-                log_entry = {
-                    "timestamp": datetime.now().isoformat(),
+                # Use GMT+8 timestamp for consistency
+                gmt8 = pytz.timezone("Asia/Shanghai")
+
+                # Create detailed log entry
+                detailed_log_entry = {
+                    "timestamp": datetime.now(gmt8).isoformat(),
                     "event_type": "user_interrupt",
+                    "gpu_id": CURRENT_CONFIG.get("gpu_id", "N/A"),
                     "batch_size": CURRENT_CONFIG["batch_size"],
                     "matrix_dims": f"M={CURRENT_CONFIG['M']} N={CURRENT_CONFIG['N']} K={CURRENT_CONFIG['K']}",
                     "config": CURRENT_CONFIG["config"],
                     "progress": f"Config {CURRENT_CONFIG['config_index'] + 1}/{CURRENT_CONFIG['total_configs']}",
                     "weight_shape_progress": f"Shape {CURRENT_CONFIG['weight_shape_index'] + 1}/{CURRENT_CONFIG['total_weight_shapes']}",
                 }
-                logger.info(f"USER_INTERRUPT: {log_entry}")
+
+                # Log detailed interruption info
+                logger.info(f"=== USER INTERRUPT ===")
+                logger.info(
+                    f"Interrupted while testing: Config {CURRENT_CONFIG['config_index'] + 1}/{CURRENT_CONFIG['total_configs']}"
+                )
+                logger.info(f"GPU: {CURRENT_CONFIG.get('gpu_id', 'N/A')}")
+                logger.info(
+                    f"Matrix: M={CURRENT_CONFIG['M']} N={CURRENT_CONFIG['N']} K={CURRENT_CONFIG['K']}"
+                )
+                logger.info(
+                    f"Weight Shape Progress: {CURRENT_CONFIG['weight_shape_index'] + 1}/{CURRENT_CONFIG['total_weight_shapes']}"
+                )
+
+                # Log config details in same format as console output for consistency
+                if CURRENT_CONFIG["config"]:
+                    config = CURRENT_CONFIG["config"]
+                    config_num = CURRENT_CONFIG["config_index"] + 1
+                    config_str = f"Config {config_num} (INTERRUPTED): | BM:{config.get('BLOCK_SIZE_M')} BN:{config.get('BLOCK_SIZE_N')} BK:{config.get('BLOCK_SIZE_K')} W:{config.get('num_warps')} S:{config.get('num_stages')} KS:{config.get('NUM_KSPLIT')} kpack:{config.get('kpack')} cache:{config.get('cache_modifier')} GROUP_SIZE_M:{config.get('GROUP_SIZE_M')} GROUP_K:{config.get('GROUP_K')}"
+                    logger.info(f"CONFIG_DETAILS: {config_str}")
+
+                logger.info(f"DETAILED_ENTRY: {detailed_log_entry}")
+                logger.info(f"=== END USER INTERRUPT ===")
 
                 # Force flush to write immediately
                 for handler in logger.handlers:
@@ -136,12 +196,13 @@ def sigint_handler(signum, frame):
     sys.exit(1)
 
 
-def setup_logger(log_file_path: str) -> logging.Logger:
+def setup_logger(log_file_path: str, mode: str = "a") -> logging.Logger:
     """
     Setup logger for recording bad configurations during tuning.
 
     Args:
         log_file_path: Path to the log file
+        mode: File write mode - 'a' to append to existing logs, 'w' to overwrite
 
     Returns:
         Configured logger instance
@@ -153,7 +214,8 @@ def setup_logger(log_file_path: str) -> logging.Logger:
     logger.handlers.clear()
 
     # Create file handler with live writing (immediate flush)
-    file_handler = logging.FileHandler(log_file_path, mode="w")
+    # Default to append mode to preserve logs across resume sessions
+    file_handler = logging.FileHandler(log_file_path, mode=mode)
     file_handler.setLevel(logging.INFO)
 
     # Create custom formatter that flushes immediately
@@ -163,9 +225,9 @@ def setup_logger(log_file_path: str) -> logging.Logger:
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.WARNING)
 
-    # Create formatter
-    formatter = logging.Formatter(
-        "%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    # Create GMT+8 formatter
+    formatter = GMT8Formatter(
+        "%(asctime)s [GMT+8] - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
@@ -196,8 +258,10 @@ def log_bad_config(
         config: Configuration that failed
         error_msg: Additional error message
     """
+    # Use GMT+8 timestamp for consistency
+    gmt8 = pytz.timezone("Asia/Shanghai")
     log_entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(gmt8).isoformat(),
         "error_type": error_type,
         "batch_size": M,
         "matrix_dims": f"M={M} N={N} K={K}",
@@ -373,63 +437,48 @@ def get_configs_compute_bound() -> List[Dict[str, int | str]]:
     """
     Generate configuration space for tuning the gemm_a8w8_blockscale kernel.
     Based on the sample config file, we'll tune around those values.
-    Note: GROUP_K must equal BLOCK_SIZE_K as required by the kernel.
+    Note: With (128, 128) quantization blocks, GROUP_K will be computed as 128,
+    so we must only use BLOCK_SIZE_K = 128 to satisfy the constraint GROUP_K == BLOCK_SIZE_K.
     """
     configs = []
-    # Start with the known working configuration from MI300X-GEMM-A8W8_BLOCKSCALE.json
-    base_config = {
-        "BLOCK_SIZE_M": 128,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        "num_stages": 2,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "NUM_KSPLIT": 1,
-        "kpack": 2,
-        "cache_modifier": ".cg",
-    }
 
-    # Add the base config first (known to work)
-    configs.append(base_config.copy())
+    # For blockscale kernel with (128, 128) quantization blocks:
+    # - scale_k = ceil(K / 128) = 8 for K=1024
+    # - GROUP_K = next_power_of_2(K / scale_k) = next_power_of_2(128) = 128
+    # - BLOCK_SIZE_K must equal GROUP_K, so BLOCK_SIZE_K must be 128
+    block_k = 128  # Fixed to match computed GROUP_K
 
-    # Generate variations around the base config, but be conservative
-    for block_m in [
-        32,
-        64,
-        128,
-    ]:
-        for block_n in [
-            32,
-            64,
-            128,
-        ]:
-            for block_k in [64, 128]:  # Keep as power of 2
-                for num_warps in [4, 8]:
-                    for num_stages in [2, 3, 4, 5]:
-                        for waves_per_eu in [2, 4, 8]:
-                            for cache_modifier in [
-                                ".cg",
-                                "",
-                            ]:  # Start with cache modifier
-                                config = {
-                                    "BLOCK_SIZE_M": block_m,
-                                    "BLOCK_SIZE_N": block_n,
-                                    "BLOCK_SIZE_K": block_k,
-                                    "GROUP_K": block_k,
-                                    "GROUP_SIZE_M": 1,  # Keep fixed for now
-                                    "num_warps": num_warps,
-                                    "num_stages": num_stages,
-                                    "waves_per_eu": waves_per_eu,  # Keep fixed for now
-                                    "matrix_instr_nonkdim": 16,
-                                    "NUM_KSPLIT": 1,
-                                    "kpack": 2,  # Keep fixed for now
-                                    "cache_modifier": cache_modifier,
-                                }
-                                configs.append(config)
-
-    print(f"Generated {len(configs)} configurations")
+    # Explore optimized parameter space for blockscale kernel
+    for num_stages in [1, 2, 3, 4]:
+        for block_m in [32, 64, 128]:  # Removed 256 (causes slowdowns)
+            for block_n in [32, 64, 128]:  # Removed 256 (causes slowdowns)
+                for group_size_m in [1, 8, 16]:
+                    for num_warps in [2, 4, 8]:
+                        for num_ksplit in [
+                            1,
+                            2,
+                            4,
+                        ]:  # Key parameter for K-splitting
+                            for waves_per_eu in [2, 4, 8]:
+                                for kpack in [2]:
+                                    for cache_modifier in ["", ".cg"]:
+                                        # Note: GROUP_K and GROUP_N are computed by the kernel function
+                                        # from the scale tensor shapes, not hardcoded in config
+                                        configs.append(
+                                            {
+                                                "BLOCK_SIZE_M": block_m,
+                                                "BLOCK_SIZE_N": block_n,
+                                                "BLOCK_SIZE_K": block_k,  # Must be 128 to match computed GROUP_K
+                                                "GROUP_SIZE_M": group_size_m,
+                                                "num_warps": num_warps,
+                                                "num_stages": num_stages,
+                                                "NUM_KSPLIT": num_ksplit,
+                                                "waves_per_eu": waves_per_eu,
+                                                "kpack": kpack,
+                                                "matrix_instr_nonkdim": 16,  # Fixed value from atomic kernel
+                                                "cache_modifier": cache_modifier,
+                                            }
+                                        )
     return configs
 
 
@@ -450,14 +499,23 @@ def get_weight_shapes(tp_size: int = 1) -> List[Tuple[int, int]]:
     return weight_shapes
 
 
-def run_torch(
-    x, weight, x_scale, w_scale, block_shape: Tuple[int, int], dtype=torch.bfloat16
+def run_torch_reference(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    block_shape: Tuple[int, int],
+    dtype=torch.bfloat16,
 ):
+    """
+    Run reference implementation using PyTorch for blockscale kernel.
+    This is used for correctness verification.
+    """
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape
-    n = weight.shape[0]
+    n = w.shape[0]
 
-    # Expand scales to match the block sizes
+    # Expand scales to match the block sizes (same as original)
     x_scale_expanded = x_scale.repeat_interleave(block_shape_k, dim=1)
     x_dequant = x.to(x_scale_expanded.dtype) * x_scale_expanded[:m, :k]
 
@@ -465,13 +523,176 @@ def run_torch(
     w_scale_expanded = w_scale.repeat_interleave(block_shape_n, dim=0)
     w_scale_expanded = w_scale_expanded.repeat_interleave(block_shape_k, dim=1)
     w_scale_expanded = w_scale_expanded[:n, :k]
-    weight_dequant = weight.to(w_scale_expanded.dtype) * w_scale_expanded
+    weight_dequant = w.to(w_scale_expanded.dtype) * w_scale_expanded
 
     out = torch.nn.functional.linear(
         x_dequant.to(torch.float32), weight_dequant.to(torch.float32)
     )
 
     return out.to(dtype)
+
+
+# Global variable to store console output
+console_output = []
+
+
+def create_live_display(
+    M: int,
+    N: int,
+    K: int,
+    current_config: Dict[str, Union[str, int]],
+    best_config: Dict[str, Union[str, int]],
+    best_time: float,
+    config_index: int,
+    total_configs: int,
+    console_messages: Optional[List[str]] = None,
+) -> Layout:
+    """Create a live display layout with current and best configuration tables."""
+
+    layout = Layout()
+
+    # Use global console_output if none provided
+    if console_messages is None:
+        global console_output
+        console_messages = console_output
+
+    # Create progress bar
+    progress = Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=40),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("({task.completed}/{task.total})"),
+    )
+    task = progress.add_task(
+        f"🔧 Tuning M={M} N={N} K={K} | Batch Size={M}",
+        total=total_configs,
+        completed=config_index,
+    )
+
+    # Create status information
+    status_text = ""
+    if best_time != float("inf"):
+        status_text = f"🏆 Best Performance: {best_time:.1f}μs"
+    else:
+        status_text = "🔍 Searching for best configuration..."
+
+    # Create console area
+    console_text = (
+        "\n".join(console_messages[-10:])
+        if console_messages
+        else "Waiting for results..."
+    )
+    console_table = Table(show_header=False, box=None, padding=0)
+    console_table.add_column("Output", style="white")
+    console_table.add_row(console_text)
+
+    # Create current config table
+    config_table = Table(
+        title="Current Configuration",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    config_table.add_column("Parameter", style="cyan", width=15)
+    config_table.add_column("Value", style="green", width=10)
+
+    # Add matrix dimensions and batch size first
+    config_table.add_row("[bold yellow]Matrix M[/bold yellow]", str(M), style="yellow")
+    config_table.add_row("[bold yellow]Matrix N[/bold yellow]", str(N), style="yellow")
+    config_table.add_row("[bold yellow]Matrix K[/bold yellow]", str(K), style="yellow")
+    config_table.add_row(
+        "[bold yellow]Batch Size[/bold yellow]", str(M), style="yellow"
+    )
+    config_table.add_row("", "")  # Separator
+    config_table.add_row("BLOCK_SIZE_M", str(current_config.get("BLOCK_SIZE_M", "N/A")))
+    config_table.add_row("BLOCK_SIZE_N", str(current_config.get("BLOCK_SIZE_N", "N/A")))
+    config_table.add_row("BLOCK_SIZE_K", str(current_config.get("BLOCK_SIZE_K", "N/A")))
+    config_table.add_row("num_warps", str(current_config.get("num_warps", "N/A")))
+    config_table.add_row("num_stages", str(current_config.get("num_stages", "N/A")))
+    config_table.add_row("NUM_KSPLIT", str(current_config.get("NUM_KSPLIT", "N/A")))
+    config_table.add_row("waves_per_eu", str(current_config.get("waves_per_eu", "N/A")))
+    config_table.add_row("kpack", str(current_config.get("kpack", "N/A")))
+    config_table.add_row(
+        "cache_modifier", str(current_config.get("cache_modifier", "N/A"))
+    )
+    config_table.add_row("GROUP_SIZE_M", str(current_config.get("GROUP_SIZE_M", "N/A")))
+    config_table.add_row("GROUP_K", str(current_config.get("GROUP_K", "N/A")))
+
+    # Create best config table if we have a best configuration
+    best_config_table = None
+    if best_time != float("inf"):
+        best_config_table = Table(
+            title="🏆 Best Configuration So Far",
+            show_header=True,
+            header_style="bold green",
+        )
+        best_config_table.add_column("Parameter", style="cyan", width=15)
+        best_config_table.add_column("Value", style="green", width=10)
+
+        # Add performance and matrix dimensions
+        best_config_table.add_row(
+            "[bold green]Performance[/bold green]", f"{best_time:.1f}μs", style="green"
+        )
+        best_config_table.add_row("", "")  # Separator
+        best_config_table.add_row(
+            "[bold yellow]BLOCK_SIZE_M[/bold yellow]",
+            str(best_config.get("BLOCK_SIZE_M", "N/A")),
+            style="yellow",
+        )
+        best_config_table.add_row(
+            "[bold yellow]BLOCK_SIZE_N[/bold yellow]",
+            str(best_config.get("BLOCK_SIZE_N", "N/A")),
+            style="yellow",
+        )
+        best_config_table.add_row(
+            "[bold yellow]BLOCK_SIZE_K[/bold yellow]",
+            str(best_config.get("BLOCK_SIZE_K", "N/A")),
+            style="yellow",
+        )
+        best_config_table.add_row("num_warps", str(best_config.get("num_warps", "N/A")))
+        best_config_table.add_row(
+            "num_stages", str(best_config.get("num_stages", "N/A"))
+        )
+        best_config_table.add_row(
+            "NUM_KSPLIT", str(best_config.get("NUM_KSPLIT", "N/A"))
+        )
+        best_config_table.add_row(
+            "waves_per_eu", str(best_config.get("waves_per_eu", "N/A"))
+        )
+        best_config_table.add_row("kpack", str(best_config.get("kpack", "N/A")))
+        best_config_table.add_row(
+            "cache_modifier", str(best_config.get("cache_modifier", "N/A"))
+        )
+        best_config_table.add_row(
+            "GROUP_SIZE_M", str(best_config.get("GROUP_SIZE_M", "N/A"))
+        )
+        best_config_table.add_row("GROUP_K", str(best_config.get("GROUP_K", "N/A")))
+
+    # Create combined layout
+    if best_config_table:
+        # Display tables side by side
+        tables = Columns([config_table, best_config_table], equal=True, expand=True)
+        layout.split_column(
+            Layout(Panel(progress, title="Progress", border_style="blue"), size=5),
+            Layout(Panel(status_text, title="Status", border_style="green"), size=3),
+            Layout(tables),
+            Layout(
+                Panel(console_table, title="Console Output", border_style="cyan"),
+                size=10,
+            ),
+        )
+    else:
+        # Display only current config
+        layout.split_column(
+            Layout(Panel(progress, title="Progress", border_style="blue"), size=5),
+            Layout(Panel(status_text, title="Status", border_style="green"), size=3),
+            Layout(config_table),
+            Layout(
+                Panel(console_table, title="Console Output", border_style="cyan"),
+                size=10,
+            ),
+        )
+
+    return layout
 
 
 def benchmark_config(
@@ -511,19 +732,33 @@ def benchmark_config(
         JIT compilation and GPU warmup effects. The timing is measured using CUDA events
         for accurate GPU kernel timing.
     """
-
-    torch_out = run_torch(
+    # Get reference output for correctness verification
+    torch_out = run_torch_reference(
         x,
         w,
         x_scale,
         w_scale,
-        (128, 128),  # follow test using (128,128)
-        dtype,
+        (128, 128),
+        dtype,  # follow test using (128,128)
     )
+
+    # Add SPLITK_BLOCK_SIZE computation as done in the kernel function
+    _, K = x.shape
+    _, K = w.shape
+    num_ksplit = int(config["NUM_KSPLIT"])
+    block_k = int(config["BLOCK_SIZE_K"])
+    splitk_block_size = triton.cdiv(K, num_ksplit)
+
+    config["SPLITK_BLOCK_SIZE"] = splitk_block_size
+    if block_k > splitk_block_size:
+        block_k = triton.next_power_of_2(splitk_block_size)
+        if block_k > splitk_block_size:
+            block_k = block_k // 4
+    block_k = max(block_k, 16)
+    config["BLOCK_SIZE_K"] = block_k
 
     # Run kernel
     def run():
-        # Pass the modified config to the kernel
         return gemm_a8w8_blockscale(
             x, w, x_scale, w_scale, dtype, y, config, skip_reduce=False
         )
@@ -566,6 +801,7 @@ def benchmark_config(
         latencies.append(start_event.elapsed_time(end_event))
         torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
     avg = sum(latencies) / (num_iters * 10) * 1000  # us
+
     return avg
 
 
@@ -582,7 +818,15 @@ def tune(
     if not signal.getsignal(signal.SIGINT) == sigint_handler:
         signal.signal(signal.SIGINT, sigint_handler)
 
-    if input_type != "bfloat16":
+    if input_type == "bfloat16":
+        # Use the same input generation as test file
+        # IMPORTANT: Use fixed quantization block sizes (128, 128), not kernel BLOCK_SIZE_N/BLOCK_SIZE_K
+        # These are completely different concepts - quantization blocks vs kernel tiling
+        quant_block_size_n, quant_block_size_k = 128, 128
+        x, w, x_scale, w_scale, _ = generate_gemm_a8w8_blockscale_inputs(
+            M, N, K, quant_block_size_n, quant_block_size_k, torch.bfloat16
+        )
+    else:
         raise RuntimeError(
             "Currently, only support tune a8w8 blockscale kernel with bfloat16 output."
         )
@@ -593,24 +837,28 @@ def tune(
         1000  # microseconds - configs slower than this get highlighted
     )
 
+    # Clear console output for fresh start
+    global console_output
+    console_output = []
+
     # Initialize Rich console for better formatting
     console = Console()
 
-    # Create progress display with Rich
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        transient=False,  # Keep progress bar visible
-    ) as progress:
-        task = progress.add_task(
-            f"🔧 Tuning M={M} N={N} K={K}",
-            total=len(search_space),
-        )
+    # Create initial live display
+    initial_layout = create_live_display(
+        M,
+        N,
+        K,
+        search_space[0] if search_space else {},
+        best_config,
+        best_time,
+        0,
+        len(search_space),
+        console_output,
+    )
 
+    # Create progress display with Rich and Live
+    with Live(initial_layout, refresh_per_second=4, console=console) as live:
         for i, config in enumerate(search_space):
             # Check if we were interrupted
             if INTERRUPTED:
@@ -629,77 +877,21 @@ def tune(
                 }
             )
 
-            # Update progress
-            progress.update(
-                task,
-                advance=1,
-                description=f"🔧 Testing config {i + 1}/{len(search_space)}",
+            # Update live display with current configuration
+            layout = create_live_display(
+                M,
+                N,
+                K,
+                config,
+                best_config,
+                best_time,
+                i + 1,
+                len(search_space),
+                console_output,
             )
-
-            # Show current config (only every 10 configs to avoid flicker)
-            if i % 10 == 0 or i == len(search_space) - 1:
-                # Create fresh config table with matrix dimensions and batch size
-                config_table = Table(
-                    title="Current Configuration",
-                    show_header=True,
-                    header_style="bold magenta",
-                )
-                config_table.add_column("Parameter", style="cyan", width=15)
-                config_table.add_column("Value", style="green", width=10)
-
-                # Add matrix dimensions and batch size first
-                config_table.add_row(
-                    "[bold yellow]Matrix M[/bold yellow]", str(M), style="yellow"
-                )
-                config_table.add_row(
-                    "[bold yellow]Matrix N[/bold yellow]", str(N), style="yellow"
-                )
-                config_table.add_row(
-                    "[bold yellow]Matrix K[/bold yellow]", str(K), style="yellow"
-                )
-                config_table.add_row(
-                    "[bold yellow]Batch Size[/bold yellow]", str(M), style="yellow"
-                )
-                config_table.add_row("", "")  # Separator
-                config_table.add_row(
-                    "BLOCK_SIZE_M", str(config.get("BLOCK_SIZE_M", "N/A"))
-                )
-                config_table.add_row(
-                    "BLOCK_SIZE_N", str(config.get("BLOCK_SIZE_N", "N/A"))
-                )
-                config_table.add_row(
-                    "BLOCK_SIZE_K", str(config.get("BLOCK_SIZE_K", "N/A"))
-                )
-                config_table.add_row("num_warps", str(config.get("num_warps", "N/A")))
-                config_table.add_row("num_stages", str(config.get("num_stages", "N/A")))
-                config_table.add_row("NUM_KSPLIT", str(config.get("NUM_KSPLIT", "N/A")))
-                config_table.add_row(
-                    "waves_per_eu", str(config.get("waves_per_eu", "N/A"))
-                )
-
-                # Create summary header with all tuning parameters
-                header_text = f"[bold blue]🔧 Tuning M={M} N={N} K={K} | Batch Size={M} | Config {i + 1}/{len(search_space)}[/bold blue]"
-
-                # Show config info (don't clear screen to avoid issues in multiprocessing)
-                console.print(f"\n{header_text}")
-                console.print(config_table)
-
-                if best_time != float("inf"):
-                    console.print(
-                        f"[yellow]🏆 Best time so far: {best_time:.1f}μs[/yellow]"
-                    )
-                console.print("─" * 70)
+            live.update(layout)
 
             try:
-                # Use the same input generation as test file
-                x, w, x_scale, w_scale, _ = generate_gemm_a8w8_blockscale_inputs(
-                    M,
-                    N,
-                    K,
-                    int(config["BLOCK_SIZE_N"]),
-                    int(config["BLOCK_SIZE_K"]),
-                    torch.bfloat16,
-                )
                 kernel_time = benchmark_config(
                     x=x,
                     w=w,
@@ -711,50 +903,65 @@ def tune(
                     num_iters=10,
                 )
 
-                # Warn about slow configs
+                # Add kernel time to console output
                 if kernel_time > slow_config_threshold:
-                    console.print(
-                        f"\n[bold yellow]⚠️  SLOW CONFIG DETECTED: {kernel_time:.1f}μs[/bold yellow]"
-                    )
-                    console.print(
-                        f"[cyan]📊 Matrix: M={M} N={N} K={K} | Config:[/cyan] BM:{config.get('BLOCK_SIZE_M', 'N/A')}, BN:{config.get('BLOCK_SIZE_N', 'N/A')}, BK:{config.get('BLOCK_SIZE_K', 'N/A')}, W:{config.get('num_warps', 'N/A')}, S:{config.get('num_stages', 'N/A')}, KS:{config.get('NUM_KSPLIT', 'N/A')}"
-                    )
+                    console_msg = f"[yellow]⚠️  Config {i + 1} (SLOW): {kernel_time:.1f}μs | BM:{config.get('BLOCK_SIZE_M')} BN:{config.get('BLOCK_SIZE_N')} BK:{config.get('BLOCK_SIZE_K')} W:{config.get('num_warps')} S:{config.get('num_stages')} KS:{config.get('NUM_KSPLIT')} GSM:{config.get('GROUP_SIZE_M')}[/yellow]"
+                    live.console.print(console_msg)
+                    console_output.append(console_msg)
+                else:
+                    console_msg = f"[green]✅ Config {i + 1}: {kernel_time:.1f}μs | BM:{config.get('BLOCK_SIZE_M')} BN:{config.get('BLOCK_SIZE_N')} BK:{config.get('BLOCK_SIZE_K')} W:{config.get('num_warps')} S:{config.get('num_stages')} KS:{config.get('NUM_KSPLIT')} GSM:{config.get('GROUP_SIZE_M')}[/green]"
+                    console_output.append(console_msg)
 
                 # Update best time and config
                 if kernel_time < best_time:
                     best_time = kernel_time
                     best_config = config
+                    best_msg = (
+                        f"[bold green]🏆 NEW BEST: {kernel_time:.1f}μs![/bold green]"
+                    )
+                    console_output.append(best_msg)
+
+                # Update live display with current configuration and console output
+                layout = create_live_display(
+                    M,
+                    N,
+                    K,
+                    config,
+                    best_config,
+                    best_time,
+                    i + 1,
+                    len(search_space),
+                    console_output,
+                )
+                live.update(layout)
 
             except triton.runtime.autotuner.OutOfResources as e:
                 # Log and skip out of resources configurations
                 log_bad_config(logger, "out_of_resources", M, N, K, config, str(e))
-                console.print(
-                    f"\n[bold red]⚠️  Out of resources for M={M} N={N} K={K} - logged[/bold red]"
-                )
+                error_msg = f"[red]❌ Config {i + 1} (OOM): Out of resources | BM:{config.get('BLOCK_SIZE_M')} BN:{config.get('BLOCK_SIZE_N')} BK:{config.get('BLOCK_SIZE_K')} W:{config.get('num_warps')} S:{config.get('num_stages')} KS:{config.get('NUM_KSPLIT')} GSM:{config.get('GROUP_SIZE_M')}[/red]"
+                console_output.append(error_msg)
+                live.console.print(error_msg)
                 continue
             except AssertionError as e:
                 # Log and skip assert error configurations
                 log_bad_config(logger, "assert_error", M, N, K, config, str(e))
-                console.print(
-                    f"\n[bold red]❌ Assert error for M={M} N={N} K={K} - logged[/bold red]"
-                )
-                console.print(f"[red]💬 Error:[/red] {e}")
+                error_msg = f"[red]❌ Config {i + 1} (ASSERT): Assert error | BM:{config.get('BLOCK_SIZE_M')} BN:{config.get('BLOCK_SIZE_N')} BK:{config.get('BLOCK_SIZE_K')} W:{config.get('num_warps')} S:{config.get('num_stages')} KS:{config.get('NUM_KSPLIT')} GSM:{config.get('GROUP_SIZE_M')} | {e}[/red]"
+                console_output.append(error_msg)
+                live.console.print(error_msg)
                 continue
             except TimeoutError as e:
                 # Log and skip timeout configurations
                 log_bad_config(logger, "timeout", M, N, K, config, str(e))
-                console.print(
-                    f"\n[bold orange1]⏱️  TIMEOUT for M={M} N={N} K={K} - logged[/bold orange1]"
-                )
-                console.print(f"[orange1]💬 Timeout:[/orange1] {e}")
+                error_msg = f"[orange1]⏱️ Config {i + 1} (TIMEOUT): {e} | BM:{config.get('BLOCK_SIZE_M')} BN:{config.get('BLOCK_SIZE_N')} BK:{config.get('BLOCK_SIZE_K')} W:{config.get('num_warps')} S:{config.get('num_stages')} KS:{config.get('NUM_KSPLIT')} GSM:{config.get('GROUP_SIZE_M')}[/orange1]"
+                console_output.append(error_msg)
+                live.console.print(error_msg)
                 continue
             except Exception as e:
                 # Log and skip other error configurations
                 log_bad_config(logger, "other_error", M, N, K, config, str(e))
-                console.print(
-                    f"\n[bold red]💥 Unexpected error for M={M} N={N} K={K} - logged[/bold red]"
-                )
-                console.print(f"[red]💬 Error:[/red] {e}")
+                error_msg = f"[red]💥 Config {i + 1} (ERROR): {e} | BM:{config.get('BLOCK_SIZE_M')} BN:{config.get('BLOCK_SIZE_N')} BK:{config.get('BLOCK_SIZE_K')} W:{config.get('num_warps')} S:{config.get('num_stages')} KS:{config.get('NUM_KSPLIT')} GSM:{config.get('GROUP_SIZE_M')}[/red]"
+                console_output.append(error_msg)
+                live.console.print(error_msg)
                 continue
 
     # Show final completion message with Rich
@@ -774,14 +981,36 @@ def tune(
     best_table.add_row("[bold yellow]Matrix N[/bold yellow]", str(N), style="yellow")
     best_table.add_row("[bold yellow]Matrix K[/bold yellow]", str(K), style="yellow")
     best_table.add_row("", "")  # Separator
-    best_table.add_row("Performance", f"{best_time:.1f}μs")
-    best_table.add_row("BLOCK_SIZE_M", str(best_config.get("BLOCK_SIZE_M", "N/A")))
-    best_table.add_row("BLOCK_SIZE_N", str(best_config.get("BLOCK_SIZE_N", "N/A")))
-    best_table.add_row("BLOCK_SIZE_K", str(best_config.get("BLOCK_SIZE_K", "N/A")))
+    best_table.add_row(
+        "[bold green]Performance[/bold green]", f"{best_time:.1f}μs", style="green"
+    )
+    best_table.add_row("", "")  # Separator
+    best_table.add_row(
+        "[bold yellow]BLOCK_SIZE_M[/bold yellow]",
+        str(best_config.get("BLOCK_SIZE_M", "N/A")),
+        style="yellow",
+    )
+    best_table.add_row(
+        "[bold yellow]BLOCK_SIZE_N[/bold yellow]",
+        str(best_config.get("BLOCK_SIZE_N", "N/A")),
+        style="yellow",
+    )
+    best_table.add_row(
+        "[bold yellow]BLOCK_SIZE_K[/bold yellow]",
+        str(best_config.get("BLOCK_SIZE_K", "N/A")),
+        style="yellow",
+    )
     best_table.add_row("num_warps", str(best_config.get("num_warps", "N/A")))
     best_table.add_row("num_stages", str(best_config.get("num_stages", "N/A")))
     best_table.add_row("NUM_KSPLIT", str(best_config.get("NUM_KSPLIT", "N/A")))
     best_table.add_row("waves_per_eu", str(best_config.get("waves_per_eu", "N/A")))
+    best_table.add_row("kpack", str(best_config.get("kpack", "N/A")))
+    best_table.add_row("cache_modifier", str(best_config.get("cache_modifier", "N/A")))
+    best_table.add_row("GROUP_SIZE_M", str(best_config.get("GROUP_SIZE_M", "N/A")))
+    best_table.add_row("GROUP_K", str(best_config.get("GROUP_K", "N/A")))
+    best_table.add_row(
+        "matrix_instr_nonkdim", str(best_config.get("matrix_instr_nonkdim", "N/A"))
+    )
 
     completion_panel = Panel(
         best_table,
@@ -800,18 +1029,68 @@ def save_configs(
     K,
     configs,
     save_path,
+    is_incremental=False,
+    completed_batch_sizes=None,
 ) -> None:
     """Save the best configurations to a JSON file."""
     os.makedirs(save_path, exist_ok=True)
     device_name = "R9700"  # TODO: Hardcoded, make it dynamic
-    json_file_name = f"{device_name}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
+
+    if is_incremental:
+        # Save incremental progress with batch size info in filename
+        batch_sizes_str = (
+            "_".join(map(str, completed_batch_sizes))
+            if completed_batch_sizes
+            else "partial"
+        )
+        json_file_name = f"{device_name}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}_batch_{batch_sizes_str}.json"
+        progress_file = os.path.join(
+            save_path,
+            f"{device_name}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}_progress.json",
+        )
+
+        # Save progress info
+        progress_info = {
+            "completed_batch_sizes": completed_batch_sizes or [],
+            "configs": configs,
+            "last_updated": datetime.now().isoformat(),
+        }
+
+        with open(progress_file, "w") as f:
+            json.dump(progress_info, f, indent=4)
+            f.write("\n")
+    else:
+        json_file_name = f"{device_name}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
 
     config_file_path = os.path.join(save_path, json_file_name)
-    print(f"Writing best config to {config_file_path}...")
+
+    # Add incremental flag to filename
+    action = "Updating incremental" if is_incremental else "Writing"
+    print(f"{action} config to {config_file_path}...")
 
     with open(config_file_path, "w") as f:
         json.dump(configs, f, indent=4)
         f.write("\n")
+
+
+def load_progress(N, K, save_path):
+    """Load previously saved progress for a given N,K configuration."""
+    device_name = "R9700"  # TODO: Hardcoded, make it dynamic
+    progress_file = os.path.join(
+        save_path, f"{device_name}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}_progress.json"
+    )
+
+    if os.path.exists(progress_file):
+        try:
+            with open(progress_file, "r") as f:
+                progress_info = json.load(f)
+            return progress_info.get("completed_batch_sizes", []), progress_info.get(
+                "configs", {}
+            )
+        except Exception as e:
+            print(f"Warning: Could not load progress file {progress_file}: {e}")
+            return [], {}
+    return [], {}
 
 
 def tune_on_gpu(
@@ -819,6 +1098,8 @@ def tune_on_gpu(
     batch_sizes: List[int],
     weight_shapes: List[Tuple[int, int]],
     input_type: str,
+    resume: bool = True,
+    log_filename: Optional[str] = None,
 ) -> None:
     """Run tuning on a specific GPU."""
     # Register SIGINT handler and set GPU ID in global state
@@ -830,12 +1111,33 @@ def tune_on_gpu(
 
     save_path = AITER_TRITON_CONFIGS_PATH + "/gemm/"
 
-    # Setup logger for this GPU with proper prefix
-    log_file_path = os.path.join(
-        save_path, f"tune_a8w8_blockscale_bad_configs_gpu{gpu_id}.log"
-    )
-    logger = setup_logger(log_file_path)
-    logger.info(f"Starting tuning on GPU {gpu_id} with batch sizes {batch_sizes}")
+    # Setup logger for this GPU with custom or timestamped filename
+    if log_filename:
+        # Use custom filename, ensure it has .log extension
+        if not log_filename.endswith(".log"):
+            log_filename += ".log"
+        # If no path separator, assume it's just a filename
+        if "/" not in log_filename and "\\" not in log_filename:
+            log_filename = os.path.join(save_path, log_filename)
+        else:
+            log_filename = log_filename  # Use full path as provided
+    else:
+        # Fall back to timestamped filename
+        log_filename = os.path.join(
+            save_path,
+            get_timestamped_filename(f"tune_a8w8_blockscale_bad_configs_gpu{gpu_id}"),
+        )
+
+    # Choose appropriate logging mode: append for resume, overwrite for fresh start
+    log_mode = "a" if resume else "w"
+    logger = setup_logger(log_filename, mode=log_mode)
+
+    # Log the start time in GMT+8
+    gmt8 = pytz.timezone("Asia/Shanghai")
+    start_time_gmt8 = datetime.now(gmt8).strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"=== TUNING SESSION STARTED AT {start_time_gmt8} [GMT+8] ===")
+    logger.info(f"GPU: {gpu_id}")
+    logger.info(f"Batch sizes: {batch_sizes}")
 
     search_space = get_configs_compute_bound()
     total_configs = len(search_space)
@@ -846,7 +1148,13 @@ def tune_on_gpu(
     print(
         f"   ⚡  Estimated tests per weight shape: {total_configs * len(batch_sizes):,}"
     )
-    print(f"   📝 Bad configurations will be logged to: {log_file_path}")
+    log_action = (
+        "Appending to existing"
+        if resume and os.path.exists(log_filename)
+        else "Writing to new"
+    )
+    print(f"   📝 Bad configurations will be logged to: {log_filename}")
+    print(f"   📝 Logging mode: {log_action}")
 
     start = time.time()
 
@@ -871,8 +1179,68 @@ def tune_on_gpu(
             f"   📊 Testing {len(search_space):,} configurations across {len(batch_sizes)} batch sizes"
         )
 
-        benchmark_results = []
-        for batch_size in batch_sizes:
+        # Check for existing progress and resume from there (if resume is enabled)
+        if resume:
+            completed_batch_sizes, existing_configs = load_progress(N, K, save_path)
+        else:
+            completed_batch_sizes, existing_configs = [], {}
+
+        # Filter batch_sizes to only those not yet completed
+        remaining_batch_sizes = [
+            bs for bs in batch_sizes if bs not in completed_batch_sizes
+        ]
+
+        if completed_batch_sizes and resume:
+            print(f"\n   📂 [GPU {gpu_id}] Found progress for N={N}, K={K}")
+            print(f"   ✅ Already completed batch sizes: {completed_batch_sizes}")
+            print(f"   🔄 Remaining batch sizes to tune: {remaining_batch_sizes}")
+        elif not resume:
+            print(
+                f"\n   🔄 [GPU {gpu_id}] Starting fresh (resume disabled) for N={N}, K={K}"
+            )
+        elif not remaining_batch_sizes:
+            print(
+                f"\n   ✅ [GPU {gpu_id}] All batch sizes already completed for N={N}, K={K}"
+            )
+            # Add existing configs to all_configs and continue to next shape
+            if existing_configs:
+                all_configs.append(existing_configs)
+                save_configs(N, K, existing_configs, save_path)
+            continue
+
+        # Initialize benchmark_results with existing results if any
+        benchmark_results: List[Dict[str, str | int]] = []
+        if existing_configs:
+            # Reconstruct benchmark_results from existing configs
+            # We need to map the configs back to their corresponding batch sizes
+            for i, batch_size in enumerate(batch_sizes):
+                if batch_size in completed_batch_sizes:
+                    # Find the config for this batch size
+                    config_to_add = None
+
+                    # Try to find matching config based on batch size category
+                    if batch_size < 32 and "small" in existing_configs:
+                        config_to_add = existing_configs["small"]
+                    elif batch_size <= 128:
+                        BLK_M = triton.next_power_of_2(batch_size)
+                        if BLK_M == 32 and "medium_M32" in existing_configs:
+                            config_to_add = existing_configs["medium_M32"]
+                        elif BLK_M == 64 and "medium_M64" in existing_configs:
+                            config_to_add = existing_configs["medium_M64"]
+                        elif BLK_M == 128 and "medium_M128" in existing_configs:
+                            config_to_add = existing_configs["medium_M128"]
+                    elif batch_size <= 256 and "large" in existing_configs:
+                        config_to_add = existing_configs["large"]
+                    elif batch_size > 256 and "xlarge" in existing_configs:
+                        config_to_add = existing_configs["xlarge"]
+
+                    if config_to_add:
+                        benchmark_results.append(config_to_add)
+                    else:
+                        # If we couldn't find a matching config, we'll need to retune this batch size
+                        remaining_batch_sizes.append(batch_size)
+
+        for batch_size in remaining_batch_sizes:
             # Check if we were interrupted
             if INTERRUPTED:
                 break
@@ -894,8 +1262,49 @@ def tune_on_gpu(
                 break
 
             benchmark_results.append(result)
+
+            # Save incremental progress immediately after each batch size
+            updated_completed_batch_sizes = completed_batch_sizes + [batch_size]
+
+            # Create configs for different M size categories as expected by the kernel
+            incremental_configs: Dict[str, Dict[str, int | str]] = {}
+            for i, (M, config) in enumerate(
+                zip(batch_sizes[: len(benchmark_results)], benchmark_results)
+            ):
+                if i == len(batch_sizes[: len(benchmark_results)]) - 1:
+                    incremental_configs["any"] = config
+                elif M < 32:
+                    incremental_configs["small"] = config
+                elif M <= 128:
+                    BLK_M = triton.next_power_of_2(M)
+                    if BLK_M == 32:
+                        incremental_configs["medium_M32"] = config
+                    elif BLK_M == 64:
+                        incremental_configs["medium_M64"] = config
+                    elif BLK_M == 128:
+                        incremental_configs["medium_M128"] = config
+                elif M <= 256:
+                    incremental_configs["large"] = config
+                else:
+                    incremental_configs["xlarge"] = config
+
+            # Save the incremental progress
+            save_configs(
+                N,
+                K,
+                incremental_configs,
+                save_path,
+                is_incremental=True,
+                completed_batch_sizes=updated_completed_batch_sizes,
+            )
+
+            print(f"   💾 [GPU {gpu_id}] Saved progress for batch size {batch_size}")
+
+            # Update completed_batch_sizes for next iteration
+            completed_batch_sizes = updated_completed_batch_sizes
+
+        # Create final configs for different M size categories as expected by the kernel
         best_configs: Dict[str, Dict[str, int | str]] = {}
-        # Create configs for different M size categories as expected by the kernel
         for i, (M, config) in enumerate(zip(batch_sizes, benchmark_results)):
             if i == len(batch_sizes) - 1:
                 best_configs["any"] = config
@@ -913,9 +1322,22 @@ def tune_on_gpu(
                 best_configs["large"] = config
             else:
                 best_configs["xlarge"] = config
+
         # Store configs for later analysis
         all_configs.append(best_configs)
+
+        # Save the final complete config (non-incremental)
         save_configs(N, K, best_configs, save_path)
+
+        # Clean up progress file since we completed successfully
+        device_name = "R9700"  # TODO: Hardcoded, make it dynamic
+        progress_file = os.path.join(
+            save_path,
+            f"{device_name}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}_progress.json",
+        )
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
+            print(f"   🧹 [GPU {gpu_id}] Cleaned up progress file for N={N}, K={K}")
 
     # Create a default config file (without N,K parameters) by selecting the most common config
     default_config = create_default_config(all_configs)
@@ -923,10 +1345,17 @@ def tune_on_gpu(
 
     end = time.time()
 
+    # Log session end time in GMT+8
+    gmt8 = pytz.timezone("Asia/Shanghai")
+    end_time_gmt8 = datetime.now(gmt8).strftime("%Y-%m-%d %H:%M:%S")
+    duration = end - start
+    logger.info(f"=== TUNING SESSION COMPLETED AT {end_time_gmt8} [GMT+8] ===")
+    logger.info(f"Total duration: {duration:.2f} seconds")
+
     # Log summary of bad configurations
     log_bad_config_summary(logger, total_tests)
 
-    print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
+    print(f"Tuning on GPU {gpu_id} took {duration:.2f} seconds")
 
 
 def create_default_config(
@@ -1026,12 +1455,41 @@ def main(args):
                 batches_per_gpu[gpu_id],
                 weight_shapes,  # Each GPU processes all weight shapes
                 args.input_type,
+                args.resume,
+                args.log_filename,
             )
         )
 
+    # Set up signal handler for main process to gracefully terminate workers
+    def main_sigint_handler(signum, frame):  # type: ignore
+        print("\n" + "=" * 80)
+        print("🛑 MAIN PROCESS INTERRUPTED BY USER (Ctrl+C)")
+        print("📡 Sending termination signal to worker processes...")
+        print("⏳ Giving workers 3 seconds to log their current state...")
+        print("=" * 80)
+        # Set a flag for workers to check and give them time to cleanup
+        global INTERRUPTED
+        INTERRUPTED = True
+        import time
+
+        time.sleep(3)  # Give workers time to handle the signal and log
+        sys.exit(1)
+
+    # Register main process signal handler
+    if not signal.getsignal(signal.SIGINT) == main_sigint_handler:
+        signal.signal(signal.SIGINT, main_sigint_handler)
+
     ctx = mp.get_context("spawn")
-    with ctx.Pool(num_gpus) as pool:
-        pool.starmap(tune_on_gpu, process_args)
+    try:
+        with ctx.Pool(num_gpus) as pool:
+            pool.starmap(tune_on_gpu, process_args)
+    except KeyboardInterrupt:
+        print("\n🛑 Keyboard interrupt received in main process")
+        print("📡 Worker processes terminated")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Error in main process: {e}")
+        sys.exit(1)
 
     print("Multi-GPU tuning completed")
 
@@ -1052,6 +1510,20 @@ if __name__ == "__main__":
         default="bfloat16",
     )
     parser.add_argument("--batch-size", type=int, required=False)
+    parser.add_argument(
+        "--log-filename",
+        type=str,
+        default=None,
+        help="Custom log filename (without .log extension). If not provided, timestamped filename will be used.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resume functionality and start fresh tuning",
+    )
     args = parser.parse_args()
+
+    # Convert no_resume flag to resume boolean
+    args.resume = not args.no_resume
 
     main(args)
