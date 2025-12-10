@@ -10,8 +10,12 @@ from aiter.ops.triton.fused_gemm_a8w8_blockscale_a16w16 import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
 )
-from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import run_torch as run_torch_fp8
-from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import generate_gemm_a16w16_inputs
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
+    run_torch as run_torch_fp8,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+    generate_gemm_a16w16_inputs,
+)
 import torch.nn.functional as F
 
 

@@ -7,7 +7,10 @@ import torch
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
-from op_tests.triton_tests.moe.test_moe import torch_moe_ref, torch_moe_align_block_size_ref
+from op_tests.triton_tests.moe.test_moe import (
+    torch_moe_ref,
+    torch_moe_align_block_size_ref,
+)
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref

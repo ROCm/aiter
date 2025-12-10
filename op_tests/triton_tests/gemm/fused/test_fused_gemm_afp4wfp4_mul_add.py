@@ -8,7 +8,9 @@ from aiter.ops.triton.fused_gemm_afp4wfp4_mul_add import (
     fused_gemm_afp4wfp4_preshuffle_add_mul,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    generate_gemm_afp4wfp4_inputs,
+)
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     run_torch as run_torch_gemm_afp4wfp4,
 )

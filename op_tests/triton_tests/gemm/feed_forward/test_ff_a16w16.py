@@ -1,7 +1,10 @@
 import torch
 import pytest
 from aiter.ops.triton.ff_a16w16 import ff_a16w16_gated, ff_a16w16_nogate
-from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import ff_gated_test, ff_ungated_test
+from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import (
+    ff_gated_test,
+    ff_ungated_test,
+)
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import get_x_vals
 
 
