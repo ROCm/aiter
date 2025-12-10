@@ -210,7 +210,7 @@ if IS_ROCM:
 
     has_torch = True
     try:
-        import torch as _torch
+        import torch as _
     except Exception:
         has_torch = False
 
@@ -233,8 +233,6 @@ if IS_ROCM:
                 os.remove(f)
             except Exception:
                 pass
-        prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
-        os.makedirs(prebuild_dir + "/srcs", exist_ok=True)
 
         def build_one_module(one_opt_args):
             flags_cc = list(one_opt_args["flags_extra_cc"]) + [
@@ -266,49 +264,11 @@ if IS_ROCM:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        if PREBUILD_KERNELS != 4:
-            with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-                list(executor.map(build_one_module, all_opts_args_build))
-        if os.environ.get("AITER_SKIP_AGGREGATE", "1") != "1":
-            agg_flags_cc = list(prebuild_link_param["flags_extra_cc"]) + [
-                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
-            ]
-            agg_flags_hip = list(prebuild_link_param["flags_extra_hip"]) + [
-                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
-            ]
-            agg_srcs = sorted(
-                set(
-                    s
-                    for one in all_opts_args_build
-                    for s in one["srcs"]
-                    if ("/pybind/" not in s and not s.endswith("_pybind.cu"))
-                )
-            ) + [os.path.join(this_dir, "csrc", "rocm_ops.cpp")]
-            core.build_module(
-                md_name="aiter_",
-                srcs=agg_srcs,
-                flags_extra_cc=agg_flags_cc,
-                flags_extra_hip=agg_flags_hip,
-                blob_gen_cmd=prebuild_link_param["blob_gen_cmd"],
-                extra_include=prebuild_link_param["extra_include"],
-                extra_ldflags=None,
-                verbose=False,
-                is_python_module=True,
-                is_standalone=False,
-                torch_exclude=False,
-            )
+        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+            list(executor.map(build_one_module, all_opts_args_build))
 
 else:
     raise NotImplementedError("Only ROCM is supported")
-
-
-# aiter_meta prepared above
-if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
-    shutil.rmtree("aiter_meta")
-## link "3rdparty", "hsa", "csrc" into "aiter_meta"
-shutil.copytree("3rdparty", "aiter_meta/3rdparty")
-shutil.copytree("hsa", "aiter_meta/hsa")
-shutil.copytree("csrc", "aiter_meta/csrc")
 
 
 class NinjaBuildExtension(BuildExtension):
