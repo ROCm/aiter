@@ -21,9 +21,7 @@ try:
 except ImportError:
     IRIS_AVAILABLE = False
     # Iris is optional - only log at debug level
-    logging.debug(
-        "Iris library not available. Iris-based communication will not work."
-    )
+    logging.debug("Iris library not available. Iris-based communication will not work.")
 
 logger = logging.getLogger("aiter")
 
@@ -71,8 +69,19 @@ def calculate_heap_size(
             )
         world_size = torch.distributed.get_world_size()
 
-    # Calculate element size in bytes
-    elem_bytes = torch.tensor(0, dtype=dtype).element_size()
+    # Calculate element size in bytes (fast path for common types)
+    if dtype in (torch.float32, torch.int32):
+        elem_bytes = 4
+    elif dtype in (torch.float16, torch.bfloat16, torch.int16):
+        elem_bytes = 2
+    elif dtype in (torch.float64, torch.int64):
+        elem_bytes = 8
+    elif dtype == torch.int8:
+        elem_bytes = 1
+    else:
+        # Fallback for uncommon types (e.g., float8, complex types, future dtypes)
+        elem_bytes = torch.empty(0, dtype=dtype).element_size()
+
     M_shard = M // world_size
 
     # Memory for input tensor (M x N)
