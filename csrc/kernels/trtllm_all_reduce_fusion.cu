@@ -151,9 +151,9 @@ __device__ __forceinline__ T warp_reduce(T val, func_t fn) {
     return val;
 }
 
-template <typename T, int WARP_SIZE, typename func_t>
+template <typename T, int WARP_SIZE, int BLOCK_SIZE, typename func_t>
 __device__ __forceinline__ T block_reduce(T val, func_t fn) {
-    static __shared__ T shared[1024 / WARP_SIZE];
+    static __shared__ T shared[BLOCK_SIZE / WARP_SIZE];
     const int tid = threadIdx.x;
     const int w_tid = tid % WARP_SIZE;
     const int wid = tid / WARP_SIZE;
@@ -162,10 +162,9 @@ __device__ __forceinline__ T block_reduce(T val, func_t fn) {
         shared[wid] = val;
     }
     __syncthreads();
-    bool is_mask = threadIdx.x < (blockDim.x / (float)WARP_SIZE);
-    val = is_mask ? shared[w_tid] : (T)(0.0f);
+    val = shared[w_tid];
     __syncthreads();
-    val = warp_reduce<T, WARP_SIZE, func_t>(val, fn);
+    val = warp_reduce<T, BLOCK_SIZE / WARP_SIZE, func_t>(val, fn);
     return val;
 }
 
@@ -358,7 +357,7 @@ __device__ __forceinline__ vec_t<QuantT, VEC_SIZE> convert_to_fp8(vec_t<T, VEC_S
     return out_vec;
 }
 
-template <typename T, int VEC_SIZE, typename OutT>
+template <typename T, int VEC_SIZE, typename OutT, int BLOCK_SIZE>
 __device__ __forceinline__ vec_t<OutT, VEC_SIZE> rms_norm(AllReduceFusionParams<T> const &m_params,
                                                           vec_t<T, VEC_SIZE> const &residual, vec_t<T, VEC_SIZE> const &gamma) {
     __shared__ float s_val;
@@ -369,7 +368,7 @@ __device__ __forceinline__ vec_t<OutT, VEC_SIZE> rms_norm(AllReduceFusionParams<
         float v = static_cast<float>(reinterpret_cast<T const *>(&residual)[i]);
         acc += v * v;
     }
-    acc = block_reduce<float, WARP_SIZE>(acc, std::plus<float>());
+    acc = block_reduce<float, WARP_SIZE, BLOCK_SIZE>(acc, std::plus<float>());
     if (threadIdx.x == 0) {
         s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
     }
@@ -382,7 +381,7 @@ __device__ __forceinline__ vec_t<OutT, VEC_SIZE> rms_norm(AllReduceFusionParams<
     return norm_out;
 }
 
-template <typename T, int VEC_SIZE>
+template <typename T, int VEC_SIZE, int BLOCK_SIZE>
 __device__ __forceinline__ float reduce_abs_max(vec_t<T, VEC_SIZE> const &data) {
     __shared__ float s_val;
     auto fn = [](float a, float b) { return a > b ? a : b; };
@@ -392,7 +391,7 @@ __device__ __forceinline__ float reduce_abs_max(vec_t<T, VEC_SIZE> const &data) 
         float v = static_cast<float>(reinterpret_cast<T const *>(&data)[i]);
         acc = fn(acc, std::abs(v));
     }
-    acc = block_reduce<float, WARP_SIZE>(acc, fn);
+    acc = block_reduce<float, WARP_SIZE, BLOCK_SIZE>(acc, fn);
     if (threadIdx.x == 0) {
         s_val = acc;
     }
@@ -401,7 +400,7 @@ __device__ __forceinline__ float reduce_abs_max(vec_t<T, VEC_SIZE> const &data) 
     return acc;
 }
 
-template <typename T, int VEC_SIZE, bool STORE = true>
+template <typename T, int VEC_SIZE, bool STORE = true, int BLOCK_SIZE = 0>
 __device__ __forceinline__ void epilogue(
     AllReduceFusionParams<T> const &params,
     vec_t<T, VEC_SIZE> &rms_in,
@@ -410,11 +409,11 @@ __device__ __forceinline__ void epilogue(
     if constexpr (STORE)
         rms_in.store(reinterpret_cast<T *>(params.residual_out) + idx);
     if (params.quant_type == QuantType::NONE) {
-        auto val = rms_norm<T, VEC_SIZE, T>(params, rms_in, rms_weight);
+        auto val = rms_norm<T, VEC_SIZE, T, BLOCK_SIZE>(params, rms_in, rms_weight);
         val.store(reinterpret_cast<T *>(params.norm_out) + idx);
     } else {
-        auto val = rms_norm<T, VEC_SIZE, float>(params, rms_in, rms_weight);
-        float scale = reduce_abs_max<float, VEC_SIZE>(val);
+        auto val = rms_norm<T, VEC_SIZE, float, BLOCK_SIZE>(params, rms_in, rms_weight);
+        float scale = reduce_abs_max<float, VEC_SIZE, BLOCK_SIZE>(val);
         if (params.quant_type == QuantType::FP8E4M3FN) {
             scale = scale == 0.f ? 1.f : scale / (float)fp8e4m3fn::max_value;
             auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fn>(val, scale);
@@ -456,7 +455,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_1stage(
     }
     *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(params.residual_out) + idx) = acc;
     auto gamma = *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
-    epilogue<T, VEC_SIZE, false>(params, acc, gamma, idx, tidx);
+    epilogue<T, VEC_SIZE, false, BLOCK_SIZE>(params, acc, gamma, idx, tidx);
 }
 
 template <typename T, int NRanks, int HIDDEN_DIM>
@@ -524,7 +523,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_2stage(
         idx += gridDim.x * params.hidden_dim, tidx += gridDim.x) {
         vec_t<T, VEC_SIZE> val;
         val.load(reinterpret_cast<T *>(cptrs->data_ptrs[params.rank]) + idx);
-        epilogue<T, VEC_SIZE, true>(params, val, gamma, idx, tidx);
+        epilogue<T, VEC_SIZE, true, BLOCK_SIZE>(params, val, gamma, idx, tidx);
     }
 }
 
