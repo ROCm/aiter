@@ -469,7 +469,7 @@ mha_varlen_fwd(
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
-    bool has_sink = mask.sink > 0? true : false;
+    bool has_sink = mask.sink > 0;
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
     if (!paged_KV) {
         const int total_k = k.size(0);
