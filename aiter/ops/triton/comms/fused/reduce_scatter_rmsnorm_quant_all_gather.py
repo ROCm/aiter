@@ -14,7 +14,6 @@ Based on Iris example: examples/22_rs_rmsnorm_fp8quant_ag/reduce_scatter_rmsnorm
 """
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 import triton
 import triton.language as tl
