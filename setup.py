@@ -42,8 +42,7 @@ def getMaxJobs():
     import psutil
 
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)
-    # free memory in GB
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
     max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
@@ -309,37 +308,31 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-if is_develop_mode() and PREBUILD_KERNELS > 0:
-    print(
-        "[aiter] PREBUILD_KERNELS>0 + develop: do prebuild only and skip editable install"
-    )
-else:
-    setup(
-        name=PACKAGE_NAME,
-        use_scm_version=True,
-        packages=["aiter_meta", "aiter"],
-        include_package_data=True,
-        package_data={
-            "": ["*"],
-        },
-        classifiers=[
-            "Programming Language :: Python :: 3",
-            "License :: OSI Approved :: BSD License",
-            "Operating System :: Unix",
-        ],
-        # ext_modules=ext_modules,
-        cmdclass={"build_ext": NinjaBuildExtension},
-        python_requires=">=3.8",
-        install_requires=[
-            "pybind11>=3.0.1",
-            "ninja",
-            "pandas",
-            "einops",
-            "psutil",
-        ],
-        setup_requires=setup_requires,
-        distclass=ForcePlatlibDistribution,
-    )
+setup(
+    name=PACKAGE_NAME,
+    use_scm_version=True,
+    packages=["aiter_meta", "aiter"],
+    include_package_data=True,
+    package_data={
+        "": ["*"],
+    },
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: BSD License",
+        "Operating System :: Unix",
+    ],
+    cmdclass={"build_ext": NinjaBuildExtension},
+    python_requires=">=3.8",
+    install_requires=[
+        "pybind11>=3.0.1",
+        "ninja",
+        "pandas",
+        "einops",
+        "psutil",
+    ],
+    setup_requires=setup_requires,
+    distclass=ForcePlatlibDistribution,
+)
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")
