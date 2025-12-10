@@ -8,14 +8,14 @@ from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
     fused_dynamic_mxfp4_quant_moe_sort,
 )
-from op_tests.triton_tests.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
-from op_tests.triton_tests.test_gemm_afp4wfp4 import (
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     mxfp4_to_f32,
     e8m0_to_f32,
     SCALE_GROUP_SIZE,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from op_tests.triton_tests.test_gemm_afp4wfp4 import shuffle_scales, un_shuffle_scales
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales, un_shuffle_scales
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.utility.fp4_utils import moe_mxfp4_sort, dynamic_mxfp4_quant
