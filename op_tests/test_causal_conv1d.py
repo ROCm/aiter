@@ -253,14 +253,14 @@ def test_causal_conv1d_no_bias(batch, dim, seqlen, width, dtype, use_silu=False,
     return ret
 
 
-# Test configurations (默认使用小规模配置快速验证)
-l_dtype = ["float32", "float16", "bfloat16"]  # 测试所有支持的数据类型
+# Test configurations (default: small-scale config for quick verification)
+l_dtype = ["float32", "float16", "bfloat16"]  # Test all supported data types
 l_batch = [2, 4]
 l_dim = [64, 256]
 l_seqlen = [2048]
 l_width = [4]
-l_use_silu = [False, True]  # 测试两种场景: 无激活 和 SiLU激活
-l_layout = ["channel_first", "channel_last"]  # 测试两种布局
+l_use_silu = [False, True]  # Test two scenarios: no activation and SiLU activation
+l_layout = ["channel_first", "channel_last"]  # Test both layouts
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

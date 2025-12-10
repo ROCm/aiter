@@ -1,12 +1,12 @@
 # Copyright (C) 2024, Tri Dao.
 #
-# AIter causal_conv1d 测试
+# AIter causal_conv1d tests
 #
-# 已修复问题：
-# 1. float16/bfloat16 支持已添加到 causal_conv1d_channellast_fwd_kernel_traits
-#    - 修改了 kernel traits 以支持模板化的 input_t 和 weight_t
-#    - 现在可以正确处理 FP16/BF16 数据类型
-# 2. 当 has_bias=False 时，需要传递形状为 (dim,) 的零张量而非 None
+# Issues fixed:
+# 1. float16/bfloat16 support added to causal_conv1d_channellast_fwd_kernel_traits
+#    - Modified kernel traits to support templated input_t and weight_t
+#    - Now correctly handles FP16/BF16 data types
+# 2. When has_bias=False, need to pass a zero tensor with shape (dim,) instead of None
 #
 
 import math
@@ -147,7 +147,7 @@ def causal_conv1d_update_ref(x, conv_state, weight, bias=None, activation=None, 
 @pytest.mark.parametrize("channel_last", [False, True])
 # @pytest.mark.parametrize('channel_last', [True])
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-# @pytest.mark.parametrize("itype", [torch.float32])  # 已修复，现在支持 float16/bfloat16
+# @pytest.mark.parametrize("itype", [torch.float32])  # Fixed, now supports float16/bfloat16
 # @pytest.mark.parametrize('itype', [torch.float16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 # @pytest.mark.parametrize('silu_activation', [True])
@@ -195,21 +195,21 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
     initial_states_ref = initial_states.detach().clone().requires_grad_() if initial_states is not None else None
     activation = None if not silu_activation else "silu"
     
-    # 准备 AIter 调用的参数
-    # 签名: causal_conv1d_fn(x, weight, bias, seq_idx, initial_states, out, final_states_out, silu_activation)
+    # Prepare arguments for AIter call
+    # Signature: causal_conv1d_fn(x, weight, bias, seq_idx, initial_states, out, final_states_out, silu_activation)
     out = torch.empty_like(x)
     if return_final_states:
-        # final_states 需要是 channel-last 布局，即 stride(1) == 1
-        # 形状 (batch, dim, width-1)，stride 应该是 (dim*(width-1), 1, dim)
+        # final_states needs to be in channel-last layout, i.e. stride(1) == 1
+        # Shape (batch, dim, width-1), stride should be (dim*(width-1), 1, dim)
         final_states = torch.empty(batch, dim, width - 1, device=device, dtype=itype).transpose(1, 2).contiguous().transpose(1, 2)
     else:
         final_states = None
     
-    # 转换 bias 为正确格式（None -> zeros tensor with shape (dim,)）
-    # AIter 需要传递形状为 (dim,) 的零 tensor，而不是空 tensor 或 None
+    # Convert bias to correct format (None -> zeros tensor with shape (dim,))
+    # AIter requires passing a zero tensor with shape (dim,), not an empty tensor or None
     bias_aiter = bias if bias is not None else torch.zeros(dim, device=device, dtype=torch.float32)
     
-    # 调用 AIter 实现
+    # Call AIter implementation
     aiter.causal_conv1d_fn(
         x,                  # input
         weight,             # weight
@@ -221,7 +221,7 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
         silu_activation     # silu_activation (bool)
     )
     
-    # 参考实现
+    # Reference implementation
     out_ref = causal_conv1d_ref(x_ref, weight_ref, bias_ref, initial_states=initial_states_ref, return_final_states=return_final_states, activation=activation)
     
     if return_final_states:
@@ -234,8 +234,8 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
-    # 注意：aiter.causal_conv1d_fn 目前不支持反向传播
-    # 跳过梯度检查
+    # Note: aiter.causal_conv1d_fn currently does not support backpropagation
+    # Skip gradient checks
     # if return_final_states:
     #     out += F.sigmoid(final_states).sum(dim=-1, keepdim=True)
     #     out_ref += F.sigmoid(final_states_ref).sum(dim=-1, keepdim=True)
@@ -446,15 +446,15 @@ def test_causal_conv1d_update_with_padding(dim, width, seqlen, has_cache_seqlens
 @pytest.mark.parametrize("channel_last", [False, True])
 # @pytest.mark.parametrize('channel_last', [True])
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-# @pytest.mark.parametrize('itype', [torch.float32])  # 已修复，现在支持 float16/bfloat16
-@pytest.mark.parametrize("silu_activation", [False, True])  # 测试两种
+# @pytest.mark.parametrize('itype', [torch.float32])  # Fixed, now supports float16/bfloat16
+@pytest.mark.parametrize("silu_activation", [False, True])  # Test both
 # @pytest.mark.parametrize('silu_activation', [True])
 @pytest.mark.parametrize("has_bias", [False, True])
 # @pytest.mark.parametrize('has_bias', [True])
-@pytest.mark.parametrize("width", [2, 3, 4])  # 测试所有宽度
+@pytest.mark.parametrize("width", [2, 3, 4])  # Test all widths
 # @pytest.mark.parametrize('width', [4])
 # @pytest.mark.parametrize(
-#     "seqlen", [128, 512, 2048]  # 测试多个序列长度
+#     "seqlen", [128, 512, 2048]  # Test multiple sequence lengths
 #     # "seqlen", [2048]
 # )
 @pytest.mark.parametrize('seqlen', [8, 16, 32, 64, 128, 256, 512, 784, 1024, 2048, 4096])
@@ -483,13 +483,13 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
     
     activation = None if not silu_activation else "silu"
     
-    # 第一次运行
+    # First run
     out0 = torch.empty_like(x)
     aiter.causal_conv1d_fn(x, weight, bias_aiter, None, None, out0, None, silu_activation)
     
-    # 注意：aiter 不支持反向传播，跳过梯度检查
-    # 只测试前向一致性
-    for i in range(100):  # 减少迭代次数到 100
+    # Note: aiter does not support backpropagation, skip gradient checks
+    # Only test forward consistency
+    for i in range(100):  # Reduced iterations to 100
         out = torch.empty_like(x)
         aiter.causal_conv1d_fn(x, weight, bias_aiter, None, None, out, None, silu_activation)
         assert torch.equal(out, out0), f"Iteration {i}: output mismatch"
@@ -544,11 +544,11 @@ def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, ity
     bias_ref = bias.detach().clone().requires_grad_() if bias is not None else None
     activation = None if not silu_activation else "silu"
     
-    # AIter 实现
+    # AIter implementation
     out = torch.empty_like(x)
     aiter.causal_conv1d_fn(x, weight, bias_aiter, seq_idx, None, out, None, silu_activation)
     
-    # 参考实现
+    # Reference implementation
     out_ref = []
     for b in range(batch):
         out_ref_b = []
@@ -561,7 +561,7 @@ def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, ity
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
-    # 注意：aiter 不支持反向传播
+    # Note: aiter does not support backpropagation
     # g = torch.randn_like(out)
     # out_ref.backward(g)
     # out.backward(g)
