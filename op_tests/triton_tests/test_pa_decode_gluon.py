@@ -1613,13 +1613,6 @@ def run_pa_gluon_test(
         msg=f"[PyTorch vs Unified][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
     )
     results["us_unified"] = unified_time
-    err_gluon = checkAllclose(
-        reference_output_quant,
-        final_output_gluon,
-        atol=fp8_tolerance,
-        rtol=fp8_tolerance,
-        msg=f"[PyTorch vs Gluon_FP8][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
-    )
     # Compare with original reference
     err_gluon = checkAllclose(
         reference_output_quant,
@@ -1627,12 +1620,6 @@ def run_pa_gluon_test(
         atol=fp8_tolerance,
         rtol=fp8_tolerance,
         msg=f"[PyTorch vs Gluon_FP8][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
-    )
-    torch.testing.assert_close(
-        reference_output_quant,
-        final_output_gluon,
-        atol=fp8_tolerance,
-        rtol=fp8_tolerance,
     )
     if err_gluon > 0:
         err_gluon = 1

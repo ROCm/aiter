@@ -1094,7 +1094,7 @@ def paged_attention_decode_sliding_window(
 
     # ==================== SEQUENCE PROCESSING ====================
     # NUM_ITERATIONS: gl.constexpr = triton.cdiv(SLIDING_WINDOW, CONTEXT_PARTITION_SIZE)
-    SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
+    # SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
 
     sequence_partition_start_idx = (
         context_length - SLIDING_WINDOW
@@ -1126,7 +1126,7 @@ def paged_attention_decode_sliding_window(
         num_kv_blocks = gl.cdiv(
             kv_sequence_end_idx - kv_sequence_start_idx, KV_BLOCK_SIZE
         )
-        kv_block_start_idx = sequence_partition_idx * SEQUENCE_PARTITION_KV_BLOCKS
+        kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
         qk_column_offsets = kv_block_start_idx * KV_BLOCK_SIZE + gl.arange(
             0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
