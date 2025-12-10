@@ -1,4 +1,3 @@
-import functools
 import json
 import os
 
@@ -12,7 +11,6 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
 STANDARD_M_BOUNDS = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 
-@functools.lru_cache(maxsize=1024)
 def get_gemm_config(
     config_name,
     M,
@@ -110,6 +108,10 @@ def get_gemm_config(
 
     if "any" in config_dict:
         return dict(config_dict["any"])
+
+    raise KeyError(
+        f"No matching configuration found for M={M}, N={N}, K={K} in config '{config_name}'."
+    )
 
 
 def add_default_gemm_config_params(config):
