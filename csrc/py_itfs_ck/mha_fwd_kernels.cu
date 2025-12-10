@@ -246,7 +246,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
-    bool has_sink = mask.sink > 0? true : false;
+    bool has_sink = mask.sink > 0;
 
     TORCH_CHECK(!(bias_.has_value() && alibi_slopes_.has_value()), "cannot apply bias and alibi at the same time");
     bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
