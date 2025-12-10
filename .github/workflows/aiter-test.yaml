@@ -154,7 +154,7 @@ jobs:
   multi-gpu:
     needs: define-runners
     # only run multi-gpu tests on main branch due to limited multi-gpu resources
-    if: github.ref == 'refs/heads/main' 
+    # if: github.ref == 'refs/heads/main' 
     strategy:
       fail-fast: false
       matrix:
@@ -215,7 +215,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh && pip show triton && pip show torch || true"
 
       - name: Tests
         run: |

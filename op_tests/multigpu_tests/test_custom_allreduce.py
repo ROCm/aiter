@@ -94,6 +94,11 @@ def test_allreduce_custom(
     withGraph=False,
     distributed_init_method: Optional[str] = None,
 ):
+    print("python executable:", sys.executable)
+    print("torch version:", torch.__version__)
+    print("torch file:", torch.__file__)
+    print("cuda version:", torch.version.cuda)
+    print("torch config:", torch.__config__.show())
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
