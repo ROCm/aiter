@@ -156,7 +156,7 @@ auto create_args(int argc, char* argv[])
         .insert("v3_bf16_cvt",
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
-        .insert("v3_api_check", "0", "if set to 1, check whether the input scenarios is supported by the asm kernel.");
+        .insert("v3_api_check", "0", "if set to 1, check whether the input scenario is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
