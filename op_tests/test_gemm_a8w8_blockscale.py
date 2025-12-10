@@ -220,7 +220,7 @@ for dtype in [dtypes.bf16]:
             # (7168, 16384),
             # (36864, 7168),
         ]:
-            ret = test_gemm(dtype, m, n, k)
+            ret = test_gemm(dtype, m, n, k, ck_preshuffle=False)
             df.append(ret)
 df = pd.DataFrame(df)
 
