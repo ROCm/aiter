@@ -68,7 +68,7 @@ def run_torch_mrope_3d_rms(
     qw: Tensor,  #  contiguous (head_size)
     kw: Tensor,  #  contiguous (head_size)
     cos_sin: Tensor,  # contiguous (max_positions * head_size)
-    positions: Tensor,  # contiguous (3 * num_tokens)
+    positions: Tensor,  # contiguous (3 * num_tokens) or (num_tokens)
     num_tokens: int,
     num_heads_q: int,
     num_heads_k: int,
@@ -78,6 +78,7 @@ def run_torch_mrope_3d_rms(
     mrope_section: List[int],
     is_interleaved: bool,
     eps: float,
+    is_mrope: bool,
 ):
     q_size = num_heads_q * head_size
     k_size = num_heads_k * head_size
@@ -94,22 +95,24 @@ def run_torch_mrope_3d_rms(
     k = k_by_head.view(k.shape)
 
     cos_sin = cos_sin.view(max_positions, head_size)
-    positions = positions.view(3, num_tokens)
+    if is_mrope:
+        positions = positions.view(3, num_tokens)
     cos_sin = cos_sin[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
 
-    if is_interleaved:
-        cos = apply_interleaved_rope(cos, mrope_section)
-        sin = apply_interleaved_rope(sin, mrope_section)
-    else:
-        cos = torch.cat(
-            [m[i] for i, m in enumerate(cos.split(mrope_section, dim=-1))],
-            dim=-1,
-        )
-        sin = torch.cat(
-            [m[i] for i, m in enumerate(sin.split(mrope_section, dim=-1))],
-            dim=-1,
-        )
+    if is_mrope:
+        if is_interleaved:
+            cos = apply_interleaved_rope(cos, mrope_section)
+            sin = apply_interleaved_rope(sin, mrope_section)
+        else:
+            cos = torch.cat(
+                [m[i] for i, m in enumerate(cos.split(mrope_section, dim=-1))],
+                dim=-1,
+            )
+            sin = torch.cat(
+                [m[i] for i, m in enumerate(sin.split(mrope_section, dim=-1))],
+                dim=-1,
+            )
 
     q_shape = q.shape
     q = q.view(num_tokens, -1, head_size)
@@ -140,24 +143,42 @@ def run_aiter_mrope_3d_rms(
     mrope_section: List[int],
     is_interleaved: bool,
     eps: float,
+    is_mrope: bool,
 ):
     qkv = qkv.clone()  # inplace op
-    aiter.fused_mrope_3d_rms(
-        qkv,
-        qw,
-        kw,
-        cos_sin,
-        positions,
-        num_tokens,
-        num_heads_q,
-        num_heads_k,
-        num_heads_v,
-        head_size,
-        is_neox_style,
-        mrope_section,
-        is_interleaved,
-        eps,
-    )
+
+    if is_mrope:
+        aiter.fused_mrope_3d_rms(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            mrope_section,
+            is_interleaved,
+            eps,
+        )
+    else:
+        aiter.fused_rope_rms(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+        )
 
     q_size = num_heads_q * head_size
     k_size = num_heads_k * head_size
@@ -179,7 +200,8 @@ def test_mrope_3d_rms(
     is_neox_style,
     mrope_section,
     is_interleaved,
-    eps=1e-6,
+    eps,
+    is_mrope,
 ):
     qkv = torch.randn(
         (num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size),
@@ -189,8 +211,12 @@ def test_mrope_3d_rms(
     qw = torch.randn(head_size, dtype=dtype, device="cuda")
     kw = torch.randn(head_size, dtype=dtype, device="cuda")
     cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
+    if is_mrope:
+        pos_shape = (3, num_tokens)
+    else:
+        pos_shape = (num_tokens,)
     positions = torch.randint(
-        0, max_positions, (3, num_tokens), dtype=torch.int64, device="cuda"
+        0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
     )
 
     (q_ref, k_ref, v_ref), avg_torch = run_torch_mrope_3d_rms(
@@ -208,6 +234,7 @@ def test_mrope_3d_rms(
         mrope_section,
         is_interleaved,
         eps,
+        is_mrope,
     )
     (q, k, v), avg_cu = run_aiter_mrope_3d_rms(
         qkv,
@@ -224,12 +251,12 @@ def test_mrope_3d_rms(
         mrope_section,
         is_interleaved,
         eps,
+        is_mrope,
     )
 
     info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
-    info += (
-        f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
-    )
+    if is_mrope:
+        info += f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
     checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
     checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
@@ -237,6 +264,32 @@ def test_mrope_3d_rms(
 
 
 if __name__ == "__main__":
+    # rope
+    is_neox_styles = [True, False]
+    num_tokens = [513, 1257, 127, 778, 10024, 3]
+    num_heads = [32, 64]
+    head_sizes = [64, 128, 256]
+    max_positions = 10000
+    dtype = torch.bfloat16
+    for is_neox_style in is_neox_styles:
+        for num_token in num_tokens:
+            for num_head in num_heads:
+                for i, head_size in enumerate(head_sizes):
+                    test_mrope_3d_rms(
+                        dtype,
+                        num_token,
+                        num_head,
+                        num_head,
+                        num_head,
+                        head_size,
+                        is_neox_style,
+                        None,
+                        None,
+                        eps=1e-6,
+                        is_mrope=False,
+                    )
+
+    # mrope
     is_neox_styles = [True, False]
     num_tokens = [513, 1257, 127, 778, 10024, 3]
     num_heads = [32, 64]
@@ -262,5 +315,6 @@ if __name__ == "__main__":
                             ms,
                             is_interleaved,
                             eps=1e-6,
+                            is_mrope=True,
                         )
     print("done")

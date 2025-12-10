@@ -75,7 +75,7 @@ def moe_sorting(
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def get_inter_dim(w1_shape, w2_shape):
     E, _, model_dim = w1_shape
     E, model_dim, inter_dim = w2_shape
@@ -461,7 +461,7 @@ def fused_moe_1stage(
     return moe_buf
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
     cu_num = get_cu_num()
     tileN = 128
@@ -521,8 +521,12 @@ def get_padded_M(M):
         padded_m = 16
     elif M < 1024:
         padded_m = nextPow2(padded_m)
-    else:
+    elif M < 2048:
         padded_m = 1024
+    elif M < 16384:
+        padded_m = 2048
+    else:
+        padded_m = 16384
     return padded_m
 
 
@@ -535,7 +539,7 @@ class MOEMetadata:
     run_1stage: bool = False
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
     model_dim,
@@ -644,7 +648,7 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                run_1stage = True and (inter_dim % 256 == 0)
+                run_1stage = True and (inter_dim % 256 == 0) and token < 256
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -703,7 +707,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 bias2=bias2,
             ),
-            16 if token < 2048 else 32,
+            16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
             False,
         )

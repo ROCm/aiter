@@ -75,8 +75,13 @@ struct PaMetadataV1KernelParameter: MlaMetadataV1KernelParameter
 {
     // Inputs
     const int32_t* p_pages_kv_indptr;
+    const int32_t* p_context_lens;
+    int32_t        block_size;
+    int32_t        blocks_per_unit;
     int32_t        num_heads_k;
     int32_t        gqa_ratio;
+    int32_t        qhead_granularity;
+    int32_t        qlen_granularity;
 };
 
 template <typename T>
