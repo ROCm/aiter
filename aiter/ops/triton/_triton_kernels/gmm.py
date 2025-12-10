@@ -25,7 +25,7 @@ from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
 @functools.lru_cache()
-def get_config(gmm_type: str, M: int, K: int, N: int, G: int) -> dict[str, int]:
+def get_config(gmm_type: str, M: int, K: int, N: int, G: int, accumulate: bool = False) -> dict[str, int]:
     assert gmm_type in {
         "gmm",
         "ptgmm",
@@ -49,7 +49,8 @@ def get_config(gmm_type: str, M: int, K: int, N: int, G: int) -> dict[str, int]:
     assert (
         "default" in get_config._config_dict[gmm_type]
     ), "Default configuration is absent."
-    return get_config._config_dict[gmm_type]["default"]
+    key = "accumulate" if accumulate else "default"
+    return get_config._config_dict[gmm_type][key]
 
 
 # Common code shared by GMM and TGMM kernels.

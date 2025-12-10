@@ -331,7 +331,7 @@ def ptgmm(
     trans_lhs, _ = get_tgmm_transposition(lhs, rhs, out)
 
     if config is None:
-        config = get_config("ptgmm", M, K, N, G)
+        config = get_config("ptgmm", M, K, N, G, accumulate)
 
     assert all(
         key in config
@@ -525,7 +525,7 @@ def nptgmm(
     )
 
     if config is None:
-        config = get_config("nptgmm", M, K, N, G)
+        config = get_config("nptgmm", M, K, N, G, accumulate)
 
     assert all(
         key in config
