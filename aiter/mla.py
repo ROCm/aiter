@@ -343,12 +343,16 @@ def mla_decode_fwd(
                 o,
                 dbg_tr,
             )
-            kvc = torch.index_select(kv_buffer, 0, kv_indices).to(dtype=torch.float32)
-            for idx in range(kv_indptr[-1].item()):
-                # for idx in range(1):
-                checkAllclose(
-                    dbg_tr[idx], kvc[idx][0][0], msg=f"dbg_tr[{idx}] vs. kvc[{idx}]"
-                )
+            qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
+            kvc = torch.index_select(kv_buffer, 0, kv_indices).squeeze(1)
+            kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
+            for i in range(bs):
+                key = kvs[i]
+                query = qs[i]
+                qk = torch.einsum("qhd,khd->hqk", query.float(), key.float()).squeeze(1)
+                dbg_qk = dbg_tr[i * nhead : (i + 1) * nhead, : qk.shape[1]]
+                checkAllclose(dbg_qk, qk, msg=f"dbg[{bs}] vs. qk[{bs}]")
+
             exit()
 
         aiter.mla_decode_stage1_asm_fwd(

@@ -21,6 +21,7 @@ namespace ckt    = ck_tile;
 union FUI
 {
     uint32_t ui;
+    float f32;
     hk::fp8e4m3_4 fp8_4;
     struct
     {
@@ -427,126 +428,92 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
-            // Load 1st part of K from LDS to VGPR
-            for(int k_step = 0; k_step < T::kQkNopeHeadDim / T::kBlockK; ++k_step)
-            {
+            // GEMM on NoPE
+            ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}([&](auto idx) {
+                using q_range_0 =
+                    hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
+                                         2>;
+                using q_range_1 = hkdart::
+                    split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>, 2>;
+                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+
+                // Load K from LDS to GPR
+                constexpr int32_t tile_idx = (idx.value - k_q_nope_begin) / 2;
                 load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim>(
-                    kv_0, p_lds_k_nope, 0, k_step * T::kBlockK);
+                    kv_0, p_lds_k_nope, 0, tile_idx * T::kBlockK);
+                load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim>(
+                    kv_1, p_lds_k_nope, 0, (tile_idx + 1) * T::kBlockK);
+
                 asm volatile("s_waitcnt lgkmcnt(0)");
 
-                // debug
-                using k0_type   = decltype(kv_0);
-                using k_range_0 = hkdart::get_nth_range_t<typename k0_type::register_ranges, 0>;
-                using k_range_1 = hkdart::get_nth_range_t<typename k0_type::register_ranges, 1>;
-
-                const int32_t row = lane_idx % 16;
-                const int32_t col = (lane_idx / 16) * 8; // 8 = #bytes per thr for each tile
-                uint32_t data_00  = hkm::v_get_gpr<k_range_0::lo>();
-                uint32_t data_01  = hkm::v_get_gpr<k_range_0::lo + 1>();
-                uint32_t data_10  = hkm::v_get_gpr<k_range_1::lo>();
-                uint32_t data_11  = hkm::v_get_gpr<k_range_1::lo + 1>();
-
-                float4 f4_00 = convert_fp8x4_to_float4(FUI{data_00});
-                float4 f4_01 = convert_fp8x4_to_float4(FUI{data_01});
-                float4 f4_10 = convert_fp8x4_to_float4(FUI{data_10});
-                float4 f4_11 = convert_fp8x4_to_float4(FUI{data_11});
-
-                uint32_t row0 = kv_start + row;
-                uint32_t col0 = col + k_step * 32; // 0 = K offset
-                uint32_t off0 = row0 * 576 + col0;
-                uint32_t off1 = off0 + 16 * 576;
-
-                params.p_dbg[off0 + 0] = f4_00.x;
-                params.p_dbg[off0 + 1] = f4_00.y;
-                params.p_dbg[off0 + 2] = f4_00.z;
-                params.p_dbg[off0 + 3] = f4_00.w;
-                params.p_dbg[off0 + 4] = f4_01.x;
-                params.p_dbg[off0 + 5] = f4_01.y;
-                params.p_dbg[off0 + 6] = f4_01.z;
-                params.p_dbg[off0 + 7] = f4_01.w;
-                params.p_dbg[off1 + 0] = f4_10.x;
-                params.p_dbg[off1 + 1] = f4_10.y;
-                params.p_dbg[off1 + 2] = f4_10.z;
-                params.p_dbg[off1 + 3] = f4_10.w;
-                params.p_dbg[off1 + 4] = f4_11.x;
-                params.p_dbg[off1 + 5] = f4_11.y;
-                params.p_dbg[off1 + 6] = f4_11.z;
-                params.p_dbg[off1 + 7] = f4_11.w;
-            }
-
-            for(int k_step = 0; k_step < T::kQkRopeHeadDim / T::kBlockK; ++k_step)
-            {
-                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
-                    kv_0, p_lds_k_rope, 0, k_step * T::kBlockK);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-
-                // debug
-                using k0_type   = decltype(kv_0);
-                using k_range_0 = hkdart::get_nth_range_t<typename k0_type::register_ranges, 0>;
-                using k_range_1 = hkdart::get_nth_range_t<typename k0_type::register_ranges, 1>;
-
-                const int32_t row  = lane_idx % 16;
-                const int32_t col  = (lane_idx / 16) * 8; // 8 = #bytes per thr for each tile
-                const int32_t addr = p_lds_k_rope + row * 64 + col + k_step * 32;
-                uint32_t data_00   = hkm::v_get_gpr<k_range_0::lo>();
-                uint32_t data_01   = hkm::v_get_gpr<k_range_0::lo + 1>();
-                uint32_t data_10   = hkm::v_get_gpr<k_range_1::lo>();
-                uint32_t data_11   = hkm::v_get_gpr<k_range_1::lo + 1>();
-
-                float4 f4_00 = convert_fp8x4_to_float4(FUI{data_00});
-                float4 f4_01 = convert_fp8x4_to_float4(FUI{data_01});
-                float4 f4_10 = convert_fp8x4_to_float4(FUI{data_10});
-                float4 f4_11 = convert_fp8x4_to_float4(FUI{data_11});
-
-                uint32_t row0 = kv_start + row;
-                uint32_t col0 = col + k_step * 32 + 512;
-                uint32_t off0 = row0 * 576 + col0;
-                uint32_t off1 = off0 + 16 * 576;
-
-                params.p_dbg[off0 + 0] = f4_00.x;
-                params.p_dbg[off0 + 1] = f4_00.y;
-                params.p_dbg[off0 + 2] = f4_00.z;
-                params.p_dbg[off0 + 3] = f4_00.w;
-                params.p_dbg[off0 + 4] = f4_01.x;
-                params.p_dbg[off0 + 5] = f4_01.y;
-                params.p_dbg[off0 + 6] = f4_01.z;
-                params.p_dbg[off0 + 7] = f4_01.w;
-                params.p_dbg[off1 + 0] = f4_10.x;
-                params.p_dbg[off1 + 1] = f4_10.y;
-                params.p_dbg[off1 + 2] = f4_10.z;
-                params.p_dbg[off1 + 3] = f4_10.w;
-                params.p_dbg[off1 + 4] = f4_11.x;
-                params.p_dbg[off1 + 5] = f4_11.y;
-                params.p_dbg[off1 + 6] = f4_11.z;
-                params.p_dbg[off1 + 7] = f4_11.w;
-            }
-
-            // // GEMM on NoPE
-            // ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}(
-            // [&](auto idx) {
-            //     using q_range_0 =
-            //         hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value +
-            //         1>>, 2>;
-            //     using q_range_1 =
-            //         hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value
-            //         + 3>>, 2>;
-            //     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
-            //     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
-
-            //     // Load K from LDS to GPR
-
-            //     if constexpr(idx.value == k_q_nope_begin)
-            //     {
-            //         hk::mma_ABt(p_comp, q_0, kv_0);
-            //     }
-            //     else
-            //     {
-            //         hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
-            //     }
-            //     hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
-            // });
+                if constexpr(idx.value == k_q_nope_begin)
+                {
+                    hk::mma_ABt(p_comp, q_0, kv_0);
+                }
+                else
+                {
+                    hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
+                }
+                hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
+            });
 
             // GEMM on RoPE
+            ckt::static_for<k_q_rope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
+                using q_range_0 =
+                    hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
+                                         2>;
+                using q_range_1 = hkdart::
+                    split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>, 2>;
+                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+
+                // Load K from LDS to GPR
+                constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
+                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
+                    kv_0, p_lds_k_rope, 0, tile_idx * T::kBlockK);
+                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
+                    kv_1, p_lds_k_rope, 0, (tile_idx + 1) * T::kBlockK);
+
+                asm volatile("s_waitcnt lgkmcnt(0)");
+
+                hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
+                hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
+            });
+
+            float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
+            float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
+            float r02 = FUI(hkm::v_get_gpr<k_p_comp_begin + 2>()).f32;
+            float r03 = FUI(hkm::v_get_gpr<k_p_comp_begin + 3>()).f32;
+            float r10 = FUI(hkm::v_get_gpr<k_p_comp_begin + 4>()).f32;
+            float r11 = FUI(hkm::v_get_gpr<k_p_comp_begin + 5>()).f32;
+            float r12 = FUI(hkm::v_get_gpr<k_p_comp_begin + 6>()).f32;
+            float r13 = FUI(hkm::v_get_gpr<k_p_comp_begin + 7>()).f32;
+
+            int row0 = qo_start + warp_idx * 16;
+            int row1 = qo_start + warp_idx * 16 + 1;
+            int row2 = qo_start + warp_idx * 16 + 2;
+            int row3 = qo_start + warp_idx * 16 + 3;
+            int col0 = kv_start + (lane_idx % 16);
+            int col1 = col0 + 16;
+
+            int off00 = row0 * 576 + col0;
+            int off01 = row1 * 576 + col0;
+            int off02 = row2 * 576 + col0;
+            int off03 = row3 * 576 + col0;
+            int off10 = row0 * 576 + col1;
+            int off11 = row1 * 576 + col1;
+            int off12 = row2 * 576 + col1;
+            int off13 = row3 * 576 + col1;
+
+            params.p_dbg[off00] = r00;
+            params.p_dbg[off01] = r01;
+            params.p_dbg[off02] = r02;
+            params.p_dbg[off03] = r03;
+            params.p_dbg[off10] = r10;
+            params.p_dbg[off11] = r11;
+            params.p_dbg[off12] = r12;
+            params.p_dbg[off13] = r13;
         };
 
         const int32_t kv_len = kv_end - kv_start;
