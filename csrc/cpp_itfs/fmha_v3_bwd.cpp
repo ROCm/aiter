@@ -101,11 +101,13 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
             continue;
         const auto& cfg = el.second;
 
-        if((cfg.dtype == data_type) && (cfg.hdim_q == padded_hdim_q) && (cfg.mode == mode) &&
+        if((cfg.hdim_q == padded_hdim_q) && (cfg.mode == mode) &&
            ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))))
         {
-            postProcessingKernelName = el.first;
-            break;
+            if ((cfg.dtype == data_type) || (atomic32 == 0)) {
+                postProcessingKernelName = el.first;
+                break;
+            }
         }
     }
     return std::make_tuple(preProcessingKernelName, dQdKdVKernelName, postProcessingKernelName);
@@ -297,7 +299,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
     else
     {
-        // std::cout << "Cannot find dqdkdv kernel: " << dqdkdv_kernel << std::endl;
         return -1;
     }
 
