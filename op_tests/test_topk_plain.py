@@ -85,10 +85,14 @@ def test_topk(
         topk_value,
         topk,
         largest,
-        torch.tensor([], dtype=torch.int32, device=device),  # rowStarts - empty int32 tensor
-        torch.tensor([], dtype=torch.int32, device=device),  # rowEnds - empty int32 tensor
-        -1,              # stride0
-        1,               # stride1
+        torch.tensor(
+            [], dtype=torch.int32, device=device
+        ),  # rowStarts - empty int32 tensor
+        torch.tensor(
+            [], dtype=torch.int32, device=device
+        ),  # rowEnds - empty int32 tensor
+        -1,  # stride0
+        1,  # stride1
     )
 
     id_aiter, _aiter = torch.sort(topk_ids.to(torch.long))
@@ -110,7 +114,6 @@ def test_topk(
     #     topk_value.gather(1, _aiter),
     #     msg="topk_values [golden vs aiter]",
     # )
-
 
     return {
         "err": err,
@@ -136,7 +139,9 @@ for batch_size in BATCH_SIZES:
     for hiddensize in HIDDENSIZES:
         for topk in TOPKS:
             print(f"\n{'='*60}")
-            print(f"Testing: batch_size={batch_size}, hiddensize={hiddensize}, topk={topk}")
+            print(
+                f"Testing: batch_size={batch_size}, hiddensize={hiddensize}, topk={topk}"
+            )
             print(f"{'='*60}")
             ret = test_topk(
                 batch_size,
