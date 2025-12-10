@@ -1334,7 +1334,7 @@ def test_attn_qk_int8_per_block(
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     # Quantization
     sm_scale = HEAD_SZ**-0.5
-    q_fp8, q_scale, k_fp8, k_scale = per_block_int8(
+    q_fp8, q_scale, k_fp8, k_scale, _ = per_block_int8(
         q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
     )
     # q_fp8, q_scale = int8_per_block_quantize_bshd(q, torch.int8, block_size=config["BLOCK_SIZE_M"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd", include_sqrt_scale=True)
