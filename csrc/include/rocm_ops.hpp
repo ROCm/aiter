@@ -1349,7 +1349,9 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
-#define FUSED_MROPE_RMS_PYBIND m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms);
+#define FUSED_MROPE_RMS_PYBIND                        \
+    m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms); \
+    m.def("fused_rope_rms", &fused_rope_rms);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
