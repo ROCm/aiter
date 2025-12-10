@@ -307,6 +307,9 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
+# Define Iris dependency once to avoid duplication
+IRIS_DEP = "iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429"
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -329,8 +332,6 @@ setup(
         "einops",
         "psutil",
     ],
-    # Define Iris dependency once to avoid duplication
-    IRIS_DEP = "iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429"
     extras_require={
         # Triton-based communication using Iris
         # Pinned to commit 905ec1c (Nov 18, 2024) for reproducibility and API stability
