@@ -1469,6 +1469,7 @@ namespace py = pybind11;
           "get_pa_metadata_v1",                  \
           py::arg("seqlens_qo_indptr"),          \
           py::arg("pages_kv_indptr"),            \
+          py::arg("context_lens"),               \
           py::arg("num_heads_per_head_k"),       \
           py::arg("num_heads_k"),                \
           py::arg("is_causal"),                  \
@@ -1479,6 +1480,7 @@ namespace py = pybind11;
           py::arg("reduce_final_map"),           \
           py::arg("reduce_partial_map"),         \
           py::arg("kv_granularity")      = 16,   \
+          py::arg("block_size")          = 16,   \
           py::arg("max_seqlen_qo")       = -1,   \
           py::arg("uni_seqlen_qo")       = -1,   \
           py::arg("fast_mode")           = true, \
