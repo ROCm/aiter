@@ -31,6 +31,19 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
+from aiter.ops.triton.attn_qk_int8_per_block import int8_per_block_quantize_bshd
+from op_tests.triton_tests.test_mha import check_attention_outputs
+from op_tests.op_benchmarks.triton.mha_correctness_utils import (
+    primary_output,
+    restore_tensor_layout,
+    print_output_comparison_stats,
+    run_sage_reference,
+)
+
+
+# test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
+import logging
+logging.getLogger().setLevel(logging.INFO)
 
 
 def nonvarlen_benchmark_configs():
@@ -536,37 +549,90 @@ def run_benchmark(custom, args):
                     v = v.to(torch.float16)
                 k_mean = None
                 sm_scale = D_HEAD**-0.5
-                q, q_scale, k, k_scale = per_block_int8(
+                q, q_scale, k, k_scale, _ = per_block_int8(
                     q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
                 )
                 q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
                 k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
+                # q, q_scale = int8_per_block_quantize_bshd(q, torch.int8, block_size=config["BLOCK_SIZE_M"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd", include_sqrt_scale=True)
+                # k, k_scale = int8_per_block_quantize_bshd(k, torch.int8, block_size=config["BLOCK_SIZE_N"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd")
             else:
                 # Fake quantization: use random int8 tensors directly (faster, for benchmarking kernel only)
                 if tensor_layout == "HND":
                     # HND format: (batch, heads, seq, dim)
-                    q = torch.randint(-100, 100, (BATCH, HQ, N_CTX_Q, D_HEAD), dtype=torch.int8, device=device)
-                    k = torch.randint(-100, 100, (BATCH, HK, N_CTX_K, D_HEAD), dtype=torch.int8, device=device)
+                    q = torch.randint(-127, 127, (BATCH, HQ, N_CTX_Q, D_HEAD), dtype=torch.int8, device=device)
+                    k = torch.randint(-127, 127, (BATCH, HK, N_CTX_K, D_HEAD), dtype=torch.int8, device=device)
                     v = torch.randn(BATCH, HQ, N_CTX_Q, D_HEAD_V, dtype=torch.float16, device=device)
                     q_scale = torch.randn(BATCH, HQ, ((N_CTX_Q + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
                     k_scale = torch.randn(BATCH, HK, ((N_CTX_K + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
                 else:  # NHD
                     # NHD format: (batch, seq, heads, dim)
-                    q = torch.randint(-100, 100, (BATCH, N_CTX_Q, HQ, D_HEAD), dtype=torch.int8, device=device)
-                    k = torch.randint(-100, 100, (BATCH, N_CTX_K, HK, D_HEAD), dtype=torch.int8, device=device)
+                    q = torch.randint(-127, 127, (BATCH, N_CTX_Q, HQ, D_HEAD), dtype=torch.int8, device=device)
+                    k = torch.randint(-127, 127, (BATCH, N_CTX_K, HK, D_HEAD), dtype=torch.int8, device=device)
                     v = torch.randn(BATCH, N_CTX_Q, HQ, D_HEAD_V, dtype=torch.float16, device=device)
                     q_scale = torch.randn(BATCH, HQ, ((N_CTX_Q + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
                     k_scale = torch.randn(BATCH, HK, ((N_CTX_K + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
             fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
         
+        metric_is_all = args.metric == "all"
+        primary_provider = "time(ms)" if metric_is_all else None
+        run_correctness_check = (
+            args.check_correctness_FAv3FP8_SageAttnV1
+            and args.fp8
+            and not varlen
+            and (
+                not metric_is_all
+                or provider == primary_provider
+            )
+        )
+        if args.check_correctness_FAv3FP8_SageAttnV1 and args.fp8 and varlen:
+            raise ValueError("--check_correctness_FAv3FP8_SageAttnV1 currently supports only dense (bshd) layout.")
+
         ms = triton.testing.do_bench(fn)
 
+        needs_output_value = args.save_output or run_correctness_check
+        cached_output = fn() if needs_output_value else None
+
         if args.save_output:
+            assert cached_output is not None
             save_benchmark_output(
-                args, fn, saved_output_keys, model,
-                BATCH, HQ, HK, N_CTX_Q, N_CTX_K,
-                D_HEAD, D_HEAD_V, dtype, causal, mode, varlen,
+                args,
+                lambda output=cached_output: output,
+                saved_output_keys,
+                model or "",
+                BATCH,
+                HQ,
+                HK,
+                N_CTX_Q,
+                N_CTX_K,
+                D_HEAD,
+                D_HEAD_V,
+                dtype,
+                causal,
+                mode,
+                varlen,
             )
+
+        if run_correctness_check:
+            assert cached_output is not None
+            current_primary = primary_output(cached_output).contiguous()
+            reference_primary = primary_output(
+                run_sage_reference(
+                    q_input,
+                    k_input,
+                    v_input,
+                    args,
+                    D_HEAD,
+                    D_HEAD_V,
+                )
+            )
+            reference_primary = restore_tensor_layout(
+                reference_primary,
+                args.qk_int8_layout,
+            )
+            print("Asserting FP8 output matches SageAttnV1 reference...")
+            print_output_comparison_stats(current_primary, reference_primary)
+            check_attention_outputs(current_primary, reference_primary, fp8=True)
 
         if mode == "bwd":
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
@@ -700,6 +766,11 @@ def parse_args():
         type=str,
         default="outputs",
         help="Directory to store tensors when --save_output is used.",
+    )
+    parser.add_argument(
+        "--check_correctness_FAv3FP8_SageAttnV1",
+        action="store_true",
+        help="For -fp8 runs, also execute the SageAttn reference kernel and assert outputs match.",
     )
     return parser.parse_args()
 

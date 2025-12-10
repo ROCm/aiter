@@ -22,7 +22,7 @@ from ..utils._triton.pid_preprocessing import remap_xcd
 
 
 _attn_fwd_repr = make_kernel_repr(
-    "_attn_fwd",
+    "_attn_fwd_qk_int8_per_block",
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
@@ -90,7 +90,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
     return acc, l_i, m_i
 
 @triton.jit(repr=_attn_fwd_repr)
-def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse, 
+def _attn_fwd_qk_int8_per_block(Q, K, V, Q_scale, K_scale, Out, mask, Lse, 
               stride_qz, stride_qh, stride_qn,
               stride_kz, stride_kh, stride_kn,  
               stride_vz, stride_vh, stride_vn,  

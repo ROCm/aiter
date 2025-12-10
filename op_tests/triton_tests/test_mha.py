@@ -113,6 +113,42 @@ def fp8_assert_close(
     )
 
 
+def _tensor_from_result(result):
+    if isinstance(result, torch.Tensor):
+        return result
+    if isinstance(result, (list, tuple)) and result:
+        return _tensor_from_result(result[0])
+    raise TypeError(f"Unsupported result type for comparison: {type(result)}")
+
+
+def check_attention_outputs(
+    current,
+    reference,
+    fp8=False,
+    atol=None,
+    rtol=None,
+    max_diff_percentage=0.5,
+):
+    current_tensor = _tensor_from_result(current)
+    reference_tensor = _tensor_from_result(reference).to(current_tensor.dtype)
+
+    if fp8:
+        fp8_assert_close(
+            current_tensor,
+            reference_tensor,
+            atol=atol or ATOL_fp8,
+            rtol=rtol or RTOL_fp8,
+            max_diff_percentage=max_diff_percentage,
+        )
+    else:
+        torch.testing.assert_close(
+            current_tensor,
+            reference_tensor,
+            atol=atol or 1e-2,
+            rtol=rtol or 1e-2,
+        )
+
+
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -1302,9 +1338,11 @@ def test_attn_qk_int8_per_block(
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     # Quantization
     sm_scale = HEAD_SZ**-0.5
-    q_fp8, q_scale, k_fp8, k_scale = per_block_int8(
+    q_fp8, q_scale, k_fp8, k_scale, _ = per_block_int8(
         q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
     )
+    # q_fp8, q_scale = int8_per_block_quantize_bshd(q, torch.int8, block_size=config["BLOCK_SIZE_M"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd", include_sqrt_scale=True)
+    # k_fp8, k_scale = int8_per_block_quantize_bshd(k, torch.int8, block_size=config["BLOCK_SIZE_N"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd")
 
     triton_out, lse = attn_qk_int8_per_block(q_fp8, k_fp8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
 

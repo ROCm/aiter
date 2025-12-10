@@ -11,7 +11,7 @@ import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.attn_qk_int8_per_block import (
-    _attn_fwd,
+    _attn_fwd_qk_int8_per_block,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -21,9 +21,14 @@ _LOGGER = AiterTritonLogger()
 import math
 import torch
 from typing import Tuple
+
+# log2(e) = 1.44269504, used for exp2-based softmax in attention kernels
+LOG2_E = 1.44269504
+
 def int8_per_block_quantize_bshd(
     x: torch.Tensor,
     int8_dtype: torch.dtype,
+    tensor_layout: str = "bshd",
     clamp_val: float = 1e-9,
     block_size: int = 128,
     include_sqrt_scale: bool = False,
@@ -31,8 +36,14 @@ def int8_per_block_quantize_bshd(
     """
     Convert a tensor to INT8 format, returning an INT8 tensor and a descale factor.
     Quantization is done per block on the seqlen dimension.
-    x: [batch, seqlen, heads, dim] (bshd)
-    include_sqrt_scale: if True, include 1/sqrt(head_dim) in descale for attention's Q
+    x: [batch, seqlen, heads, dim] (bshd) or [batch, heads, seqlen, dim] (bhsd)
+    include_sqrt_scale: if True, pre-multiply by sm_scale * log2(e) before quantization
+                        (for attention's Q tensor, matching per_block_int8 behavior)
+    
+    Note: If seqlen is not divisible by block_size, the tensor is padded with zeros
+    to the next multiple of block_size for quantization. The output x_int8 retains
+    the original seqlen (unpadded).
+    
     Returns:
         x_int8: same shape as x, stored as int8_dtype
         descale_factor: [batch, heads, num_blocks, 1] scale to dequantize:
@@ -42,14 +53,46 @@ def int8_per_block_quantize_bshd(
         raise ValueError(
             f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}"
         )
-    batch, seqlen, num_heads, head_dim = x.shape
-    if seqlen % block_size != 0:
-        raise ValueError(
-            f"seqlen={seqlen} must be divisible by block_size={block_size} for per-block quantization"
-        )
+    if tensor_layout == "bshd":
+        batch, seqlen, num_heads, head_dim = x.shape
+    elif tensor_layout == "bhsd":
+        batch, num_heads, seqlen, head_dim = x.shape
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}, supported layouts: bshd, bhsd")
+    
+    # Calculate number of blocks using ceiling division to handle non-divisible seqlen
+    n_blocks = (seqlen + block_size - 1) // block_size
+    padded_seqlen = n_blocks * block_size
+    
+    # Pad tensor if seqlen is not divisible by block_size
+    if seqlen != padded_seqlen:
+        pad_size = padded_seqlen - seqlen
+        if tensor_layout == "bshd":
+            # Pad along seq dimension (dim 1): [batch, seqlen, heads, dim]
+            x_padded = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad_size), mode='constant', value=0)
+        else:  # bhsd
+            # Pad along seq dimension (dim 2): [batch, heads, seqlen, dim]
+            x_padded = torch.nn.functional.pad(x, (0, 0, 0, pad_size), mode='constant', value=0)
+    else:
+        x_padded = x
+    
+    # For Q tensor (include_sqrt_scale=True): pre-multiply by sm_scale * log2(e)
+    # This matches per_block_int8 kernel behavior which applies this scaling before quantization
+    # The log2(e) factor is needed because attention kernels use exp2 instead of exp for softmax
+    if include_sqrt_scale:
+        sm_scale = head_dim ** -0.5
+        pre_scale = sm_scale * LOG2_E
+        x_padded = x_padded.float() * pre_scale
+    
     # Reshape to expose blocks along seqlen: [b, n_blocks, block_size, h, d]
-    n_blocks = seqlen // block_size
-    x_reshaped = x.view(batch, n_blocks, block_size, num_heads, head_dim)
+    if tensor_layout == "bshd":
+        x_reshaped = x_padded.view(batch, n_blocks, block_size, num_heads, head_dim)
+    else:  # bhsd
+        # [batch, heads, seqlen, dim] -> [batch, heads, n_blocks, block_size, dim]
+        x_reshaped = x_padded.view(batch, num_heads, n_blocks, block_size, head_dim)
+        # Permute to [batch, n_blocks, block_size, heads, dim] for consistent processing
+        x_reshaped = x_reshaped.permute(0, 2, 3, 1, 4)
+    
     # Compute max absolute value per block (reduce over block_size and dim)
     # Shape: [b, n_blocks, num_heads, 1]
     max_abs = x_reshaped.abs().amax(dim=2)        # [b, n_blocks, h, d]
@@ -65,13 +108,21 @@ def int8_per_block_quantize_bshd(
     x_scaled = x_reshaped * scale.unsqueeze(2)  # [b, n_blocks, block_size, h, d]
     # Quantize and clamp to valid INT8 range
     x_int8 = torch.round(x_scaled).clamp(-qmax - 1, qmax).to(int8_dtype)
-    # Reshape back to [b, s, h, d]
-    x_int8 = x_int8.view(batch, seqlen, num_heads, head_dim)
+    
+    # Reshape back to original layout and slice to original seqlen
+    if tensor_layout == "bshd":
+        x_int8 = x_int8.view(batch, padded_seqlen, num_heads, head_dim)
+        x_int8 = x_int8[:, :seqlen, :, :].contiguous()  # Slice back to original seqlen
+    else:  # bhsd
+        # Permute back to [batch, heads, n_blocks, block_size, dim]
+        x_int8 = x_int8.permute(0, 3, 1, 2, 4)
+        x_int8 = x_int8.reshape(batch, num_heads, padded_seqlen, head_dim)
+        x_int8 = x_int8[:, :, :seqlen, :].contiguous()  # Slice back to original seqlen
+    
     # Descale factor for dequantization: x_fp32 ≈ x_int8 * descale_factor
-    descale_factor = 1.0 / scale
-    # Include 1/sqrt(head_dim) for attention scaling (applied to Q's descale)
-    if include_sqrt_scale:
-        descale_factor = descale_factor / math.sqrt(head_dim)
+    # descale = max_abs / qmax (inverse of quantization scale)
+    descale_factor = max_abs / qmax  # [b, n_blocks, h, 1]
+    
     # Kernel expects scale in [b, h, n_blocks, 1] format, so permute from [b, n_blocks, h, 1]
     # Must call contiguous() after permute so kernel's pointer arithmetic (+= 1) works correctly
     descale_factor = descale_factor.permute(0, 2, 1, 3).contiguous()  # [b, h, n_blocks, 1]
@@ -105,12 +156,64 @@ def quant_per_block_int8_kernel(Input, Output, Scale, L,
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
     tl.store(scale_ptrs, scale)
 
-def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layout="NHD"):
+def compute_k_smoothing_factors(k: torch.Tensor, tensor_layout: str = "NHD") -> torch.Tensor:
+    """
+    Compute per-channel smoothing factors for K tensor following SageAttention approach.
     
+    This computes the mean across the sequence dimension for each channel (head_dim)
+    to reduce outliers before quantization, improving INT8 accuracy.
+    
+    Args:
+        k: Key tensor with shape (B, kv_len, H, head_dim) for NHD layout
+           or (B, H, kv_len, head_dim) for HND layout
+        tensor_layout: Either "NHD" or "HND"
+    
+    Returns:
+        k_smooth: Smoothing factors with shape matching k, computed as per-channel mean
+    """
+    if tensor_layout == "NHD":
+        # k shape: [B, kv_len, H, head_dim]
+        # Compute mean across sequence dimension (dim=1), keep dims for broadcasting
+        k_mean = k.mean(dim=1, keepdim=True)  # [B, 1, H, head_dim]
+    elif tensor_layout == "HND":
+        # k shape: [B, H, kv_len, head_dim]
+        # Compute mean across sequence dimension (dim=2), keep dims for broadcasting
+        k_mean = k.mean(dim=2, keepdim=True)  # [B, H, 1, head_dim]
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    
+    return k_mean
+
+def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layout="NHD", smooth_k=True):
+    """
+    Quantize Q and K tensors to INT8 with per-block scaling.
+    
+    Args:
+        q: Query tensor
+        k: Key tensor
+        km: Optional pre-computed K smoothing factors (if None and smooth_k=True, will be computed)
+        BLKQ: Block size for Q quantization
+        BLKK: Block size for K quantization
+        sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
+        tensor_layout: Either "NHD" or "HND"
+        smooth_k: Whether to apply SageAttention-style smoothing to K tensor (default: True)
+    
+    Returns:
+        q_int8: Quantized Q tensor
+        q_scale: Per-block scales for Q
+        k_int8: Quantized K tensor  
+        k_scale: Per-block scales for K
+        k_smooth: K smoothing factors applied (or None if smooth_k=False)
+    """
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 
-    if km is not None:
+    # Apply K tensor smoothing following SageAttention approach
+    k_smooth = None
+    if smooth_k:
+        if km is None:
+            km = compute_k_smoothing_factors(k, tensor_layout)
+            k_smooth = km
         k = k - km
 
     if tensor_layout == "HND":
@@ -158,7 +261,7 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         C=head_dim, BLK=BLKK
     )
 
-    return q_int8, q_scale, k_int8, k_scale
+    return q_int8, q_scale, k_int8, k_scale, k_smooth
 
 def _get_config():
     return {
@@ -167,7 +270,8 @@ def _get_config():
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 2,
-        "cache_modifier": None
+        "matrix_instr_nonkdim": 32,
+        "cache_modifier": ".ca"
     }
 
 def attn_qk_int8_per_block(
@@ -211,9 +315,10 @@ def attn_qk_int8_per_block(
             config = _get_config()
        
         sm_scale = math.sqrt(head_dim)
-        q, q_scale, k, k_scale = per_block_int8(
-            q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
+        q, q_scale, k, k_scale, k_smooth = per_block_int8(
+            q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout, smooth_k=True
         )
+        # Note: k_smooth factors are applied during quantization to reduce outliers (SageAttention approach)
         # naive torch quantization
         # int8_dtype = torch.int8
         # q, q_scale = int8_per_block_quantize_bshd(q, int8_dtype, block_size=config["BLOCK_SIZE_M"], include_sqrt_scale=True)
@@ -266,7 +371,7 @@ def attn_qk_int8_per_block(
         lse = torch.empty([0], dtype=torch.float32, device="cpu")
 
     grid = (triton.cdiv(qo_len, config["BLOCK_SIZE_M"]) * h_qo * b, )
-    _attn_fwd[grid](
+    _attn_fwd_qk_int8_per_block[grid](
         q,
         k,
         v,
