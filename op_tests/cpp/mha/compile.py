@@ -56,14 +56,13 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
     else:
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}",
-            f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter "*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*" --output_dir {{}}',
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}",
         ]
     blob_gen_cmd.extend(BWD_CODEGEN_CMD)
-    print(blob_gen_cmd)
+    flag_use_v3 = "-DONLY_FAV3" if ck_exclude else None
     return {
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": [flag_use_v3]
     }
 
 

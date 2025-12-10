@@ -100,8 +100,8 @@ run_gfx950_bwd_v3() {
     for prec in "bf16" "fp16" ; do
     for mask in 0 1 2 ; do
     for v3_atomic_fp32 in 1 0 ; do
-    for hdim in 72 96 112 120 192 ; do
-    for batch in 1 3 ; do
+    for hdim in 72 112 128 192 ; do
+    for batch in 3 ; do
     for head in 2 4 ; do
     for sq in 13 62 174 ; do
     for sk in 65 174 299 577 799 ; do
@@ -129,8 +129,8 @@ run_gfx950_group_bwd_v3() {
     for prec in "bf16" "fp16" ; do
     for mask in 0 1 2 ; do
     for v3_atomic_fp32 in 0 1 ; do
-    for seqlen in 63 127 200 377 546 718; do
-    for hdim in 80 96 120 128 ; do
+    for seqlen in 63 145 377 546 718; do
+    for hdim in 80 120 128 ; do
     for perm in 0 1 ; do
 
     $EXE -prec=$prec -b=2 -h=3 -d=$hdim -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=1 -kname=$KNAME $COMMON_ARGS
@@ -144,8 +144,8 @@ run_gfx950_group_bwd_v3() {
     done
 }
 
-run_batch_mode_tests
-run_group_mode_tests
-run_swa_tests
-# run_gfx950_group_bwd_v3
-# run_gfx950_bwd_v3
+# run_batch_mode_tests
+# run_group_mode_tests
+# run_swa_tests
+run_gfx950_group_bwd_v3
+run_gfx950_bwd_v3

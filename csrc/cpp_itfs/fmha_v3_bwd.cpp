@@ -46,9 +46,6 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
     int pssk;
     int ts_kv = 0;
 
-    // std::cout << "padded_hdim_q: " << padded_hdim_q << ", padded_hdim_v: " << padded_hdim_v << std::endl;
-    // std::cout << "pddv: " << pddv << std::endl;
-
     std::string preProcessingKernelName  = "";
     std::string dQdKdVKernelName         = "";
     std::string postProcessingKernelName = "";
@@ -59,7 +56,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
             continue;
         const auto& cfg = el.second;
 
-        if((cfg.dtype == data_type) && (cfg.hdim_q == padded_hdim_q) && (cfg.mode == mode))
+        if((cfg.dtype == data_type) && (cfg.hdim_v == padded_hdim_v) && (cfg.mode == mode))
         {
             preProcessingKernelName = el.first;
             break;
@@ -216,16 +213,11 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* drop_seed_offset   */ a.drop_seed_offset,
     };
 
-    if (a.use_asm_v3 == 0) {
-        float asm_ret = fmha_v3_bwd(a, s);
-        if(asm_ret == -1)
-        {
-            return fmha_bwd(traits, ck_args, s);
-        }
-    } else {
+    float asm_ret = fmha_v3_bwd(a, s);
+    if(asm_ret == -1)
+    {
         return fmha_bwd(traits, ck_args, s);
     }
-
 #endif
 }
 

@@ -689,6 +689,7 @@ def cmdGenFunc_mha_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": ["'-DONLY_FAV3=0'"]
     }
 
 
@@ -800,6 +801,9 @@ def mha_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
+    only_v3: bool,
+    v3_atomic_fp32: bool,
+    v3_bf16_cvt: int,
     dq: Optional[Tensor] = None,
     dk: Optional[Tensor] = None,
     dv: Optional[Tensor] = None,
