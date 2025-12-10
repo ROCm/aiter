@@ -69,7 +69,6 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
     for(const auto& el : *cfgs)
     {
         if(el.first.find(arch_id) != 0) {
-            // std::cout << "not supported arch" << std::endl;
             continue;
         }
         const auto& cfg = el.second;
@@ -78,23 +77,18 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
            (cfg.mask == mask_type) && (cfg.atomic32 == atomic32) &&
            ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))) && (cfg.mode == mode))
         {
-            // std::cout << "kernel name: " <<  el.first << std::endl;
             if(ts_kv == 0)
             {
-                // std::cout << "first chosen ts_kv: " << cfg.ts << std::endl;
                 ts_kv= cfg.ts;
                 pssk  = (seqlen_q != seqlen_k) || (seqlen_q % ts_kv != 0);
-                // std::cout << "pssk: " << pssk << std::endl;
             }
             if((cfg.pssk == pssk) && (cfg.pddv == pddv))
             {
-                // std::cout << "all matched case: " << el.first << std::endl;
                 dQdKdVKernelName = el.first;
                 break;
             }
             else if((cfg.pssk >= pssk) && (cfg.pddv >= pddv))
             {
-                // std::cout << "some matched case: " << el.first << std::endl;
                 dQdKdVKernelName = el.first;
             }
         }
@@ -299,7 +293,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
 
     auto it_dqdkdv = dqdkdv_cfgs->find(dqdkdv_kernel);
-    // std::cout << "it_dqdkdv name: " << dqdkdv_kernel << std::endl;
     if(it_dqdkdv != dqdkdv_cfgs->end())
     {
         const auto& cfg     = it_dqdkdv->second;
@@ -431,35 +424,36 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     dqdkdv_args.max_seqlen_dq          = a.v3_atomic_fp32
                                        ? a.max_seqlen_q
                                        : (a.max_seqlen_q + 15) / 16 * 16;
-    std::cout << "scalar: " << dqdkdv_args.scalar << std::endl;
-    std::cout << "log2e: " << dqdkdv_args.log2e << std::endl;
-    std::cout << "seqlen_q: " << dqdkdv_args.seqlen_q << std::endl;
-    std::cout << "Ts: " << dqdkdv_args.Ts << std::endl;
-    std::cout << "Hs_q: " << dqdkdv_args.Hs_q << std::endl;
-    std::cout << "BAs_q: " << dqdkdv_args.BAs_q << std::endl;
-    std::cout << "Seqs_q: " << dqdkdv_args.Seqs_q << std::endl;
-    std::cout << "ratio: " << dqdkdv_args.ratio << std::endl;
-    std::cout << "Hs_k: " << dqdkdv_args.Hs_k << std::endl;
-    std::cout << "BAs_k: " << dqdkdv_args.BAs_k << std::endl;
-    std::cout << "Seqs_k: " << dqdkdv_args.Seqs_k << std::endl;
-    std::cout << "Seqs_dk: " << dqdkdv_args.Seqs_dk << std::endl;
-    std::cout << "seqlen_k: " << dqdkdv_args.seqlen_k << std::endl;
-    std::cout << "head_dim_q: " << dqdkdv_args.head_dim_q << std::endl;
-    std::cout << "head_dim_v: " << dqdkdv_args.head_dim_v << std::endl;
-    std::cout << "nhead_q: " << dqdkdv_args.nhead_q << std::endl;
-    std::cout << "Hs_v: " << dqdkdv_args.Hs_v << std::endl;
-    std::cout << "BAs_v: " << dqdkdv_args.BAs_v << std::endl;
-    std::cout << "Seqs_v: " << dqdkdv_args.Seqs_v << std::endl;
-    std::cout << "Hs_do: " << dqdkdv_args.Hs_do << std::endl;
-    std::cout << "BAs_do: " << dqdkdv_args.BAs_do << std::endl;
-    std::cout << "Seqs_do: " << dqdkdv_args.Seqs_do << std::endl;
-    std::cout << "Hs_dk: " << dqdkdv_args.Hs_dk << std::endl;
-    std::cout << "BAs_dk: " << dqdkdv_args.BAs_dk << std::endl;
-    std::cout << "Hs_dv: " << dqdkdv_args.Hs_dv << std::endl;
-    std::cout << "BAs_dv: " << dqdkdv_args.BAs_dv << std::endl;
-    std::cout << "Seqs_dv: " << dqdkdv_args.Seqs_dv << std::endl;
-    std::cout << "Hs_lsed: " << dqdkdv_args.Hs_lsed << std::endl;
-    std::cout << "max_seqlen_dq: " << dqdkdv_args.max_seqlen_dq << std::endl;
+    
+    // std::cout << "scalar: " << dqdkdv_args.scalar << std::endl;
+    // std::cout << "log2e: " << dqdkdv_args.log2e << std::endl;
+    // std::cout << "seqlen_q: " << dqdkdv_args.seqlen_q << std::endl;
+    // std::cout << "Ts: " << dqdkdv_args.Ts << std::endl;
+    // std::cout << "Hs_q: " << dqdkdv_args.Hs_q << std::endl;
+    // std::cout << "BAs_q: " << dqdkdv_args.BAs_q << std::endl;
+    // std::cout << "Seqs_q: " << dqdkdv_args.Seqs_q << std::endl;
+    // std::cout << "ratio: " << dqdkdv_args.ratio << std::endl;
+    // std::cout << "Hs_k: " << dqdkdv_args.Hs_k << std::endl;
+    // std::cout << "BAs_k: " << dqdkdv_args.BAs_k << std::endl;
+    // std::cout << "Seqs_k: " << dqdkdv_args.Seqs_k << std::endl;
+    // std::cout << "Seqs_dk: " << dqdkdv_args.Seqs_dk << std::endl;
+    // std::cout << "seqlen_k: " << dqdkdv_args.seqlen_k << std::endl;
+    // std::cout << "head_dim_q: " << dqdkdv_args.head_dim_q << std::endl;
+    // std::cout << "head_dim_v: " << dqdkdv_args.head_dim_v << std::endl;
+    // std::cout << "nhead_q: " << dqdkdv_args.nhead_q << std::endl;
+    // std::cout << "Hs_v: " << dqdkdv_args.Hs_v << std::endl;
+    // std::cout << "BAs_v: " << dqdkdv_args.BAs_v << std::endl;
+    // std::cout << "Seqs_v: " << dqdkdv_args.Seqs_v << std::endl;
+    // std::cout << "Hs_do: " << dqdkdv_args.Hs_do << std::endl;
+    // std::cout << "BAs_do: " << dqdkdv_args.BAs_do << std::endl;
+    // std::cout << "Seqs_do: " << dqdkdv_args.Seqs_do << std::endl;
+    // std::cout << "Hs_dk: " << dqdkdv_args.Hs_dk << std::endl;
+    // std::cout << "BAs_dk: " << dqdkdv_args.BAs_dk << std::endl;
+    // std::cout << "Hs_dv: " << dqdkdv_args.Hs_dv << std::endl;
+    // std::cout << "BAs_dv: " << dqdkdv_args.BAs_dv << std::endl;
+    // std::cout << "Seqs_dv: " << dqdkdv_args.Seqs_dv << std::endl;
+    // std::cout << "Hs_lsed: " << dqdkdv_args.Hs_lsed << std::endl;
+    // std::cout << "max_seqlen_dq: " << dqdkdv_args.max_seqlen_dq << std::endl;
 
     // convert l/r to x/y HERE
     // if (a.window_size_left == -1 && a.window_size_right == 0) {
@@ -474,7 +468,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     //     dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
     // }
     arg_size = sizeof(dqdkdv_args);
-    std::cout << "dqdkdv arg size: " << arg_size << std::endl;
     auto dqdkdv_kernel_launch =
         [&]() {
             int bdx = 256;
@@ -506,7 +499,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
 
     int dq_acc_element_size = a.v3_atomic_fp32? 4: 2;
-    std::cout << "dq_acc_element_size: " << dq_acc_element_size << std::endl;
     fmha_bwd_post_kernel_args post_args;
     arg_size = sizeof(post_args);
     post_args.ptr_dq_acc      = a.dq_acc_ptr;
@@ -523,12 +515,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     post_args.ptr_qseq        = (a.cu_seqlen_q_ptr && a.seqstart_q_ptr)
                                 ? a.cu_seqlen_q_ptr
                                 : a.seqstart_q_ptr;
-    std::cout << "Hs_dq_acc: " << post_args.Hs_dq_acc << std::endl
-              << "BAs_dq_acc: " << post_args.BAs_dq_acc << std::endl
-              << "Seqs_dq_acc: " << post_args.Seqs_dq_acc << std::endl
-              << "Hs_dq: " << post_args.Hs_dq << std::endl
-              << "BAs_dq: " << post_args.BAs_dq << std::endl
-              << "Seqs_dq: " << post_args.Seqs_dq << std::endl;
+
+    // std::cout << "Hs_dq_acc: " << post_args.Hs_dq_acc << std::endl
+    //           << "BAs_dq_acc: " << post_args.BAs_dq_acc << std::endl
+    //           << "Seqs_dq_acc: " << post_args.Seqs_dq_acc << std::endl
+    //           << "Hs_dq: " << post_args.Hs_dq << std::endl
+    //           << "BAs_dq: " << post_args.BAs_dq << std::endl
+    //           << "Seqs_dq: " << post_args.Seqs_dq << std::endl;
 
     auto post_kernel_launch =
         [&]() {
@@ -552,13 +545,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         [=](const ck_tile::stream_config& s_) { dqdkdv_kernel_launch(); },
         [=](const ck_tile::stream_config& s_) { post_kernel_launch(); }
         );
-    // pre_kernel_launch();
-    // std::cout << "pre_kernel_launch done" << std::endl;
-    // dqdkdv_kernel_launch();
-    // std::cout << "dqdkdv_kernel_launch done" << std::endl;
-    // post_kernel_launch();
-    // std::cout << "post_kernel_launch done" << std::endl;
-    // return 1;
 }
 
 } // namespace aiter
