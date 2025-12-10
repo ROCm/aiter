@@ -465,30 +465,28 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
             });
 
-            // // GEMM on RoPE
-            // ckt::static_for<k_q_rope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
-            //     using q_range_0 =
-            //         hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value +
-            //         1>>,
-            //                              2>;
-            //     using q_range_1 = hkdart::
-            //         split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>,
-            //         2>;
-            //     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
-            //     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+            // GEMM on RoPE
+            ckt::static_for<k_q_rope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
+                using q_range_0 =
+                    hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
+                                         2>;
+                using q_range_1 = hkdart::
+                    split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>, 2>;
+                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
-            //     // Load K from LDS to GPR
-            //     constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
-            //     load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
-            //         kv_0, p_lds_k_rope, 0, tile_idx * T::kBlockK);
-            //     load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim>(
-            //         kv_1, p_lds_k_rope, 0, (tile_idx + 1) * T::kBlockK);
+                // Load K from LDS to GPR
+                constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
+                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim, 0, tile_idx * T::kBlockK>(
+                    kv_0, p_lds_k_rope, 0, 0);
+                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim, 0, (tile_idx + 1) * T::kBlockK>(
+                    kv_1, p_lds_k_rope, 0, 0);
 
-            //     asm volatile("s_waitcnt lgkmcnt(0)");
+                asm volatile("s_waitcnt lgkmcnt(0)");
 
-            //     hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
-            //     hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
-            // });
+                hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
+                hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
+            });
 
             float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
             float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
