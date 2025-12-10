@@ -1264,10 +1264,14 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         warps_per_cta=[4, 1, 1, 1],
         order=[3, 2, 1, 0],
     )
+    # key_warps_per_cta_f16: gl.constexpr = [4, 1, 1, 1]
+    key_warps_per_cta_f16: gl.constexpr = (
+        [4, 1, 1, 1] if KV_BLOCK_SIZE == 16 else [1, 1, 4, 1]
+    )
     blocked_key_layout_f16: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1, 1, 8],
         threads_per_warp=[1, 4, 16, 1],
-        warps_per_cta=[4, 1, 1, 1],
+        warps_per_cta=key_warps_per_cta_f16,
         order=[3, 2, 1, 0],
     )
     blocked_key_layout: gl.constexpr = (
@@ -1323,11 +1327,26 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     # Value cache layout configuration based on transpose flag
     if VALUE_TRANSPOSED:
         # Transposed value layout for better memory access patterns
-        blocked_value_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 1, 1, 16],
-            threads_per_warp=[4, 1, 16, 1],
+        # value_threads_per_warp : gl.constexpr = [4, 1, 16, 1]
+        value_threads_per_warp: gl.constexpr = (
+            [4, 1, 16, 1] if KV_BLOCK_SIZE == 16 else [1, 4, 16, 1]
+        )
+        blocked_value_layout_f16: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 1, 1, 8],
+            threads_per_warp=value_threads_per_warp,
             warps_per_cta=[1, 1, 4, 1],
             order=[3, 2, 1, 0],
+        )
+        blocked_value_layout_fp8: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 1, 1, 16],
+            threads_per_warp=value_threads_per_warp,
+            warps_per_cta=[1, 1, 4, 1],
+            order=[3, 2, 1, 0],
+        )
+        blocked_value_layout: gl.constexpr = (
+            blocked_value_layout_fp8
+            if COMPUTE_TYPE == gl.float8e4b8
+            else blocked_value_layout_f16
         )
         value_dim1_offsets = gl.arange(
             0,
@@ -1352,9 +1371,13 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         )
     else:
         # Standard value layout
+        # value_threads_per_warp : gl.constexpr = [4, 16, 1]
+        value_threads_per_warp: gl.constexpr = (
+            [4, 16, 1] if KV_BLOCK_SIZE == 16 else [1, 16, 4]
+        )
         blocked_value_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 1, 16],
-            threads_per_warp=[4, 16, 1],
+            threads_per_warp=value_threads_per_warp,
             warps_per_cta=[1, 4, 1],
             order=[2, 1, 0],
         )
@@ -2242,10 +2265,9 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         All parameters from the pa_decode_gluon function, plus kernel configuration
         parameters for Triton compilation and execution.
     """
-    # Production path - select and launch appropriate kernel
-    QUERY_GROUP_SIZE = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
-    KV_COMPUTE_BLOCK_SIZE = 256
     waves_per_eu = 1
+    QUERY_GROUP_SIZE = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
+    KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
     if QUERY_GROUP_SIZE < 16:
         QUERY_GROUP_SIZE_POW2 = 16
     else:
