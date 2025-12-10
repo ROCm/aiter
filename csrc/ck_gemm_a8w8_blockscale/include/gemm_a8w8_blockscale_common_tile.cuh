@@ -30,15 +30,51 @@ using TILE_FP16 = ck_tile::half_t;
 using TILE_BF16 = ck_tile::bf16_t;
 using TILE_FP8  = ck_tile::fp8_t;
 
-using ADataType   = TILE_FP8;
-using BDataType   = TILE_FP8;
-using AccDataType = TILE_FP32;
+using ADataType       = TILE_FP8;
+using BDataType       = TILE_FP8;
+using AccDataType     = TILE_FP32;
+using ComputeDataType = BDataType;
 
 using ALayout = ck_tile::tensor_layout::gemm::RowMajor;
 using BLayout = ck_tile::tensor_layout::gemm::ColumnMajor;
 using CLayout = ck_tile::tensor_layout::gemm::RowMajor;
 
 using CDEElementWise = ck_tile::element_wise::PassThrough;
+
+template <ck_tile::index_t M_Tile,
+          ck_tile::index_t N_Tile,
+          ck_tile::index_t K_Tile,
+          ck_tile::index_t M_Warp,
+          ck_tile::index_t N_Warp,
+          ck_tile::index_t K_Warp,
+          ck_tile::index_t M_Warp_Tile,
+          ck_tile::index_t N_Warp_Tile,
+          ck_tile::index_t K_Warp_Tile,
+          bool kPadM,
+          bool kPadN,
+          bool kPadK,
+          bool TransposeC                          = false,
+          bool DoubleSmemBuffer                    = false,
+          bool UsePersistentKernel                 = false,
+          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave>
+struct CreateTileGemmConfig
+{
+    static constexpr ck_tile::index_t M_Tile_v      = M_Tile;
+    static constexpr ck_tile::index_t N_Tile_v      = N_Tile;
+    static constexpr ck_tile::index_t K_Tile_v      = K_Tile;
+    static constexpr ck_tile::index_t M_Warp_v      = M_Warp;
+    static constexpr ck_tile::index_t N_Warp_v      = N_Warp;
+    static constexpr ck_tile::index_t K_Warp_v      = K_Warp;
+    static constexpr ck_tile::index_t M_Warp_Tile_v = M_Warp_Tile;
+    static constexpr ck_tile::index_t N_Warp_Tile_v = N_Warp_Tile;
+    static constexpr ck_tile::index_t K_Warp_Tile_v = K_Warp_Tile;
+    static constexpr bool kPadM_v                   = kPadM;
+    static constexpr bool kPadN_v                   = kPadN;
+    static constexpr bool kPadK_v                   = kPadK;
+    static constexpr bool TransposeC_v              = TransposeC;
+    static constexpr bool DoubleSmemBuffer_v        = DoubleSmemBuffer;
+    static constexpr bool UsePersistentKernel_v     = UsePersistentKernel;
+};
 
 template <typename AB1DataType,
           typename EDataType,
@@ -58,16 +94,39 @@ template <typename AB1DataType,
           bool DoubleSmemBuffer                    = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave>
-struct TileGemmTileHelperF8BlockScale
+using TileGemmConfig = CreateTileGemmConfig<M_Tile,
+                                            N_Tile,
+                                            K_Tile,
+                                            M_Warp,
+                                            N_Warp,
+                                            K_Warp,
+                                            M_Warp_Tile,
+                                            N_Warp_Tile,
+                                            K_Warp_Tile,
+                                            kPadM,
+                                            kPadN,
+                                            kPadK,
+                                            TransposeC,
+                                            DoubleSmemBuffer,
+                                            UsePersistentKernel,
+                                            Scheduler>;
+
+template <typename AB1DataType,
+          typename EDataType,
+          typename GemmConfig,
+          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave>
+void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 {
-    using GemmShape =
-        ck_tile::TileGemmShape<ck_tile::sequence<M_Tile, N_Tile, K_Tile>,
-                               ck_tile::sequence<M_Warp, N_Warp, K_Warp>,
-                               ck_tile::sequence<M_Warp_Tile, N_Warp_Tile, K_Warp_Tile>>;
+    using GemmShape = ck_tile::TileGemmShape<
+        ck_tile::sequence<GemmConfig::M_Tile_v, GemmConfig::N_Tile_v, GemmConfig::K_Tile_v>,
+        ck_tile::sequence<GemmConfig::M_Warp_v, GemmConfig::N_Warp_v, GemmConfig::K_Warp_v>,
+        ck_tile::sequence<GemmConfig::M_Warp_Tile_v,
+                          GemmConfig::N_Warp_Tile_v,
+                          GemmConfig::K_Warp_Tile_v>>;
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
-    using GemmTraits      = ck_tile::TileGemmQuantTraits<kPadM,
-                                                         kPadN,
-                                                         kPadK,
+    using GemmTraits      = ck_tile::TileGemmQuantTraits<GemmConfig::kPadM_v,
+                                                         GemmConfig::kPadN_v,
+                                                         GemmConfig::kPadK_v,
                                                          false, // PreshuffleQuant
                                                          false, // PreshuffleB
                                                          ALayout,
@@ -76,50 +135,104 @@ struct TileGemmTileHelperF8BlockScale
                                                          ck_tile::QuantType::RowColQuant,
                                                          ALayout, // for AQLayout
                                                          BLayout, // for BQLayout
-                                                         TransposeC,
-                                                         DoubleSmemBuffer>;
-    using PipelineProblem = ck_tile::GemmRowColTensorQuantPipelineProblem<ADataType,
-                                                                          BDataType,
-                                                                          EDataType,
-                                                                          AccDataType,
-                                                                          GemmShape,
-                                                                          GemmTraits,
-                                                                          TransposeC,
-                                                                          AB1DataType,
-                                                                          Scheduler>;
-    using GemmPipeline    = ck_tile::GemmPipelineAgBgCrCompV3<PipelineProblem>;
-    using GemmEpilogue    = ck_tile::CShuffleEpilogue<
-           ck_tile::CShuffleEpilogueProblem<ADataType,
-                                            BDataType,
-                                            ck_tile::tuple<>,
-                                            AccDataType,
-                                            EDataType,
-                                            ck_tile::tuple<>,
-                                            CLayout,
-                                            CDEElementWise,
-                                            TilePartitioner::MPerBlock,
-                                            TilePartitioner::NPerBlock,
-                                            M_Warp,
-                                            N_Warp,
-                                            M_Warp_Tile,
-                                            N_Warp_Tile,
-                                            K_Warp_Tile,
-                                            TransposeC,
-                                            ck_tile::memory_operation_enum::set>>;
-    using type = ck_tile::QuantGemmKernel<TilePartitioner,
-                                          GemmPipeline,
-                                          GemmEpilogue,
-                                          ck_tile::QuantType::RowColQuant>;
+                                                         GemmConfig::TransposeC_v,
+                                                         GemmConfig::DoubleSmemBuffer_v>;
+
+    using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
+                                                                 BDataType,
+                                                                 AccDataType,
+                                                                 GemmShape,
+                                                                 GemmTraits,
+                                                                 ComputeDataType>;
+
+    using BaseGemmPipeline = ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>;
+
+    const ck_tile::index_t K_split =
+        (args.K + GemmConfig::K_Tile_v - 1) / GemmConfig::K_Tile_v * GemmConfig::K_Tile_v;
+    const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);
+    const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
+    const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
+
+    const auto Run = [&](const auto has_hot_loop_, const auto tail_number_) {
+        constexpr bool has_hot_loop_v = has_hot_loop_.value;
+        constexpr auto tail_number_v  = tail_number_.value;
+        constexpr bool transpose_c    = GemmConfig::TransposeC_v;
+
+        using PipelineProblem = ck_tile::GemmRowColTensorQuantPipelineProblem<ADataType,
+                                                                              BDataType,
+                                                                              AccDataType,
+                                                                              AccDataType,
+                                                                              GemmShape,
+                                                                              GemmTraits,
+                                                                              transpose_c,
+                                                                              ComputeDataType,
+                                                                              Scheduler,
+                                                                              has_hot_loop_v,
+                                                                              tail_number_v>;
+
+        using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<PipelineProblem>;
+
+        using GemmEpilogue = ck_tile::CShuffleEpilogue<
+            ck_tile::CShuffleEpilogueProblem<ADataType,
+                                             BDataType,
+                                             ck_tile::tuple<>,
+                                             AccDataType,
+                                             EDataType,
+                                             ck_tile::tuple<>,
+                                             CLayout,
+                                             CDEElementWise,
+                                             TilePartitioner::MPerBlock,
+                                             TilePartitioner::NPerBlock,
+                                             GemmConfig::M_Warp_v,
+                                             GemmConfig::N_Warp_v,
+                                             GemmConfig::M_Warp_Tile_v,
+                                             GemmConfig::N_Warp_Tile_v,
+                                             GemmConfig::K_Warp_Tile_v,
+                                             transpose_c,
+                                             ck_tile::memory_operation_enum::set,
+                                             1,
+                                             false,
+                                             1,
+                                             false>>;
+
+        using Kernel = ck_tile::QuantGemmKernel<TilePartitioner,
+                                                GemmPipeline,
+                                                GemmEpilogue,
+                                                ck_tile::QuantType::RowColQuant>;
+
+        auto kargs = Kernel::MakeKernelArgs(args);
+
+        const dim3 grids  = Kernel::GridSize(args.M, args.N, args.k_batch);
+        const dim3 blocks = Kernel::BlockSize();
+
+        if(args.k_batch != 1)
+        {
+            throw std::runtime_error("split-k is not supported yet!");
+        }
+
+        if(!Kernel::IsSupportedArgument(kargs))
+        {
+            throw std::runtime_error("Wrong! Arguments not supported! Skipping gemm!\n");
+        }
+
+        ck_tile::launch_kernel(
+            ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
+            ck_tile::make_kernel<1>(Kernel{}, grids, blocks, 0, kargs));
+    };
+
+    BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
 };
 
-template <typename DDataType, typename EDataType, typename GemmHelper>
-__forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
-                                                             torch::Tensor& WQ,
-                                                             torch::Tensor& x_scale,
-                                                             torch::Tensor& w_scale,
-                                                             torch::Tensor& Y)
+template <typename DDataType, typename EDataType, typename GemmInstance>
+__forceinline__ torch::Tensor
+tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,      // [M,K]
+                               torch::Tensor& WQ,      // [N, K] -> [N/128, K*128]
+                               torch::Tensor& x_scale, // [K/128, M]
+                               torch::Tensor& w_scale, // [K/128, N/128]
+                               torch::Tensor& Y)       // Out:[M, N] fp16
 {
-    using GemmInstance = typename GemmHelper::type;
+    TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
+    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
     ck_tile::QuantGemmHostArgs args;
     args.a_ptr  = XQ.data_ptr();
@@ -136,21 +249,16 @@ __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     // Row quantization for A
     args.QK_A = 1;
     // Column quantization for B
-    args.QK_B      = 1;
-    args.stride_A  = XQ.stride(-2);
-    args.stride_B  = WQ.stride(-2);
-    args.stride_C  = Y.stride(-2);
-    args.stride_AQ = x_scale.stride(-2);
-    args.stride_BQ = w_scale.stride(-2);
+    args.QK_B = 1;
+
+    args.stride_A  = args.K;
+    args.stride_B  = args.K;
+    args.stride_C  = args.N;
+    args.stride_AQ = 1;
+    args.stride_BQ = 1;
 
     // do tile GEMM
-    const dim3 grids  = GemmInstance::GridSize(args.M, args.N, args.k_batch);
-    const dim3 blocks = GemmInstance::BlockSize();
-    auto kargs        = GemmInstance::MakeKernelArgs(args);
-    TORCH_CHECK(GemmInstance::IsSupportedArgument(kargs), "Wrong! This GEMM is not supported!");
-    auto ave_time = ck_tile::launch_kernel(
-        ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
-        ck_tile::make_kernel<GemmInstance::kBlockPerCu>(GemmInstance{}, grids, blocks, 0, kargs));
+    TileGemmCompute<DDataType, EDataType, GemmInstance>(args);
 
     return Y;
 }

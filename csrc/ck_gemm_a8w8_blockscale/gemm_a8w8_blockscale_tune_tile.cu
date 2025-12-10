@@ -40,7 +40,7 @@ static BlockwiseKernel blockwise_dispatch_tile(int id)
     return lookup.find(0)->second;
 }
 
-torch::Tensor gemm_a8w8_blockscale_tile_tune(torch::Tensor& XQ,
+torch::Tensor gemm_a8w8_blockscale_tune_tile(torch::Tensor& XQ,
                                              torch::Tensor& WQ,
                                              torch::Tensor& x_scale,
                                              torch::Tensor& w_scale,

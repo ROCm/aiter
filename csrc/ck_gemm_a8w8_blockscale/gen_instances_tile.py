@@ -91,7 +91,7 @@ torch::Tensor
 }}
 
 """    
-        TILE_INSTANCE = f"""using TileGemmInstance = TileGemmTileHelperF8BlockScale<
+        TILE_INSTANCE = f"""using TileGemmInstance = TileGemmConfig<
             DDataType, EDataType,
             {k.M_Tile}, {k.N_Tile}, {k.K_Tile},
             {k.M_Warp}, {k.N_Warp}, {k.K_Warp},

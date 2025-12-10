@@ -74,12 +74,12 @@ class TileKernelInstance:
 # These instances are used for generating the kernel code and tuning.
 candidate_kernels_dict_tile = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile | kPadM | kPadN | kPadK |   Scheduler   | TransposeC | DoubleSmemBuffer | UsePersistentKernel |
-    0:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      False,  False,  False,   "Intrawave",     False,          False,            False             )   
+    0:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           32,      False,  False,  False,   "Intrawave",     False,          False,            False             )   
 }
 
 
 default_kernels_dict_tile = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile | kPadM | kPadN | kPadK |   Scheduler   | TransposeC | DoubleSmemBuffer | UsePersistentKernel |
-    -1:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           256,      True,  True,    True,   "Intrawave",      False,          False,            True             )   
+    -1:   TileKernelInstance(   16,     64,      256,     1,        4,       1,        16,            16,           32,      True,  True,    True,   "Intrawave",      False,          False,            True             )   
 }
 # fmt: on
