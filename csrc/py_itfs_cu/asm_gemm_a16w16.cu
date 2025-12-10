@@ -116,7 +116,7 @@ get_heuristic_kernel(int M,
                 {
                     TORCH_CHECK(cfg.subK > 0, __func__, " cfg.subK must be greater than 0 to avoid division by zero.");
                     int max_split = std::min(
-                        std::min(static_cast<int>(num_cu / pure_tg_num), 64),
+                        std::min(static_cast<int>(num_cu / pure_tg_num), 16),
                         static_cast<int>(K / cfg.subK)    // “K-dim must satisfy min 128 bytes. BF16 are 2 bytes each, this means min ele of K is 64.”
                     );
                     for(int i = max_split; i >= 1; i--)
@@ -312,6 +312,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     if(selectedksplit > 1)
     {
         out.zero_();
+        // HIP_CALL(hipMemsetAsync(out.data_ptr(), 0, elem_bytes * szC, stream))
         int k_per_tg = Kdim / selectedksplit;
         gdz          = selectedksplit;
     }
