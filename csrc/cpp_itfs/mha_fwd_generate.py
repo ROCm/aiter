@@ -169,7 +169,6 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
-                                     false,
                                      quant_scale_enum::no_scale,
                                      use_ext_asm,
                                      has_sink);

@@ -1833,7 +1833,7 @@ def flash_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1, 0),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     bias=None,
     alibi_slopes=None,
     deterministic=True,
@@ -2459,7 +2459,7 @@ def flash_attn_varlen_func(
     softmax_scale=None,
     logits_soft_cap=0.0,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     bias=None,
     alibi_slopes=None,
     deterministic=False,
@@ -2769,7 +2769,7 @@ def flash_attn_fp8_pertensor_func(
     k_descale,
     v_descale,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     softmax_scale=None,
 ):
     if softmax_scale is None:

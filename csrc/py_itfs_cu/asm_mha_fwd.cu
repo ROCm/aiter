@@ -133,7 +133,7 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         batch_stride_o,
                         mask.left,
                         mask.right,
-                        0,
+                        0, // sink_size
                         static_cast<ck_tile::index_t>(mask.type),
                         0, // min_seqlen_q
                         p_dropout,
