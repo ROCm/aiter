@@ -347,8 +347,8 @@ def mla_decode_fwd(
             kvc = torch.index_select(kv_buffer, 0, kv_indices).squeeze(1)
             kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
             for i in range(bs):
-                key = kvs[i][:, :, :512]
-                query = qs[i][:, :, :512]
+                key = kvs[i]
+                query = qs[i]
                 qk = torch.einsum("qhd,khd->hqk", query.float(), key.float()).squeeze(1)
                 dbg_qk = dbg_tr[i * nhead : (i + 1) * nhead, : qk.shape[1]]
                 checkAllclose(dbg_qk, qk, msg=f"dbg[{i}] vs. qk[{i}]")
