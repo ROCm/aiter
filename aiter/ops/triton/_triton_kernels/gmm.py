@@ -25,7 +25,9 @@ from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
 @functools.lru_cache()
-def get_config(gmm_type: str, M: int, K: int, N: int, G: int, accumulate: bool = False) -> dict[str, int]:
+def get_config(
+    gmm_type: str, M: int, K: int, N: int, G: int, accumulate: bool = False
+) -> dict[str, int]:
     assert gmm_type in {
         "gmm",
         "ptgmm",
