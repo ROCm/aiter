@@ -14,16 +14,10 @@ import triton
 import triton.language as tl
 import logging
 
-try:
-    import iris
+import iris
 
-    IRIS_AVAILABLE = True
-except ImportError:
-    IRIS_AVAILABLE = False
-    # Iris is optional - only log at debug level
-    logging.debug(
-        "Iris library not available. Reduce-scatter operations will not work."
-    )
+# If we got here, iris is available
+IRIS_AVAILABLE = True
 
 logger = logging.getLogger("aiter")
 

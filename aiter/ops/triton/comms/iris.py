@@ -13,15 +13,11 @@ import logging
 import math
 from typing import Optional
 
-try:
-    import torch
-    import iris
+import torch
+import iris
 
-    IRIS_AVAILABLE = True
-except ImportError:
-    IRIS_AVAILABLE = False
-    # Iris is optional - only log at debug level
-    logging.debug("Iris library not available. Iris-based communication will not work.")
+# If we got here, iris is available
+IRIS_AVAILABLE = True
 
 logger = logging.getLogger("aiter")
 

@@ -23,16 +23,10 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from ..iris import IrisCommContext
 
-try:
-    import iris
+import iris
 
-    IRIS_AVAILABLE = True
-except ImportError:
-    IRIS_AVAILABLE = False
-    # Iris is optional - only log at debug level
-    logging.debug(
-        "Iris library not available. Fused communication kernels will not work."
-    )
+# If we got here, iris is available
+IRIS_AVAILABLE = True
 
 # Import shared implementations
 from ..reduce_scatter import _reduce_scatter_impl
