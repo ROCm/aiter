@@ -538,6 +538,7 @@ def get_pa_metadata_info_v1(
 def get_pa_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     pages_kv_indptr: torch.Tensor,
+    context_lens: torch.Tensor,
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
@@ -548,6 +549,7 @@ def get_pa_metadata_v1(
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
     kv_granularity: int = 16,
+    block_size: int = 16,
     max_seqlen_qo: int = -1,
     uni_seqlen_qo: int = -1,
     fast_mode: bool = True,
@@ -558,6 +560,7 @@ def get_pa_metadata_v1(
     Inputs:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
         cumulated used pages of k/v: (batch_size + 1), dtype torch.int32.
+        context_lens: seqlens of k/v, dtype torch.int32.
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
