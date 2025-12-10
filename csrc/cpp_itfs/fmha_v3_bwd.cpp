@@ -1,8 +1,8 @@
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include "aiter_hip_common.h"
-#include "fmha_bwd.hpp"
 #include "mha_bwd.h"
 #include <string>
+#define ONLY_FAV3 1
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
@@ -120,126 +120,122 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
     return std::make_tuple(preProcessingKernelName, dQdKdVKernelName, postProcessingKernelName);
 }
 
-float mha_bwd(mha_bwd_args a)
+float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
-    if (a.use_asm_v3 == 1) {
-        return fmha_v3_bwd(a);
+#if ONLY_FAV3
+    return fmha_v3_bwd(a, s);
+#else
+    fmha_bwd_traits traits{
+        a.hdim_q,
+        a.hdim_v,
+        a.data_type,
+        a.is_group_mode,
+        static_cast<mask_enum>(a.ck_mask_type),
+        static_cast<bias_enum>(a.bias_type),
+        a.has_dbias,
+        a.has_dropout,
+        a.is_store_randval,
+        a.is_deterministic
+    };
+
+    fmha_bwd_args ck_args{
+        /* q_ptr              */ a.q_ptr,
+        /* k_ptr              */ a.k_ptr,
+        /* v_ptr              */ a.v_ptr,
+        /* bias_ptr           */ a.bias_ptr,
+        /* o_ptr              */ a.o_ptr,
+        /* lse_ptr            */ a.lse_ptr,
+        /* do_ptr             */ a.do_ptr,
+        /* d_ptr              */ a.d_ptr,
+        /* rand_val_ptr       */ a.rand_val_ptr,
+        /* dq_ptr             */ a.dq_ptr,
+        /* dk_ptr             */ a.dk_ptr,
+        /* dv_ptr             */ a.dv_ptr,
+        /* dbias_ptr          */ a.dbias_ptr,
+        /* dq_acc_ptr         */ a.dq_acc_ptr,
+
+        /* seqstart_q_ptr     */ a.seqstart_q_ptr,
+        /* seqstart_k_ptr     */ a.seqstart_k_ptr,
+        /* seqlen_q_ptr       */ a.seqlen_q_ptr,
+        /* seqlen_k_ptr       */ a.seqlen_k_ptr,
+        /* cu_seqlen_q_ptr    */ a.cu_seqlen_q_ptr,
+        /* cu_seqlen_k_ptr    */ a.cu_seqlen_k_ptr,
+
+        /* seqlen_q           */ a.seqlen_q,
+        /* seqlen_k           */ a.seqlen_k,
+        /* batch              */ a.batch,
+        /* max_seqlen_q       */ a.max_seqlen_q,
+        /* max_seqlen_k       */ a.max_seqlen_k,
+        /* hdim_q             */ a.hdim_q,
+        /* hdim_v             */ a.hdim_v,
+        /* nhead_q            */ a.nhead_q,
+        /* nhead_k            */ a.nhead_k,
+        /* scale              */ a.scale,
+
+        /* stride_q           */ a.stride_q,
+        /* stride_k           */ a.stride_k,
+        /* stride_v           */ a.stride_v,
+        /* stride_bias        */ a.stride_bias,
+        /* stride_o           */ a.stride_o,
+        /* stride_randval     */ a.stride_randval,
+        /* stride_do          */ a.stride_do,
+        /* stride_dq_acc      */ a.stride_dq_acc,
+        /* stride_dq          */ a.stride_dq,
+        /* stride_dk          */ a.stride_dk,
+        /* stride_dv          */ a.stride_dv,
+        /* stride_dbias       */ a.stride_dbias,
+
+        /* nhead_stride_q     */ a.nhead_stride_q,
+        /* nhead_stride_k     */ a.nhead_stride_k,
+        /* nhead_stride_v     */ a.nhead_stride_v,
+        /* nhead_stride_bias  */ a.nhead_stride_bias,
+        /* nhead_stride_o     */ a.nhead_stride_o,
+        /* nhead_stride_randval*/ a.nhead_stride_randval,
+        /* nhead_stride_do    */ a.nhead_stride_do,
+        /* nhead_stride_lsed  */ a.nhead_stride_lsed,
+        /* nhead_stride_dq_acc*/ a.nhead_stride_dq_acc,
+        /* nhead_stride_dq    */ a.nhead_stride_dq,
+        /* nhead_stride_dk    */ a.nhead_stride_dk,
+        /* nhead_stride_dv    */ a.nhead_stride_dv,
+        /* nhead_stride_dbias */ a.nhead_stride_dbias,
+
+        /* batch_stride_q     */ a.batch_stride_q,
+        /* batch_stride_k     */ a.batch_stride_k,
+        /* batch_stride_v     */ a.batch_stride_v,
+        /* batch_stride_bias  */ a.batch_stride_bias,
+        /* batch_stride_o     */ a.batch_stride_o,
+        /* batch_stride_randval*/ a.batch_stride_randval,
+        /* batch_stride_do    */ a.batch_stride_do,
+        /* batch_stride_lsed  */ a.batch_stride_lsed,
+        /* batch_stride_dq_acc*/ a.batch_stride_dq_acc,
+        /* batch_stride_dq    */ a.batch_stride_dq,
+        /* batch_stride_dk    */ a.batch_stride_dk,
+        /* batch_stride_dv    */ a.batch_stride_dv,
+        /* batch_stride_dbias */ a.batch_stride_dbias,
+
+        /* split_stride_dq_acc*/ a.split_stride_dq_acc,
+        /* window_size_left   */ a.window_size_left,
+        /* window_size_right  */ a.window_size_right,
+        /* mask_type          */ a.ck_mask_type,
+        /* p_drop             */ a.p_drop,
+        /* p_undrop           */ a.p_undrop,
+        /* drop_seed_offset   */ a.drop_seed_offset,
+    };
+
+    if (a.use_asm_v3 == 0) {
+        float asm_ret = fmha_v3_bwd(a, s);
+        if(asm_ret == -1)
+        {
+            return fmha_bwd(traits, ck_args, s);
+        }
+    } else {
+        return fmha_bwd(traits, ck_args, s);
     }
-    // else {
-    //     fmha_bwd_traits traits{
-    //         a.hdim_q,
-    //         a.hdim_v,
-    //         a.data_type,
-    //         a.is_group_mode,
-    //         static_cast<mask_enum>(a.ck_mask_type),
-    //         static_cast<bias_enum>(a.bias_type),
-    //         a.has_dbias,
-    //         a.has_dropout,
-    //         a.is_store_randval,
-    //         a.is_deterministic
-    //     };
 
-    //     fmha_bwd_args ck_args{
-    //         /* q_ptr              */ a.q_ptr,
-    //         /* k_ptr              */ a.k_ptr,
-    //         /* v_ptr              */ a.v_ptr,
-    //         /* bias_ptr           */ a.bias_ptr,
-    //         /* o_ptr              */ a.o_ptr,
-    //         /* lse_ptr            */ a.lse_ptr,
-    //         /* do_ptr             */ a.do_ptr,
-    //         /* d_ptr              */ a.d_ptr,
-    //         /* rand_val_ptr       */ a.rand_val_ptr,
-    //         /* dq_ptr             */ a.dq_ptr,
-    //         /* dk_ptr             */ a.dk_ptr,
-    //         /* dv_ptr             */ a.dv_ptr,
-    //         /* dbias_ptr          */ a.dbias_ptr,
-    //         /* dq_acc_ptr         */ a.dq_acc_ptr,
-
-    //         /* seqstart_q_ptr     */ a.seqstart_q_ptr,
-    //         /* seqstart_k_ptr     */ a.seqstart_k_ptr,
-    //         /* seqlen_q_ptr       */ a.seqlen_q_ptr,
-    //         /* seqlen_k_ptr       */ a.seqlen_k_ptr,
-    //         /* cu_seqlen_q_ptr    */ a.cu_seqlen_q_ptr,
-    //         /* cu_seqlen_k_ptr    */ a.cu_seqlen_k_ptr,
-
-    //         /* seqlen_q           */ a.seqlen_q,
-    //         /* seqlen_k           */ a.seqlen_k,
-    //         /* batch              */ a.batch,
-    //         /* max_seqlen_q       */ a.max_seqlen_q,
-    //         /* max_seqlen_k       */ a.max_seqlen_k,
-    //         /* hdim_q             */ a.hdim_q,
-    //         /* hdim_v             */ a.hdim_v,
-    //         /* nhead_q            */ a.nhead_q,
-    //         /* nhead_k            */ a.nhead_k,
-    //         /* scale              */ a.scale,
-
-    //         /* stride_q           */ a.stride_q,
-    //         /* stride_k           */ a.stride_k,
-    //         /* stride_v           */ a.stride_v,
-    //         /* stride_bias        */ a.stride_bias,
-    //         /* stride_o           */ a.stride_o,
-    //         /* stride_randval     */ a.stride_randval,
-    //         /* stride_do          */ a.stride_do,
-    //         /* stride_dq_acc      */ a.stride_dq_acc,
-    //         /* stride_dq          */ a.stride_dq,
-    //         /* stride_dk          */ a.stride_dk,
-    //         /* stride_dv          */ a.stride_dv,
-    //         /* stride_dbias       */ a.stride_dbias,
-
-    //         /* nhead_stride_q     */ a.nhead_stride_q,
-    //         /* nhead_stride_k     */ a.nhead_stride_k,
-    //         /* nhead_stride_v     */ a.nhead_stride_v,
-    //         /* nhead_stride_bias  */ a.nhead_stride_bias,
-    //         /* nhead_stride_o     */ a.nhead_stride_o,
-    //         /* nhead_stride_randval*/ a.nhead_stride_randval,
-    //         /* nhead_stride_do    */ a.nhead_stride_do,
-    //         /* nhead_stride_lsed  */ a.nhead_stride_lsed,
-    //         /* nhead_stride_dq_acc*/ a.nhead_stride_dq_acc,
-    //         /* nhead_stride_dq    */ a.nhead_stride_dq,
-    //         /* nhead_stride_dk    */ a.nhead_stride_dk,
-    //         /* nhead_stride_dv    */ a.nhead_stride_dv,
-    //         /* nhead_stride_dbias */ a.nhead_stride_dbias,
-
-    //         /* batch_stride_q     */ a.batch_stride_q,
-    //         /* batch_stride_k     */ a.batch_stride_k,
-    //         /* batch_stride_v     */ a.batch_stride_v,
-    //         /* batch_stride_bias  */ a.batch_stride_bias,
-    //         /* batch_stride_o     */ a.batch_stride_o,
-    //         /* batch_stride_randval*/ a.batch_stride_randval,
-    //         /* batch_stride_do    */ a.batch_stride_do,
-    //         /* batch_stride_lsed  */ a.batch_stride_lsed,
-    //         /* batch_stride_dq_acc*/ a.batch_stride_dq_acc,
-    //         /* batch_stride_dq    */ a.batch_stride_dq,
-    //         /* batch_stride_dk    */ a.batch_stride_dk,
-    //         /* batch_stride_dv    */ a.batch_stride_dv,
-    //         /* batch_stride_dbias */ a.batch_stride_dbias,
-
-    //         /* split_stride_dq_acc*/ a.split_stride_dq_acc,
-    //         /* window_size_left   */ a.window_size_left,
-    //         /* window_size_right  */ a.window_size_right,
-    //         /* mask_type          */ a.ck_mask_type,
-    //         /* p_drop             */ a.p_drop,
-    //         /* p_undrop           */ a.p_undrop,
-    //         /* drop_seed_offset   */ a.drop_seed_offset,
-    //     };
-
-    //     ck_tile::stream_config stream_config{
-    //         a.stream_id_, a.time_kernel_, a.log_level_, a.cold_niters_, a.nrepeat_, a.is_gpu_timer_, a.flush_cache_, a.rotating_count_
-    //     };
-
-    //     if (a.use_asm_v3 == 0) {
-    //         float asm_ret = fmha_v3_bwd(a);
-    //         if(asm_ret == -1)
-    //         {
-    //             return fmha_bwd(traits, ck_args, stream_config);
-    //         }
-    //     } else {
-    //         return fmha_bwd(traits, ck_args, stream_config);
-    //     }
-    // }
+#endif
 }
 
-float fmha_v3_bwd(mha_bwd_args a)
+float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     int ts_odo;
     int ts_kv;
@@ -375,7 +371,7 @@ float fmha_v3_bwd(mha_bwd_args a)
                                          bdx,
                                          1,
                                          1,
-                                         a.stream_id_});
+                                         s.stream_id_});
         };
 
     fmha_bwd_dqdkdv_args dqdkdv_args;
@@ -435,19 +431,50 @@ float fmha_v3_bwd(mha_bwd_args a)
     dqdkdv_args.max_seqlen_dq          = a.v3_atomic_fp32
                                        ? a.max_seqlen_q
                                        : (a.max_seqlen_q + 15) / 16 * 16;
+    std::cout << "scalar: " << dqdkdv_args.scalar << std::endl;
+    std::cout << "log2e: " << dqdkdv_args.log2e << std::endl;
+    std::cout << "seqlen_q: " << dqdkdv_args.seqlen_q << std::endl;
+    std::cout << "Ts: " << dqdkdv_args.Ts << std::endl;
+    std::cout << "Hs_q: " << dqdkdv_args.Hs_q << std::endl;
+    std::cout << "BAs_q: " << dqdkdv_args.BAs_q << std::endl;
+    std::cout << "Seqs_q: " << dqdkdv_args.Seqs_q << std::endl;
+    std::cout << "ratio: " << dqdkdv_args.ratio << std::endl;
+    std::cout << "Hs_k: " << dqdkdv_args.Hs_k << std::endl;
+    std::cout << "BAs_k: " << dqdkdv_args.BAs_k << std::endl;
+    std::cout << "Seqs_k: " << dqdkdv_args.Seqs_k << std::endl;
+    std::cout << "Seqs_dk: " << dqdkdv_args.Seqs_dk << std::endl;
+    std::cout << "seqlen_k: " << dqdkdv_args.seqlen_k << std::endl;
+    std::cout << "head_dim_q: " << dqdkdv_args.head_dim_q << std::endl;
+    std::cout << "head_dim_v: " << dqdkdv_args.head_dim_v << std::endl;
+    std::cout << "nhead_q: " << dqdkdv_args.nhead_q << std::endl;
+    std::cout << "Hs_v: " << dqdkdv_args.Hs_v << std::endl;
+    std::cout << "BAs_v: " << dqdkdv_args.BAs_v << std::endl;
+    std::cout << "Seqs_v: " << dqdkdv_args.Seqs_v << std::endl;
+    std::cout << "Hs_do: " << dqdkdv_args.Hs_do << std::endl;
+    std::cout << "BAs_do: " << dqdkdv_args.BAs_do << std::endl;
+    std::cout << "Seqs_do: " << dqdkdv_args.Seqs_do << std::endl;
+    std::cout << "Hs_dk: " << dqdkdv_args.Hs_dk << std::endl;
+    std::cout << "BAs_dk: " << dqdkdv_args.BAs_dk << std::endl;
+    std::cout << "Hs_dv: " << dqdkdv_args.Hs_dv << std::endl;
+    std::cout << "BAs_dv: " << dqdkdv_args.BAs_dv << std::endl;
+    std::cout << "Seqs_dv: " << dqdkdv_args.Seqs_dv << std::endl;
+    std::cout << "Hs_lsed: " << dqdkdv_args.Hs_lsed << std::endl;
+    std::cout << "max_seqlen_dq: " << dqdkdv_args.max_seqlen_dq << std::endl;
+
     // convert l/r to x/y HERE
-    if (a.window_size_left == -1 && a.window_size_right == 0) {
-        dqdkdv_args.mask_y = 0;
-        dqdkdv_args.mask_x = 0;
-    } else {
-        auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
-            a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k,
-            (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
-            a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
-        dqdkdv_args.mask_y = generic_mask.at(ck_tile::number<0>{});
-        dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
-    }
+    // if (a.window_size_left == -1 && a.window_size_right == 0) {
+    //     dqdkdv_args.mask_y = 0;
+    //     dqdkdv_args.mask_x = 0;
+    // } else {
+    //     auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
+    //         a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k,
+    //         (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
+    //         a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+    //     dqdkdv_args.mask_y = generic_mask.at(ck_tile::number<0>{});
+    //     dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
+    // }
     arg_size = sizeof(dqdkdv_args);
+    std::cout << "dqdkdv arg size: " << arg_size << std::endl;
     auto dqdkdv_kernel_launch =
         [&]() {
             int bdx = 256;
@@ -468,9 +495,8 @@ float fmha_v3_bwd(mha_bwd_args a)
                                             bdx,
                                             1,
                                             1,
-                                            a.stream_id_});
+                                            s.stream_id_});
         };
-    ck_tile::stream_config s{a.stream_id_, a.time_kernel_, a.log_level_, a.cold_niters_, a.nrepeat_, a.is_gpu_timer_, a.flush_cache_, a.rotating_count_};
 
     if (!need_post_processing) {
         return ck_tile::launch_kernel(s,
@@ -519,7 +545,7 @@ float fmha_v3_bwd(mha_bwd_args a)
                                           bdx,
                                           1,
                                           1,
-                                          a.stream_id_});
+                                          s.stream_id_});
         };
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_) { pre_kernel_launch(); },

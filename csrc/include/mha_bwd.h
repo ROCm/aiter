@@ -5,40 +5,12 @@
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch
 // headers.
 #include "aiter_hip_common.h"
+#include "fmha_bwd.hpp"
 #include <variant>
 
 namespace aiter {
 
 struct mha_bwd_args {
-    // stream config
-    /*
-    * construct this structure with behavior as:
-    *
-    *   // create stream config with default stream(NULL), and not timing the kernel
-    *   stream_config s = stream_config{};
-    *
-    *   // create stream config with _some_stream_id_, and not timing the kernel
-    *   stream_config s = stream_config{_some_stream_id_};
-    *
-    *   // create stream config with _some_stream_id_, and benchmark with warmup/repeat as default
-    *   stream_config s = stream_config{_some_stream_id_, true};
-    *
-    *   // create stream config with _some_stream_id_, and benchmark using cpu timer
-    *   stream_config s = stream_config{_some_stream_id_, true, 0, 3, 10, false};
-    *
-    *   // create stream config with _some_stream_id_, and enable gpu timer for rotating buffer with
-    *rotating buffer count stream_config s = stream_config{_some_stream_id_, true, 0, 3, 10, true,
-    *true, 1};
-    **/
-    hipStream_t stream_id_ = nullptr;
-    bool time_kernel_      = false;
-    int log_level_         = 0;
-    int cold_niters_       = 3;
-    int nrepeat_           = 10;
-    bool is_gpu_timer_     = true; // keep compatible
-    bool flush_cache_      = false;
-    int rotating_count_    = 1;
-
     // aiter args
     int mask_type; // 0: no mask   1: top_left_causal   2: bottom_right_causal   3: sliding_window
     bool use_asm_v3; // 0: default(asm first)   1: force asm   2: force ck
@@ -323,8 +295,8 @@ struct __attribute__((packed)) fmha_bwd_post_kernel_args
     p2 _p11;
 };
 
-__attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args);
+__attribute__((visibility("default"))) float mha_bwd(mha_bwd_args, const ck_tile::stream_config&);
 
-float fmha_v3_bwd(mha_bwd_args a);
+float fmha_v3_bwd(mha_bwd_args, const ck_tile::stream_config&);
 
 } // namespace aiter
