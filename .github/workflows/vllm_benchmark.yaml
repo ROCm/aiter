@@ -110,6 +110,8 @@ jobs:
             kv_cache_dtype: 'fp8_kvcache'
         
     steps:
+      - name: Fix permissions for cleanup
+        run: chmod -R u+rwX . || true
       - name: Checkout aiter repo
         uses: actions/checkout@v4
         
