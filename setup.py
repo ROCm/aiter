@@ -216,56 +216,48 @@ if IS_ROCM:
 
     if PREBUILD_KERNELS != 0:
         if not has_torch:
-            print(
-                "[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment"
-            )
+            print("[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment")
         else:
-            all_opts_args_build, prebuild_link_param = core.get_args_of_build(
-                "all", exclude=exclude_ops
-            )
+            all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
-        bd = f"{core.get_user_jit_dir()}/build"
-        import glob
+            bd = f"{core.get_user_jit_dir()}/build"
+            import glob
 
-        shutil.rmtree(bd, ignore_errors=True)
-        for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
+            shutil.rmtree(bd, ignore_errors=True)
+            for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
 
-        def build_one_module(one_opt_args):
-            flags_cc = list(one_opt_args["flags_extra_cc"]) + [
-                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
-            ]
-            flags_hip = list(one_opt_args["flags_extra_hip"]) + [
-                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
-            ]
+            def build_one_module(one_opt_args):
+                flags_cc = list(one_opt_args["flags_extra_cc"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
+                flags_hip = list(one_opt_args["flags_extra_hip"]) + [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
 
-            core.build_module(
-                md_name=one_opt_args["md_name"],
-                srcs=one_opt_args["srcs"],
-                flags_extra_cc=flags_cc,
-                flags_extra_hip=flags_hip,
-                blob_gen_cmd=one_opt_args["blob_gen_cmd"],
-                extra_include=one_opt_args["extra_include"],
-                extra_ldflags=None,
-                verbose=False,
-                is_python_module=True,
-                is_standalone=False,
-                torch_exclude=False,
-            )
+                core.build_module(
+                    md_name=one_opt_args["md_name"],
+                    srcs=one_opt_args["srcs"],
+                    flags_extra_cc=flags_cc,
+                    flags_extra_hip=flags_hip,
+                    blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+                    extra_include=one_opt_args["extra_include"],
+                    extra_ldflags=None,
+                    verbose=False,
+                    is_python_module=True,
+                    is_standalone=False,
+                    torch_exclude=False,
+                )
 
-        prebuid_thread_num = 5
-        max_jobs = os.environ.get("MAX_JOBS")
-        if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
-            prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
-        else:
-            prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
-        os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
+            prebuid_thread_num = 5
+            max_jobs = os.environ.get("MAX_JOBS")
+            if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
+                prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
+            else:
+                prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
+            os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-            list(executor.map(build_one_module, all_opts_args_build))
+            with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+                list(executor.map(build_one_module, all_opts_args_build))
 
 else:
     raise NotImplementedError("Only ROCM is supported")
