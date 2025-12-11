@@ -306,10 +306,10 @@ struct SyncComm {
             while (details::ld_flag<RELAXED>(current_flag) < flag) {
             }
         }
-        __syncthreads();
         if (threadIdx.x == 0) {
             *flag_ptr = flag;
         }
+        __syncthreads();
     }
 
     int *flag_ptr;
@@ -429,27 +429,37 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_1stage(
     SyncComm<NRanks> comm(meta);
     comm.sync();
     using vec_t_ = vec_t<T, VEC_SIZE>;
+    using acc_vec_t_ = vec_t<float, VEC_SIZE>;
     int tidx = blockIdx.x;
     int access_id_in_token = threadIdx.x * VEC_SIZE;
     int idx = tidx * params.hidden_dim + access_id_in_token;
 
-    auto acc = *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(cptrs->data_ptrs[0]) + idx);
+    acc_vec_t_ acc;
+    auto vec = *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(cptrs->data_ptrs[0]) + idx);
+#pragma unroll
+    for (int v = 0; v < VEC_SIZE; ++v) {
+        acc.data[v] = vec.data[v];
+    }
 #pragma unroll
     for (int r = 1; r < NRanks; ++r) {
-        auto vec = *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(cptrs->data_ptrs[r]) + idx);
+        vec = *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(cptrs->data_ptrs[r]) + idx);
 #pragma unroll
         for (int v = 0; v < VEC_SIZE; ++v) {
-            acc.data[v] = acc.data[v] + vec.data[v];
+            acc.data[v] += (float)vec.data[v];
         }
     }
     auto res = *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(params.residual_in) + idx);
 #pragma unroll
     for (int v = 0; v < VEC_SIZE; ++v) {
-        acc.data[v] = acc.data[v] + res.data[v];
+        acc.data[v] += (float)res.data[v];
     }
-    *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(params.residual_out) + idx) = acc;
+#pragma unroll
+    for (int v = 0; v < VEC_SIZE; ++v) {
+        vec.data[v] = (T)acc.data[v];
+    }
+    *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(params.residual_out) + idx) = vec;
     auto gamma = *reinterpret_cast<vec_t_ *>(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
-    epilogue<T, VEC_SIZE, false, BLOCK_SIZE>(params, acc, gamma, idx, tidx);
+    epilogue<T, VEC_SIZE, false, BLOCK_SIZE>(params, vec, gamma, idx, tidx);
 }
 
 template <typename T, int NRanks, int HIDDEN_DIM>
@@ -489,15 +499,26 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_2stage(
         val.store(&shared[0] + threadIdx.x * VEC_SIZE);
         __syncthreads();
         if (warp_id == 0) {
-            vec_t<T, VEC_SIZE> acc;
-            acc.load(&shared[0] + lane_id * VEC_SIZE);
+            vec_t<T, VEC_SIZE> vec;
+            vec_t<float, VEC_SIZE> acc;
+            vec.load(&shared[0] + lane_id * VEC_SIZE);
+#pragma unroll
+            for (int v = 0; v < VEC_SIZE; ++v) {
+                acc.data[v] = (float)vec.data[v];
+            }
 #pragma unroll
             for (int r = 1; r < NRanks; ++r) {
-                vec_t<T, VEC_SIZE> vec;
                 vec.load(&shared[0] + (r * WARP_SIZE_ + lane_id) * VEC_SIZE);
-                vec_add_<T, VEC_SIZE>(acc, vec);
+#pragma unroll
+                for (int v = 0; v < VEC_SIZE; ++v) {
+                    acc.data[v] += (float)vec.data[v];
+                }
             }
-            acc.store(&shared[0] + lane_id * VEC_SIZE);
+#pragma unroll
+            for (int v = 0; v < VEC_SIZE; ++v) {
+                vec.data[v] = (T)acc.data[v];
+            }
+            vec.store(&shared[0] + lane_id * VEC_SIZE);
         }
         __syncthreads();
         val.load(&shared[0] + lane_id * VEC_SIZE);
