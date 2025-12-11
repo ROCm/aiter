@@ -215,7 +215,7 @@ _gemm_a16wfp4_preshuffle_repr = make_kernel_repr(
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
     }
 )
-@triton.jit(repr=_gemm_a16wfp4_repr)
+@triton.jit(repr=_gemm_a16wfp4_preshuffle_repr)
 def _gemm_a16wfp4_preshuffle_kernel(
     a_ptr,
     b_ptr,
