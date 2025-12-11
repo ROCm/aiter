@@ -340,36 +340,63 @@ struct __attribute__((packed)) fmha_bwd_v3_swa_genl_args
     p1 _p26;
 };
 
-struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
+struct __attribute__((packed)) fmha_bwd_odo_args
 {
-    void* ptr_dq_acc;
+    const void *ptr_o;
     p2 _p0;
-    void* ptr_dq;
+    const void *ptr_do;
     p2 _p1;
-    unsigned int Ts;
-    p3 _p2;
-    unsigned int Hs_dq_acc;
+    void *ptr_d;
+    p2 _p2;
+    unsigned int Hs_odo;
     p3 _p3;
-    unsigned int BAs_dq_acc;
+    unsigned int BAs_odo;
     p3 _p4;
-    unsigned int Seqs_dq_acc;
+    unsigned int Seqs_odo;
     p3 _p5;
-    unsigned int Hs_dq;
+    unsigned int Hs_d;
     p3 _p6;
-    unsigned int BAs_dq;
+    unsigned int BAs_d;
     p3 _p7;
-    unsigned int Seqs_dq;
+    unsigned int Seqs_d;
     p3 _p8;
     unsigned int seqlen_q;
     p3 _p9;
     unsigned int head_dim;
     p3 _p10;
-    const void* ptr_qseq;
+    const void *ptr_qseq;
     p2 _p11;
-    const void* ptr_qseq_padded;
+    const void *ptr_qseq_padded;
     p2 _p12;
-    unsigned int max_seqlen_dq;
-    p3 _p13;
+};
+
+// dq_shuffle & dq_convert post process kernel args
+struct __attribute__((packed)) fmha_bwd_post_kernel_args
+{
+    void* ptr_dq_acc;
+    p2 _p0;
+    void* ptr_dq;
+    p2 _p1;
+    unsigned int Hs_dq_acc;
+    p3 _p2;
+    unsigned int BAs_dq_acc;
+    p3 _p3;
+    unsigned int Seqs_dq_acc;
+    p3 _p4;
+    unsigned int Hs_dq;
+    p3 _p5;
+    unsigned int BAs_dq;
+    p3 _p6;
+    unsigned int Seqs_dq;
+    p3 _p7;
+    unsigned int seqlen_q;
+    p3 _p8;
+    unsigned int head_dim;
+    p3 _p9;
+    const void* ptr_qseq;
+    p2 _p10;
+    const void* ptr_qseq_padded;
+    p2 _p11;
 };
 
 struct fmha_bwd_v3_traits
@@ -383,7 +410,9 @@ struct fmha_bwd_v3_traits
     int mask;
     int ts_qo;
     int ts_kv;
-    int ts_dq = 64;
+
+    int ts_pre_kernel = 128;
+    int ts_post_kernel = 64;
 };
 
 template <ck_tile::index_t HDim_q_,
