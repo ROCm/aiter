@@ -29,7 +29,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
-    runs-on: aiter-mi300-1gpu
+    runs-on: aiter-mi355-1gpu
     needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
@@ -59,6 +59,7 @@ jobs:
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
+          --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
@@ -102,6 +103,8 @@ jobs:
         run: |
           set -ex
           echo "Running Triton Tests..."
+          docker exec -w /workspace triton_test pip show triton || true
+          docker exec -w /workspace triton_test bash -c "python -c 'import triton; print(triton.__version__)'" || true
           docker exec -w /workspace triton_test mkdir -p test-reports
           docker exec -w /workspace triton_test pytest -v ${{ env.TRITON_TEST }} --junitxml=test-reports/triton.xml
 
