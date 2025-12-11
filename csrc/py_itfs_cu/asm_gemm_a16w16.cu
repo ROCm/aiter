@@ -12,13 +12,13 @@
 // start to prepare the input and output buffer
 struct __attribute__((packed)) KernelArgs
 {
-    void* ptr_D;
+    void *ptr_D;
     p2 _p0;
-    void* ptr_C;
+    void *ptr_C;
     p2 _p1;
-    void* ptr_A;
+    void *ptr_A;
     p2 _p2;
-    void* ptr_B;
+    void *ptr_B;
     p2 _p3;
     float alpha;
     p3 _p4;
@@ -50,6 +50,10 @@ struct __attribute__((packed)) KernelArgs
     p3 _p17;
     unsigned int is_out_b16;
     p3 _p18;
+    void *ptr_Bias;
+    p2 _p19;
+    unsigned int add_bias;
+    p3 _p20;
 };
 
 std::tuple<std::string, int>
@@ -59,6 +63,7 @@ get_heuristic_kernel(int M,
                      CFG* cfgs,
                      std::string arch_id,
                      bool bpreshuffle,
+                     int add_bias,
                      std::optional<int> splitk             = std::nullopt,
                      std::optional<std::string> kernelName = std::nullopt)
 {
@@ -84,7 +89,20 @@ get_heuristic_kernel(int M,
         const auto& cfg = el.second;
         if(kernelName.has_value() && el.first != (arch_id + kernelName.value()))
             continue;
-        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0))
+        if(kernelName.has_value())
+        {
+            TORCH_CHECK(
+                N % cfg.tileN == 0 && 
+                cfg.bPreshuffle == (bpreshuffle ? 1 : 0) && 
+                (add_bias == 0 || cfg.bias == 1),
+                __func__, 
+                " the specified kernel name ", el.first, 
+                " cannot support the input shape (N=", N, ", tileN=", cfg.tileN, 
+                ") or bias/preshuffle setting (preshuffle=", bpreshuffle, 
+                ", bias=", add_bias, ")."
+            );
+        }
+        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) && (add_bias == 0 || cfg.bias == 1))
         {
             // 1. select splitK
             int split_K = 1;
@@ -96,7 +114,11 @@ get_heuristic_kernel(int M,
                     ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN); // M-orient support OOB
                 if(pure_tg_num < num_cu)
                 {
-                    int max_split = (num_cu / pure_tg_num) < 64 ? (num_cu / pure_tg_num) : 64;
+                    TORCH_CHECK(cfg.subK > 0, __func__, " cfg.subK must be greater than 0 to avoid division by zero.");
+                    int max_split = std::min(
+                        std::min(static_cast<int>(num_cu / pure_tg_num), 16),
+                        static_cast<int>(K / cfg.subK)    // “K-dim must satisfy min 128 bytes. BF16 are 2 bytes each, this means min ele of K is 64.”
+                    );
                     for(int i = max_split; i >= 1; i--)
                     {
                         if(K % 64 == 0)
@@ -165,6 +187,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     int szA           = Mdim * Kdim;
     int szB           = Kdim * Ndim;
     int szC           = Mdim * Ndim;
+    int szBias = 1 * Ndim;
     int sz_A_pad      = 0;
     int sz_B_pad      = 0;
     int sz_C_pad      = 0;
@@ -177,9 +200,10 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     int strideB0      = 0;
     int strideB1      = 0;
     int is_out_b16   = 0;
+    int add_bias = bias.has_value() ? 1 : 0;
     // A row major, B col major, C row major
-    strideA0 = strideA1 = Kdim * 2; // in bytes
-    strideB0 = strideB1 = Kdim * 2;
+    strideA0 = strideA1 = A.stride(0) * A.element_size(); // in bytes
+    strideB0 = strideB1 = B.stride(0) * B.element_size();
     const auto elem_bytes = out.element_size(); 
     strideC0 = strideC1 = strideD0 = strideD1 = Ndim * elem_bytes; // inbytes
     if (out.dtype() == torch::ScalarType::BFloat16)
@@ -196,6 +220,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     args.ptr_C     = (void*)NULL;
     args.ptr_A     = (void*)A.data_ptr();
     args.ptr_B     = (void*)B.data_ptr();
+    args.ptr_Bias = bias.has_value() ? (void*)bias.value().data_ptr() : nullptr;
     args.alpha     = alpha;
     args.beta      = beta;
     args.stride_C0 = strideC0;
@@ -205,6 +230,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     args.N         = Ndim;
     args.K         = Kdim;
     args.is_out_b16 = is_out_b16;
+    args.add_bias   = add_bias;
 
     // args.stride_D0 = 25;
     // args.stride_D1 = 80;
@@ -228,6 +254,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
                                            config_map,
                                            arch_id,
                                            bpreshuffle,
+                                           add_bias,
                                            splitK.has_value() ? splitK : std::nullopt,
                                            kernelName.has_value() ? kernelName : std::nullopt);
         selectedKernelName = std::get<0>(it_sel);
@@ -254,6 +281,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     // printf("K: %u\n", args.K);
     // printf("splitk: %u\n", args.splitk);
     // printf("is_out_b16: %u\n", args.is_out_b16);
+    // printf("add_bias: %u\n", args.add_bias);
     // printf("=======================================\n");
 
     auto it_kl = config_map->find(selectedKernelName);
@@ -284,6 +312,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     if(selectedksplit > 1)
     {
         out.zero_();
+        // HIP_CALL(hipMemsetAsync(out.data_ptr(), 0, elem_bytes * szC, stream))
         int k_per_tg = Kdim / selectedksplit;
         gdz          = selectedksplit;
     }
