@@ -148,39 +148,10 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
-
-        dq, dk, dv, _delta = flash_attn_3.bwd(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            None,  # dq
-            None,  # dk
-            None,  # dv
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_k
-            None,  # seqused_q
-            None,  # seqused_k
-            None,  # max_seqlen_q
-            None,  # max_seqlen_k
-            ctx.softmax_scale,
-            ctx.causal,
-            int(ctx.window_size[0]),
-            int(ctx.window_size[1]),
-            ctx.softcap,
-            ctx.deterministic,
-            ctx.sm_margin,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-        )
         return (
-            dq,  # q
-            dk,  # k
-            dv,  # v
+            None,  # q
+            None,  # k
+            None,  # v
             None,  # softmax_scale
             None,  # causal
             None,  # qv
@@ -315,15 +286,7 @@ def sage_attn_v1_func(
     sm_margin: int = 0,
 ):
     """
-    SageAttention v1 high-precision entry point.
-
-    This function accepts high-precision (BF16/FP32) tensors and internally
-    quantizes them to Int8/BF16 for computation. The output and gradients remain
-    in high precision (FP32 for output, input dtype for gradients).
-
-    This API is designed for seamless integration with existing training code
-    that uses BF16/FP32 tensors, providing FP8 acceleration without requiring
-    manual quantization.
+    SageAttention v1.
 
     Args:
         q: Query tensor [batch, seqlen, num_q_heads, head_dim] (int8)
