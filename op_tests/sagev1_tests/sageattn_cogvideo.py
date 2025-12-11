@@ -116,7 +116,7 @@ logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str, default="THUDM/CogVideoX-2b", help='Model path')
 parser.add_argument('--compile', action='store_true', help='Compile the model')
-parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sage', 'fa3', 'fa3_fp8'], help='Attention type')
+parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sage', 'fa3', 'fa3_fp8', 'sagev1_fa3'], help='Attention type')
 parser.add_argument('--save_inputs', action='store_true', help='Save attention inputs for later benchmarking')
 parser.add_argument('--input_dir', type=str, default='./captured_inputs', help='Directory to save captured inputs')
 parser.add_argument('--max_captures', type=int, default=10, help='Maximum number of inputs to save (use 0 for unlimited)')
@@ -188,6 +188,35 @@ elif args.attention_type == 'fa3_fp8':
         F.scaled_dot_product_attention = _capture_wrapper
     else:
         F.scaled_dot_product_attention = fa3_fp8_wrapper
+elif args.attention_type == 'sagev1_fa3':
+    from aiter.ops.triton.mha_v3 import flash_attn_fp8_func as _fa3_fp8
+    from aiter.ops.triton.sage_v1 import sage_attn_v1_wrapper_func as _sagev1_fa3
+
+    # Wrapper to convert BHSD to BSHD
+    # scaled_dot_product_attention: (batch, heads, seqlen, dim)
+    # sage_attn_v1_wrapper_func: (batch, seqlen, heads, dim)
+    def sagev1_fa3_wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
+        original_dtype = query.dtype
+        
+        # Transpose from BHSD to BSHD
+        q = query.transpose(1, 2).contiguous()
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+        
+        # Call sagev1 attention (ignores attn_mask and dropout_p for now)
+        # Note: returns FP32 output for numerical stability
+        out = _sagev1_fa3(q, k, v, softmax_scale=softmax_scale, causal=is_causal)
+        
+        # Transpose back from BSHD to BHSD and restore original dtype
+        return out.transpose(1, 2).to(original_dtype)
+    
+    if args.save_inputs:
+        # 0 means unlimited
+        max_caps = args.max_captures if args.max_captures > 0 else None
+        _capture_wrapper = InputCaptureWrapper(fa3_fp8_wrapper, args.input_dir, name="_sagev1_fa3", max_captures=max_caps)
+        F.scaled_dot_product_attention = _capture_wrapper
+    else:
+        F.scaled_dot_product_attention = sagev1_fa3_wrapper
 
 prompt = "A panda, dressed in a small, red jacket and a tiny hat, sits on a wooden stool in a serene bamboo forest. The panda's fluffy paws strum a miniature acoustic guitar, producing soft, melodic tunes. Nearby, a few other pandas gather, watching curiously and some clapping in rhythm. Sunlight filters through the tall bamboo, casting a gentle glow on the scene. The panda's face is expressive, showing concentration and joy as it plays. The background includes a small, flowing stream and vibrant green foliage, enhancing the peaceful and magical atmosphere of this unique musical performance."
 

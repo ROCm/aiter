@@ -375,7 +375,7 @@ def run_benchmark(custom, args):
                 sm_scale=sm_scale,
                 k_smooth=k_smooth,
             )
-        elif args.sagev1: # sage v1, fused on fa3
+        elif args.sagev1_fa3: # sage v1, fused on fa3
             fn = sagev1_forward_func(
                 q,
                 k,
@@ -545,7 +545,7 @@ def parse_args():
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-qk_int8", action="store_true", default=False)
-    parser.add_argument("-sagev1", action="store_true", default=False)
+    parser.add_argument("-sagev1_fa3", action="store_true", default=False)
     parser.add_argument("-no_k_smooth", action="store_true", default=False)
     parser.add_argument("-qk_int8_layout", type=str, default="NHD", choices=["HND", "NHD"],
         help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")

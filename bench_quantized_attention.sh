@@ -55,7 +55,7 @@ for i in ${!BATCH_SIZES[@]}; do
         -hq ${NUM_HEADS[i]} \
         -sq ${SEQ_LENS[i]} \
         -d 128 \
-        -sagev1 \
+        -sagev1_fa3 \
         -metric all \
         # -print_vgpr \
     
