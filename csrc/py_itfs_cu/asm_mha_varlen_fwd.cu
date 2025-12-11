@@ -158,10 +158,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
                std::optional<const at::Tensor> &cu_seqlens_k, // [b+1]
-                // FIXME: this two args currently not support on ck side
-                //        and has no host code on aiter side
-                std::optional<const at::Tensor>& cu_seqlens_q_padded,   // [b+1]
-                std::optional<const at::Tensor>& cu_seqlens_k_padded,   // [b+1]
+               std::optional<const at::Tensor>& cu_seqlens_q_padded,   // [b+1]
+               std::optional<const at::Tensor>& cu_seqlens_k_padded,   // [b+1]
                int max_seqlen_q,
                int max_seqlen_k,
                int min_seqlen_q,
