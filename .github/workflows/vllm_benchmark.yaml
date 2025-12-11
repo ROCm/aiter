@@ -94,7 +94,7 @@ jobs:
 
   vllm_benchmark:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-mi325-8gpu-bm
+    runs-on: aiter-8gpu-runner
     needs: build_vllm_image
     strategy:
       fail-fast: false
@@ -110,8 +110,10 @@ jobs:
             kv_cache_dtype: 'fp8_kvcache'
         
     steps:
-      - name: Fix permissions for cleanup
-        run: chmod -R u+rwX . || true
+      - name: Fix workspace permissions
+        run: |
+          sudo chown -R $USER:$USER "$GITHUB_WORKSPACE" || true
+          
       - name: Checkout aiter repo
         uses: actions/checkout@v4
         
