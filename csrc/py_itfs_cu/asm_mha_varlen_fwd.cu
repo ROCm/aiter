@@ -107,8 +107,8 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                          cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k_ptr
                          nullptr, // seqlen_q_ptr (per-sequence logical, not used here)
                          seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
-                         cu_seqlens_q_padded.has_value() ? cu_seqlens_q_padded.value().data_ptr() : nullptr, // cu_seqlen_q_ptr (not used in this mode)
-                         cu_seqlens_k_padded.has_value() ? cu_seqlens_k_padded.value().data_ptr() : nullptr, // cu_seqlen_k_ptr (not used in this mode)
+                         cu_seqlens_q_padded.has_value() ? cu_seqlens_q_padded.value().data_ptr() : nullptr, // cu_seqlen_q_ptr
+                         cu_seqlens_k_padded.has_value() ? cu_seqlens_k_padded.value().data_ptr() : nullptr, // cu_seqlen_k_ptr
                          total_q,
                          total_k,
                          b,
