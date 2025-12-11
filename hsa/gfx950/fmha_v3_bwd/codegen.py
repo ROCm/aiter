@@ -858,6 +858,16 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
         post_kernel_args.ptr_qseq_padded    = a.seqstart_q_ptr;
     }
 
+    // convert l/r to x/y HERE
+    if (a.window_size_left == -1 && a.window_size_right == 0) {
+        args.mask_y = 0;
+        args.mask_x = 0; 
+    } else {
+        auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k, (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) || a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+        args.mask_y = generic_mask.at(ck_tile::number<0>{});
+        args.mask_x = generic_mask.at(ck_tile::number<1>{});
+    }
+
     auto traits = fmha_bwd_v3_traits{a.batch,
                                      a.nhead_q,
                                      a.max_seqlen_q, // when batch mode, max_seqlen equal to seqlen
