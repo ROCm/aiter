@@ -247,14 +247,14 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
             ck_tile::index_t nhead_stride_dq = dq.stride(2);
 
             // dk_expanded: (batch_size, seqlen_k, nheads, hdim_q)
-            ck_tile::index_t batch_stride_dk = dk.stride(0);
-            ck_tile::index_t stride_dk = dk.stride(1);
-            ck_tile::index_t nhead_stride_dk = dk.stride(2);
+            ck_tile::index_t batch_stride_dk = dk_expanded.stride(0);
+            ck_tile::index_t stride_dk = dk_expanded.stride(1);
+            ck_tile::index_t nhead_stride_dk = dk_expanded.stride(2);
 
             // dv_expanded: (batch_size, seqlen_k, nheads, hdim_v)
-            ck_tile::index_t batch_stride_dv = dv.stride(0);
-            ck_tile::index_t stride_dv = dv.stride(1);
-            ck_tile::index_t nhead_stride_dv = dv.stride(2);
+            ck_tile::index_t batch_stride_dv = dv_expanded.stride(0);
+            ck_tile::index_t stride_dv = dv_expanded.stride(1);
+            ck_tile::index_t nhead_stride_dv = dv_expanded.stride(2);
 
             // dq_acc: (split, batch_size, seqlen_q, nheads, hdim_q)
             ck_tile::index_t split_stride_dq_acc = dq_accum.stride(0);
@@ -291,8 +291,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
             ck_tile::index_t stride_dbias = 0;
             ck_tile::index_t nhead_stride_dbias = 0;
             // dbias:(batch_size, seqlen_q, nheads, seqlen_k)
-            if (dbias_.has_value()) {
-                auto dbias = dbias_.value();
+            if (dbias_expanded_.has_value()) {
+                auto dbias = dbias_expanded_.value();
                 CHECK_DEVICE(dbias);
                 TORCH_CHECK(dbias.stride(-1) == 1, "dbias tensor must have contiguous last dimension");
                 TORCH_CHECK(dbias.sizes() == torch::IntArrayRef({batch_size, seqlen_q, num_heads, seqlen_k}));
@@ -329,8 +329,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 softmax_d.data_ptr(),
                                 nullptr, // rand_val
                                 dq.data_ptr(),
-                                dk.data_ptr(),
-                                dv.data_ptr(),
+                                dk_expanded.data_ptr(),
+                                dv_expanded.data_ptr(),
                                 dbias_ptr,
                                 dq_accum.data_ptr(),
                                 nullptr, // seqstart_q_ptr

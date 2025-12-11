@@ -268,6 +268,10 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                              pre_cfgs,
                              dqdkdv_cfgs,
                              post_cfgs);
+    
+    if ((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == ""))) {
+        return -1;
+    }
 
     auto it_pre = pre_cfgs->find(pre_kernel);
     if(it_pre != pre_cfgs->end())

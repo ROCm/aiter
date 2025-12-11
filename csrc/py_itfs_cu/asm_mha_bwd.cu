@@ -233,14 +233,14 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
             ck_tile::index_t nhead_stride_dq = dq.stride(2);
 
             // dk_expanded: (batch_size, seqlen_k, nheads, hdim_q)
-            ck_tile::index_t batch_stride_dk = dk.stride(0);
-            ck_tile::index_t stride_dk = dk.stride(1);
-            ck_tile::index_t nhead_stride_dk = dk.stride(2);
+            ck_tile::index_t batch_stride_dk = dk_expanded.stride(0);
+            ck_tile::index_t stride_dk = dk_expanded.stride(1);
+            ck_tile::index_t nhead_stride_dk = dk_expanded.stride(2);
 
             // dv_expanded: (batch_size, seqlen_k, nheads, hdim_v)
-            ck_tile::index_t batch_stride_dv = dv.stride(0);
-            ck_tile::index_t stride_dv = dv.stride(1);
-            ck_tile::index_t nhead_stride_dv = dv.stride(2);
+            ck_tile::index_t batch_stride_dv = dv_expanded.stride(0);
+            ck_tile::index_t stride_dv = dv_expanded.stride(1);
+            ck_tile::index_t nhead_stride_dv = dv_expanded.stride(2);
 
             // TODO: if dq_acc layout do no harm to performance consider reuse this api
             // dq_acc: (split, batch_size, nheads, seqlen_q, hdim_q)
@@ -291,8 +291,8 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 softmax_d.data_ptr(),
                                 nullptr, // rand_val
                                 dq.data_ptr(),
-                                dk.data_ptr(),
-                                dv.data_ptr(),
+                                dk_expanded.data_ptr(),
+                                dv_expanded.data_ptr(),
                                 nullptr, // dbias
                                 dq_accum.data_ptr(),
                                 nullptr, // seqstart_q_ptr (batch mode)
