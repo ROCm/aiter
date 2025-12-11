@@ -463,14 +463,13 @@ def la_persistent_inner(
         # tiles_per_head: total sum of # BLOCK_N in K/V sequence of all batches
         # per_head_tile_size: per head # BLOCK_N of each output tile
 
-        per_head_tile_idx, per_head_tile_size, total_blocks = find_group_pingpong(
-            iter
-            - (tile_head_idx * tiles_per_head)
-            - (tile_batch_idx * (tiles_per_head // batch_size)),
-            MASKED_BLOCKS,
-            num_m_blocks,
-        )
-        """
+        # per_head_tile_idx, per_head_tile_size, total_blocks = find_group_pingpong(
+        #     iter
+        #     - (tile_head_idx * tiles_per_head)
+        #     - (tile_batch_idx * (tiles_per_head // batch_size)),
+        #     MASKED_BLOCKS,
+        #     num_m_blocks,
+        # )
         per_head_tile_idx, per_head_tile_size, total_blocks = find_group_sequential(
             iter
             - (tile_head_idx * tiles_per_head)
@@ -478,7 +477,7 @@ def la_persistent_inner(
             MASKED_BLOCKS,
             num_m_blocks,
         )
-        """
+        
         tile_iter = (
             tile_head_idx * tiles_per_head
             + (tile_batch_idx * (tiles_per_head // batch_size))

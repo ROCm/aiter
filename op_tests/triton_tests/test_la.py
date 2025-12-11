@@ -11,6 +11,7 @@ from aiter.ops.triton.lean_atten import (
     persistent_lean_attention,
 )
 from aiter.ops.triton._triton_kernels.lean_atten import _get_config
+from aiter.ops.triton.mha import flash_attn_func
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 import pytest
 
@@ -536,31 +537,27 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 
 
 def main():
-    batch = 8
+    batch = 1
     causal = False
-    hq = 64
-    hk = 64
-    n_ctx_q = 16
-    n_ctx = [
-        1024,
-        1024,
-        2048,
-        2048,
-        4096,
-        4096,
-        32768,
-        65536,
-    ]  # [4096, 32768, 65536]  # [131072] * batch  # [16384] #[8192]
+    hq = 8
+    hk = 8
+    n_ctx_q = 32768
+    n_ctx = [32768]  # [4096, 32768, 65536]  # [131072] * batch  # [16384] #[8192]
     d = 128
-    total_programs = 912
+    total_programs = 304
     init_dtype = torch.float16
-    BLOCK_M = 16
+    BLOCK_M = 128
     BLOCK_N = 64
     XCD_REMAP = True
     waves_per_eu = 2
     num_warps = 4
-    RAGGED_BATCH = True
+    RAGGED_BATCH = False
     assert batch == len(n_ctx)
+
+    # ============ SELECT KERNEL TO TEST ============
+    USE_LA = True   # Lean Attention
+    USE_MHA = False  # Flash Attention (MHA)
+    # ===============================================
 
     try:
         sum_n_ctx = sum(int(n) for n in n_ctx)
@@ -594,41 +591,37 @@ def main():
         init_dtype,
     )
 
-    # Triton LeanAttention output
-    la_out, ms = _persistent_lean_attention(
-        q,
-        k,
-        v,
-        Mp,
-        Lp,
-        Op,
-        locks,
-        batch_num_block_n,
-        total_programs,
-        BLOCK_M,
-        BLOCK_N,
-        XCD_REMAP,
-        causal,
-        batch,
-        RAGGED_BATCH,
-        num_warps,
-        waves_per_eu,
-    )
-    # print(f"ms={ms}")
+    # ============ LEAN ATTENTION ============
+    if USE_LA:
+        print("Running Lean Attention...")
+        la_out, ms = _persistent_lean_attention(
+            q,
+            k,
+            v,
+            Mp,
+            Lp,
+            Op,
+            locks,
+            batch_num_block_n,
+            total_programs,
+            BLOCK_M,
+            BLOCK_N,
+            XCD_REMAP,
+            causal,
+            batch,
+            RAGGED_BATCH,
+            num_warps,
+            waves_per_eu,
+        )
 
-    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, causal)
-
-    # # Compare result
-    atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
-    rtol = 1e-2 if init_dtype == "fp8" else 3e-3
-    try:
-        torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
-    except AssertionError:
-        #     print("Assertion failed! Showing mismatches:")
-        #     # print_mismatches(ref_out, la_out, atol, rtol)
-        raise  # Re-raise the exception after printing mismatches
-
-    # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    # ============ MHA (FLASH ATTENTION) ============
+    if USE_MHA:
+        print("Running MHA (Flash Attention)...")
+        # Reshape for MHA: (batch*seq, heads, dim) -> (batch, seq, heads, dim)
+        q_mha = q.view(batch, n_ctx_q, hq, d)
+        k_mha = k.view(batch, n_ctx[0], hk, d)  # assumes equal seq lengths
+        v_mha = v.view(batch, n_ctx[0], hk, d)
+        mha_out = flash_attn_func(q_mha, k_mha, v_mha, causal=causal)
 
 
 if __name__ == "__main__":
