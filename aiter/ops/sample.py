@@ -42,7 +42,7 @@ def mixed_sample_outer_exponential(
     out: Tensor,
     input: Tensor,
     exponentials: Tensor,
-    temperatures: Tensor,
+    temperature: Tensor,
     eps: float = 1e-10,
 ) -> None: ...
 
