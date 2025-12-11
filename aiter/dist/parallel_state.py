@@ -321,7 +321,7 @@ class GroupCoordinator:
             yield graph_capture_context
 
     def all_reduce(
-        self, input_: torch.Tensor, ca_use_new: bool = False, ca_fp8_quant: bool = False
+        self, input_: torch.Tensor, ca_use_new: bool = True, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the

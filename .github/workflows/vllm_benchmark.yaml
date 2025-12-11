@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   VLLM_BRANCH: "main"
@@ -110,6 +110,8 @@ jobs:
             kv_cache_dtype: 'fp8_kvcache'
         
     steps:
+      - name: Fix permissions for cleanup
+        run: chmod -R u+rwX . || true
       - name: Checkout aiter repo
         uses: actions/checkout@v4
         
