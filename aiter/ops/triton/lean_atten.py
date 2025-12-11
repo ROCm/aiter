@@ -18,11 +18,10 @@ TO be added features:
 """
 
 import torch
-from typing import Optional, Sequence, Union
+from typing import Optional
 from bisect import bisect_right
 import math
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -173,7 +172,7 @@ def _persistent_lean_attention(
         HEAD_DIM_PADDED = 16
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
-    # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
+    # For gfx942, BLOCK_M=128, BLOCK_N=64 is better for performance
     MASKED_BLOCKS = BLOCK_M // BLOCK_N
 
     if causal:
@@ -224,7 +223,7 @@ def _persistent_lean_attention(
             f"HEADS_PER_XCD={HEADS_PER_XCD}, NUM_XCDS={NUM_XCDS}. XCD_REMAP={XCD_REMAP}"
         )
 
-    CAUSAL_MODE = 1  # 0:ping-pong, 1: sequential
+    CAUSAL_MODE = 0  # 0:ping-pong, 1: sequential
     max_output_tile_cnt = calculate_max_output_tiles_analytically(
         tiles_per_head=tiles_per_head,
         num_m_blocks=num_m_blocks,
@@ -234,10 +233,9 @@ def _persistent_lean_attention(
         causal=causal,
         MASKED_BLOCKS=MASKED_BLOCKS,
         MODE=CAUSAL_MODE,
-        batch_size=batch_size,
-        batch_num_block_n=batch_num_block_n,
     )
-   
+    if not causal:
+        max_output_tile_cnt = math.ceil((H * batch_size) / total_programs) + 4
 
     if DEBUG:
         print(f"max_output_tile_cnt={max_output_tile_cnt}")
@@ -294,8 +292,6 @@ def _persistent_lean_attention(
             f"locks must have length >= total_programs ({total_programs}), got {locks.numel()}"
         )
 
-    # Use analytically computed bound without extra padding
-
     grid = (total_programs, 1, 1)
 
     o = torch.empty_like(q, dtype=v.dtype)
@@ -343,7 +339,7 @@ def _persistent_lean_attention(
         sm_scale,
         HEADS_PER_XCD=HEADS_PER_XCD,
         HEAD_DIM_ORIG=HEAD_DIM_K,
-        HEAD_DIM=HEAD_DIM_PADDED,
+        HEAD_DIM=HEAD_DIM_K,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         MASKED_BLOCKS=MASKED_BLOCKS,
@@ -364,8 +360,6 @@ def _persistent_lean_attention(
         num_warps=num_warps,
         num_stages=1,
         num_ctas=1,
-        num_heads_q=H,
-        num_heads_k=H_K,
         gqa_group_size=GQA_GROUP_SIZE,
         use_64_indexing=(
             (k.stride(0) * N_CTX_K) >= (1 << 31)
@@ -373,8 +367,10 @@ def _persistent_lean_attention(
             or (Op.stride(0) * total_programs) >= (1 << 31)
             or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
             or (o.stride(0) * N_CTX_Q) >= (1 << 31)
+            or (q.stride(0) * N_CTX_Q) >= (1 << 31)
         ),
         RAGGED_BATCH=RAGGED_BATCH,
+        **config,
     )
 
     """
@@ -445,8 +441,6 @@ def get_num_splits_and_buffer_sizes(
     else:
         # Decode or Not Causal
         tiles_per_head = num_m_blocks * num_n_blocks
-        # Decode or Not Causal
-        tiles_per_head = num_m_blocks * num_n_blocks
 
     # Total tiles across all Q heads
     if XCD_REMAP:
@@ -491,7 +485,6 @@ def get_num_splits_and_buffer_sizes(
 
     # Needed for causal. This is (per batch n_ctx) // BLOCK_N
     num_n_blocks = num_n_blocks // batch_size
-    num_n_blocks = num_n_blocks // batch_size
 
     return (
         num_m_blocks,
@@ -514,8 +507,6 @@ def calculate_max_output_tiles_analytically(
     causal: bool,
     MASKED_BLOCKS: int,
     MODE: int,  # 0-ping-pong, 1-sequential
-    batch_size: int,
-    batch_num_block_n: Optional[torch.Tensor] = None,
 ):
     """
     Calculates maximum output tiles per workgroup for buffer allocation.
@@ -551,17 +542,6 @@ def calculate_max_output_tiles_analytically(
             task_size = (q_block_idx + 1) * MASKED_BLOCKS
             total_blocks += task_size
             m_block_boundaries.append(total_blocks)
-    else:
-        # For non-causal ragged: build per-batch cumulative boundaries within a head
-        if batch_num_block_n is not None:
-            if isinstance(batch_num_block_n, torch.Tensor):
-                batch_boundaries = [int(x) for x in batch_num_block_n.tolist()]
-            else:
-                batch_boundaries = [int(x) for x in batch_num_block_n]
-        else:
-            # Fallback to uniform split
-            per_batch = tiles_per_head // max(batch_size, 1)
-            batch_boundaries = [per_batch * (i + 1) for i in range(max(batch_size, 0))]
 
     max_total_output_tiles = 0
     # Loop through each workgroup to find the one that spans the most output tiles.
@@ -590,13 +570,8 @@ def calculate_max_output_tiles_analytically(
             wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
 
             if not causal:
-                # Count how many batch tiles (ragged) are spanned in this head
-                relative_start = wg_start_in_head - head_start_iter
-                relative_end = wg_end_in_head - head_start_iter
-                start_b_idx = bisect_right(batch_boundaries, relative_start)
-                end_b_idx = bisect_right(batch_boundaries, relative_end - 1)
-                tiles_in_this_head = (end_b_idx - start_b_idx) + 1
-                total_output_tiles_for_wg += tiles_in_this_head
+                # For non-causal, each head is one output tile.
+                total_output_tiles_for_wg += 1
                 continue
 
             # --- Causal Logic using Binary Search ---
