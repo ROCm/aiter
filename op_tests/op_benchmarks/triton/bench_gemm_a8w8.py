@@ -1,11 +1,10 @@
 import sys
 import triton
 import math
+import torch.nn.functional as F
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.triton_tests.test_gemm_a8w8 import (
-    generate_gemm_a8w8_inputs,
-)
+from op_tests.triton_tests.test_gemm_a8w8 import generate_gemm_a8w8_inputs, run_torch
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,
@@ -13,14 +12,16 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
+    get_gemm_model_benchmark_object,
+    get_gemm_shape_benchmark_object,
     print_vgpr,
     get_caller_name_no_ext,
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(
+    M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False
+):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
     x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
@@ -34,11 +35,20 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     mem_write = (M * N) * bias.element_size()
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: gemm_a8w8(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
-        warmup=25,
-        rep=100,
-    )
+    if use_torch:
+        ms = triton.testing.do_bench(
+            lambda: run_torch(x, weight, x_scale, w_scale, bias, c_dtype),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: gemm_a8w8(
+                x, weight, x_scale, w_scale, bias, c_dtype, y
+            ),  # noqa: E731
+            warmup=25,
+            rep=100,
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -57,11 +67,11 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_gemm_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8(
-        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+        M, hidden_dim, intermediate_dim, metric, provider, model_name=None, **kwargs
     ):
         """
         Fc1:
@@ -74,20 +84,22 @@ def run_model_benchmark(args):
 
         Tensor parallel splits across int_dim (N for fc1, K for fc2)
         """
-        if layer == "fc1":
+        if provider[1] == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer == "fc2":
+        elif provider[1] == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider[0] == "torch")
+        )
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -96,13 +108,15 @@ def run_shape_benchmark(args):
     """
     Runs a benchmark with given tensor shapes.
     """
-    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_gemm_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8(M, N, K, metric, model_name=None, **kwargs):
+    def bench_gemm_a8w8(M, N, K, metric, provider, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider == "torch")
+        )
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 

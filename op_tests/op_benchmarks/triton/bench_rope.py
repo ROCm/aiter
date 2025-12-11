@@ -2,7 +2,6 @@ import argparse
 import sys
 import torch
 from triton.testing import runtime
-from op_tests.triton_tests.test_rope import generate_rope_inputs
 from aiter.ops.triton.rope import RotateStyle
 from aiter.ops.triton.rope import (
     rope_fwd,
@@ -29,6 +28,7 @@ from aiter.ops.triton.rope import (
     # rope_fwd_2d,
     # rope_fwd_2d_inplace,
 )
+from op_tests.triton_tests.test_rope import generate_rope_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,

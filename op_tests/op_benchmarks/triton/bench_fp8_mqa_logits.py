@@ -32,14 +32,14 @@ def run_benchmark(args):
     x_names = ["seq_q_l", "seq_kv_l", "num_heads_q", "head_dim"]
     x_vals_list = [[args.seq_q_l, args.seq_kv_l, args.num_heads_q, args.head_dim]]
     if args.metric == "time":
-        ylabel = "Time (ms)"
+        ylabel = "ms"
     elif args.metric == "throughput":
         ylabel = "TFLOPs"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
-    line_names = [ylabel]
-    line_vals = [ylabel]
+    line_names = [args.metric]
+    line_vals = [args.metric]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,

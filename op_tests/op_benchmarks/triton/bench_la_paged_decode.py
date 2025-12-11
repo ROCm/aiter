@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
-from utils.benchmark_utils import (
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_unit,
     get_model_configs,
     get_available_models,
     get_dtype_bytes,
@@ -344,7 +345,7 @@ def run_benchmark(args):
 
     x_names = ["OP", "BS", "HQ", "HK", "SEQ_LEN", "HEAD_DIM"]
 
-    line_names = ["Time_(ms)"]
+    line_names = ["time"]
     line_vals = ["time"]
 
     benchmark = triton.testing.Benchmark(
@@ -354,7 +355,7 @@ def run_benchmark(args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-")],
-        ylabel="ms",
+        ylabel=get_evaluation_unit("time"),
         plot_name=get_caller_name_no_ext(),
         args={},
     )

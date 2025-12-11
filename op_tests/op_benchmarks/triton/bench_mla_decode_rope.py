@@ -1,17 +1,17 @@
 import triton
+from aiter.ops.triton.mla_decode_rope import (
+    decode_attention_fwd_grouped_rope,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
+    get_evaluation_unit,
 )
 import torch
 import sys
 import argparse
 import itertools
-
-from aiter.ops.triton.mla_decode_rope import (
-    decode_attention_fwd_grouped_rope,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_mla_decode_rope import input_helper, ref_preprocess
 
@@ -105,25 +105,17 @@ def create_benchmark_configs(args: argparse.Namespace):
     else:
         x_vals_list = nonvarlen_benchmark_configs(args)
 
-    if args.metric == "time":
-        unit = "ms"
-    elif args.metric == "throughput":
-        unit = "TFLOPS"
-    elif args.metric == "bandwidth":
-        unit = "GB/s"
-    else:
-        raise ValueError("Unknown metric: " + args.metric)
-
-    line_vals = [f"{unit}"]
+    line_vals = [get_evaluation_unit(args.metric)]
+    line_names = [args.metric]
     configs.append(
         triton.testing.Benchmark(
             x_names=x_names,
             x_vals=x_vals_list,
-            line_arg="provider",
+            line_arg="unit",
             line_vals=line_vals,
-            line_names=line_vals,
+            line_names=line_names,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
-            ylabel=unit,
+            ylabel=get_evaluation_unit(args.metric),
             plot_name=get_caller_name_no_ext(),
             args=extra_args,
         )

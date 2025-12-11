@@ -1,3 +1,4 @@
+# FIXME: Update this schema to match the actual benchmark implementations
 benchmarks:
   batched_gemm_a8w8:
     input_columns: [batch, M, N, K]

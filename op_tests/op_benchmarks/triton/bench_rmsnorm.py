@@ -9,6 +9,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
     get_caller_name_no_ext,
     print_vgpr,
+    get_evaluation_unit,
 )
 
 
@@ -54,15 +55,10 @@ def run_benchmark(args):
     x_names = ["model_name", "M", "N"]
     x_vals_list = model_benchmark_shapes(args)
 
-    if args.metric == "time":
-        ylabel = "Time_(ms)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth_(GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
+    ylabel = get_evaluation_unit(args.metric)
 
-    line_names = [ylabel]
-    line_vals = [ylabel]
+    line_names = [args.metric]
+    line_vals = [get_evaluation_unit(args.metric)]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,

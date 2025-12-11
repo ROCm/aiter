@@ -15,8 +15,10 @@ import triton
 from triton.testing import runtime
 from aiter.ops.triton.topk import topk as triton_topk
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_unit,
     get_model_configs,
     get_available_models,
+    get_caller_name_no_ext,
 )
 
 DEVICE = "cuda"
@@ -151,9 +153,12 @@ def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None
         x_log=False,
         line_arg="provider",
         line_vals=["triton", "torch"],
-        line_names=["Triton", "Torch"],
+        line_names=[
+            "triton_latency",
+            "torch_latency",
+        ],
         styles=[("blue", "-"), ("green", "-")],
-        ylabel="Latency (us)",
+        ylabel=get_evaluation_unit("latency"),
         plot_name="topk_latency",
         args={},
     )
@@ -190,9 +195,12 @@ def bench_latency(batch, provider, *, dim2: int, k: int):
         x_log=False,
         line_arg="provider",
         line_vals=["triton", "torch"],
-        line_names=["Triton", "Torch"],
+        line_names=[
+            "triton_memory",
+            "torch_memory",
+        ],
         styles=[("blue", "--"), ("green", "--")],
-        ylabel="Peak memory (MB)",
+        ylabel=get_evaluation_unit("memory"),
         plot_name="topk_memory",
         args={},
     )
@@ -264,23 +272,18 @@ def run_benchmark(args, x_vals_list):
     """
     x_names = ["M", "N", "topk"]
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "memory":
-        ylabel = "Memory (MB)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
-    line_names = ["Triton"]
-    line_vals = line_names
+    ylabel = get_evaluation_unit(args.metric)
+    line_names = [args.metric]
+    line_vals = [get_evaluation_unit(args.metric)]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
-        line_arg="provider",
+        line_arg="unit",
         line_vals=line_vals,
         line_names=line_names,
         styles=[("green", "-")],  # match line names to colors
         ylabel=ylabel,
-        plot_name="Benchmark Routing Layer",
+        plot_name=get_caller_name_no_ext(),
         args={"metric": args.metric},
     )
 

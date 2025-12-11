@@ -5,34 +5,46 @@ import triton
 import math
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
-    gemm_afp4wfp4_preshuffled_scales,
     gemm_afp4wfp4_preshuffled_weight_scales,
 )
-from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
+from op_tests.triton_tests.test_gemm_afp4wfp4 import (
+    generate_gemm_afp4wfp4_inputs,
+    run_torch,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,
     get_ff_args,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
+    get_gemm_model_benchmark_object,
+    get_gemm_shape_benchmark_object,
     print_vgpr,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: bool):
+def bench_gemm_fn(
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    shuffle: bool,
+    use_torch: bool = False,
+):
     c_dtype = torch.bfloat16
-    x, _, w, _, _, x_scale, w_scale, _, y = generate_gemm_afp4wfp4_inputs(
-        M,
-        N,
-        K,
-        c_dtype,
-        layout=layout,
-        output=True,
-        shuffle_scales_fg=shuffle,
-        shuffle_weight_fg=shuffle,
+    x, w, w_triton, x_scale, w_scale, x_scale_triton, w_scale_triton, _, y = (
+        generate_gemm_afp4wfp4_inputs(
+            M,
+            N,
+            K,
+            c_dtype,
+            layout=layout,
+            output=True,
+            shuffle_scales_fg=shuffle,
+            shuffle_weight_fg=shuffle,
+        )
     )
     # flops
     flops = 2.0 * M * N * K
@@ -44,20 +56,30 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: boo
     )
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
-    if shuffle:
+
+    if use_torch:
         ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4_preshuffled_weight_scales(
-                x, w, x_scale, w_scale, c_dtype, y  # , config=config
-            ),
+            lambda: run_torch(x, w, x_scale, w_scale, c_dtype),
             warmup=25,
-            rep=100,
+            rep=100,  # noqa: E731
         )
     else:
-        ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
-            warmup=25,
-            rep=100,
-        )
+        if shuffle:
+            ms = triton.testing.do_bench(
+                lambda: gemm_afp4wfp4_preshuffled_weight_scales(
+                    x, w_triton, x_scale_triton, w_scale_triton, c_dtype, y
+                ),
+                warmup=25,
+                rep=100,
+            )
+        else:
+            ms = triton.testing.do_bench(
+                lambda: gemm_afp4wfp4(
+                    x, w_triton, x_scale_triton, w_scale_triton, c_dtype, y
+                ),
+                warmup=25,
+                rep=100,
+            )
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms
@@ -98,35 +120,45 @@ def run_benchmark(args, defaults):
 
 
 def run_model_benchmark(args):
-    benchmark = get_model_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
+    benchmark = get_gemm_model_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4(
-        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+        M, hidden_dim, intermediate_dim, metric, provider, model_name=None, **kwargs
     ):
-        if layer == "fc1":
+        if provider[1] == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer == "fc2":
+        elif provider[1] == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle)
+        return bench_gemm_fn(
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.shuffle,
+            use_torch=(provider[0] == "torch"),
+        )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
-    benchmark = get_shape_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
+    benchmark = get_gemm_shape_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_afp4wfp4(M, N, K, metric, model_name=None, **kwargs):
-        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle)
+    def bench_gemm_afp4wfp4(M, N, K, metric, provider, model_name=None, **kwargs):
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, args.shuffle, use_torch=(provider == "torch")
+        )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 

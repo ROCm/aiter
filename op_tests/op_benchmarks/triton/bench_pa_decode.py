@@ -10,6 +10,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_dtype_bytes,
     get_caller_name_no_ext,
     print_vgpr,
+    get_evaluation_unit,
 )
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
@@ -187,9 +188,11 @@ def run_benchmark(args):
 
     model_name = "paged-attn-decode"
 
-    line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
-    line_vals = ["time", "tflops", "bandwidth"]
+    line_names = ["time", "throughput", "bandwidth"]
+    line_vals = ["time", "throughput", "bandwidth"]
 
+    # FIXME: Refer to the FIXME comment in op_tests/op_benchmarks/triton/bench_batch_prefill.py"
+    # to understand the problem here.
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
@@ -197,7 +200,9 @@ def run_benchmark(args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
-        ylabel="ms / TFLOPS / GB/s",
+        ylabel=f"{get_evaluation_unit("time")} / "
+        + f"{get_evaluation_unit("throughput")} / "
+        + f"{get_evaluation_unit("bandwidth")}",
         plot_name=get_caller_name_no_ext(),
         args={},
     )
@@ -245,7 +250,7 @@ def run_benchmark(args):
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
             return ms
-        elif metric == "tflops":
+        elif metric == "throughput":
             return tflops
         elif metric == "bandwidth":
             return bandwidth

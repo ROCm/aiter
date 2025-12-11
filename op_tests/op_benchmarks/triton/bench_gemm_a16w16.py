@@ -1,5 +1,6 @@
 import sys
 import torch
+import torch.nn.functional as F
 import triton
 import math
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
@@ -12,10 +13,11 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
+    get_gemm_model_benchmark_object,
+    get_gemm_shape_benchmark_object,
     print_vgpr,
     get_caller_name_no_ext,
+    get_torch_activation_from_str,
 )
 from typing import Optional
 
@@ -26,6 +28,7 @@ def bench_gemm_fn(
     K: int,
     metric: str,
     layout: str,
+    use_torch: bool = False,
     atomic: bool = False,
     activation: Optional[str] = None,
     **kwargs,
@@ -44,23 +47,42 @@ def bench_gemm_fn(
     mem_write = (M * N) * x.element_size()
     mem = mem_read + mem_write
 
-    if atomic:
-        # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
-        assert (
-            activation is None
-        ), "Atomic kernel does not currently support fused activation"
-        y = y.to(torch.float32).zero_()
-        ms = triton.testing.do_bench(
-            lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
-            warmup=25,
-            rep=100,  # noqa: E731
-        )
+    if use_torch:
+        # Atomic kernel does not use activation, so just bench torch linear layer
+        if atomic:
+            ms = triton.testing.do_bench(
+                lambda: F.linear(x, w, bias=None),
+                warmup=25,
+                rep=100,  # noqa: E731
+            )
+        else:
+            ms = triton.testing.do_bench(
+                lambda: (
+                    get_torch_activation_from_str(activation)(F.linear(x, w, bias=bias))
+                    if activation
+                    else F.linear(x, w, bias=bias)
+                ),
+                warmup=25,
+                rep=100,  # noqa: E731
+            )
     else:
-        ms = triton.testing.do_bench(
-            lambda: gemm_a16w16(x, w, bias, c_dtype, y, activation=activation),
-            warmup=25,
-            rep=100,  # noqa: E731
-        )
+        if atomic:
+            # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
+            assert (
+                activation is None
+            ), "Atomic kernel does not currently support fused activation"
+            y = y.to(torch.float32).zero_()
+            ms = triton.testing.do_bench(
+                lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
+                warmup=25,
+                rep=100,  # noqa: E731
+            )
+        else:
+            ms = triton.testing.do_bench(
+                lambda: gemm_a16w16(x, w, bias, c_dtype, y, activation=activation),
+                warmup=25,
+                rep=100,  # noqa: E731
+            )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -79,10 +101,10 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_gemm_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
+    def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, provider, **kwargs):
         """
         Fc1:
              M      K                  K           N          M       N
@@ -94,21 +116,28 @@ def run_model_benchmark(args):
 
         Tensor parallel splits across int_dim (N for fc1, K for fc2)
         """
-        if layer == "fc1":
+        if provider[1] == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer == "fc2":
+        elif provider[1] == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
-            M, N, K, metric, args.layout, atomic=args.atomic, activation=args.activation
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            use_torch=(provider[0] == "torch"),
+            atomic=args.atomic,
+            activation=args.activation,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -118,13 +147,21 @@ def run_shape_benchmark(args):
     """
     Runs a benchmark with given tensor shapes.
     """
-    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_gemm_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a16w16(M, N, K, metric, **kwargs):
+    def bench_gemm_a16w16(M, N, K, metric, provider, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic)
+        return bench_gemm_fn(
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            use_torch=(provider == "torch"),
+            atomic=args.atomic,
+        )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 

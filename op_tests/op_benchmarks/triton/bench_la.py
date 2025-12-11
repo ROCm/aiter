@@ -2,12 +2,15 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
-import torch
 import triton
-
 from aiter.ops.triton.lean_atten import (
     _persistent_lean_attention,
 )
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    get_evaluation_unit,
+)
+import torch
 
 
 configs = []
@@ -287,10 +290,10 @@ configs.append(
         ],
         line_arg="provider",
         line_vals=["triton"],
-        line_names=["Triton(ms)"],
+        line_names=["triton_time"],
         # styles=[('red', '-'), ('blue', '-')],
-        ylabel="ms",
-        plot_name="lean-attention-",
+        ylabel=get_evaluation_unit("time"),
+        plot_name=get_caller_name_no_ext(),
         args={
             # "causal": causal,
         },

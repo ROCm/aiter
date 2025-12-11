@@ -10,13 +10,51 @@ import sys
 import time
 import tempfile
 import re
+from functools import partial
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
 
 
-def get_shape_benchmark_object(plot_name, args, x_names=None):
+def get_evaluation_unit(metric):
+    """
+    Utility function for returning associated units with metrics used throughout
+    the Triton kernel benchmark scripts.
+    """
+
+    evaluation_metric_to_unit = {
+        "throughput": "TFLOPS",
+        "time": "ms",
+        "bandwidth": "GB/s",
+        "latency": "us",
+        "memory": "MB",
+    }
+
+    unit = evaluation_metric_to_unit[metric]
+    if unit:
+        return unit
+    else:
+        raise NotImplementedError(f"{metric} is not supported")
+
+
+def get_torch_activation_from_str(activation: str):
+    """
+    Utility function for returning PyTorch analogues for the given activation function.
+    """
+
+    mapping = {
+        "gelu": F.gelu,
+        "gelu_tanh": partial(F.gelu, approximate="tanh"),
+        "silu": F.silu,
+        "silu_exp2": F.silu,
+        "relu": F.relu,
+    }
+    return mapping[activation]
+
+
+def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
     """
     Utility function for returning a triton.testing.Benchmark object to populate.
 
@@ -46,29 +84,29 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     else:
         x_vals_list = get_x_vals(dims=len(x_names), args=args)
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
+    ylabel = get_evaluation_unit(args.metric)
 
-    evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
-    }
+    line_names = []
+    line_vals = []
+    if not args.bench_torch:
+        line_vals.append(args.metric)
+        line_names.append(args.metric)
+    else:
+        line_vals.append("triton")
+        line_names.append(f"triton_{args.metric}")
+        line_vals.append("torch")
+        line_names.append(f"torch_{args.metric}")
+
+    mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="unit",
-        line_vals=[evaluation_metric_to_unit[args.metric]],
-        line_names=[evaluation_metric_to_unit[args.metric]],
-        styles=[("green", "-")],
+        line_arg="provider",
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=[(mpl_colors[i], "-") for i in range(len(line_names))],
         ylabel=ylabel,
         plot_name=plot_name,
         args={"metric": args.metric},
@@ -76,7 +114,7 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     return benchmark
 
 
-def get_model_benchmark_object(
+def get_gemm_model_benchmark_object(
     plot_name, args, x_names=None, model_benchmark_shapes_fn=None
 ):
     """
@@ -97,21 +135,28 @@ def get_model_benchmark_object(
         args.fc2 = True
     x_vals_list = model_benchmark_shapes_fn(args)
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
+    ylabel = get_evaluation_unit(args.metric)
 
     line_names = []
+    line_vals = []
     if args.fc1:
-        line_names.append("fc1")
+        if not args.bench_torch:
+            line_names.append(f"fc1_{args.metric}")
+            line_vals.append(("triton", "fc1"))
+        else:
+            line_vals.append(("triton", "fc1"))
+            line_names.append(f"triton_fc1_{args.metric}")
+            line_vals.append(("torch", "fc1"))
+            line_names.append(f"torch_fc1_{args.metric}")
     if args.fc2:
-        line_names.append("fc2")
-    line_vals = line_names
+        if not args.bench_torch:
+            line_names.append(f"fc2_{args.metric}")
+            line_vals.append(("triton", "fc2"))
+        else:
+            line_vals.append(("triton", "fc2"))
+            line_names.append(f"triton_fc2_{args.metric}")
+            line_vals.append(("torch", "fc2"))
+            line_names.append(f"torch_fc2_{args.metric}")
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
@@ -119,7 +164,7 @@ def get_model_benchmark_object(
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="layer",
+        line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
         styles=[

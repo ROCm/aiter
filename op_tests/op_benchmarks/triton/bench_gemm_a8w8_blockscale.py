@@ -1,5 +1,6 @@
 import sys
 import torch
+import torch.nn.functional as F
 import triton
 from aiter.ops.triton.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
@@ -9,10 +10,11 @@ from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
 )
 from op_tests.triton_tests.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
+    run_torch,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
+    get_gemm_model_benchmark_object,
+    get_gemm_shape_benchmark_object,
     print_vgpr,
     get_caller_name_no_ext,
 )
@@ -26,7 +28,15 @@ import math
 block_shape = (128, 128)
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callable):
+def bench_gemm_fn(
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    impl: callable,
+    use_torch: bool = False,
+):
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
@@ -40,11 +50,18 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callab
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: impl(x, weight, x_scale, w_scale, c_dtype, y),  # noqa: E731
-        warmup=25,
-        rep=100,
-    )
+    if use_torch:
+        ms = triton.testing.do_bench(
+            lambda: run_torch(x, weight, x_scale, w_scale, c_dtype),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: impl(x, weight, x_scale, w_scale, c_dtype, y),  # noqa: E731
+            warmup=25,
+            rep=100,
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -63,11 +80,11 @@ def run_model_benchmark(args, impl):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_gemm_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(
-        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+        M, hidden_dim, intermediate_dim, metric, provider, model_name=None, **kwargs
     ):
         """
         Fc1:
@@ -80,32 +97,38 @@ def run_model_benchmark(args, impl):
 
         Tensor parallel splits across int_dim (N for fc1, K for fc2)
         """
-        if layer == "fc1":
+        if provider[1] == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer == "fc2":
+        elif provider[1] == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, use_torch=(provider[0] == "torch")
+        )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args, impl):
-    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_gemm_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
+    def bench_gemm_a8w8_blockscale(
+        M, N, K, metric, provider, model_name=None, **kwargs
+    ):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, use_torch=(provider == "torch")
+        )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
