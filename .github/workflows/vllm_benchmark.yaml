@@ -9,12 +9,12 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
-  BASE_IMAGE: rocm/vllm-dev:nightly@sha256:9ed6489aa34b70f8dbd1b2e93f2c8bf8c2f2806c2c28c1b89ed4754057213066
+  BASE_IMAGE: rocm/vllm-dev:nightly
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -110,6 +110,8 @@ jobs:
             kv_cache_dtype: 'fp8_kvcache'
         
     steps:
+      - name: Fix permissions for cleanup
+        run: chmod -R u+rwX . || true
       - name: Checkout aiter repo
         uses: actions/checkout@v4
         

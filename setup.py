@@ -73,68 +73,200 @@ if IS_ROCM:
         ck_dir
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
-    if PREBUILD_KERNELS == 1:
-        exclude_ops = [
-            "libmha_fwd",
-            "libmha_bwd",
-            "module_fmha_v3_fwd",
-            "module_mha_fwd",
-            "module_mha_varlen_fwd",
-            "module_mha_batch_prefill",
-            "module_fmha_v3_bwd",
-            "module_fmha_v3_varlen_bwd",
-            "module_fmha_v3_varlen_fwd",
-            "module_mha_bwd",
-            "module_mha_varlen_bwd",
-        ]
+    if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+        shutil.rmtree("aiter_meta")
+    shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+    shutil.copytree("hsa", "aiter_meta/hsa")
+    shutil.copytree("gradlib", "aiter_meta/gradlib")
+    shutil.copytree("csrc", "aiter_meta/csrc")
 
-        all_opts_args_build, prebuild_link_param = core.get_args_of_build(
-            "all", exclude=exclude_ops
-        )
-        os.system(f"rm -rf {core.get_user_jit_dir()}/build")
-        os.system(f"rm -rf {core.get_user_jit_dir()}/*.so")
-        prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
-        os.makedirs(prebuild_dir + "/srcs")
-
-        def build_one_module(one_opt_args):
-            core.build_module(
-                md_name=one_opt_args["md_name"],
-                srcs=one_opt_args["srcs"],
-                flags_extra_cc=one_opt_args["flags_extra_cc"],
-                flags_extra_hip=one_opt_args["flags_extra_hip"],
-                blob_gen_cmd=one_opt_args["blob_gen_cmd"],
-                extra_include=one_opt_args["extra_include"],
-                extra_ldflags=None,
-                verbose=False,
-                is_python_module=True,
-                is_standalone=False,
-                torch_exclude=False,
-            )
-
-        # step 1, build *.cu -> module*.so
-        prebuid_thread_num = 5
-        # Respect MAX_JOBS environment variable, fallback to auto-calculation
-        max_jobs = os.environ.get("MAX_JOBS")
-        if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
-            prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
+    def get_exclude_ops():
+        if PREBUILD_KERNELS == 1:
+            return [
+                "libmha_fwd",
+                "libmha_bwd",
+                "module_fmha_v3_fwd",
+                "module_mha_fwd",
+                "module_mha_varlen_fwd",
+                "module_mha_batch_prefill",
+                "module_fmha_v3_bwd",
+                "module_fmha_v3_varlen_bwd",
+                "module_fmha_v3_varlen_fwd",
+                "module_mha_bwd",
+                "module_mha_varlen_bwd",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+                "module_gemm_mi350_a8w8_blockscale_asm",
+            ]
+        elif PREBUILD_KERNELS == 2:
+            return [
+                "libmha_bwd",
+                "module_mha_batch_prefill",
+                "module_fmha_v3_bwd",
+                "module_fmha_v3_varlen_bwd",
+                "module_mha_bwd",
+                "module_mha_varlen_bwd",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+                "module_gemm_mi350_a8w8_blockscale_asm",
+            ]
+        elif PREBUILD_KERNELS == 3:
+            return [
+                "module_activation",
+                "module_attention",
+                "module_pa_ragged",
+                "module_pa_v1",
+                "module_attention_asm",
+                "module_pa",
+                "module_mla_asm",
+                "module_cache",
+                "module_custom_all_reduce",
+                "module_quick_all_reduce",
+                "module_custom",
+                "module_gemm_common",
+                "module_batched_gemm_bf16",
+                "module_batched_gemm_a8w8",
+                "module_gemm_a8w8",
+                "module_gemm_a8w8_blockscale",
+                "module_gemm_a8w8_blockscale_bpreshuffle",
+                "module_gemm_a4w4_blockscale",
+                "module_gemm_a8w8_bpreshuffle",
+                "module_deepgemm",
+                "module_gemm_a8w8_bpreshuffle_cktile",
+                "module_gemm_a8w8_asm",
+                "module_gemm_a16w16_asm",
+                "module_gemm_a4w4_asm",
+                "module_gemm_a8w8_blockscale_asm",
+                "module_gemm_a8w8_blockscale_bpreshuffle_asm",
+                "module_gemm_mi350_a8w8_blockscale_asm",
+                "module_moe_asm",
+                "module_moe_ck2stages",
+                "module_moe_cktile2stages",
+                "module_moe_sorting",
+                "module_moe_topk",
+                "module_norm",
+                "module_pos_encoding",
+                "module_rmsnorm",
+                "module_smoothquant",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+                "module_aiter_operator",
+                "module_aiter_unary",
+                "module_quant",
+                "module_sample",
+                "module_rope_general_fwd",
+                "module_rope_general_bwd",
+                "module_rope_pos_fwd",
+                "module_fused_mrope_rms",
+                # "module_fmha_v3_fwd",
+                "module_mha_fwd",
+                "module_mha_varlen_fwd",
+                # "module_fmha_v3_bwd",
+                "module_fmha_v3_varlen_bwd",
+                "module_fmha_v3_varlen_fwd",
+                "module_mha_bwd",
+                "module_mha_varlen_bwd",
+                "libmha_fwd",
+                "libmha_bwd",
+                "module_rocsolgemm",
+                "module_hipbsolgemm",
+                "module_top_k_per_row",
+                "module_mla_metadata",
+                "module_mla_reduce",
+                "module_topk_plain",
+            ]
         else:
-            prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
-        os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
+            return [
+                "module_gemm_mi350_a8w8_blockscale_asm",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+            ]
 
-        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-            list(executor.map(build_one_module, all_opts_args_build))
+    exclude_ops = get_exclude_ops()
+
+    has_torch = True
+    try:
+        import torch as _
+    except Exception:
+        has_torch = False
+
+    if PREBUILD_KERNELS != 0:
+        if not has_torch:
+            print(
+                "[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment"
+            )
+        else:
+            all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
+
+            bd = f"{core.get_user_jit_dir()}/build"
+            import glob
+
+            shutil.rmtree(bd, ignore_errors=True)
+            for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+            def build_one_module(one_opt_args):
+                flags_cc = list(one_opt_args["flags_extra_cc"]) + [
+                    f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+                ]
+                flags_hip = list(one_opt_args["flags_extra_hip"]) + [
+                    f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+                ]
+
+                core.build_module(
+                    md_name=one_opt_args["md_name"],
+                    srcs=one_opt_args["srcs"],
+                    flags_extra_cc=flags_cc,
+                    flags_extra_hip=flags_hip,
+                    blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+                    extra_include=one_opt_args["extra_include"],
+                    extra_ldflags=None,
+                    verbose=False,
+                    is_python_module=True,
+                    is_standalone=False,
+                    torch_exclude=False,
+                )
+
+            prebuid_thread_num = 5
+            max_jobs = os.environ.get("MAX_JOBS")
+            if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
+                prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
+            else:
+                prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
+            os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
+
+            with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+                list(executor.map(build_one_module, all_opts_args_build))
 
 else:
     raise NotImplementedError("Only ROCM is supported")
-
-
-if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
-    shutil.rmtree("aiter_meta")
-## link "3rdparty", "hsa", "csrc" into "aiter_meta"
-shutil.copytree("3rdparty", "aiter_meta/3rdparty")
-shutil.copytree("hsa", "aiter_meta/hsa")
-shutil.copytree("gradlib", "aiter_meta/gradlib")
-shutil.copytree("csrc", "aiter_meta/csrc")
 
 
 class NinjaBuildExtension(BuildExtension):
@@ -165,7 +297,7 @@ setup_requires = [
     "ninja",
     "setuptools_scm",
 ]
-if PREBUILD_KERNELS == 1:
+if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")
 
 
@@ -187,7 +319,6 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
-    # ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[

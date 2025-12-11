@@ -408,8 +408,8 @@ def test_mla(
         batch_size,
         max_seqlen_qo,
         nhead,
-        q.dtype,
-        kv_buffer.dtype,
+        dtype,
+        kvtype,
         is_sparse=True,
         fast_mode=True,
     )
@@ -452,8 +452,8 @@ def test_mla(
         uni_seqlen_qo=decode_qlen,
         fast_mode=True,
         topk=2048,
-        dtype_q=q.dtype,
-        dtype_kv=kv_buffer.dtype,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
     )
 
     # generate kv topk per token & convert indices into per token
@@ -597,7 +597,9 @@ def test_mla(
     ):
         err, us_asm_decode = test_sparse_mla_bf16()
     elif kvtype == dtypes.fp8 and (
-        (nhead in [16, 128]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
+        (dtype == dtypes.fp8 and nhead in [16, 128])
+        or (dtype == dtypes.bf16 and nhead in [16])
+        or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
     ):
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err

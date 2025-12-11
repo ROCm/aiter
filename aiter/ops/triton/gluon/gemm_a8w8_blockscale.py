@@ -426,7 +426,7 @@ def _get_config(
     K: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         if int(dev.split("MI")[1].replace("X", "")) < 350:
             raise ValueError(
                 "Gluon implementation is not supported on this device (requires CDNA4)."
@@ -441,7 +441,7 @@ def _get_config(
 
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:

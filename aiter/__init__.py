@@ -43,10 +43,7 @@ def getLogger():
 
 logger = getLogger()
 
-import importlib.util
 
-if importlib.util.find_spec("aiter_") is not None:
-    from aiter_ import *
 from .jit import core as core
 from .utility import dtypes as dtypes
 from .ops.enum import *
@@ -72,8 +69,10 @@ from .ops.rmsnorm import *
 from .ops.communication import *
 from .ops.rope import *
 from .ops.topk import *
+from .ops.topk_plain import topk_plain
 from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
+from .ops.fused_mrope_rms import *
 from . import mla

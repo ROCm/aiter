@@ -34,7 +34,7 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
     }
     if constexpr (stage == 1)
     {
-        return moe_stage1_heuristic_dispatch(block_m, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight);
+        return moe_stage1_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight);
     }
     else
     {
@@ -65,7 +65,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                 "Out dtype only support BFloat16/Float16!")
 
     int tokens = hidden_states.size(0);
-    int sorted_size = sorted_token_ids.size(0);
+    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
     int N = w1.size(1) / 2;
     int K = hidden_states.size(-1);
@@ -122,7 +122,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                 "Out dtype only support BFloat16/Float16!")
 
     int tokens = inter_states.size(0);
-    int sorted_size = sorted_token_ids.size(0);
+    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
     int N = w2.size(1);
     int K = inter_states.size(-1);
