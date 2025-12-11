@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any
 import torch
 try:
@@ -13,6 +14,97 @@ from op_tests.sagev1_tests.core import sageattn
 import torch.nn.functional as F
 import argparse
 
+
+class InputCaptureWrapper:
+    """
+    Wrapper that captures input tensors during inference for later benchmarking.
+    Saves q, k, v tensors and kwargs to disk up to max_captures calls.
+    Also tracks unique shapes to understand how inputs change across pipeline steps.
+    """
+    def __init__(self, fn, save_dir, name="attention", max_captures=None):
+        self.fn = fn
+        self.save_dir = save_dir
+        self.name = name
+        self.max_captures = max_captures  # None = unlimited
+        self.captured_shapes = {}  # Maps shape_key -> list of call indices
+        self.call_idx = 0
+        self.saved_count = 0
+        self.shape_history = []  # Track shape at each call for analysis
+        os.makedirs(save_dir, exist_ok=True)
+        
+        if max_captures:
+            logging.getLogger(__name__).info(f"Input capture limited to {max_captures} saves")
+    
+    def __call__(self, q, k, v, **kwargs):
+        # Create a unique key based on shapes and dtype
+        shape_key = (tuple(q.shape), tuple(k.shape), tuple(v.shape), str(q.dtype))
+        
+        # Track which calls have this shape (always track, even if not saving)
+        if shape_key not in self.captured_shapes:
+            self.captured_shapes[shape_key] = []
+        self.captured_shapes[shape_key].append(self.call_idx)
+        self.shape_history.append(shape_key)
+        
+        # Save tensors only if under the capture limit
+        if self.max_captures is None or self.saved_count < self.max_captures:
+            save_path = os.path.join(self.save_dir, f"{self.name}_input_{self.call_idx:06d}.pt")
+            torch.save({
+                'q': q.detach().cpu().clone(),
+                'k': k.detach().cpu().clone(),
+                'v': v.detach().cpu().clone(),
+                'q_shape': list(q.shape),
+                'k_shape': list(k.shape),
+                'v_shape': list(v.shape),
+                'dtype': str(q.dtype),
+                'call_idx': self.call_idx,
+                'kwargs': {key: val for key, val in kwargs.items() if not isinstance(val, torch.Tensor)},
+            }, save_path)
+            self.saved_count += 1
+            
+            if self.saved_count % 100 == 0:  # Log every 100 saves to avoid spam
+                logging.getLogger(__name__).info(
+                    f"Captured input {self.saved_count}/{self.max_captures or 'unlimited'}: "
+                    f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+                )
+            
+            # Log when we hit the limit
+            if self.max_captures and self.saved_count == self.max_captures:
+                logging.getLogger(__name__).info(
+                    f"Reached capture limit of {self.max_captures}. Continuing without saving."
+                )
+        
+        self.call_idx += 1
+        return self.fn(q, k, v, **kwargs)
+    
+    def summary(self):
+        """Print summary of captured inputs."""
+        logger = logging.getLogger(__name__)
+        logger.info(f"=== Input Capture Summary for {self.name} ===")
+        logger.info(f"Total attention calls: {self.call_idx}")
+        logger.info(f"Inputs saved to disk: {self.saved_count}")
+        if self.max_captures:
+            logger.info(f"Capture limit: {self.max_captures}")
+        logger.info(f"Unique shapes: {len(self.captured_shapes)}")
+        logger.info(f"Saved to: {self.save_dir}")
+        logger.info("")
+        logger.info("Shape distribution:")
+        for shape_key, call_indices in sorted(self.captured_shapes.items(), key=lambda x: -len(x[1])):
+            q_shape, k_shape, v_shape, dtype = shape_key
+            logger.info(f"  q={q_shape}, k={k_shape}, v={v_shape}, dtype={dtype}")
+        logger.info("=" * 50)
+        
+        # Also save metadata summary for benchmark script
+        metadata_path = os.path.join(self.save_dir, f"{self.name}_metadata.pt")
+        torch.save({
+            'total_calls': self.call_idx,
+            'saved_count': self.saved_count,
+            'max_captures': self.max_captures,
+            'captured_shapes': {str(k): v for k, v in self.captured_shapes.items()},
+            'shape_history': self.shape_history,
+            'kernel_name': self.name,
+        }, metadata_path)
+        logger.info(f"Metadata saved to: {metadata_path}")
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -25,7 +117,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str, default="THUDM/CogVideoX-2b", help='Model path')
 parser.add_argument('--compile', action='store_true', help='Compile the model')
 parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sage', 'fa3', 'fa3_fp8'], help='Attention type')
+parser.add_argument('--save_inputs', action='store_true', help='Save attention inputs for later benchmarking')
+parser.add_argument('--input_dir', type=str, default='./captured_inputs', help='Directory to save captured inputs')
+parser.add_argument('--max_captures', type=int, default=10, help='Maximum number of inputs to save (use 0 for unlimited)')
 args = parser.parse_args()
+
+# Global variable to hold the capture wrapper for summary reporting
+_capture_wrapper = None
 
 # Check if we're on AMD GPU - torch.compile with inductor backend has compatibility issues
 # with AMD's triton-rocm due to missing NVIDIA-specific metadata (cluster_dims)
@@ -46,7 +144,14 @@ logger.debug(f"torch.version.hip: {getattr(torch.version, 'hip', None)}")
 
 
 if args.attention_type == 'sage':
-    F.scaled_dot_product_attention = sageattn
+    attn_fn = sageattn
+    if args.save_inputs:
+        # 0 means unlimited
+        max_caps = args.max_captures if args.max_captures > 0 else None
+        _capture_wrapper = InputCaptureWrapper(attn_fn, args.input_dir, name="sage", max_captures=max_caps)
+        F.scaled_dot_product_attention = _capture_wrapper
+    else:
+        F.scaled_dot_product_attention = attn_fn
 # TODO: add AMD fa2 and fa3 Triton kernels
 elif args.attention_type == 'fa3':
     raise NotImplementedError("AMD fa3 Triton kernel is not yet supported")
@@ -76,7 +181,13 @@ elif args.attention_type == 'fa3_fp8':
         # layers (like to_out linear) expect the original dtype (e.g., float16)
         return out.transpose(1, 2).to(original_dtype)
     
-    F.scaled_dot_product_attention = fa3_fp8_wrapper
+    if args.save_inputs:
+        # 0 means unlimited
+        max_caps = args.max_captures if args.max_captures > 0 else None
+        _capture_wrapper = InputCaptureWrapper(fa3_fp8_wrapper, args.input_dir, name="fa3_fp8", max_captures=max_caps)
+        F.scaled_dot_product_attention = _capture_wrapper
+    else:
+        F.scaled_dot_product_attention = fa3_fp8_wrapper
 
 prompt = "A panda, dressed in a small, red jacket and a tiny hat, sits on a wooden stool in a serene bamboo forest. The panda's fluffy paws strum a miniature acoustic guitar, producing soft, melodic tunes. Nearby, a few other pandas gather, watching curiously and some clapping in rhythm. Sunlight filters through the tall bamboo, casting a gentle glow on the scene. The panda's face is expressive, showing concentration and joy as it plays. The background includes a small, flowing stream and vibrant green foliage, enhancing the peaceful and magical atmosphere of this unique musical performance."
 
@@ -110,3 +221,7 @@ with torch.no_grad():
 output_file = f"cogvideox-2b_{args.attention_type}.mp4"
 export_to_video(video, output_file, fps=8)
 logger.info(f"Video exported to {output_file}")
+
+# Print capture summary if inputs were saved
+if args.save_inputs and _capture_wrapper is not None:
+    _capture_wrapper.summary()
