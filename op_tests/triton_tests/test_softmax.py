@@ -1,11 +1,7 @@
 import torch
 import pytest
-from aiter.ops.triton.softmax import (
-    softmax as triton_softmax
-)
-from aiter.ops.triton.gluon.softmax import (
-    softmax as gluon_softmax
-)
+from aiter.ops.triton.softmax import softmax as triton_softmax
+from aiter.ops.triton.gluon.softmax import softmax as gluon_softmax
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
@@ -14,16 +10,27 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 @pytest.mark.parametrize(
     "M, N",
     [
-        (1823, 781),
+        (1, 1024),
+        (1, 781),
         (1, 1),
         (128, 1),
         (1, 128),
         (8192, 8192),
         (4096, 8192),
         (359, 1),
+        (1, 512),
         (1, 359),
         (1, 131072),
+        (1, 65536),
         (1, 89999),
+        (1, 2),
+        (1, 4),
+        (1, 8),
+        (1, 16),
+        (1, 32),
+        (1, 64),
+        (1, 128),
+        (1, 12),
     ],
 )
 @pytest.mark.parametrize(
