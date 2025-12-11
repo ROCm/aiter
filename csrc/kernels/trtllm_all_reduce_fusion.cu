@@ -573,7 +573,10 @@ void allreduce_fusion_kernel_launcher_(
     TORCH_CHECK(params.size % params.hidden_dim == 0);
     TORCH_CHECK(params.hidden_dim % VEC_SIZE == 0);
     TORCH_CHECK(params.hidden_dim == HIDDEN_DIM);
-    if (token_num <= 8) {
+    auto bytes = params.size * sizeof(T);
+    bool use_1s = token_num <= (NBLOCKS_PER_GPU / 4);
+    use_1s = use_1s && ((NRanks <= 2) || (NRanks <= 4 && bytes < 160 * 1024) || (NRanks <= 8 && bytes < 80 * 1024));
+    if (use_1s) {
         allreduce_fusion_kernel_1stage_launcher<T, NRanks, HIDDEN_DIM, QUANT_TYPE>(params, meta, cptrs, stream);
     } else {
         allreduce_fusion_kernel_2stage_launcher<T, NRanks, HIDDEN_DIM, QUANT_TYPE>(params, meta, cptrs, stream);
