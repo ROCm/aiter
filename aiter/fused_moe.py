@@ -615,6 +615,9 @@ def get_2stage_cfgs(
         )
 
     def FinalFunc():
+        logger.info(
+            f"tuned configs are saved in {tune_file}, you can set AITER_CONFIG_FMOE to this file to use tuned configs"
+        )
         logger.info("\033[0m")
 
     # cfg = cfg_2stages.get(keys, None)
