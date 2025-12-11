@@ -244,8 +244,8 @@ def test_mla(
         batch_size,
         max_seqlen_qo,
         nhead,
-        q.dtype,
-        kv_buffer.dtype,
+        dtype,
+        kvtype,
         is_sparse=False,
         fast_mode=True if not non_persistent_mode else False,
         num_kv_splits=max_split_per_batch,
@@ -292,9 +292,7 @@ def test_mla(
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
         dtype_q=dtype,
-        dtype_kv=(
-            kvtype if dtype == kvtype else dtype
-        ),  # if q bf16 k fp8 should be same as bf16bf16 for dp mode
+        dtype_kv=kvtype,
     )
 
     def test_absorb_decode_bf16():

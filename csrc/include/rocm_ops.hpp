@@ -190,6 +190,16 @@ namespace py = pybind11;
           py::arg("bias")   = std::nullopt, \
           py::arg("splitK") = 0);
 
+#define BATCHED_GEMM_BF16_PYBIND            \
+    m.def("batched_gemm_bf16",              \
+          &batched_gemm_bf16,               \
+          "batched_gemm_bf16",              \
+          py::arg("XQ"),                    \
+          py::arg("WQ"),                    \
+          py::arg("Out"),                   \
+          py::arg("bias")   = std::nullopt, \
+          py::arg("splitK") = 0);
+
 #define BATCHED_GEMM_A8W8_TUNE_PYBIND \
     m.def("batched_gemm_a8w8_tune",   \
           &batched_gemm_a8w8_tune,    \
@@ -311,7 +321,36 @@ namespace py = pybind11;
           py::arg("dst_k"),                                                         \
           py::arg("dst_scale"),                                                     \
           py::arg("block_table"),                                                   \
-          py::arg("cu_seq_lens"));
+          py::arg("cu_seq_lens"));                                                  \
+    m.def("fused_qk_rope_concat_and_cache_mla",                                     \
+          &aiter::fused_qk_rope_concat_and_cache_mla,                               \
+          "fused_qk_rope_concat_and_cache_mla("                                     \
+          "                     Tensor q_nope, Tensor q_pe,"                        \
+          "                     Tensor kv_c, Tensor k_pe,"                          \
+          "                     Tensor! kv_cache,"                                  \
+          "                     Tensor! q_out, "                                    \
+          "                     Tensor slot_mapping,"                               \
+          "                     Tensor k_scale,"                                    \
+          "                     Tensor q_scale,"                                    \
+          "                     Tensor positions,"                                  \
+          "                     Tensor cos_cache,"                                  \
+          "                     Tensor sin_cache,"                                  \
+          "                     bool is_neox    ,"                                  \
+          "                     bool is_nope_first)->()",                           \
+          py::arg("q_nope"),                                                        \
+          py::arg("q_pe"),                                                          \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("q_out"),                                                         \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("k_scale"),                                                       \
+          py::arg("q_scale"),                                                       \
+          py::arg("positions"),                                                     \
+          py::arg("cos_cache"),                                                     \
+          py::arg("sin_cache"),                                                     \
+          py::arg("is_neox"),                                                       \
+          py::arg("is_nope_first"));
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \
@@ -436,6 +475,30 @@ namespace py = pybind11;
           py::arg("beta")         = 0.0,          \
           py::arg("bpreshuffle")  = true,         \
           py::arg("log2_k_split") = std::nullopt);
+
+#define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
+    m.def("flatmm_a8w8_blockscale_asm",   \
+          &flatmm_a8w8_blockscale_asm,    \
+          "flatmm_a8w8_blockscale_asm",   \
+          py::arg("XQ"),                  \
+          py::arg("WQ"),                  \
+          py::arg("x_scale"),             \
+          py::arg("w_scale"),             \
+          py::arg("Out"));
+
+#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_ASM_PYBIND                  \
+    m.def("gemm_a8w8_blockscale_bpreshuffle_asm",                    \
+          &gemm_a8w8_blockscale_bpreshuffle_asm,                     \
+          "FP8 blockscale BpreShuffle GEMM assembly implementation", \
+          py::arg("A"),                                              \
+          py::arg("B"),                                              \
+          py::arg("out"),                                            \
+          py::arg("A_scale"),                                        \
+          py::arg("B_scale"),                                        \
+          py::arg("bias")        = py::none(),                       \
+          py::arg("splitK")      = py::none(),                       \
+          py::arg("kernelName")  = py::none(),                       \
+          py::arg("bpreshuffle") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -1286,7 +1349,9 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
-#define FUSED_MROPE_RMS_PYBIND m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms);
+#define FUSED_MROPE_RMS_PYBIND                        \
+    m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms); \
+    m.def("fused_rope_rms", &fused_rope_rms);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
@@ -1406,30 +1471,30 @@ namespace py = pybind11;
           py::arg("stride0"),      \
           py::arg("stride1"));
 
-#define MLA_METADATA_PYBIND                               \
-    m.def("get_mla_metadata_v1",                          \
-          &get_mla_metadata_v1,                           \
-          "get_mla_metadata_v1",                          \
-          py::arg("seqlens_qo_indptr"),                   \
-          py::arg("seqlens_kv_indptr"),                   \
-          py::arg("num_heads_per_head_k"),                \
-          py::arg("num_heads_k"),                         \
-          py::arg("is_causal"),                           \
-          py::arg("work_metadata_ptrs"),                  \
-          py::arg("work_info_set"),                       \
-          py::arg("work_indptr"),                         \
-          py::arg("reduce_indptr"),                       \
-          py::arg("reduce_final_map"),                    \
-          py::arg("reduce_partial_map"),                  \
-          py::arg("kv_granularity")      = 16,            \
-          py::arg("max_seqlen_qo")       = -1,            \
-          py::arg("uni_seqlen_qo")       = -1,            \
-          py::arg("fast_mode")           = true,          \
-          py::arg("topk")                = -1,            \
-          py::arg("max_split_per_batch") = -1,            \
-          py::arg("intra_batch_mode")   = false,         \
-          py::arg("dtype_q")             = std::nullopt,  \
-          py::arg("dtype_kv")            = std::nullopt); \
+#define MLA_METADATA_PYBIND                              \
+    m.def("get_mla_metadata_v1",                         \
+          &get_mla_metadata_v1,                          \
+          "get_mla_metadata_v1",                         \
+          py::arg("seqlens_qo_indptr"),                  \
+          py::arg("seqlens_kv_indptr"),                  \
+          py::arg("num_heads_per_head_k"),               \
+          py::arg("num_heads_k"),                        \
+          py::arg("is_causal"),                          \
+          py::arg("work_metadata_ptrs"),                 \
+          py::arg("work_info_set"),                      \
+          py::arg("work_indptr"),                        \
+          py::arg("reduce_indptr"),                      \
+          py::arg("reduce_final_map"),                   \
+          py::arg("reduce_partial_map"),                 \
+          py::arg("kv_granularity")      = 16,           \
+          py::arg("max_seqlen_qo")       = -1,           \
+          py::arg("uni_seqlen_qo")       = -1,           \
+          py::arg("fast_mode")           = true,         \
+          py::arg("topk")                = -1,           \
+          py::arg("max_split_per_batch") = -1,           \
+          py::arg("intra_batch_mode")    = false,        \
+          py::arg("dtype_q")             = std::nullopt, \
+          py::arg("dtype_kv")            = std::nullopt);           \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define PA_METADATA_PYBIND                       \
@@ -1438,6 +1503,7 @@ namespace py = pybind11;
           "get_pa_metadata_v1",                  \
           py::arg("seqlens_qo_indptr"),          \
           py::arg("pages_kv_indptr"),            \
+          py::arg("context_lens"),               \
           py::arg("num_heads_per_head_k"),       \
           py::arg("num_heads_k"),                \
           py::arg("is_causal"),                  \
@@ -1448,6 +1514,7 @@ namespace py = pybind11;
           py::arg("reduce_final_map"),           \
           py::arg("reduce_partial_map"),         \
           py::arg("kv_granularity")      = 16,   \
+          py::arg("block_size")          = 16,   \
           py::arg("max_seqlen_qo")       = -1,   \
           py::arg("uni_seqlen_qo")       = -1,   \
           py::arg("fast_mode")           = true, \

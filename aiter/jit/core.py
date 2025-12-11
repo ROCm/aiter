@@ -500,6 +500,7 @@ def build_module(
     torch_exclude,
     hipify=False,
 ):
+    os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
@@ -576,7 +577,7 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob"
+                blob_dir = f"{op_dir}/blob/"
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")

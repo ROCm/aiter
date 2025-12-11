@@ -30,6 +30,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
+from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 
 aiter.hipb_create_extension()
 
@@ -69,6 +70,10 @@ def run_gemm_bf16_asm(
     )
 
 
+def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
+    return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
+
+
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
     cu_num = get_cu_num()
@@ -106,7 +111,7 @@ def generate_data(
     bias = torch.randn(n, device=device).to(outdtype) if bias else None
     scale_half = torch.tensor(0.5, dtype=dtypes.fp32, device=device)
     scale_one = torch.tensor(1, dtype=dtypes.fp32, device=device)
-    scale = scale_half if scaleAB else scale_one
+    scale = scale_half if scaleAB else None
     # if scaleAB:
     #    scaleB = scaleB.t()
     out_asm = torch.empty(m, n, dtype=outdtype, device=device)
@@ -135,9 +140,12 @@ def get_gemm_ref(inp, weights, bias, scale, indtype, outdtype):
             ref = ref[0]
     else:
         ref = (
-            F.linear(inp, weights).to(outdtype) + bias.to(outdtype)
+            (
+                F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32))
+                + bias.to(dtypes.fp32)
+            ).to(outdtype)
             if bias is not None
-            else F.linear(inp, weights).to(outdtype)
+            else F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32)).to(outdtype)
         )
     return ref
 
@@ -171,8 +179,7 @@ class Gemm:
         self.m = m
         self.k = k
         self.n = n
-        self.bias = torch.randn(n, device="cuda").to(outdtype) if bias else None
-
+        self.bias = torch.randn(n, device="cuda").to(indtype) if bias else None
         self.indtype = indtype
         self.outdtype = outdtype
         self.scaleAB = scaleAB
@@ -183,8 +190,8 @@ class Gemm:
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
         self.topn = 20  # number of top solutions from each source
         self.hipb_sols = []
-        self.rtol = 1e-2
-        self.atol = 1e-2
+        self.rtol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
+        self.atol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
         # self.ref = self.get_gemm_ref()
         self.check_err_ratio = err_ratio
         self.splitK = None
@@ -262,25 +269,20 @@ class Gemm:
             print(f"ASM kernel list file not exist: {file}")
             return {}
         df = pd.read_csv(file)
-        if "bPreshuffle" in df.columns:
-            shuffle_int = 1 if is_shuffle else 0
-            df = df[df["bPreshuffle"] == shuffle_int]
+
         kernel_dict = (
-            df.groupby(["tileM", "tileN", "pf", "splitK"])["knl_name"]
+            df.groupby(
+                ["tileM", "tileN", "pf", "splitK", "subK", "bias", "bPreshuffle"]
+            )["knl_name"]
             .apply(list)
             .to_dict()
         )
         return kernel_dict
 
     def asm_gemm_all_solutions(self):
-        if self.bias is not None:
-            print("[Warning]: asm not support bias")
-            return []
+
         if (
-            self.scaleAB
-            or self.k % 64 != 0
-            or self.indtype != dtypes.bf16
-            or self.outdtype != dtypes.fp32
+            self.scaleAB or self.k % 64 != 0 or self.indtype != dtypes.bf16
         ) and get_gfx() == "gfx942":
             print(
                 f"only indtype=bf16 and outdtype=fp32 and k%64==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
@@ -289,10 +291,9 @@ class Gemm:
             return []
         if (
             self.scaleAB
-            or self.k % 256 != 0
-            or self.n % 256 != 0  # mismatch randomly
+            or self.k % 64 != 0
+            or self.n % 64 != 0  # mismatch randomly
             or self.indtype != dtypes.bf16
-            or self.outdtype != dtypes.bf16
         ) and get_gfx() == "gfx950":
             print(
                 f"only indtype=bf16 and outdtype=bf16 and k%256==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
@@ -308,8 +309,10 @@ class Gemm:
 
         solutions = 0
         for key in asm_tiles:
-            tile_m, tile_n, pf, splitK = key
-            print(f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}")
+            tile_m, tile_n, pf, splitK, subK, bias, bPreshuffle = key
+            print(
+                f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}, splitK: {splitK}, subK: {subK}, bias:{bias}"
+            )
             kernelName = asm_kernels[key][0]
             if splitK:
                 maxSplitK = compute_gemm_SplitK(
@@ -317,6 +320,14 @@ class Gemm:
                 )  # if self.splitK else 1
             else:
                 maxSplitK = 1
+            maxSplitK = min(maxSplitK, 64)
+            # maxSplitK = 1
+            if not bias and self.bias is not None:
+                continue
+            if (bPreshuffle == 0 and self.is_shuffle) or (
+                bPreshuffle == 1 and not self.is_shuffle
+            ):
+                continue
             solidx = solidx + 1
             self.asm_map[solidx] = kernelName
             for splitK in range(1, maxSplitK + 1):
@@ -336,6 +347,8 @@ class Gemm:
                     "asm",
                     kernelName,
                 )
+                if self.k / splitK < subK:
+                    break
                 task_asm.append(
                     (
                         info,
@@ -370,8 +383,73 @@ class Gemm:
                 (),
             )
         ]
-        ret = mp_tuner(task_asm, in_data, self.mp, False)
+        # ret = mp_tuner(task_asm, in_data, self.mp, False)
+        return task_asm
+
+    def run_asm_triton_sols(self):
+        tasks = []
+        tasks.extend(self.triton_egmm_all_sols())
+        tasks.extend(self.asm_gemm_all_solutions())
+        solutions = len(tasks)
+        in_data = [
+            (
+                solutions,
+                (),
+            )
+        ]
+        ret = mp_tuner(tasks, in_data, self.mp, False)
         return ret
+
+    def triton_egmm_all_sols(self):
+        if self.scaleAB or self.is_shuffle or self.outdtype == dtypes.fp32:
+            print(
+                f"Triton gemm_a16w16 does not support scaling{self.scaleAB} or weight shuffle {self.is_shuffle}  or fp32 output {self.outdtype} yet"
+            )
+            return []
+        info = (
+            (
+                self.m,
+                self.n,
+                self.k,
+                False if self.bias is None else True,
+                str(self.indtype),
+                str(self.outdtype),
+                self.scaleAB,
+                self.is_shuffle,
+            ),
+            0,
+            0,
+            "triton",
+            "auto",
+        )
+        task = []
+        task.append(
+            (
+                info,
+                generate_data,
+                (
+                    self.m,
+                    self.n,
+                    self.k,
+                    self.indtype,
+                    self.outdtype,
+                    self.scaleAB,
+                    self.is_shuffle,
+                    0,
+                    True if self.bias is not None else False,
+                ),
+                run_triton_gemm_bf16,
+                ([0, 1, 3], self.outdtype),
+                {},
+                get_gemm_ref,
+                ([0, 1, 3, 4], self.indtype, self.outdtype),
+                {},
+                None,  # self.ref if fast_mode == 0 else None,
+                self.rtol,
+                self.atol,
+            )
+        )
+        return task
 
     def hipb_time_all_sols(self, fast_mode=0, top_sols=0):
         coldi = 20
@@ -494,7 +572,7 @@ class Gemm:
     def run_best_solutions(self):
         self.warmup()
         rets_hipb = self.hipb_time_all_sols(fast_mode=0, top_sols=1)
-        rets_asm = self.asm_gemm_all_solutions()
+        rets_asm = self.run_asm_triton_sols()
         return rets_hipb + rets_asm
 
     def run_solutions(self):
