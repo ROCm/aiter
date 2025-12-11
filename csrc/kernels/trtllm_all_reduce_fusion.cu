@@ -296,25 +296,30 @@ struct SyncComm {
             target_flag = reinterpret_cast<int *>(meta.barrier_flag_ptrs[target_rank]) + blockIdx.x * NRanks + rank;
             current_flag = reinterpret_cast<int *>(meta.barrier_flag_ptrs[rank]) + blockIdx.x * NRanks + target_rank;
         }
+        flag = *flag_ptr;
     }
 
-    template <bool RELAXED = true>
+    template <bool RELAXED = true, bool FINAL = true>
     __device__ __forceinline__ void sync() {
-        auto flag = (*flag_ptr) + 1;
+        __syncthreads();
+        flag += 1;
         if (threadIdx.x < NRanks) {
             details::st_flag<RELAXED>(target_flag, flag);
             while (details::ld_flag<RELAXED>(current_flag) < flag) {
             }
         }
-        if (threadIdx.x == 0) {
-            *flag_ptr = flag;
-        }
         __syncthreads();
+        if constexpr (FINAL) {
+            if (threadIdx.x == 0) {
+                *flag_ptr = flag;
+            }
+        }
     }
 
     int *flag_ptr;
     int *target_flag;
     int *current_flag;
+    int flag;
 };
 
 enum QuantType {
@@ -488,7 +493,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_2stage(
     int warp_id = threadIdx.x / WARP_SIZE_;
     int lane_id = threadIdx.x % WARP_SIZE_;
 
-    comm.sync();
+    comm.template sync<true, false>();
 
     for (
         int idx = ((blockIdx.x * NRanks + params.rank) * WARP_SIZE_ + lane_id) * VEC_SIZE;
@@ -531,7 +536,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_2stage(
     int access_id_in_token = threadIdx.x * VEC_SIZE;
     vec_t<T, VEC_SIZE> gamma;
     gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
-    comm.template sync<false>();
+    comm.template sync<false, true>();
     for (
         int idx = blockIdx.x * params.hidden_dim + access_id_in_token, tidx = blockIdx.x;
         idx < params.size;
