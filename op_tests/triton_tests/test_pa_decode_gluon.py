@@ -24,6 +24,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
+from aiter.ops.triton.unified_attention import unified_attention
 
 try:
     from triton.experimental import gluon
@@ -1097,7 +1098,7 @@ def prepare_gluon_query_and_scale(
     """
     quantized_query_gluon = quantized_query
     query_scale_gluon = query_scale_factors
-    output_gluon = torch.zeros_like(reference_output_quant)
+    output_gluon = torch.empty_like(reference_output_quant)
     # output_gluon = torch.zeros_like(reference_output_quant)
 
     if query_length > 1:
@@ -1131,6 +1132,46 @@ def prepare_gluon_query_and_scale(
             )
 
     return quantized_query_gluon, query_scale_gluon, output_gluon
+
+
+@perftest()
+def run_unified_attention_kernel(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    query_output_indptr: torch.Tensor,
+    max_query_length: int,
+    context_lengths: torch.Tensor,
+    max_context_length: int,
+    softmax_scale: float,
+    window_size_tuple: Tuple[int, int],
+    block_tables: torch.Tensor,
+    key_scale: torch.Tensor,
+    value_scale: torch.Tensor,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> Dict:
+    return unified_attention(
+        query,  # q
+        key_cache,  # k
+        value_cache,  # v
+        output,  # out
+        query_output_indptr,  # cu_seqlens_q
+        max_query_length,  # max_seqlen_q
+        context_lengths,  # seqused_k
+        max_context_length,  # max_seqlen_k
+        softmax_scale,  # softmax_scale
+        True,  # causal
+        window_size_tuple,  # window_size
+        block_tables,  # block_table
+        0,  # softcap
+        None,  # q_descale (must be None)
+        key_scale,  # k_descale
+        value_scale,  # v_descale
+        alibi_slopes=alibi_slopes,
+        sinks=sinks,
+    )
 
 
 @perftest()
@@ -1486,13 +1527,13 @@ def run_pa_gluon_test(
         max_context_partition_num,
         equivalent_query_group_size,
     )
-    exp_sums = torch.zeros(
+    exp_sums = torch.empty(
         intermediate_shape, dtype=torch.float32, device=output_gluon.device
     )
-    max_logits = torch.zeros(
+    max_logits = torch.empty(
         intermediate_shape, dtype=torch.float32, device=output_gluon.device
     )
-    temporary_output = torch.zeros(
+    temporary_output = torch.empty(
         *intermediate_shape,
         head_size,
         dtype=output_gluon.dtype,
@@ -1530,7 +1571,48 @@ def run_pa_gluon_test(
         final_output_gluon = final_output_gluon.transpose(1, 2).reshape(
             batch_size * query_length, num_kv_heads * query_group_size, head_size
         )
+    unified_output = torch.zeros_like(output_gluon)
+    window_size_tuple = (
+        (sliding_window - 1, 0)
+        if sliding_window is not None and sliding_window > 0
+        else (-1, -1)
+    )
+    quantized_keys = (
+        quantized_keys.transpose(-1, -2)
+        .contiguous()
+        .view(-1, 8, 64, 16)
+        .permute(0, 3, 1, 2)
+        .contiguous()
+    )
+    quantized_values = quantized_values.permute(0, 3, 1, 2).contiguous()
+    # quantized_keys = quantized_keys.view(quantized_keys.shape[0], -1, num_kv_heads, head_size)
+    # quantized_values = quantized_values.view(quantized_values.shape[0], -1, num_kv_heads, head_size)
+    _, unified_time = run_unified_attention_kernel(
+        quantized_query_gluon,  # q
+        quantized_keys,  # k
+        quantized_values,  # v
+        unified_output,  # out
+        query_output_indptr,  # cu_seqlens_q
+        max_query_length,  # max_seqlen_q
+        context_lengths,  # seqused_k
+        max_context_length,  # max_seqlen_k
+        softmax_scale,  # softmax_scale
+        window_size_tuple,  # window_size
+        block_tables,  # block_table
+        key_scale_original,  # k_descale
+        value_scale_original,  # v_descale
+        alibi_slopes=None,
+        sinks=sinks,
+    )
 
+    err_unified = checkAllclose(
+        unified_output,
+        reference_output_quant,
+        atol=fp8_tolerance,
+        rtol=fp8_tolerance,
+        msg=f"[PyTorch vs Unified][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
+    )
+    results["us_unified"] = unified_time
     # Compare with original reference
     err_gluon = checkAllclose(
         reference_output_quant,
@@ -1590,6 +1672,9 @@ def run_pa_gluon_test(
     kernel_time_us = gluon_time
     bandwidth_tb_per_sec = pa_rw_bytes / (kernel_time_us * 1e6 * 1.024**4)
     results["gluon_bandwith(TB/s)"] = bandwidth_tb_per_sec
+    kernel_time_us = unified_time
+    bandwidth_tb_per_sec = pa_rw_bytes / (kernel_time_us * 1e6 * 1.024**4)
+    results["unified_bandwith(TB/s)"] = bandwidth_tb_per_sec
 
     # Test Assembly
     query_group_size = num_query_heads // num_kv_heads
@@ -1602,7 +1687,7 @@ def run_pa_gluon_test(
         or (compute_type == torch.float16 and (quant_q or quant_kv))
         or (head_size not in [128])
     )
-
+    skip_assembly = True
     # aiter_assembly_kernel do not support per-tensor quantization, we always use per-token quantization here
     if quant_kv and quant_mode == "per_tensor":
         key_scale_original = key_scale_factors_flat.contiguous()
@@ -1653,8 +1738,13 @@ def run_pa_gluon_test(
 
     if "us_asm" in results:
         results["perf_gluon_vs_asm"] = f'{results["us_asm"] / results["us_gluon"]:.0%}'
+    elif "us_unified" in results:
+        results["perf_gluon_vs_unified"] = (
+            f'{results["us_unified"] / results["us_gluon"]:.0%}'
+        )
     else:
         results["perf_gluon_vs_asm"] = "NaN"
+        results["perf_gluon_vs_unified"] = "NaN"
 
     sys.stdout.flush()
 
@@ -1901,7 +1991,7 @@ def run_multi_pa_gluon_test(
     context_partition_size_options,
     sample_rate=1.0,
     use_sinks_options=[False, True],
-    sliding_window_options=[128],
+    sliding_window_options=[0, 128],
 ) -> pd.DataFrame:
     """Run all tests."""
     # Generate all test configurations
@@ -2133,10 +2223,10 @@ def simple_test():
     QUERY_LENGTH_OPTIONS = [1]
     BATCH_SIZE_OPTIONS = [4, 128]
     HEAD_CONFIGURATIONS = [(64, 8)]
-    CONTEXT_LENGTH_OPTIONS = [1024]
-    HEAD_DIMENSION_OPTIONS = [64, 128]
+    CONTEXT_LENGTH_OPTIONS = [1024, 2048]
+    HEAD_DIMENSION_OPTIONS = [64]
     TRANS_V_OPTIONS = [False]
-    KV_VARLEN_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False, True]
     USE_AOT_IMPL_OPTIONS = [False]
     # USE_AOT_IMPL_OPTIONS = [True]
     # USE_AOT_IMPL_OPTIONS = [False]
