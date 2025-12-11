@@ -935,13 +935,15 @@ namespace aiter
         {
           add_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
         }
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
+        tmps[rank][rank * part + idx] = add_rslt;
       }
       __syncthreads();
+    }
 
-      // cross device store
-      P rslt = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
-      tmps[warp_id][rank * part + idx] = rslt;
+    // cross device store
+    for (int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    {
+      tmps[warp_id][rank * part + idx] = tmps[rank][rank * part + idx];
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
   }
