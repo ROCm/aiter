@@ -408,8 +408,8 @@ def test_mla(
         batch_size,
         max_seqlen_qo,
         nhead,
-        q.dtype,
-        kv_buffer.dtype,
+        dtype,
+        kvtype,
         is_sparse=True,
         fast_mode=True,
     )
@@ -452,8 +452,8 @@ def test_mla(
         uni_seqlen_qo=decode_qlen,
         fast_mode=True,
         topk=2048,
-        dtype_q=q.dtype,
-        dtype_kv=kv_buffer.dtype,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
     )
 
     # generate kv topk per token & convert indices into per token
