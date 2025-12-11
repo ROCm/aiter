@@ -278,8 +278,8 @@ def attn_qk_int8_per_block(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
+    q_scale: torch.Tensor = None,
+    k_scale: torch.Tensor = None,
     tensor_layout: str = "HND",
     attn_mask: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = torch.float16,
@@ -314,7 +314,7 @@ def attn_qk_int8_per_block(
         if config is None:
             config = _get_config()
        
-        sm_scale = math.sqrt(head_dim)
+        sm_scale = q.shape[-1] ** -0.5
         q, q_scale, k, k_scale, k_smooth = per_block_int8(
             q, k, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout, smooth_k=True
         )
@@ -406,5 +406,8 @@ def attn_qk_int8_per_block(
         **config
     )
 
-    return o, lse
+    if return_lse:
+        return o, lse
+    else:
+        return o
 
