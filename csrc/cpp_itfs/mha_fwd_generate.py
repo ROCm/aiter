@@ -165,7 +165,7 @@ V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
 
 def get_v3_api():
-    v3_call = "fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check)"
+    v3_call = "fmha_fwd_v3(traits, args, stream_config, is_v3_api_check)"
     gfx_list = get_gfx_list()
     v3_arch_list = [arch for arch in ["gfx942", "gfx950"] if arch in gfx_list]
 

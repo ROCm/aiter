@@ -486,6 +486,8 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q_padded: Optional[torch.Tensor],
+    cu_seqlens_k_padded: Optional[torch.Tensor],
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -549,6 +551,8 @@ def fmha_v3_varlen_fwd(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q_padded: Optional[torch.Tensor],
+    cu_seqlens_k_padded: Optional[torch.Tensor],
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -1910,7 +1914,6 @@ def _flash_attn_varlen_forward(
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
-        ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1922,6 +1925,8 @@ def _flash_attn_varlen_forward(
             v,
             cu_seqlens_q,
             cu_seqlens_k,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
             max_seqlen_q,
             max_seqlen_k,
             min_seqlen_q,

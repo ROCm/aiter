@@ -216,8 +216,6 @@ namespace gfx942 {
 float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqstart_q_padding_ptr = nullptr,
-                  const void* seqstart_k_padding_ptr = nullptr,
                   bool is_v3_api_check = false);
 }
 
@@ -225,8 +223,6 @@ namespace gfx950 {
 float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqstart_q_padding_ptr = nullptr,
-                  const void* seqstart_k_padding_ptr = nullptr,
                   bool is_v3_api_check = false);
 }
 } // namespace aiter

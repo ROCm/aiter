@@ -27,6 +27,8 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           const at::Tensor v,
                                           const at::Tensor cu_seqlens_q,
                                           std::optional<const at::Tensor> &cu_seqlens_k,
+                                          std::optional<const at::Tensor> &cu_seqlens_q_padded,
+                                          std::optional<const at::Tensor> &cu_seqlens_k_padded,
                                           std::optional<const at::Tensor> &seqlens_k,
                                           std::optional<const at::Tensor> &bias_,
                                           std::optional<const at::Tensor> &alibi_slopes_,
@@ -105,8 +107,8 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                          cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k_ptr
                          nullptr, // seqlen_q_ptr (per-sequence logical, not used here)
                          seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
-                         nullptr, // cu_seqlen_q_ptr (not used in this mode)
-                         nullptr, // cu_seqlen_k_ptr (not used in this mode)
+                         cu_seqlens_q_padded.has_value() ? cu_seqlens_q_padded.value().data_ptr() : nullptr, // cu_seqlen_q_ptr (not used in this mode)
+                         cu_seqlens_k_padded.has_value() ? cu_seqlens_k_padded.value().data_ptr() : nullptr, // cu_seqlen_k_ptr (not used in this mode)
                          total_q,
                          total_k,
                          b,
@@ -157,8 +159,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> &cu_seqlens_k, // [b+1]
                 // FIXME: this two args currently not support on ck side
                 //        and has no host code on aiter side
-                //    const at::Tensor& cu_seqlens_q_padded,   // [b+1]
-                //    const at::Tensor& cu_seqlens_k_padded,   // [b+1]
+                std::optional<const at::Tensor>& cu_seqlens_q_padded,   // [b+1]
+                std::optional<const at::Tensor>& cu_seqlens_k_padded,   // [b+1]
                int max_seqlen_q,
                int max_seqlen_k,
                int min_seqlen_q,
@@ -365,6 +367,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                cu_seqlens_q_padded,
+                cu_seqlens_k_padded,
                 seqlens_k,
                 bias_,
                 alibi_slopes_,

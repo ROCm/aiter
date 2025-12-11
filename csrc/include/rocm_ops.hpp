@@ -675,6 +675,8 @@ namespace py = pybind11;
           py::arg("v"),                           \
           py::arg("cu_seqlens_q"),                \
           py::arg("cu_seqlens_k"),                \
+          py::arg("cu_seqlens_q_padded"),                \
+          py::arg("cu_seqlens_k_padded"),                \
           py::arg("max_seqlen_q"),                \
           py::arg("max_seqlen_k"),                \
           py::arg("min_seqlen_q"),                \
