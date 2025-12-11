@@ -27,7 +27,7 @@ jobs:
   sglang:
     name: sglang integration
     needs: [check-signal]
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-mi325-1gpu
     env:
       SGL_BRANCH: v0.5.6
       GPU_ARCH: gfx942
