@@ -1,28 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import torch.nn.functional as F
-import sys
+import argparse
 import os
 import random
-import aiter
-import pandas as pd
-from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter.ops.shuffle import shuffle_weight
-from aiter import hipb_mm, hipb_create_extension
+import sys
 from functools import lru_cache
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+import aiter
+from aiter import dtypes, hipb_create_extension, hipb_mm
 from aiter.jit.utils.chip_info import get_gfx
-import argparse
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.tuned_gemm import tgemm, triton_gemm
 
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
-
-if 1:
-    _path = os.path.abspath(os.path.dirname(__file__))
-    sys.path.insert(0, f"{_path}/../../")
-    from aiter.tuned_gemm import tgemm
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -84,6 +81,11 @@ def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
     )
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_gemm_triton(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
+    return triton_gemm(x, weight, 0, bias=bias, otype=otype)
+
+
 @lru_cache(maxsize=1)
 def init_hipblas():
     hipb_create_extension()
@@ -94,16 +96,18 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
     weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
+    if otype is None:
+        otype = dtype
     if bias:
-        bias = torch.rand(n, dtype=otype, device="cuda")
+        bias = torch.rand(n, dtype=dtype, device="cuda")
     else:
         bias = None
     if scaleA is not None:
         scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
     if scaleB is not None:
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
-    (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
-    (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
+    a, avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
+    b, avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
     if (
         n % 16 == 0
         and k % 32 == 0
@@ -113,7 +117,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     ):
         init_hipblas()
         weight_bpreshuffle = shuffle_weight(weight, layout=(16, 16), use_int4=False)
-        (c, *_), avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
+        c, avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
         if bias is not None:
             c = c + bias
     else:
@@ -143,40 +147,40 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     ### run bf16gemm_f32 asm
     if (
         dtype == dtypes.bf16
-        and bias is None
-        and (
-            (
-                get_gfx() == "gfx942"
-                and (otype == dtypes.fp32 or otype == dtypes.bf16)
-                and k % 64 == 0
-                and n % 64 == 0
-            )
-            or (
-                get_gfx() == "gfx950"
-                and otype == dtypes.bf16
-                and k % 256 == 0
-                and n % 256 == 0
-            )
-        )
+        and (otype == dtypes.fp32 or otype == dtypes.bf16)
+        and k % 64 == 0
+        and n % 64 == 0
     ):
-        # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
+        ### b preshuffle
         wshuffle = shuffle_weight(weight, layout=(16, 16))
-        (d, *_), avg_d = run_bf16gemm_asm(
-            x, wshuffle, out_asm, bpreshuffle=wshuffle.is_shuffled
+        d, avg_d = run_bf16gemm_asm(
+            x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
         )
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
         err_asm = checkAllclose(b, d, msg=msg)
+        ### no shuffle
+        e, avg_e = run_bf16gemm_asm(x, weight, out_asm, bias)
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
+        err_asm_noshuffle = checkAllclose(b, e, msg=msg)
 
-    return {
+    ret = {
         "torch us": avg_a,
         "tgemm us": avg_b,
         "tgemm err (vs torch)": err_tgemm,
         "hipb us": locals().get("avg_c", ""),
         "hipb err (vs torch)": locals().get("err_hipb", ""),
-        "asm us": locals().get("avg_d", ""),
-        "asm err (vs tgemm)": locals().get("err_asm", ""),
+        "asm-bpshuff us": locals().get("avg_d", ""),
+        "asm-bpshuff err (vs tgemm)": locals().get("err_asm", ""),
+        "asm-nshuff us": locals().get("avg_e", ""),
+        "asm-nshuff err (vs tgemm)": locals().get("err_asm_noshuffle", ""),
     }
+
+    a, us = run_gemm_triton(x, weight, bias, otype, scaleA, scaleB)
+    err = checkAllclose(b, a)
+    ret["triton us"] = us
+
+    return ret
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -506,7 +510,7 @@ for test in args.test:
                         scaleA=args.scale_a,
                         scaleB=args.scale_b,
                     )
-                df.append(ret)
+                    df.append(ret)
 
     elif test == "skinny":
         ret = test_skinny_gemm()

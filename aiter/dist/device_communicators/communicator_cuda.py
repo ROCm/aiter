@@ -140,7 +140,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self._all2all_manager_created = True
 
     def all_reduce(
-        self, input_, use_new: bool = False, ca_fp8_quant: bool = False
+        self, input_, use_new: bool = True, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -197,7 +197,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_)
             and can_use_fuse_ar_rms
         ):
-            res_out, out = ca_comm.custom_fused_ar_rms(input_, res_inp_, weight_, eps)
+            out, res_out = ca_comm.custom_fused_ar_rms(input_, res_inp_, weight_, eps)
             assert out is not None
             assert res_out is not None
             return out, res_out

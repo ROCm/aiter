@@ -2,6 +2,7 @@
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "metadata/v1_0_device.cuh"
 #include "metadata/v1_1_device.cuh"
 #include "metadata/v1_1_host.cuh"
 #include "metadata/v1_2_device.cuh"
@@ -53,6 +54,7 @@ void get_mla_metadata_v1(
     const bool                          fast_mode,
     const int32_t                       topk,
     const int32_t                       max_split_per_batch,
+    const bool                          intra_batch_mode,
     const std::optional<at::ScalarType> dtype_q,
     const std::optional<at::ScalarType> dtype_kv)
 {
@@ -87,6 +89,26 @@ void get_mla_metadata_v1(
             max_split_per_batch,
             q_dtype,
             kv_dtype,
+            work_metadata_ptrs,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map);
+    }
+    else if (intra_batch_mode)
+    {
+        get_mla_metadata_v1_0_device(
+            seqlens_qo_indptr,
+            seqlens_kv_indptr,
+            num_heads_per_head_k,
+            num_heads_k,
+            is_causal,
+            kv_granularity,
+            max_seqlen_qo,
+            uni_seqlen_qo,
+            max_split_per_batch,
+            q_dtype,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,
@@ -145,7 +167,8 @@ std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
 
 void get_pa_metadata_v1(
     const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
-    const torch::Tensor& pages_kv_indptr,     // [batch size + 1]
+    const torch::Tensor& pages_kv_indptr,       // [batch size + 1]
+    const torch::Tensor& context_lens,          // [batch size]
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
     const bool           is_causal,
@@ -156,6 +179,7 @@ void get_pa_metadata_v1(
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map,
     const int32_t        kv_granularity,
+    const int32_t        block_size,
     const int32_t        max_seqlen_qo,
     const int32_t        uni_seqlen_qo,
     const bool           fast_mode,
@@ -178,10 +202,12 @@ void get_pa_metadata_v1(
     get_pa_metadata_v1_2_device(
         seqlens_qo_indptr,
         pages_kv_indptr,
+        context_lens,
         num_heads_per_head_k,
         num_heads_k,
         is_causal,
         kv_granularity,
+        block_size,
         max_seqlen_qo,
         uni_seqlen_qo,
         topk,
