@@ -153,6 +153,8 @@ if args.attention_type == 'sage':
     else:
         F.scaled_dot_product_attention = attn_fn
 # TODO: add AMD fa2 and fa3 Triton kernels
+elif args.attention_type == 'spda':
+    raise NotImplementedError("AMD sdpa Triton kernel is not yet supported")
 elif args.attention_type == 'fa3':
     raise NotImplementedError("AMD fa3 Triton kernel is not yet supported")
 #     from sageattention.fa3_wrapper import fa3
@@ -213,10 +215,12 @@ elif args.attention_type == 'sagev1_fa3':
     if args.save_inputs:
         # 0 means unlimited
         max_caps = args.max_captures if args.max_captures > 0 else None
-        _capture_wrapper = InputCaptureWrapper(fa3_fp8_wrapper, args.input_dir, name="_sagev1_fa3", max_captures=max_caps)
+        _capture_wrapper = InputCaptureWrapper(sagev1_fa3_wrapper, args.input_dir, name="_sagev1_fa3", max_captures=max_caps)
         F.scaled_dot_product_attention = _capture_wrapper
     else:
         F.scaled_dot_product_attention = sagev1_fa3_wrapper
+else:
+    raise ValueError(f"Attention type {args.attention_type} not supported")
 
 prompt = "A panda, dressed in a small, red jacket and a tiny hat, sits on a wooden stool in a serene bamboo forest. The panda's fluffy paws strum a miniature acoustic guitar, producing soft, melodic tunes. Nearby, a few other pandas gather, watching curiously and some clapping in rhythm. Sunlight filters through the tall bamboo, casting a gentle glow on the scene. The panda's face is expressive, showing concentration and joy as it plays. The background includes a small, flowing stream and vibrant green foliage, enhancing the peaceful and magical atmosphere of this unique musical performance."
 
