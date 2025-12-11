@@ -173,8 +173,6 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     {
                         work_info.partial_qo_loc                       = -1;
                         params.p_reduce_indptr[global_qo_tile_idx + 1] = last_reduce_indptr;
-                        // params.p_reduce_final_map[global_qo_tile_idx * 2] = -1;
-                        // params.p_reduce_final_map[global_qo_tile_idx * 2 + 1] = -2;
                     }
 
                     p_work_info_set[num_works + qo_tile_idx] = work_info;
