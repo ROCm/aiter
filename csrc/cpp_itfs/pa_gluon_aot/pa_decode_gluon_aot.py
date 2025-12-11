@@ -4,9 +4,9 @@ import shutil
 import subprocess
 from pathlib import Path
 from jinja2 import Template
-import triton
-import aiter
 import torch
+import aiter
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 import triton
 import triton.language as tl
 
@@ -533,6 +533,10 @@ def pa_decode_gluon_aot(
     - For FP8 computation, query_scale and key_scale/value_scale are required
     - For BF16/FP16 computation, scales can be None
     """
+    assert arch_info.get_arch() in (
+        "gfx942",
+    ), f"pa_decode_gluon only supports gfx942 (CDNA3) now, but got {arch_info.get_arch()}"
+
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]

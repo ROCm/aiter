@@ -9,6 +9,7 @@ import math
 from typing import Optional, Dict, Tuple
 import torch
 import aiter
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 import triton
 import triton.language as tl
@@ -2568,6 +2569,9 @@ def pa_decode_gluon(
         raise RuntimeError(
             "This version triton is not support gluon jit mode, please upgrade to 3.5.0 or higher!"
         )
+    assert arch_info.get_arch() in (
+        "gfx942",
+    ), f"pa_decode_gluon only supports gfx942 (CDNA3) now, but got {arch_info.get_arch()}"
 
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
