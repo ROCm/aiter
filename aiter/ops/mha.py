@@ -963,6 +963,9 @@ def cmdGenFunc_mha_batch_prefill(
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
     # causal=true is the same as causal=false in this case
@@ -1007,6 +1010,13 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_dropout"
         filter_fwd += "_dropout*"
+    if q_descale is None or k_descale is None or v_descale is None:
+        md_name += "_nqscale"
+        filter_fwd += "_nqscale*"
+    else:
+        # only support per-tensor quantization for now
+        md_name += "_pertensor"
+        filter_fwd += "_pertensor*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -2570,6 +2580,9 @@ def mha_batch_prefill_fake_tensors(
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2635,6 +2648,9 @@ def mha_batch_prefill(
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
