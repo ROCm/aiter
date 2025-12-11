@@ -104,6 +104,7 @@ def fused_moe(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    splitk=0,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -236,6 +237,7 @@ def fused_moe_(
         intermediate_pad,
         bias1,
         bias2,
+        get_padded_M(M),  #only used in 2stage
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -472,6 +474,29 @@ def get_block_size_M(token, topk, expert, inter_dim):
     return sorted(tmp, key=lambda x: x[:2])[0][-1]
 
 
+@functools.lru_cache(maxsize=2048)
+def get_ksplit(token, topk, expert, inter_dim, model_dim):
+    #only for moe_blk gemm1 a8w8 decode scenario
+    if (token * topk > expert):
+        return 0
+    cu_num = get_cu_num()
+    tileN = 128
+
+    tgM = token * topk #decode tile num
+    tgN = (inter_dim * 2 + tileN - 1) // tileN
+
+    tg_num = tgN * tgM
+    #if all cu already active
+    if (tg_num >= cu_num):
+        return 0
+    tilek = 256
+    split_max = (cu_num + tg_num - 1) // tg_num
+    #at least split = 2
+    for i in reversed(range(2, split_max+1)):
+        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
+            return i
+    return 0
+
 cfg_2stages = None
 # fmt: off
 fused_moe_1stage_dict = {
@@ -551,6 +576,7 @@ def get_2stage_cfgs(
     intermediate_pad,
     bias1,
     bias2,
+    token_real,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -654,11 +680,21 @@ def get_2stage_cfgs(
             BLOCK_SIZE_M
             if run_1stage
             else (
-                64
+                ( 64 if token > 32 else 16 )
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
         )
+        ksplit = (
+            ksplit
+            if (run_1stage)
+            else (
+                get_ksplit(token_real, topk, expert, inter_dim, model_dim)
+                if q_type == QuantType.per_1x128
+                else ksplit
+            )
+        )
+
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
@@ -718,10 +754,11 @@ def get_2stage_cfgs(
     ):
         return MOEMetadata(
             functools.partial(
-                aiter.ck_moe_stage1_fwd,
+                ck_moe_stage1,
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
+                splitk=ksplit
             ),
             functools.partial(
                 aiter.ck_moe_stage2_fwd,
@@ -811,6 +848,7 @@ def fused_moe_2stages(
         intermediate_pad,
         bias1,
         bias2,
+        token_num,
     )
     if (
         quant_type == QuantType.per_1x32
@@ -1288,6 +1326,52 @@ def torch_moe_stage2(
     if doweight:
         out = out * topk_weights.view(token_num, -1, 1)
     return out.sum(1).to(dtype)
+
+def ck_moe_stage1(
+    hidden_states,
+    w1,  # [E, inter_dim*2, model_dim]
+    w2,  # [E, model_dim, inter_dim]
+    sorted_token_ids,  # [max_num_tokens_padded]
+    sorted_expert_ids,  # [max_num_m_blocks]
+    num_valid_ids,  # [1]
+    out,
+    topk,
+    block_m,
+    a1_scale,
+    w1_scale,
+    kernelName="",
+    sorted_weights = None,
+    quant_type=aiter.QuantType.No,
+    activation=ActivationType.Gelu,
+    splitk=1,
+):
+    token_num = hidden_states.shape[0]
+    tmp_out = torch.zeros((token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device = out.device) if splitk > 1 else out
+    aiter.ck_moe_stage1_fwd(
+        hidden_states,
+        w1,
+        w2,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        tmp_out,
+        topk,
+        kernelName,
+        w1_scale,
+        a1_scale,
+        block_m,
+        sorted_weights,
+        quant_type,
+        activation,
+        splitk,
+        out.dtype,
+    )
+    if splitk > 1:
+        if activation == ActivationType.Silu:
+            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32).to(out.dtype))
+        else:
+            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32).to(out.dtype))
+    return out
 
 
 def cktile_moe_stage1(
