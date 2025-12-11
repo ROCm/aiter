@@ -39,42 +39,6 @@ def get_evaluation_unit(metric):
         raise NotImplementedError(f"{metric} is not supported")
 
 
-def get_evaluation_label(metric, space=False, prefix=None, only_unit=False):
-    """
-    Utility function for returning a column label given the evaluation metric
-
-    Args:
-        metric (str): User-provided metric to produce a label for
-        space (bool): Whether to use a space or hyphen delimiter
-        prefix (Optional[str]): Optional prefix to append to the label
-        only_unit (bool): Whether only units are included in the label
-                               (ex: 'TFLOPS' instead of 'Throughput_(TFLOPS)')
-                               (ex: 'fwd(TFLOPS)' instead of 'fwd_Throughput_(TFLOPS)')
-    """
-
-    if only_unit:
-        if prefix:
-            return f"{prefix}({get_evaluation_unit(metric)})"
-        else:
-            return get_evaluation_unit(metric)
-    if space:
-        return (
-            (prefix + " " if prefix else "")
-            + metric.capitalize()
-            + " ("
-            + get_evaluation_unit(metric)
-            + ")"
-        )
-    else:
-        return (
-            (prefix + "_" if prefix else "")
-            + metric.capitalize()
-            + "_("
-            + get_evaluation_unit(metric)
-            + ")"
-        )
-
-
 def get_torch_activation_from_str(activation: str):
     """
     Utility function for returning PyTorch analogues for the given activation function.
@@ -120,19 +84,18 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
     else:
         x_vals_list = get_x_vals(dims=len(x_names), args=args)
 
-    ylabel = get_evaluation_label(args.metric, space=True)
+    ylabel = get_evaluation_unit(args.metric)
 
+    line_names = []
+    line_vals = []
     if not args.bench_torch:
-        line_vals = [get_evaluation_unit(args.metric)]
-        line_names = [
-            get_evaluation_label(args.metric, only_unit=(args.metric == "throughput"))
-        ]
+        line_vals.append(args.metric)
+        line_names.append(args.metric)
     else:
-        line_vals = ["triton", "torch"]
-        line_names = [
-            get_evaluation_label(args.metric, prefix="triton"),
-            get_evaluation_label(args.metric, prefix="torch"),
-        ]
+        line_vals.append("triton")
+        line_names.append(f"triton_{args.metric}")
+        line_vals.append("torch")
+        line_names.append(f"torch_{args.metric}")
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
@@ -172,28 +135,28 @@ def get_gemm_model_benchmark_object(
         args.fc2 = True
     x_vals_list = model_benchmark_shapes_fn(args)
 
-    ylabel = get_evaluation_label(args.metric, space=True)
+    ylabel = get_evaluation_unit(args.metric)
 
     line_names = []
     line_vals = []
     if args.fc1:
         if not args.bench_torch:
-            line_names.append(get_evaluation_label(args.metric, prefix="fc1"))
+            line_names.append(f"fc1_{args.metric}")
             line_vals.append(("triton", "fc1"))
         else:
-            line_names.append(get_evaluation_label(args.metric, prefix="triton_fc1"))
             line_vals.append(("triton", "fc1"))
-            line_names.append(get_evaluation_label(args.metric, prefix="torch_fc1"))
+            line_names.append(f"triton_fc1_{args.metric}")
             line_vals.append(("torch", "fc1"))
+            line_names.append(f"torch_fc1_{args.metric}")
     if args.fc2:
         if not args.bench_torch:
-            line_names.append(get_evaluation_label(args.metric, prefix="fc2"))
+            line_names.append(f"fc2_{args.metric}")
             line_vals.append(("triton", "fc2"))
         else:
-            line_names.append(get_evaluation_label(args.metric, prefix="triton_fc2"))
             line_vals.append(("triton", "fc2"))
-            line_names.append(get_evaluation_label(args.metric, prefix="torch_fc2"))
+            line_names.append(f"triton_fc2_{args.metric}")
             line_vals.append(("torch", "fc2"))
+            line_names.append(f"torch_fc2_{args.metric}")
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(

@@ -11,7 +11,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
     print_vgpr,
     get_caller_name_no_ext,
-    get_evaluation_label,
+    get_evaluation_unit,
 )
 
 
@@ -184,16 +184,14 @@ def run_benchmark(args):
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
     if print_time:
-        line_names = [get_evaluation_label("time")]
+        line_names = ["time"]
         line_vals = ["time"]
     else:
-        line_names = [
-            get_evaluation_label("time"),
-            get_evaluation_label("throughput", only_unit=True),
-            get_evaluation_label("bandwidth"),
-        ]
+        line_names = ["time", "throughput", "bandwidth"]
         line_vals = ["time", "throughput", "bandwidth"]
 
+    # FIXME: Refer to the FIXME comment in op_tests/op_benchmarks/triton/bench_batch_prefill.py"
+    # to understand the problem here.
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
@@ -201,9 +199,9 @@ def run_benchmark(args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
-        ylabel=f"{get_evaluation_label("time", space=True)} / "
-        + f"{get_evaluation_label("throughput", space=True)} / "
-        + f"{get_evaluation_label("bandwidth", space=True)}",
+        ylabel=f"{get_evaluation_unit("time")} / "
+        + f"{get_evaluation_unit("throughput")} / "
+        + f"{get_evaluation_unit("bandwidth")}",
         plot_name=get_caller_name_no_ext(),
         args={},
     )

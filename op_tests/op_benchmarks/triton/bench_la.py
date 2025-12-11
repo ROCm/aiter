@@ -8,7 +8,7 @@ from aiter.ops.triton.lean_atten import (
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
-    get_evaluation_label,
+    get_evaluation_unit,
 )
 import torch
 
@@ -290,9 +290,9 @@ configs.append(
         ],
         line_arg="provider",
         line_vals=["triton"],
-        line_names=[get_evaluation_label("time", prefix="triton")],
+        line_names=["triton_time"],
         # styles=[('red', '-'), ('blue', '-')],
-        ylabel=get_evaluation_label("time", space=True),
+        ylabel=get_evaluation_unit("time"),
         plot_name=get_caller_name_no_ext(),
         args={
             # "causal": causal,

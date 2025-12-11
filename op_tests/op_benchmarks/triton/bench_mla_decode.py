@@ -2,11 +2,11 @@ import triton
 from aiter.ops.triton.mla_decode_rope import decode_attention_fwd_grouped_rope
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_unit,
     get_model_configs,
     get_available_models,
     print_vgpr,
     get_caller_name_no_ext,
-    get_evaluation_label,
 )
 import torch
 import argparse
@@ -67,7 +67,7 @@ def benchmark(args):
         x_names, x_vals_list = model_benchmark_configs(args)
 
     line_vals = ["mla_decode_fwd"]
-    line_names = [get_evaluation_label("time", prefix="mla_decode_fwd")]
+    line_names = ["mla_decode_fwd_time"]
 
     configs.append(
         triton.testing.Benchmark(
@@ -77,7 +77,7 @@ def benchmark(args):
             line_vals=line_vals,
             line_names=line_names,
             styles=[("red", "-"), ("green", "-")],
-            ylabel=get_evaluation_label("time", space=True),
+            ylabel=get_evaluation_unit("time"),
             plot_name=get_caller_name_no_ext(),
             args={"sm_scale": 1.0, "logit_cap": 0.0, "device": args.device},
         )

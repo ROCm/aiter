@@ -15,7 +15,6 @@ import triton
 from triton.testing import runtime
 from aiter.ops.triton.topk import topk as triton_topk
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_evaluation_label,
     get_evaluation_unit,
     get_model_configs,
     get_available_models,
@@ -155,11 +154,11 @@ def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None
         line_arg="provider",
         line_vals=["triton", "torch"],
         line_names=[
-            get_evaluation_label("latency", prefix="triton"),
-            get_evaluation_label("latency", prefix="torch"),
+            "triton_latency",
+            "torch_latency",
         ],
         styles=[("blue", "-"), ("green", "-")],
-        ylabel=get_evaluation_label("latency", space=True),
+        ylabel=get_evaluation_unit("latency"),
         plot_name="topk_latency",
         args={},
     )
@@ -197,11 +196,11 @@ def bench_latency(batch, provider, *, dim2: int, k: int):
         line_arg="provider",
         line_vals=["triton", "torch"],
         line_names=[
-            get_evaluation_label("memory", prefix="triton"),
-            get_evaluation_label("memory", prefix="torch"),
+            "triton_memory",
+            "torch_memory",
         ],
         styles=[("blue", "--"), ("green", "--")],
-        ylabel=get_evaluation_label("memory", space=True),
+        ylabel=get_evaluation_unit("memory"),
         plot_name="topk_memory",
         args={},
     )
@@ -273,8 +272,8 @@ def run_benchmark(args, x_vals_list):
     """
     x_names = ["M", "N", "topk"]
 
-    ylabel = get_evaluation_label(args.metric, space=True)
-    line_names = [get_evaluation_label(args.metric)]
+    ylabel = get_evaluation_unit(args.metric)
+    line_names = [args.metric]
     line_vals = [get_evaluation_unit(args.metric)]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,

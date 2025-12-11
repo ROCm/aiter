@@ -155,6 +155,14 @@ def run_benchmark(args):
     line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
 
+    # FIXME: The Triton benchmark infrastructure has been changed so that the provided
+    # 'ylabel' is appended to each of the column names in the output table.
+    # In this benchmark, the table would have columns like:
+    # - Time_(ms) (ms / TFLOPS / GB/s)
+    # - TFLOPS (ms / TFLOPS / GB/s)
+    # - Bandwidth_(GB/s) (ms / TFLOPS / GB/s)
+    # This is probably not the desired behavior, but Triton does not seem to support separate
+    # 'ylabel's for each of the provided line values.
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,

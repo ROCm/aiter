@@ -13,10 +13,10 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_unit,
     model_benchmark_shapes,
     get_gemm_shape_benchmark_object,
     print_vgpr,
-    get_evaluation_label,
 )
 import matplotlib.pyplot as plt
 
@@ -35,17 +35,17 @@ def get_gemm_model_benchmark_object(
         x_names = ["M", "hidden_dim", "intermediate_dim", "model_name"]
     x_vals_list = model_benchmark_shapes(args)
 
-    ylabel = get_evaluation_label(args.metric, space=True)
+    ylabel = get_evaluation_unit(args.metric)
 
     line_names = []
     line_vals = []
     if not args.bench_torch:
-        line_names.append(get_evaluation_label(args.metric, prefix="fc1"))
+        line_names.append(f"fc1_{args.metric}")
         line_vals.append(("triton", "fc1"))
     else:
-        line_names.append(get_evaluation_label(args.metric, prefix="triton_fc1"))
+        line_names.append(f"triton_fc1_{args.metric}")
         line_vals.append(("triton", "fc1"))
-        line_names.append(get_evaluation_label(args.metric, prefix="torch_fc1"))
+        line_names.append(f"torch_fc1_{args.metric}")
         line_vals.append(("torch", "fc1"))
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]

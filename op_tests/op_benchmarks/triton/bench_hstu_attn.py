@@ -13,7 +13,6 @@ from op_tests.triton_tests.test_hstu_attn import (
     get_bytes,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_evaluation_label,
     get_evaluation_unit,
     print_vgpr,
     get_caller_name_no_ext,
@@ -59,11 +58,9 @@ def run_benchmark(args):
     else:
         x_val_list = get_x_values()
 
-    ylabel = get_evaluation_label(args.metric, space=True)
+    ylabel = get_evaluation_unit(args.metric)
 
-    line_names = [
-        get_evaluation_label(args.metric, only_unit=(args.metric == "throughput"))
-    ]
+    line_names = [args.metric]
     line_vals = [get_evaluation_unit(args.metric)]
     modes = [args.mode]
     if args.mode == "both":
