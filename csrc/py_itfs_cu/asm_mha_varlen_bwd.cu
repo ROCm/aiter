@@ -367,8 +367,6 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
                                 batch_size,
                                 max_seqlen_q, // max_seqlen_q
                                 max_seqlen_k, // max_seqlen_k
-                                head_size_q, // hdim_q
-                                head_size_v, // hdim_v
                                 num_heads, // nhead
                                 num_heads_k, // nhead_k
                                 softmax_scale,
@@ -417,36 +415,6 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
                                 p_undrop,
                                 drop_seed_offset};
         }();
-            get_asm_fmha_varlen_bwd_args(
-                mask,
-                batch_size,
-                max_seqlen_q,
-                max_seqlen_k,
-                num_heads,
-                num_heads_k,
-                head_size_q,
-                head_size_v,
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                cu_seqlens_q_padded,
-                cu_seqlens_k_padded,
-                alibi_slopes_,
-                out,
-                softmax_lse,
-                dout,
-                dq_accum,
-                softmax_d,
-                dq,
-                dk_expanded,
-                dv_expanded,
-                softmax_scale,
-                p_dropout,
-                drop_seed_offset,
-                is_v3_atomic_fp32);
-
 
         float t = aiter::mha_bwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_bwd");

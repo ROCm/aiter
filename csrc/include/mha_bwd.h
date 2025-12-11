@@ -13,7 +13,7 @@ namespace aiter {
 struct mha_bwd_args {
     // aiter args
     int mask_type; // 0: no mask   1: top_left_causal   2: bottom_right_causal   3: sliding_window
-    bool use_asm_v3; // 0: default(asm first)   1: force asm   2: force ck
+    bool use_asm_v3;
     bool v3_atomic_fp32;
     int v3_bf16_cvt;
     bool v3_api_check;

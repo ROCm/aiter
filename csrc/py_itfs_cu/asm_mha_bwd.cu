@@ -31,6 +31,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                     std::optional<const at::Tensor> rng_state_,
                                     std::optional<at::Generator> gen_)
 {
+    std::cout << "is_v3_atomic_fp32: " << is_v3_atomic_fp32 << std::endl;
     if (is_causal) { window_size_right = 0; }
 
     bool is_dropout = p_dropout > 0.0;
@@ -46,6 +47,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    std::cout << "q_dtype_str: " << q_dtype_str << std::endl;
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);

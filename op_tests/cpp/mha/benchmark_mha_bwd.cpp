@@ -679,7 +679,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     float gb_per_sec = num_byte / 1.E6 / ave_time;
 
-    std::cout << std::setprecision(3) << ave_time << " ms, "
+    std::cout << std::fixed << ", " << std::setprecision(3) << ave_time << " ms, "
               << std::setprecision(2) << tflops << " TFlops, " << std::setprecision(2) << gb_per_sec
               << " GB/s" << std::flush;
 

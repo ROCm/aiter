@@ -353,8 +353,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 batch_size,
                                 max_seqlen_q, // max_seqlen_q
                                 max_seqlen_k, // max_seqlen_k
-                                head_size_q, // hdim_q
-                                head_size_v, // hdim_v
                                 num_heads, // nhead_q
                                 num_heads_k, // nhead_k
                                 softmax_scale,

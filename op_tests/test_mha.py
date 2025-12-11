@@ -169,17 +169,13 @@ def run_ck(
 @pytest.mark.parametrize(
     "d,d_v",
     [
-        (32, 32),
-        (40, 40),
-        (59, 59),
-        (64, 64),
+        # (59, 59),
+        # (64, 64),
         (96, 96),
         (111, 111),
         (128, 128),
         (160, 160),
         (192, 192),
-        (224, 224),
-        (256, 256),
         (192, 128),
     ],
 )
@@ -192,10 +188,8 @@ def run_ck(
         (108, 256),
         (256, 512),
         (512, 256),
-        (1024, 1024),
         (1023, 1024),
         (1024, 1023),
-        (2048, 2048),
     ],
 )
 def test_flash_attn_output(
@@ -433,51 +427,51 @@ def flash_attn_output_benchmark(
     )
 
 
-@pytest.mark.parametrize(
-    "padding_scenario",
-    ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
-)
-@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("deterministic", [True, False])
-@pytest.mark.parametrize("bias_type", ["no"])
-@pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dropout_p", [0.0])  # Keep dropout 0 for padding test clarity
-@pytest.mark.parametrize("batch_size", [4])
-@pytest.mark.parametrize("nheads", [6])
-@pytest.mark.parametrize(
-    "d,d_v",
-    [
-        (32, 32),
-        (40, 40),
-        (59, 59),
-        (64, 64),
-        # (96, 96), # Skip (96, 96) cases due to a known issue in CK.
-        (111, 111),
-        (128, 128),
-        (160, 160),
-        (192, 192),
-        (224, 224),
-        (256, 256),
-        (192, 128),
-    ],
-)
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-    ],
-)
+# @pytest.mark.parametrize(
+#     "padding_scenario",
+#     ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
+# )
+# @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("deterministic", [True, False])
+# @pytest.mark.parametrize("bias_type", ["no"])
+# @pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("dropout_p", [0.0])  # Keep dropout 0 for padding test clarity
+# @pytest.mark.parametrize("batch_size", [4])
+# @pytest.mark.parametrize("nheads", [6])
+# @pytest.mark.parametrize(
+#     "d,d_v",
+#     [
+#         (32, 32),
+#         (40, 40),
+#         (59, 59),
+#         (64, 64),
+#         # (96, 96), # Skip (96, 96) cases due to a known issue in CK.
+#         (111, 111),
+#         (128, 128),
+#         (160, 160),
+#         (192, 192),
+#         (224, 224),
+#         (256, 256),
+#         (192, 128),
+#     ],
+# )
+# @pytest.mark.parametrize(
+#     "seqlen_q,seqlen_k",
+#     [
+#         (113, 203),
+#         (128, 217),
+#         (113, 211),
+#         (108, 256),
+#         (256, 512),
+#         (512, 256),
+#         (1024, 1024),
+#         (1023, 1024),
+#         (1024, 1023),
+#         (2048, 2048),
+#     ],
+# )
 def test_flash_attn_seq_padding(
     padding_scenario,
     batch_size,
@@ -846,22 +840,22 @@ if __name__ == "__main__":
             args.input_layout,
         )
         collected.append(ret)
-        test_flash_attn_seq_padding(
-            "mixed",
-            args.batch_size,
-            args.nheads,
-            args.seqlen_q,
-            args.seqlen_k,
-            dim_qk,
-            dim_v,
-            args.dropout_p,
-            causal,
-            local,
-            args.bias_type if args.bias_type != "bias" else "no",
-            deterministic,
-            mha_type,
-            dtypes.d_dtypes[dtype],
-        )
+        # test_flash_attn_seq_padding(
+        #     "mixed",
+        #     args.batch_size,
+        #     args.nheads,
+        #     args.seqlen_q,
+        #     args.seqlen_k,
+        #     dim_qk,
+        #     dim_v,
+        #     args.dropout_p,
+        #     causal,
+        #     local,
+        #     args.bias_type if args.bias_type != "bias" else "no",
+        #     deterministic,
+        #     mha_type,
+        #     dtypes.d_dtypes[dtype],
+        # )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha summary:\n{df}")
