@@ -13,7 +13,23 @@ import argparse
 import pandas as pd
 import os
 import numpy as np
-import logging
+import random
+import inspect
+import subprocess
+
+torch.set_printoptions(threshold=100000)  # 设置一个很大的阈值，防止省略
+
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    np.random.seed(seed)  # Numpy module.
+    random.seed(seed)  # Python random module.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
 
 from aiter.fused_moe import (
     fused_topk,
@@ -266,10 +282,57 @@ def test_fmoe(
         return 1 - sim
 
     logits_diff = calc_diff(out2_ref, out2_ck)
-    if logits_diff > 1e-3:
-        logging.warning(
-            f"logits_diff: {logits_diff} is too large, please check the implementation"
-        )
+    if logits_diff >= 1e-3:
+        print(f"logits_diff ({logits_diff}) >= 1e-3, saving inputs to fmoe_inputs.pt")
+
+        fused_moe_source = inspect.getsource(fused_moe)
+        fused_moe_file = inspect.getfile(fused_moe)
+        inputs_to_save = {
+            "fused_moe_name": fused_moe.__name__,
+            "fused_moe_file": fused_moe_file,
+            "fused_moe_source": fused_moe_source,
+            "input": input,
+            "w1_qt_aiter": w1_qt_aiter,
+            "w2_qt_aiter": w2_qt_aiter,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "w1_scale": w1_scale_aiter,
+            "w2_scale": w2_scale_aiter,
+            "quant_type": qType,
+            "activation": actType,
+            "doweight_stage1": doweight_stage1,
+            "intermediate_pad": intermediate_pad,
+            "hidden_pad": hidden_pad,
+            "bias1": exp_bias1_aiter,
+            "bias2": exp_bias2_aiter,
+            "out2_ref": out2_ref,
+            "out2_ck": out2_ck,
+        }
+        print("Saved variables' information (generating repr for log restoration):")
+        # 为了能从日志还原，我们打印成类似Python字典的格式
+        print("{")
+        for k, v in inputs_to_save.items():
+            if k == "fused_moe_source":
+                # 源代码含有换行符，需要特殊处理成Python多行字符串
+                print(f'    "{k}": """{v}""",')
+                continue
+
+            # 使用 repr() 来获得可以被Python直接解析的字符串表示
+            print(f'    "{k}": {repr(v)},')
+        print("}")
+
+        print("\n" + "=" * 20 + " rocm-smi output " + "=" * 20)
+        try:
+            result = subprocess.run(
+                ["rocm-smi"], capture_output=True, text=True, check=True
+            )
+            print(result.stdout)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"Failed to run 'rocm-smi': {e}")
+        print("=" * (40 + len(" rocm-smi output ")) + "\n")
+
+        torch.save(inputs_to_save, "fmoe_inputs.pt")
+    assert logits_diff < 1e-3
 
     return {"us": us2, "err": err}
 
@@ -410,6 +473,10 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+# Set a fixed seed for reproducibility
+set_seed(1)
+
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
 else:
