@@ -188,9 +188,11 @@ def bench_mlp(
     fpath = Path(tempfile.mktemp())
     M, K = xg.shape
     N, K = wg.shape
+    # Reduce blocksize to prevent LDS out of resource limits
     config = _get_config(M, N, K)
-    config["BLOCK_SIZE_N"] = 64
-    config["BLOCK_SIZE_K"] = 128
+    config["BLOCK_SIZE_M"] = 128 if config["BLOCK_SIZE_M"] > 128 else config["BLOCK_SIZE_M"]
+    config["BLOCK_SIZE_N"] = 128 if config["BLOCK_SIZE_N"] > 128 else config["BLOCK_SIZE_N"]
+    config["BLOCK_SIZE_K"] = 128 if config["BLOCK_SIZE_K"] > 128 else config["BLOCK_SIZE_K"]
     proton.start(str(fpath), hook="triton")
     for i in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg, config=config)

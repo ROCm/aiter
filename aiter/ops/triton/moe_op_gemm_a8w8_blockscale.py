@@ -70,10 +70,10 @@ def allocate_output(
 
 def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
-    group_size_m = 1
-    group_m = 128
-    group_k = 128
-    group_n = 128
+    group_m = 1
+    blockscale_m = 128
+    blockscale_k = 128
+    blockscale_n = 128
     num_xcds = 8
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
@@ -102,12 +102,12 @@ def get_kernel_config(m, n, k, routing_data):
         "block_m": block_m,
         "block_n": block_n,
         "block_k": block_k,
-        "group_size_m": group_size_m,
+        "group_m": group_m,
         "num_warps": num_warps,
         "num_stages": num_stages,
-        "group_m": group_m,
-        "group_n": group_n,
-        "group_k": group_k,
+        "blockscale_m": blockscale_m,
+        "blockscale_n": blockscale_n,
+        "blockscale_k": blockscale_k,
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
         "waves_per_eu": 1,
@@ -123,7 +123,7 @@ def reduce_grouped(
     out: torch.Tensor,
     apply_swiglu=False,
     alpha=1.0,
-    limit=1.0,
+    limit=None,
     reduction_n=1,
     out_dtype: bool = None,
 ):
@@ -212,7 +212,7 @@ def moe_gemm_a8w8_blockscale(
     out_dtype=torch.bfloat16,
     apply_swiglu=False,
     alpha=1.0,
-    limit=1.0,
+    limit=None,
     unpadded_N=None,
     unpadded_K=None,
     per_row_x_scale=False,
@@ -333,10 +333,10 @@ def moe_gemm_a8w8_blockscale(
         config["block_m"],
         config["block_n"],
         config["block_k"],
-        config["group_size_m"],
         config["group_m"],
-        config["group_k"],
-        config["group_n"],
+        config["blockscale_m"],
+        config["blockscale_n"],
+        config["blockscale_k"],
         SPLIT_K=config["split_k"],
         EVEN_K=K % config["block_k"] == 0,
         MASK_K_LIMIT=K % config["block_k"],
@@ -396,7 +396,7 @@ def moe_gemm_torch(
     gammas=None,
     apply_swiglu=False,
     alpha=1.0,
-    limit=1.0,
+    limit=None,
 ):
     assert x.dtype.itemsize > 1
     assert w.dtype.itemsize > 1

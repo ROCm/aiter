@@ -197,10 +197,10 @@ def _moe_gemm_a8w8_blockscale(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
     GROUP_M: tl.constexpr,
-    GROUP_K: tl.constexpr,
-    GROUP_N: tl.constexpr,
+    BLOCKSCALE_M: tl.constexpr,
+    BLOCKSCALE_N: tl.constexpr,
+    BLOCKSCALE_K: tl.constexpr,
     EVEN_K: tl.constexpr,
     MASK_K_LIMIT: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -245,7 +245,7 @@ def _moe_gemm_a8w8_blockscale(
         tl.assume(stride_b_e >= 0)
     tl.assume(grid_m >= 0)
     tl.assume(grid_n >= 0)
-    tl.static_assert(GROUP_K == BLOCK_K, "This kernel assumes one K-block per tile")
+    tl.static_assert(BLOCKSCALE_K == BLOCK_K, "This kernel assumes one K-block per tile")
 
     is_x_blockscale: tl.constexpr = XBlockScale is not None
     is_w_blockscale: tl.constexpr = WBlockScale is not None
@@ -269,7 +269,7 @@ def _moe_gemm_a8w8_blockscale(
     pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
     pid_k = pid_mnk % SPLIT_K
     pid_mn = pid_mnk // SPLIT_K
-    pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, GROUP_SIZE_M)
+    pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, GROUP_M)
     # For split-k, advance to the output k slice
     if SPLIT_K > 1:
         Y += pid_k.to(index_type) * stride_y_k
@@ -287,7 +287,7 @@ def _moe_gemm_a8w8_blockscale(
 
     # A pointers
     splitk_block_size = tl.cdiv(K, SPLIT_K)
-    offs_k_scale = (pid_k * splitk_block_size) // GROUP_K
+    offs_k_scale = (pid_k * splitk_block_size) // BLOCKSCALE_K
     offs_k = tl.arange(0, BLOCK_K)
     offs_k_split = pid_k * splitk_block_size + offs_k
 
@@ -327,7 +327,7 @@ def _moe_gemm_a8w8_blockscale(
             )
         else:
             # XScale: [M_blocks, K_blocks]
-            offs_x_scale_m = offs_x_m // GROUP_M
+            offs_x_scale_m = offs_x_m // BLOCKSCALE_M
             XScalePtrs = (
                 XBlockScale
                 + offs_x_scale_m.to(index_type) * stride_x_bs_m
@@ -336,13 +336,13 @@ def _moe_gemm_a8w8_blockscale(
 
     if is_w_blockscale:
         WBlockScale += expt_id * stride_w_bs_e
-        offs_w_scale_n = offs_w_n // GROUP_N
+        offs_w_scale_n = offs_w_n // BLOCKSCALE_N
         # WBlockScale: [K_blocks, N_blocks]
         WScalePtrs = (
             WBlockScale + offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n
         )
 
-    offs_ks_step = BLOCK_K // GROUP_K
+    offs_ks_step = BLOCK_K // BLOCKSCALE_K
     num_k_iter = tl.cdiv(splitk_block_size, BLOCK_K)
     # compute output
     x_scale = tl.full((BLOCK_M,), 1.0, dtype=tl.float32)
