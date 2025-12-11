@@ -19,7 +19,7 @@ class deepgemm_codegen:
         # self.b_dtype = b_dtype.upper()
         # self.c_dtype = c_dtype.upper()
         # self.quant_type = quant_type
-        assert (istune == False, "not surpport tuning!")
+        assert istune is False, "not support tuning!"
 
     def gen_instance(self, k: kernelInstance):
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT

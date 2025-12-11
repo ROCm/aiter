@@ -43,10 +43,7 @@ def getLogger():
 
 logger = getLogger()
 
-import importlib.util
 
-if importlib.util.find_spec("aiter_") is not None:
-    from aiter_ import *
 from .jit import core as core
 from .utility import dtypes as dtypes
 from .ops.enum import *
