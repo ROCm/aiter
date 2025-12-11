@@ -289,17 +289,12 @@ struct CommPtrs {
 template <int NRanks>
 struct SyncComm {
     __device__ __forceinline__ SyncComm(CommDeviceMeta<NRanks> &meta) {
-#pragma unroll
-        for (int r = 0; r < NRanks; ++r) {
-            barrier_flags[r] = meta.barrier_flag_ptrs[r];
-        }
         flag_ptr = ((int *)meta.sync_clock) + blockIdx.x;
         int rank = meta.rank;
-        __syncthreads();
         if (threadIdx.x < NRanks) {
             int target_rank = threadIdx.x;
-            target_flag = reinterpret_cast<int *>(barrier_flags[target_rank]) + blockIdx.x * NRanks + rank;
-            current_flag = reinterpret_cast<int *>(barrier_flags[rank]) + blockIdx.x * NRanks + target_rank;
+            target_flag = reinterpret_cast<int *>(meta.barrier_flag_ptrs[target_rank]) + blockIdx.x * NRanks + rank;
+            current_flag = reinterpret_cast<int *>(meta.barrier_flag_ptrs[rank]) + blockIdx.x * NRanks + target_rank;
         }
     }
 
@@ -318,7 +313,6 @@ struct SyncComm {
     }
 
     int *flag_ptr;
-    void *barrier_flags[NRanks];
     int *target_flag;
     int *current_flag;
 };
