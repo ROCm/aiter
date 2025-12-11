@@ -3,9 +3,10 @@
 # generate kernel instances to speed up compilation
 
 import argparse
+import binascii
+import glob
 from pathlib import Path
 from typing import Optional
-
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -13,12 +14,15 @@ FMHA_FWD_API_FILENAME = "asm_fmha_fwd_v3_gfx942.cpp"
 
 FMHA_FWD_KERNEL_HEADER = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.\n
-"""
-
-FMHA_FWD_API = """#include <hip/hip_fp16.h>
+#include <hip/hip_fp16.h>
 #include "mha_fwd.h"
 
+"""
+
+FMHA_FWD_API = """
 namespace aiter {
+
+#define mi300_or_mi308(name) std::pair<const void *, const void *>{&mi300_##name, &mi308_##name}
 
 // ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        BF16Cvt |
 template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtne"; };
@@ -49,32 +53,32 @@ template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      
 template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtz_group"; };
 
 // #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch        BF16Cvt |
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtne.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtna.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtz.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtne.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtna.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtz.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtne.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtna.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtz.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtne.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtna.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtz.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtne); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtna); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtz); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtne); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtna); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtz); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtne); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtna); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtz); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtne); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtna); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtz); };
 
 // #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        BF16Cvt | kIsGroupMode_ |
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtne_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtna_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtz_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtne_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtna_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtz_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtne_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtna_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtz_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtne_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtna_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtz_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtne_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtna_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtz_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtne_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtna_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_rtz_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtne_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtna_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtz_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtne_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtna_group); };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr auto fwd_v3_buf = mi300_or_mi308(fwd_hd128_bf16_causal_rtz_group); };
 
 // #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch        BF16Cvt |
 template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
@@ -104,25 +108,27 @@ template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,
 template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
 template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
 
+#undef mi300_or_mi308
+
 namespace gfx942{
 class fmha_fwd_v3_kernel
 {
     public:
-    fmha_fwd_v3_kernel(const char *name, const char *hsaco)
+    fmha_fwd_v3_kernel(const char *name, std::pair<const void *, const void *> hsacos)
     {
         int length = strlen(name);
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
-        std::string AITER_ASM_DIR = std::string(std::getenv("AITER_ASM_DIR")) + "fmha_v3_fwd/";
+        const void * hsaco = nullptr;
         uint32_t cu_num = get_num_cu_func();
         if (cu_num == 304) {
-            AITER_ASM_DIR += "MI300/";
+            hsaco = hsacos.first;
         } else if (cu_num == 80 || cu_num == 64) {
-            AITER_ASM_DIR += "MI308/";
+            hsaco = hsacos.second;
         } else {
             // TODO: return with error
             return;
         }
-        HIP_CALL(hipModuleLoad(&module, (AITER_ASM_DIR + hsaco).c_str()));
+        HIP_CALL(hipModuleLoadData(&module, hsaco));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }
 
@@ -549,15 +555,33 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
 """
 
 
+def transfer_hsaco(hsaco_path):
+    with open(hsaco_path, "rb") as f:
+        hsaco = f.read()
+    hsaco_hex = binascii.hexlify(hsaco).decode("utf-8")
+    return len(hsaco_hex), ", ".join(
+        [f"0x{x}{y}" for x, y in zip(hsaco_hex[::2], hsaco_hex[1::2])]
+    )
+
+
 def write_blobs(output_dir: Optional[str]) -> None:
     if output_dir is None:
         output_dir = Path(__file__).parent
     else:
         output_dir = Path(output_dir) / GEN_DIR
 
+    FMHA_HSACO_DATA = []
+
+    for prefix in ["mi300", "mi308"]:
+        for hsaco_path in glob.glob(f"{Path(__file__).parent}/{prefix.upper()}/*.co"):
+            bin_size, bin_data = transfer_hsaco(hsaco_path)
+            FMHA_HSACO_DATA.append(
+                f"static const unsigned char {prefix}_{Path(hsaco_path).stem}[{bin_size}] = {{ {bin_data} }};"
+            )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / FMHA_FWD_API_FILENAME).write_text(
-        FMHA_FWD_KERNEL_HEADER + FMHA_FWD_API
+        FMHA_FWD_KERNEL_HEADER + "\n".join(FMHA_HSACO_DATA) + FMHA_FWD_API
     )
 
 
