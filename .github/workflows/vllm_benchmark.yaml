@@ -94,7 +94,7 @@ jobs:
 
   vllm_benchmark:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-mi325-8gpu
+    runs-on: aiter-mi355-8gpu
     needs: build_vllm_image
     strategy:
       fail-fast: false
