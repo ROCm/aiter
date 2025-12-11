@@ -541,7 +541,7 @@ def moe_mxfp4_sort(
     assert (N_i // 2) % 2 == 0
     assert block_size % BLOCK_SIZE_M == 0
 
-    blockscale_e8m0_sorted = torch.empty(
+    blockscale_e8m0_sorted = torch.zeros(
         (
             triton.cdiv(M_o, BLOCK_SIZE_M),
             triton.cdiv(N_o, BLOCK_SIZE_N),

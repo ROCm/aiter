@@ -115,10 +115,12 @@ torch::Tensor
             xptr = "static_cast<float*>(x_scale.value().data_ptr())"
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
         elif k.QuantType == "1x32":
-            scaleGranA = "-1"
+            # scaleGranA = "-1"
+            scaleGranA = "1, 32"
             scaleGranB = "1, 32"
             biasGran = "1"
-            xptr = "nullptr"
+            # xptr = "nullptr"
+            xptr = "static_cast<float*>(x_scale.value().data_ptr())"
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
             biasptr = "static_cast<float*>(exp_bias.value().data_ptr())"
 
