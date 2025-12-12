@@ -96,6 +96,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     const int32_t average = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
                         Traits::kFixedOverheadNumBlocks;
     const int32_t reminder = std::max(sum_blocks - params.num_splits * average, 0);
+    if(lane_idx == 0) {
+        printf("==>PaMetadataV12Traits:%d,%d,%d,%d,%d,%d\n", Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2, Traits::kQoSplits, Traits::kUniSeqlenQo, Traits::kFixedOverheadNumBlocks, Traits::kIsSparse, Traits::kLdsBatchInfo);
+        printf("==>sum_blocks,%d,average,%d,reminder,%d\n", sum_blocks, average, reminder);
+    }
 
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
@@ -380,13 +384,13 @@ void dispatch_pa_metadata_v1_2_device(const PaMetadataV1KernelParameter& params,
 void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
                                  const torch::Tensor& pages_kv_indptr,   // [batch size + 1]
                                  const torch::Tensor& context_lens,      // [batch size]
-                                 const int32_t num_heads_per_head_k,
+                                 const int32_t num_heads_per_head_k,  // qhead_granularity
                                  const int32_t num_heads_k,
                                  const bool is_causal,
                                  const int32_t kv_granularity,
                                  const int32_t block_size,
                                  const int32_t max_seqlen_qo,
-                                 const int32_t ori_uni_seqlen_qo,
+                                 const int32_t ori_uni_seqlen_qo,  // qlen_granularity
                                  const int32_t topk,
                                  const int32_t max_split_per_batch,
                                  torch::Tensor& work_metadata_ptrs,
@@ -396,7 +400,7 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
                                  torch::Tensor& reduce_final_map,
                                  torch::Tensor& reduce_partial_map)
 {
-    constexpr int32_t kPackedQoLenPerWg = 128;
+    constexpr int32_t kPackedQoLenPerWg = 256;
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -405,7 +409,8 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
     hipGetDevice(&dev);
     hipGetDeviceProperties(&dev_prop, dev);
 
-    const int32_t num_clusters = dev_prop.multiProcessorCount;
+    // const int32_t num_clusters = dev_prop.multiProcessorCount;
+    const int32_t num_clusters = 2;
 
     int32_t num_batches    = context_lens.size(0);
     int32_t num_heads      = num_heads_k * num_heads_per_head_k;
@@ -432,23 +437,23 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
     params.num_cu                       = num_clusters;
     params.num_splits                   = num_splits;
     params.reduce_indptr_size           = reduce_indptr.size(0);
-    params.qhead_granularity            = num_heads_per_head_k;
-    params.qlen_granularity             = max_seqlen_qo;
-    params.kv_granularity               = kv_granularity;
+    params.qhead_granularity            = num_heads_per_head_k;  // prefill-1, decode-gqa
+    params.qlen_granularity             = ori_uni_seqlen_qo;     // prefill-tile_q, decode-max_qlen  // TODO: check
+    params.kv_granularity               = kv_granularity;        // max(block_size, tile_kv)
     params.kv_granularity_log2          = __builtin_ctz(kv_granularity);
     params.block_size                   = block_size;
     params.blocks_per_unit              = kv_granularity / block_size;
     params.uni_seqlen_qo                = uni_seqlen_qo;
-    params.ori_seqlen_qo                = ori_uni_seqlen_qo;
+    params.ori_seqlen_qo                = ori_uni_seqlen_qo;     // duplicate w/ qlen_granularity
     params.is_causal                    = is_causal;
     params.topk                         = topk;
     params.qk_batch_ratio               = qk_batch_ratio;
 
     // launch kernel
     MLA_METADATA_DISPATCHER(
-        max_seqlen_qo * num_heads_per_head_k,
-        kPackedQoLenPerWg,
-        params.uni_seqlen_qo,
+        max_seqlen_qo * params.qhead_granularity,  // MAX_PACKED_SEQLEN_QO
+        kPackedQoLenPerWg,                         // PACKED_QO_LEN_PER_WG
+        params.uni_seqlen_qo,                      
         topk,
         dispatch_pa_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
             params,
