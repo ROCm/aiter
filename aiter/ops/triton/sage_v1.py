@@ -43,6 +43,7 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
         pack_gqa: Optional[bool],
         deterministic: bool,
         sm_margin: int,
+        return_lse: bool = True,
     ):
         batch, seqlen_q, num_q_heads, head_dim = q.shape
         _, seqlen_k, num_kv_heads, _ = k.shape
@@ -94,6 +95,9 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
                 "sm_margin != 0 not supported in FP8 high-precision API"
             )
 
+        if q.requires_grad or k.requires_grad or v.requires_grad:
+            assert return_lse, f"in train mode, return_lse is expected to be True, got {return_lse}"
+
         # Call flash attention forward
         out, softmax_lse = sage_attn_1.fwd(
             q_int8,
@@ -130,7 +134,11 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
             1,
             None,
             sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+            return_lse,
         )
+
+        if not return_lse:
+            return out
 
         # Save tensors needed for backward
         ctx.save_for_backward(
@@ -183,6 +191,7 @@ def sage_attn_v1_wrapper_func(
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     sm_margin: int = 0,
+    inference_mode: bool = True,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -249,6 +258,7 @@ def sage_attn_v1_wrapper_func(
             "sm_margin != 0 not supported in Sage Attention v1 API"
         )
 
+    return_lse = (not inference_mode)
     return _SageAttnV1WrapperFunc.apply(
         q,
         k,
@@ -264,6 +274,7 @@ def sage_attn_v1_wrapper_func(
         pack_gqa,
         deterministic,
         sm_margin,
+        return_lse,
     )
 
 
@@ -284,6 +295,7 @@ def sage_attn_v1_func(
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     sm_margin: int = 0,
+    inference_mode: bool = True,
 ):
     """
     SageAttention v1.
@@ -352,6 +364,7 @@ def sage_attn_v1_func(
             "sm_margin != 0 not supported in FP8 high-precision API"
         )
 
+    return_lse = (not inference_mode)
     # Call flash attention forward
     out, _ = sage_attn_1.fwd(
         q,
@@ -388,6 +401,7 @@ def sage_attn_v1_func(
         1,
         None,
         sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+        return_lse,
     )
 
     return out

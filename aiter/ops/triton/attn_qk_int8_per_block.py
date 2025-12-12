@@ -247,7 +247,7 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
         stride_bz_q, stride_h_q, stride_seq_q,
         stride_bz_qo, stride_h_qo, stride_seq_qo,
         q_scale.stride(0), q_scale.stride(1),
-        sm_scale=(sm_scale * 1.44269504),
+        sm_scale=(sm_scale * 1.4426950408889634),
         C=head_dim, BLK=BLKQ
     )
 
