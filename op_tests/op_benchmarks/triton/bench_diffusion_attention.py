@@ -1,6 +1,8 @@
 from __future__ import annotations
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List, Dict, Any
 import torch
+import os
+import glob
 
 import sys
 import warnings
@@ -59,6 +61,32 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
 # test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
 import logging
 logging.getLogger().setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
+    """
+    Load captured input tensors from disk.
+    
+    Args:
+        input_dir: Directory containing captured .pt files
+        
+    Returns:
+        List of dictionaries containing q, k, v tensors and metadata
+    """
+    input_files = sorted(glob.glob(os.path.join(input_dir, "*_input_*.pt")))
+    if not input_files:
+        raise FileNotFoundError(f"No captured input files found in {input_dir}")
+    
+    inputs = []
+    for i, f in enumerate(input_files):
+        data = torch.load(f, weights_only=False)
+        inputs.append(data)
+        logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
+    
+    logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
+    return inputs
+
 
 # taken from mha_v3.py
 def fav3_fp8_forward_func(
@@ -291,6 +319,199 @@ def create_benchmark_configs(custom, args):
         )
     )
     return configs
+
+
+def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
+    """
+    Create triton.testing.Benchmark configurations from captured inputs.
+    
+    Captured inputs are in BHSD format (batch, heads, seqlen, dim).
+    """
+    # Extract x_vals from loaded inputs
+    x_vals_list = []
+    for i, inp in enumerate(inputs):
+        # Shape from BHSD format: (batch, heads, seqlen, dim)
+        q_shape = inp['q_shape']
+        batch = q_shape[0]
+        hq = q_shape[1]  # heads at index 1 in BHSD
+        seq_q = q_shape[2]  # seqlen at index 2
+        d_head = q_shape[3]
+        
+        k_shape = inp['k_shape']
+        hk = k_shape[1]
+        seq_k = k_shape[2]
+        
+        v_shape = inp['v_shape']
+        d_head_v = v_shape[3]
+        
+        x_vals_list.append((i, batch, hq, hk, seq_q, seq_k, d_head, d_head_v))
+    
+    x_names = ["INPUT_IDX", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
+    
+    # Determine line_vals based on metric
+    if args.metric == "all" or args.metric is None:
+        line_vals = ["time(ms)", "throughput(TFLOPS)", "bandwidth(GB/s)", "arithmetic_intensity(FLOP/byte)"]
+    else:
+        metric_map = {
+            "time": "time(ms)",
+            "throughput": "throughput(TFLOPS)",
+            "bandwidth": "bandwidth(GB/s)",
+            "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
+        }
+        line_vals = [metric_map.get(args.metric, "throughput(TFLOPS)")]
+    
+    plot_name = "bench_diffusion_attention_captured"
+    
+    configs = [
+        triton.testing.Benchmark(
+            x_names=x_names,
+            x_vals=x_vals_list,
+            line_arg="provider",
+            line_vals=line_vals,
+            line_names=line_vals,
+            styles=[("red", "-"), ("green", "-"), ("yellow", "-"), ("blue", "-")],
+            ylabel="",
+            plot_name=plot_name,
+            args={
+                "inputs": inputs,
+                "causal": args.causal,
+                "mode": args.mode,
+            },
+        )
+    ]
+    return configs
+
+
+def run_benchmark_captured(args):
+    """
+    Run benchmark using captured inputs from disk.
+    Captured inputs are in BHSD format and need to be transposed to BSHD for kernels.
+    """
+    torch.manual_seed(20)
+    
+    # Load captured inputs
+    inputs = load_captured_inputs(args.captured_dir)
+    logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
+    
+    @triton.testing.perf_report(create_benchmark_configs_from_captured(inputs, args))
+    def bench_mha_captured(
+        INPUT_IDX,
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        inputs,
+        causal,
+        mode,
+        provider,
+        device="cuda",
+    ):
+        """
+        Benchmark function for attention kernels using captured inputs.
+        INPUT_IDX: Index in the loaded inputs list
+        """
+        k_smooth = not args.no_k_smooth
+        
+        # Get the input tensors for this configuration
+        inp = inputs[INPUT_IDX]
+        
+        # Load tensors to GPU - captured inputs are in BHSD format (batch, heads, seq, dim)
+        q_bhsd = inp['q'].to(device)
+        k_bhsd = inp['k'].to(device)
+        v_bhsd = inp['v'].to(device)
+        
+        # Transpose from BHSD to BSHD (batch, seq, heads, dim) for kernel compatibility
+        q = q_bhsd.transpose(1, 2).contiguous()
+        k = k_bhsd.transpose(1, 2).contiguous()
+        v = v_bhsd.transpose(1, 2).contiguous()
+        
+        # Get kwargs from capture
+        kwargs = inp.get('kwargs', {})
+        is_causal = kwargs.get('is_causal', causal)
+        softmax_scale = kwargs.get('softmax_scale', None)
+        
+        # Default softmax scale
+        if softmax_scale is None:
+            softmax_scale = 1.0 / (D_HEAD**0.5)
+        
+        # Calculate FLOPS: 2 * batch * heads * seq_q * seq_k * (head_dim + head_dim_v)
+        total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+        
+        # Select kernel and create benchmark function
+        if args.fp8:  # fav3 fp8
+            fn = fav3_fp8_forward_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=is_causal,
+                window_size=(-1, -1),
+                attention_chunk=0,
+                softcap=0.0,
+                deterministic=False,
+                sm_margin=0,
+            )
+        elif args.qk_int8:  # sage v1
+            fn = qk_int8_forward_func(
+                q,
+                k,
+                v,
+                tensor_layout=args.qk_int8_layout,
+                sm_scale=softmax_scale,
+                k_smooth=k_smooth,
+            )
+        elif args.sagev1_fa3:  # sage v1, fused on fa3
+            fn = sagev1_forward_func(
+                q,
+                k,
+                v,
+                causal=is_causal,
+            )
+        else:  # fav2 (no quantization)
+            fn = fav2_forward_func(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                softmax_scale=softmax_scale,
+                causal=is_causal,
+                return_lse=True,
+                return_attn_probs=False,
+            )
+        
+        # Run benchmark
+        ms = triton.testing.do_bench(fn)
+        
+        # Calculate memory transfer
+        q_element_size = 1 if args.qk_int8 or args.fp8 else q.element_size()
+        k_element_size = 1 if args.qk_int8 or args.fp8 else k.element_size()
+        v_element_size = 1 if args.fp8 else v.element_size()
+        
+        total_num_tokens_q = BATCH * N_CTX_Q
+        total_num_tokens_k = BATCH * N_CTX_K
+        q_size = total_num_tokens_q * HQ * D_HEAD * q_element_size
+        k_size = total_num_tokens_k * HK * D_HEAD * k_element_size
+        v_size = total_num_tokens_k * HK * D_HEAD_V * v_element_size
+        o_size = total_num_tokens_q * HQ * D_HEAD_V * q_element_size
+        
+        mem = q_size + k_size + v_size + o_size
+        
+        # Return appropriate metric
+        if "ms" in provider:
+            return ms
+        elif "TFLOPS" in provider:
+            return total_flops / ms * 1e-9
+        elif "GB/s" in provider:
+            return mem / ms * 1e-6
+        elif "arithmetic_intensity" in provider:
+            return total_flops / mem
+        
+        return ms  # default
+    
+    bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(custom, args):
@@ -594,6 +815,18 @@ def parse_args():
         action="store_true",
         help="also execute the reference kernel (-ref) and assert outputs match.",
     )
+    # Captured input loading
+    parser.add_argument(
+        "--load_captured",
+        action="store_true",
+        help="Load captured inputs from disk instead of generating random tensors",
+    )
+    parser.add_argument(
+        "--captured_dir",
+        type=str,
+        default="./captured_inputs",
+        help="Directory containing captured input .pt files",
+    )
     return parser.parse_args()
 
 
@@ -606,6 +839,19 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+
+    # Handle captured input mode separately
+    if args.load_captured:
+        logger.info(f"Running benchmark with captured inputs from: {args.captured_dir}")
+        
+        # Set defaults for captured mode
+        if args.causal is None:
+            args.causal = False
+        if args.layout is None:
+            args.layout = "bshd"
+        
+        run_benchmark_captured(args)
+        return 0
 
     if args.model:
         if args.causal is None:  # User didn't specify -causal
