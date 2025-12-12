@@ -420,16 +420,16 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         hk::load<2, T::kQkNopeHeadDim>(
             q_rope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
 
-        auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_start,
-                                                             const int32_t kv_end) {
+        auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_tile_start,
+                                                             const int32_t kv_tile_end) {
             // Async load K from VRAM to LDS
             /// TODO: Merge loading Q with K on first iter.
             async_load_k<T, kIsTail>(p_lds_k_nope,
                                      p_lds_k_rope,
                                      params.kv_buffer,
                                      params.p_kv_indices,
-                                     kv_start,
-                                     kv_end);
+                                     kv_tile_start,
+                                     kv_tile_end);
 
             __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_s_barrier();
@@ -501,7 +501,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             int row1 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 1;
             int row2 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 2;
             int row3 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 3;
-            int col0 = lane_idx % 16;
+            int col0 = lane_idx % 16 + (kv_tile_start - kv_start);
             int col1 = col0 + 16;
 
             int off00 = row0 * 576 + col0;
