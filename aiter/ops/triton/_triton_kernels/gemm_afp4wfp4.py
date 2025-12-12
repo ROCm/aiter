@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 _gemm_afp4wfp4_repr = make_kernel_repr(
@@ -711,8 +712,6 @@ def _get_config(
     K: int,
     shuffle: bool = False,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
-
     shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
     config_name = f"GEMM-AFP4WFP4{shuffle_suffix}"
 

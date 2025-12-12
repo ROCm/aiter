@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 @triton.heuristics(
@@ -159,6 +160,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
 
     return get_gemm_config("FF-A16W16-fused", M, N, K, bounds=[4, 8, 64, 4096])

@@ -11,14 +11,34 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
 STANDARD_M_BOUNDS = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 
+def _load_config_file(
+    cache_dict: dict,
+    cache_key: str,
+    fpath: str,
+    config_key: str,
+    fpath_should_exist: bool = False,
+) -> bool:
+    """
+    Helper function to load a config file and cache it.
+    """
+    if os.path.exists(fpath):
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        cache_dict[cache_key][config_key] = config
+        return True
+    elif fpath_should_exist:
+        raise AssertionError(f"Required config file doesn't exist: {fpath}")
+    return False
+
+
 def get_gemm_config(
-    config_name,
-    M,
-    N=None,
-    K=None,
-    bounds=None,
-    specialized_filename=None,
-):
+    config_name: str,
+    M: int,
+    N: int | None = None,
+    K: int | None = None,
+    bounds: list[int] | None = None,
+    specialized_filename: str | None = None,
+) -> dict:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
 
@@ -42,6 +62,16 @@ def get_gemm_config(
     Returns:
         Dictionary with the config params
     """
+    # Input validation
+    assert M > 0, "M must be positive."
+    assert N is None or N > 0, "N must be positive when provided."
+    assert K is None or K > 0, "K must be positive when provided."
+    assert bounds is None or (
+        len(bounds) > 0
+        and all(x > 0 for x in bounds)
+        and all(x < y for x, y in zip(bounds, bounds[1:]))
+    ), "When provided, bounds list must be non-empty, contain only positive numbers, and be strictly increasing."
+
     if not hasattr(get_gemm_config, "_config_cache"):
         get_gemm_config._config_cache = {}
 
@@ -51,12 +81,15 @@ def get_gemm_config(
     if cache_key not in get_gemm_config._config_cache:
         get_gemm_config._config_cache[cache_key] = {}
 
-        # Load default config
+        # Load default config (must exist)
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"
-
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        get_gemm_config._config_cache[cache_key]["default"] = config
+        _load_config_file(
+            get_gemm_config._config_cache,
+            cache_key,
+            fpath,
+            "default",
+            fpath_should_exist=True,
+        )
 
     config_dict_key = "default"
 
@@ -64,12 +97,10 @@ def get_gemm_config(
     if specialized_filename is not None:
         spec_key = specialized_filename
         if spec_key not in get_gemm_config._config_cache[cache_key]:
-
             fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-{specialized_filename}.json"
-            if os.path.exists(fpath):
-                with open(fpath, "r") as file:
-                    config = json.load(file)
-                get_gemm_config._config_cache[cache_key][spec_key] = config
+            if _load_config_file(
+                get_gemm_config._config_cache, cache_key, fpath, spec_key
+            ):
                 config_dict_key = spec_key
         else:
             config_dict_key = spec_key
@@ -81,10 +112,9 @@ def get_gemm_config(
             fpath = (
                 f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-N={N}-K={K}.json"
             )
-            if os.path.exists(fpath):
-                with open(fpath, "r") as file:
-                    config = json.load(file)
-                get_gemm_config._config_cache[cache_key][nk_key] = config
+            if _load_config_file(
+                get_gemm_config._config_cache, cache_key, fpath, nk_key
+            ):
                 config_dict_key = nk_key
         else:
             config_dict_key = nk_key
@@ -114,7 +144,16 @@ def get_gemm_config(
     )
 
 
-def add_default_gemm_config_params(config):
+def add_default_gemm_config_params(config: dict) -> dict:
+    """
+    this fn ensures that all configs have required default values.
+
+    Args:
+        config: Dictionary containing GEMM configuration parameters.
+
+    Returns:
+        same object as input
+    """
     if "NUM_KSPLIT" not in config:
         config["NUM_KSPLIT"] = 1
 
@@ -125,10 +164,20 @@ def add_default_gemm_config_params(config):
     return config
 
 
-def compute_splitk_params(config, K):
+def compute_splitk_params(config: dict, K: int) -> dict:
     """
-    Compute split-K parameters for a GEMM config.
+    this fn calculates the SPLITK_BLOCK_SIZE and adjusts BLOCK_SIZE_K
+    if necessary based on the NUM_KSPLIT value in the config.
+
+    Args:
+        config: Dictionary containing GEMM configuration parameters.
+        K: K dimension of the GEMM operation (must be positive)
+
+    Returns:
+        same object as input
     """
+    assert K > 0, "K must be positive"
+
     add_default_gemm_config_params(config)
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])

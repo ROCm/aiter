@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 @triton.heuristics(
@@ -401,7 +402,6 @@ def _get_config(
     N_bf16: int,
     K: int,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
 
     # Custom file naming: N8={N_fp8}-N16={N_bf16}-K={K}
     specialized_filename = f"N8={N_fp8}-N16={N_bf16}-K={K}"

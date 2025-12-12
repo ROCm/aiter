@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.fused_fp8_quant import _fp8_quant_op
 from ..utils._triton.pid_preprocessing import pid_grid
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 @triton.heuristics(
@@ -188,6 +189,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
 
     return get_gemm_config("GEMM-A16W8_BLOCKSCALE", M, N, K)

@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.kernel_repr import make_kernel_repr
-
+from ..utils.gemm_config_utils import get_gemm_config
 
 _fused_gemm_afp4wfp4_split_cat_repr = make_kernel_repr(
     "_fused_gemm_afp4wfp4_split_cat",
@@ -393,7 +393,6 @@ def _get_config(
     N: int,
     K: int,
 ) -> dict:
-    from ..utils.gemm_config_utils import get_gemm_config
 
     # Note: Config files use K=2*K in their naming
     return get_gemm_config("GEMM-AFP4WFP4", M, N, 2 * K)

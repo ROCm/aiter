@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 _gemm_a16w16_gated_repr = make_kernel_repr(
@@ -153,7 +154,6 @@ def _get_config(
     N: int,
     K: int,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
 
     return get_gemm_config(
         "GEMM-A16W16-gated", M, N, K, bounds=[64, 128, 256, 512, 2048]
