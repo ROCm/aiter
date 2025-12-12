@@ -21,7 +21,9 @@ from op_tests.triton_tests.test_fused_mul_add import (
 
 def get_x_vals():
 
-    x_vals = [(v, 7168, 256) for v in [2, 4, 8, 16, 1024]] # TODO M = 1 triton upstream compilation error without AMDGCN_USE_BUFFER_OPS=0
+    x_vals = [
+        (v, 7168, 256) for v in [2, 4, 8, 16, 1024]
+    ]  # TODO M = 1 triton upstream compilation error without AMDGCN_USE_BUFFER_OPS=0
     return x_vals
 
 
