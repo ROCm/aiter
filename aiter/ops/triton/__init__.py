@@ -38,7 +38,6 @@ if _COMMS_AVAILABLE:
     )
 
 
-
 _BACKWARD_COMPAT_MAP = {
     # Batched GEMM modules (gemm/batched/)
     "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant": "gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant",
@@ -133,6 +132,7 @@ _BACKWARD_COMPAT_MAP = {
 def __getattr__(name):
     if name in _BACKWARD_COMPAT_MAP:
         import importlib
+
         new_path = f"aiter.ops.triton.{_BACKWARD_COMPAT_MAP[name]}"
         return importlib.import_module(new_path)
     raise AttributeError(f"module 'aiter.ops.triton' has no attribute '{name}'")
