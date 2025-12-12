@@ -232,11 +232,9 @@ def test_op(
     device="cuda",
 ):
 
+    if get_arch() != "gfx950":
+        pytest.skip("FP4 kernels are not supported on MI300.")
     if hbm_swizzling:
-        if get_arch() != "gfx950":
-            pytest.skip(
-                "Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet."
-            )
         if n % 32 != 0 or k % (32 * 8) != 0:
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
