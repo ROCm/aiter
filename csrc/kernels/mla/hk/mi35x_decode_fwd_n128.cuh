@@ -119,6 +119,9 @@ struct HkMlaDecodeFwdParams
     Traits::gl_so split_output;
     Traits::gl_slse split_lse;
 
+    // parameters
+    const float softmax_scale;
+
     // debug
     float* p_dbg;
 };
@@ -402,6 +405,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     const int32_t warp_idx = ckt::get_warp_id();
     const int32_t lane_idx = ckt::get_lane_id();
 
+    // Store some of values in sgpr
+    /// TODO: asm cannot use sgpr as operand!!!
+    const float softmax_scale = __builtin_amdgcn_readfirstlane(params.softmax_scale);
+
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
         const int32_t partial_qo_loc = __builtin_amdgcn_readfirstlane(
@@ -487,6 +494,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
                 hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
             });
+
+            hk::mul_vgpr(p_comp, p_comp, params.softmax_scale);
 
             float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
             float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
@@ -612,6 +621,8 @@ void dispatch_mla_decode_fwd_n128(torch::Tensor& query,
             split_lse.size(0),
             Traits::kQoNumHead,
             1),
+        // parameters
+        softmax_scale,
         // debug
         dbg_tr.has_value() ? dbg_tr.value().data_ptr<float>() : nullptr};
 
