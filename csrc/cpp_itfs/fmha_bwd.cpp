@@ -2,6 +2,7 @@
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include "mha_bwd.h"
 #include <string>
+#include <memory>
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
@@ -75,10 +76,20 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
            ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))) &&
            (cfg.mode == mode))
         {
+            int tmp_ts_kv = 0;
             if(ts_kv == 0)
             {
                 ts_kv = cfg.ts;
-                pssk  = (seqlen_q != seqlen_k) || (seqlen_q % ts_kv != 0);
+                tmp_ts_kv = ts_kv;
+                // std::cout << "dqdkdv kernel: " << el.first << std::endl;
+                // std::cout << el.first.find("recompile") << std::endl;
+                // std::cout << (el.first.find("recompile") != std::string::npos) << std::endl;
+                if (cfg.atomic32 == 0 && ((arch_id == "gfx942") || (el.first.find("recompile") != std::string::npos)))
+                {
+
+                    tmp_ts_kv = 64;
+                }
+                pssk  = (seqlen_q != seqlen_k) || (seqlen_k % tmp_ts_kv != 0);
             }
             if((cfg.pssk == pssk) && (cfg.pddv == pddv))
             {
@@ -260,7 +271,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         }
     }();
 
-    bool need_post_processing = (arch_id == "gfx950") || (a.v3_atomic_fp32 == 1);
+    bool need_post_processing = ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
+    std::cout << "need_post_processing: " << need_post_processing << std::endl;
 
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
@@ -276,6 +288,9 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
+    // std::cout << "pre_kernel: " << pre_kernel << std::endl;
+    // std::cout << "dqdkdv_kernel: " << dqdkdv_kernel << std::endl;
+    // std::cout << "post_kernel: " << post_kernel << std::endl;
     if((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == "")))
     {
         return -1;
@@ -333,11 +348,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         return -1;
     }
 
-    if(!post_cfgs)
-    {
-        assert((!need_post_processing) && (post_kernel == ""));
-    }
-    else
+    if(need_post_processing)
     {
         auto it_post = post_cfgs->find(post_kernel);
         if(it_post != post_cfgs->end())
