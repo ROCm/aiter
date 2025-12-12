@@ -720,7 +720,10 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
     # PV matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=CDNA_VERSION,
+        instr_shape=[16, 16],
+        transposed=True,
+        warps_per_cta=[1, 4],
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
