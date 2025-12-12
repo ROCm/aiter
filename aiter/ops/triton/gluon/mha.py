@@ -4,8 +4,6 @@
 from typing import Optional, Tuple
 import torch
 import triton
-import triton.language as tl
-import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
 
 import aiter.ops.triton.utils.types as types
@@ -13,9 +11,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.gluon._gluon_kernels.mha import _attn_fwd, _get_config
 from aiter.ops.triton.mha import (
-    _cast_to_fp8,
-    _cast_varlen_to_fp8,
-    _USE_FUSED_BWD_KERNEL,
     _USE_INT64_STRIDES,
 )
 
@@ -56,6 +51,7 @@ def _flash_attn_forward(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
     config: Optional[dict[str, any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -260,6 +256,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_lse,
         return_softmax,
+        sink,
         is_grad_enabled,
         config=None,
     ):
@@ -285,52 +282,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
-    config: Optional[dict[str, any]] = None,
-):
-    raise NotImplementedError(
-        "Flash Attention with bshd/bhsd layout is not implemented yet for Gluon"
-    )
-
-
-class _FlashAttnFP8Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_softmax,
-        is_grad_enabled,
-        config=None,
-    ):
-        raise NotImplementedError(
-            "Flash Attention with bshd/bhsd layout is not implemented yet for Gluon"
-        )
-
-    @staticmethod
-    def backward(ctx, do, *args):
-        raise NotImplementedError("Backward pass not implemented for Gluon")
-
-
-def flash_attn_fp8_func(
-    q,
-    k,
-    v,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    alibi_slopes=None,
-    deterministic=False,
-    return_lse=False,
-    return_attn_probs=False,
+    sink=None,
     config: Optional[dict[str, any]] = None,
 ):
     raise NotImplementedError(
@@ -360,6 +312,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         out,
+        sink,
         is_grad_enabled,
         config=None,
     ):
@@ -440,6 +393,7 @@ def flash_attn_varlen_func(
     return_attn_probs=False,
     block_table=None,
     out=None,
+    sink=None,
     config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -520,58 +474,7 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         out,
+        sink,
         torch.is_grad_enabled(),
         config,
     )
-
-
-class _FlashAttnVarlenFP8Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_softmax,
-        block_table,
-        is_grad_enabled,
-        config=None,
-    ):
-        raise NotImplementedError("FP8 not implemented for Gluon")
-
-    @staticmethod
-    def backward(ctx, do, *args):
-        raise NotImplementedError("Backward pass not implemented for Gluon")
-
-
-def flash_attn_varlen_fp8_func(
-    q,
-    k,
-    v,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    alibi_slopes=None,
-    deterministic=False,
-    return_lse=False,
-    return_attn_probs=False,
-    block_table=None,
-    config: Optional[dict[str, any]] = None,
-):
-    raise NotImplementedError("FP8 not implemented for Gluon")

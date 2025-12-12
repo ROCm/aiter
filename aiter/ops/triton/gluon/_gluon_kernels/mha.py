@@ -633,6 +633,7 @@ def _attn_fwd(
     IS_CAUSAL: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_K_HEADS: gl.constexpr,
+    PRELOAD_V: tl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
@@ -1217,16 +1218,20 @@ def _get_config(
     has_pe: bool = False,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
-
-    if has_pe and "pe" in _get_config._config_dict["default"]["fwd"]:
-        return _get_config._config_dict["default"]["fwd"]["pe"]
+    fwd_cfg = _get_config._config_dict["default"]["fwd"]
+    has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
+    # TODO: pe + dropout is not tuned
+    if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
+        return fwd_cfg["pe_dropout_or_fp32"]
+    elif has_pe and "pe" in fwd_cfg:
+        return fwd_cfg["pe"]
     elif enable_dropout or dtype == torch.float32:
-        return _get_config._config_dict["default"]["fwd"]["dropout_or_fp32"]
+        return fwd_cfg["dropout_or_fp32"]
     else:
-        return _get_config._config_dict["default"]["fwd"]["default"]
+        return fwd_cfg["default"]

@@ -11,10 +11,7 @@ from aiter.ops.triton.mha import (
 )
 from aiter.ops.triton.gluon.mha import (
     flash_attn_func as gluon_flash_attn_func,
-    flash_attn_fp8_func as gluon_flash_attn_fp8_func,
     flash_attn_varlen_func as gluon_flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func as gluon_flash_attn_varlen_fp8_func,
-    mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.mha_v3 import (
     flash_attn_fp8_func as triton_flash_attn_fp8_func,
@@ -477,7 +474,7 @@ def run_benchmark(custom, args):
         if varlen:
             if args.fp8:
                 if args.gluon:
-                    flash_attn_varlen_fp8_func = gluon_flash_attn_varlen_fp8_func
+                    raise NotImplementedError("FP8 not supported in Gluon MHA yet.")
                 else:
                     flash_attn_varlen_fp8_func = triton_flash_attn_varlen_fp8_func
 
@@ -520,7 +517,7 @@ def run_benchmark(custom, args):
         else:
             if args.fp8:
                 if args.gluon:
-                    flash_attn_fp8_func = gluon_flash_attn_fp8_func
+                    raise NotImplementedError("FP8 not supported in Gluon MHA yet.")
                 else:
                     flash_attn_fp8_func = triton_flash_attn_fp8_func
 
