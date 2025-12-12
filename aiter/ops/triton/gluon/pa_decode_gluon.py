@@ -2736,9 +2736,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     stride_logits_group,
     QUERY_GROUP_SIZE,
     HEAD_SIZE,
-    MAX_CONTEXT_PARTITION_NUM,
     CONTEXT_PARTITION_SIZE,
-    SLIDING_WINDOW,
 ):
     """
     Wrapper function for paged attention reduction kernel with kernel selection.
@@ -2821,7 +2819,7 @@ def pa_decode_gluon(
     softmax_scale: float,
     query_length: int,
     max_context_length: int,
-    # context_partition_size: int,
+    context_partition_size: int,
     compute_type: tl.dtype,
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -3106,7 +3104,5 @@ def pa_decode_gluon(
         temporary_output.stride(3),
         QUERY_GROUP_SIZE=equivalent_query_group_size,
         HEAD_SIZE=head_size,
-        MAX_CONTEXT_PARTITION_NUM=max_context_partition_num,
         CONTEXT_PARTITION_SIZE=context_partition_size,
-        SLIDING_WINDOW=sliding_window,
     )

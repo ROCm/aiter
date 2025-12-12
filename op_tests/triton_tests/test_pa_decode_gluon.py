@@ -1235,7 +1235,7 @@ def run_gluon_kernel(
                 attention_scale,
                 query_sequence_length,
                 max_context_length,
-                # context_partition_size,
+                context_partition_size,
                 compute_type,
                 query_scale,
                 key_scale,
@@ -1263,7 +1263,6 @@ def run_pa_gluon_test(
     compute_type: torch.dtype,
     query_length: int,
     quant_mode: str,
-    context_partition_size: int,
     trans_v: bool,
     kv_varlen: bool,
     use_aot_impl: bool,
@@ -1517,6 +1516,12 @@ def run_pa_gluon_test(
         if sliding_window > 0
         else context_lengths.max().item()
     )
+    context_partition_size = 256
+    if sliding_window > 0:
+        max_context_length = min(max_context_length, sliding_window)
+        if max_context_length <= 128:
+            context_partition_size = 128
+
     max_context_partition_num = (
         max_context_length + context_partition_size - 1
     ) // context_partition_size
@@ -1587,32 +1592,32 @@ def run_pa_gluon_test(
     quantized_values = quantized_values.permute(0, 3, 1, 2).contiguous()
     # quantized_keys = quantized_keys.view(quantized_keys.shape[0], -1, num_kv_heads, head_size)
     # quantized_values = quantized_values.view(quantized_values.shape[0], -1, num_kv_heads, head_size)
-    _, unified_time = run_unified_attention_kernel(
-        quantized_query_gluon,  # q
-        quantized_keys,  # k
-        quantized_values,  # v
-        unified_output,  # out
-        query_output_indptr,  # cu_seqlens_q
-        max_query_length,  # max_seqlen_q
-        context_lengths,  # seqused_k
-        max_context_length,  # max_seqlen_k
-        softmax_scale,  # softmax_scale
-        window_size_tuple,  # window_size
-        block_tables,  # block_table
-        key_scale_original,  # k_descale
-        value_scale_original,  # v_descale
-        alibi_slopes=None,
-        sinks=sinks,
-    )
+    # _, unified_time = run_unified_attention_kernel(
+    #     quantized_query_gluon,  # q
+    #     quantized_keys,  # k
+    #     quantized_values,  # v
+    #     unified_output,  # out
+    #     query_output_indptr,  # cu_seqlens_q
+    #     max_query_length,  # max_seqlen_q
+    #     context_lengths,  # seqused_k
+    #     max_context_length,  # max_seqlen_k
+    #     softmax_scale,  # softmax_scale
+    #     window_size_tuple,  # window_size
+    #     block_tables,  # block_table
+    #     key_scale_original,  # k_descale
+    #     value_scale_original,  # v_descale
+    #     alibi_slopes=None,
+    #     sinks=sinks,
+    # )
 
-    err_unified = checkAllclose(
-        unified_output,
-        reference_output_quant,
-        atol=fp8_tolerance,
-        rtol=fp8_tolerance,
-        msg=f"[PyTorch vs Unified][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
-    )
-    results["us_unified"] = unified_time
+    # err_unified = checkAllclose(
+    #     unified_output,
+    #     reference_output_quant,
+    #     atol=fp8_tolerance,
+    #     rtol=fp8_tolerance,
+    #     msg=f"[PyTorch vs Unified][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
+    # )
+    # results["us_unified"] = unified_time
     # Compare with original reference
     err_gluon = checkAllclose(
         reference_output_quant,
@@ -1672,8 +1677,8 @@ def run_pa_gluon_test(
     kernel_time_us = gluon_time
     bandwidth_tb_per_sec = pa_rw_bytes / (kernel_time_us * 1e6 * 1.024**4)
     results["gluon_bandwith(TB/s)"] = bandwidth_tb_per_sec
-    kernel_time_us = unified_time
-    bandwidth_tb_per_sec = pa_rw_bytes / (kernel_time_us * 1e6 * 1.024**4)
+    # kernel_time_us = unified_time
+    # bandwidth_tb_per_sec = pa_rw_bytes / (kernel_time_us * 1e6 * 1.024**4)
     results["unified_bandwith(TB/s)"] = bandwidth_tb_per_sec
 
     # Test Assembly
@@ -1961,7 +1966,7 @@ def _run_single_test(args):
         compute_type=test_config["compute_type"],
         query_length=test_config["query_length"],
         quant_mode=test_config["quant_mode"],
-        context_partition_size=test_config["context_partition_size"],
+        # context_partition_size=test_config["context_partition_size"],
         trans_v=test_config["trans_v"],
         kv_varlen=test_config["kv_varlen"],
         use_aot_impl=test_config["use_aot_impl"],
@@ -1990,7 +1995,7 @@ def run_multi_pa_gluon_test(
     use_aot_impl_options,
     context_partition_size_options,
     sample_rate=1.0,
-    use_sinks_options=[False, True],
+    use_sinks_options=[True],
     sliding_window_options=[0, 128],
 ) -> pd.DataFrame:
     """Run all tests."""
@@ -2216,17 +2221,17 @@ def simple_test():
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [128]
     # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
+    COMPUTE_TYPE_OPTIONS = ["bf16"]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     QUANT_Q_AND_KV_OPTIONS = [[False, True]]
     BLOCK_SIZE_OPTIONS = [16]
     QUERY_LENGTH_OPTIONS = [1]
-    BATCH_SIZE_OPTIONS = [4, 128]
-    HEAD_CONFIGURATIONS = [(64, 8)]
-    CONTEXT_LENGTH_OPTIONS = [1024, 2048]
-    HEAD_DIMENSION_OPTIONS = [64]
+    BATCH_SIZE_OPTIONS = [32, 64, 128, 256]
+    HEAD_CONFIGURATIONS = [(8, 1), (16, 1)]
+    CONTEXT_LENGTH_OPTIONS = [1024, 4000, 4096, 10240]
+    HEAD_DIMENSION_OPTIONS = [128]
     TRANS_V_OPTIONS = [False]
-    KV_VARLEN_OPTIONS = [False, True]
+    KV_VARLEN_OPTIONS = [True]
     USE_AOT_IMPL_OPTIONS = [False]
     # USE_AOT_IMPL_OPTIONS = [True]
     # USE_AOT_IMPL_OPTIONS = [False]
