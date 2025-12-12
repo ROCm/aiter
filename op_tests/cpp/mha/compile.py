@@ -62,7 +62,7 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
     return {
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": [flag_use_v3]
+        "flags_extra_cc": [flag_use_v3],
     }
 
 

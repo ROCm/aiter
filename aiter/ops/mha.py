@@ -684,13 +684,12 @@ def cmdGenFunc_mha_bwd(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
         "--receipt 300 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"
-
+        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"]
+        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
     }
 
 
@@ -937,12 +936,12 @@ def cmdGenFunc_mha_varlen_bwd(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
         "--receipt 400 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"
+        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"]
+        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
     }
 
 

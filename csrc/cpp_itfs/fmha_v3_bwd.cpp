@@ -264,7 +264,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                              dqdkdv_cfgs,
                              post_cfgs);
 
-    
+
     if ((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == ""))) {
         return -1;
     }
@@ -273,12 +273,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     int ts_kv;
     int ts_dq;
     int arg_size;
-    
+
     AiterAsmKernel* impl_ptr_pre    = nullptr;
     AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
     AiterAsmKernel* impl_ptr_post   = nullptr;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    
+
     auto it_pre = pre_cfgs->find(pre_kernel);
     if(it_pre != pre_cfgs->end())
     {
@@ -438,49 +438,20 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     dqdkdv_args.max_seqlen_dq          = a.v3_atomic_fp32
                                        ? a.max_seqlen_q
                                        : (a.max_seqlen_q + 15) / 16 * 16;
-    
-    // std::cout << "scalar: " << dqdkdv_args.scalar << std::endl;
-    // std::cout << "log2e: " << dqdkdv_args.log2e << std::endl;
-    // std::cout << "seqlen_q: " << dqdkdv_args.seqlen_q << std::endl;
-    // std::cout << "Ts: " << dqdkdv_args.Ts << std::endl;
-    // std::cout << "Hs_q: " << dqdkdv_args.Hs_q << std::endl;
-    // std::cout << "BAs_q: " << dqdkdv_args.BAs_q << std::endl;
-    // std::cout << "Seqs_q: " << dqdkdv_args.Seqs_q << std::endl;
-    // std::cout << "ratio: " << dqdkdv_args.ratio << std::endl;
-    // std::cout << "Hs_k: " << dqdkdv_args.Hs_k << std::endl;
-    // std::cout << "BAs_k: " << dqdkdv_args.BAs_k << std::endl;
-    // std::cout << "Seqs_k: " << dqdkdv_args.Seqs_k << std::endl;
-    // std::cout << "Seqs_dk: " << dqdkdv_args.Seqs_dk << std::endl;
-    // std::cout << "seqlen_k: " << dqdkdv_args.seqlen_k << std::endl;
-    // std::cout << "head_dim_q: " << dqdkdv_args.head_dim_q << std::endl;
-    // std::cout << "head_dim_v: " << dqdkdv_args.head_dim_v << std::endl;
-    // std::cout << "nhead_q: " << dqdkdv_args.nhead_q << std::endl;
-    // std::cout << "Hs_v: " << dqdkdv_args.Hs_v << std::endl;
-    // std::cout << "BAs_v: " << dqdkdv_args.BAs_v << std::endl;
-    // std::cout << "Seqs_v: " << dqdkdv_args.Seqs_v << std::endl;
-    // std::cout << "Hs_do: " << dqdkdv_args.Hs_do << std::endl;
-    // std::cout << "BAs_do: " << dqdkdv_args.BAs_do << std::endl;
-    // std::cout << "Seqs_do: " << dqdkdv_args.Seqs_do << std::endl;
-    // std::cout << "Hs_dk: " << dqdkdv_args.Hs_dk << std::endl;
-    // std::cout << "BAs_dk: " << dqdkdv_args.BAs_dk << std::endl;
-    // std::cout << "Hs_dv: " << dqdkdv_args.Hs_dv << std::endl;
-    // std::cout << "BAs_dv: " << dqdkdv_args.BAs_dv << std::endl;
-    // std::cout << "Seqs_dv: " << dqdkdv_args.Seqs_dv << std::endl;
-    // std::cout << "Hs_lsed: " << dqdkdv_args.Hs_lsed << std::endl;
-    // std::cout << "max_seqlen_dq: " << dqdkdv_args.max_seqlen_dq << std::endl;
 
     // convert l/r to x/y HERE
-    // if (a.window_size_left == -1 && a.window_size_right == 0) {
-    //     dqdkdv_args.mask_y = 0;
-    //     dqdkdv_args.mask_x = 0;
-    // } else {
-    //     auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
-    //         a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k,
-    //         (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
-    //         a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
-    //     dqdkdv_args.mask_y = generic_mask.at(ck_tile::number<0>{});
-    //     dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
-    // }
+    if (a.window_size_left == -1 && a.window_size_right == 0) {
+        dqdkdv_args.mask_y = 0;
+        dqdkdv_args.mask_x = 0;
+    } else {
+        auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
+            a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k,
+            (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
+            a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+        dqdkdv_args.mask_y = generic_mask.at(ck_tile::number<0>{});
+        dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
+    }
+
     arg_size = sizeof(dqdkdv_args);
     auto dqdkdv_kernel_launch =
         [&]() {
@@ -489,7 +460,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             int gdy = a.nhead_q;
             int gdz = a.batch;
 
-            if(a.mask_type == 1 || a.mask_type == 2)
+            if((a.mask_type == 1) || (a.mask_type == 2))
             { // sliding window
                 gdx = (gdx + 1) / 2;
             }
@@ -529,13 +500,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     post_args.ptr_qseq        = (a.cu_seqlen_q_ptr && a.seqstart_q_ptr)
                                 ? a.cu_seqlen_q_ptr
                                 : a.seqstart_q_ptr;
-
-    // std::cout << "Hs_dq_acc: " << post_args.Hs_dq_acc << std::endl
-    //           << "BAs_dq_acc: " << post_args.BAs_dq_acc << std::endl
-    //           << "Seqs_dq_acc: " << post_args.Seqs_dq_acc << std::endl
-    //           << "Hs_dq: " << post_args.Hs_dq << std::endl
-    //           << "BAs_dq: " << post_args.BAs_dq << std::endl
-    //           << "Seqs_dq: " << post_args.Seqs_dq << std::endl;
 
     auto post_kernel_launch =
         [&]() {
