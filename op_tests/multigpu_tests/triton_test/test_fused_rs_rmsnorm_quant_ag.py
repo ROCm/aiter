@@ -267,7 +267,7 @@ def test_fused_without_quant(
 
     avg_time = sum(times) / len(times)
     print(
-        f"\n✓ test_fused_without_quant passed: tp_size={tp_size}, M={M}, N={N}, "
+        f"\n? test_fused_without_quant passed: tp_size={tp_size}, M={M}, N={N}, "
         f"dtype={dtype}, do_allgather={do_allgather}, avg_time={avg_time:.2f} us\n"
     )
 
@@ -361,7 +361,7 @@ def test_fused_with_fp8_quant(tp_size, M, N, dtype, heap_size=1 << 30):
 
     avg_time = sum(times) / len(times)
     print(
-        f"\n✓ test_fused_with_fp8_quant passed: tp_size={tp_size}, M={M}, N={N}, "
+        f"\n? test_fused_with_fp8_quant passed: tp_size={tp_size}, M={M}, N={N}, "
         f"dtype={dtype}, avg_time={avg_time:.2f} us\n"
     )
 

@@ -322,15 +322,15 @@ def test_reduce_scatter(tp_size, M=8192, N=7168, heap_size=1 << 30):
     all_passed = True
     for i, (output_shard, expected_mean, actual_mean) in enumerate(outputs):
         if abs(actual_mean - expected_mean) < 0.01:
-            print(f"✓ GPU {i}: Reduce-scatter PASSED (mean={actual_mean:.2f})")
+            print(f"? GPU {i}: Reduce-scatter PASSED (mean={actual_mean:.2f})")
         else:
             print(
-                f"✗ GPU {i}: Reduce-scatter FAILED (mean={actual_mean:.2f}, expected={expected_mean:.2f})"
+                f"? GPU {i}: Reduce-scatter FAILED (mean={actual_mean:.2f}, expected={expected_mean:.2f})"
             )
             all_passed = False
 
     if all_passed:
-        print(f"\n✓ test_reduce_scatter passed: tp_size={tp_size}, M={M}, N={N}\n")
+        print(f"\n? test_reduce_scatter passed: tp_size={tp_size}, M={M}, N={N}\n")
     else:
         raise AssertionError("Reduce-scatter test failed")
 
@@ -370,11 +370,11 @@ def test_all_gather(tp_size, M_shard=1024, N=7168, heap_size=1 << 30):
             actual_mean = rank_means[r]
             if abs(actual_mean - expected_value) < 0.01:
                 print(
-                    f"✓ GPU {i}: Segment from rank {r} correct (mean={actual_mean:.2f})"
+                    f"? GPU {i}: Segment from rank {r} correct (mean={actual_mean:.2f})"
                 )
             else:
                 print(
-                    f"✗ GPU {i}: Segment from rank {r} incorrect (mean={actual_mean:.2f}, expected={expected_value})"
+                    f"? GPU {i}: Segment from rank {r} incorrect (mean={actual_mean:.2f}, expected={expected_value})"
                 )
                 segment_passed = False
 
@@ -383,7 +383,7 @@ def test_all_gather(tp_size, M_shard=1024, N=7168, heap_size=1 << 30):
 
     if all_passed:
         print(
-            f"\n✓ test_all_gather passed: tp_size={tp_size}, M_shard={M_shard}, N={N}\n"
+            f"\n? test_all_gather passed: tp_size={tp_size}, M_shard={M_shard}, N={N}\n"
         )
     else:
         raise AssertionError("All-gather test failed")
@@ -421,15 +421,15 @@ def test_round_trip(tp_size, M=8192, N=7168, heap_size=1 << 30):
     all_passed = True
     for i, (reconstructed, expected_mean, actual_mean) in enumerate(outputs):
         if abs(actual_mean - expected_mean) < 0.01 and reconstructed.shape == (M, N):
-            print(f"✓ GPU {i}: Round-trip PASSED (mean={actual_mean:.2f})")
+            print(f"? GPU {i}: Round-trip PASSED (mean={actual_mean:.2f})")
         else:
             print(
-                f"✗ GPU {i}: Round-trip FAILED (mean={actual_mean:.2f}, expected={expected_mean:.2f})"
+                f"? GPU {i}: Round-trip FAILED (mean={actual_mean:.2f}, expected={expected_mean:.2f})"
             )
             all_passed = False
 
     if all_passed:
-        print(f"\n✓ test_round_trip passed: tp_size={tp_size}, M={M}, N={N}\n")
+        print(f"\n? test_round_trip passed: tp_size={tp_size}, M={M}, N={N}\n")
     else:
         raise AssertionError("Round-trip test failed")
 
