@@ -468,14 +468,6 @@ def test_mla(
     return ret
 
 
-kv_lora_rank = 512
-qk_nope_head_dim = 128
-qk_rope_head_dim = 64
-v_head_dim = 128
-block_size = 1
-list_dtype = ["bf16", "fp8"]
-l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -524,20 +516,16 @@ parser.add_argument(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=["bf16", "fp8"],
-    nargs="*",
-    default=["bf16"],
+    type=dtypes.str2Dtype,
+    default=dtypes.str2Dtype("bf16,fp8"),
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-kvd",
     "--kv_dtype",
-    type=str,
-    choices=["bf16", "fp8"],
-    nargs="*",
-    default=["bf16"],
+    type=dtypes.str2Dtype,
+    default=dtypes.str2Dtype("bf16,fp8"),
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
@@ -563,10 +551,10 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=list_nhead,
-    nargs="?",
+    choices=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    nargs="*",
     const=None,
-    default=None,
+    default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
     help="""Number of nhead and decode_qlen.
     e.g.: -n 16,1""",
 )
@@ -589,15 +577,11 @@ parser.add_argument(
 import pandas as pd
 
 args = parser.parse_args()
-list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
-l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
-if args.nhead is not None:
-    list_nhead = [args.nhead]
 
-for nhead, decode_qlen in list_nhead:
+for nhead, decode_qlen in args.nhead:
     df = []
     for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
+        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
     ):
         ret = test_mla(
             ctx_len,
