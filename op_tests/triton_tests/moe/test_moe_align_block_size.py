@@ -6,7 +6,7 @@ import torch
 import pytest
 from typing import Tuple
 
-from aiter.ops.triton.moe_align_block_size import moe_align_block_size_triton
+from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
 
 
 def _torch_moe_align_block_size(

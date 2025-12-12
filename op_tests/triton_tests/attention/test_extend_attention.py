@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.extend_attention import extend_attention_fwd
+from aiter.ops.triton.attention.extend_attention import extend_attention_fwd
 
 
 def input_helper(
