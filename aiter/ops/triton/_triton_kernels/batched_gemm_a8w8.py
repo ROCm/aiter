@@ -4,7 +4,7 @@
 import triton
 import triton.language as tl
 from ..utils._triton.kernel_repr import make_kernel_repr
-
+from ..utils.gemm_config_utils import get_gemm_config
 
 _batched_gemm_a8w8_repr = make_kernel_repr(
     "_batched_gemm_a8w8_kernel",
@@ -198,6 +198,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
 
     return get_gemm_config("BATCHED_GEMM-A8W8", M, N, K)

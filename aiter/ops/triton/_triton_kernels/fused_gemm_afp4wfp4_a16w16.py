@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 _fused_gemm_afp4wfp4_a16w16_repr = make_kernel_repr(
@@ -815,13 +816,13 @@ def _get_config(
     K: int,
     shuffle: bool = False,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
-
     config_name = (
         "FUSED-GEMM-AFP4WFP4-A16W16"
         if not shuffle
         else "FUSED-GEMM-AFP4WFP4_PRESHUFFLED-A16W16"
     )
     # Custom file naming: N4={N_fp4}-N16={N_bf16}-K={2*K}
+    # Note: N and K are not passed to get_gemm_config here, as they are encoded in the specialized_filename.
+    # This differs from most other usages, where N and K are required as explicit arguments.
     specialized_filename = f"N4={N_fp4}-N16={N_bf16}-K={2*K}"
     return get_gemm_config(config_name, M, specialized_filename=specialized_filename)

@@ -6,6 +6,7 @@ import triton.language as tl
 
 from ..utils._triton.kernel_repr import make_kernel_repr
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils.gemm_config_utils import get_gemm_config
 from .quant import _mxfp4_quant_op
 
 _batched_gemm_a16wfp4_repr = make_kernel_repr(
@@ -314,7 +315,7 @@ def _get_config(
     N: int,
     K: int,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
-
-    # Note: Config files use K=2*K in their naming
+    # Note: Config files use K=2*K in their naming because FP4 weights are packed,
+    # so the actual K dimension in the config file corresponds to 2*K unpacked elements.
+    # This naming convention reflects the physical memory layout of the packed FP4 data.
     return get_gemm_config("BATCHED_GEMM_PREQUANT-AFP4WFP4", M, N, 2 * K)

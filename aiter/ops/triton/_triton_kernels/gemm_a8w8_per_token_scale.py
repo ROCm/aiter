@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.kernel_repr import make_kernel_repr
-
+from ..utils.gemm_config_utils import get_gemm_config
 
 _gemm_a8w8_per_token_scale_repr = make_kernel_repr(
     "_gemm_a8w8_per_token_scale_kernel",
@@ -251,6 +251,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-    from ..utils.gemm_config_utils import get_gemm_config
 
     return get_gemm_config("GEMM-A8W8_PER_TOKEN_SCALE", M, N, K)
