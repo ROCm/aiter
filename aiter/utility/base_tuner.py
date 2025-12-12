@@ -58,6 +58,7 @@ class TunerCommon:
         self.failed = pd.DataFrame(columns=self.columns)
 
         self.remain_untuned = pd.DataFrame(columns=self.keys)
+        self.sort_keys = key
         self.start_time = 0
 
     def get_arg_defaults(self):
@@ -305,7 +306,14 @@ class TunerCommon:
         """post process, post process all results to return topk results"""
         rets = list(rets)
         if args.profile_file != "":
+            if args.verbose:
+                logger.info(f"saving profile to {args.profile_file}")
             profiledf = self.result_to_df(sorted(rets, key=itemgetter(0)))
+            if os.path.exists(args.profile_file):
+                old_df = pd.read_csv(args.profile_file)
+            else:
+                old_df = pd.DataFrame(columns=self.columns)
+            profiledf = pd.concat([old_df, profiledf], ignore_index=True)
             profiledf.to_csv(args.profile_file, index=False, na_rep="Null")
 
         if fast_mode or topk == -1:
@@ -394,7 +402,7 @@ class TunerCommon:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
             # self.update_tflops_bw(args.tune_file)
-            self.sortResults(output_file, args.sort, self.keys)
+            self.sortResults(output_file, args.sort, self.sort_keys)
             logger.info(
                 f"no shapes to be tuned, skip tuning, tuned file is {args.tune_file}"
             )
@@ -426,7 +434,7 @@ class TunerCommon:
                     logger.info(
                         f"tune result is none or all shape is tuned in {args.tune_file}!"
                     )
-            self.sortResults(output_file, args.sort, self.keys)
+            self.sortResults(output_file, args.sort, self.sort_keys)
         except KeyboardInterrupt:
             tuning_status = "Interrupted"
             logger.error(
@@ -460,6 +468,14 @@ class GemmCommonTuner(TunerCommon):
         description=None,
     ):
         super().__init__(name, key, resultList, description)
+        # Swap M and N positions to ensure N comes before M
+        self.sort_keys = list(key)
+        m_idx = self.sort_keys.index("M")
+        n_idx = self.sort_keys.index("N")
+        self.sort_keys[m_idx], self.sort_keys[n_idx] = (
+            self.sort_keys[n_idx],
+            self.sort_keys[m_idx],
+        )
 
     def pre_process(self, args):
         if args.all:
