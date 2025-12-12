@@ -219,7 +219,7 @@ def sagev1_forward_func(
         q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout="NHD"
     )
 
-    fp8_dtype = torch.float8_e4m3fn
+    fp8_dtype = torch.float8_e4m3fnuz
     v_fp16 = v.to(torch.float16)
 
     v_fp8, v_descale = _quantize_bshd(v_fp16, fp8_dtype)

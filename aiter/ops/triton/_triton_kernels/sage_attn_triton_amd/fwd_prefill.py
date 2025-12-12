@@ -22,7 +22,7 @@ from .utils import (
 @triton.jit
 def get_fp8_max():
     """Returns the FP8 max value as a compile-time constant."""
-    return 448.0
+    return 240.0
 
 def get_fwd_configs(autotune: bool):
     configs = []
