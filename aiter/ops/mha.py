@@ -981,6 +981,12 @@ def cmdGenFunc_mha_batch_prefill(
     elif q.dtype == torch.bfloat16:
         md_name += "_bf16"
         filter_fwd += "bf16*"
+    elif q.dtype == dtypes.fp8:
+        if out is None or out.dtype == dtypes.bf16:
+            md_name += "_fp8bf16"
+            filter_fwd += "fp8bf16*"
+        else:
+            raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if 0.0 < logits_soft_cap:
         md_name += "_logits"
         filter_fwd += "_logits*"
