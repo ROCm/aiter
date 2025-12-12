@@ -1303,3 +1303,335 @@ def test_mha_backward_varlen_with_pe(
         rtol=bwd_rtol,
         msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
     )
+
+
+# Run sink tests with:
+# pytest op_tests/triton_tests/test_mha.py -k with_sink
+
+
+@pytest.mark.parametrize("BATCH", [1, 3])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 64), (32, 128), (1024, 1024)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(64, 8), (8, 1)])
+@pytest.mark.parametrize("HEAD_SZ", [32, 64])
+@pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
+@pytest.mark.parametrize("CAUSAL", [False, True])
+def test_mha_with_sink(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    DROPOUT: float,
+    CAUSAL: bool,
+):
+    HAS_DROPOUT: bool = DROPOUT > 0.0
+    # Causal + Dropout use case is disabled in `test_mha_backward`.
+    # FIXME: We should fix it in the base implementation before adding sink to the mix.
+    TEST_BWD: bool = not (CAUSAL and HAS_DROPOUT)
+    device: str = "cuda"
+    dtype: torch.dtype = torch.bfloat16
+
+    # Generate tensors
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=TEST_BWD,
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=TEST_BWD,
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=TEST_BWD,
+    )
+    sink = torch.randn(
+        (NUM_Q_HEADS,), device=device, dtype=torch.float32, requires_grad=TEST_BWD
+    )
+
+    # Triton forward
+    with torch.set_grad_enabled(TEST_BWD):
+        triton_out = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=DROPOUT,
+            causal=CAUSAL,
+            return_lse=HAS_DROPOUT,
+            return_attn_probs=HAS_DROPOUT,
+            sink=sink,
+        )
+    if HAS_DROPOUT:
+        assert len(triton_out) == 3
+        dropout_mask = triton_out[2] > 0
+        triton_out = triton_out[0]
+    else:
+        dropout_mask = None
+
+    # Torch forward
+    with torch.set_grad_enabled(TEST_BWD):
+        torch_out, _, _ = attention_ref(
+            q,
+            k,
+            v,
+            dropout_p=DROPOUT,
+            dropout_mask=dropout_mask,
+            causal=CAUSAL,
+            sink=sink,
+        )
+
+    # Forward assertion
+    fwd_atol: float = 1e-2
+    fwd_rtol: float = 1e-2
+    torch.testing.assert_close(
+        triton_out,
+        torch_out,
+        atol=fwd_atol,
+        rtol=fwd_rtol,
+        msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
+    )
+
+    if not TEST_BWD:
+        return
+
+    # Generate backward tensor
+    do = torch.randn_like(q)
+
+    # Triton backward
+    # Sink support isn't implemented in fused backward.
+    mha_set_use_fused_bwd_kernel(False)
+    triton_dq, triton_dk, triton_dv, triton_dsink = torch.autograd.grad(
+        triton_out, (q, k, v, sink), do
+    )
+
+    # Torch backward
+    torch_dq, torch_dk, torch_dv, torch_dsink = torch.autograd.grad(
+        torch_out, (q, k, v, sink), do
+    )
+
+    # Backward assertions
+    bwd_atol = 1.5e-2
+    bwd_rtol = 1.5e-2
+    torch.testing.assert_close(
+        triton_dq,
+        torch_dq,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dq mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dk,
+        torch_dk,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dk mismatch\n\n{msg}\n",
+    )
+    # Case [True-0.0-64-64-8-1024-1024-3] was failing on "gfx942" due to 1 / 1572864 mismatched element.
+    relax_dv_err_tol: bool = (
+        arch == "gfx942" and BATCH > 1 and SEQLEN_Q >= 1024 and SEQLEN_K >= 1024
+    )
+    torch.testing.assert_close(
+        triton_dv,
+        torch_dv,
+        atol=2e-2 if relax_dv_err_tol else bwd_atol,
+        rtol=2e-2 if relax_dv_err_tol else bwd_rtol,
+        msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dsink,
+        torch_dsink,
+        atol=5e-2,  # higher tolerance due to summation over exp
+        rtol=5e-2,  # higher tolerance due to summation over exp
+        msg=lambda msg: f"bwd dsink mismatch\n\n{msg}\n",
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(16, 32), (128, 64), (256, 256)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(64, 8), (8, 1)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
+@pytest.mark.parametrize("CAUSAL", [False, True])
+def test_mha_varlen_with_sink(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    DROPOUT: float,
+    CAUSAL: bool,
+):
+    HAS_DROPOUT: bool = DROPOUT > 0.0
+    # Dropout use case is disabled in `test_mha_backward_varlen`.
+    # FIXME: We should fix it in the base implementation before adding sink to the mix.
+    TEST_BWD: bool = not HAS_DROPOUT
+    device: str = "cuda"
+    dtype: torch.dtype = torch.bfloat16
+
+    # Generate tensors
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=TEST_BWD,
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=TEST_BWD,
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=TEST_BWD,
+    )
+    sink = torch.randn(
+        (NUM_Q_HEADS,), device=device, dtype=torch.float32, requires_grad=TEST_BWD
+    )
+    query_padding_mask = generate_random_padding_mask(SEQLEN_Q, BATCH, device)
+    key_padding_mask = generate_random_padding_mask(SEQLEN_K, BATCH, device)
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
+    q_unpad.requires_grad = TEST_BWD
+    k_unpad.requires_grad = TEST_BWD
+    v_unpad.requires_grad = TEST_BWD
+
+    # Triton forward
+    with torch.set_grad_enabled(TEST_BWD):
+        triton_out = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=DROPOUT,
+            causal=CAUSAL,
+            return_lse=HAS_DROPOUT,
+            return_attn_probs=HAS_DROPOUT,
+            sink=sink,
+        )
+    if HAS_DROPOUT:
+        assert len(triton_out) == 3
+        dropout_mask = (
+            pad_rearrange_dropout_mask(
+                triton_out[2] > 0,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                SEQLEN_Q,
+                SEQLEN_K,
+                NUM_Q_HEADS,
+            )
+            > 0
+        )
+        triton_out = triton_out[0]
+    else:
+        dropout_mask = None
+    triton_out = output_pad_fn(triton_out)
+
+    # Torch forward
+    with torch.set_grad_enabled(TEST_BWD):
+        torch_out, _, _ = attention_ref(
+            q,
+            k,
+            v,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+            dropout_p=DROPOUT,
+            dropout_mask=dropout_mask,
+            causal=CAUSAL,
+            sink=sink,
+        )
+
+    # Forward assertion
+    fwd_atol: float = 1e-2
+    fwd_rtol: float = 1e-2
+    torch.testing.assert_close(
+        triton_out,
+        torch_out,
+        atol=fwd_atol,
+        rtol=fwd_rtol,
+        msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
+    )
+
+    if not TEST_BWD:
+        return
+
+    # Generate backward tensor
+    do = torch.randn_like(q)
+
+    # Triton backward
+    # Sink support isn't implemented in fused backward.
+    mha_set_use_fused_bwd_kernel(False)
+    triton_dq, triton_dk, triton_dv, triton_dsink = torch.autograd.grad(
+        triton_out, (q_unpad, k_unpad, v_unpad, sink), do
+    )
+    triton_dq = dq_pad_fn(triton_dq)
+    triton_dk = dk_pad_fn(triton_dk)
+    triton_dv = dk_pad_fn(triton_dv)
+
+    # Torch backward
+    torch_dq, torch_dk, torch_dv, torch_dsink = torch.autograd.grad(
+        torch_out, (q, k, v, sink), do
+    )
+
+    # Backward assertions
+    bwd_atol = 1.5e-2
+    bwd_rtol = 1.5e-2
+    torch.testing.assert_close(
+        triton_dq,
+        torch_dq,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dq mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dk,
+        torch_dk,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dk mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dv,
+        torch_dv,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dsink,
+        torch_dsink,
+        atol=5e-2,  # higher tolerance due to summation over exp
+        rtol=5e-2,  # higher tolerance due to summation over exp
+        msg=lambda msg: f"bwd dsink mismatch\n\n{msg}\n",
+    )

@@ -250,7 +250,7 @@ def generate_qkv(
         max_seqlen_k = seqlen_k
 
     if qkvpacked:
-        assert (query_padding_mask == None and key_padding_mask == None) or (
+        assert (query_padding_mask is None and key_padding_mask is None) or (
             query_padding_mask == key_padding_mask
         ).all()
         assert seqlen_q == seqlen_k
@@ -394,6 +394,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     key_leftpad=None,
+    sink=None,
 ):
     """
     Arguments:
@@ -412,6 +413,7 @@ def attention_ref(
         reorder_ops: whether to change the order of operations (scaling k instead of scaling q, etc.)
             without changing the math. This is to estimate the numerical error from operation
             reordering.
+        sink: (nheads,), attention sink scores (one per Q head), or None
     Output:
         output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
@@ -422,6 +424,8 @@ def attention_ref(
     dtype_og = q.dtype
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
+        if sink is not None:
+            sink = sink.float()
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
@@ -451,8 +455,17 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
+    if sink is not None:
+        # Concatenate sink scores to the attention scores.
+        batch_size = scores.shape[0]
+        nheads = scores.shape[1]
+        sink_expanded = sink.view(1, nheads, 1, 1).expand(batch_size, -1, seqlen_q, -1)
+        scores = torch.cat([scores, sink_expanded], dim=-1)
     lse = torch.logsumexp(scores, dim=-1).to(v.dtype)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    if sink is not None:
+        # Remove sink attention weights before computing output.
+        attention = attention[..., :-1]
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if window_size[0] >= 0 or window_size[1] >= 0:
         attention = attention.masked_fill(
