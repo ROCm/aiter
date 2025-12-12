@@ -36,10 +36,13 @@ class cktile_moe_2stage_gemm_codegen:
         mul_routed_weight_stage,
         istune=False,
     ):
+        self.init = True
         self.working_path = working_path
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
+        self.dispatchers_path = os.path.join(working_path, "dispatchers")
         self.istune = istune
+        self.kernel_name_list = []
         self.ab_dtype = ab_dtype.lower()
         self.acc_dtype = acc_dtype.lower()
         self.c_dtype = c_dtype.lower()
@@ -262,7 +265,8 @@ template torch::Tensor
             # print(placeholders)
             # print(str_mapping)
             if missing:
-                raise KeyError(f"Missing keys in mapping: {missing}")
+                for mis in missing:
+                    placeholders.remove(mis)
             result = template
             # for placeholder in placeholders:
             #     result = result.replace(placeholder, str_mapping[placeholder])
@@ -271,7 +275,7 @@ template torch::Tensor
 
         # create heuristic heirarchy
         with open(
-            os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"),
+            os.path.join(self.dispatchers_path, f"moe_cktile2stages_heuristic_dispatch_{tag}.h"),
             "w",
         ) as f:
             f.write(validate_and_format(HEURISTIC_template, kernels_dict))
@@ -284,6 +288,27 @@ template torch::Tensor
             #         suffix2 = self.get_suffix(2)
             #     )
             # )
+
+    """genarete heuristic dispatch header for multi dtype"""
+
+    def gen_heuristic_dispatch_header(self, tags):
+        HEURISTIC_dispatch_header = """#pragma once
+        // SPDX-License-Identifier: MIT
+        // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
+
+"""
+        for tag in tags:
+            HEURISTIC_headers = f"""#include "moe_cktile2stages_heuristic_dispatch_{tag}"
+"""
+            HEURISTIC_dispatch_header += HEURISTIC_headers
+
+        # create heuristic heirarchy
+        with open(
+            os.path.join(self.working_path, f"moe_cktile2stages_heuristic_dispatch.h"),
+            "w",
+        ) as f:
+            f.write(HEURISTIC_dispatch_header)
 
     """generate lookup.h linking MNK/datatype to specific instance"""
 
@@ -331,7 +356,7 @@ template torch::Tensor
 
     """generate manifest.h for instance header"""
 
-    def gen_manifest_head(self, kernels_dict):
+    def gen_manifest_head(self):
         MAINFEST_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -370,25 +395,31 @@ torch::Tensor
             os.path.join(self.working_path, "moe_cktile2stages_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            for k_name in self.kernel_name_list:
+                f.write(MAINFEST_template.format(kernel_name=k_name))
             f.write(MAINFEST_end)
 
     """generate all instances and headers"""
 
     def gen_instances(self, tag, kernels_dict):
-        if os.path.exists(self.impl_path):
+        if os.path.exists(self.impl_path) and self.init:
             shutil.rmtree(self.impl_path)
-        os.mkdir(self.impl_path)
-        if os.path.exists(self.instances_path):
+            os.mkdir(self.impl_path)
+        if os.path.exists(self.instances_path) and self.init:
             shutil.rmtree(self.instances_path)
-        os.mkdir(self.instances_path)
+            os.mkdir(self.instances_path)
+        if os.path.exists(self.dispatchers_path) and self.init:
+            shutil.rmtree(self.dispatchers_path)
+            os.mkdir(self.dispatchers_path)
+
+        self.init = False
 
         for mnk, k in kernels_dict.items():
             self.gen_instance(k)
+            if k.name not in self.kernel_name_list:
+                self.kernel_name_list.append(k.name)
 
         self.gen_lookup_dict(kernels_dict)
-        self.gen_manifest_head(kernels_dict)
         self.gen_heuristic_dispatch(tag, kernels_dict)
 
 
@@ -550,6 +581,7 @@ if __name__ == "__main__":
     # quant_type = "per_token"
 
     a_type = "fp8"
+    a_types = ["bf16", "fp8"]
     # a_type = "bf16"
     b_type = "fp4"
     quant_type = "1x32"
@@ -561,24 +593,30 @@ if __name__ == "__main__":
         args.working_path, a_type, acc_type, c_type, quant_type, act_type, 2, False
     )
     # gen all instances for gemm1 and gemm2
-    _, gemm1_kernel_list = get_gemm1_kernels_list(
-        a_type,
-        b_type,
-        quant_type,
-        act_type,
-        False,
-    )
-    tag, gemm2_kernel_list = get_gemm2_kernels_list(
-        a_type,
-        b_type,
-        quant_type,
-        "",
-        True,
-    )
-    # merge gemm1/gemm2 dict with key = {stage, key}
-    kernel_dict_merge = {
-        **{(1, key): value for key, value in gemm1_kernel_list.items()},
-        **{(2, key): value for key, value in gemm2_kernel_list.items()},
-    }
-    # print(kernel_dict_merge)
-    codegen.gen_instances(tag, kernel_dict_merge)
+    tags = []
+    kernel_list = []
+    for a_type in a_types:
+        _, gemm1_kernel_list = get_gemm1_kernels_list(
+            a_type,
+            b_type,
+            quant_type,
+            act_type,
+            False,
+        )
+        tag, gemm2_kernel_list = get_gemm2_kernels_list(
+            a_type,
+            b_type,
+            quant_type,
+            "",
+            True,
+        )
+        # merge gemm1/gemm2 dict with key = {stage, key}
+        kernel_dict_merge = {
+            **{(1, key): value for key, value in gemm1_kernel_list.items()},
+            **{(2, key): value for key, value in gemm2_kernel_list.items()},
+        }
+        # print(kernel_dict_merge)
+        codegen.gen_instances(tag, kernel_dict_merge)
+        tags.append(tag)
+    codegen.gen_heuristic_dispatch_header(tags)
+    codegen.gen_manifest_head()
