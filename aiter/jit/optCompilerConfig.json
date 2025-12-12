@@ -845,7 +845,7 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'"
         ]
     },
-    "module_fmha_bwd": {
+    "module_fmha_v3_bwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_bwd.cu'",
@@ -864,7 +864,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_bwd --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}'"
         ]
     },
     "module_fmha_v3_varlen_bwd": {
@@ -886,7 +886,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_bwd --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}'"
 
         ]
     },
