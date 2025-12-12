@@ -30,7 +30,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 
 aiter.hipb_create_extension()
 

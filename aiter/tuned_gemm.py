@@ -406,7 +406,7 @@ def triton_gemm(
     scale_c: Optional[Tensor] = None,
     bpreshuffle: Optional[bool] = False,
 ):
-    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
     assert (
         scale_a is None and scale_b is None and scale_c is None
