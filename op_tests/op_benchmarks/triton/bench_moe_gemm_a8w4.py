@@ -192,7 +192,7 @@ def bench_mlp(
             )
         else:
             assert x_dtype_str == "mx8"
-            x, _, x_scale = quantize(x, x_dtype_str)
+            x, x_scale = quantize(x, x_dtype_str)
             x = moe_gemm_a8w4(
                 x,
                 w1,
@@ -206,7 +206,7 @@ def bench_mlp(
                 swizzle_mx_scale="CDNA4_SCALE",
                 apply_swiglu=True,
             )
-            x, _, x_scale = quantize(x, x_dtype_str)
+            x, x_scale = quantize(x, x_dtype_str)
             x = moe_gemm_a8w4(
                 x,
                 w2,
