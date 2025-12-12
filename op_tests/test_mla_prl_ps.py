@@ -90,6 +90,7 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
+    import pdb; pdb.set_trace()
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
 
@@ -311,27 +312,27 @@ print(f"  kv_indices shape: {kv_indices.shape}")
 # print(f"  kv_end: {work_info_set[0, 5]}")
 # print(f"  q_head_range: {work_info_set[0, 7]} (head {work_info_set[0, 7]} to {work_info_set[0, 7] >> 16})")
 
-_, us_asm_prefill = run_perftest(
-    aiter.mla.mla_ps_prefill_fwd,
-    q_quant,
-    k_quant,
-    v_quant,
-    output,
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    work_indptr,
-    work_info_set,
-    max_seqlen_q,
-    is_causal,
-    reduce_indptr,
-    reduce_final_map,
-    reduce_partial_map,
-    softmax_scale,
-    q_scale,
-    k_scale,
-    v_scale,
-)
+# _, us_asm_prefill = run_perftest(
+#     aiter.mla.mla_ps_prefill_fwd,
+#     q_quant,
+#     k_quant,
+#     v_quant,
+#     output,
+#     qo_indptr,
+#     kv_indptr,
+#     kv_indices,
+#     work_indptr,
+#     work_info_set,
+#     max_seqlen_q,
+#     is_causal,
+#     reduce_indptr,
+#     reduce_final_map,
+#     reduce_partial_map,
+#     softmax_scale,
+#     q_scale,
+#     k_scale,
+#     v_scale,
+# )
 
 # print('This is output', output)
 
