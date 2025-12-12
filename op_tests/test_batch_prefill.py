@@ -9,6 +9,8 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter import per_tensor_quant
+from aiter.test_common import run_perftest
 from einops import rearrange, repeat
 import argparse
 
@@ -270,6 +272,186 @@ def test_batch_prefill_with_paged_kv_cache(
         torch.testing.assert_close(o_i, o_ref_i, rtol=rtol, atol=atol)
 
 
+def run_ck(
+    q,
+    k_cache,
+    v_cache,
+    cu_seqlens_q,
+    kv_indptr,
+    kv_page_indices,
+    max_seqlen_q,
+    max_seqlen_k,
+    causal=False,
+    logits_soft_cap=0.0,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+):
+    """Unified interface for running batch_prefill with or without FP8."""
+    if (
+        q.dtype == dtypes.fp8
+        and k_cache.dtype == dtypes.fp8
+        and v_cache.dtype == dtypes.fp8
+    ):
+        # FP8 path
+        return run_perftest(
+            aiter.mha_batch_prefill_func,
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_page_indices,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+    else:
+        # Standard BF16/FP16 path
+        return run_perftest(
+            aiter.mha_batch_prefill_func,
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_page_indices,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+        )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (32, 8)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize(
+    "qo_len,kv_len",
+    [
+        (1024, 1024),
+        (2048, 2048),
+        (4096, 4096),
+    ],
+)
+def test_batch_prefill_fp8_output(
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    qo_len,
+    kv_len,
+    head_dim,
+    causal,
+    logits_soft_cap,
+):
+    """Test FP8 batch_prefill by comparing with BF16 kernel."""
+    torch.random.manual_seed(0)
+    torch.cuda.empty_cache()
+
+    dtype = torch.bfloat16
+    quant_dtype = dtypes.fp8
+    page_size = 1
+
+    def create_tensor(min_val, max_val, *args, **kwargs):
+        x = torch.randn(*args, **kwargs)
+        x = (x - x.min()) / (x.max() - x.min())
+        return min_val + (max_val - min_val) * x
+
+    def convert_lens_to_indptr(lens):
+        return torch.cumsum(torch.cat((torch.tensor([0]), lens)), dim=0).int()
+
+    # Create Q tensor
+    q = create_tensor(
+        -10, 10, batch_size * qo_len, num_qo_heads, head_dim, dtype=dtype
+    ).to(0)
+
+    # Create sequence lengths
+    if batch_size > 1:
+        qo_lens = torch.randint(1, qo_len + 1, (batch_size,)).int()
+        kv_lens = torch.maximum(
+            qo_lens, torch.randint(1, kv_len + 1, (batch_size,))
+        ).int()
+    else:
+        qo_lens = torch.full((batch_size,), qo_len).int()
+        kv_lens = torch.full((batch_size,), kv_len).int()
+
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+
+    # Create paged KV cache
+    max_num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = max_num_pages_per_seq * batch_size
+    kv_shape = [total_num_pages, 2, num_kv_heads, page_size, head_dim]
+
+    kv_data = create_tensor(-5, 5, *kv_shape, dtype=dtype).to(0)
+
+    kv_num_used_pages = (kv_lens + page_size - 1) // page_size
+    kv_indptr_cpu = convert_lens_to_indptr(kv_num_used_pages)
+    kv_indices_cpu = torch.nn.functional.pad(
+        torch.randperm(total_num_pages).int(), (0, 128), value=0
+    )
+
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_indptr_cpu.to(0)
+    kv_indices_gpu = kv_indices_cpu.to(0)
+
+    # Extract K and V caches
+    chunks = torch.chunk(kv_data, 2, dim=1)
+    k_cache = chunks[0].squeeze(2).squeeze(2)
+    v_cache = chunks[1].squeeze(2).squeeze(2)
+
+    # Quantize to FP8
+    q_quant, q_descale = per_tensor_quant(q, 1.0, quant_dtype=quant_dtype)
+    k_cache_quant, k_descale = per_tensor_quant(k_cache, 1.0, quant_dtype=quant_dtype)
+    v_cache_quant, v_descale = per_tensor_quant(v_cache, 1.0, quant_dtype=quant_dtype)
+
+    # Run FP8 version
+    out_fp8, us_fp8 = run_ck(
+        q_quant,
+        k_cache_quant,
+        v_cache_quant,
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        torch.max(qo_lens).item(),
+        torch.max(kv_lens).item(),
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    # Run BF16 reference
+    out_ref, us_ref = run_ck(
+        q,
+        k_cache,
+        v_cache,
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        torch.max(qo_lens).item(),
+        torch.max(kv_lens).item(),
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+    )
+
+    # Compare outputs
+    max_diff = (out_fp8 - out_ref).abs().max().item()
+    print(f"FP8 vs BF16 max diff: {max_diff}")
+    print(
+        f"FP8 time: {us_fp8:.2f} us, BF16 time: {us_ref:.2f} us, Speedup: {us_ref/us_fp8:.2f}x"
+    )
+
+    # Assert accuracy
+    assert max_diff < 0.055, f"FP8 precision loss too large: {max_diff}"
+
+
 l_causal = [False, True]
 l_logits_soft_cap = [0.0, 30.0]
 l_dtype = ["fp16", "bf16"]
@@ -309,6 +491,12 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
+parser.add_argument(
+    "--test_fp8",
+    action="store_true",
+    help="""Run FP8 test instead of standard test.
+    e.g.: --test_fp8""",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -321,27 +509,42 @@ if __name__ == "__main__":
     if args.logits_soft_cap is not None:
         l_logits_soft_cap = [args.logits_soft_cap]
 
-    for (
-        causal,
-        logits_soft_cap,
-        dtype,
-    ) in itertools.product(l_causal, l_logits_soft_cap, l_dtype):
-        test_batch_prefill_with_paged_kv_cache(
-            batch_size=1,
-            kv_len=8192,
-            qo_len=8192,
-            page_size=1,
-            num_qo_heads=6,
-            num_kv_heads=1,
-            head_dim=128,
-            causal=causal,
-            kv_layout="NHD",
-            logits_soft_cap=logits_soft_cap,
-            contiguous_kv=True,
-            dtype=dtype,
-            q_init_min=-10,
-            q_init_max=10,
-            kv_init_min=-5,
-            kv_init_max=5,
-            seed=19378,
-        )
+    if args.test_fp8:
+        # Run FP8 tests
+        for causal, logits_soft_cap in itertools.product(l_causal, l_logits_soft_cap):
+            test_batch_prefill_fp8_output(
+                batch_size=1,
+                num_qo_heads=6,
+                num_kv_heads=1,
+                qo_len=8192,
+                kv_len=8192,
+                head_dim=128,
+                causal=causal,
+                logits_soft_cap=logits_soft_cap,
+            )
+    else:
+        # Run standard tests
+        for (
+            causal,
+            logits_soft_cap,
+            dtype,
+        ) in itertools.product(l_causal, l_logits_soft_cap, l_dtype):
+            test_batch_prefill_with_paged_kv_cache(
+                batch_size=1,
+                kv_len=8192,
+                qo_len=8192,
+                page_size=1,
+                num_qo_heads=6,
+                num_kv_heads=1,
+                head_dim=128,
+                causal=causal,
+                kv_layout="NHD",
+                logits_soft_cap=logits_soft_cap,
+                contiguous_kv=True,
+                dtype=dtype,
+                q_init_min=-10,
+                q_init_max=10,
+                kv_init_min=-5,
+                kv_init_max=5,
+                seed=19378,
+            )
