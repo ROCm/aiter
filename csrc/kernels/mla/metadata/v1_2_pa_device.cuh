@@ -93,9 +93,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     // expected payload handled by each cu part.
-    const int32_t average = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
-                        Traits::kFixedOverheadNumBlocks;
-    const int32_t reminder = std::max(sum_blocks - params.num_splits * average, 0);
+    const int32_t average  = sum_blocks / params.num_splits;
+    const int32_t reminder = sum_blocks % params.num_splits;
 
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
