@@ -74,7 +74,8 @@ def get_kernel_config(m, n, k, routing_data):
     blockscale_m = 128
     blockscale_k = 128
     blockscale_n = 128
-    num_xcds = 8
+    num_xcds = 2
+    xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
 
@@ -103,6 +104,7 @@ def get_kernel_config(m, n, k, routing_data):
         "block_n": block_n,
         "block_k": block_k,
         "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
         "num_warps": num_warps,
         "num_stages": num_stages,
         "blockscale_m": blockscale_m,
@@ -337,6 +339,7 @@ def moe_gemm_a8w8_blockscale(
         config["blockscale_m"],
         config["blockscale_n"],
         config["blockscale_k"],
+        XCD_SWIZZLE=config["xcd_swizzle"],
         SPLIT_K=config["split_k"],
         EVEN_K=K % config["block_k"] == 0,
         MASK_K_LIMIT=K % config["block_k"],

@@ -58,6 +58,30 @@ def matmul_launch_metadata(grid, kernel, args):
     return ret
 
 
+# TODO: using aiter swizzle instead can lead to perf degradation in rare cases
+@triton.jit
+def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: tl.constexpr):
+    """
+    Swizzle the program id based on integer XCD_SWIZZLE.
+    This is useful for reording how blocks are ordered. A scheduler may, for example,
+    assign sequential blocks 0, 1, 2, 3, ..., 8, 9, 10.. to its 8 hardware units 0, 1, 2, 3, ..., 0, 1, 2.
+    This pattern may not be ideal for memory access, and it may be better to swizzle so the assignment
+    becomes 0, 0, 0, 0, ..., 1, 1, 1, ... In the swizzled arrangement, sequential blocks are assigned to
+    the same hardware unit.
+    """
+    # Number of pids per group in the new arrangement
+    pids_per_group = domain_size // XCD_SWIZZLE
+    extra_pid_groups = domain_size % XCD_SWIZZLE
+
+    # Compute current current and local pid within the group
+    group = pid % XCD_SWIZZLE
+    local_pid = pid // XCD_SWIZZLE
+
+    # Calculate new pid based on the new grouping
+    new_pid = group * pids_per_group + min(group, extra_pid_groups) + local_pid
+    return new_pid
+
+
 @triton.jit
 def clip(x, limit, clip_lower: tl.constexpr):
     res = tl.minimum(x, limit)
@@ -201,6 +225,7 @@ def _moe_gemm_a8w8_blockscale(
     BLOCKSCALE_M: tl.constexpr,
     BLOCKSCALE_N: tl.constexpr,
     BLOCKSCALE_K: tl.constexpr,
+    XCD_SWIZZLE: tl.constexpr,
     EVEN_K: tl.constexpr,
     MASK_K_LIMIT: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -216,11 +241,11 @@ def _moe_gemm_a8w8_blockscale(
     - X: Matrix X with shape (M, K).
     - E: Matrix E with shape (E, K, N).
     - Y: Matrix C with shape (E, M, N).
-    - x_scale: Scale tensor for A with shape (M // group_m, K // group_k) or (M, K // group_k)
-    - w_scale: Scale tensor for B with shape (K // group_k, N // group_n)
+    - x_scale: Scale tensor for A with shape (M // blockscale_m, K // blockscale_k) or (M, K // blockscale_k)
+    - w_scale: Scale tensor for B with shape (K // blockscale_k, N // blockscale_n)
     - PER_ROW_X_SCALE: Determines whether we use per-row or 2D blockscale on X
 
-    For this kernel implementation, GROUP_K must equal BLOCK_K.
+    For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K.
     """
 
     tl.assume(stride_y_k >= 0)
@@ -254,7 +279,12 @@ def _moe_gemm_a8w8_blockscale(
     yN = N // ACTIVATION_REDUCTION_N
 
     pid = tl.program_id(0)
-    padding_m: tl.constexpr = 0
+    if ExptOffsSum is not None and XCD_SWIZZLE > 1:
+        # Determine how much padding there is on the expert data. This allows us to
+        # know the true grid size and avoid processing padding tiles.
+        padding_m = grid_m - tl.load(ExptOffsSum)
+    else:
+        padding_m: tl.constexpr = 0
 
     index_type: tl.constexpr = tl.int64 if UPCAST_INDICES else tl.int32
 
@@ -265,6 +295,8 @@ def _moe_gemm_a8w8_blockscale(
         return
 
     pid_emnk = pid
+    if XCD_SWIZZLE != 1:
+        pid_emnk = xcd_swizzle(pid_emnk, total_actual_tiles, XCD_SWIZZLE)
     # pid_e = pid_emnk // (unpadded_m * grid_n * SPLIT_K)
     pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
     pid_k = pid_mnk % SPLIT_K
