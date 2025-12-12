@@ -120,9 +120,6 @@ def get_x_vals():
         (64, 7168, 256),
         (128, 7168, 256),
     ]
-    x_vals = [
-        (8, 4096, 7168),
-    ]
     # x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
@@ -215,6 +212,12 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
         )
 
+    if impl == "triton_shuffle":
+        if N % 16 > 0 or K % 32 > 0:
+            pytest.skip(
+                "N has to be multiple of 16 and K has to be multiple of 32 for weight preshuffle cases"
+            )
+
     dtype = str_to_torch_dtype[dtype]
     x, weight, weight_triton, x_scale, w_scale, y = (
         generate_gemm_a8w8_blockscale_inputs(
@@ -240,30 +243,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 
-    from triton import runtime
-
-    di = runtime.driver.active.get_device_interface()
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()
-    config = {
-        "BLOCK_SIZE_M": 8,
-        # "BLOCK_SIZE_N": 32,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        # "num_warps": 2,
-        "num_stages": 2,
-        "waves_per_eu": 2,
-        # "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg",
-        "NUM_KSPLIT": 14,
-    }
-    for _ in range(250):
-        cache.zero_()
-        di.synchronize()
-        # b = run_triton(x, weight_triton, x_scale, w_scale, dtype, y, impl)
-        b = impl(x, weight_triton, x_scale, w_scale, dtype, y, config=config)
-        di.synchronize()
+    b = run_triton(x, weight_triton, x_scale, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

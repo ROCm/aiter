@@ -203,7 +203,7 @@ def gemm_a8w8_blockscale_preshuffle(
     w_scale = w_scale.T  # (scale_k, scale_n)
 
     if config is None:
-        config = _get_config(M, N, K)
+        config = _get_config(M, N, K, True)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
