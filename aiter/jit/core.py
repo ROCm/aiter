@@ -20,7 +20,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx
+from chip_info import get_gfx, get_gfx_list
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from torch_guard import torch_compile_guard  # noqa: E402
@@ -55,10 +55,6 @@ def mp_lock(
     return ret
 
 
-PREBUILD_KERNELS = False
-if os.path.exists(os.path.dirname(os.path.abspath(__file__)) + "/aiter_.so"):
-    aiter_ = importlib.import_module(f"{__package__}.aiter_")
-    PREBUILD_KERNELS = True
 logger = logging.getLogger("aiter")
 
 PY = sys.executable
@@ -68,23 +64,28 @@ AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
 
+
 # config_env start here
 AITER_CONFIG_GEMM_A4W4 = os.getenv(
     "AITER_CONFIG_GEMM_A4W4",
     f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
 )
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
 )
+
 AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
 )
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
 )
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
@@ -101,70 +102,169 @@ AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
 )
 
 AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
-    "AITER_CONFIG_BATCHED_GEMM_BF16",
+    "AITER_CONFIG_BF16_BATCHED_GEMM",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
 )
 
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
-    f"{AITER_ROOT_DIR}/aiter/configs/tuned_gemm.csv",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
 
-def update_config_files(file_path: str, merge_name: str):
-    path_list = file_path.split(os.pathsep) if file_path else []
-    if len(path_list) <= 1:
-        return file_path
-    df_list = []
-    ## merge config files
-    ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
-    import pandas as pd
+class AITER_CONFIG(object):
+    @property
+    def AITER_CONFIG_GEMM_A4W4_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W4",
+            AITER_CONFIG_GEMM_A4W4,
+            "a4w4_blockscale_tuned_gemm",
+        )
 
-    df_list.append(pd.read_csv(path_list[0]))
-    for i, path in enumerate(path_list[1:]):
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            ## check columns
-            assert (
-                df.columns.tolist() == df_list[0].columns.tolist()
-            ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+    @property
+    def AITER_CONFIG_GEMM_A8W8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
+        )
 
-            df_list.append(df)
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE,
+            "a8w8_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
+            "a8w8_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_FMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+            "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_A8W8_BATCHED_GEMM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_A8W8_BATCHED_GEMM",
+            AITER_CONFIG_A8W8_BATCHED_GEMM,
+            "a8w8_tuned_batched_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_BF16_BATCHED_GEMM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BF16_BATCHED_GEMM",
+            AITER_CONFIG_BF16_BATCHED_GEMM,
+            "bf16_tuned_batched_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    def update_config_files(self, file_path: str, merge_name: str):
+        path_list = file_path.split(os.pathsep) if file_path else []
+        if len(path_list) <= 1:
+            return file_path
+        df_list = []
+        ## merge config files
+        ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+        import pandas as pd
+
+        df_list.append(pd.read_csv(path_list[0]))
+        for i, path in enumerate(path_list[1:]):
+            if os.path.exists(path):
+                df = pd.read_csv(path)
+                ## check columns
+                assert (
+                    df.columns.tolist() == df_list[0].columns.tolist()
+                ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+
+                df_list.append(df)
+            else:
+                logger.info(f"path {i+1}: {path} (not exist)")
+        merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+        ## get keys from untuned file to drop_duplicates
+        untuned_name = (
+            re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
+            if re.search(r"(?:_)?tuned$", merge_name)
+            else merge_name.replace("tuned", "untuned")
+        )
+        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+        if os.path.exists(untuned_path):
+            untunedf = pd.read_csv(untuned_path)
+            keys = untunedf.columns.to_list()
+            keys.append("cu_num")
+            merge_df = (
+                merge_df.sort_values("us")
+                .drop_duplicates(subset=keys, keep="first")
+                .reset_index(drop=True)
+            )
         else:
-            print(f"path {i+1}: {path} (not exist)")
-    merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
-    merge_df = merge_df.drop_duplicates(keep="last")
-    new_file_path = f"/tmp/{merge_name}.csv"
-    merge_df.to_csv(new_file_path, index=False)
-    return new_file_path
+            logger.warning(
+                f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
+            )
+        from pathlib import Path
+
+        config_path = Path("/tmp/aiter_configs/")
+        if not config_path.exists():
+            config_path.mkdir(parents=True, exist_ok=True)
+        new_file_path = f"{config_path}/{merge_name}.csv"
+        lock_path = f"{new_file_path}.lock"
+
+        def write_config():
+            merge_df.to_csv(new_file_path, index=False)
+
+        mp_lock(lock_path, write_config)
+        return new_file_path
+
+    @functools.lru_cache(maxsize=20)
+    def get_config_file(self, env_name, default_file, tuned_file_name):
+        config_env_file = os.getenv(env_name)
+        # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
+        from pathlib import Path
+
+        if not config_env_file:
+            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+            op_tuned_file_list = [
+                p
+                for p in model_config_dir.glob(f"*{tuned_file_name}*")
+                if (p.is_file() and "untuned" not in str(p))
+            ]
+
+            if not op_tuned_file_list:
+                config_file = default_file
+            else:
+                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
+                tuned_files = default_file + ":" + tuned_files
+                logger.info(
+                    f"merge tuned file under model_configs/ and configs/ {tuned_files}"
+                )
+                config_file = self.update_config_files(tuned_files, tuned_file_name)
+        else:
+            config_file = self.update_config_files(config_env_file, tuned_file_name)
+            # print(f"get config file from environment ", config_file)
+        return config_file
 
 
-AITER_CONFIG_GEMM_A4W4_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A4W4, "a4w4_blockscale_tuned_gemm"
-)
-AITER_CONFIG_GEMM_A8W8_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
-)
-AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, "a8w8_bpreshuffle_tuned_gemm"
-)
-AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, "a8w8_blockscale_tuned_gemm"
-)
-AITER_CONFIG_FMOE_FILE = update_config_files(AITER_CONFIG_FMOE, "tuned_fmoe")
-AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
-    "a8w8_blockscale_bpreshuffle_tuned_gemm",
-)
-AITER_CONFIG_A8W8_BATCHED_GEMM_FILE = update_config_files(
-    AITER_CONFIG_A8W8_BATCHED_GEMM, "a8w8_tuned_batched_gemm"
-)
-AITER_CONFIG_BF16_BATCHED_GEMM_FILE = update_config_files(
-    AITER_CONFIG_BF16_BATCHED_GEMM, "bf16_tuned_batched_gemm"
-)
-AITER_CONFIG_GEMM_BF16_FILE = update_config_files(
-    AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
-)
+AITER_CONFIGS = AITER_CONFIG()
 # config_env end here
 
 find_aiter = importlib.util.find_spec("aiter")
@@ -186,18 +286,26 @@ if find_aiter is not None:
 
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
-    # install mode
     else:
         AITER_META_DIR = os.path.abspath(f"{AITER_ROOT_DIR}/aiter_meta/")
 else:
     AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
+
+# honor environment override and fallback if missing
+env_meta = os.environ.get("AITER_META_DIR")
+if env_meta:
+    AITER_META_DIR = os.path.abspath(env_meta)
+if not os.path.exists(os.path.join(AITER_META_DIR, "csrc")):
+    AITER_META_DIR = AITER_ROOT_DIR
+
 sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
-gfx = get_gfx()
-AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
+gfxs = get_gfx_list()
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{get_gfx()}/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
@@ -246,6 +354,13 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1103",
+        "gfx1150",
+        "gfx1151",
+        "gfx1152",
+        "gfx1153",
         "gfx950",
     ]
 
@@ -384,8 +499,8 @@ def build_module(
     is_standalone,
     torch_exclude,
     hipify=False,
-    prebuild=0,
 ):
+    os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
@@ -405,14 +520,7 @@ def build_module(
         if os.path.exists(f"{get_user_jit_dir()}/{target_name}"):
             os.remove(f"{get_user_jit_dir()}/{target_name}")
 
-        if prebuild != 2:
-            sources = rename_cpp_to_cu(srcs, src_dir, hipify)
-        else:
-            sources = rename_cpp_to_cu(
-                [get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"],
-                src_dir,
-                hipify,
-            )
+        sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
         flags_cc = ["-O3", "-std=c++20"]
         flags_hip = [
@@ -469,7 +577,7 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob"
+                blob_dir = f"{op_dir}/blob/"
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
@@ -477,12 +585,11 @@ def build_module(
                 sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 
-        if prebuild != 2:
-            if isinstance(blob_gen_cmd, list):
-                for s_blob_gen_cmd in blob_gen_cmd:
-                    sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
-            else:
-                sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
+        if isinstance(blob_gen_cmd, list):
+            for s_blob_gen_cmd in blob_gen_cmd:
+                sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
+        else:
+            sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
         extra_include_paths = [
             f"{CK_HELPER_DIR}",
@@ -530,23 +637,9 @@ def build_module(
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
                 hipify=hipify,
-                prebuild=prebuild,
             )
             if is_python_module and not is_standalone:
-                if prebuild == 1:
-                    shutil.copy(
-                        f"{opbd_dir}/{target_name}",
-                        f"{get_user_jit_dir()}/build/aiter_/build",
-                    )
-                elif prebuild == 2:
-                    from pathlib import Path
-
-                    src_dir = Path(opbd_dir)
-                    dst_dir = Path(get_user_jit_dir())
-                    for src_file in src_dir.glob("*.so"):
-                        shutil.move(str(src_file), str(dst_dir / src_file.name))
-                else:
-                    shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
             else:
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
@@ -684,15 +777,15 @@ def compile_ops(
                 module = None
                 if gen_func is not None:
                     custom_build_args.update(gen_func(*args, **kwargs))
-                if PREBUILD_KERNELS:
-                    if hasattr(aiter_, loadName):
-                        module = aiter_
                 elif AITER_REBUILD and md_name not in rebuilded_list:
                     rebuilded_list.append(md_name)
                     raise ModuleNotFoundError("start rebuild")
                 if module is None:
-                    md = custom_build_args.get("md_name", md_name)
-                    module = get_module(md)
+                    try:
+                        module = get_module(md_name)
+                    except Exception as e:
+                        md = custom_build_args.get("md_name", md_name)
+                        module = get_module(md)
             except ModuleNotFoundError:
                 d_args = get_args_of_build(md_name)
                 d_args.update(custom_build_args)
@@ -761,6 +854,13 @@ def compile_ops(
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
                     doc_str = doc_str.replace("list[", "List[")
+                    doc_str = doc_str.replace("tuple[", "Tuple[")
+                    doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
+                    doc_str = doc_str.replace("typing.SupportsInt", "int")
+                    doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                    # A|None  -->  Optional[A]
+                    pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
+                    doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                     for el in enum_types:
                         doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
@@ -769,9 +869,7 @@ def compile_ops(
                         "torch": torch,
                         "typing": typing,
                     }
-                    if sys.version_info < (3, 10):
-                        pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
-                        doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
+
                     exec(
                         f"from aiter import*\ndef {doc_str}: pass",
                         namespace,

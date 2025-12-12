@@ -37,6 +37,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bias_enum bias_type,
                                   bool has_lse,
                                   bool has_dropout,
+                                  quant_scale_enum qscale_type,
                                   bool use_ext_asm,
                                   int how_v3_bf16_cvt = 1,
                                   bool skip_min_seqlen_q = false)
@@ -50,6 +51,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           bias_type,
                           has_lse,
                           has_dropout,
+                          qscale_type,
                           use_ext_asm,
                           how_v3_bf16_cvt,
                           skip_min_seqlen_q);
@@ -87,6 +89,7 @@ float mha_fwd(mha_fwd_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
+              quant_scale_enum qscale_type,
               bool use_ext_asm,
               int how_v3_bf16_cvt,
               const void* seqstart_q_padding_ptr,
@@ -105,6 +108,7 @@ float mha_fwd(mha_fwd_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
+                                     qscale_type,
                                      use_ext_asm,
                                      how_v3_bf16_cvt,
                                      args.min_seqlen_q != 0);
@@ -157,30 +161,38 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
+                                     quant_scale_enum::no_scale,
                                      use_ext_asm);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 
 V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
-V3_MULTI_TARGET_API = """
-    if (get_gpu_arch() == "gfx942") {
-        t = gfx942::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check);
-    } else if (get_gpu_arch() == "gfx950") {
-        t = gfx950::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check);
-    } else {
-        std::cout << "No supported GPU arch found!" << std::endl;
-        return -1;
-    }
-"""
-
 
 def get_v3_api():
+    v3_call = "fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check)"
     gfx_list = get_gfx_list()
+    v3_arch_list = [arch for arch in ["gfx942", "gfx950"] if arch in gfx_list]
+
+    if len(v3_arch_list) == 0:
+        return ""  # no v3 support
     if len(gfx_list) == 1:
-        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check);"
-    else:
-        return V3_MULTI_TARGET_API
+        return f"t = {gfx_list[0]}::{v3_call};"
+
+    api = """{
+        const std::string gpu_arch = get_gpu_arch();"""
+    for arch in v3_arch_list:
+        api = (
+            api
+            + f"""
+        if (gpu_arch == "{arch}") {{ t = {arch}::{v3_call}; }}"""
+        )
+    api = (
+        api
+        + """
+    }"""
+    )
+    return api
 
 
 V3_API = get_v3_api()

@@ -6,6 +6,7 @@ import os
 import copy
 import numpy as np
 import pandas as pd
+import multiprocessing as mp
 from aiter import logger
 
 pd.set_option("display.max_rows", 200)
@@ -15,6 +16,31 @@ pd.set_option("display.max_rows", 200)
 # pd.set_option("display.width", None)
 # pd.set_option("display.max_colwidth", None)
 # pd.set_option("display.expand_frame_repr", False)
+
+
+def ensure_spawn_method():
+    """
+    Ensure multiprocessing uses 'spawn' start method.
+
+    This is required for CUDA/distributed tests. Only sets the method if
+    it hasn't been set yet, avoiding conflicts with existing initialization.
+
+    Usage:
+        Called at the beginning of multi-GPU test functions before spawning
+        worker processes.
+    """
+    try:
+        current_method = mp.get_start_method(allow_none=True)
+        if current_method is None:
+            mp.set_start_method("spawn")
+        elif current_method != "spawn":
+            logger.warning(
+                f"Multiprocessing start method already set to '{current_method}', "
+                f"expected 'spawn'. This may cause issues with CUDA."
+            )
+    except RuntimeError:
+        # Already set, which is fine
+        pass
 
 
 def perftest(
@@ -175,7 +201,6 @@ def run_perftest(
     needTrace=False,
     **kwargs,
 ):
-
     @perftest(
         num_iters=num_iters,
         num_warmup=num_warmup,

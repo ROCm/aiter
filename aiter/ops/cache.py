@@ -95,3 +95,42 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_cache")
+def indexer_k_quant_and_cache(
+    k: Tensor,
+    kv_cache: Tensor,
+    slot_mapping: Tensor,
+    quant_block_size: int,
+    scale_fmt: str,
+) -> None: ...
+
+
+@compile_ops("module_cache")
+def cp_gather_indexer_k_quant_cache(
+    kv_cache: Tensor,
+    dst_k: Tensor,
+    dst_scale: Tensor,
+    block_table: Tensor,
+    cu_seq_lens: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_cache")
+def fused_qk_rope_concat_and_cache_mla(
+    q_nope: Tensor,
+    q_pe: Tensor,
+    kv_c: Tensor,
+    k_pe: Tensor,  # key tensor
+    kv_cache: Tensor,
+    q_out: Tensor,
+    slot_mapping: Tensor,
+    k_scale: Tensor,
+    q_scale: Tensor,
+    positions: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+    is_neox: bool,
+    is_nope_first: bool,
+) -> None: ...

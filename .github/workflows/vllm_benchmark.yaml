@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   VLLM_BRANCH: "main"
@@ -19,9 +19,22 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-1gpu-runner
+    needs: [check-signal]
+    runs-on: aiter-k8s-build
 
     steps:
       - name: Checkout aiter repo
@@ -47,6 +60,9 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
+          RUN pip config set global.default-timeout 60 \
+              && pip config set global.retries 10
+          RUN pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
@@ -65,7 +81,7 @@ jobs:
       - name: Build Docker image
         run: |
           IMAGE_TAG=rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
-          docker build -t $IMAGE_TAG -f Dockerfile.mod .
+          docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
       - name: Push Docker image
         run: |
@@ -78,7 +94,7 @@ jobs:
 
   vllm_benchmark:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-8gpu-runner
+    runs-on: aiter-mi325-8gpu
     needs: build_vllm_image
     strategy:
       fail-fast: false
@@ -94,28 +110,13 @@ jobs:
             kv_cache_dtype: 'fp8_kvcache'
         
     steps:
-      - name: Checkout aiter repo
-        uses: actions/checkout@v4
-        
-      - name: Checkout vLLM repo with retry
-        uses: nick-fields/retry@v2
-        with:
-          timeout_minutes: 20
-          max_attempts: 3
-          command: |
-            git clone --depth=1 --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
-
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download the vLLM image
         run: |
           docker pull rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
-      
-      - name: Clean up Rocm processes
-        run: |
-          ./.github/scripts/clean_up_rocm.sh
-
+    
       - name: Run benchmarks
         run: |
           set -x -o pipefail
@@ -144,10 +145,12 @@ jobs:
               -tp 8 --load-format dummy ${extraArgs} |& tee ${logFile}
           grep "Avg latency:" ${logFile} | awk '{print $3}'
   
-      - name: Clean up Rocm processes
+      - name: Clean up
         if: always()
         run: |
-          ./.github/scripts/clean_up_rocm.sh
+          docker stop aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
+          docker rm -f aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
+          docker rmi rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
 
   skip-job:
     if: ${{ github.event.pull_request.head.repo.fork }}

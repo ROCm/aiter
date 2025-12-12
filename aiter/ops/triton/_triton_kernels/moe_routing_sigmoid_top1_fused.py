@@ -8,9 +8,22 @@ import triton
 import triton.language as tl
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
-@triton.jit
+_routing_sigmoid_top1_repr = make_kernel_repr(
+    "_routing_sigmoid_top1_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_K",
+        "BLOCK_N",
+        "TOPK",
+        "FUSED_SHARED_EXPERTS",
+    ],
+)
+
+
+@triton.jit(repr=_routing_sigmoid_top1_repr)
 def _routing_sigmoid_top1_kernel(
     X_ptr,
     W_ptr,
@@ -115,7 +128,7 @@ def _routing_sigmoid_top1_kernel(
 @functools.lru_cache(maxsize=1024)
 def _get_config(M, N, K):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE_ROUTING_SIGMOID_TOPK1.json"
         with open(fpath, "r") as file:

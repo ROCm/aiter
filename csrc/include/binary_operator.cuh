@@ -15,11 +15,12 @@
  * limitations under the License.
  */
 #pragma once
-#include <torch/all.h>
+#include "dispatch_utils.h"
+#include "hip_compat.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include "hip_compat.h"
-#include "dispatch_utils.h"
+#include <torch/all.h>
+#include <torch/extension.h>
 #include <torch/torch.h>
 
 #include <hip/hip_bf16.h>

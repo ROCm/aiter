@@ -52,8 +52,54 @@ def flash_attn_onekernel_backward(
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
+    sink: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
     config: Optional[Dict[str, any]] = None,
 ):
+    """
+    Flash Attention one-kernel backward pass with positional encoding support.
+    Computes dQ, dK, dV in separate passes without atomics. Supports Q/K head dimensions
+    larger than V for positional encoding.
+
+    Args:
+        do (torch.Tensor): Output gradient. Shape (batch, seqlen_q, num_q_heads, v_head_dim)
+            or (total_tokens, num_q_heads, v_head_dim) for varlen.
+        q (torch.Tensor): Query tensor with shape (batch, seqlen_q, num_q_heads, qk_head_dim).
+            qk_head_dim may be larger than v_head_dim for positional encoding.
+        k (torch.Tensor): Key tensor with shape (batch, seqlen_k, num_k_heads, qk_head_dim).
+        v (torch.Tensor): Value tensor with shape (batch, seqlen_k, num_k_heads, v_head_dim).
+        o (torch.Tensor): Output from forward pass with same shape as do.
+        softmax_lse (torch.Tensor): Log-sum-exp from forward pass with shape
+            (batch, num_q_heads, seqlen_q) or (total_tokens, num_q_heads) for varlen.
+        dq (torch.Tensor): Pre-allocated query gradient with same shape as q.
+        dk (torch.Tensor): Pre-allocated key gradient with same shape as k.
+        dv (torch.Tensor): Pre-allocated value gradient with same shape as v.
+        dbias (torch.Tensor): Bias gradient (not supported, must be None).
+        sm_scale (float): Softmax scale, typically 1/sqrt(head_dim).
+        alibi_slopes (Optional[torch.Tensor]): ALiBi position bias slopes with shape (num_q_heads,).
+        causal (bool): Apply causal masking.
+        cu_seqlens_q (Optional[torch.Tensor]): Cumulative sequence lengths for query with shape
+            (batch + 1,). Enables variable-length mode.
+        cu_seqlens_k (Optional[torch.Tensor]): Cumulative sequence lengths for key with shape
+            (batch + 1,).
+        max_seqlen_q (int): Maximum query sequence length in batch.
+        max_seqlen_k (int): Maximum key sequence length in batch.
+        dropout_p (float): Dropout probability. 0.0 disables dropout.
+        philox_seed (Optional[int]): Random seed for dropout.
+        philox_offset (Optional[int]): Random offset for dropout.
+        descale_q (Optional[torch.Tensor]): FP8 descaling factor for q.
+        descale_k (Optional[torch.Tensor]): FP8 descaling factor for k.
+        descale_v (Optional[torch.Tensor]): FP8 descaling factor for v.
+        descale_do (Optional[torch.Tensor]): FP8 descaling factor for do.
+        USE_INT64_STRIDES (Optional[bool]): Use 64-bit stride indexing for large tensors.
+        sink (Optional[torch.Tensor]): Attention sink scores (one per Q head). Shape (num_q_heads,).
+        dsink (Optional[torch.Tensor]): Pre-allocated sink gradient with same shape as sink.
+        config (Optional[Dict[str, any]]): Kernel tuning parameters (preprocess_kernel,
+            onekernel, onekernel_pe).
+
+    Returns:
+        torch.Tensor: Delta tensor (element-wise product of do and o) with shape matching softmax_lse.
+    """
     _LOGGER.info(
         f"FLASH_ATTN_ONEKERNEL_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
         + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
@@ -139,6 +185,16 @@ def flash_attn_onekernel_backward(
         IS_FP8 and pe_head_dim == 0
     ), "Positional encoding doesn't support FP8."
 
+    assert (sink is None) or (
+        sink is not None and sink.dim() == 1 and sink.shape[0] == num_q_heads
+    ), "Sink must be 1D and have one element per query head."
+    assert (dsink is None) or (
+        dsink is not None and dsink.dim() == 1 and dsink.shape[0] == num_q_heads
+    ), "Sink gradient must be 1D and have one element per query head."
+    assert (sink is None) == (
+        dsink is None
+    ), "Sink and its gradient must be both present or absent."
+
     # Configs
     if config is None:
         config = _get_config()
@@ -209,11 +265,13 @@ def flash_attn_onekernel_backward(
             q,
             k,
             v,
+            sink,
             sm_scale,
             do,
             dq,
             dk,
             dv,
+            dsink,
             softmax_lse,
             delta,
             *q_strides,
@@ -252,10 +310,10 @@ def flash_attn_onekernel_backward(
             USE_EXP2=True,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_OUTPUT=False,
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
+            ENABLE_SINK=sink is not None,
             **config_onekernel,
         )
     else:
@@ -263,11 +321,13 @@ def flash_attn_onekernel_backward(
             q,
             k,
             v,
+            sink,
             sm_scale,
             do,
             dq,
             dk,
             dv,
+            dsink,
             softmax_lse,
             delta,
             *q_strides,
@@ -306,10 +366,10 @@ def flash_attn_onekernel_backward(
             USE_EXP2=True,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_OUTPUT=False,
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
+            ENABLE_SINK=sink is not None,
             **config_onekernel,
         )
 

@@ -8,6 +8,22 @@ import triton
 import triton.language as tl
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = make_kernel_repr(
+    "_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel",
+    [
+        "HAS_BIAS",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "EVEN_K",
+        "cache_modifier",
+        "GRID_MN",
+    ],
+)
 
 
 @triton.heuristics(
@@ -17,7 +33,9 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(
+    repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr
+)
 def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel(
     # Pointers to matrices
     a_ptr,
@@ -190,7 +208,7 @@ def _get_config(
     K: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT.json"
         with open(fpath, "r") as file:
@@ -199,7 +217,7 @@ def _get_config(
 
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT-N={N}-K={K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:

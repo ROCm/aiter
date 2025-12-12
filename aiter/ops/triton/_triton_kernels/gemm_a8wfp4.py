@@ -8,6 +8,40 @@ import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_gemm_a8wfp4_repr = make_kernel_repr(
+    "_gemm_a8wfp4_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "RAW_MASKED_LOADS",
+        "cache_modifier",
+    ],
+)
+
+_gemm_afp4_wfp4_reduce_repr = make_kernel_repr(
+    "_gemm_afp4_wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "RAW_MASKED_LOADS",
+        "cache_modifier",
+    ],
+)
 
 
 @triton.heuristics(
@@ -19,7 +53,7 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_gemm_a8wfp4_repr)
 def _gemm_a8wfp4_kernel(
     a_ptr,
     b_ptr,
@@ -52,7 +86,8 @@ def _gemm_a8wfp4_kernel(
     RAW_MASKED_LOADS: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """
+    Kernel for computing the matmul C = A x B.
     A is in fp8 e4m3 format.
     B is in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.
@@ -183,7 +218,7 @@ def _gemm_a8wfp4_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_gemm_afp4_wfp4_reduce_repr)
 def _gemm_afp4_wfp4_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
@@ -237,7 +272,7 @@ def _get_config(
     K: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8WFP4.json"
 
         with open(fpath, "r") as file:

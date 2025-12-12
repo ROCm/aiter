@@ -28,8 +28,9 @@ import pandas as pd
 from GemmTuner import GemmTuner
 
 import time
+import multiprocessing as mp
+import gc
 
-aiter.rocb_create_extension()
 aiter.hipb_create_extension()
 
 
@@ -89,7 +90,7 @@ def load_input_gemms(input_file):
         return
 
 
-if __name__ == "__main__":
+def runGemmTuner():
     gtuner = GemmTuner()
     ext_group = gtuner.parser.add_argument_group("extra parameters")
     ext_group.add_argument(
@@ -117,7 +118,6 @@ if __name__ == "__main__":
         help="Tensor parallelism to be used.",
     )
     args = gtuner.parse_args()
-
     if args.outdtype is None:
         args.outdtype = args.indtype
     indtype = get_dtype(args.indtype)
@@ -130,9 +130,7 @@ if __name__ == "__main__":
             print(">>> Warning! NO MODEL SPECIFIED. Tuning for LL2 13B TP1")
             # LL2 13B sizes
             mksets = [(15360, 5120), (5120, 5120), (27648, 5120), (5120, 13824)]
-
             gtuner.add_gemm(m=32000, n=1, k=5120, indtype=indtype)  # logits gemm
-
         else:
             mksets, hidden_size, dtype = generate_mk_sets(args.model_dir, args.tp)
             gtuner.add_gemm(
@@ -141,11 +139,62 @@ if __name__ == "__main__":
                 k=hidden_size,
                 indtype=dtype,
             )  # TODO: Handle cases where vocab_size is not divisible by tp
-
             for n in sorted(nsets):
                 for m, k in mksets:
                     gtuner.add_gemm(m, n, k, indtype=dtype)
         gtuner.untunedf.to_csv("./tmp_untuned.csv", index=False)
         args.untune_file = "./tmp_untuned.csv"
-
     gtuner.run(args)
+
+
+def clean():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch.cuda, "memory_allocated"):
+        torch.cuda.synchronize()
+    try:
+        if hasattr(mp, "resource_tracker"):
+            mp.resource_tracker.ensure_running()
+            # clean  leaked semaphore objects
+            if hasattr(mp.resource_tracker, "_CLEANUP_FUNCS"):
+                # be careful
+                for name in list(mp.resource_tracker._CLEANUP_FUNCS.keys()):
+                    try:
+                        mp.resource_tracker._CLEANUP_FUNCS.pop(name)()
+                    except:
+                        pass
+    except Exception as e:
+        print(f"Resource cleanup warning: {e}")
+
+
+if __name__ == "__main__":
+    retries = 0
+    MAX_TRY = 30
+    mp.set_start_method("spawn", force=True)
+    while retries <= MAX_TRY:
+        try:
+            process = mp.Process(target=runGemmTuner, args=(), daemon=False)
+            process.start()
+            process.join()
+            if process.exitcode > 1:
+                time.sleep(0.5 * retries)
+                print(
+                    "!Error when run GemmTuner process exitcode is ", process.exitcode
+                )
+                clean()
+                retries += 1
+            else:
+                break
+        except Exception as e:
+            print(f"Process creation failed: {e}")
+            retries += 1
+            clean()
+            time.sleep(1)
+        finally:
+            if process and process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    clean()
+    print(f"retried num is {retries}")

@@ -24,19 +24,21 @@ def gemm_a16w16_gated(
     activation: Optional[str] = None,
 ):
     """
-    Computes the 16 bit matmul Y = X x W
-    Uses the first half of the output (along the N dim) as a gate for the second half (e.g for SwiGLU)
+    Computes 16 bit gated matrix multiplication Y = X @ W^T with gating mechanism (e.g., SwiGLU).
+    Uses first half of W output as gate for second half, producing (M, N//2) output.
 
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
-    - Y: Output Matrix Y with shape (M, N//2).
-    If this is none, then it's created by this API and returned as output.
-    - activation: Optional activation function to apply to the output. One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu")
+    Args:
+        x (torch.Tensor): Input matrix with shape (M, K).
+        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed. N must be even.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N//2).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M).
+        activation (Optional[str]): Activation function applied to gate ("gelu", "gelu_tanh",
+            "silu", "silu_exp2", "relu").
 
     Returns:
-    - Y: The output matrix with shape (M, N//2).
+        torch.Tensor: Gated output with shape (M, N//2).
     """
     _LOGGER.info(f"GEMM_A16W16_GATED: x={tuple(x.shape)} w={tuple(w.shape)}")
 
