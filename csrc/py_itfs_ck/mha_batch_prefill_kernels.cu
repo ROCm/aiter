@@ -422,6 +422,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                            mask.type,
                                            bias_type,
                                            has_lse,
+                                           qscale_type,
                                            false);
         TORCH_CHECK(t >= 0, "invalid argument for batch_prefill");
     }

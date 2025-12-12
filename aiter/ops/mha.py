@@ -962,6 +962,7 @@ def cmdGenFunc_mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     q_descale: Optional[Tensor] = None,
     k_descale: Optional[Tensor] = None,
@@ -2647,6 +2648,7 @@ def mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
@@ -2670,11 +2672,15 @@ def _mha_batch_prefill(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
     zero_tensors: bool = False,
     out: torch.Tensor = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2697,8 +2703,11 @@ def _mha_batch_prefill(
         return_lse,
         return_softmax,
         out,
+        bias,
         alibi_slopes,
-        None,
+        q_descale,
+        k_descale,
+        v_descale,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
@@ -2723,6 +2732,9 @@ def mha_batch_prefill_func(
     return_lse=False,
     return_attn_probs=False,
     out=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -2752,6 +2764,9 @@ def mha_batch_prefill_func(
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
         out=out,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     out = out_padded[..., :head_size_v_og]
 
