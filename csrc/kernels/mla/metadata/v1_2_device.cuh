@@ -17,7 +17,7 @@ struct MlaMetadataV12Traits
     // ==  0: read from MlaMetadataV1KernelParameter::uni_seqlen_qo
     // >=  1: read from MlaMetadataV12Traits::kUniSeqlenQo
     static constexpr int32_t kUniSeqlenQo            = kUniSeqlenQo_;
-    static constexpr int32_t kFixedOverheadNumBlocks = 6;
+    static constexpr int32_t kFixedOverheadNumBlocks = 16;
     static constexpr int32_t kIsSparse               = kIsSparse_;
     static constexpr int32_t kLdsBatchInfo           = kLdsBatchInfo_;
 };
