@@ -43,7 +43,6 @@
 #include "opus/opus.hpp"
 #include "py_itfs_common.h"
 #include "quick_all_reduce_base.h"
-#include "topk_per_row.h"
 
 #define HIP_CHECK(val)                                \
     {                                                 \
@@ -81,6 +80,7 @@ void standalone_stable_radix_11bits(void* buf,
 // Forward declaration of workspace size calculation function (at global scope)
 template <typename T>
 int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0);
+extern template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows, int32_t stride0);
 
 // Forward declaration of helper function to call topk_per_row kernel
 template <typename IdxT>

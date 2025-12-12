@@ -18,9 +18,3 @@ void top_k_per_row_decode(const torch::Tensor& logits,
                           int64_t numRows,
                           int64_t stride0,
                           int64_t stride1);
-
-template <typename T>
-int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0);
-
-extern template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows, int32_t stride0);
-extern template int64_t invokeComputeTopkLastDimWorkspaceSize<double>(int32_t numRows, int32_t stride0);
