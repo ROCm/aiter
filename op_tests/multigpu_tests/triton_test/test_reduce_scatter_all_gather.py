@@ -316,7 +316,7 @@ def test_reduce_scatter(tp_size, M=8192, N=7168, heap_size=1 << 30):
     outputs = [r.get() for r in results]
 
     print(f"\n{'='*80}")
-    print(f"Checking Reduce-Scatter Results")
+    print("Checking Reduce-Scatter Results")
     print(f"{'='*80}")
 
     all_passed = True
@@ -358,7 +358,7 @@ def test_all_gather(tp_size, M_shard=1024, N=7168, heap_size=1 << 30):
     outputs = [r.get() for r in results]
 
     print(f"\n{'='*80}")
-    print(f"Checking All-Gather Results")
+    print("Checking All-Gather Results")
     print(f"{'='*80}")
 
     all_passed = True
@@ -415,7 +415,7 @@ def test_round_trip(tp_size, M=8192, N=7168, heap_size=1 << 30):
     outputs = [r.get() for r in results]
 
     print(f"\n{'='*80}")
-    print(f"Checking Round-Trip Results")
+    print("Checking Round-Trip Results")
     print(f"{'='*80}")
 
     all_passed = True
@@ -484,7 +484,7 @@ if __name__ == "__main__":
     print("=" * 80)
     print("Testing Iris-Based Reduce-Scatter and All-Gather")
     print("=" * 80)
-    print(f"Configuration:")
+    print("Configuration:")
     print(f"  M (rows): {args.num_rows}")
     print(f"  N (cols): {args.num_cols}")
     print(f"  Number of GPUs: {args.num_gpus}")

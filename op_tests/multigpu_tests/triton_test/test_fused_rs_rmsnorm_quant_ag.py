@@ -327,7 +327,7 @@ def test_fused_with_fp8_quant(tp_size, M, N, dtype, heap_size=1 << 30):
     times = [out[3] for out in outputs]
 
     print(f"\n{'='*80}")
-    print(f"Checking Results (with FP8 quantization)")
+    print("Checking Results (with FP8 quantization)")
     print(f"{'='*80}")
 
     for i, (norm_out, quant_out, gather_out, us) in enumerate(outputs):
@@ -425,7 +425,7 @@ if __name__ == "__main__":
     print("=" * 80)
     print("Testing Fused Reduce-Scatter + RMSNorm + Quantization + All-Gather")
     print("=" * 80)
-    print(f"Configuration:")
+    print("Configuration:")
     print(f"  M (rows): {args.num_rows}")
     print(f"  N (cols): {args.num_cols}")
     print(f"  Dtype: {args.dtype}")
