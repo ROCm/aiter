@@ -2902,11 +2902,6 @@ def pa_decode_gluon(
     num_query_heads_total = query.shape[1]
     num_query_heads_total = num_query_heads_total // query_length
     num_kv_heads = key_cache.shape[1]
-    context_partition_size = 256
-    if sliding_window > 0:
-        max_context_length = min(max_context_length, sliding_window)
-        if max_context_length <= 128:
-            context_partition_size = 128
     max_context_partition_num = triton.cdiv(max_context_length, context_partition_size)
     head_size = query.shape[-1]
     kv_block_size = key_cache.shape[-2]
