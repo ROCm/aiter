@@ -127,7 +127,6 @@ def get_GEMM_A16W16_config(
                 eval(dtype) == dtypes.bf16
                 and N % 64 == 0
                 and K % 64 == 0
-                and not bias
                 and (eval(otype) == dtypes.bf16 or eval(otype) == dtypes.fp32)
             ):
                 default_config["libtype"] = "asm"

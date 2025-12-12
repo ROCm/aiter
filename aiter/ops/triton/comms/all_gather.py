@@ -14,13 +14,10 @@ import triton
 import triton.language as tl
 import logging
 
-try:
-    import iris
+import iris
 
-    IRIS_AVAILABLE = True
-except ImportError:
-    IRIS_AVAILABLE = False
-    logging.warning("Iris library not available. All-gather operations will not work.")
+# If we got here, iris is available
+IRIS_AVAILABLE = True
 
 logger = logging.getLogger("aiter")
 
@@ -192,7 +189,7 @@ def all_gather(
     if not IRIS_AVAILABLE:
         raise RuntimeError("Iris library is not available. Cannot perform all-gather.")
 
-    if not ctx._initialized:
+    if not ctx.is_initialized:
         raise RuntimeError(
             "Iris context not initialized. Use IrisCommContext as context manager."
         )
@@ -239,6 +236,7 @@ def all_gather(
     )
 
     # Synchronize
+    torch.cuda.synchronize()
     iris_ctx.barrier()
 
     logger.info(

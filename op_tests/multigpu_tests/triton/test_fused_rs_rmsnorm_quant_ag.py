@@ -17,8 +17,7 @@ import traceback
 import logging
 
 import aiter
-from aiter.test_common import checkAllclose, perftest
-from aiter import dtypes
+from aiter.test_common import checkAllclose, perftest, ensure_spawn_method
 from aiter.ops.triton.comms import (
     IrisCommContext,
     reduce_scatter_rmsnorm_quant_all_gather,
@@ -195,7 +194,7 @@ def test_fused_without_quant(
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49374"
-    mp.set_start_method("spawn", force=True)
+    ensure_spawn_method()
 
     # Create input data
     torch.manual_seed(42)
@@ -287,11 +286,9 @@ def test_fused_with_fp8_quant(tp_size, M, N, dtype, heap_size=1 << 30):
     if M % tp_size != 0:
         raise ValueError(f"M ({M}) must be divisible by tp_size ({tp_size})")
 
-    M_shard = M // tp_size
-
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49375"
-    mp.set_start_method("spawn", force=True)
+    ensure_spawn_method()
 
     # Create input data
     torch.manual_seed(42)

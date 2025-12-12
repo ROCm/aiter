@@ -28,6 +28,7 @@ import traceback
 import logging
 
 import aiter
+from aiter.test_common import ensure_spawn_method
 
 # Import AITER Iris communication
 try:
@@ -296,7 +297,7 @@ def test_reduce_scatter(tp_size, M=8192, N=7168, heap_size=1 << 30):
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49376"
-    mp.set_start_method("spawn", force=True)
+    ensure_spawn_method()
 
     # Run on each GPU
     pool = mp.Pool(processes=tp_size)
@@ -338,7 +339,7 @@ def test_all_gather(tp_size, M_shard=1024, N=7168, heap_size=1 << 30):
     """Test all-gather operation."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49377"
-    mp.set_start_method("spawn", force=True)
+    ensure_spawn_method()
 
     # Run on each GPU
     pool = mp.Pool(processes=tp_size)
@@ -395,7 +396,7 @@ def test_round_trip(tp_size, M=8192, N=7168, heap_size=1 << 30):
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49378"
-    mp.set_start_method("spawn", force=True)
+    ensure_spawn_method()
 
     # Run on each GPU
     pool = mp.Pool(processes=tp_size)
