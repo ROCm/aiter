@@ -12,7 +12,7 @@ from ..utils._triton import arch_info
 from ..utils._triton.kernel_repr import make_kernel_repr
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from .quant import _mxfp4_quant_op
+from ...quant.quant import _mxfp4_quant_op
 
 _batched_gemm_a16wfp4_repr = make_kernel_repr(
     "_batched_gemm_a16wfp4_kernel",

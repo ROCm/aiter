@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 from .quant import (
     static_per_tensor_quant_fp8_i8,
     dynamic_per_tensor_quant_fp8_i8,
