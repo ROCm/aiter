@@ -1,7 +1,7 @@
 import sys
 import triton
 import math
-from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
     generate_gemm_a8w8_inputs,

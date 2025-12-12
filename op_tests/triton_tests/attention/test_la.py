@@ -6,7 +6,7 @@ import pytest
 import torch
 import math
 from typing import Union, List
-from aiter.ops.triton.lean_atten import (
+from aiter.ops.triton.attention.lean_atten import (
     _persistent_lean_attention,
     persistent_lean_attention,
 )
