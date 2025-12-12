@@ -349,7 +349,10 @@ def mla_decode_fwd(
             for i in range(bs):
                 key = kvs[i]
                 query = qs[i]
-                qk = torch.einsum("qhd,khd->hqk", query.float(), key.float()).squeeze(1)
+                qk = (
+                    torch.einsum("qhd,khd->hqk", query.float(), key.float()).squeeze(1)
+                    * sm_scale
+                )
                 dbg_qk = dbg_tr[i * nhead : (i + 1) * nhead, : qk.shape[1]]
                 checkAllclose(dbg_qk, qk, msg=f"dbg[{i}] vs. qk[{i}]")
 
