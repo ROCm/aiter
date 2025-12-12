@@ -54,8 +54,8 @@ def _batched_gemm_a8w8_kernel(
     GRID_MN: gl.constexpr,
 ):
     """
-    Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
-    below
+    NOTE: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
+    in aiter/ops/triton/gluon/batched_gemm_a8w8.py instead.
 
     Computes the matmul C[i] = A[i] x B[i] and applies a conversion scale for every i in a given batch.
     Optionally, adds a bias to each result.
