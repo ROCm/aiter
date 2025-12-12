@@ -273,13 +273,20 @@ float fmha_fwd_v3_group_dispatcher(const ck_tile::stream_config& s, mha_fwd_args
     args.s_o_Seqs = a.stride_o * 2;
     args.s_o_Hs = a.nhead_stride_o * 2;
     args.s_o_Bs = a.batch_stride_o * 2;
-
     args.s_lse_Hs = a.nhead_stride_lse * 4;
-    args.ptr_qseq = a.seqstart_q_ptr;
-    args.ptr_kseq = a.seqstart_k_ptr;
-    args.ptr_qseq_padding = a.cu_seqlen_q_ptr == nullptr ? a.seqstart_q_ptr : a.cu_seqlen_q_ptr;
-    args.ptr_kseq_padding = a.cu_seqlen_k_ptr == nullptr ? a.seqstart_k_ptr : a.cu_seqlen_k_ptr;
 
+    args.ptr_kseq_padding    = a.seqstart_k_ptr;
+    if (a.cu_seqlen_k_ptr && a.seqstart_k_ptr) {
+        args.ptr_kseq           = a.cu_seqlen_k_ptr;
+    } else {
+        args.ptr_kseq           = a.seqstart_k_ptr;
+    }
+    args.ptr_qseq_padding    = a.seqstart_q_ptr;
+    if (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) {
+        args.ptr_qseq           = a.cu_seqlen_q_ptr;
+    } else {
+        args.ptr_qseq           = a.seqstart_q_ptr;
+    }
     auto traits = fmha_fwd_v3_traits{a.batch,
                                      a.nhead_q,
                                      a.seqlen_q,

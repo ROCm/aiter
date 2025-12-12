@@ -522,9 +522,7 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
-    cu_seqlens_q_padded: Optional[torch.Tensor],
-    cu_seqlens_k_padded: Optional[torch.Tensor],
+    cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -543,6 +541,8 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
+    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
     device = q.device
@@ -587,9 +587,7 @@ def fmha_v3_varlen_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
-    cu_seqlens_q_padded: Optional[torch.Tensor],
-    cu_seqlens_k_padded: Optional[torch.Tensor],
+    cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -608,6 +606,8 @@ def fmha_v3_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
+    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1975,8 +1975,6 @@ def _flash_attn_varlen_forward(
             v,
             cu_seqlens_q,
             cu_seqlens_k,
-            cu_seqlens_q_padded,
-            cu_seqlens_k_padded,
             max_seqlen_q,
             max_seqlen_k,
             min_seqlen_q,
@@ -1995,6 +1993,8 @@ def _flash_attn_varlen_forward(
             bias,
             alibi_slopes,
             None,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     else:
