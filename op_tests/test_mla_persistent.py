@@ -308,7 +308,9 @@ def test_mla(
     # Print metadata tensors
     valid_work_cnt = valid_work_cnt = work_indptr[-1].item()
     valid_batch_size = batch_size * (
-        (nhead // 16) if (nhead != 128 and nhead % 16 == 0) else (nhead + 64 - 1) // 64
+        (nhead // 16)
+        if (nhead != 128 and nhead % 16 == 0)
+        else (nhead + 128 - 1) // 128
     )
     valid_reduce_partial_cnt = reduce_indptr[valid_batch_size].item()
 
