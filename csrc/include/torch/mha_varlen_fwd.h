@@ -21,6 +21,7 @@ mha_varlen_fwd(at::Tensor& q,                                 // [total_q, hq, d
                bool is_causal,
                int window_size_left,
                int window_size_right,
+               int sink_size,
                bool return_softmax_lse,
                bool return_dropout_randval,
                std::optional<at::Tensor> out,                // [total_q, hq, d]

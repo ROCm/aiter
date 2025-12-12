@@ -136,6 +136,7 @@ inline void print_fmha_fwd_args(ARG args)
     printf("batch_stride_o = %d\n", args.batch_stride_o);
     printf("window_size_left = %d\n", args.window_size_left);
     printf("window_size_right = %d\n", args.window_size_right);
+    printf("sink_size = %d\n", args.sink_size);
     printf("mask_type = %d\n", args.mask_type);
     printf("p_drop = %f\n", args.p_drop);
     printf("s_randval = %d\n", args.s_randval);
