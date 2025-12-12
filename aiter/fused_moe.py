@@ -1202,7 +1202,7 @@ def torch_moe_stage1(
             if w1_bias is not None:
                 out[mask] = out[mask] + w1_bias[E_id].view(1, -1)
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
-    use_swiglu = (a1_scale is None) and (quant_type == QuantType.per_1x32)
+    use_swiglu = (quant_type == QuantType.per_1x32) and (activation == ActivationType.Swiglu)
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)

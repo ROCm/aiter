@@ -218,6 +218,7 @@ template torch::Tensor
         # else:
         def fill_template(name, a_type, b_type, acc_type, c_type):
             nonlocal self
+
             intsance = INSTANCE_template.format(
                 name=name, dtypes=f"{a_type}, {b_type}, {acc_type}, {c_type}"
             )
@@ -228,9 +229,12 @@ template torch::Tensor
                 )
             ).write_text(intsance)
 
+        print(f"DEBUG: k.QuantType={k.QuantType}, self.ab_dtype={self.ab_dtype}")
         if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
             fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
         elif (k.QuantType == "1x32") and (self.ab_dtype in ["fp8", "bf8"]):
+            fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
+        elif (k.QuantType == "1x32") and (self.ab_dtype in ["pk_fp4"]):
             fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
         else:
             for CDtype in ["bf16", "fp16"]:
@@ -251,7 +255,7 @@ template torch::Tensor
 
     def gen_heuristic_dispatch(self, tag, kernels_dict):
         HEURISTIC_template = get_heuristic_dispatch_template(tag)
-        # print(HEURISTIC_template)
+        print(HEURISTIC_template)
 
         def validate_and_format(template: str, mapping: dict) -> str:
             # check all format element in dict.
@@ -259,8 +263,8 @@ template torch::Tensor
             cleaned_template = template.replace("{{", "").replace("}}", "")
             placeholders = re.findall(r"\{([^{}]*)\}", cleaned_template)
             missing = [p for p in placeholders if p not in str_mapping]
-            # print(placeholders)
-            # print(str_mapping)
+            print(placeholders)
+            print(str_mapping)
             if missing:
                 raise KeyError(f"Missing keys in mapping: {missing}")
             result = template
@@ -549,9 +553,9 @@ if __name__ == "__main__":
     # b_type = "fp8"
     # quant_type = "per_token"
 
-    a_type = "fp8"
+    a_type = "pk_fp4"
     # a_type = "bf16"
-    b_type = "fp4"
+    b_type = "pk_fp4"
     quant_type = "1x32"
 
     acc_type = "float"
@@ -580,5 +584,5 @@ if __name__ == "__main__":
         **{(1, key): value for key, value in gemm1_kernel_list.items()},
         **{(2, key): value for key, value in gemm2_kernel_list.items()},
     }
-    # print(kernel_dict_merge)
+    print(kernel_dict_merge)
     codegen.gen_instances(tag, kernel_dict_merge)

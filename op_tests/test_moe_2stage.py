@@ -65,13 +65,13 @@ def test_fmoe(
     doweight_stage1=False,
     hidden_pad=0,
     intermediate_pad=0,
-    preshuffle=False,
+    preshuffle=True,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
-    input = torch.randn((token, model_dim), dtype=dtype)
-    # input = torch.ones((token, model_dim), dtype=dtype)
+    # input = torch.randn((token, model_dim), dtype=dtype)
+    input = torch.ones((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         # w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype)
@@ -159,12 +159,12 @@ def test_fmoe(
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     else:
-        a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType)
+        a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
@@ -191,7 +191,7 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
@@ -262,28 +262,15 @@ def test_fmoe(
     ):
         a1 = input.to(dtype)
         a1_scale_stage1 = None
-    # elif qType == aiter.QuantType.per_1x32:
-    #     a1, a1_scale_stage1 = quant_func(
-    #         input,
-    #         scale=None,
-    #         quant_dtype=q_dtype_a,
-    #         num_rows=None,
-    #     )
-    #     a1_scale_stage1 = moe_mxfp4_sort(
-    #         a1_scale_stage1,
-    #         sorted_ids=sorted_ids,
-    #         num_valid_ids=num_valid_ids,
-    #         token_num=token_num,
-    #         block_size=block_size_M,
-    #     )
     elif (
         qType == aiter.QuantType.per_1x32
         and dtype in [dtypes.bf16]
-        and AQDType == dtypes.fp8
+        and AQDType == dtypes.fp4x2
         and w1_qt_aiter.dtype == dtypes.fp4x2
         and actType == aiter.ActivationType.Swiglu
     ):
-        a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType, scale_type=dtypes.fp8)
+        # a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType, scale_type=dtypes.fp8)
+        a1, a1_scale_stage1 = torch_quant(input, quant_dtype=AQDType)
         a1_scale_stage1_bak = a1_scale_stage1
         print(a1_scale_stage1)
         a1_scale_stage1 = moe_mxfp4_sort(
@@ -312,17 +299,11 @@ def test_fmoe(
         )
     # a1_scale_tmp.fill_(a1_scale_v1)
     # a1_scale_tmp *= a1_scale_v1
-    a1_f = a1.view(-1, 32)
-    a1_f = a1_f.to(torch.float32)
-    a1_scale_stage1_bak = a1_scale_stage1_bak.view(-1).to(torch.float32)
-    a1_f = a1_f * a1_scale_stage1_bak.view(-1, 1)
-    a1_f = a1_f.reshape(a1.shape[0], -1)
-
+    
 
     # ######################## stage 1 start ###########
     out1_ref = torch_moe_stage1(
-        # a1_qt,
-        a1_f.to(dtypes.bf16),
+        a1_qt,
         w1_qt,
         w2_qt,
         topk_weights,
@@ -418,11 +399,12 @@ def test_fmoe(
     elif (
         qType == aiter.QuantType.per_1x32
         and dtype in [dtypes.bf16]
-        and AQDType == dtypes.fp8
+        and AQDType == dtypes.fp4x2
         and w1_qt_aiter.dtype == dtypes.fp4x2
         and actType == aiter.ActivationType.Swiglu
     ):
-        a2, a2_scale_stage2 = per_1x32_f8_scale_f8_quant(a2, quant_dtype=AQDType, scale_type=dtypes.fp8)
+        # a2, a2_scale_stage2 = per_1x32_f8_scale_f8_quant(a2, quant_dtype=AQDType, scale_type=dtypes.fp8)
+        a2, a2_scale_stage2 = torch_quant(a2, quant_dtype=AQDType)
         a2_scale_stage2 = moe_mxfp4_sort(
             a2_scale_stage2,
             sorted_ids=sorted_ids,
@@ -522,8 +504,8 @@ l_tokenNum = [
     128,
 ]
 l_quant = [
-    (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a16w4
-    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    # (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2), 
+    (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2), 
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
@@ -693,7 +675,7 @@ for (
                 df.append(ret)
     if (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
-        dtypes.fp8,
+        dtypes.fp4x2,
         dtypes.fp4x2,
     ):
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
@@ -715,30 +697,30 @@ for (
                     intermediate_pad=intermediate_pad,
                 )
                 df.append(ret)
-    elif (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.fp4x2,
-        dtypes.fp4x2,
-    ):
-        for preshuffle in l_preshuffle:
-            for act_type in l_act:
-                for m in l_tokenNum:
-                    ret = test_fmoe(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        args.expert,
-                        args.topk,
-                        act_type,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        use_g1u1=True,
-                        doweight_stage1=doweight_stage1,
-                        preshuffle=preshuffle,
-                    )
-                    df.append(ret)
+    # elif (quant_type, aq_dtype, wq_dtype) == (
+    #     aiter.QuantType.per_1x32,
+    #     dtypes.fp4x2,
+    #     dtypes.fp4x2,
+    # ):
+    #     for preshuffle in l_preshuffle:
+    #         for act_type in l_act:
+    #             for m in l_tokenNum:
+    #                 ret = test_fmoe(
+    #                     dtype,
+    #                     m,
+    #                     model_dim,
+    #                     inter_dim,
+    #                     args.expert,
+    #                     args.topk,
+    #                     act_type,
+    #                     quant_type,
+    #                     aq_dtype,
+    #                     wq_dtype,
+    #                     use_g1u1=True,
+    #                     doweight_stage1=doweight_stage1,
+    #                     preshuffle=preshuffle,
+    #                 )
+    #                 df.append(ret)
     else:
         for act_type in l_act:
             for m in l_tokenNum:
