@@ -22,7 +22,7 @@ from csrc.cpp_itfs.utils import (
     get_default_func_name,
 )
 
-from aiter.ops.triton.gluon.pa_decode_gluon import (
+from aiter.ops.triton.attention.gluon.pa_decode_gluon import (
     pa_decode_gluon,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (

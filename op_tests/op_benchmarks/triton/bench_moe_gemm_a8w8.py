@@ -6,15 +6,15 @@ from pathlib import Path
 import triton.profiler as proton
 import torch
 import argparse
-from aiter.ops.triton.moe_routing.routing import routing
-from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe_op_gemm_a8w8 import (
+from aiter.ops.triton.moe.moe_routing.routing import routing
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+from aiter.ops.triton.moe.moe_op_gemm_a8w8 import (
     moe_gemm_a8w8,
     swizzle_scales,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
-from aiter.ops.triton.quant_moe import (
+from aiter.ops.triton.quant.quant_moe import (
     downcast_to_static_fp8,
     downcast_to_mxfp,
     downcast_to_static_fp8_3d,

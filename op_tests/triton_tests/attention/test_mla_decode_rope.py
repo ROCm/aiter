@@ -4,7 +4,7 @@
 import torch
 import pytest
 
-from aiter.ops.triton.mla_decode_rope import (
+from aiter.ops.triton.rope.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
     decode_attention_fwd_grouped_rope,
     _get_config,

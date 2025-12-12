@@ -4,7 +4,7 @@
 import torch
 import pytest
 
-from aiter.ops.triton.quant import (
+from aiter.ops.triton.quant.quant import (
     static_per_tensor_quant_fp8_i8,
     dynamic_per_tensor_quant_fp8_i8,
     dynamic_per_token_quant_fp8_i8,

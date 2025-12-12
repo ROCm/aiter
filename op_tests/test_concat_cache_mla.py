@@ -341,7 +341,7 @@ def test_fused_rope_concat_and_cache_mla(
         is_nope_first,
         q_out_dtype,
     )
-    from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+    from aiter.ops.triton.attention.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 
     #### triton test
     # reshaped_kv_c = kv_c.unsqueeze(1)

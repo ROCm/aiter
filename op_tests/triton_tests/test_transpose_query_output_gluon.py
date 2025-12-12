@@ -15,7 +15,7 @@ import aiter
 from typing import Optional
 
 # Import the functions to test
-from aiter.ops.triton.gluon.pa_decode_gluon import (
+from aiter.ops.triton.attention.gluon.pa_decode_gluon import (
     transpose_query_gluon,
     transpose_output_gluon,
     GLUON_JIT_KERNEL_ENABLED,

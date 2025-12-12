@@ -1,6 +1,6 @@
 import torch
 import triton.language as tl
-from ._triton import arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 
 def get_dtype_max(dtype):

@@ -10,7 +10,7 @@ import os
 import triton
 
 from aiter.test_common import run_perftest
-from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.ops.shuffle import shuffle_weight
 
 

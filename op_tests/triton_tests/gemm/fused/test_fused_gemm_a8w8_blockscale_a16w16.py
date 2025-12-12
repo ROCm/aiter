@@ -4,7 +4,7 @@
 import torch
 import triton
 import pytest
-from aiter.ops.triton.fused_gemm_a8w8_blockscale_a16w16 import (
+from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     fused_gemm_a8w8_blockscale_a16w16,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (

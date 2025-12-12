@@ -4,7 +4,7 @@
 import torch
 import pytest
 
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
 
 DEBUG_MODE = False
 

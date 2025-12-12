@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from . import quant
+from . import attention, gemm, moe, normalization, quant, rope
 
 # Try to import comms module (requires iris)
 try:
     from . import comms
 
     # Re-export communication primitives at this level for convenience
-    from .comms import (
+    from aiter.ops.triton.comms import (
         IrisCommContext,
         reduce_scatter,
         all_gather,
@@ -23,7 +23,14 @@ except ImportError:
     IRIS_COMM_AVAILABLE = False
     comms = None
 
-__all__ = ["quant"]
+__all__ = [
+    "attention",
+    "gemm",
+    "moe",
+    "normalization",
+    "quant",
+    "rope",
+]
 
 if _COMMS_AVAILABLE:
     __all__.extend(

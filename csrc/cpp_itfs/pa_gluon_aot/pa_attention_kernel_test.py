@@ -28,7 +28,7 @@ from csrc.cpp_itfs.utils import (
     not_built,
     run_lib,
 )
-from aiter.ops.triton.gluon.pa_decode_gluon import (
+from aiter.ops.triton.attention.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_gluon_dot_kernel,
     paged_attention_decode_v2_gluon_large_block_dot_kernel,
 )

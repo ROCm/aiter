@@ -6,11 +6,11 @@ import pytest
 import torch
 import math
 from typing import Union, List
-from aiter.ops.triton.lean_atten import (
+from aiter.ops.triton.attention.lean_atten import (
     _persistent_lean_attention,
     persistent_lean_attention,
 )
-from aiter.ops.triton._triton_kernels.lean_atten import _get_config
+from aiter.ops.triton._triton_kernels.attention.lean_atten import _get_config
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 import pytest
 

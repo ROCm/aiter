@@ -1,6 +1,6 @@
 import torch
 import pytest
-from aiter.ops.triton.fused_fp8_quant import (
+from aiter.ops.triton.quant.fused_fp8_quant import (
     fused_rms_fp8_per_tensor_static_quant,
     fused_rms_fp8_group_quant,
     fused_flatten_fp8_group_quant,
