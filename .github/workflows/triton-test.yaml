@@ -29,11 +29,30 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
+    name: Triton (${{ matrix.test_name }})
     runs-on: aiter-mi300-1gpu
     needs: [check-signal]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - test_name: attention
+            test_path: op_tests/triton_tests/attention
+          - test_name: gemm
+            test_path: op_tests/triton_tests/gemm
+          - test_name: moe
+            test_path: op_tests/triton_tests/moe
+          - test_name: normalization
+            test_path: op_tests/triton_tests/normalization
+          - test_name: quant
+            test_path: op_tests/triton_tests/quant
+          - test_name: rope
+            test_path: op_tests/triton_tests/rope
+          - test_name: loose-files
+            test_path: op_tests/triton_tests/*.py
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
-      TRITON_TEST: "op_tests/triton_tests/"
+      TRITON_TEST: ${{ matrix.test_path }}
 
     steps:
       - name: Checkout code
@@ -109,7 +128,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: triton-test-logs
+          name: triton-test-logs-${{ matrix.test_name }}
           path: test-reports/triton.xml
 
       - name: Cleanup container
