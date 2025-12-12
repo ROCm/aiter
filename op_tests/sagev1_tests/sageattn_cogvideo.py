@@ -116,7 +116,7 @@ logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str, default="THUDM/CogVideoX-2b", help='Model path')
 parser.add_argument('--compile', action='store_true', help='Compile the model')
-parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sage', 'fa2', 'fa3', 'fa3_fp8', 'sagev1_fa3'], help='Attention type')
+parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sagev1', 'fa2', 'fa3', 'fa3_fp8', 'sagev1_fa3'], help='Attention type')
 parser.add_argument('--save_inputs', action='store_true', help='Save attention inputs for later benchmarking')
 parser.add_argument('--input_dir', type=str, default='./captured_inputs', help='Directory to save captured inputs')
 parser.add_argument('--max_captures', type=int, default=10, help='Maximum number of inputs to save (use 0 for unlimited)')
@@ -143,17 +143,38 @@ logger.debug(f"AMD GPU detected: {_is_amd_gpu()}")
 logger.debug(f"torch.version.hip: {getattr(torch.version, 'hip', None)}")
 
 
-if args.attention_type == 'sage':
+if args.attention_type == 'sagev1':
     attn_fn = sageattn
     if args.save_inputs:
         # 0 means unlimited
         max_caps = args.max_captures if args.max_captures > 0 else None
-        _capture_wrapper = InputCaptureWrapper(attn_fn, args.input_dir, name="sage", max_captures=max_caps)
+        _capture_wrapper = InputCaptureWrapper(attn_fn, args.input_dir, name="sagev1", max_captures=max_caps)
         F.scaled_dot_product_attention = _capture_wrapper
     else:
         F.scaled_dot_product_attention = attn_fn
-elif args.attention_type == 'spda':
-    raise NotImplementedError("AMD sdpa Triton kernel is not yet supported")
+elif args.attention_type == 'sdpa':
+    attn_fn = torch.nn.functional.scaled_dot_product_attention
+    
+    # Wrapper for PyTorch's native scaled_dot_product_attention
+    # scaled_dot_product_attention: (batch, heads, seqlen, dim) - BHSD format
+    # torch.nn.functional.scaled_dot_product_attention expects BHSD format
+    def sdpa_wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
+        # PyTorch SDPA uses 'scale' parameter instead of 'softmax_scale'
+        return attn_fn(
+            query, key, value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=softmax_scale
+        )
+    
+    if args.save_inputs:
+        # 0 means unlimited
+        max_caps = args.max_captures if args.max_captures > 0 else None
+        _capture_wrapper = InputCaptureWrapper(sdpa_wrapper, args.input_dir, name="sdpa", max_captures=max_caps)
+        F.scaled_dot_product_attention = _capture_wrapper
+    else:
+        F.scaled_dot_product_attention = sdpa_wrapper
 elif args.attention_type == 'fa2':
     from aiter.ops.triton.mha import flash_attn_func as _fa2
 

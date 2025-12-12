@@ -167,6 +167,29 @@ def fa3_fp8_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return lambda: flash_attn_fp8_func(q_bshd, k_bshd, v_bshd, softmax_scale=softmax_scale, causal=is_causal)
 
 
+def sdpa_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+                       softmax_scale: Optional[float] = None, is_causal: bool = False):
+    """
+    Create a lambda for benchmarking PyTorch's native scaled_dot_product_attention.
+    
+    Args:
+        q, k, v: Input tensors in BHSD format (batch, heads, seqlen, dim)
+        softmax_scale: Softmax scale (defaults to 1/sqrt(head_dim))
+        is_causal: Whether to use causal masking
+        
+    Returns:
+        Lambda function that executes the attention
+    """
+    # PyTorch SDPA expects BHSD format, which matches our input
+    return lambda: torch.nn.functional.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=is_causal,
+        scale=softmax_scale
+    )
+
+
 def fa2_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
                        softmax_scale: Optional[float] = None, is_causal: bool = False):
     """
@@ -346,6 +369,8 @@ def run_benchmark(args):
                                        sm_scale=softmax_scale, k_smooth=not no_k_smooth)
         elif kernel == "sage_fa3":
             fn = sage_fa3_forward_func(q, k, v, is_causal=is_causal)
+        elif kernel == "sdpa":
+            fn = sdpa_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
         elif kernel == "fa2":
             fn = fa2_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
         elif kernel == "fa3":
@@ -405,8 +430,8 @@ def parse_args():
         "--kernel",
         type=str,
         default="sagev1",
-        choices=["sagev1", "sage_fa3", "fa2", "fa3", "fa3_fp8"],
-        help="Kernel to benchmark: sagev1 (qk_int8_per_block), sage_fa3 (sage_attn_v1_func fused on fa3), fa2 (flash_attn_func v2), fa3 (flash_attn_func v3), fa3_fp8",
+        choices=["sagev1", "sage_fa3", "sdpa", "fa2", "fa3", "fa3_fp8"],
+        help="Kernel to benchmark: sagev1 (qk_int8_per_block), sage_fa3 (sage_attn_v1_func fused on fa3), sdpa (PyTorch native), fa2 (flash_attn_func v2), fa3 (flash_attn_func v3), fa3_fp8",
     )
     parser.add_argument(
         "-metric",
@@ -454,6 +479,7 @@ def parse_args():
     # Shorthand flags
     parser.add_argument("-sage_fa3", action="store_true", help="Shorthand for --kernel sage_fa3")
     parser.add_argument("-sagev1", action="store_true", help="Shorthand for --kernel sagev1")
+    parser.add_argument("-sdpa", action="store_true", help="Shorthand for --kernel sdpa")
     parser.add_argument("-fa2", action="store_true", help="Shorthand for --kernel fa2")
     parser.add_argument("-fa3", action="store_true", help="Shorthand for --kernel fa3")
     parser.add_argument("-fa3_fp8", action="store_true", help="Shorthand for --kernel fa3_fp8")
@@ -469,6 +495,8 @@ def main():
         args.kernel = "sage_fa3"
     elif args.sagev1:
         args.kernel = "sagev1"
+    elif args.sdpa:
+        args.kernel = "sdpa"
     elif args.fa2:
         args.kernel = "fa2"
     elif args.fa3:
