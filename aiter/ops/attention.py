@@ -488,8 +488,6 @@ def get_pa_metadata_info_v1(
     batch_size: int,
     max_seqlen_qo: int,
     num_head_qo: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
     is_sparse: int,
     fast_mode: bool = True,
 ):
@@ -497,7 +495,7 @@ def get_pa_metadata_info_v1(
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
-        3. Shape of work_info_set followed by its scalar type.
+        3. Shape of work_info followed by its scalar type.
         4. Shape of reduce_indptr followed by its scalar type.
         5. Shape of reduce_final_map followed by its scalar type.
         6. Shape of reduce_partial_map followed by its scalar type.
@@ -513,23 +511,23 @@ def get_pa_metadata_info_v1(
     # better hide inside get_xxx_metadata csrc?
     max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * num_head_qo / tile_q))
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
-    tile_cnt = batch_size * max_qo_tiles_per_batch
+    qo_tile_cnt = batch_size * max_qo_tiles_per_batch
 
     if fast_mode:
-        max_work = tile_cnt + cu_num - 1
+        max_work = qo_tile_cnt + cu_num - 1
         max_split_tiles = (
             min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
         )
     else:
-        max_work = tile_cnt * cu_num
-        max_split_tiles = tile_cnt * cu_num
+        max_work = qo_tile_cnt * cu_num
+        max_split_tiles = qo_tile_cnt * cu_num
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
         ((cu_num + 1), torch.int32),  # work_indptr
-        ((max_work, 8), torch.int32),  # work_info_set
-        ((tile_cnt + 1), torch.int32),  # reduce_indptr
-        ((tile_cnt, 2), torch.int32),  # reduce_final_map
+        ((max_work, 8), torch.int32),  # work_info
+        ((qo_tile_cnt + 1), torch.int32),  # reduce_indptr
+        ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
         (max_split_tiles, torch.int32),  # reduce_partial_map
     )
 

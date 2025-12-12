@@ -3,6 +3,7 @@
 
 import argparse
 import itertools
+import math
 import numpy as np
 import random
 from typing import List, Optional, Tuple, Union
@@ -505,17 +506,25 @@ def test_pa_mtp(
         batch_size,
         max_qlen,
         num_query_heads,
-        query.dtype,
-        k_quant_.dtype,
         is_sparse=False,
     )
-    work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
-    work_indptr = torch.zeros(work_indptr_size, dtype=work_indptr_type)
-    work_info = torch.zeros(work_info_set_size, dtype=work_info_set_type)
-    reduce_indptr = torch.zeros(reduce_indptr_size, dtype=reduce_indptr_type)
-    reduce_final_map = torch.zeros(reduce_final_map_size, dtype=reduce_final_map_type)
+    work_metadata_ptrs = torch.zeros(
+        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
+    )
+    work_indptr = torch.zeros(
+        work_indptr_size, dtype=work_indptr_type, device="cuda"
+    )
+    work_info = torch.zeros(
+        work_info_set_size, dtype=work_info_set_type, device="cuda"
+    )
+    reduce_indptr = torch.zeros(
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
+    )
+    reduce_final_map = torch.zeros(
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
+    )
     reduce_partial_map = torch.zeros(
-        reduce_partial_map_size, dtype=reduce_partial_map_type
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
     metadata_map = {
@@ -538,11 +547,12 @@ def test_pa_mtp(
             torch.set_printoptions(threshold=999999, linewidth=120)
             print(f"==>load {name} from {file_name}:\n{meta}")
     else:
+        gqa_ratio = num_query_heads // num_kv_heads
         aiter.get_pa_metadata_v1(
             qo_indptr,
             kv_indptr,
             seq_lens_kv,
-            num_query_heads // num_kv_heads,
+            gqa_ratio,
             num_kv_heads,
             True,
             work_metadata_ptrs,
@@ -551,10 +561,10 @@ def test_pa_mtp(
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
-            kv_granularity=max(block_size, 16),
+            kv_granularity=max(block_size, 256),
             block_size=block_size,
-            max_seqlen_qo=int(max_qlen),
-            uni_seqlen_qo=qlen,
+            max_seqlen_qo=max_qlen,
+            uni_seqlen_qo=math.ceil(max_qlen * gqa_ratio / 16) * 16,  # tile_q
             fast_mode=True,
             max_split_per_batch=-1,
         )
