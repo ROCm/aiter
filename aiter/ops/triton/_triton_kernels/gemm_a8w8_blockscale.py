@@ -353,8 +353,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
         b_ptrs = b_ptr + (
-            offs_bn[:, None] * stride_bn
-            + offs_k_shuffle[None, :] * stride_bk
+            offs_bn[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
         )
 
         # Create pointers for the scales
@@ -499,6 +498,9 @@ def _get_config(
     M: int,
     N: int,
     K: int,
+    shuffle: bool = False,
 ):
+    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
+    config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
 
-    return get_gemm_config("GEMM-A8W8_BLOCKSCALE", M, N, K)
+    return get_gemm_config(config_name, M, N, K)
