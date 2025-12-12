@@ -16,16 +16,15 @@ for i in ${!BATCH_SIZES[@]}; do
     echo "Running benchmark $((i+1))/4: batch_size=${BATCH_SIZES[i]}, num_heads=${NUM_HEADS[i]}, seq_len=${SEQ_LENS[i]}"
     echo "=========================================="
 
-    echo "--- FAv2 (no quantization) ---"
-    run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
-        -b ${BATCH_SIZES[i]} \
-        -hq ${NUM_HEADS[i]} \
-        -sq ${SEQ_LENS[i]} \
-        -d 128 \
-        -metric all \
-        # -print_vgpr \
-
-    echo ""
+    #echo "--- FAv2 (no quantization) ---"
+    #run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
+    #    -b ${BATCH_SIZES[i]} \
+    #    -hq ${NUM_HEADS[i]} \
+    #    -sq ${SEQ_LENS[i]} \
+    #    -d 128 \
+    #    -metric all \
+    #    # -print_vgpr \
+    #echo ""
     
     echo "--- SageAttnV1 (i.e -qk_int8) ---"
     run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
@@ -36,20 +35,19 @@ for i in ${!BATCH_SIZES[@]}; do
         -qk_int8 \
         -metric all \
         # -print_vgpr \
-    
-    echo ""
-    echo "--- FAv3 FP8 (i.e -fp8) ---"
-    run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
-        -b ${BATCH_SIZES[i]} \
-        -hq ${NUM_HEADS[i]} \
-        -sq ${SEQ_LENS[i]} \
-        -d 128 \
-        -fp8 \
-        -metric all
-        
     echo ""
 
-    echo "--- SageAttnV1 (i.e -sagev1,  fused on fa3 fp8) ---"
+    #echo "--- FAv3 FP8 (i.e -fp8) ---"
+    #run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
+    #    -b ${BATCH_SIZES[i]} \
+    #    -hq ${NUM_HEADS[i]} \
+    #    -sq ${SEQ_LENS[i]} \
+    #    -d 128 \
+    #    -fp8 \
+    #    -metric all
+    #echo ""
+
+    echo "--- SageAttnV1 (i.e -sagev1_fa3) ---"
     run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
         -b ${BATCH_SIZES[i]} \
         -hq ${NUM_HEADS[i]} \
@@ -58,7 +56,18 @@ for i in ${!BATCH_SIZES[@]}; do
         -sagev1_fa3 \
         -metric all \
         # -print_vgpr \
-    
+    echo ""
+
+    echo "--- SageAttnV1 (i.e -sagev1_fa3, return sm_lse) ---"
+    run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
+        -b ${BATCH_SIZES[i]} \
+        -hq ${NUM_HEADS[i]} \
+        -sq ${SEQ_LENS[i]} \
+        -d 128 \
+        -sagev1_fa3 \
+        -return_lse \
+        -metric all \
+        # -print_vgpr \
     echo ""
 done
 

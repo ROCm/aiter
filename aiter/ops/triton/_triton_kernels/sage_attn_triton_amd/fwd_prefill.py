@@ -17,6 +17,7 @@ from .utils import (
     is_rdna,
     apply_rotary,
     get_recommended_fp8_dtype,
+    map_dims,
 )
 
 
@@ -1770,10 +1771,11 @@ def attention_forward_prefill_triton_impl(
             softmax_lse.stride(1),
         ) if softmax_lse is not None else (0, 0, 0)
     else:
+        bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         # shapes
-        batch_q, seqlen_q, nheads_q, head_size_q = q.shape
-        batch_k, seqlen_k, nheads_k, head_size_k = k.shape
-        batch_v, seqlen_v, nheads_v, head_size_v = v.shape
+        batch_q, seqlen_q, nheads_q, head_size_q = map_dims(q.shape, bshd)
+        batch_k, seqlen_k, nheads_k, head_size_k = map_dims(k.shape, bshd)
+        batch_v, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd)
 
         # assert batch dimensions
         assert (
@@ -1798,10 +1800,10 @@ def attention_forward_prefill_triton_impl(
 
         # assert output shapes
         assert o.shape == (
-            batch_q,
-            seqlen_q,
-            nheads_q,
-            head_size_v,
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            v.shape[-1],
         ), f"o shape {o.shape} != expected {(batch_q, seqlen_q, nheads_q, head_size_v)}"
 
         # set vars
@@ -1810,7 +1812,7 @@ def attention_forward_prefill_triton_impl(
         max_seqlens_q = seqlen_q
         max_seqlens_k = seqlen_k
 
-        # Assert softmax_lse tensor is large enough
+        # Assert softmax_lse tensor is large enough 
         if softmax_lse is not None:
             assert (
                 softmax_lse.shape[0] >= batch
@@ -1829,30 +1831,10 @@ def attention_forward_prefill_triton_impl(
             ), f"softmax_lse must be on same device as q"
 
         # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = (
-            q.stride(0),
-            q.stride(2),
-            q.stride(1),
-            q.stride(3),
-        )
-        stride_kb, stride_kh, stride_kn, stride_kd = (
-            k.stride(0),
-            k.stride(2),
-            k.stride(1),
-            k.stride(3),
-        )
-        stride_vb, stride_vh, stride_vn, stride_vd = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
-        )
-        stride_ob, stride_oh, stride_om, stride_od = (
-            o.stride(0),
-            o.stride(2),
-            o.stride(1),
-            o.stride(3),
-        )
+        stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
+        stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+        stride_vb, stride_vn, stride_vh, stride_vd = map_dims(v.stride(), bshd)
+        stride_ob, stride_om, stride_oh, stride_od = map_dims(o.stride(), bshd)
         stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride() if softmax_lse is not None else (0, 0, 0)
 
     # apply rotary embeddings
