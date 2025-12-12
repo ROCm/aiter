@@ -40,9 +40,8 @@ def topk(
     TILE_SIZE = 8
     BLOCK_MM = HIST_BLOCK_M * TILE_SIZE
     pids_x = cdiv(n_rows, BLOCK_MM)
-    pids_y = cdiv(n_cols, 32)
     scratchpad_partials = torch.empty(
-        (pids_y * 32, pids_x * TILE_SIZE), device=dev, dtype=torch.int32
+        (n_cols_pad, pids_x * TILE_SIZE), device=dev, dtype=torch.int32
     )
     scratchpad_partials = torch.transpose(scratchpad_partials, 0, 1)
     sp_size = torch.numel(scratchpad_partials)

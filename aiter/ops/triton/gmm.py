@@ -17,11 +17,13 @@ from aiter.ops.triton.utils.gmm_common import (
     DTYPE,
     is_power_of_2,
     check_input_device_dtype,
+    check_bias_shape_stride,
     get_gmm_shape,
     get_gmm_output,
     get_gmm_transposition,
     get_tgmm_shape,
     get_tgmm_output,
+    get_tgmm_bias_grad,
     get_tgmm_transposition,
 )
 
@@ -72,14 +74,15 @@ def gmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
     config: dict[str, int] | None = None,
+    bias: Tensor | None = None,
 ) -> Tensor:
     """
-    Perform Group Matrix Multiplication (GMM): out = lhs @ rhs
+    Perform Group Matrix Multiplication (GMM): out = lhs @ rhs + bias
 
     lhs rows are divided into G groups. Each group of lhs rows is matrix multiplied with a plane of
     rhs 3D tensor and then stored in a slice of out. In PyTorch parlance, it can be implemented as
     follows for a given group g:
-        out[group_start:group_end, :] = lhs[group_start:group_end, :] @ rhs[g]
+        out[group_start:group_end, :] = lhs[group_start:group_end, :] @ rhs[g] + bias[g]
 
     The size of each group, and their respective start and end positions are specified by
     group_sizes tensor. For instance, suppose that group_sizes = [3, 2, 4, 1]. In this particular
@@ -113,6 +116,10 @@ def gmm(
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
+    bias : torch.Tensor or None, optional
+        Optional bias tensor. Shape: (G, N).
+        If provided, bias data type must match lhs and rhs data type, and bias must be on the same
+        device as other input tensors. Each group g adds bias[g] to the output.
 
     Returns
     -------
@@ -131,10 +138,15 @@ def gmm(
       this is useful for computing the lhs derivative in the backward pass, while fusing the
       transposition.
     - out must be row-major (out.stride() == (N, 1)).
+    - bias must be row-major (bias.stride() == (N, 1)) if provided.
     """
-    check_input_device_dtype(lhs, rhs, group_sizes)
+    use_bias = bias is not None
+    check_input_device_dtype(lhs, rhs, group_sizes, bias)
 
     M, K, N, G = get_gmm_shape(lhs, rhs, group_sizes)
+
+    if use_bias:
+        check_bias_shape_stride(bias, G, N)
 
     out = get_gmm_output(
         M,
@@ -177,11 +189,12 @@ def gmm(
     # fmt: off
     gmm_kernel[grid](
         # Tensor pointers:
-        lhs, rhs, group_sizes, out,
+        lhs, rhs, group_sizes, out, bias,
         # Tensor shapes:
         M, K, N, G,
         # Meta-parameters:
         TRANS_RHS=trans_rhs,
+        USE_BIAS=use_bias,
         **config,
     )
     # fmt: on
@@ -229,6 +242,8 @@ def ptgmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
     config: dict[str, int] | None = None,
+    bias_grad: Tensor | None = None,
+    accumulate: bool = False,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -274,6 +289,14 @@ def ptgmm(
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
+    bias_grad : torch.Tensor or None, optional
+        Optional bias gradient output tensor. Shape: (G, K).
+        If provided, the kernel will compute the bias gradient and write it to this tensor.
+        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
+    accumulate : bool, optional
+        Whether to accumulate into existing output tensor values. Default is False.
+        If False, output will be overwritten with fresh computation.
+        If True, results will be added to existing output tensor values.
 
     Returns
     -------
@@ -308,7 +331,7 @@ def ptgmm(
     trans_lhs, _ = get_tgmm_transposition(lhs, rhs, out)
 
     if config is None:
-        config = get_config("ptgmm", M, K, N, G)
+        config = get_config("ptgmm", M, K, N, G, accumulate)
 
     assert all(
         key in config
@@ -327,6 +350,17 @@ def ptgmm(
         }
     ), "Invalid PTGMM kernel config."
 
+    # Bias gradient handling.
+    # -----------------------
+    # Get or validate bias gradient tensor.
+    compute_bias_grad = bias_grad is not None
+    bias_grad_ptr = get_tgmm_bias_grad(
+        K,
+        G,
+        device=lhs.device,
+        existing_bias_grad=bias_grad,
+    )
+
     grid = _ptgmm_grid(
         K,
         N,
@@ -339,11 +373,13 @@ def ptgmm(
     # fmt: off
     tgmm_persistent_kernel[grid](
         # Tensor pointers:
-        lhs, rhs, group_sizes, out,
+        lhs, rhs, group_sizes, out, bias_grad_ptr,
         # Tensor shapes:
         M, K, N, G,
         # Meta-parameters:
         TRANS_LHS=trans_lhs,
+        COMPUTE_BIAS_GRAD=compute_bias_grad,
+        ACCUMULATE=accumulate,
         **config,
     )
     # fmt: on
@@ -389,6 +425,8 @@ def nptgmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
     config: dict[str, int] | None = None,
+    bias_grad: Tensor | None = None,
+    accumulate: bool = False,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -434,6 +472,14 @@ def nptgmm(
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
+    bias_grad : torch.Tensor or None, optional
+        Optional bias gradient output tensor. Shape: (G, K).
+        If provided, the kernel will compute the bias gradient and write it to this tensor.
+        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
+    accumulate : bool, optional
+        Whether to accumulate into existing output tensor values. Default is False.
+        If False, output will be overwritten with fresh computation.
+        If True, results will be added to existing output tensor values.
 
     Returns
     -------
@@ -467,8 +513,19 @@ def nptgmm(
 
     trans_lhs, _ = get_tgmm_transposition(lhs, rhs, out)
 
+    # Bias gradient handling.
+    # -----------------------
+    # Get or validate bias gradient tensor.
+    compute_bias_grad = bias_grad is not None
+    bias_grad_ptr = get_tgmm_bias_grad(
+        K,
+        G,
+        device=lhs.device,
+        existing_bias_grad=bias_grad,
+    )
+
     if config is None:
-        config = get_config("nptgmm", M, K, N, G)
+        config = get_config("nptgmm", M, K, N, G, accumulate)
 
     assert all(
         key in config
@@ -497,11 +554,13 @@ def nptgmm(
     # fmt: off
     tgmm_non_persistent_kernel[grid](
         # Tensor pointers:
-        lhs, rhs, group_sizes, out,
+        lhs, rhs, group_sizes, out, bias_grad_ptr,
         # Tensor shapes:
         M, K, N, G,
         # Meta-parameters:
         TRANS_LHS=trans_lhs,
+        COMPUTE_BIAS_GRAD=compute_bias_grad,
+        ACCUMULATE=accumulate,
         **config,
     )
     # fmt: on
