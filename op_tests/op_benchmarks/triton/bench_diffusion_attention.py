@@ -218,13 +218,19 @@ def sagev1_forward_func(
     q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
         q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout="NHD"
     )
+
+    fp8_dtype = torch.float8_e4m3fn
     v_fp16 = v.to(torch.float16)
+
+    v_fp8, v_descale = _quantize_bshd(v_fp16, fp8_dtype)
+
     return lambda: sage_attn_v1_func(
         q_int8, 
         k_int8, 
-        v_fp16,
+        v_fp8,
         q_descale,
         k_descale,
+        v_descale,
         causal=causal,
     )
 

@@ -19,6 +19,10 @@ from .utils import (
     get_recommended_fp8_dtype,
 )
 
+@triton.jit
+def get_fp8_max():
+    """Returns the FP8 max value as a compile-time constant."""
+    return 448.0
 
 def get_fwd_configs(autotune: bool):
     configs = []
@@ -193,6 +197,7 @@ def _attn_fwd_no_mask(
     alibi_slope,
     q_descale,
     k_descale_base_ptr,
+    v_descale,
     stride_k_descale_blk,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL_QK: tl.constexpr,
@@ -349,8 +354,10 @@ def _attn_fwd_no_mask(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        acc += tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float16)
+        acc += tl.dot((p * get_fp8_max()).to(v.type.element_ty), v, out_dtype=tl.float32)
 
+    scale_factor = v_descale / get_fp8_max()
+    acc = acc * scale_factor
     return acc, l_i, m_i
 
 
@@ -389,6 +396,7 @@ def _attn_fwd_mask(
     alibi_slope,
     q_descale,
     k_descale_base_ptr,
+    v_descale,
     stride_k_descale_blk,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -718,8 +726,10 @@ def _attn_fwd_mask(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        acc += tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float16)
+        acc += tl.dot((p * get_fp8_max()).to(v.type.element_ty), v, out_dtype=tl.float32)
 
+    scale_factor = v_descale / get_fp8_max()
+    acc = acc * scale_factor
     return acc, l_i, m_i
 
 
@@ -1026,6 +1036,7 @@ def attn_fwd(
     bias,
     Q_Descale,
     K_Descale,
+    v_Descale,
     stride_q_descale_z,
     stride_q_descale_h,
     stride_q_descale_blk,
@@ -1169,6 +1180,9 @@ def attn_fwd(
     )  # MHA: use q head index
 
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
+    v_descale_head = tl.load(
+        v_Descale + off_h_k
+    )
 
     # figure out masking pattern
     (
@@ -1318,6 +1332,7 @@ def attn_fwd(
             alibi_slope,
             q_descale,
             k_descale_ptr,
+            v_descale_head,
             stride_k_descale_blk,
             IS_CAUSAL,
             BLOCK_M,
@@ -1382,6 +1397,7 @@ def attn_fwd(
             alibi_slope,
             q_descale,
             k_descale_ptr,
+            v_descale_head,
             stride_k_descale_blk,
             BLOCK_M,
             BLOCK_DMODEL_QK,
@@ -1448,6 +1464,7 @@ def attn_fwd(
             alibi_slope,
             q_descale,
             k_descale_ptr,
+            v_descale_head,
             stride_k_descale_blk,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
@@ -1929,6 +1946,7 @@ def attention_forward_prefill_triton_impl(
         bias,
         q_descale,
         k_descale,
+        v_descale,
         stride_q_descale_z,
         stride_q_descale_h,
         stride_q_descale_blk,

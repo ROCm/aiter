@@ -273,6 +273,7 @@ def sage_attn_v1_func(
     v: torch.Tensor,
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
     k_mean: torch.Tensor = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -321,9 +322,9 @@ def sage_attn_v1_func(
     # Check that inputs are high precision
     assert q.dtype == torch.int8, f"expected dtype of q to be int8, got {q.dtype}"
     assert k.dtype == torch.int8, f"expected dtype of k to be int8, got {k.dtype}"
-    assert v.dtype in [torch.float16, torch.bfloat16], (
-        f"sage_attn_v1_func expects high-precision inputs (fp16/bf16), got v.dtype={v.dtype}. "
-    )
+    # assert v.dtype in [torch.float16, torch.bfloat16], (
+    #     f"sage_attn_v1_func expects high-precision inputs (fp16/bf16), got v.dtype={v.dtype}. "
+    # )
 
     # Verify descale shapes for GQA/MQA
     num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
@@ -376,7 +377,7 @@ def sage_attn_v1_func(
         None,  # rotary_cos, rotary_sin, seqlens_rotary
         q_descale,
         k_descale,
-        None, # v_descale
+        v_descale, # v_descale
         softmax_scale,
         causal,
         int(window_size[0]),
