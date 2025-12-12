@@ -1,4 +1,5 @@
 import sys
+from typing import Optional
 import torch
 import triton
 import math
@@ -18,11 +19,22 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
 from aiter.ops.triton.batched_gemm_a8w8 import (
-    batched_gemm_a8w8 as batched_gemm_a8w8,
+    batched_gemm_a8w8 as triton_batched_gemm_a8w8,
+)
+from aiter.ops.triton.gluon.batched_gemm_a8w8 import (
+    batched_gemm_a8w8 as gluon_batched_gemm_a8w8,
 )
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    impl: callable,
+):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
         batch, M, N, K, dtype=c_dtype, layout=layout, output=True
@@ -40,7 +52,7 @@ def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: batched_gemm_a8w8(x, w, x_scale, w_scale, bias, c_dtype, YQ=y),
+        lambda: impl(x, w, x_scale, w_scale, bias, c_dtype, YQ=y),
         warmup=25,
         rep=100,
     )
@@ -58,7 +70,7 @@ def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
         raise ValueError("Unknown metric: " + metric)
 
 
-def run_model_benchmark(args):
+def run_model_benchmark(args, impl):
     benchmark = get_model_benchmark_object(
         plot_name=get_caller_name_no_ext(),
         args=args,
@@ -83,12 +95,20 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            impl,
+        )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_shape_benchmark(args):
+def run_shape_benchmark(args, impl):
     benchmark = get_shape_benchmark_object(
         plot_name=get_caller_name_no_ext(),
         args=args,
@@ -97,7 +117,15 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            impl,
+        )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -107,6 +135,11 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
 
+    if args.gluon:
+        impl = gluon_batched_gemm_a8w8
+    else:
+        impl = triton_batched_gemm_a8w8
+
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
@@ -114,7 +147,7 @@ def run_benchmark(args, defaults):
                 raise Exception(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
-        run_model_benchmark(args)
+        run_model_benchmark(args, impl)
     else:
         unsupported_args = [
             "fc1",
@@ -127,7 +160,7 @@ def run_benchmark(args, defaults):
                 raise Exception(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
-        run_shape_benchmark(args)
+        run_shape_benchmark(args, impl)
 
 
 def parse_args():
@@ -138,6 +171,11 @@ def parse_args():
         type=int,
         required=False,
         help="Batch size to be used when using --model flag.",
+    )
+    parser.add_argument(
+        "-gluon",
+        action="store_true",
+        help="Use Gluon implementation (experimental, requires latest Triton from main)",
     )
     return get_ff_args(parser)
 

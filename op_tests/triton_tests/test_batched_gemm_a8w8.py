@@ -4,7 +4,12 @@
 import torch
 import pytest
 import functools
-from aiter.ops.triton.batched_gemm_a8w8 import batched_gemm_a8w8
+from aiter.ops.triton.batched_gemm_a8w8 import (
+    batched_gemm_a8w8 as triton_batched_gemm_a8w8,
+)
+from aiter.ops.triton.gluon.batched_gemm_a8w8 import (
+    batched_gemm_a8w8 as gluon_batched_gemm_a8w8,
+)
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 from typing import Union
@@ -68,8 +73,10 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None):
-    return batched_gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, YQ=y)
+def run_triton(
+    x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None, impl=None
+):
+    return impl(x, weight, x_scale, w_scale, bias, dtype, YQ=y)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -131,7 +138,14 @@ def minimal_x_vals(num_vals=20):
         for shape in get_x_vals()
     ],
 )
-def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "gluon",
+        "triton",
+    ],
+)
+def test_batched_gemm_a8w8(dtype, b, m, n, k, output, impl):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
@@ -139,7 +153,13 @@ def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
         b, m, n, k, dtype, output
     )
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
+    if impl == "gluon":
+        impl = gluon_batched_gemm_a8w8
+    elif impl == "triton":
+        impl = triton_batched_gemm_a8w8
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+    b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
 
@@ -155,7 +175,14 @@ def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
         for layout in ["TT", "NN", "NT"]
     ],
 )
-def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output):
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "gluon",
+        "triton",
+    ],
+)
+def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output, impl: str):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
@@ -163,6 +190,12 @@ def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output):
         b, m, n, k, dtype, output, layout
     )
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
+    if impl == "gluon":
+        impl = gluon_batched_gemm_a8w8
+    elif impl == "triton":
+        impl = triton_batched_gemm_a8w8
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+    b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
