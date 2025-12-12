@@ -19,7 +19,8 @@ import logging
 import triton
 
 from aiter.ops.triton.mha_v3 import flash_attn_fp8_func
-from aiter.ops.triton.mha import flash_attn_func
+from aiter.ops.triton.mha_v3 import flash_attn_func as flash_attn_v3_func
+from aiter.ops.triton.mha import flash_attn_func as flash_attn_v2_func
 from aiter.ops.triton.attn_qk_int8_per_block import per_block_int8
 from aiter.ops.triton.sage_v1 import sage_attn_v1_func
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import get_fwd_configs
@@ -179,12 +180,33 @@ def fa2_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     Returns:
         Lambda function that executes the attention
     """
-    # Convert from BHSD to BSHD for flash_attn_func
+    # Convert from BHSD to BSHD for flash_attn_v2_func
     q_bshd = q.transpose(1, 2).contiguous()
     k_bshd = k.transpose(1, 2).contiguous()
     v_bshd = v.transpose(1, 2).contiguous()
     
-    return lambda: flash_attn_func(q_bshd, k_bshd, v_bshd, dropout_p=0.0, softmax_scale=softmax_scale, causal=is_causal)
+    return lambda: flash_attn_v2_func(q_bshd, k_bshd, v_bshd, dropout_p=0.0, softmax_scale=softmax_scale, causal=is_causal)
+
+
+def fa3_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+                       softmax_scale: Optional[float] = None, is_causal: bool = False):
+    """
+    Create a lambda for benchmarking flash_attn_func v3 (fa3) kernel.
+    
+    Args:
+        q, k, v: Input tensors in BHSD format (batch, heads, seqlen, dim)
+        softmax_scale: Softmax scale (defaults to 1/sqrt(head_dim))
+        is_causal: Whether to use causal masking
+        
+    Returns:
+        Lambda function that executes the attention
+    """
+    # Convert from BHSD to BSHD for flash_attn_v3_func
+    q_bshd = q.transpose(1, 2).contiguous()
+    k_bshd = k.transpose(1, 2).contiguous()
+    v_bshd = v.transpose(1, 2).contiguous()
+    
+    return lambda: flash_attn_v3_func(q_bshd, k_bshd, v_bshd, softmax_scale=softmax_scale, causal=is_causal)
 
 
 def create_benchmark_configs(inputs: List[Dict[str, Any]], args):
@@ -324,10 +346,12 @@ def run_benchmark(args):
                                        sm_scale=softmax_scale, k_smooth=not no_k_smooth)
         elif kernel == "sage_fa3":
             fn = sage_fa3_forward_func(q, k, v, is_causal=is_causal)
-        elif kernel == "fa3_fp8":
-            fn = fa3_fp8_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
         elif kernel == "fa2":
             fn = fa2_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
+        elif kernel == "fa3":
+            fn = fa3_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
+        elif kernel == "fa3_fp8":
+            fn = fa3_fp8_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
         else:
             raise ValueError(f"Unknown kernel: {kernel}")
         
@@ -335,7 +359,7 @@ def run_benchmark(args):
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         
         # Calculate memory transfer
-        # sage_fa3 and sagev1 use int8 quantized Q/K; fa3_fp8 uses fp8
+        # sage_fa3 and sagev1 use int8 quantized Q/K; fa3_fp8 uses fp8; fa2 and fa3 use original dtype
         q_element_size = 1 if kernel in ["sagev1", "sage_fa3", "fa3_fp8"] else q.element_size()
         k_element_size = 1 if kernel in ["sagev1", "sage_fa3", "fa3_fp8"] else k.element_size()
         v_element_size = 1 if kernel == "fa3_fp8" else v.element_size()
@@ -381,8 +405,8 @@ def parse_args():
         "--kernel",
         type=str,
         default="sagev1",
-        choices=["sagev1", "sage_fa3", "fa3_fp8", "fa2"],
-        help="Kernel to benchmark: sagev1 (qk_int8_per_block), sage_fa3 (sage_attn_v1_func fused on fa3), fa3_fp8, fa2 (flash_attn_func)",
+        choices=["sagev1", "sage_fa3", "fa2", "fa3", "fa3_fp8"],
+        help="Kernel to benchmark: sagev1 (qk_int8_per_block), sage_fa3 (sage_attn_v1_func fused on fa3), fa2 (flash_attn_func v2), fa3 (flash_attn_func v3), fa3_fp8",
     )
     parser.add_argument(
         "-metric",
@@ -429,9 +453,10 @@ def parse_args():
     )
     # Shorthand flags
     parser.add_argument("-sage_fa3", action="store_true", help="Shorthand for --kernel sage_fa3")
-    parser.add_argument("-fa3_fp8", action="store_true", help="Shorthand for --kernel fa3_fp8")
     parser.add_argument("-sagev1", action="store_true", help="Shorthand for --kernel sagev1")
     parser.add_argument("-fa2", action="store_true", help="Shorthand for --kernel fa2")
+    parser.add_argument("-fa3", action="store_true", help="Shorthand for --kernel fa3")
+    parser.add_argument("-fa3_fp8", action="store_true", help="Shorthand for --kernel fa3_fp8")
     
     return parser.parse_args()
 
@@ -442,12 +467,14 @@ def main():
     # Handle shorthand flags
     if args.sage_fa3:
         args.kernel = "sage_fa3"
-    elif args.fa3_fp8:
-        args.kernel = "fa3_fp8"
     elif args.sagev1:
         args.kernel = "sagev1"
     elif args.fa2:
         args.kernel = "fa2"
+    elif args.fa3:
+        args.kernel = "fa3"
+    elif args.fa3_fp8:
+        args.kernel = "fa3_fp8"
     
     logger.info(f"Benchmarking kernel: {args.kernel}")
     logger.info(f"Input directory: {args.input_dir}")
