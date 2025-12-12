@@ -1771,6 +1771,35 @@ void standalone_stable_radix_11bits(void* buf,
     }
 }
 
+// Explicit template instantiation for standalone_stable_radix_11bits
+template void standalone_stable_radix_11bits<float, int, true, true>(
+    void* buf,
+    size_t& buf_size,
+    float const* in,
+    int batch_size,
+    int64_t len,
+    int* rowStarts,
+    int* rowEnds,
+    int k,
+    float* out,
+    int* out_idx,
+    bool greater,
+    hipStream_t stream);
+
+template void standalone_stable_radix_11bits<float, int, false, true>(
+    void* buf,
+    size_t& buf_size,
+    float const* in,
+    int batch_size,
+    int64_t len,
+    int* rowStarts,
+    int* rowEnds,
+    int k,
+    float* out,
+    int* out_idx,
+    bool greater,
+    hipStream_t stream);
+
 // AIR TopK end
 
 static inline __device__ uint32_t floatAsSortableUint(float x)
@@ -2369,6 +2398,9 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
     }
     return buf_size;
 }
+
+// Explicit template instantiation to ensure the symbol is available for linking
+template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows, int32_t stride0);
 
 void top_k_per_row_prefill(const torch::Tensor& logits,
                            const torch::Tensor& rowStarts,
