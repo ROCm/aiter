@@ -204,7 +204,7 @@ def sagev1_forward_func(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool,
-    inference_mode: bool,
+    inference_mode: bool, # not return softmax_lse
 ):
     config, _ = get_fwd_configs(False)
     assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
@@ -383,7 +383,7 @@ def run_benchmark(custom, args):
                 k,
                 v,
                 causal=False,
-                inference_mode=(not args.return_lse),
+                inference_mode=True,
             )
         else: # fav2 (no quantization)
             fn = fav2_forward_func(
@@ -549,7 +549,6 @@ def parse_args():
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-qk_int8", action="store_true", default=False)
     parser.add_argument("-sagev1_fa3", action="store_true", default=False)
-    parser.add_argument("-return_lse", action="store_true", default=False)
     parser.add_argument("-no_k_smooth", action="store_true", default=False)
     parser.add_argument("-qk_int8_layout", type=str, default="NHD", choices=["HND", "NHD"],
         help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")
