@@ -1423,7 +1423,14 @@ def run_pa_gluon_test(
         batch_size
         * head_size
         * (
-            2 * context_length * num_kv_heads * quantized_keys.dtype.itemsize
+            2
+            * (
+                min(context_length, sliding_window)
+                if sliding_window > 0
+                else context_length
+            )
+            * num_kv_heads
+            * quantized_keys.dtype.itemsize
             + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
         )
     )
@@ -1710,9 +1717,7 @@ def run_pa_gluon_test(
         results["asm_bandwith(TB/s)"] = assembly_bandwidth
 
     if "us_asm" in results:
-        results["perf_gluon_vs_asm"] = (
-            f'{results["us_asm"] / results["us_gluon"]:.0%}'
-        )
+        results["perf_gluon_vs_asm"] = f'{results["us_asm"] / results["us_gluon"]:.0%}'
     else:
         results["perf_gluon_vs_asm"] = "NaN"
 
