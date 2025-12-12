@@ -5,7 +5,7 @@ import triton
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from aiter.ops.triton.moe_op import fused_moe as triton_moe
 from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
-from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
+from op_tests.triton_tests.moe.test_moe import input_helper, input_helper_int4_w4a16
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,

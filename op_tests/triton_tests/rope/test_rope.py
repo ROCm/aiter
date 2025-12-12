@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-import sys
 import torch
 import pytest
 import random
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from test_rope import ref_rope_sbhd_fwd, ref_rope_thd_fwd, RotateStyle, ref_rope_2d_fwd
+from op_tests.test_rope import (
+    ref_rope_sbhd_fwd,
+    ref_rope_thd_fwd,
+    RotateStyle,
+    ref_rope_2d_fwd,
+)
 from aiter.ops.triton.rope import (
     rope_fwd,
     rope_fwd_inplace,

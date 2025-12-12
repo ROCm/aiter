@@ -10,7 +10,7 @@ from aiter.ops.triton.mla_decode_rope import decode_attention_fwd_grouped_rope
 import torch
 import argparse
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.triton_tests.test_mla_decode_rope import input_helper
+from op_tests.triton_tests.attention.test_mla_decode_rope import input_helper
 
 
 def ref_preprocess(kv_cache, kv_lora_rank):
