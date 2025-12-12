@@ -25,7 +25,6 @@ try:
 except ImportError:
     print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
 
-from aiter.jit.utils.file_baton import FileBaton
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     compile_gluon_kernel,
     CompileGluonArgs,
@@ -47,6 +46,13 @@ from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
 )
 
 MD_NAME = "pa_decode_attention_reduce_kernel"
+
+# Detect CDNA version based on target architecture
+target = triton.runtime.driver.active.get_current_target()
+if target.arch in ["gfx950"]:
+    CDNA_VERSION = 4
+else:
+    CDNA_VERSION = 3
 
 
 def clean_directory_except_so(directory_path):
@@ -241,6 +247,7 @@ def compile(
             f"{fp8_max_value}",
             f"{value_transposed}",
             f"{is_causal}",
+            f"{CDNA_VERSION}",
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"
@@ -272,6 +279,7 @@ def compile(
             "*fp32:16",  # max_logits_ptr
             logits_sig,  # logits_ptr
             "*i32:16",  # context_lengths_ptr
+            "*fp32:16",  # sinks_ptr
             "i32:16",  # stride_output_seq
             "i32:16",  # stride_output_head
             "i32:16",  # stride_exp_sums_seq
@@ -369,11 +377,11 @@ def compile(
             )
             if result.returncode != 0 and result.stderr:
                 print(f"Warning: {result.stderr}")
-            print(f"Cleaning aot temporary files completed!")
+            print("Cleaning aot temporary files completed!")
             print(f"Cleaning aiter build cache directory: {BUILD_DIR}/{func_name}")
             clean_directory_except_so(f"{BUILD_DIR}/{func_name}")
             print(
-                f"Cleaning aiter build cache directory completed, only *.so files are left!"
+                "Cleaning aiter build cache directory completed, only *.so files are left!"
             )
             return main_func_result
         else:
@@ -407,6 +415,7 @@ def pa_decode_gluon_aot(
     temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
     run_compiled_kernel: bool = True,
+    sinks: torch.Tensor = None,
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -708,7 +717,7 @@ def pa_decode_gluon_aot(
         is_causal=int(is_causal),
     )
 
-    assert combined_func is not None, f"Combined function is not compiled"
+    assert combined_func is not None, "Combined function is not compiled"
     # Execute the combined kernel
     if run_compiled_kernel:
         combined_func(
@@ -722,6 +731,7 @@ def pa_decode_gluon_aot(
                 value_cache,
                 block_tables,
                 context_lengths,
+                sinks,
                 softmax_scale,
                 query_scale_gluon,
                 key_scale,
