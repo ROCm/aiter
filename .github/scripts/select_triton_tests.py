@@ -191,6 +191,10 @@ def git_check_branch(branch: str) -> None:
 
 
 def git_filename_diff(source_branch: str, target_branch: str) -> set[Path]:
+    # FIXME: The statement bellow only works if the script is invoked in AITER
+    #        repo root directory as `python .github/scripts/select_triton_tests.py`.
+    #        `(p := Path(diff_p)).exists()` returns `False` when running from
+    #        other directories, and `files` end up empty.
     files = {
         p
         for diff_p in git(f"diff --name-only {target_branch} {source_branch}")
