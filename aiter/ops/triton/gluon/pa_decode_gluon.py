@@ -2587,26 +2587,6 @@ def pa_decode_gluon(
     if query_length > 1:
         # Transpose query and query_scale from [num_seqs * query_length, num_query_heads, head_size]
         # to [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
-
-        # # Using PyTorch operations instead of transpose_query_gluon kernel for debugging
-        # query_gluon_temp = query.reshape(
-        #     batch_size, query_length, num_kv_heads, query_group_size, head_size
-        # )
-        # query_gluon_temp = query_gluon_temp.transpose(1, 2).reshape(
-        #     batch_size, num_kv_heads * query_length * query_group_size, head_size
-        # )
-        # query_gluon.copy_(query_gluon_temp)
-
-        # # Handle query_scale if present (per-token quantization)
-        # if query_scale is not None and len(query_scale.shape) > 1:
-        #     query_scale_gluon_temp = query_scale.reshape(
-        #         batch_size, query_length, num_kv_heads, query_group_size, 1
-        #     )
-        #     query_scale_gluon_temp = query_scale_gluon_temp.transpose(1, 2).reshape(
-        #         batch_size, num_kv_heads * query_length * query_group_size, 1
-        #     )
-        #     query_scale_gluon.copy_(query_scale_gluon_temp)
-
         transpose_query_gluon(
             query=query,
             query_gluon=query_gluon,
@@ -2824,23 +2804,9 @@ def pa_decode_gluon(
         CONTEXT_PARTITION_SIZE=context_partition_size,
     )
 
-    # Transpose output from [num_seqs, num_kv_heads, query_length, query_group_size, head_size]
-    # back to [num_seqs * query_length, num_query_heads, head_size]
-    # Only needed when query_length > 1
     if query_length > 1:
-        # Using PyTorch operations instead of transpose_output_gluon kernel for debugging
-        # output_gluon shape: [batch_size, num_kv_heads * query_length * query_group_size, head_size]
-        # # Logical layout: [batch_size, num_kv_heads, query_length, query_group_size, head_size]
-        # output_temp = output_gluon.reshape(
-        #     batch_size, num_kv_heads, query_length, query_group_size, head_size
-        # )
-        # # Transpose to [batch_size, query_length, num_kv_heads, query_group_size, head_size]
-        # output_temp = output_temp.transpose(1, 2).reshape(
-        #     batch_size * query_length, num_kv_heads * query_group_size, head_size
-        # )
-        # output.copy_(output_temp)
-
-        # Original transpose_output_gluon call (commented out for debugging)
+        # Transpose output from [num_seqs, num_kv_heads, query_length, query_group_size, head_size]
+        # back to [num_seqs * query_length, num_query_heads, head_size]
         transpose_output_gluon(
             output_gluon=output_gluon,
             output=output,
