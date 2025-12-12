@@ -31,9 +31,30 @@ jobs:
   triton:
     runs-on: aiter-mi300-1gpu
     needs: [check-signal]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: attention
+            test_path: op_tests/triton_tests/attention
+          - name: gemm
+            test_path: op_tests/triton_tests/gemm
+          - name: moe
+            test_path: op_tests/triton_tests/moe
+          - name: normalization
+            test_path: op_tests/triton_tests/normalization
+          - name: quant
+            test_path: op_tests/triton_tests/quant
+          - name: rope
+            test_path: op_tests/triton_tests/rope
+          - name: misc
+            test_path: op_tests/triton_tests/test_*.py
+
+    name: triton-${{ matrix.name }}
+
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
-      TRITON_TEST: "op_tests/triton_tests/"
+      CONTAINER_NAME: triton_test_${{ matrix.name }}
 
     steps:
       - name: Checkout code
@@ -48,7 +69,7 @@ jobs:
       - name: Run the container
         run: |
           set -ex
-          echo "Starting container: triton_test"
+          echo "Starting container: ${{ env.CONTAINER_NAME }}"
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
@@ -63,7 +84,7 @@ jobs:
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
-          --name triton_test \
+          --name ${{ env.CONTAINER_NAME }} \
           ${{ env.DOCKER_IMAGE }}
 
       - name: Install speedtest-cli and test network
@@ -72,13 +93,13 @@ jobs:
           echo "Installing speedtest-cli and testing network..."
           docker exec \
           -w /workspace \
-          triton_test \
+          ${{ env.CONTAINER_NAME }} \
           bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
 
       - name: Setup pip config
         run: |
-          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root triton_test bash -c "pip config set global.retries 10"
+          docker exec -u root ${{ env.CONTAINER_NAME }} bash -c "pip config set global.default-timeout 60"
+          docker exec -u root ${{ env.CONTAINER_NAME }} bash -c "pip config set global.retries 10"
 
       - name: Setup Aiter and Triton
         run: |
@@ -86,7 +107,7 @@ jobs:
           echo "Setting up Aiter and Triton..."
           docker exec \
           -w /workspace \
-          triton_test \
+          ${{ env.CONTAINER_NAME }} \
           ./.github/scripts/build_aiter_triton.sh
 
       - name: Install Pytest
@@ -95,27 +116,27 @@ jobs:
           echo "Installing Pytest..."
           docker exec \
           -w /workspace \
-          triton_test \
+          ${{ env.CONTAINER_NAME }} \
           pip install pytest
 
-      - name: Triton Tests
+      - name: Triton ${{ matrix.name }} Tests
         run: |
           set -ex
-          echo "Running Triton Tests..."
-          docker exec -w /workspace triton_test mkdir -p test-reports
-          docker exec -w /workspace triton_test pytest -v ${{ env.TRITON_TEST }} --junitxml=test-reports/triton.xml
+          echo "Running Triton ${{ matrix.name }} Tests..."
+          docker exec -w /workspace ${{ env.CONTAINER_NAME }} mkdir -p test-reports
+          docker exec -w /workspace ${{ env.CONTAINER_NAME }} pytest -v ${{ matrix.test_path }} --junitxml=test-reports/triton-${{ matrix.name }}.xml
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: triton-test-logs
-          path: test-reports/triton.xml
+          name: triton-${{ matrix.name }}-test-logs
+          path: test-reports/triton-${{ matrix.name }}.xml
 
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f triton_test || true
+          docker rm -f ${{ env.CONTAINER_NAME }} || true
 
       - name: Clean up Rocm processes
         if: always()
