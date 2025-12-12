@@ -1698,6 +1698,27 @@ namespace py = pybind11;
           py::arg("topk")                = -1,   \
           py::arg("max_split_per_batch") = -1);
 
+#define PS_METADATA_PYBIND                       \
+    m.def("get_ps_metadata_v1",                  \
+          &get_ps_metadata_v1,                   \
+          "get_ps_metadata_v1",                  \
+          py::arg("seqlens_qo_indptr"),          \
+          py::arg("pages_kv_indptr"),            \
+          py::arg("context_lens"),               \
+          py::arg("gqa_ratio"),                  \
+          py::arg("num_heads_k"),                \
+          py::arg("work_metadata_ptrs"),         \
+          py::arg("work_indptr"),                \
+          py::arg("work_info"),                  \
+          py::arg("reduce_indptr"),              \
+          py::arg("reduce_final_map"),           \
+          py::arg("reduce_partial_map"),         \
+          py::arg("qhead_granularity")   = 1,    \
+          py::arg("qlen_granularity")    = 256,  \
+          py::arg("kvlen_granularity")   = 1,    \
+          py::arg("block_size")          = 1,    \
+          py::arg("is_causal")           = true);
+
 #define MLA_REDUCE_PYBIND                \
     m.def("mla_reduce_v1",               \
           &mla_reduce_v1,                \
