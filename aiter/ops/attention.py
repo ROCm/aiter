@@ -623,7 +623,6 @@ def get_mla_metadata_info_v1(
     """
 
     assert num_head_qo % 16 == 0
-
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
@@ -635,17 +634,15 @@ def get_mla_metadata_info_v1(
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
-    num_clusters = cu_num // max_qo_tiles_per_batch
 
     if fast_mode:
-        max_work = (batch_size + num_clusters - 1) * max_qo_tiles_per_batch
+        max_work = (batch_size + cu_num - 1) * max_qo_tiles_per_batch
         max_split_tiles = (
-            min(batch_size + num_clusters - 1, (num_clusters - 1) * 2)
-            * max_qo_tiles_per_batch
+            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
         )
     else:
-        max_work = tile_cnt * num_clusters
-        max_split_tiles = tile_cnt * num_clusters
+        max_work = tile_cnt * cu_num
+        max_split_tiles = tile_cnt * cu_num
 
     if not intra_batch_mode:
         return (
