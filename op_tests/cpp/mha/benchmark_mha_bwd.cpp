@@ -669,6 +669,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
               << std::setprecision(2) << tflops << " TFlops, " << std::setprecision(2) << gb_per_sec
               << " GB/s" << std::flush;
 
+    // Reset stream formatting to default
+    std::cout << std::defaultfloat << std::setprecision(6);
+    
     if(!do_validation)
     {
         std::cout << std::flush << std::endl;
