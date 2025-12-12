@@ -14,6 +14,10 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
     per_block_int8,
 )
 
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import (
+    map_dims,
+)
+
 
 class _SageAttnV1WrapperFunc(torch.autograd.Function):
     """
@@ -43,9 +47,12 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
         pack_gqa: Optional[bool],
         deterministic: bool,
         sm_margin: int,
+        return_lse: bool = True,
+        layout: str = "bshd",
     ):
-        batch, seqlen_q, num_q_heads, head_dim = q.shape
-        _, seqlen_k, num_kv_heads, _ = k.shape
+        bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+        batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
+        _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
 
         # Quantize K, V to int8, and convert v to float16
         config, _ = get_fwd_configs(False)
@@ -55,9 +62,10 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
         BLKK = config["BLOCK_N"]
 
         softmax_scale = head_dim**-0.5
+        tensor_layout = "NHD" if layout == "bshd" else "HND"
         ## following quantization already considered softmax scale and RCP_LN2 
         q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
-            q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout="NHD"
+            q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout=tensor_layout
         )
 
         v_fp16 = v.to(torch.float16)
@@ -93,6 +101,9 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
             raise NotImplementedError(
                 "sm_margin != 0 not supported in FP8 high-precision API"
             )
+
+        if q.requires_grad or k.requires_grad or v.requires_grad:
+            assert return_lse, f"in train mode, return_lse is expected to be True, got {return_lse}"
 
         # Call flash attention forward
         out, softmax_lse = sage_attn_1.fwd(
@@ -130,7 +141,12 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
             1,
             None,
             sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+            return_lse,
+            layout,
         )
+
+        if not return_lse:
+            return out
 
         # Save tensors needed for backward
         ctx.save_for_backward(
@@ -143,6 +159,7 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
         ctx.input_dtype = q.dtype
+        ctx.layout = layout
 
         return out
 
@@ -183,6 +200,8 @@ def sage_attn_v1_wrapper_func(
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     sm_margin: int = 0,
+    inference_mode: bool = True,
+    layout: str = "bshd",
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -210,9 +229,11 @@ def sage_attn_v1_wrapper_func(
         pack_gqa: GQA packing flag (not yet supported)
         deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
+        inference_mode: do not return softmax_lse
+        layout: bshd or bhsd layout for the inputs
 
     Returns:
-        out: Output tensor [batch, seqlen, num_q_heads, head_dim] (FP32)
+        out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
 
     Note:
         - Supports GQA/MQA (num_q_heads != num_kv_heads)
@@ -249,6 +270,7 @@ def sage_attn_v1_wrapper_func(
             "sm_margin != 0 not supported in Sage Attention v1 API"
         )
 
+    return_lse = (not inference_mode)
     return _SageAttnV1WrapperFunc.apply(
         q,
         k,
@@ -264,6 +286,8 @@ def sage_attn_v1_wrapper_func(
         pack_gqa,
         deterministic,
         sm_margin,
+        return_lse,
+        layout,
     )
 
 
@@ -284,6 +308,8 @@ def sage_attn_v1_func(
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     sm_margin: int = 0,
+    inference_mode: bool = True,
+    layout: str = "bshd",
 ):
     """
     SageAttention v1.
@@ -303,13 +329,16 @@ def sage_attn_v1_func(
         pack_gqa: GQA packing flag (not yet supported)
         deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
+        inference_model: do not return softmax_lse
+        layout: bshd or bhsd layout for the inputs
 
     Returns:
-        out: Output tensor [batch, seqlen, num_q_heads, head_dim] (FP32)
+        out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
     """
 
-    batch, seqlen_q, num_q_heads, head_dim = q.shape
-    _, seqlen_k, num_kv_heads, _ = k.shape
+    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
+    _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
 
     # Quantize K, V to int8, and convert v to float16
     config, _ = get_fwd_configs(False)
@@ -352,6 +381,7 @@ def sage_attn_v1_func(
             "sm_margin != 0 not supported in FP8 high-precision API"
         )
 
+    return_lse = (not inference_mode)
     # Call flash attention forward
     out, _ = sage_attn_1.fwd(
         q,
@@ -388,6 +418,8 @@ def sage_attn_v1_func(
         1,
         None,
         sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+        return_lse,
+        layout,
     )
 
     return out

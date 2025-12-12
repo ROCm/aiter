@@ -232,6 +232,7 @@ def sagev1_forward_func(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool,
+    inference_mode: bool, # not return softmax_lse
 ):
     config, _ = get_fwd_configs(False)
     assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
@@ -254,6 +255,7 @@ def sagev1_forward_func(
         q_descale,
         k_descale,
         causal=causal,
+        inference_mode=inference_mode,
     )
 
 def nonvarlen_benchmark_configs():
@@ -602,6 +604,7 @@ def run_benchmark(custom, args):
                 k,
                 v,
                 causal=False,
+                inference_mode=True,
             )
         else: # fav2 (no quantization)
             fn = fav2_forward_func(
@@ -688,8 +691,8 @@ def run_benchmark(custom, args):
             if args.print_compare_stats:
                 print_output_comparison_stats(current_primary, reference_primary)
 
-        q_element_size = 1 if args.qk_int8 or args.fp8 else q.element_size()
-        k_element_size = 1 if args.qk_int8 or args.fp8 else k.element_size()
+        q_element_size = 1 if args.qk_int8 or args.fp8 or args.sagev1_fa3 else q.element_size()
+        k_element_size = 1 if args.qk_int8 or args.fp8 or args.sagev1_fa3 else k.element_size()
         v_element_size = 1 if args.fp8 else v.element_size()
 
         

@@ -17,6 +17,7 @@ from .utils import (
     is_rdna,
     apply_rotary,
     get_recommended_fp8_dtype,
+    map_dims,
 )
 
 
@@ -51,46 +52,58 @@ def get_fwd_configs(autotune: bool):
                 )
             )
         elif arch == "gfx942":
-            if get_cu_count() < 304:
-                configs.extend(
-                    [
-                        # best fp8 config
-                        triton.Config(
-                            {
-                                "BLOCK_M": 128,
-                                "BLOCK_N": 64,
-                                "waves_per_eu": 2,
-                                "PRE_LOAD_V": False,
-                            },
-                            num_stages=1,
-                            num_warps=4,
-                        ),
-                        ## best f16 config
-                        #triton.Config(
-                        #    {
-                        #        "BLOCK_M": 128,
-                        #        "BLOCK_N": 32,
-                        #        "waves_per_eu": 2,
-                        #        "PRE_LOAD_V": False,
-                        #    },
-                        #    num_stages=2,
-                        #    num_warps=4,
-                        #),
-                    ]
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_warps=4,
+                    num_stages=1,
                 )
-            else:
-                configs.append(
-                    triton.Config(
-                        {
-                            "BLOCK_M": 128,
-                            "BLOCK_N": 64,
-                            "waves_per_eu": 2,
-                            "PRE_LOAD_V": False,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    )
-                )
+            )
+            #if get_cu_count() < 304:
+            #    configs.extend(
+            #        [
+            #            # best fp8 config
+            #            triton.Config(
+            #                {
+            #                    "BLOCK_M": 128,
+            #                    "BLOCK_N": 64,
+            #                    "waves_per_eu": 2,
+            #                    "PRE_LOAD_V": False,
+            #                },
+            #                num_stages=1,
+            #                num_warps=4,
+            #            ),
+            #            ## best f16 config
+            #            #triton.Config(
+            #            #    {
+            #            #        "BLOCK_M": 128,
+            #            #        "BLOCK_N": 32,
+            #            #        "waves_per_eu": 2,
+            #            #        "PRE_LOAD_V": False,
+            #            #    },
+            #            #    num_stages=2,
+            #            #    num_warps=4,
+            #            #),
+            #        ]
+            #    )
+            #else:
+            #    configs.append(
+            #        triton.Config(
+            #            {
+            #                "BLOCK_M": 128,
+            #                "BLOCK_N": 64,
+            #                "waves_per_eu": 2,
+            #                "PRE_LOAD_V": False,
+            #            },
+            #            num_stages=1,
+            #            num_warps=4,
+            #        )
+            #    )
         elif arch in (
             "gfx1030",
             "gfx1100",
@@ -1072,6 +1085,7 @@ def attn_fwd(
     dropout_p,
     philox_seed,
     philox_offset_base,
+    RETURN_LSE: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
@@ -1215,14 +1229,15 @@ def attn_fwd(
         )
 
         # Write zeros to LSE
-        l_ptrs = (
-            LSE
-            + off_z * stride_lse_z
-            + off_h_q * stride_lse_h
-            + cu_seqlens_q_start * stride_lse_m
-            + offs_m * stride_lse_m
-        )
-        tl.store(l_ptrs, tl.zeros([BLOCK_M], dtype=tl.float32), mask=offs_m < seqlen_q)
+        if RETURN_LSE:
+            l_ptrs = (
+                LSE
+                + off_z * stride_lse_z
+                + off_h_q * stride_lse_h
+                + cu_seqlens_q_start * stride_lse_m
+                + offs_m * stride_lse_m
+            )
+            tl.store(l_ptrs, tl.zeros([BLOCK_M], dtype=tl.float32), mask=offs_m < seqlen_q)
         return
 
     # ============================================================
@@ -1491,30 +1506,31 @@ def attn_fwd(
         acc = acc * dropout_scale
 
     # compute log-sum-exp
-    if USE_EXP2:
-        RCP_LN2: tl.constexpr = 1.4426950408889634
-        LN2: tl.constexpr = 0.6931471824645996
-        # compute log-sum-exp in base 2 units
-        #mi_base2 = m_i * RCP_LN2
-        mi_base2 = m_i
-        # For invalid rows, log(l_i) would be -inf, but we want LSE to be -inf
-        # So we handle this case explicitly
-        if USE_SLIDING_WINDOW:
-            log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i))
-            softmax_lse = mi_base2 + log_l_i
-            # Ensure invalid rows have LSE = -inf
-            softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
+    if RETURN_LSE:
+        if USE_EXP2:
+            # RCP_LN2: tl.constexpr = 1.4426950408889634
+            LN2: tl.constexpr = 0.6931471824645996
+            # compute log-sum-exp in base 2 units
+            #mi_base2 = m_i * RCP_LN2
+            mi_base2 = m_i
+            # For invalid rows, log(l_i) would be -inf, but we want LSE to be -inf
+            # So we handle this case explicitly
+            if USE_SLIDING_WINDOW:
+                log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i))
+                softmax_lse = mi_base2 + log_l_i
+                # Ensure invalid rows have LSE = -inf
+                softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
+            else:
+                softmax_lse = mi_base2 + tl.math.log2(l_i)
+            # convert back to natural units
+            softmax_lse *= LN2
         else:
-            softmax_lse = mi_base2 + tl.math.log2(l_i)
-        # convert back to natural units
-        softmax_lse *= LN2
-    else:
-        if USE_SLIDING_WINDOW:
-            log_l_i = tl.where(invalid_mask, 0.0, tl.math.log(l_i))
-            softmax_lse = m_i + log_l_i
-            softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
-        else:
-            softmax_lse = m_i + tl.math.log(l_i)
+            if USE_SLIDING_WINDOW:
+                log_l_i = tl.where(invalid_mask, 0.0, tl.math.log(l_i))
+                softmax_lse = m_i + log_l_i
+                softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
+            else:
+                softmax_lse = m_i + tl.math.log(l_i)
 
     # handle masking edge cases
     if USE_SLIDING_WINDOW:
@@ -1556,27 +1572,30 @@ def attn_fwd(
                     acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
 
             # Zero out LSE for rows above diagonal
-            softmax_lse = tl.where(causal_mask, 0.0, softmax_lse)
+            if RETURN_LSE:
+                softmax_lse = tl.where(causal_mask, 0.0, softmax_lse)
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
-    l_offset = (
-        LSE
-        + off_z * stride_lse_z
-        + off_h_q * stride_lse_h
-        + cu_seqlens_q_start * stride_lse_m
-    )
-    l_ptrs = l_offset + offs_m * stride_lse_m
+    if RETURN_LSE:
+        l_offset = (
+            LSE
+            + off_z * stride_lse_z
+            + off_h_q * stride_lse_h
+            + cu_seqlens_q_start * stride_lse_m
+        )
+        l_ptrs = l_offset + offs_m * stride_lse_m
 
     # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
     # This is only true for the last Q block. For others, overflow_size will be -ve
     end_m_idx = (start_m + 1) * BLOCK_M
     overflow_size = end_m_idx - seqlen_q
-    if overflow_size > 0:
-        boundary = tl.full((BLOCK_M,), BLOCK_M - overflow_size, dtype=tl.int32)
-        l_ptrs_mask = tl.arange(0, BLOCK_M) < boundary
-        tl.store(l_ptrs, softmax_lse, mask=l_ptrs_mask)
-    else:
-        tl.store(l_ptrs, softmax_lse)
+    if RETURN_LSE:
+        if overflow_size > 0:
+            boundary = tl.full((BLOCK_M,), BLOCK_M - overflow_size, dtype=tl.int32)
+            l_ptrs_mask = tl.arange(0, BLOCK_M) < boundary
+            tl.store(l_ptrs, softmax_lse, mask=l_ptrs_mask)
+        else:
+            tl.store(l_ptrs, softmax_lse)
 
     # write back O
     o_offset = (
@@ -1597,7 +1616,7 @@ def attention_forward_prefill_triton_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
-    softmax_lse: torch.Tensor,
+    softmax_lse: Optional[torch.Tensor],
     sd_mask: Optional[torch.Tensor],
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
@@ -1707,18 +1726,19 @@ def attention_forward_prefill_triton_impl(
         head_size_qk = head_size_q
 
         # Assert softmax_lse tensor is large enough
-        assert (
-            softmax_lse.shape[0] >= nheads_q
-        ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= nheads_q={nheads_q}"
-        assert (
-            softmax_lse.shape[1] >= total_seqlen_q
-        ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= total_seqlen_q={total_seqlen_q}"
-        assert (
-            softmax_lse.dtype == torch.float32
-        ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
-        assert (
-            softmax_lse.device == q.device
-        ), f"softmax_lse must be on same device as q"
+        if softmax_lse is not None:
+            assert (
+                softmax_lse.shape[0] >= nheads_q
+            ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= nheads_q={nheads_q}"
+            assert (
+                softmax_lse.shape[1] >= total_seqlen_q
+            ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= total_seqlen_q={total_seqlen_q}"
+            assert (
+                softmax_lse.dtype == torch.float32
+            ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
+            assert (
+                softmax_lse.device == q.device
+            ), f"softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1749,12 +1769,13 @@ def attention_forward_prefill_triton_impl(
             0,
             softmax_lse.stride(0),
             softmax_lse.stride(1),
-        )
+        ) if softmax_lse is not None else (0, 0, 0)
     else:
+        bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         # shapes
-        batch_q, seqlen_q, nheads_q, head_size_q = q.shape
-        batch_k, seqlen_k, nheads_k, head_size_k = k.shape
-        batch_v, seqlen_v, nheads_v, head_size_v = v.shape
+        batch_q, seqlen_q, nheads_q, head_size_q = map_dims(q.shape, bshd)
+        batch_k, seqlen_k, nheads_k, head_size_k = map_dims(k.shape, bshd)
+        batch_v, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd)
 
         # assert batch dimensions
         assert (
@@ -1779,10 +1800,10 @@ def attention_forward_prefill_triton_impl(
 
         # assert output shapes
         assert o.shape == (
-            batch_q,
-            seqlen_q,
-            nheads_q,
-            head_size_v,
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            v.shape[-1],
         ), f"o shape {o.shape} != expected {(batch_q, seqlen_q, nheads_q, head_size_v)}"
 
         # set vars
@@ -1791,49 +1812,30 @@ def attention_forward_prefill_triton_impl(
         max_seqlens_q = seqlen_q
         max_seqlens_k = seqlen_k
 
-        # Assert softmax_lse tensor is large enough
-        assert (
-            softmax_lse.shape[0] >= batch
-        ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= batch={batch}"
-        assert (
-            softmax_lse.shape[1] >= nheads_q
-        ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= nheads_q={nheads_q}"
-        assert (
-            softmax_lse.shape[2] >= seqlen_q
-        ), f"softmax_lse.shape[2]={softmax_lse.shape[2]} must be >= seqlen_q={seqlen_q}"
-        assert (
-            softmax_lse.dtype == torch.float32
-        ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
-        assert (
-            softmax_lse.device == q.device
-        ), f"softmax_lse must be on same device as q"
+        # Assert softmax_lse tensor is large enough 
+        if softmax_lse is not None:
+            assert (
+                softmax_lse.shape[0] >= batch
+            ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= batch={batch}"
+            assert (
+                softmax_lse.shape[1] >= nheads_q
+            ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= nheads_q={nheads_q}"
+            assert (
+                softmax_lse.shape[2] >= seqlen_q
+            ), f"softmax_lse.shape[2]={softmax_lse.shape[2]} must be >= seqlen_q={seqlen_q}"
+            assert (
+                softmax_lse.dtype == torch.float32
+            ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
+            assert (
+                softmax_lse.device == q.device
+            ), f"softmax_lse must be on same device as q"
 
         # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = (
-            q.stride(0),
-            q.stride(2),
-            q.stride(1),
-            q.stride(3),
-        )
-        stride_kb, stride_kh, stride_kn, stride_kd = (
-            k.stride(0),
-            k.stride(2),
-            k.stride(1),
-            k.stride(3),
-        )
-        stride_vb, stride_vh, stride_vn, stride_vd = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
-        )
-        stride_ob, stride_oh, stride_om, stride_od = (
-            o.stride(0),
-            o.stride(2),
-            o.stride(1),
-            o.stride(3),
-        )
-        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
+        stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
+        stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+        stride_vb, stride_vn, stride_vh, stride_vd = map_dims(v.stride(), bshd)
+        stride_ob, stride_om, stride_oh, stride_od = map_dims(o.stride(), bshd)
+        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride() if softmax_lse is not None else (0, 0, 0)
 
     # apply rotary embeddings
     if rotary_cos is not None and rotary_sin is not None:
@@ -1920,6 +1922,8 @@ def attention_forward_prefill_triton_impl(
     else:
         stride_bz, stride_bh, stride_bm, stride_bn = (0, 0, 0, 0)
 
+    return_lse = True if softmax_lse is not None else False
+
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     attn_fwd[grid](
@@ -1975,6 +1979,7 @@ def attention_forward_prefill_triton_impl(
         dropout_p=dropout_p,
         philox_seed=philox_seed,
         philox_offset_base=philox_offset,
+        RETURN_LSE=return_lse,
         HQ=nheads_q,
         HK=nheads_k,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,

@@ -1369,6 +1369,7 @@ def test_attn_qk_int8_per_block(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize("LAYOUT", ["bshd", "bhsd"])
 def test_sage_v1(
     BATCH: int,
     SEQLEN_Q: int,
@@ -1377,19 +1378,35 @@ def test_sage_v1(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    LAYOUT: str,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
-    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    if LAYOUT == "bshd":
+        q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+        k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+        v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    elif LAYOUT == "bhsd":
+        q = torch.randn((BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ), device="cuda", dtype=dtype)
+        k = torch.randn((BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ), device="cuda", dtype=dtype)
+        v = torch.randn((BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ), device="cuda", dtype=dtype)
+    else:
+        raise NotImplementedError(f"Expected layout to be 'bshd' or 'bhsd', got {LAYOUT}.")
 
     triton_out = sage_attn_v1_wrapper_func(
         q,
         k,
         v,
         causal=CAUSAL,
+        layout=LAYOUT,
     )
+
+    if LAYOUT == "bhsd":
+        triton_out = triton_out.transpose(1,2).contiguous()
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
