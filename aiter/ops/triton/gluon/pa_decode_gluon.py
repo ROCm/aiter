@@ -1230,11 +1230,6 @@ def paged_attention_decode_sliding_window(
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
-    # if CDNA_VERSION == 4:
-    #     FP8_MAX_VALUE: gl.constexpr = 448
-    # else:
-    #     FP8_MAX_VALUE: gl.constexpr = 240
-
     # ==================== CONSTANTS AND CONFIGURATION ====================
     if COMPUTE_TYPE.is_fp8():
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
