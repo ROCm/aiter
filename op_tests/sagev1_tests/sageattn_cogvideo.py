@@ -15,6 +15,28 @@ import torch.nn.functional as F
 import argparse
 
 
+def make_bshd_wrapper(inner_fn, **fixed_kwargs):
+    """
+    Creates a BHSD->BSHD wrapper for attention functions that expect BSHD format.
+    
+    BHSD = (batch, heads, seqlen, dim) - PyTorch's scaled_dot_product_attention format
+    BSHD = (batch, seqlen, heads, dim) - Flash attention format
+    
+    Args:
+        inner_fn: Attention function expecting BSHD format with signature:
+                  inner_fn(q, k, v, softmax_scale=..., causal=..., **fixed_kwargs)
+        **fixed_kwargs: Additional fixed arguments to pass to inner_fn (e.g., dropout_p=0.0)
+    """
+    def wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
+        original_dtype = query.dtype
+        q = query.transpose(1, 2).contiguous()
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+        out = inner_fn(q, k, v, softmax_scale=softmax_scale, causal=is_causal, **fixed_kwargs)
+        return out.transpose(1, 2).to(original_dtype)
+    return wrapper
+
+
 class InputCaptureWrapper:
     """
     Wrapper that captures input tensors during inference for later benchmarking.
@@ -143,154 +165,56 @@ logger.debug(f"AMD GPU detected: {_is_amd_gpu()}")
 logger.debug(f"torch.version.hip: {getattr(torch.version, 'hip', None)}")
 
 
+# Define attention wrapper based on attention_type
+kernel_name = args.attention_type
+attn_fn = None
+
 if args.attention_type == 'sagev1':
     attn_fn = sageattn
-    if args.save_inputs:
-        # 0 means unlimited
-        max_caps = args.max_captures if args.max_captures > 0 else None
-        _capture_wrapper = InputCaptureWrapper(attn_fn, args.input_dir, name="sagev1", max_captures=max_caps)
-        F.scaled_dot_product_attention = _capture_wrapper
-    else:
-        F.scaled_dot_product_attention = attn_fn
+
 elif args.attention_type == 'sdpa':
-    attn_fn = torch.nn.functional.scaled_dot_product_attention
+    _sdpa_fn = torch.nn.functional.scaled_dot_product_attention
     
     # Wrapper for PyTorch's native scaled_dot_product_attention
     # scaled_dot_product_attention: (batch, heads, seqlen, dim) - BHSD format
-    # torch.nn.functional.scaled_dot_product_attention expects BHSD format
     def sdpa_wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
         # PyTorch SDPA uses 'scale' parameter instead of 'softmax_scale'
-        return attn_fn(
+        return _sdpa_fn(
             query, key, value,
             attn_mask=None,
             dropout_p=0.0,
             is_causal=is_causal,
             scale=softmax_scale
         )
-    
-    if args.save_inputs:
-        # 0 means unlimited
-        max_caps = args.max_captures if args.max_captures > 0 else None
-        _capture_wrapper = InputCaptureWrapper(sdpa_wrapper, args.input_dir, name="sdpa", max_captures=max_caps)
-        F.scaled_dot_product_attention = _capture_wrapper
-    else:
-        F.scaled_dot_product_attention = sdpa_wrapper
+    attn_fn = sdpa_wrapper
+
 elif args.attention_type == 'fa2':
     from aiter.ops.triton.mha import flash_attn_func as _fa2
+    attn_fn = make_bshd_wrapper(_fa2, dropout_p=0.0)
 
-    # Wrapper to convert BHSD to BSHD
-    # scaled_dot_product_attention: (batch, heads, seqlen, dim)
-    # flash_attn_func: (batch, seqlen, heads, dim)
-    def fa2_wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
-        original_dtype = query.dtype
-        
-        # Transpose from BHSD to BSHD
-        q = query.transpose(1, 2).contiguous()
-        k = key.transpose(1, 2).contiguous()
-        v = value.transpose(1, 2).contiguous()
-        
-        # Call flash attention
-        out = _fa2(q, k, v, dropout_p=0.0, softmax_scale=softmax_scale, causal=is_causal)
-        
-        # Transpose back from BSHD to BHSD
-        return out.transpose(1, 2).to(original_dtype)
-    
-    if args.save_inputs:
-        # 0 means unlimited
-        max_caps = args.max_captures if args.max_captures > 0 else None
-        _capture_wrapper = InputCaptureWrapper(fa2_wrapper, args.input_dir, name="fa2", max_captures=max_caps)
-        F.scaled_dot_product_attention = _capture_wrapper
-    else:
-        F.scaled_dot_product_attention = fa2_wrapper
 elif args.attention_type == 'fa3':
     from aiter.ops.triton.mha_v3 import flash_attn_func as _fa3
+    attn_fn = make_bshd_wrapper(_fa3)
 
-    # Wrapper to convert BHSD to BSHD
-    # scaled_dot_product_attention: (batch, heads, seqlen, dim)
-    # flash_attn_func (v3): (batch, seqlen, heads, dim)
-    def fa3_wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
-        original_dtype = query.dtype
-        
-        # Transpose from BHSD to BSHD
-        q = query.transpose(1, 2).contiguous()
-        k = key.transpose(1, 2).contiguous()
-        v = value.transpose(1, 2).contiguous()
-        
-        # Call flash attention v3
-        out = _fa3(q, k, v, softmax_scale=softmax_scale, causal=is_causal)
-        
-        # Transpose back from BSHD to BHSD
-        return out.transpose(1, 2).to(original_dtype)
-    
-    if args.save_inputs:
-        # 0 means unlimited
-        max_caps = args.max_captures if args.max_captures > 0 else None
-        _capture_wrapper = InputCaptureWrapper(fa3_wrapper, args.input_dir, name="fa3", max_captures=max_caps)
-        F.scaled_dot_product_attention = _capture_wrapper
-    else:
-        F.scaled_dot_product_attention = fa3_wrapper
 elif args.attention_type == 'fa3_fp8':
     from aiter.ops.triton.mha_v3 import flash_attn_fp8_func as _fa3_fp8
+    attn_fn = make_bshd_wrapper(_fa3_fp8)
 
-    # Wrapper to convert BHSD to BSHD
-    # scaled_dot_product_attention: (batch, heads, seqlen, dim)
-    # flash_attn_fp8_func: (batch, seqlen, heads, dim)
-    def fa3_fp8_wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
-        # Store original dtype to restore after FP8 attention (which returns FP32)
-        original_dtype = query.dtype
-        
-        # Transpose from BHSD to BSHD
-        q = query.transpose(1, 2).contiguous()
-        k = key.transpose(1, 2).contiguous()
-        v = value.transpose(1, 2).contiguous()
-        
-        # Call flash attention (ignores attn_mask and dropout_p for now)
-        # Note: flash_attn_fp8_func returns FP32 output for numerical stability
-        out = _fa3_fp8(q, k, v, softmax_scale=softmax_scale, causal=is_causal)
-        
-        # Transpose back from BSHD to BHSD and restore original dtype
-        # This is necessary because FP8 attention returns FP32 but downstream
-        # layers (like to_out linear) expect the original dtype (e.g., float16)
-        return out.transpose(1, 2).to(original_dtype)
-    
-    if args.save_inputs:
-        # 0 means unlimited
-        max_caps = args.max_captures if args.max_captures > 0 else None
-        _capture_wrapper = InputCaptureWrapper(fa3_fp8_wrapper, args.input_dir, name="fa3_fp8", max_captures=max_caps)
-        F.scaled_dot_product_attention = _capture_wrapper
-    else:
-        F.scaled_dot_product_attention = fa3_fp8_wrapper
 elif args.attention_type == 'sagev1_fa3':
-    from aiter.ops.triton.mha_v3 import flash_attn_fp8_func as _fa3_fp8
     from aiter.ops.triton.sage_v1 import sage_attn_v1_wrapper_func as _sagev1_fa3
+    kernel_name = "_sagev1_fa3"  # Override kernel name for this variant
+    attn_fn = make_bshd_wrapper(_sagev1_fa3)
 
-    # Wrapper to convert BHSD to BSHD
-    # scaled_dot_product_attention: (batch, heads, seqlen, dim)
-    # sage_attn_v1_wrapper_func: (batch, seqlen, heads, dim)
-    def sagev1_fa3_wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
-        original_dtype = query.dtype
-        
-        # Transpose from BHSD to BSHD
-        q = query.transpose(1, 2).contiguous()
-        k = key.transpose(1, 2).contiguous()
-        v = value.transpose(1, 2).contiguous()
-        
-        # Call sagev1 attention (ignores attn_mask and dropout_p for now)
-        # Note: returns FP32 output for numerical stability
-        out = _sagev1_fa3(q, k, v, softmax_scale=softmax_scale, causal=is_causal)
-        
-        # Transpose back from BSHD to BHSD and restore original dtype
-        return out.transpose(1, 2).to(original_dtype)
-    
-    if args.save_inputs:
-        # 0 means unlimited
-        max_caps = args.max_captures if args.max_captures > 0 else None
-        _capture_wrapper = InputCaptureWrapper(sagev1_fa3_wrapper, args.input_dir, name="_sagev1_fa3", max_captures=max_caps)
-        F.scaled_dot_product_attention = _capture_wrapper
-    else:
-        F.scaled_dot_product_attention = sagev1_fa3_wrapper
 else:
     raise ValueError(f"Attention type {args.attention_type} not supported")
+
+# Apply attention function with optional input capture wrapper
+if args.save_inputs:
+    max_caps = args.max_captures if args.max_captures > 0 else None
+    _capture_wrapper = InputCaptureWrapper(attn_fn, args.input_dir, name=kernel_name, max_captures=max_caps)
+    F.scaled_dot_product_attention = _capture_wrapper
+else:
+    F.scaled_dot_product_attention = attn_fn
 
 prompt = "A panda, dressed in a small, red jacket and a tiny hat, sits on a wooden stool in a serene bamboo forest. The panda's fluffy paws strum a miniature acoustic guitar, producing soft, melodic tunes. Nearby, a few other pandas gather, watching curiously and some clapping in rhythm. Sunlight filters through the tall bamboo, casting a gentle glow on the scene. The panda's face is expressive, showing concentration and joy as it plays. The background includes a small, flowing stream and vibrant green foliage, enhancing the peaceful and magical atmosphere of this unique musical performance."
 
