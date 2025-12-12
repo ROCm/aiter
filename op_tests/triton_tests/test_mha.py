@@ -6,14 +6,17 @@ import pytest
 import logging
 import numpy as np
 from aiter.ops.triton.mha import (
-    flash_attn_func,
-    flash_attn_varlen_func,
+    flash_attn_func as triton_flash_attn_func,
+    flash_attn_varlen_func as triton_flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
+from aiter.ops.triton.gluon.mha import (
+    flash_attn_varlen_func as gluon_flash_attn_varlen_func,
+)
 from aiter.ops.triton.mha_v3 import (
-    flash_attn_fp8_func,
-    flash_attn_varlen_fp8_func,
+    flash_attn_fp8_func as triton_flash_attn_fp8_func,
+    flash_attn_varlen_fp8_func as triton_flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
     attention_ref,
@@ -104,6 +107,30 @@ def fp8_assert_close(
     )
 
 
+def check_gluon_compatibility(impl, **params):
+    """Skip test if parameters are incompatible with Gluon kernel"""
+    if impl != "GLUON":
+        return
+
+    if params.get("NUM_Q_HEADS", 1) > params.get("NUM_K_HEADS", 1):
+        pytest.skip("Gluon backend doesn't support Q > KV heads")
+
+    if params.get("DROPOUT", 0.0) > 0.0:
+        pytest.skip("Gluon backend doesn't support dropout")
+
+    if params.get("RETURN_SOFTMAX", False):
+        pytest.skip("Gluon backend doesn't support returning softmax weights")
+
+    if params.get("FP8", False):
+        pytest.skip("Gluon backend doesn't support FP8")
+
+    if "TEST_BACKWARD" in params and params["TEST_BACKWARD"]:
+        pytest.skip("Gluon backend doesn't support backward pass")
+
+    if "dtype" in params and params["dtype"] != torch.float16:
+        pytest.skip("Gluon backend only supports float16 dtype")
+
+
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -144,14 +171,14 @@ def test_mha(
                 "FP8 mode does not support dropout_p, return_lse, or return_attn_probs"
             )
 
-        triton_out = flash_attn_fp8_func(
+        triton_out = triton_flash_attn_fp8_func(
             q,
             k,
             v,
             causal=CAUSAL,
         )
     else:
-        triton_out = flash_attn_func(
+        triton_out = triton_flash_attn_func(
             q,
             k,
             v,
@@ -205,6 +232,7 @@ def test_mha(
 
 
 # LLaMA 3 405B config
+@pytest.mark.parametrize("IMPL", ["GLUON", "TRITON"])
 @pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -214,7 +242,9 @@ def test_mha(
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [True])
 @pytest.mark.parametrize("DROPOUT", [0.0])
+@pytest.mark.parametrize("TEST_BACKWARD", [True, False])
 def test_mha_int64_strides(
+    IMPL: str,
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -223,13 +253,27 @@ def test_mha_int64_strides(
     HEAD_SZ: int,
     CAUSAL: bool,
     DROPOUT: float,
+    TEST_BACKWARD: bool,
     dtype=torch.float16,
     device="cuda",
-    test_backward=True,
 ):
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
+    check_gluon_compatibility(
+        IMPL,
+        BATCH=BATCH,
+        SEQLEN_Q=SEQLEN_Q,
+        SEQLEN_K=SEQLEN_K,
+        NUM_Q_HEADS=NUM_Q_HEADS,
+        NUM_K_HEADS=NUM_K_HEADS,
+        HEAD_SZ=HEAD_SZ,
+        CAUSAL=CAUSAL,
+        DROPOUT=DROPOUT,
+        dtype=dtype,
+        TEST_BACKWARD=TEST_BACKWARD,
+    )
+
     torch.cuda.empty_cache()
     torch.manual_seed(20)
     # use int64 strides.
@@ -279,6 +323,11 @@ def test_mha_int64_strides(
         print("cu_seqlens_q:", cu_seqlens_q.shape, cu_seqlens_q.stride())
         print("cu_seqlens_k:", cu_seqlens_k.shape, cu_seqlens_k.stride())
 
+    if IMPL == "GLUON":
+        flash_attn_varlen_func = gluon_flash_attn_varlen_func
+    else:
+        flash_attn_varlen_func = triton_flash_attn_varlen_func
+
     triton_out, _ = flash_attn_varlen_func(
         q,
         k,
@@ -291,19 +340,20 @@ def test_mha_int64_strides(
         causal=CAUSAL,
         return_lse=True,
     )
-    if test_backward:
+    if TEST_BACKWARD:
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
             triton_out, (q, k, v), do.clone()
         )
 
     # NOTE: use fwd output to wait not exit program before kernel finishes
     print("triton_out:", triton_out)
-    if test_backward:
+    if TEST_BACKWARD:
         print("triton_dq:", triton_dq.shape, triton_dq.stride())
         print("triton_dk:", triton_dk.shape, triton_dk.stride())
         print("triton_dv:", triton_dv.shape, triton_dv.stride())
 
 
+@pytest.mark.parametrize("IMPL", ["GLUON", "TRITON"])
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -319,6 +369,7 @@ def test_mha_int64_strides(
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 @pytest.mark.parametrize("FP8", [(False), (True)])
 def test_mha_varlen(
+    IMPL: str,
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -332,6 +383,22 @@ def test_mha_varlen(
     FP8: bool,
     dtype=torch.float16,
 ):
+    check_gluon_compatibility(
+        IMPL,
+        BATCH=BATCH,
+        SEQLEN_Q=SEQLEN_Q,
+        SEQLEN_K=SEQLEN_K,
+        NUM_Q_HEADS=NUM_Q_HEADS,
+        NUM_K_HEADS=NUM_K_HEADS,
+        HEAD_SZ=HEAD_SZ,
+        DROPOUT=DROPOUT,
+        RETURN_LSE=RETURN_LSE,
+        RETURN_SOFTMAX=RETURN_SOFTMAX,
+        CAUSAL=CAUSAL,
+        FP8=FP8,
+        dtype=dtype,
+    )
+
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -384,7 +451,7 @@ def test_mha_varlen(
                 "FP8 varlen mode does not support dropout_p, return_lse, or return_attn_probs"
             )
 
-        triton_out = flash_attn_varlen_fp8_func(
+        triton_out = triton_flash_attn_varlen_fp8_func(
             q_unpad,
             k_unpad,
             v_unpad,
@@ -395,6 +462,10 @@ def test_mha_varlen(
             causal=CAUSAL,
         )
     else:
+        if IMPL == "GLUON":
+            flash_attn_varlen_func = gluon_flash_attn_varlen_func
+        else:
+            flash_attn_varlen_func = triton_flash_attn_varlen_func
         triton_out = flash_attn_varlen_func(
             q_unpad,
             k_unpad,
@@ -545,7 +616,7 @@ def test_mha_backward(
         if FP8:
             if DROPOUT > 0.0:
                 pytest.skip("FP8 does not support dropout_p")
-            triton_out = flash_attn_fp8_func(
+            triton_out = triton_flash_attn_fp8_func(
                 q,
                 k,
                 v,
@@ -553,7 +624,7 @@ def test_mha_backward(
             )
             lse, sd_mask = None, None
         else:
-            triton_out = flash_attn_func(
+            triton_out = triton_flash_attn_func(
                 q,
                 k,
                 v,
@@ -722,7 +793,7 @@ def test_mha_backward_varlen(
         print(f"do.shape={do.shape} do={do}")
 
     with torch.enable_grad():
-        triton_out = flash_attn_varlen_func(
+        triton_out = triton_flash_attn_varlen_func(
             q_unpad,
             k_unpad,
             v_unpad,
@@ -859,7 +930,7 @@ def test_mha_with_pe(
     )
 
     # Triton
-    triton_out = flash_attn_func(
+    triton_out = triton_flash_attn_func(
         q,
         k,
         v,
@@ -889,6 +960,7 @@ def test_mha_with_pe(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("IMPL", ["GLUON", "TRITON"])
 @pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -899,6 +971,7 @@ def test_mha_with_pe(
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_varlen_with_pe(
+    IMPL: int,
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -909,6 +982,19 @@ def test_mha_varlen_with_pe(
     DROPOUT: float,
     CAUSAL: bool,
 ):
+    check_gluon_compatibility(
+        IMPL,
+        BATCH=BATCH,
+        SEQLEN_Q=SEQLEN_Q,
+        SEQLEN_K=SEQLEN_K,
+        NUM_Q_HEADS=NUM_Q_HEADS,
+        NUM_K_HEADS=NUM_K_HEADS,
+        HEAD_SZ_QK=HEAD_SZ_QK,
+        HEAD_SZ_V=HEAD_SZ_V,
+        DROPOUT=DROPOUT,
+        CAUSAL=CAUSAL,
+    )
+
     HAS_DROPOUT: bool = DROPOUT > 0.0
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
@@ -950,6 +1036,10 @@ def test_mha_varlen_with_pe(
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
 
     # Triton
+    if IMPL == "GLUON":
+        flash_attn_varlen_func = gluon_flash_attn_varlen_func
+    else:
+        flash_attn_varlen_func = triton_flash_attn_varlen_func
     triton_out = flash_attn_varlen_func(
         q_unpad,
         k_unpad,
@@ -1062,7 +1152,7 @@ def test_mha_backward_with_pe(
 
     # Triton forward
     with torch.enable_grad():
-        triton_out = flash_attn_func(
+        triton_out = triton_flash_attn_func(
             q,
             k,
             v,
@@ -1211,7 +1301,7 @@ def test_mha_backward_varlen_with_pe(
 
     # Triton forward
     with torch.enable_grad():
-        triton_out = flash_attn_varlen_func(
+        triton_out = triton_flash_attn_varlen_func(
             q_unpad,
             k_unpad,
             v_unpad,
@@ -1359,7 +1449,7 @@ def test_mha_with_sink(
 
     # Triton forward
     with torch.set_grad_enabled(TEST_BWD):
-        triton_out = flash_attn_func(
+        triton_out = triton_flash_attn_func(
             q,
             k,
             v,
@@ -1524,7 +1614,7 @@ def test_mha_varlen_with_sink(
 
     # Triton forward
     with torch.set_grad_enabled(TEST_BWD):
-        triton_out = flash_attn_varlen_func(
+        triton_out = triton_flash_attn_varlen_func(
             q_unpad,
             k_unpad,
             v_unpad,

@@ -5,13 +5,20 @@ import argparse
 import itertools
 import triton
 from aiter.ops.triton.mha import (
-    flash_attn_func,
-    flash_attn_varlen_func,
+    flash_attn_func as triton_flash_attn_func,
+    flash_attn_varlen_func as triton_flash_attn_varlen_func,
+    mha_set_use_fused_bwd_kernel,
+)
+from aiter.ops.triton.gluon.mha import (
+    flash_attn_func as gluon_flash_attn_func,
+    flash_attn_fp8_func as gluon_flash_attn_fp8_func,
+    flash_attn_varlen_func as gluon_flash_attn_varlen_func,
+    flash_attn_varlen_fp8_func as gluon_flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.mha_v3 import (
-    flash_attn_fp8_func,
-    flash_attn_varlen_fp8_func,
+    flash_attn_fp8_func as triton_flash_attn_fp8_func,
+    flash_attn_varlen_fp8_func as triton_flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
     generate_random_padding_mask,
@@ -47,6 +54,18 @@ def varlen_benchmark_configs():
     configs = [
         (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
         for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
+    ]
+    return configs
+
+
+def seq_length_benchmark_configs(args):
+    batch_sizes = [args.b if args.b else 1]
+    N_HEADS = [(args.hq if args.hq else 1, args.hk if args.hk else 1)]
+    seq_lens = [1, 32, 64, 128, 192, 256, 320, 512, 1024, 2048, 4096, 8192, 16384]
+    configs = list(itertools.product(batch_sizes, N_HEADS, seq_lens))
+    configs = [
+        (batch_size, N_HEAD_Q, N_HEAD_K, seq_len, seq_len)
+        for batch_size, (N_HEAD_Q, N_HEAD_K), seq_len in configs
     ]
     return configs
 
@@ -135,7 +154,9 @@ def create_benchmark_configs(custom, args):
     if custom:
         x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
     else:
-        if varlen:
+        if args.bench_seq_length:
+            x_vals_list = seq_length_benchmark_configs(args)
+        elif varlen:
             x_vals_list = varlen_benchmark_configs()  # Assume this exists
         else:
             x_vals_list = nonvarlen_benchmark_configs()  # Assume this exists
@@ -455,6 +476,10 @@ def run_benchmark(custom, args):
         # Benchmark mode
         if varlen:
             if args.fp8:
+                if args.gluon:
+                    flash_attn_varlen_fp8_func = gluon_flash_attn_varlen_fp8_func
+                else:
+                    flash_attn_varlen_fp8_func = triton_flash_attn_varlen_fp8_func
 
                 def fn():
                     return flash_attn_varlen_fp8_func(
@@ -470,6 +495,10 @@ def run_benchmark(custom, args):
                     )
 
             else:
+                if args.gluon:
+                    flash_attn_varlen_func = gluon_flash_attn_varlen_func
+                else:
+                    flash_attn_varlen_func = triton_flash_attn_varlen_func
 
                 def fn():
                     return flash_attn_varlen_func(
@@ -490,6 +519,10 @@ def run_benchmark(custom, args):
 
         else:
             if args.fp8:
+                if args.gluon:
+                    flash_attn_fp8_func = gluon_flash_attn_fp8_func
+                else:
+                    flash_attn_fp8_func = triton_flash_attn_fp8_func
 
                 def fn():
                     return flash_attn_fp8_func(
@@ -501,6 +534,10 @@ def run_benchmark(custom, args):
                     )
 
             else:
+                if args.gluon:
+                    flash_attn_func = gluon_flash_attn_func
+                else:
+                    flash_attn_func = triton_flash_attn_func
 
                 def fn():
                     return flash_attn_func(
@@ -649,6 +686,22 @@ def parse_args():
         "-o", action="store_true", help="Write performance results to CSV file"
     )
     parser.add_argument(
+        "-gluon",
+        action="store_true",
+        help="Use Gluon implementation (experimental, requires latest Triton from main). Currently limited to the following config: \n"
+        + "-layout = thd \n"
+        + "-mode = fwd \n"
+        + "-fp8 = False \n"
+        + "-causal = True or False \n"
+        + "-dtype = fp16",
+    )
+    parser.add_argument(
+        "-bench_seq_length",
+        action="store_true",
+        default=False,
+        help="Benchmark over a range of sequence lengths (sq == sk).",
+    )
+    parser.add_argument(
         "-sink", action="store_true", default=False, help="use attention sink"
     )
     return parser.parse_args()
@@ -661,8 +714,25 @@ arg_to_torch_dtype = {
 }
 
 
+def validate_gluon_params(args):
+    if args.gluon:
+        if args.layout is not None:
+            assert args.layout == "thd", "Gluon MHA only supports thd layout."
+
+        assert args.mode == "fwd", "Gluon MHA only supports forward mode."
+
+        assert not args.fp8, "Gluon MHA does not support FP8."
+
+        assert args.dtype == "fp16", "Gluon MHA only supports fp16 data type."
+
+        assert not args.model, "Gluon MHA currently does not support model configs."
+
+
 def main():
     args = parse_args()
+
+    if args.gluon:
+        validate_gluon_params(args)
 
     if args.model:
         if args.causal is None:  # User didn't specify -causal
@@ -684,7 +754,7 @@ def main():
     assert (
         args.layout == "thd" or not args.equal_seqlens or args.model
     ), "Equal sequence lengths arg must be used with the thd layout or a model config."
-    if args.hq or args.hk or args.d or args.dv:
+    if not args.bench_seq_length and (args.hq or args.hk or args.d or args.dv):
         custom_config = True
         if not args.dv:
             args.dv = args.d
