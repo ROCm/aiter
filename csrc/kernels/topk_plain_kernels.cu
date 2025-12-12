@@ -43,6 +43,7 @@
 #include "opus/opus.hpp"
 #include "py_itfs_common.h"
 #include "quick_all_reduce_base.h"
+#include "topk_per_row.h"
 
 #define HIP_CHECK(val)                                \
     {                                                 \
