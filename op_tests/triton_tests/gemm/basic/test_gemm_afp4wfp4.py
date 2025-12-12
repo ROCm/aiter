@@ -3,7 +3,7 @@
 import pytest
 import os
 import torch
-from aiter.ops.triton.gemm_afp4wfp4 import (
+from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffle,
 )

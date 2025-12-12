@@ -6,7 +6,7 @@ from typing import Optional
 import pytest
 import torch
 
-from aiter.ops.triton.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]

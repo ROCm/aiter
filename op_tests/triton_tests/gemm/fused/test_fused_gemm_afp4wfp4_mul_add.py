@@ -3,7 +3,7 @@
 import pytest
 import os
 import torch
-from aiter.ops.triton.fused_gemm_afp4wfp4_mul_add import (
+from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     fused_gemm_afp4wfp4_mul_add,
     fused_gemm_afp4wfp4_preshuffle_add_mul,
 )

@@ -6,7 +6,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.mla_decode_rope import decode_attention_fwd_grouped_rope
+from aiter.ops.triton.attention.mla_decode_rope import decode_attention_fwd_grouped_rope
 import torch
 import argparse
 from aiter.ops.triton.utils.types import str_to_torch_dtype

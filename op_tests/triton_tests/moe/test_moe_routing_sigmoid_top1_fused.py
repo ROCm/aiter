@@ -5,7 +5,7 @@ from functools import partial
 
 import pytest
 import torch
-from aiter.ops.triton.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1
+from aiter.ops.triton.moe.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1
 
 
 def torch_routing_sigmoid_top1(

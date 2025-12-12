@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import fused_gemm_afp4wfp4_split_cat
+from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import fused_gemm_afp4wfp4_split_cat
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     mxfp4_to_f32,
     e8m0_to_f32,

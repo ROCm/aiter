@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import pytest
-from aiter.ops.triton.gemm_a16w16_gated import gemm_a16w16_gated
+from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import get_x_vals
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 

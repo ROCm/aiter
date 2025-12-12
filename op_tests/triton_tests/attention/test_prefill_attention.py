@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.prefill_attention import context_attention_fwd as prefill_triton
+from aiter.ops.triton.attention.prefill_attention import context_attention_fwd as prefill_triton
 
 
 def input_helper(BATCH, SEQLEN, H, HEAD_DIM, dtype, absorb=False):

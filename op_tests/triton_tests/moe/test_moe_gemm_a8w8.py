@@ -12,14 +12,14 @@ import triton
 from aiter.ops.triton.moe_routing.routing import routing
 
 # matmul utilities
-from aiter.ops.triton.moe_op_gemm_a8w8 import (
+from aiter.ops.triton.moe.moe_op_gemm_a8w8 import (
     moe_gemm_a8w8,
     moe_gemm_torch,
     swizzle_scales,
 )
 
 # numerics utilities
-from aiter.ops.triton.quant_moe import (
+from aiter.ops.triton.moe.quant_moe import (
     downcast_to_static_fp8,
     downcast_to_static_fp8_3d,
     downcast_to_mxfp,

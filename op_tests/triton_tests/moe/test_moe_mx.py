@@ -4,8 +4,8 @@
 import pytest
 import torch
 
-from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
-from aiter.ops.triton.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
+from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
+from aiter.ops.triton.moe.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from op_tests.triton_tests.moe.test_moe import (
     torch_moe_ref,
