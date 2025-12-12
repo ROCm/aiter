@@ -116,7 +116,7 @@ logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str, default="THUDM/CogVideoX-2b", help='Model path')
 parser.add_argument('--compile', action='store_true', help='Compile the model')
-parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sage', 'fa3', 'fa3_fp8', 'sagev1_fa3'], help='Attention type')
+parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sage', 'fa3', 'fa3_fp8', 'sagev1_fa3', 'fa2'], help='Attention type')
 parser.add_argument('--save_inputs', action='store_true', help='Save attention inputs for later benchmarking')
 parser.add_argument('--input_dir', type=str, default='./captured_inputs', help='Directory to save captured inputs')
 parser.add_argument('--max_captures', type=int, default=10, help='Maximum number of inputs to save (use 0 for unlimited)')
@@ -219,6 +219,33 @@ elif args.attention_type == 'sagev1_fa3':
         F.scaled_dot_product_attention = _capture_wrapper
     else:
         F.scaled_dot_product_attention = sagev1_fa3_wrapper
+elif args.attention_type == 'fa2':
+    from aiter.ops.triton.mha import flash_attn_func as _fa2
+
+    # Wrapper to convert BHSD to BSHD
+    # scaled_dot_product_attention: (batch, heads, seqlen, dim)
+    # flash_attn_func: (batch, seqlen, heads, dim)
+    def fa2_wrapper(query, key, value, is_causal=False, softmax_scale=None, **kwargs: Any):
+        original_dtype = query.dtype
+        
+        # Transpose from BHSD to BSHD
+        q = query.transpose(1, 2).contiguous()
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+        
+        # Call flash attention
+        out = _fa2(q, k, v, dropout_p=0.0, softmax_scale=softmax_scale, causal=is_causal)
+        
+        # Transpose back from BSHD to BHSD
+        return out.transpose(1, 2).to(original_dtype)
+    
+    if args.save_inputs:
+        # 0 means unlimited
+        max_caps = args.max_captures if args.max_captures > 0 else None
+        _capture_wrapper = InputCaptureWrapper(fa2_wrapper, args.input_dir, name="fa2", max_captures=max_caps)
+        F.scaled_dot_product_attention = _capture_wrapper
+    else:
+        F.scaled_dot_product_attention = fa2_wrapper
 else:
     raise ValueError(f"Attention type {args.attention_type} not supported")
 
