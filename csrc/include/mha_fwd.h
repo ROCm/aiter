@@ -56,7 +56,8 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                              bool has_lse,
                              bool has_dropout,
                              bool skip_min_seqlen_q,
-                             bool is_sglang_layout)
+                             bool is_sglang_layout,
+                             int page_size)
         : fmha_batch_prefill_traits{head_size_q,
                                     head_size_v,
                                     dtype,
@@ -69,7 +70,8 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                                     has_dropout,
                                     quant_scale_enum::no_scale, // qscale_type
                                     skip_min_seqlen_q,
-                                    is_sglang_layout}
+                                    is_sglang_layout,
+                                    page_size}
     {
     }
 };
@@ -114,7 +116,7 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      int how_v3_bf16_cvt                = 1,
                                                      const void* seqstart_q_padding_ptr = nullptr,
                                                      const void* seqstart_k_padding_ptr = nullptr,
-                                                     bool is_v3_api_check = false);
+                                                     bool is_v3_api_check               = false);
 
 __attribute__((visibility("default"))) float
 mha_fwd_splitkv(mha_fwd_splitkv_args args,
@@ -250,7 +252,7 @@ float fmha_fwd_v3(mha_fwd_traits t,
                   const ck_tile::stream_config& s,
                   const void* seqstart_q_padding_ptr = nullptr,
                   const void* seqstart_k_padding_ptr = nullptr,
-                  bool is_v3_api_check = false);
+                  bool is_v3_api_check               = false);
 }
 
 namespace gfx950 {
@@ -259,6 +261,6 @@ float fmha_fwd_v3(mha_fwd_traits t,
                   const ck_tile::stream_config& s,
                   const void* seqstart_q_padding_ptr = nullptr,
                   const void* seqstart_k_padding_ptr = nullptr,
-                  bool is_v3_api_check = false);
+                  bool is_v3_api_check               = false);
 }
 } // namespace aiter
