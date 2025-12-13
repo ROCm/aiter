@@ -100,7 +100,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    void* kv_last_page_lens_ptr     = nullptr;
+    void* kv_last_page_lens_ptr = nullptr;
     if(kv_last_page_lens_.has_value())
     {
         auto kv_last_page_lens = kv_last_page_lens_.value();
@@ -169,9 +169,9 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
 }
 
 std::vector<at::Tensor>
-mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_num, page_size, hq, d]
-                  const at::Tensor& k,            // [total_k, hk, d] or [page_num, page_size, hk, d]
-                  const at::Tensor& v,            // [total_k, hk, d] or [page_num, page_size, hk, d]
+mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d] or [page_num, page_size, hq, d]
+                  const at::Tensor& k, // [total_k, hk, d] or [page_num, page_size, hk, d]
+                  const at::Tensor& v, // [total_k, hk, d] or [page_num, page_size, hk, d]
                   const at::Tensor& cu_seqlens_q, // [b+1]
                   const at::Tensor& kv_indptr,    // [b+1]
                   const at::Tensor& kv_page_indices,
@@ -229,9 +229,9 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
     const int head_size_v = v.size(-1);
     const int num_heads_k = k.size(-2);
 
-    const int num_blocks = k.size(0);
+    const int num_blocks      = k.size(0);
     const int page_block_size = k.dim() == 3 ? 1 : k.size(1);
-    
+
     if(max_seqlen_q == 1 && !alibi_slopes_.has_value())
     {
         is_causal = false;

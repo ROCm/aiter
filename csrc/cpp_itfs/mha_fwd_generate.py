@@ -69,6 +69,7 @@ mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
                                   bool has_lse,
                                   bool has_dropout,
                                   bool is_sglang_layout,
+                                  int page_size,
                                   bool skip_min_seqlen_q = false)
 {{
     return mha_batch_prefill_traits(head_size_q,
@@ -81,7 +82,8 @@ mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
                           has_lse,
                           has_dropout,
                           skip_min_seqlen_q,
-                          is_sglang_layout);
+                          is_sglang_layout,
+                          page_size);
 }}
 
 mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
@@ -195,7 +197,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
-                                     is_sglang_layout);
+                                     is_sglang_layout,
+                                     args.page_block_size);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 

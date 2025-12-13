@@ -6,7 +6,6 @@ import math
 import os
 import pytest
 import torch
-import numpy as np
 
 
 import aiter
@@ -273,6 +272,7 @@ def test_batch_prefill_with_paged_kv_cache(
         o_i = o_ck_flash_attn[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         torch.testing.assert_close(o_i, o_ref_i, rtol=rtol, atol=atol)
 
+
 l_causal = [False, True]
 l_logits_soft_cap = [0.0, 30.0]
 l_dtype = ["fp16", "bf16"]
@@ -312,7 +312,42 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
-
+parser.add_argument(
+    "-s",
+    "--seqlen",
+    type=int,
+    const=None,
+    default=1024,
+    help="""seqlen.
+    e.g.: -s 1024""",
+)
+parser.add_argument(
+    "-p",
+    "--pagesize",
+    type=int,
+    const=None,
+    default=16,
+    help="""page size.
+    e.g.: -p 16""",
+)
+parser.add_argument(
+    "-q",
+    "--headq",
+    type=int,
+    const=None,
+    default=8,
+    help="""number of q head.
+    e.g.: -h 8""",
+)
+parser.add_argument(
+    "-k",
+    "--headk",
+    type=int,
+    const=None,
+    default=8,
+    help="""number of kv head.
+    e.g.: -h_k 8""",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
     if args.dtype is None:
@@ -329,13 +364,14 @@ if __name__ == "__main__":
         logits_soft_cap,
         dtype,
     ) in itertools.product(l_causal, l_logits_soft_cap, l_dtype):
+        print(f"causal={causal}, logits_soft_cap={logits_soft_cap}, dtype={dtype}")
         test_batch_prefill_with_paged_kv_cache(
             batch_size=1,
-            kv_len=32,
-            qo_len=16,
-            page_size=16,
-            num_qo_heads=6,
-            num_kv_heads=1,
+            kv_len=args.seqlen,
+            qo_len=args.seqlen,
+            page_size=args.pagesize,
+            num_qo_heads=args.headq,
+            num_kv_heads=args.headk,
             head_dim=128,
             causal=causal,
             kv_layout="NHD",
