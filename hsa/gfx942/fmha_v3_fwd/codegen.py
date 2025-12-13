@@ -232,10 +232,11 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a)
     args.s_o_Bs = a.batch_stride_o * 2;
 
     args.s_lse_Hs = a.nhead_stride_lse * 4;
-    args.ptr_qseq = a.seqstart_q_ptr;
-    args.ptr_kseq = a.seqstart_k_ptr;
-    args.ptr_qseq_padding = a.cu_seqlen_q_ptr == nullptr ? a.seqstart_q_ptr : a.cu_seqlen_q_ptr;
-    args.ptr_kseq_padding = a.cu_seqlen_k_ptr == nullptr ? a.seqstart_k_ptr : a.cu_seqlen_k_ptr;
+    // batch mode does not support padded
+    args.ptr_qseq = nullptr;
+    args.ptr_kseq = nullptr;
+    args.ptr_qseq_padding = nullptr;
+    args.ptr_kseq_padding = nullptr;
 
     auto traits = fmha_fwd_v3_traits{a.batch,
                                      a.nhead_q,
