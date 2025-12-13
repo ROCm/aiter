@@ -13,9 +13,6 @@ from aiter.ops.triton._triton_kernels.fused_gemm_afp4wfp4_mul_add import (
     _fused_gemm_afp4wfp4_mul_add_reduce_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
-    _gemm_afp4wfp4_reduce_kernel,
-)
 from .utils.core import AITER_TRITON_CONFIGS_PATH
 
 import os
@@ -101,7 +98,7 @@ def fused_gemm_afp4wfp4_mul_add(
     """
 
     _LOGGER.info(
-        f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
+        f"FUSED_GEMM_AFPWFP4_MUL_ADD: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
     if isinstance(a, float) or isinstance(a, int):
