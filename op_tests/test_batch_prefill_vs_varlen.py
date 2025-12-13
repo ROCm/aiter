@@ -206,6 +206,12 @@ def test_batch_prefill_vs_varlen_bf16(
     print(f"Max diff: {max_diff:.6e}")
     print(f"Mean diff: {mean_diff:.6e}")
 
+    # IMPORTANT: Check that outputs are not all zeros (which would indicate kernel didn't run)
+    print(f"Varlen output max: {out_varlen.abs().max().item():.6e}")
+    print(f"Batch_prefill output max: {out_batch_prefill.abs().max().item():.6e}")
+    assert out_varlen.abs().max().item() > 1e-6, "Varlen output is all zeros - kernel may not have launched!"
+    assert out_batch_prefill.abs().max().item() > 1e-6, "Batch_prefill output is all zeros - kernel may not have launched!"
+
     if out_varlen.abs().max().item() > 0:
         rel_error = max_diff / out_varlen.abs().max().item()
         print(f"Relative error: {rel_error * 100:.4f}%")
@@ -293,6 +299,7 @@ def test_batch_prefill_vs_varlen_fp8(
         max_seqlen_k=kv_lens.max().item(),
         min_seqlen_q=0,
         causal=causal,
+        logits_soft_cap=logits_soft_cap,
         window_size=(-1, -1),
     )
 
@@ -336,6 +343,12 @@ def test_batch_prefill_vs_varlen_fp8(
 
     print(f"Max diff: {max_diff:.6e}")
     print(f"Mean diff: {mean_diff:.6e}")
+
+    # IMPORTANT: Check that outputs are not all zeros (which would indicate kernel didn't run)
+    print(f"Varlen output max: {out_varlen.abs().max().item():.6e}")
+    print(f"Batch_prefill output max: {out_batch_prefill.abs().max().item():.6e}")
+    assert out_varlen.abs().max().item() > 1e-6, "Varlen output is all zeros - kernel may not have launched!"
+    assert out_batch_prefill.abs().max().item() > 1e-6, "Batch_prefill output is all zeros - kernel may not have launched!"
 
     if out_varlen.abs().max().item() > 0:
         rel_error = max_diff / out_varlen.abs().max().item()
