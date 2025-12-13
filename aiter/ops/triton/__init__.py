@@ -111,10 +111,7 @@ _BACKWARD_COMPAT_MAP = {
     # Rope modules (rope/)
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",
     "rope": "rope.rope",
-    # Gluon modules (gluon/)
-    "gemm_a8w8_blockscale": "gluon.gemm_a8w8_blockscale",
-    "pa_decode_gluon": "gluon.pa_decode_gluon",
-    "pa_mqa_logits": "gluon.pa_mqa_logits",
+
     # Utils modules (utils/)
     "common_utils": "utils.common_utils",
     "core": "utils.core",
@@ -126,8 +123,16 @@ _BACKWARD_COMPAT_MAP = {
     "moe_common": "utils.moe_common",
     "moe_config_utils": "utils.moe_config_utils",
     "types": "utils.types",
-    # MOE routing submodule (backward compat for moe_routing)
+    # MOE routing submodule (backward compat)
     "moe_routing": "moe.moe_routing",
+    # Quant submodules (backward compat)
+    "fused_fp8_quant": "quant.fused_fp8_quant",
+    "fused_mxfp4_quant": "quant.fused_mxfp4_quant",
+    # Top level modules
+    "activation": "activation",
+    "gmm": "gmm",
+    "softmax": "softmax",
+    "topk": "topk",
 }
 
 
