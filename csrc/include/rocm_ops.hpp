@@ -828,7 +828,9 @@ namespace py = pybind11;
           py::arg("block_m")        = 32,           \
           py::arg("sorted_weights") = std::nullopt, \
           py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0);               \
+          py::arg("activation")     = 0,            \
+          py::arg("splitk")         = 1,            \
+          py::arg("dst_type")       = std::nullopt);\
                                                     \
     m.def("ck_moe_stage2",                          \
           &ck_moe_stage2,                           \
@@ -846,7 +848,9 @@ namespace py = pybind11;
           py::arg("block_m")        = 32,           \
           py::arg("sorted_weights") = std::nullopt, \
           py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0);
+          py::arg("activation")     = 0,            \
+          py::arg("splitk")         = 1,            \
+          py::arg("dst_type")       = std::nullopt);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \
