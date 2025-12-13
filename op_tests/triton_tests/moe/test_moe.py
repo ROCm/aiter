@@ -5,19 +5,19 @@ import torch
 import pytest
 from typing import Dict
 
-from aiter.ops.triton.moe_op import (
+from aiter.ops.triton.moe.moe_op import (
     fused_moe as triton_moe,
     moe_set_use_persistent_kernel as triton_moe_set_use_persistent_kernel,
 )
-from aiter.ops.triton.moe_op_e2e import (
+from aiter.ops.triton.moe.moe_op_e2e import (
     e2e_moe as triton_e2e_moe,
     moe_set_use_persistent_kernel as triton_e2e_moe_set_use_persistent_kernel,
 )
-from aiter.ops.triton.moe_op_silu_fused import (
+from aiter.ops.triton.moe.moe_op_silu_fused import (
     fused_moe_silu as triton_moe_silu,
     moe_set_use_persistent_kernel as triton_moe_silu_set_use_persistent_kernel,
 )
-from aiter.ops.triton.moe_op_gelu import (
+from aiter.ops.triton.moe.moe_op_gelu import (
     fused_moe_gelu as triton_moe_gelu,
     moe_set_use_persistent_kernel as triton_moe_gelu_set_use_persistent_kernel,
 )
