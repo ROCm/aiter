@@ -10,11 +10,7 @@ from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-
-
 block_shape = (128, 128)
-DEVICE_ARCH = arch_info.get_device()
 
 
 def run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
