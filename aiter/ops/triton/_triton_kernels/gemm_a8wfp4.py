@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
-import json
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
 
 
@@ -265,32 +261,14 @@ def _gemm_afp4_wfp4_reduce_kernel(
     tl.store(c_out_ptrs, c)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8WFP4.json"
+    from ..utils.gemm_config_utils import get_gemm_config
 
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
-
-    if M < 32:
-        config = _get_config._config_dict["M_LT_32"]
-    elif M == 32:
-        config = _get_config._config_dict["M_EQ_32"]
-    elif M <= 64:
-        config = _get_config._config_dict["M_33_64"]
-    elif M <= 128:
-        config = _get_config._config_dict["M_65_128"]
-    elif M <= 256:
-        config = _get_config._config_dict["M_129_256"]
-    else:
-        config = _get_config._config_dict["default"]
+    config = get_gemm_config("GEMM-A8WFP4", M, N, K)
 
     if M <= 128:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = _get_splitk(
@@ -299,7 +277,6 @@ def _get_config(
         config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
-
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
 
