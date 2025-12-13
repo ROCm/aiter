@@ -63,7 +63,7 @@ def get_gemm_config(
         Dictionary with the config params
     """
     # Input validation
-    assert M > 0, "M must be positive."
+    assert M >= 0, "M must be positive."
     assert N is None or N > 0, "N must be positive when provided."
     assert K is None or K > 0, "K must be positive when provided."
     assert bounds is None or (
