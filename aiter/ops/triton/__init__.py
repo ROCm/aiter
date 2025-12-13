@@ -104,6 +104,7 @@ _BACKWARD_COMPAT_MAP = {
     "moe_op": "moe.moe_op",
     "moe_routing_sigmoid_top1_fused": "moe.moe_routing_sigmoid_top1_fused",
     "quant_moe": "moe.quant_moe",
+    "moe_routing": "moe.moe_routing",
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
     "norm": "normalization.norm",
@@ -111,7 +112,6 @@ _BACKWARD_COMPAT_MAP = {
     # Rope modules (rope/)
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",
     "rope": "rope.rope",
-
     # Utils modules (utils/)
     "common_utils": "utils.common_utils",
     "core": "utils.core",
@@ -123,12 +123,9 @@ _BACKWARD_COMPAT_MAP = {
     "moe_common": "utils.moe_common",
     "moe_config_utils": "utils.moe_config_utils",
     "types": "utils.types",
-    # MOE routing submodule (backward compat)
-    "moe_routing": "moe.moe_routing",
-    # Quant submodules (backward compat)
+    # Quant modules (quant/)
     "fused_fp8_quant": "quant.fused_fp8_quant",
     "fused_mxfp4_quant": "quant.fused_mxfp4_quant",
-    # Top level modules
     "activation": "activation",
     "gmm": "gmm",
     "softmax": "softmax",
