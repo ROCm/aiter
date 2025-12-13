@@ -2,7 +2,7 @@ import math
 import torch
 import triton
 from dataclasses import dataclass, field
-from aiter.ops.triton._triton_kernels.moe_routing.routing import (
+from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
