@@ -53,18 +53,21 @@ def varlen_to_paged_kv(k_varlen, v_varlen, kv_lens, page_size=1):
 
     # Create paged KV cache
     kv_data = torch.zeros(
-        total_num_pages, 2, num_kv_heads, page_size, head_dim,
-        dtype=dtype, device=device
+        total_num_pages,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=dtype,
+        device=device,
     )
 
     # Create page indices (identity mapping for simplicity)
-    kv_indices = torch.arange(total_num_pages, dtype=torch.int32, device='cpu')
+    kv_indices = torch.arange(total_num_pages, dtype=torch.int32, device="cpu")
     kv_indices = torch.nn.functional.pad(kv_indices, (0, 128), value=0)
 
     # Fill in the data
-    kv_indptr = convert_lens_to_indptr(
-        ((kv_lens + page_size - 1) // page_size).cpu()
-    )
+    kv_indptr = convert_lens_to_indptr(((kv_lens + page_size - 1) // page_size).cpu())
     cu_kv_lens = convert_lens_to_indptr(kv_lens.cpu())
 
     for batch_idx in range(batch_size):
@@ -83,12 +86,14 @@ def varlen_to_paged_kv(k_varlen, v_varlen, kv_lens, page_size=1):
             tokens_in_page = token_end - token_start
 
             # K data
-            kv_data[global_page_idx, 0, :, :tokens_in_page, :] = \
-                k_varlen[seq_start + token_start:seq_start + token_end, :, :]
+            kv_data[global_page_idx, 0, :, :tokens_in_page, :] = k_varlen[
+                seq_start + token_start : seq_start + token_end, :, :
+            ]
 
             # V data
-            kv_data[global_page_idx, 1, :, :tokens_in_page, :] = \
-                v_varlen[seq_start + token_start:seq_start + token_end, :, :]
+            kv_data[global_page_idx, 1, :, :tokens_in_page, :] = v_varlen[
+                seq_start + token_start : seq_start + token_end, :, :
+            ]
 
     return kv_data, kv_indptr, kv_indices
 
@@ -96,7 +101,15 @@ def varlen_to_paged_kv(k_varlen, v_varlen, kv_lens, page_size=1):
 @pytest.mark.parametrize("batch_size", [1, 3])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (8, 1)])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("qo_len,kv_len", [(128, 128), (1024, 1024)])
+@pytest.mark.parametrize(
+    "qo_len,kv_len",
+    [
+        (128, 128),
+        (1024, 1024),
+        (2048, 2048),
+        (4096, 4096),
+    ],
+)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -145,8 +158,11 @@ def test_batch_prefill_vs_varlen_bf16(
 
     # Run flash_attn_varlen
     out_varlen = aiter.flash_attn_varlen_func(
-        q, k, v,
-        cu_seqlens_q, cu_seqlens_k,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
         max_seqlen_q=qo_lens.max().item(),
         max_seqlen_k=kv_lens.max().item(),
         causal=causal,
@@ -177,8 +193,10 @@ def test_batch_prefill_vs_varlen_bf16(
 
     # Compare results
     print(f"\n=== BF16 Comparison ===")
-    print(f"batch_size={batch_size}, heads={num_qo_heads}/{num_kv_heads}, "
-          f"dim={head_dim}, qo_len={qo_len}, kv_len={kv_len}")
+    print(
+        f"batch_size={batch_size}, heads={num_qo_heads}/{num_kv_heads}, "
+        f"dim={head_dim}, qo_len={qo_len}, kv_len={kv_len}"
+    )
     print(f"causal={causal}, logits_soft_cap={logits_soft_cap}")
 
     diff = (out_varlen - out_batch_prefill).abs()
@@ -197,10 +215,18 @@ def test_batch_prefill_vs_varlen_bf16(
     torch.testing.assert_close(out_batch_prefill, out_varlen, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1)])
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (8, 1)])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("qo_len,kv_len", [(128, 128), (1024, 1024)])
+@pytest.mark.parametrize(
+    "qo_len,kv_len",
+    [
+        (128, 128),
+        (1024, 1024),
+        (2048, 2048),
+        (4096, 4096),
+    ],
+)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 def test_batch_prefill_vs_varlen_fp8(
@@ -255,9 +281,14 @@ def test_batch_prefill_vs_varlen_fp8(
 
     # Run flash_attn_varlen FP8
     out_varlen = aiter.flash_attn_varlen_fp8_pertensor_func(
-        q_fp8, k_fp8, v_fp8,
-        q_descale, k_descale, v_descale,
-        cu_seqlens_q, cu_seqlens_k,
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_descale,
+        k_descale,
+        v_descale,
+        cu_seqlens_q,
+        cu_seqlens_k,
         max_seqlen_q=qo_lens.max().item(),
         max_seqlen_k=kv_lens.max().item(),
         min_seqlen_q=0,
@@ -266,7 +297,9 @@ def test_batch_prefill_vs_varlen_fp8(
     )
 
     # Convert to paged KV cache format
-    kv_data, kv_indptr, kv_indices = varlen_to_paged_kv(k_fp8, v_fp8, kv_lens, page_size=1)
+    kv_data, kv_indptr, kv_indices = varlen_to_paged_kv(
+        k_fp8, v_fp8, kv_lens, page_size=1
+    )
 
     # Extract K and V from paged format
     k_paged = kv_data[:, 0, :, :, :].squeeze(2)
@@ -291,8 +324,10 @@ def test_batch_prefill_vs_varlen_fp8(
 
     # Compare results
     print(f"\n=== FP8 Comparison ===")
-    print(f"batch_size={batch_size}, heads={num_qo_heads}/{num_kv_heads}, "
-          f"dim={head_dim}, qo_len={qo_len}, kv_len={kv_len}")
+    print(
+        f"batch_size={batch_size}, heads={num_qo_heads}/{num_kv_heads}, "
+        f"dim={head_dim}, qo_len={qo_len}, kv_len={kv_len}"
+    )
     print(f"causal={causal}, logits_soft_cap={logits_soft_cap}")
 
     diff = (out_varlen - out_batch_prefill).abs()
