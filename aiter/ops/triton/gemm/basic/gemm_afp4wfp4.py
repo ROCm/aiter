@@ -14,7 +14,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_reduce_kernel,
     _get_config,
 )
-from .utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 import os
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext

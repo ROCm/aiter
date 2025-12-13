@@ -126,6 +126,8 @@ _BACKWARD_COMPAT_MAP = {
     "moe_common": "utils.moe_common",
     "moe_config_utils": "utils.moe_config_utils",
     "types": "utils.types",
+    # MOE routing submodule (backward compat for moe_routing)
+    "moe_routing": "moe.moe_routing",
 }
 
 

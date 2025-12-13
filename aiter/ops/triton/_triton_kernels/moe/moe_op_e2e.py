@@ -4,7 +4,7 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # Source:
