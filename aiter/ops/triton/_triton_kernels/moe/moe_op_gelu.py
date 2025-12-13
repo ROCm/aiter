@@ -6,9 +6,9 @@ import triton.language as tl
 
 
 from .activation import _gelu_tanh
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from ..utils._triton.moe_common import _write_zeros_to_output
-from ..utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 # Source:

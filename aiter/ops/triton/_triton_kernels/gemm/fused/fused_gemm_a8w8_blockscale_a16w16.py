@@ -8,9 +8,9 @@ import os
 import torch
 import triton
 import triton.language as tl
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.heuristics(

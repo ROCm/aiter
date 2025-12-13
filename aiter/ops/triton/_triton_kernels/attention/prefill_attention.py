@@ -24,7 +24,7 @@ It supporst page size = 1.
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 import triton
 import triton.language as tl
-from ..utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 _fwd_kernel_repr = make_kernel_repr(

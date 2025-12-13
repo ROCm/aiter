@@ -9,9 +9,9 @@ import torch
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from ...quant.quant import _mxfp4_quant_op
 
 
