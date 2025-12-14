@@ -175,22 +175,22 @@ def transpose_query_gluon(
     Returns:
         None (results are written to query_gluon and query_scale_gluon in-place)
     """
-    # Calculate strides for input tensors based on actual 3D shape
-    # But we interpret them as 5D: [batch_size, seq_len, num_kv_heads, query_group_size, head_size]
-    # Actual memory layout: [batch*seq, num_kv_heads*query_group_size, head_size]
-    stride_input_batch = (
-        query_sequence_length * num_kv_heads * query_group_size * head_size
-    )
-    stride_input_seq = num_kv_heads * query_group_size * head_size
-    stride_input_head = query_group_size * head_size
-    stride_input_group = head_size
+    # Calculate strides for input tensors using actual tensor strides
+    # Input query shape: [batch_size * seq_len, num_kv_heads * query_group_size, head_size]
+    # We interpret it as 5D: [batch_size, seq_len, num_kv_heads, query_group_size, head_size]
+    # Use actual tensor strides to support non-contiguous tensors
+    query_stride_0 = query.stride(0)  # stride for dim 0 (batch*seq dimension)
+    query_stride_1 = query.stride(1)  # stride for dim 1 (num_heads dimension)
 
-    # Calculate strides for output tensors (3D)
+    stride_input_batch = query_sequence_length * query_stride_0  # skip seq_len rows
+    stride_input_seq = query_stride_0  # skip 1 row
+    stride_input_head = query_group_size * query_stride_1  # skip query_group_size heads
+    stride_input_group = query_stride_1  # skip 1 head
+
+    # Calculate strides for output tensors using actual tensor strides
     # Output shape: [batch_size, num_kv_heads * seq_len * query_group_size, head_size]
-    stride_output_batch = (
-        num_kv_heads * query_sequence_length * query_group_size * head_size
-    )
-    stride_output_merged = head_size
+    stride_output_batch = query_gluon.stride(0)
+    stride_output_merged = query_gluon.stride(1)
 
     if GLUON_JIT_KERNEL_ENABLED:
         BLOCK_SIZE_LAST = triton.next_power_of_2(head_size)
@@ -232,20 +232,20 @@ def transpose_query_gluon(
             # For scale, last_dim = 1
             BLOCK_SIZE_LAST_SCALE = 1
 
-            # Calculate strides for query_scale with last_dim = 1
+            # Calculate strides for query_scale using actual tensor strides
             # Input shape: [batch_size * seq_len, num_kv_heads * query_group_size, 1]
-            stride_input_batch_scale = (
-                query_sequence_length * num_kv_heads * query_group_size * 1
-            )
-            stride_input_seq_scale = num_kv_heads * query_group_size * 1
-            stride_input_head_scale = query_group_size * 1
-            stride_input_group_scale = 1
+            query_scale_stride_0 = query_scale.stride(0)  # stride for dim 0
+            query_scale_stride_1 = query_scale.stride(1)  # stride for dim 1
 
+            stride_input_batch_scale = query_sequence_length * query_scale_stride_0
+            stride_input_seq_scale = query_scale_stride_0
+            stride_input_head_scale = query_group_size * query_scale_stride_1
+            stride_input_group_scale = query_scale_stride_1
+
+            # Output strides using actual tensor strides
             # Output shape: [batch_size, num_kv_heads * seq_len * query_group_size, 1]
-            stride_output_batch_scale = (
-                num_kv_heads * query_sequence_length * query_group_size * 1
-            )
-            stride_output_merged_scale = 1
+            stride_output_batch_scale = query_scale_gluon.stride(0)
+            stride_output_merged_scale = query_scale_gluon.stride(1)
 
             grid_scale = (
                 batch_size,
@@ -427,20 +427,24 @@ def transpose_output_gluon(
     Returns:
         None (results are written to output in-place)
     """
-    # Calculate strides for input tensors
+    # Calculate strides for input tensors using actual tensor strides
+    # Input output_gluon shape: [batch_size, num_kv_heads * query_sequence_length * query_group_size, head_size]
     # Logical layout: [batch_size, num_kv_heads, query_sequence_length, query_group_size, head_size] (5D view)
-    stride_input_batch = (
-        num_kv_heads * query_sequence_length * query_group_size * head_size
-    )
-    stride_input_kv_head = query_sequence_length * query_group_size * head_size
-    stride_input_seq = query_group_size * head_size
-    stride_input_group = head_size
+    # Merged dimension is organized as: kv_head * (seq_len * group_size) + seq * group_size + group
+    output_gluon_stride_0 = output_gluon.stride(0)  # stride for batch dimension
+    output_gluon_stride_1 = output_gluon.stride(1)  # stride for merged dimension
 
-    # Calculate strides for output tensors
+    stride_input_batch = output_gluon_stride_0
+    stride_input_kv_head = (
+        query_sequence_length * query_group_size * output_gluon_stride_1
+    )
+    stride_input_seq = query_group_size * output_gluon_stride_1
+    stride_input_group = output_gluon_stride_1
+
+    # Calculate strides for output tensors using actual tensor strides
     # Output shape: [batch_size * query_sequence_length, num_query_heads, head_size]
-    num_query_heads = num_kv_heads * query_group_size
-    stride_output_batch_seq = num_query_heads * head_size
-    stride_output_merged = head_size
+    stride_output_batch_seq = output.stride(0)
+    stride_output_merged = output.stride(1)
 
     if GLUON_JIT_KERNEL_ENABLED:
         BLOCK_SIZE_LAST = triton.next_power_of_2(head_size)
@@ -2800,10 +2804,9 @@ def pa_decode_gluon(
         CONTEXT_PARTITION_SIZE=context_partition_size,
     )
 
-    # Transpose output from [num_seqs, num_kv_heads, query_length, query_group_size, head_size]
-    # back to [num_seqs * query_length, num_query_heads, head_size]
-    # Only needed when query_length > 1
     if query_length > 1:
+        # Transpose output from [num_seqs, num_kv_heads, query_length, query_group_size, head_size]
+        # back to [num_seqs * query_length, num_query_heads, head_size]
         transpose_output_gluon(
             output_gluon=output_gluon,
             output=output,
