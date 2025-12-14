@@ -698,8 +698,9 @@ def get_2stage_cfgs(
                 else ksplit
             )
         )
-        aiter.logger.debug(f"run_1stage = {run_1stage}, ksplit = {ksplit} {q_type}")
-
+        aiter.logger.info(
+            f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type}"
+        )
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
