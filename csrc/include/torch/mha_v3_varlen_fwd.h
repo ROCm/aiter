@@ -10,7 +10,7 @@ fmha_v3_varlen_fwd(at::Tensor& q,                                 // [total_q, h
                    const at::Tensor& k,                           // [total_k, hk, d]
                    const at::Tensor& v,                           // [total_k, hk, d]
                    const at::Tensor& cu_seqlens_q,                // [b+1]
-                   std::optional<const at::Tensor>& cu_seqlens_k, // [b+1]
+                   const at::Tensor& cu_seqlens_k, // [b+1]
                    int max_seqlen_q,
                    int max_seqlen_k,
                    int min_seqlen_q,
@@ -28,6 +28,8 @@ fmha_v3_varlen_fwd(at::Tensor& q,                                 // [total_q, h
                    std::optional<const at::Tensor> block_table,  // [hq] or [b, hq]
                    std::optional<const at::Tensor> bias,         // [total_q, max_seqlen_k]
                    std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
-                   std::optional<at::Generator> gen);
+                   std::optional<at::Generator> gen,
+                   std::optional<const at::Tensor> cu_seqlens_q_padded, // [b+1]
+                   std::optional<const at::Tensor> cu_seqlens_k_padded); // [b+1]);
 } // namespace torch_itfs
 } // namespace aiter
