@@ -647,8 +647,22 @@ def get_2stage_cfgs(
     def FinalFunc():
         logger.info("\033[0m")
 
+    def use_cfg():
+        problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
+        bypass_type = (
+            ActivationType.Silu,
+            dtypes.bf16,
+            dtypes.fp8,
+            dtypes.fp8,
+            QuantType.per_1x128,
+        )
+        if problem_type == bypass_type and (token * topk) <= 64:  # bypass tuned
+            aiter.logger.info("bypass tuned results for fp8 blockscale")
+            return False
+        return True
+
     # cfg = cfg_2stages.get(keys, None)
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+    cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
