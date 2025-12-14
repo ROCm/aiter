@@ -31,6 +31,7 @@ def fused_rms_fp8_per_tensor_static_quant(
     dtype_quant=fp8_dtype,
     res1=None,
     output_unquantized_inp1=False,
+    intermediate_convert_to_inp1_type=False,
 ):
     """
     This op contains several steps:
@@ -80,7 +81,7 @@ def fused_rms_fp8_per_tensor_static_quant(
     if output_unquantized_inp1:
         out1 = torch.empty((M, N1), dtype=inp1.dtype, device=inp1.device)
         out1_row_stride = out1.stride(0)
-        out1_col_stride = out2.stride(1)
+        out1_col_stride = out1.stride(1)
 
     out_res1 = None
     res1_row_stride = 0
@@ -149,6 +150,7 @@ def fused_rms_fp8_per_tensor_static_quant(
         HAVE_SECOND_INPUT=(inp2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
         FIRST_INPUT_OUT=output_unquantized_inp1,
+        CONVERT_TO_INP1_TYPE=intermediate_convert_to_inp1_type,
         num_warps=num_warps,
     )
 
