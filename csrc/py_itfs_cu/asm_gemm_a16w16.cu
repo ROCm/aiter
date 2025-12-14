@@ -176,14 +176,16 @@ AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName, CFG* c
     return result.first->second.get();
 }
 
-void debug_semaphore(uint32_t* semaphore_host, void* SemaphoreBuffer, int semaphore_size,
-                     int gdx, int gdy, int selectedksplit)
+void debug_semaphore(uint32_t* semaphore_host,int semaphore_size, int gdx, int gdy)
 {
     bool all_correct = true;
     for(int j = 0; j < semaphore_size; j++)
     {
         uint32_t expected_value = j / gdx;
         all_correct &= (semaphore_host[j] == expected_value);
+        if(!all_correct){
+            printf("semaphore_host[%d]: %d, expected_value: %d\n", j, semaphore_host[j], expected_value);
+        }
     }
     if(all_correct)
         printf("All %d semaphores verified successfully\n", semaphore_size);
@@ -205,7 +207,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A, torch::Tensor& B, torch::Tensor&
     int Ndim = B.size(0);
     int Kdim = A.size(1);
 
-    unsigned int SUBM = 64;
+    unsigned int SUBM = 32;
     unsigned int SUBN = 64;
 
     KernelArgs args = {};
@@ -237,7 +239,6 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A, torch::Tensor& B, torch::Tensor&
     }
     args.splitk = selectedksplit;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(selectedKernelName, config_map, SUBM, SUBN);
-
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -256,9 +257,12 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A, torch::Tensor& B, torch::Tensor&
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
 
-    if(DEBUG_SEMAPHORE && selectedksplit > 1)
-        debug_semaphore(semaphore_host, SemaphoreBuffer, semaphore_size, gdx, gdy, selectedksplit);
-    
+    if(DEBUG_SEMAPHORE && selectedksplit > 1){
+        HIP_CALL(hipDeviceSynchronize());
+        HIP_CALL(hipMemcpy(semaphore_host, SemaphoreBuffer, sizeof(uint32_t) * semaphore_size, hipMemcpyDeviceToHost));
+        debug_semaphore(semaphore_host, semaphore_size, gdx, gdy);
+    }
+
     HIP_CALL(hipFree(SemaphoreBuffer));
     delete[] semaphore_host; 
     return out;
