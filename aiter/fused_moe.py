@@ -657,7 +657,7 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
-    if cfg is None:
+    if cfg is None or int(os.environ.get("AITER_HEURISTIC_ONLY", "0")):
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
