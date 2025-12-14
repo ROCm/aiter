@@ -28,7 +28,7 @@ class cktile_moe_2stage_gemm_codegen:
     def __init__(
         self,
         working_path,
-        ab_dtype,
+        a_dtypes,
         acc_dtype,
         c_dtype,
         quant_type,
@@ -43,7 +43,8 @@ class cktile_moe_2stage_gemm_codegen:
         self.dispatchers_path = os.path.join(working_path, "dispatchers")
         self.istune = istune
         self.kernel_name_list = []
-        self.ab_dtype = ab_dtype.lower()
+        self.a_dtypes = a_dtypes
+        self.b_dtypes = ["fp4"]
         self.acc_dtype = acc_dtype.lower()
         self.c_dtype = c_dtype.lower()
         self.quant_type = quant_type
@@ -61,7 +62,7 @@ class cktile_moe_2stage_gemm_codegen:
             if element != ""
         )
 
-    def gen_instance(self, k: kernelInstance):
+    def gen_instance(self, k: kernelInstance, a_type):
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages_common.cuh"
@@ -122,8 +123,7 @@ torch::Tensor
             scaleGranA = "1, 32"
             scaleGranB = "1, 32"
             biasGran = "1"
-            # xptr = "nullptr"
-            xptr = "static_cast<float*>(x_scale.value().data_ptr())"
+            xptr = "x_scale.has_value() ? static_cast<float*>(x_scale.value().data_ptr()) : nullptr"
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
             biasptr = "static_cast<float*>(exp_bias.value().data_ptr())"
 
@@ -230,11 +230,10 @@ template torch::Tensor
                     f"{name}_a{a_type}_b{b_type}_acc{acc_type}_C{c_type}.cpp",
                 )
             ).write_text(intsance)
+            # import pdb; pdb.set_trace()
 
-        if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
-            fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
-        elif (k.QuantType == "1x32") and (self.ab_dtype in ["fp8", "bf8"]):
-            fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
+        if (k.QuantType == "1x32") and (a_type in ["bf16", "fp16", "fp8"]):
+            fill_template(k.name, a_type, "pk_fp4", self.acc_dtype, self.c_dtype)
         else:
             for CDtype in ["bf16", "fp16"]:
                 for ABDtype in ["fp8"]:  # "bf16", "fp16",
@@ -293,22 +292,40 @@ template torch::Tensor
 
     def gen_heuristic_dispatch_header(self, tags):
         HEURISTIC_dispatch_header = """#pragma once
-        // SPDX-License-Identifier: MIT
-        // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
 
 """
         for tag in tags:
-            HEURISTIC_headers = f"""#include "moe_cktile2stages_heuristic_dispatch_{tag}"
+            HEURISTIC_headers = f"""#include "./dispatchers/moe_cktile2stages_heuristic_dispatch_{tag}.h"
 """
             HEURISTIC_dispatch_header += HEURISTIC_headers
 
+
+        HEURISTIC_function = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "moe_cktile2stages.h"
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m);
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m);
+"""
         # create heuristic heirarchy
         with open(
             os.path.join(self.working_path, f"moe_cktile2stages_heuristic_dispatch.h"),
             "w",
         ) as f:
             f.write(HEURISTIC_dispatch_header)
+        with open(
+            os.path.join(self.dispatchers_path, f"moe_cktile2stages_heuristic_dispatch_common.h"),
+            "w",
+        ) as f:
+            f.write(HEURISTIC_function)
 
     """generate lookup.h linking MNK/datatype to specific instance"""
 
@@ -401,21 +418,22 @@ torch::Tensor
 
     """generate all instances and headers"""
 
-    def gen_instances(self, tag, kernels_dict):
-        if os.path.exists(self.impl_path) and self.init:
-            shutil.rmtree(self.impl_path)
+    def gen_instances(self, tag, kernels_dict, a_type):
+        if self.init:
+            if os.path.exists(self.impl_path):
+                shutil.rmtree(self.impl_path)
             os.mkdir(self.impl_path)
-        if os.path.exists(self.instances_path) and self.init:
-            shutil.rmtree(self.instances_path)
+            if os.path.exists(self.instances_path):
+                shutil.rmtree(self.instances_path)
             os.mkdir(self.instances_path)
-        if os.path.exists(self.dispatchers_path) and self.init:
-            shutil.rmtree(self.dispatchers_path)
+            if os.path.exists(self.dispatchers_path):
+                shutil.rmtree(self.dispatchers_path)
             os.mkdir(self.dispatchers_path)
 
         self.init = False
 
         for mnk, k in kernels_dict.items():
-            self.gen_instance(k)
+            self.gen_instance(k, a_type)
             if k.name not in self.kernel_name_list:
                 self.kernel_name_list.append(k.name)
 
@@ -580,7 +598,6 @@ if __name__ == "__main__":
     # b_type = "fp8"
     # quant_type = "per_token"
 
-    a_type = "fp8"
     a_types = ["bf16", "fp8"]
     # a_type = "bf16"
     b_type = "fp4"
@@ -590,7 +607,7 @@ if __name__ == "__main__":
     c_type = "bf16"
     act_type = "silu"
     codegen = cktile_moe_2stage_gemm_codegen(
-        args.working_path, a_type, acc_type, c_type, quant_type, act_type, 2, False
+        args.working_path, a_types, acc_type, c_type, quant_type, act_type, 2, False
     )
     # gen all instances for gemm1 and gemm2
     tags = []
@@ -616,7 +633,7 @@ if __name__ == "__main__":
             **{(2, key): value for key, value in gemm2_kernel_list.items()},
         }
         # print(kernel_dict_merge)
-        codegen.gen_instances(tag, kernel_dict_merge)
+        codegen.gen_instances(tag, kernel_dict_merge, a_type)
         tags.append(tag)
     codegen.gen_heuristic_dispatch_header(tags)
     codegen.gen_manifest_head()

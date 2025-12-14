@@ -46,7 +46,7 @@ def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-setup_seed(1)
+# setup_seed(1)
 
 
 @benchmark()
@@ -312,17 +312,17 @@ def test_fmoe(
         )
     # a1_scale_tmp.fill_(a1_scale_v1)
     # a1_scale_tmp *= a1_scale_v1
-    a1_f = a1.view(-1, 32)
-    a1_f = a1_f.to(torch.float32)
-    a1_scale_stage1_bak = a1_scale_stage1_bak.view(-1).to(torch.float32)
-    a1_f = a1_f * a1_scale_stage1_bak.view(-1, 1)
-    a1_f = a1_f.reshape(a1.shape[0], -1)
+    # a1_f = a1.view(-1, 32)
+    # a1_f = a1_f.to(torch.float32)
+    # a1_scale_stage1_bak = a1_scale_stage1_bak.view(-1).to(torch.float32)
+    # a1_f = a1_f * a1_scale_stage1_bak.view(-1, 1)
+    # a1_f = a1_f.reshape(a1.shape[0], -1)
 
 
     # ######################## stage 1 start ###########
     out1_ref = torch_moe_stage1(
-        # a1_qt,
-        a1_f.to(dtypes.bf16),
+        a1_qt,
+        # a1_f.to(dtypes.bf16),
         w1_qt,
         w2_qt,
         topk_weights,
@@ -403,7 +403,7 @@ def test_fmoe(
         out1_ref,
         a2,
     )
-    import pdb;pdb.set_trace()
+    import pdb; pdb.set_trace()
 
     
     # Prepare a2 for Stage 2
@@ -496,7 +496,6 @@ def test_fmoe(
         sorted_weights=sorted_weights if not doweight_stage1 else None,
     )
     out2_ck = moe_out
-    import pdb;pdb.set_trace()
     
     
     us_total = us1 + us2
@@ -512,6 +511,7 @@ def test_fmoe(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
 
+    print(logits_diff)
     return {"us": us_total, "us1": us1, "us2": us2, "err": err}
 
 
@@ -523,12 +523,11 @@ l_tokenNum = [
 ]
 l_quant = [
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a16w4
-    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
-# l_hidden_intermediate_pad = [(192,128)]
-l_hidden_intermediate_pad = [(0,0)]
+l_hidden_intermediate_pad = [(192,128)]
 l_preshuffle = [True]
 
 
@@ -691,7 +690,7 @@ for (
                     intermediate_pad=intermediate_pad,
                 )
                 df.append(ret)
-    if (quant_type, aq_dtype, wq_dtype) == (
+    elif (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
         dtypes.fp8,
         dtypes.fp4x2,

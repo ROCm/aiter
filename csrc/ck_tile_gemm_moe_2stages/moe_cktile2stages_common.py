@@ -203,6 +203,7 @@ a8w8_gfx950_heuristic_dispatch = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 
 template <>
 MoeKernel moe_gemm1_heuristic_dispatch<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
@@ -267,6 +268,7 @@ a16w4_gfx950_heuristic_dispatch = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 
 template <>
 MoeKernel moe_gemm1_heuristic_dispatch<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
@@ -323,6 +325,7 @@ a16w4_heuristic_dispatch = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 
 template <>
 MoeKernel moe_gemm1_heuristic_dispatch<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
@@ -379,6 +382,7 @@ a8w4_gfx950_heuristic_dispatch = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 
 template <>
 MoeKernel moe_gemm1_heuristic_dispatch<ck_tile::fp8_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(
