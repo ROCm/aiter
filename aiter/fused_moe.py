@@ -237,7 +237,7 @@ def fused_moe_(
         intermediate_pad,
         bias1,
         bias2,
-        get_padded_M(M),  #only used in 2stage
+        get_padded_M(M),  # only used in 2stage
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -476,26 +476,30 @@ def get_block_size_M(token, topk, expert, inter_dim):
 
 @functools.lru_cache(maxsize=2048)
 def get_ksplit(token, topk, expert, inter_dim, model_dim):
-    #only for moe_blk gemm1 a8w8 decode scenario
-    if (token * topk > expert):
+    aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
+    if aiter_ksplit != 0:
+        return aiter_ksplit
+    # only for moe_blk gemm1 a8w8 decode scenario
+    if token * topk > expert:
         return 0
     cu_num = get_cu_num()
     tileN = 128
 
-    tgM = token * topk #decode tile num
+    tgM = token * topk  # decode tile num
     tgN = (inter_dim * 2 + tileN - 1) // tileN
 
     tg_num = tgN * tgM
-    #if all cu already active
-    if (tg_num >= cu_num):
+    # if all cu already active
+    if tg_num >= cu_num:
         return 0
     tilek = 256
     split_max = (cu_num + tg_num - 1) // tg_num
-    #at least split = 2
-    for i in reversed(range(2, split_max+1)):
+    # at least split = 2
+    for i in reversed(range(2, split_max + 1)):
         if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
             return i
     return 0
+
 
 cfg_2stages = None
 # fmt: off
@@ -668,7 +672,7 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                run_1stage = True and (inter_dim % 256 == 0)
+                run_1stage = token > 32 and (inter_dim % 256 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -680,7 +684,7 @@ def get_2stage_cfgs(
             BLOCK_SIZE_M
             if run_1stage
             else (
-                ( 64 if token > 32 else 16 )
+                (64 if token > 32 else 16)
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
@@ -694,6 +698,7 @@ def get_2stage_cfgs(
                 else ksplit
             )
         )
+        aiter.logger.debug(f"run_1stage = {run_1stage}, ksplit = {ksplit} {q_type}")
 
     else:
         block_m = cfg["block_m"]
@@ -750,6 +755,7 @@ def get_2stage_cfgs(
             dtypes.fp16,
             torch.uint32,
             dtypes.fp4x2,
+            dtypes.fp8,
         ]
     ):
         return MOEMetadata(
@@ -758,7 +764,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
-                splitk=ksplit
+                splitk=ksplit,
             ),
             functools.partial(
                 aiter.ck_moe_stage2_fwd,
@@ -1327,6 +1333,7 @@ def torch_moe_stage2(
         out = out * topk_weights.view(token_num, -1, 1)
     return out.sum(1).to(dtype)
 
+
 def ck_moe_stage1(
     hidden_states,
     w1,  # [E, inter_dim*2, model_dim]
@@ -1340,13 +1347,19 @@ def ck_moe_stage1(
     a1_scale,
     w1_scale,
     kernelName="",
-    sorted_weights = None,
+    sorted_weights=None,
     quant_type=aiter.QuantType.No,
     activation=ActivationType.Gelu,
     splitk=1,
 ):
     token_num = hidden_states.shape[0]
-    tmp_out = torch.zeros((token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device = out.device) if splitk > 1 else out
+    tmp_out = (
+        torch.zeros(
+            (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
+        )
+        if splitk > 1
+        else out
+    )
     aiter.ck_moe_stage1_fwd(
         hidden_states,
         w1,
