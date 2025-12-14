@@ -337,7 +337,7 @@ setup(
         #     # IRIS_DEP,
         #     # Triton-based communication using Iris
         #     # Pinned to commit 905ec1c (Nov 18, 2024) for reproducibility and API stability
-        #     # Public Pypi Can't have direct git dependency.
+        #     # Public PyPI Can't have direct git dependency.
         #     # To install Iris by requirements.txt.
         # ],
         # Install all optional dependencies
