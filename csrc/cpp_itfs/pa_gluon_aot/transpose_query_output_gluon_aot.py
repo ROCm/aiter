@@ -255,14 +255,21 @@ def transpose_query_gluon_aot(
         output_tensor.dtype == input_tensor.dtype
     ), f"Output dtype {output_tensor.dtype} must match input dtype {input_tensor.dtype}"
 
-    # Calculate strides
-    stride_input_batch = seq_len * num_query_heads * last_dim
-    stride_input_seq = num_query_heads * last_dim
-    stride_input_head = query_group_size * last_dim
-    stride_input_group = last_dim
+    # Calculate strides using actual tensor strides to support non-contiguous tensors
+    # Input shape: [batch_size * seq_len, num_kv_heads * query_group_size, last_dim]
+    # Interpreted as 5D: [batch_size, seq_len, num_kv_heads, query_group_size, last_dim]
+    input_stride_0 = input_tensor.stride(0)  # stride for dim 0 (batch*seq dimension)
+    input_stride_1 = input_tensor.stride(1)  # stride for dim 1 (num_heads dimension)
 
-    stride_output_batch = num_kv_heads * seq_len * query_group_size * last_dim
-    stride_output_merged = last_dim
+    stride_input_batch = seq_len * input_stride_0  # skip seq_len rows
+    stride_input_seq = input_stride_0  # skip 1 row
+    stride_input_head = query_group_size * input_stride_1  # skip query_group_size heads
+    stride_input_group = input_stride_1  # skip 1 head
+
+    # Output strides using actual tensor strides
+    # Output shape: [batch_size, num_kv_heads * seq_len * query_group_size, last_dim]
+    stride_output_batch = output_tensor.stride(0)
+    stride_output_merged = output_tensor.stride(1)
 
     # Calculate block sizes
     merged_dim_size = num_kv_heads * seq_len * query_group_size
@@ -312,16 +319,20 @@ def transpose_query_gluon_aot(
         scale_last_dim = 1
         block_size_last_scale = 1
 
-        # Calculate strides for query_scale with last_dim = 1
+        # Calculate strides for query_scale using actual tensor strides
         # Input shape: [batch_size * seq_len, num_kv_heads * query_group_size, 1]
-        stride_input_batch_scale = seq_len * num_kv_heads * query_group_size * 1
-        stride_input_seq_scale = num_kv_heads * query_group_size * 1
-        stride_input_head_scale = query_group_size * 1
-        stride_input_group_scale = 1
+        input_scale_stride_0 = input_scale.stride(0)  # stride for dim 0
+        input_scale_stride_1 = input_scale.stride(1)  # stride for dim 1
 
+        stride_input_batch_scale = seq_len * input_scale_stride_0
+        stride_input_seq_scale = input_scale_stride_0
+        stride_input_head_scale = query_group_size * input_scale_stride_1
+        stride_input_group_scale = input_scale_stride_1
+
+        # Output strides using actual tensor strides
         # Output shape: [batch_size, num_kv_heads * seq_len * query_group_size, 1]
-        stride_output_batch_scale = num_kv_heads * seq_len * query_group_size * 1
-        stride_output_merged_scale = 1
+        stride_output_batch_scale = output_scale.stride(0)
+        stride_output_merged_scale = output_scale.stride(1)
 
         # Calculate grid dimensions for scale
         grid_dim_0_scale = batch_size
@@ -574,17 +585,22 @@ def transpose_output_gluon_aot(
         output_tensor.dtype == input_tensor.dtype
     ), f"Output dtype {output_tensor.dtype} must match input dtype {input_tensor.dtype}"
 
-    # Calculate strides for input tensor
+    # Calculate strides for input tensor using actual tensor strides
+    # Input shape: [batch_size, num_kv_heads * seq_len * query_group_size, last_dim]
     # Logical layout: [batch_size, num_kv_heads, seq_len, query_group_size, last_dim] (5D view)
-    stride_input_batch = num_kv_heads * seq_len * query_group_size * last_dim
-    stride_input_kv_head = seq_len * query_group_size * last_dim
-    stride_input_seq = query_group_size * last_dim
-    stride_input_group = last_dim
+    # Merged dimension is organized as: kv_head * (seq_len * group_size) + seq * group_size + group
+    input_stride_0 = input_tensor.stride(0)  # stride for batch dimension
+    input_stride_1 = input_tensor.stride(1)  # stride for merged dimension
 
-    # Calculate strides for output tensor
+    stride_input_batch = input_stride_0
+    stride_input_kv_head = seq_len * query_group_size * input_stride_1
+    stride_input_seq = query_group_size * input_stride_1
+    stride_input_group = input_stride_1
+
+    # Calculate strides for output tensor using actual tensor strides
     # Output shape: [batch_size * seq_len, num_query_heads, last_dim]
-    stride_output_batch_seq = num_query_heads * last_dim
-    stride_output_merged = last_dim
+    stride_output_batch_seq = output_tensor.stride(0)
+    stride_output_merged = output_tensor.stride(1)
 
     # Calculate block sizes
     merged_dim_size = num_kv_heads * query_group_size
