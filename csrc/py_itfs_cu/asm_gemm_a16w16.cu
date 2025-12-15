@@ -181,7 +181,10 @@ void debug_semaphore(uint32_t* semaphore_host,int semaphore_size, int gdx, int g
     bool all_correct = true;
     for(int j = 0; j < semaphore_size; j++)
     {
-        uint32_t expected_value = j / gdx;
+        uint32_t tgidX = j % gdx;
+        uint32_t tgidY = j / gdx;
+        uint32_t expected_value = 0x12340000 + tgidY * gdx + tgidX;  // Unique value for each (tgidX, tgidY)
+        
         all_correct &= (semaphore_host[j] == expected_value);
         if(!all_correct){
             printf("semaphore_host[%d]: %d, expected_value: %d\n", j, semaphore_host[j], expected_value);
