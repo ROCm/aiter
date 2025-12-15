@@ -13,7 +13,14 @@ STANDARD_M_BOUNDS = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 # This flag should be set to True, unless it is being used for debugging
 USE_LRU_CACHE = True
-
+"""
+Cold start: 290.8928 ms
+LRU Cache: ENABLED
+Avg per call: 0.110 us
+vs 
+LRU Cache: DISABLED
+Avg per call: 2.503 us
+"""
 
 def _load_config_file(
     cache_dict: dict,
