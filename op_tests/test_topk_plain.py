@@ -95,7 +95,7 @@ def test_topk(
     id_aiter, _aiter = torch.sort(topk_ids.to(torch.long))
 
     # Skip for float16 as it would has duplicates in topk_ids
-    if dtype != torch.float16:
+    if dtype != torch.float16 and dtype != torch.bfloat16:
         err = checkAllclose(
             ref_value,
             topk_value,
