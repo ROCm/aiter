@@ -264,11 +264,9 @@ __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     args.N       = N;
     args.K       = K;
 
-    // Quantization parameters for ABQuantGrouped mode
-    // A: [M, K] with scale [M, K/128] (AQK per row)
-    const int AQK = K / AQuantGroupSize::kK;                              // K/128
-    const int BQK = K / BQuantGroupSize::kK;                              // K/128
-    const int BQN = ck_tile::integer_divide_ceil(N, BQuantGroupSize::kN); // N/128 (ceil)
+    const int AQK = K / AQuantGroupSize::kK;
+    const int BQK = K / BQuantGroupSize::kK;
+    const int BQN = ck_tile::integer_divide_ceil(N, BQuantGroupSize::kN);
 
     const int stride_A  = K;
     const int stride_B  = K;
