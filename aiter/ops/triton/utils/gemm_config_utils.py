@@ -22,6 +22,7 @@ LRU Cache: DISABLED
 Avg per call: 2.503 us
 """
 
+
 def _load_config_file(
     cache_dict: dict,
     cache_key: str,
