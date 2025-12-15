@@ -196,5 +196,4 @@ def _get_config(
     N: int,
     K: int,
 ):
-
-    return get_gemm_config("FF-A16W16-fused", M, N, K, bounds=[4, 8, 64, 4096])
+    return get_gemm_config("FF-A16W16-fused", M, N, K, bounds=(4, 8, 64, 4096))

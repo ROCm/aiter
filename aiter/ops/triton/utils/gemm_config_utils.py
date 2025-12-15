@@ -8,8 +8,8 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
-# Standard bounds for M_LEQ_x keys
-STANDARD_M_BOUNDS = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+# Standard bounds for M_LEQ_x keys (tuple for hashability with LRU cache)
+STANDARD_M_BOUNDS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
 # This flag should be set to True, unless it is being used for debugging
 USE_LRU_CACHE = True
@@ -43,12 +43,13 @@ def _load_config_file(
     return False
 
 
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
 def get_gemm_config(
     config_name: str,
     M: int,
     N: int | None = None,
     K: int | None = None,
-    bounds: list[int] | tuple[int, ...] | None = None,
+    bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
 ) -> dict:
     """
@@ -74,10 +75,6 @@ def get_gemm_config(
     Returns:
         Dictionary with the config params
     """
-    # Convert bounds to tuple for LRU caching
-    if bounds is not None and not isinstance(bounds, tuple):
-        bounds = tuple(bounds)
-
     # Input validation
     assert M >= 0, "M must be positive."
     assert N is None or N > 0, "N must be positive when provided."
@@ -86,7 +83,7 @@ def get_gemm_config(
         len(bounds) > 0
         and all(x > 0 for x in bounds)
         and all(x < y for x, y in zip(bounds, bounds[1:]))
-    ), "When provided, bounds list must be non-empty, contain only positive numbers, and be strictly increasing."
+    ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
 
     if not hasattr(get_gemm_config, "_config_cache"):
         get_gemm_config._config_cache = {}
@@ -158,10 +155,6 @@ def get_gemm_config(
     raise KeyError(
         f"No matching configuration found for M={M}, N={N}, K={K} in config '{config_name}'."
     )
-
-
-if USE_LRU_CACHE:
-    get_gemm_config = functools.lru_cache(maxsize=1024)(get_gemm_config)
 
 
 def add_default_gemm_config_params(config: dict) -> dict:
