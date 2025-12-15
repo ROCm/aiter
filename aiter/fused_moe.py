@@ -645,9 +645,6 @@ def get_2stage_cfgs(
         )
 
     def FinalFunc():
-        logger.info(
-            f"[Hint] tuned configs are saved in {tune_file}, you can set AITER_CONFIG_FMOE to this file to use tuned configs"
-        )
         logger.info("\033[0m")
 
     def use_cfg():
@@ -659,7 +656,7 @@ def get_2stage_cfgs(
             dtypes.fp8,
             QuantType.per_1x128,
         )
-        if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
+        if problem_type == bypass_type and (token_real * topk) <= 128:  # bypass tuned
             aiter.logger.info("bypass tuned results for fp8 blockscale")
             return False
         return True
