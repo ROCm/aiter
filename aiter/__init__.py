@@ -43,10 +43,7 @@ def getLogger():
 
 logger = getLogger()
 
-import importlib.util
 
-if importlib.util.find_spec("aiter_") is not None:
-    from aiter_ import *
 from .jit import core as core
 from .utility import dtypes as dtypes
 from .ops.enum import *
@@ -79,3 +76,17 @@ from .ops.trans_ragged_layout import *
 from .ops.sample import *
 from .ops.fused_mrope_rms import *
 from . import mla
+
+# Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
+try:
+    from .ops.triton.comms import (
+        IrisCommContext,
+        calculate_heap_size,
+        reduce_scatter,
+        all_gather,
+        reduce_scatter_rmsnorm_quant_all_gather,
+        IRIS_COMM_AVAILABLE,
+    )
+except ImportError:
+    # Iris not available, skip import
+    IRIS_COMM_AVAILABLE = False

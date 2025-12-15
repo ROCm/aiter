@@ -233,14 +233,16 @@ def get_tune_dict(tune_dict_csv):
             gpu = torch.cuda.current_device()
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[
-                (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "cktile")
-            ].reset_index()
+            tune_df = tune_df[(tune_df["cu_num"] == cu_num)].reset_index()
+        tune_df = tune_df[tune_df["libtype"] == "cktile"].reset_index()
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             kid = tune_df.loc[i, "kernelId"]
+            if kid < 0 or kid >= len(kernels_list):
+                print(f"[Warning]: kernelId {kid} is out of range, skip it")
+                continue
             tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict
 
