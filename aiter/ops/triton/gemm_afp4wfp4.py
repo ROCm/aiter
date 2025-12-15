@@ -3,12 +3,11 @@
 
 from typing import Optional
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_string
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_dict
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_kernel,
     _gemm_afp4wfp4_kernel_preshuffle_scales,
@@ -66,24 +65,32 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
 def gemm_afp4wfp4_fake_tensor(
-    x: Tensor,
-    w: Tensor,
-    x_scales: Tensor,
-    w_scales: Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-<<<<<<< HEAD
     config: Optional[str] = None,
-) -> Tensor:
+    skip_reduce: Optional[bool] = False,
+) -> torch.Tensor:
     if y is None:
         M, _ = x.shape
         N, _ = w.shape
         return torch.empty((M, N), dtype=dtype, device=x.device)
     return y
-=======
-    config: Optional[dict] = None,
+
+@torch_compile_guard(gen_fake=gemm_afp4wfp4_fake_tensor)
+def gemm_afp4wfp4_(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
     skip_reduce: Optional[bool] = False,
-):
+) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
 
@@ -102,18 +109,6 @@ def gemm_afp4wfp4_fake_tensor(
     Returns:
         torch.Tensor: Output with shape (M, N).
     """
->>>>>>> main
-
-@torch_compile_guard(gen_fake=gemm_afp4wfp4_fake_tensor)
-def gemm_afp4wfp4_(
-    x: Tensor,
-    w: Tensor,
-    x_scales: Tensor,
-    w_scales: Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-) -> Tensor:
     _LOGGER.info(
         f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
@@ -129,7 +124,7 @@ def gemm_afp4wfp4_(
     if config is None:
         config = _get_config(M, N, K)
     else:
-        config = deserialize_string(config)
+        config = deserialize_dict(config)
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
@@ -536,38 +531,6 @@ def gemm_afp4wfp4_preshuffle(
 
     return y
 
-<<<<<<< HEAD
-def gemm_afp4wfp4(
-    x: Tensor,
-    w: Tensor,
-    x_scales: Tensor,
-    w_scales: Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-) -> Tensor:
-    """
-    Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
-
-    Args:
-        x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K).
-        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N, K), internally transposed.
-        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M, K//32).
-            One scale per 32 elements in K dimension.
-        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N, K//32).
-            One scale per 32 elements in K dimension.
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
-
-    Returns:
-        torch.Tensor: Output with shape (M, N).
-    """
-    config_hashable = serialize_dict(config) if config else None
-    return gemm_afp4wfp4_(x, w, x_scales, w_scales, dtype, y, config_hashable)
-=======
-
 def gemm_afp4wfp4_preshuffled_weight_scales(
     x,
     w,
@@ -582,4 +545,15 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
         "gemm_afp4wfp4_preshuffled_weight_scales will be deprecated in future AITER release, please switch to gemm_afp4wfp4_preshuffle"
     )
     return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config, use_aot)
->>>>>>> main
+
+def gemm_afp4wfp4(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+) -> torch.Tensor:
+    config_hashable = serialize_dict(config) if config else None
+    return gemm_afp4wfp4_(x, w, x_scales, w_scales, dtype, y, config_hashable)

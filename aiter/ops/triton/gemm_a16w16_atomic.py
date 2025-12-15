@@ -12,7 +12,7 @@ from aiter.ops.triton._triton_kernels.gemm_a16w16_atomic import (
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_string
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_dict
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
@@ -51,7 +51,7 @@ def gemm_a16w16_atomic_(
     if config is None:
         config = _get_config(M, N, K)
     else:
-        config = deserialize_string(config)
+        config = deserialize_dict(config)
 
     # For compatability reasons, these keys may not exist in the config
     # TODO: This needs to be embedded in the configs later

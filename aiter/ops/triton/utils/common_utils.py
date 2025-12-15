@@ -7,7 +7,6 @@ import torch
 import triton
 import json
 
-
 def prev_power_of_2(x: int) -> int:
     out = triton.next_power_of_2(x)
     return out // 2 if out > x else out
@@ -41,6 +40,6 @@ def serialize_dict(d: Dict[str, Any]) -> str:
     sorted_items = sorted(items_list)
     return json.dumps(sorted_items)
 
-def deserialize_string(s: str) -> Dict[str, Any]:
+def deserialize_dict(s: str) -> Dict[str, Any]:
     items_list = json.loads(s)
     return dict(items_list)
