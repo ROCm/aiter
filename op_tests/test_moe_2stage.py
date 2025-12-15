@@ -29,7 +29,10 @@ from aiter.ops.quant import (
     get_hip_quant,
     per_1x32_f8_scale_f8_quant,
 )
-from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.utility.fp4_utils import (
+    moe_mxfp4_sort,
+    fused_quant_fp8_sort,
+)
 
 
 from aiter.ops.shuffle import (
@@ -46,7 +49,7 @@ def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-# setup_seed(1)
+setup_seed(100)
 
 
 @benchmark()
@@ -283,15 +286,21 @@ def test_fmoe(
         and w1_qt_aiter.dtype == dtypes.fp4x2
         and actType == aiter.ActivationType.Swiglu
     ):
-        a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType, scale_type=dtypes.fp8)
-        a1_scale_stage1_bak = a1_scale_stage1
-        print(a1_scale_stage1)
-        a1_scale_stage1 = moe_mxfp4_sort(
-            a1_scale_stage1,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=block_size_M,
+        # a1, a1_scale_stage1 = per_1x32_f8_scale_f8_quant(input, quant_dtype=AQDType, scale_type=dtypes.fp8)
+        # a1_scale_stage1_bak = a1_scale_stage1
+        # print(a1_scale_stage1)
+        # a1_scale_stage1 = moe_mxfp4_sort(
+        #     a1_scale_stage1,
+        #     sorted_ids=sorted_ids,
+        #     num_valid_ids=num_valid_ids,
+        #     token_num=token_num,
+        #     block_size=block_size_M,
+        # )
+        a1, a1_scale_stage1 = fused_quant_fp8_sort(
+            input,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
         )
     elif input.dtype != q_dtype_a:
         a1, a1_scale_stage1 = quant_func(
@@ -376,7 +385,7 @@ def test_fmoe(
     # Benchmark Stage 1
     a2, us1 = run_perftest(
         metadata.stage1,
-        a1,
+        a1_2,
         w1_qt_aiter,
         w2_qt_aiter,
         sorted_ids,
@@ -386,7 +395,7 @@ def test_fmoe(
         topk,
         block_m=block_size_M,
         # a1_scale=a1_scale_tmp,
-        a1_scale=a1_scale_stage1,
+        a1_scale=scale_2,
         w1_scale=w1_scale_aiter,
         sorted_weights=sorted_weights if doweight_stage1 else None,
         num_iters=5,
@@ -422,13 +431,11 @@ def test_fmoe(
         and w1_qt_aiter.dtype == dtypes.fp4x2
         and actType == aiter.ActivationType.Swiglu
     ):
-        a2, a2_scale_stage2 = per_1x32_f8_scale_f8_quant(a2, quant_dtype=AQDType, scale_type=dtypes.fp8)
-        a2_scale_stage2 = moe_mxfp4_sort(
-            a2_scale_stage2,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=block_size_M,
+        a2, a2_scale_stage2 = fused_quant_fp8_sort(
+            input,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
         )
     elif qType == aiter.QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)

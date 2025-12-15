@@ -109,7 +109,8 @@ def per_1x32_f8_scale_f8_quant(x, scale=None, quant_dtype=dtypes.fp8, scale_type
     # # dtypeMax = F4E2M1_MAX
     # dtypeMax = 2.0**MAX_POW2
     # dtypeMax = get_dtype_max(quant_dtype)/8
-    dtypeMax = 6.0 
+    # dtypeMax = 6.0 
+    dtypeMax = 448.0
     MAX_POW2 = int(torch.log2(torch.tensor(dtypeMax, dtype=torch.float32)).item())
     # dtypeMax = F4E2M1_MAX
     dtypeMax = 2.0**MAX_POW2 
