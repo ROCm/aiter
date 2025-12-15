@@ -26,10 +26,10 @@ from aiter.int4_utils import (
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.utility import fp4_utils
 import torch.nn.functional as F
 from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 
@@ -49,7 +49,7 @@ class FmoeTuner(TunerCommon):
         "untune_file": "aiter/configs/untuned_fmoe.csv",
         "errRatio": 0.5,
         "batch": 100,
-        "profile_file": "aiter/configs/profile_fmoe.csv",  # for all results
+        "profile_file": "",  # for all results
     }
 
     def _setup_specific_arguments(self):
@@ -134,15 +134,6 @@ class FmoeTuner(TunerCommon):
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
-
-        a1_scale = moe_mxfp4_sort(
-            a1_scale,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=blockM,
-        )
-
         out = torch.empty(
             (token_num, topk, inter_dim),
             dtype=dtype,
@@ -158,7 +149,7 @@ class FmoeTuner(TunerCommon):
             out,
             topk,
             kernelName,
-            fp4_utils.e8m0_shuffle(w1_scale),
+            w1_scale,
             a1_scale,
             blockM,
             sorted_weights,
@@ -195,14 +186,6 @@ class FmoeTuner(TunerCommon):
         model_dim = w2_qt_shffle_ck.shape[1]
         token_num = a2_qt.shape[0]
 
-        a2_scale = moe_mxfp4_sort(
-            a2_scale[: token_num * topk, :].view(token_num, topk, -1),
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=blockM,
-        )
-
         out = torch.zeros(
             (token_num, model_dim),
             dtype=dtype,
@@ -218,9 +201,7 @@ class FmoeTuner(TunerCommon):
             out,
             topk,
             kernelName,
-            fp4_utils.e8m0_shuffle(
-                w2_scale
-            ),  # e8m0_shuffle will do nothing if it's a fp32
+            w2_scale,
             a2_scale,
             blockM,
             sorted_weights,
@@ -415,14 +396,13 @@ class FmoeTuner(TunerCommon):
             quant_type == QuantType.No
             and activation == ActivationType.Silu
             and not isG1U1
-            or doweight_stage1
             or quant_type == QuantType.per_1x32
         ):
-            print("not support No Quant Silu G1U0 1 stage tuning!")
+            print("not support No Quant Silu G1U0 1 stage or per_1x32 quant tuning!")
         else:
             if quant_type == QuantType.per_1x128:
                 fmoe_func = FmoeTuner.run_1stage_fmoe_fp8_blockscale_g1u1
-            elif (q_dtype_a == dtypes.fp8) & doweight_stage1:
+            elif (q_dtype_a == dtypes.fp8) and doweight_stage1:
                 fmoe_func = FmoeTuner.run_1stage_fmoe_g1u1_tkw1
             elif isG1U1:
                 fmoe_func = FmoeTuner.run_1stage_fmoe_g1u1
@@ -467,13 +447,24 @@ class FmoeTuner(TunerCommon):
             )
             a1_qt = a1_qt.view(token, model_dim)
             a1_scale = a1_scale.squeeze(-1)
+        elif (
+            q_type == aiter.QuantType.per_1x32
+            and (q_dtype_a in [dtypes.bf16, dtypes.fp16])
+            and q_dtype_w == dtypes.fp4x2
+        ):  # a16w4
+            a1_qt = input.to(dtype)
+            a1_scale = None
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
         del w1, w2, score
+        if q_dtype_w is not dtypes.fp4x2:
+            w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
+            w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
+        else:
+            w1_qt_shffle = w1_qt
+            w2_qt_shffle = w2_qt
 
-        w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
-        w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
             moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
         )
@@ -639,24 +630,39 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
+        w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
+            if q_type == QuantType.per_1x32:
+                a1_scale_fp4_sort = moe_mxfp4_sort(
+                    a1_scale,  # a1_scale[: token * topk, :].view(token, topk, -1),
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token,
+                    block_size=blockM,
+                )
+            else:
+                a1_scale_fp4_sort = a1_scale
+
             return (
-                a1_qt,
-                w1_qt_shffle_ck,
-                w2_qt_shffle_ck,
-                a1_scale,
-                w1_scale,
-                sorted_ids,
-                sorted_expert_ids,
-                sorted_weights,
-                num_valid_ids,
-                moe_buf,
-                w1_qt,
-                w2_qt,
-                topk_weights,
-                topk_ids,
+                a1_qt,  # 0
+                w1_qt_shffle_ck,  # 1
+                w2_qt_shffle_ck,  # 2
+                a1_scale,  # 3
+                w1_scale,  # 4
+                sorted_ids,  # 5
+                sorted_expert_ids,  # 6
+                sorted_weights,  # 7
+                num_valid_ids,  # 8
+                moe_buf,  # 9
+                w1_qt,  # 10
+                w2_qt,  # 11
+                topk_weights,  # 12
+                topk_ids,  # 13
+                a1_scale_fp4_sort,  # 14
+                w1_scale_aiter,
             )
         elif stage == 2:
             ref1 = FmoeTuner.run_torch_moe_stage1(
@@ -687,21 +693,33 @@ class FmoeTuner(TunerCommon):
             a2_qt = a2_qt.view(token, topk, -1)
             if doweight_stage1:
                 sorted_weights = None
+            if q_type == QuantType.per_1x32:
+                a2_scale_mxfp4_sort = moe_mxfp4_sort(
+                    a2_scale[: token * topk, :].view(token, topk, -1),
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token,
+                    block_size=blockM,
+                )
+            else:
+                a2_scale_mxfp4_sort = a2_scale
             return (
-                a2_qt,
-                w1_qt_shffle_ck,
-                w2_qt_shffle_ck,
-                a2_scale,
-                w2_scale,
-                sorted_ids,
-                sorted_expert_ids,
-                sorted_weights,
-                num_valid_ids,
-                moe_buf,
-                w1_qt,
-                w2_qt,
-                topk_weights,
-                topk_ids,
+                a2_qt,  # 0
+                w1_qt_shffle_ck,  # 1
+                w2_qt_shffle_ck,  # 2
+                a2_scale,  # 3
+                w2_scale,  # 4
+                sorted_ids,  # 5
+                sorted_expert_ids,  # 6
+                sorted_weights,  # 7
+                num_valid_ids,  # 8
+                moe_buf,  # 9
+                w1_qt,  # 10
+                w2_qt,  # 11
+                topk_weights,  # 12
+                topk_ids,  # 13
+                a2_scale_mxfp4_sort,  # 14
+                w2_scale_aiter,
             )
 
     @staticmethod
@@ -766,7 +784,7 @@ class FmoeTuner(TunerCommon):
         fc1_smooth_scale = None
         fc2_smooth_scale = None
         if q_type == QuantType.per_1x32:
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = moe_mxfp4_sort(
                 a1_scale,
                 sorted_ids,
                 num_valid_ids,
@@ -1268,8 +1286,6 @@ class FmoeTuner(TunerCommon):
             quantDtype = ""
         if doweight_stage1:
             extraInfo_1stage = "_tkw1"
-            if q_dtype_a == dtypes.fp8:
-                quantDtype = "Int8"  ## tmp solution, need to be updated
         if q_type == QuantType.No:
             quantDtype_1stage = "noquant"
         elif q_type == QuantType.per_1x128:
@@ -1523,6 +1539,7 @@ class FmoeTuner(TunerCommon):
             int(q_type),
             str(act_type).split(".")[-1].lower(),
             doweight_stage1,
+            False,  # bpreshuffle
         )
         _, ck_stage2_kernels = get_gemm2_kernels_list(
             dtype2str_dict[q_dtype_a],
@@ -1531,6 +1548,7 @@ class FmoeTuner(TunerCommon):
             False,
             int(q_type),
             not doweight_stage1,
+            False,  # bpreshuffle
         )
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
@@ -1559,7 +1577,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             FmoeTuner.ck_moe_stage1_fwd_out,  # func
                             (
-                                [0, 1, 2, 5, 6, 7, 8, 4, 3],
+                                [0, 1, 2, 5, 6, 7, 8, 15, 14],
                                 dtype,
                                 topk,
                                 kernel.name,
@@ -1570,6 +1588,7 @@ class FmoeTuner(TunerCommon):
                             {},
                             FmoeTuner.run_torch_moe_stage1,
                             (
+                                # [a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
                                 [0, 10, 11, 12, 13, 3, 4],
                                 dtype,
                                 act_type,
@@ -1610,7 +1629,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             FmoeTuner.ck_moe_stage2_fwd_out,  # func
                             (
-                                [0, 1, 2, 5, 6, 7, 8, 4, 3],
+                                [0, 1, 2, 5, 6, 7, 8, 15, 14],
                                 dtype,
                                 topk,
                                 kernel.name,
@@ -1798,6 +1817,10 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
+            ## remove invalid candidate
+            profileDF = profileDF[
+                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf"))
+            ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
             )
@@ -1878,14 +1901,6 @@ class FmoeTuner(TunerCommon):
             )
             profileDF["run_1stage"] = 0
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
-            ## remove invalid candidate
-            profileDF = profileDF[
-                (profileDF["err1"] < args.errRatio)
-                & (profileDF["err2"] < args.errRatio)
-            ]
-            profileDF = profileDF[
-                (profileDF["us1"] != float("inf")) & (profileDF["us2"] != float("-inf"))
-            ]
             if len(profileDF) == 0:
                 print(
                     f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"
@@ -1943,6 +1958,13 @@ class FmoeTuner(TunerCommon):
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
             profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
             profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
+            if args.profile_file != "":
+                if os.path.exists(args.profile_file):
+                    old_df = pd.read_csv(args.profile_file)
+                else:
+                    old_df = pd.DataFrame(columns=self.columns)
+                tmpprofileDF = pd.concat([old_df, profileDF], ignore_index=True)
+                tmpprofileDF.to_csv(args.profile_file, index=False)
             best_one = profileDF.loc[profileDF["us"].idxmin()].copy()
             print(
                 f"Tuning result for {key} is {best_one['block_m'] ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
@@ -1956,12 +1978,12 @@ class FmoeTuner(TunerCommon):
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
             profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")
+            profile_file = f"aiter/configs/profile_fmoe.csv"
             old_profile = self.get_tuned_gemm_list(
-                args.profile_file, profile_result.columns.tolist()
+                profile_file, profile_result.columns.tolist()
             )
-
             profile_result = pd.concat([old_profile, profile_result])
-            profile_result.to_csv(args.profile_file, index=False)
+            profile_result.to_csv(profile_file, index=False)
         if len(bests) > 0:
             return pd.concat(bests, axis=1).T
         else:

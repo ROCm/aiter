@@ -5,9 +5,7 @@ import sys
 import torch
 import triton
 
-from aiter.ops.triton.lean_atten import (
-    _persistent_lean_attention,
-)
+from aiter.ops.triton.lean_atten import _persistent_lean_attention
 
 
 configs = []
@@ -340,8 +338,6 @@ def bench_lean_attention(
         list_sum_block_n.append(len_sum)
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
-    sm_scale = 0.5
-
     # Allocate Tensors
     q = torch.empty((n_ctx_q * batch, hq, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
@@ -377,7 +373,6 @@ def bench_lean_attention(
         XCD_REMAP,
         causal,
         batch,
-        sm_scale,
         RAGGED_BATCH,
         num_warps,
         waves_per_eu,

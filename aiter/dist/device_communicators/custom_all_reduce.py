@@ -266,6 +266,7 @@ class CustomAllreduce:
         inp: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        use_new: bool = True,
         open_fp8_quant: bool = False,
         registered: bool = False,
     ):
@@ -281,13 +282,14 @@ class CustomAllreduce:
             self._ptr,
             inp,
             out,
+            use_new,
             open_fp8_quant,
             None if registered else self.buffer,
         )
         return out
 
     def custom_all_reduce(
-        self, input: torch.Tensor, open_fp8_quant: bool = False
+        self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -295,7 +297,10 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce(
-                    input, open_fp8_quant=open_fp8_quant, registered=True
+                    input,
+                    use_new=use_new,
+                    open_fp8_quant=open_fp8_quant,
+                    registered=True,
                 )
             else:
                 # if warm up, mimic the allocation pattern
@@ -307,7 +312,7 @@ class CustomAllreduce:
             # be small(<=1% of overall latency) compared to the performance
             # gains of using custom kernels
             return self.all_reduce(
-                input, open_fp8_quant=open_fp8_quant, registered=False
+                input, use_new=use_new, open_fp8_quant=open_fp8_quant, registered=False
             )
 
     def all_gather_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
@@ -361,7 +366,7 @@ class CustomAllreduce:
             eps,
             None if registered else self.buffer,
         )
-        return res_out, out
+        return out, res_out
 
     def custom_fused_ar_rms(
         self,

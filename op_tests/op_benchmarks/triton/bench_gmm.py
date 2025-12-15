@@ -120,6 +120,8 @@ def benchmark_gmm(
     num_group_sizes: int = NUM_GROUP_SIZES,
     unif_group_sizes: bool = False,
     metric: str = DEFAULT_METRIC,
+    use_bias: bool = False,
+    accumulate: bool = False,
 ) -> None:
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
     assert metric in METRICS, "Invalid benchmark metric."
@@ -150,7 +152,7 @@ def benchmark_gmm(
     def benchmark(M: int, K: int, N: int, G: int, provider: str):
         logging.info("    (M, K, N, G) = (%d, %d, %d, %d)", M, K, N, G)
 
-        lhs, rhs, multiple_group_sizes, out = gen_tensors(
+        lhs, rhs, multiple_group_sizes, out, bias = gen_tensors(
             M,
             K,
             N,
@@ -162,6 +164,7 @@ def benchmark_gmm(
             trans_rhs=trans_rhs,
             rng_seed=rng_seed,
             unif_group_sizes=unif_group_sizes,
+            use_bias=use_bias,
         )
 
         quantiles = [0.5, 0.2, 0.8]
@@ -176,14 +179,22 @@ def benchmark_gmm(
                 "      group_sizes (first 5) = %s", str(group_sizes[:5].tolist())
             )
 
+            kwargs = {
+                "lhs": lhs,
+                "rhs": rhs,
+                "group_sizes": group_sizes,
+                "preferred_element_type": out_dtype,
+                "existing_out": out,
+            }
+
+            if gmm_type == "gmm":
+                kwargs["bias"] = bias
+            elif gmm_type == "ptgmm" or gmm_type == "nptgmm":
+                kwargs["bias_grad"] = bias
+                kwargs["accumulate"] = accumulate
+
             p50_ms, p20_ms, p80_ms = triton.testing.do_bench(
-                lambda: kernel_wrapper(
-                    lhs,
-                    rhs,
-                    group_sizes,
-                    preferred_element_type=out_dtype,
-                    existing_out=out,
-                ),
+                lambda: kernel_wrapper(**kwargs),
                 quantiles=quantiles,
             )
 
@@ -256,10 +267,12 @@ def benchmark_gmm(
 
     logging.info("Benchmarking Triton %s kernel:", desc)
     logging.info(
-        "  input_type = %s, output_type = %s, rng_seed = %d",
+        "  input_type = %s, output_type = %s, rng_seed = %d, use_bias = %s, accumulate = %s",
         in_dtype_str,
         out_dtype_str,
         rng_seed,
+        use_bias,
+        accumulate,
     )
     logging.info(
         "  trans_lhs = %s, trans_rhs = %s",
@@ -406,7 +419,16 @@ def parse_args() -> argparse.Namespace:
 
     # Other arguments
     parser.add_argument("--verbose", action="store_true", help="enable verbose output")
-
+    parser.add_argument(
+        "--use-bias",
+        action="store_true",
+        help="use bias",
+    )
+    parser.add_argument(
+        "--accumulate",
+        action="store_true",
+        help="accumulate bias gradient",
+    )
     try:
         return validate_args(parser.parse_args())
     except argparse.ArgumentError as arg_error:
@@ -445,6 +467,8 @@ def main() -> None:
         num_group_sizes=args.num_group_sizes,
         unif_group_sizes=args.unif_group_sizes,
         metric=args.metric,
+        use_bias=args.use_bias,
+        accumulate=args.accumulate,
     )
 
 

@@ -6,14 +6,15 @@ import torch
 from torch import Tensor
 import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
-    _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel,
-    _batched_gemm_afp4_wfp4_pre_quant_kernel,
-    _get_config,
-)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+<<<<<<< HEAD
 from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_string
 from aiter.jit.utils.torch_guard import torch_compile_guard
+=======
+from aiter.ops.triton.batched_gemm_a16wfp4 import (
+    batched_gemm_a16wfp4,
+)
+>>>>>>> main
 
 _LOGGER = AiterTritonLogger()
 
@@ -31,6 +32,7 @@ def batched_gemm_afp4wfp4_pre_quant_fake_tensor(
     w_scales: Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
+<<<<<<< HEAD
     config: Optional[str] = None,
 ) -> Tensor:
     if y is None:
@@ -48,9 +50,14 @@ def batched_gemm_afp4wfp4_pre_quant_(
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
 ) -> Tensor:
+=======
+    config: Optional[dict] = None,
+):
+>>>>>>> main
     _LOGGER.info(
-        f"BATCHED_GEMM_AFP4WFP_PREQUANT: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w.shape)}"
+        "batched_gemm_afp4wfp4_pre_quant will be deprecated in future AITER release, please switch to batched_gemm_a16wfp4"
     )
+<<<<<<< HEAD
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
@@ -187,3 +194,8 @@ def batched_gemm_afp4wfp4_pre_quant(
     """
     config_hashable = serialize_dict(config) if config else None
     return batched_gemm_afp4wfp4_pre_quant_(x, w, w_scales, dtype, y, config_hashable)
+=======
+    return batched_gemm_a16wfp4(
+        x, w, w_scales, dtype, y, config, transpose_bm=False, prequant=True
+    )
+>>>>>>> main
