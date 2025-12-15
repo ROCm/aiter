@@ -5,7 +5,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
 )
-from op_tests.triton_tests.test_moe_align_block_size import input_helper
+from op_tests.triton_tests.moe.test_moe_align_block_size import input_helper
 import torch
 import argparse
 from aiter.ops.triton.moe_align_block_size import moe_align_block_size_triton
