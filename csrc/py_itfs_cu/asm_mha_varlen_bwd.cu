@@ -265,13 +265,13 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
 
             // dk_expanded: (total_k, nheads, hdim_q)
             ck_tile::index_t batch_stride_dk = 0;
-            ck_tile::index_t stride_dk = dk.stride(0);
-            ck_tile::index_t nhead_stride_dk = dk.stride(1);
+            ck_tile::index_t stride_dk = dk_expanded.stride(0);
+            ck_tile::index_t nhead_stride_dk = dk_expanded.stride(1);
 
             // dv_expanded: (total_k, nheads, hdim_v)
             ck_tile::index_t batch_stride_dv = 0;
-            ck_tile::index_t stride_dv = dv.stride(0);
-            ck_tile::index_t nhead_stride_dv = dv.stride(1);
+            ck_tile::index_t stride_dv = dv_expanded.stride(0);
+            ck_tile::index_t nhead_stride_dv = dv_expanded.stride(1);
 
             ck_tile::index_t split_stride_dq_acc;
             ck_tile::index_t batch_stride_dq_acc;
