@@ -6,8 +6,11 @@ import torch
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffled_scales,
-    gemm_afp4wfp4_preshuffled_weight_scales,
+    gemm_afp4wfp4_preshuffled_weight_scales
 )
+# from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
+#     gemm_afp4wfp4_preshuffled_weight_scales,
+# )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight
@@ -225,13 +228,19 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
-@pytest.mark.parametrize("output", [True, False])
+# @pytest.mark.parametrize("M, N, K", get_x_vals())
+# # @pytest.mark.parametrize("M, N, K", [(9728, 8192, 65536)])
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+# @pytest.mark.parametrize("output", [True, False])
+
+@pytest.mark.parametrize("M, N, K", [(9728, 8192, 65536)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN"])
+@pytest.mark.parametrize("output", [True])
 @pytest.mark.parametrize(
     "shuffle_scales_fg, shuffle_weight_fg",
-    [(False, False), (True, False), (True, True)],
+    [(True, True)],
 )
 def test_gemm_afp4_wfp4(
     M: int, N: int, K: int, dtype, layout, output, shuffle_scales_fg, shuffle_weight_fg

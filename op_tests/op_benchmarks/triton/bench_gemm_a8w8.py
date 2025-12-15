@@ -3,9 +3,11 @@ import triton
 import math
 from aiter.ops.triton.gemm_a8w8 import (
     gemm_a8w8 as triton_gemm_a8w8,
+    # gemm_a8w8_preshuffle as triton_gemm_a8w8_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8 as gluon_gemm_a8w8,
+    gemm_a8w8_preshuffle as triton_gemm_a8w8_preshuffle,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.test_gemm_a8w8 import (
@@ -25,11 +27,11 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callable):
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: callable):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
-    x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
-        M, N, K, str_to_torch_dtype["fp8e4m3"], c_dtype, layout=layout, output=True
+    x, weight, weight_shuffled, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+        M, N, K, str_to_torch_dtype["fp8e4m3"], c_dtype, layout=layout, output=True, shuffle=True
     )
 
     # flops
@@ -38,12 +40,18 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callab
     mem_read = (M * K) * x.element_size() + (N * K) * weight.element_size()
     mem_write = (M * N) * bias.element_size()
     mem = mem_read + mem_write
-
-    ms = triton.testing.do_bench(
-        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
-        warmup=25,
-        rep=100,
-    )
+    if shuffle:
+        ms = triton.testing.do_bench(
+            lambda: triton_gemm_a8w8_preshuffle(x, weight_shuffled, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+            warmup=25,
+            rep=100,
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+            warmup=25,
+            rep=100,
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -107,7 +115,7 @@ def run_shape_benchmark(args, impl):
     def bench_gemm_a8w8(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl)
+        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle, impl)
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -149,6 +157,9 @@ def parse_args():
         "-gluon",
         action="store_true",
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
+    )
+    parser.add_argument(
+        "--shuffle", action="store_true", help="Preshuffle weight"
     )
     return get_ff_args(parser)
 
