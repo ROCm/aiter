@@ -119,6 +119,7 @@ def compile(
     fp8_max_value: float,
     value_transposed: int,
     is_causal: int,
+    use_sinks: int,
     func_name: str = None,
 ):
     """Compile the combined attention and reduce kernel for paged attention decode."""
@@ -143,6 +144,7 @@ def compile(
                 fp8_max_value,
                 value_transposed,
                 is_causal,
+                use_sinks,
             ),
         )
 
@@ -296,6 +298,7 @@ def compile(
             f"{equi_query_group_size_pow2}",
             f"{head_size_pow2}",
             f"{context_partition_size}",
+            f"{use_sinks}",
         ]
         reduce_signature = ",".join(reduce_signature_parts)
         reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
@@ -715,6 +718,7 @@ def pa_decode_gluon_aot(
         fp8_max_value=fp8_max_value,
         value_transposed=int(value_transposed),
         is_causal=int(is_causal),
+        use_sinks=int(sinks is not None),
     )
 
     assert combined_func is not None, "Combined function is not compiled"

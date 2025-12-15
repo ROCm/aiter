@@ -2517,6 +2517,7 @@ def paged_attention_decode_v2_reduce_kernel(
     QUERY_GROUP_SIZE_POW2: tl.constexpr,
     HEAD_SIZE_POW2: tl.constexpr,
     CONTEXT_PARTITION_SIZE: tl.constexpr,
+    USE_SINKS: tl.constexpr,
 ):
     """
     Triton reduction kernel for paged attention decode that combines partial results.
@@ -2602,7 +2603,7 @@ def paged_attention_decode_v2_reduce_kernel(
         global_exp_sum = update_scale * global_exp_sum + tl.sum(exp_sums, axis=0)
         global_max_prev = global_max
 
-    if sink_token_ptr is not None:
+    if USE_SINKS:
         sink_token_values = gl.load(
             sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
             mask=query_group_offsets < query_group_size,
@@ -2949,6 +2950,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         QUERY_GROUP_SIZE_POW2=QUERY_GROUP_SIZE_POW2,
         HEAD_SIZE_POW2=triton.next_power_of_2(HEAD_SIZE),
         CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
+        USE_SINKS=sink_token_ptr is not None,
     )
 
 
