@@ -309,7 +309,7 @@ inline __device__ void load_lds_to_gpr(RT& dst,
 
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
-    __attribute__((amdgpu_num_vgpr(64))) void kn_mla_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
+    __attribute__((amdgpu_num_vgpr(72))) void kn_mla_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
 {
     using q_t    = T::q_t;
     using kv_t   = T::kv_t;
@@ -317,6 +317,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     using comp_t = float;
 
     using G = hk::group<T::kNumWarps>;
+
+    constexpr float log2e = 1.4426950408889634;
 
     const int32_t worker_idx     = blockIdx.x;
     const int32_t work_start_idx = __builtin_amdgcn_readfirstlane(params.p_work_indptr[worker_idx]);
@@ -422,6 +424,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         const int32_t kv_end = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5]);
 
+        /// TODO: Remove duplicates of the following regs across threads in a subwarp (16 thrs)
+        float row_max[p_comp.elements_per_base_tile];
+        float row_sum_e[p_comp.elements_per_base_tile];
+
         // Load Q from VRAM to GPRs
         hk::load<2, 0>(q_nope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
         hk::load<2, T::kQkNopeHeadDim>(
@@ -496,6 +502,78 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             });
 
             hk::mul_vgpr(p_comp, p_comp, params.softmax_scale);
+
+            // Softmax
+            ckt::static_for<0, p_comp.elements_per_base_tile, 1>{}([&](auto row_idx) {
+                // Get max of each row of p_comp
+                constexpr uint32_t vgpr_off = k_p_comp_begin + row_idx.value;
+                /// TODO: It would be better to do the cal on vgpr_off and vgpr_off+4 directly.
+                float v0 = hkm::v_get_gpr<vgpr_off, float>();
+                float v1 = hkm::v_get_gpr<vgpr_off + 4, float>();
+
+                float local_max = ckt::max(v0, v1);
+
+                const uint32_t subwarp_base_idx = lane_idx & 0xf0;
+                const uint32_t subwarp_idx      = lane_idx & 0xf;
+#pragma unroll
+                for(uint32_t offset = 8; offset > 0; offset /= 2)
+                {
+                    const uint32_t src_lane =
+                        (((offset ^ 16) ^ subwarp_idx) & 0xf) | subwarp_base_idx;
+                    local_max = ckt::max(local_max, ckt::warp_shuffle(local_max, src_lane));
+                }
+                const float new_row_max =
+                    kIsFirstIter ? local_max : ckt::max(local_max, row_max[row_idx.value]);
+                const float rescale =
+                    kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((local_max - new_row_max) * log2e);
+
+                if constexpr(kIsTail)
+                {
+                    const int32_t col_idx = lane_idx & 0xf; // lane_idx % 16
+                    if((col_idx + kv_tile_start) < kv_end)
+                    {
+                        v0 = __builtin_amdgcn_exp2f((v0 - new_row_max) * log2e);
+
+                        if((col_idx + 16 + kv_tile_start) < kv_end)
+                        {
+                            v1 = __builtin_amdgcn_exp2f((v1 - new_row_max) * log2e);
+                        }
+                        else
+                        {
+                            v1 = 0.0f;
+                        }
+                    }
+                    else
+                    {
+                        v0 = 0.0f;
+                        v1 = 0.0f;
+                    }
+                }
+                else
+                {
+                    v0 = __builtin_amdgcn_exp2f((v0 - new_row_max) * log2e);
+                    v1 = __builtin_amdgcn_exp2f((v1 - new_row_max) * log2e);
+                }
+
+                row_max[row_idx.value] = new_row_max;
+
+                // Get sum of exp of each row
+                float local_sum_e = v0 + v1;
+#pragma unroll
+                for(uint32_t offset = 8; offset > 0; offset /= 2)
+                {
+                    const uint32_t src_lane =
+                        (((offset ^ 16) ^ subwarp_idx) & 0xf) | subwarp_base_idx;
+                    local_sum_e += ckt::warp_shuffle(local_sum_e, src_lane);
+                }
+
+                row_sum_e[row_idx.value] =
+                    kIsFirstIter ? local_sum_e : (rescale * row_sum_e[row_idx.value] + local_sum_e);
+
+                // Move exp from unpinned reg to pinned reg
+                hkm::v_mov_b32_up2p<vgpr_off>(v0);
+                hkm::v_mov_b32_up2p<vgpr_off + 4>(v1);
+            });
 
             float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
             float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
