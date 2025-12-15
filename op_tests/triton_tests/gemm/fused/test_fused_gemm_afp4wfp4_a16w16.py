@@ -7,11 +7,15 @@ import pytest
 from aiter.ops.triton.fused_gemm_afp4wfp4_a16w16 import (
     fused_gemm_afp4wfp4_a16w16,
 )
-from op_tests.triton_tests.test_gemm_afp4wfp4 import (
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     generate_gemm_afp4wfp4_inputs,
 )
-from op_tests.triton_tests.test_gemm_afp4wfp4 import run_torch as run_torch_fp4
-from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    run_torch as run_torch_fp4,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+    generate_gemm_a16w16_inputs,
+)
 import torch.nn.functional as F
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 

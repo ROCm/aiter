@@ -242,7 +242,7 @@ def run_benchmark(custom, args):
 
         # Test mode: run tests from op_tests with specified shapes
         if args.test_mode:
-            import op_tests.triton_tests.test_mha as test_mha
+            import op_tests.triton_tests.attention.test_mha as test_mha
 
             print(
                 f"Testing kernel implementation <{provider}> against Torch with shape:"
