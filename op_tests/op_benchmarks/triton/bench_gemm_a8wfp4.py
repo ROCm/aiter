@@ -5,7 +5,9 @@ import math
 from aiter.ops.triton.gemm_a8wfp4 import (
     gemm_a8wfp4,
 )
-from op_tests.triton_tests.test_gemm_a8wfp4 import generate_gemm_a8wfp4_inputs
+from op_tests.triton_tests.gemm.basic.test_gemm_a8wfp4 import (
+    generate_gemm_a8wfp4_inputs,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,

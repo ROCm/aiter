@@ -1,23 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import math
+
 import random
 import argparse
 
-import pytest
 import torch
 import os
 
 import triton
-import triton.language as tl
 
-from aiter.test_common import checkAllclose, run_perftest, perftest, benchmark
-from aiter.ops.triton.pa_mqa_logits import (
-    deepgemm_fp8_paged_mqa_logits_stage1,
-    deepgemm_fp8_paged_mqa_logits,
-    deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
-    deepgemm_fp8_paged_mqa_logits_ragged_k,
-)
+from aiter.test_common import run_perftest
+from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.ops.shuffle import shuffle_weight
 
 
