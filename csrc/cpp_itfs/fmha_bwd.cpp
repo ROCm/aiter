@@ -81,9 +81,6 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
             {
                 ts_kv = cfg.ts;
                 tmp_ts_kv = ts_kv;
-                // std::cout << "dqdkdv kernel: " << el.first << std::endl;
-                // std::cout << el.first.find("recompile") << std::endl;
-                // std::cout << (el.first.find("recompile") != std::string::npos) << std::endl;
                 if (cfg.atomic32 == 0 && ((arch_id == "gfx942") || (el.first.find("recompile") != std::string::npos)))
                 {
 
@@ -272,7 +269,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }();
 
     bool need_post_processing = ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
-    std::cout << "need_post_processing: " << need_post_processing << std::endl;
 
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
@@ -288,9 +284,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
-    // std::cout << "pre_kernel: " << pre_kernel << std::endl;
-    // std::cout << "dqdkdv_kernel: " << dqdkdv_kernel << std::endl;
-    // std::cout << "post_kernel: " << post_kernel << std::endl;
     if((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == "")))
     {
         return -1;
