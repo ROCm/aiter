@@ -2205,6 +2205,51 @@ def simple_test():
     HEAD_DIMENSION_OPTIONS = [64, 128]
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
     BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
+    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
+    QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False]
+    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
+    USE_AOT_IMPL_OPTIONS = [True]
+    BLOCK_SIZE_OPTIONS = [16]
+    parse_arg_and_run_test()
+    BLOCK_SIZE_OPTIONS = [64]
+    parse_arg_and_run_test()
+    # HEAD_CONFIGURATIONS = [(10, 1)]
+    # BLOCK_SIZE_OPTIONS = [1024]
+    # parse_arg_and_run_test()
+
+
+def sliding_window_test():
+    """Run simple test."""
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global COMPUTE_TYPE_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global SINKS_OPTIONS
+    global SLIDING_WINDOW_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global QUANT_Q_AND_KV_OPTIONS
+    global USE_TORCH_FLASH_REF_OPTIONS
+    global USE_AOT_IMPL_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+
+    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+    # COMPUTE_TYPE_OPTIONS = ["fp8"]
+
+    SINKS_OPTIONS = [True]
+    SLIDING_WINDOW_OPTIONS = [0, 128]
+    HEAD_DIMENSION_OPTIONS = [64, 128]
+    CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
+    BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
     QUERY_LENGTH_OPTIONS = [1]
     COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
     QUANT_Q_AND_KV_OPTIONS = [[True, True]]
@@ -2217,9 +2262,6 @@ def simple_test():
     parse_arg_and_run_test()
     BLOCK_SIZE_OPTIONS = [64]
     parse_arg_and_run_test()
-    # HEAD_CONFIGURATIONS = [(10, 1)]
-    # BLOCK_SIZE_OPTIONS = [1024]
-    # parse_arg_and_run_test()
 
 
 def multi_compute_quant_type_test():
