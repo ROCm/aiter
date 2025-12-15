@@ -4,6 +4,7 @@
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
 from typing import Optional
+from functools import lru_cache
 import torch
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -23,12 +24,16 @@ except ImportError:
     gl = tl
     GLUON_JIT_KERNEL_ENABLED = False
 
-if arch_info.get_arch() in ["gfx950"]:
-    CDNA_VERSION = 4
-elif arch_info.get_arch() in ["gfx942"]:
-    CDNA_VERSION = 3
-else:
-    CDNA_VERSION = -1
+
+@lru_cache(maxsize=1)
+def get_cdna_version():
+    """Get CDNA version lazily to avoid CUDA initialization during import."""
+    if arch_info.get_arch() in ["gfx950"]:
+        return 4
+    elif arch_info.get_arch() in ["gfx942"]:
+        return 3
+    else:
+        return -1
 
 
 @gluon.jit
@@ -2745,6 +2750,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     SLIDING_WINDOW,
     sinks_ptr,
     ONE_SHOT,
+    CDNA_VERSION,
 ):
     """
     Wrapper function for paged attention decode kernel with dynamic kernel selection.
@@ -3107,7 +3113,8 @@ def pa_decode_gluon(
         raise RuntimeError(
             "This version triton is not support gluon jit mode, please upgrade to 3.5.0 or higher!"
         )
-    assert CDNA_VERSION in [
+    cdna_version = get_cdna_version()
+    assert cdna_version in [
         3,
         4,
     ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
@@ -3317,6 +3324,7 @@ def pa_decode_gluon(
         SLIDING_WINDOW=sliding_window,
         sinks_ptr=sinks,
         ONE_SHOT=one_shot,
+        CDNA_VERSION=cdna_version,
     )
     if not one_shot:
         # ==================== REDUCTION KERNEL EXECUTION ====================

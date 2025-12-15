@@ -44,15 +44,9 @@ from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
     transpose_query_gluon_aot,
     transpose_output_gluon_aot,
 )
+from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 
 MD_NAME = "pa_decode_attention_reduce_kernel"
-
-# Detect CDNA version based on target architecture
-target = triton.runtime.driver.active.get_current_target()
-if target.arch in ["gfx950"]:
-    CDNA_VERSION = 4
-else:
-    CDNA_VERSION = 3
 
 
 def clean_directory_except_so(directory_path):
@@ -120,6 +114,7 @@ def compile(
     value_transposed: int,
     is_causal: int,
     use_sinks: int,
+    cdna_version: int,
     func_name: str = None,
 ):
     """Compile the combined attention and reduce kernel for paged attention decode."""
@@ -145,6 +140,7 @@ def compile(
                 value_transposed,
                 is_causal,
                 use_sinks,
+                cdna_version,
             ),
         )
 
@@ -249,7 +245,7 @@ def compile(
             f"{fp8_max_value}",
             f"{value_transposed}",
             f"{is_causal}",
-            f"{CDNA_VERSION}",
+            f"{cdna_version}",
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"
@@ -545,9 +541,11 @@ def pa_decode_gluon_aot(
     - For FP8 computation, query_scale and key_scale/value_scale are required
     - For BF16/FP16 computation, scales can be None
     """
-    assert arch_info.get_arch() in (
-        "gfx942",
-    ), f"pa_decode_gluon only supports gfx942 (CDNA3) now, but got {arch_info.get_arch()}"
+    cdna_version = get_cdna_version()
+    assert cdna_version in [
+        3,
+        4,
+    ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
 
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
@@ -719,6 +717,7 @@ def pa_decode_gluon_aot(
         value_transposed=int(value_transposed),
         is_causal=int(is_causal),
         use_sinks=int(sinks is not None),
+        cdna_version=cdna_version,
     )
 
     assert combined_func is not None, "Combined function is not compiled"
