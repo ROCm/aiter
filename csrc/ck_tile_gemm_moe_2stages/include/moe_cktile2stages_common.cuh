@@ -174,7 +174,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                           scheduler,
                                                           has_hot_loop_v,
                                                           tail_number_v,
-														  b_mem_nt_type_v>,
+							  b_mem_nt_type_v>,
                     ck_tile::F16xMXF4FlatmmPipelineProblem<ADataType,
                                                            BDataType,
                                                            AccDataType,
@@ -183,7 +183,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                            scheduler,
                                                            has_hot_loop_v,
                                                            tail_number_v,
-														   b_mem_nt_type_v>>,
+							   b_mem_nt_type_v>>,
                 ck_tile::FlatmmPipelineProblem<ADataType,
                                                BDataType,
                                                AccDataType,
@@ -192,7 +192,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                scheduler,
                                                has_hot_loop_v,
                                                tail_number_v,
-											   b_mem_nt_type_v>>;
+					       b_mem_nt_type_v>>;
 
         constexpr int BlockedXDLN_PerWarp =
             (BMXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up))

@@ -803,11 +803,11 @@ def fused_quant_fp8_sort(
         DTYPE_MAX = 448.0
         DTYPE_MIN = -448.0
 
-    x_fp8 = torch.zeros_like(input, dtype=quant_dtype, device="cuda")
+    x_fp8 = torch.empty_like(input, dtype=quant_dtype, device="cuda")
     M_o, N_o = sorted_ids.shape[0], N_blocks
 
     # [M_sorted_blocks/2, N_blocks/2, BLOCK_SIZE_N_u32, BLOCK_SIZE_M_u32]
-    scale_e8m0_packed = torch.zeros(
+    scale_e8m0_packed = torch.empty(
         (
             triton.cdiv(M_o, BLOCK_SIZE_M),
             triton.cdiv(N_o, BLOCK_SIZE_N),

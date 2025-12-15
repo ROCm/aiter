@@ -689,11 +689,12 @@ def get_2stage_cfgs(
     print(dtype)
     print(q_type)
     print(activation)
-    def get_block_m():
+
+    def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
-            return 32 if token < 2048 else 64,
-        else
-            16 if token < 2048 else 32 if token < 16384 else 64,
+            return 32 if token < 2048 else 64
+        else:
+            return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if run_1stage:
         return MOEMetadata(
