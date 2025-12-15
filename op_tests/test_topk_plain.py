@@ -99,24 +99,40 @@ def test_topk(
     )
 
     id_aiter, _aiter = torch.sort(topk_ids.to(torch.long))
-    err = checkAllclose(
-        id_ref,
-        id_aiter,
-        msg=(
-            f"topk_ids Performance Comparison:\n"
-            f"  {'Method':<10} {'Time (us)':>12}\n"
-            f"  {'-'*10} {'-'*12}\n"
-            f"  {'golden':<10} {us_ref:>12.2f}\n"
-            f"  {'triton':<10} {us_triton:>12.2f}\n"
-            f"  {'aiter':<10} {us_aiter:>12.2f}\n"
-        ),
-    )
-    # TODO: uncomment this when the aiter topk supports value return
-    # err = checkAllclose(
-    #     ref_value.gather(1, _ref),
-    #     topk_value.gather(1, _aiter),
-    #     msg="topk_values [golden vs aiter]",
-    # )
+
+    # Skip for float16 as it would has duplicates in topk_ids
+    if dtype != torch.float16 and dtype != torch.bfloat16:
+        err = checkAllclose(
+            ref_value,
+            topk_value,
+            msg="topk_values [golden vs aiter]",
+        )
+        err = checkAllclose(
+            id_ref,
+            id_aiter,
+            msg=(
+                f"topk_ids Performance Comparison:\n"
+                f"  {'Method':<10} {'Time (us)':>12}\n"
+                f"  {'-'*10} {'-'*12}\n"
+                f"  {'golden':<10} {us_ref:>12.2f}\n"
+                f"  {'triton':<10} {us_triton:>12.2f}\n"
+                f"  {'aiter':<10} {us_aiter:>12.2f}\n"
+            ),
+        )
+    else:
+        err = checkAllclose(
+            ref_value,
+            topk_value,
+            msg=(
+                f"topk_values [golden vs aiter]:\n"
+                f"  {'Method':<10} {'Time (us)':>12}\n"
+                f"  {'-'*10} {'-'*12}\n"
+                f"  {'golden':<10} {us_ref:>12.2f}\n"
+                f"  {'triton':<10} {us_triton:>12.2f}\n"
+                f"  {'aiter':<10} {us_aiter:>12.2f}\n"
+            ),
+        )
+
 
     return {
         "err": err,
