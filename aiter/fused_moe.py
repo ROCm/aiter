@@ -107,7 +107,6 @@ def fused_moe(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
-    q_dtype_a=None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -133,7 +132,6 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
-        q_dtype_a=q_dtype_a,
     )
 
 
@@ -195,7 +193,6 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    q_dtype_a: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -223,14 +220,14 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
 
-    if q_dtype_a is not None:
-        pass
-    elif w1.dtype != torch.uint32:
-        q_dtype_a = w1.dtype
+    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    bf16_fp8_bound = 512
+    if quant_type == QuantType.per_1x32 and M < bf16_fp8_bound:
+        q_dtype_a = dtypes.bf16
+    elif quant_type == QuantType.per_1x32 and M >= bf16_fp8_bound:
+        q_dtype_a = dtypes.fp8
     elif quant_type == QuantType.per_1x32:
         q_dtype_a = dtypes.fp4x2
-    else:
-        q_dtype_a = dtypes.fp8
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -692,7 +689,7 @@ def get_2stage_cfgs(
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
-            return 32 if token < 2048 else 64
+            return 32 # if token < 4096 else 64
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
