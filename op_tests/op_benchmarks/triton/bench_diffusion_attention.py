@@ -471,6 +471,7 @@ def run_benchmark_captured(args):
                 k,
                 v,
                 causal=is_causal,
+                inference_mode=True,
             )
         else:  # fav2 (no quantization)
             fn = fav2_forward_func(
