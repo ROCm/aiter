@@ -146,23 +146,23 @@ struct mha_bwd_args {
 
 struct __attribute__((packed)) fmha_bwd_dqdkdv_args
 {
-    void *ptr_dq;                   // 0x00: dq or dq_acc
+    void* ptr_dq;                   // 0x00: dq or dq_acc
     p2 _p0;
-    void *ptr_dk;                   // 0x10
+    void* ptr_dk;                   // 0x10
     p2 _p1;
-    void *ptr_dv;                   // 0x20
+    void* ptr_dv;                   // 0x20
     p2 _p2;
-    const void *ptr_q;              // 0x30
+    const void* ptr_q;              // 0x30
     p2 _p3;
-    const void *ptr_k;              // 0x40
+    const void* ptr_k;              // 0x40
     p2 _p4;
-    const void *ptr_v;              // 0x50
+    const void* ptr_v;              // 0x50
     p2 _p5;
-    const void *ptr_do;             // 0x60
+    const void* ptr_do;             // 0x60
     p2 _p6;
-    const void *ptr_lse;            // 0x70
+    const void* ptr_lse;            // 0x70
     p2 _p7;
-    const void *ptr_d;              // 0x80
+    const void* ptr_d;              // 0x80
     p2 _p8;
     float scalar;                   // 0x90
     p3 _p9;
@@ -220,15 +220,15 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     p3 _p35;
     unsigned int Hs_lsed;           // 0x240: group mode lsed([H,TotalValid_Q(90)]) addr = seqstart_q[batch_idx] * 4 + head_idx * nhead_stride_lsed(s_Hs_lsed)
     p3 _p36;
-    const void *ptr_qseq;                 // 0x250: group mode seqstart_q [0, 20, 50, 90]
+    const void* ptr_qseq;           // 0x250: group mode seqstart_q [0, 20, 50, 90]
     p2 _p37;
-    const void *ptr_kseq;                 // 0x260: group mode seqstart_k [0, 50, 110, 180]
+    const void* ptr_kseq;           // 0x260: group mode seqstart_k [0, 50, 110, 180]
     p2 _p38;
-    const void *ptr_qseq_padded;          // 0x270: group mode seqstart_q_padded [0, 30(20+10), 70(20+10+30+10), 120(20+10+30+10+40+10)] if 10 is padded after each seqlen[30(20+10), 40(30+10), 50(40+10)]
+    const void* ptr_qseq_padded;    // 0x270: group mode seqstart_q_padded [0, 30(20+10), 70(20+10+30+10), 120(20+10+30+10+40+10)] if 10 is padded after each seqlen[30(20+10), 40(30+10), 50(40+10)]
     p2 _p39;
-    const void *ptr_kseq_padded;          // 0x280: group mode seqstart_k_padded [0, 60(50+10), 130(50+10+60+10), 200(50+10+60+10+70+10)] if 10 is padded after each seqlen[60(50+10), 70(60+10), 80(70+10)]
+    const void* ptr_kseq_padded;    // 0x280: group mode seqstart_k_padded [0, 60(50+10), 130(50+10+60+10), 200(50+10+60+10+70+10)] if 10 is padded after each seqlen[60(50+10), 70(60+10), 80(70+10)]
     p2 _p40;
-    unsigned int max_seqlen_dq;    // 0x290: gorup mode max seqlen q for a16 dq_acc store, padding to 16x
+    unsigned int max_seqlen_dq;     // 0x290: gorup mode max seqlen q for a16 dq_acc store, padding to 16x
     p3 _p41;
     int mask_x;                     // 0x2a0
     p3 _p42;
@@ -238,11 +238,11 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
 
 struct __attribute__((packed)) fmha_bwd_odo_args
 {
-    const void *ptr_o;
+    const void* ptr_o;
     p2 _p0;
-    const void *ptr_do;
+    const void* ptr_do;
     p2 _p1;
-    void *ptr_d;
+    void* ptr_d;
     p2 _p2;
     unsigned int Hs_odo;
     p3 _p3;
@@ -260,9 +260,9 @@ struct __attribute__((packed)) fmha_bwd_odo_args
     p3 _p9;
     unsigned int head_dim;
     p3 _p10;
-    const void *ptr_qseq;
+    const void* ptr_qseq;
     p2 _p11;
-    const void *ptr_qseq_padded;
+    const void* ptr_qseq_padded;
     p2 _p12;
 };
 
