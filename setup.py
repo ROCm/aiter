@@ -17,7 +17,7 @@ from jit import core
 from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
-PACKAGE_NAME = "aiter"
+PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
 if BUILD_TARGET == "auto":
@@ -42,7 +42,8 @@ def getMaxJobs():
     import psutil
 
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)
+    # free memory in GB
     max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
@@ -306,6 +307,9 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
+# Define Iris dependency once to avoid duplication
+IRIS_DEP = "iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429"
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -328,6 +332,17 @@ setup(
         "einops",
         "psutil",
     ],
+    extras_require={
+        # Triton-based communication using Iris
+        # Pinned to commit 905ec1c (Nov 18, 2024) for reproducibility and API stability
+        "triton_comms": [
+            IRIS_DEP,
+        ],
+        # Install all optional dependencies
+        "all": [
+            IRIS_DEP,
+        ],
+    },
     setup_requires=setup_requires,
     distclass=ForcePlatlibDistribution,
 )
