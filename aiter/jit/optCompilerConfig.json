@@ -849,7 +849,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_bwd.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/fmha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
@@ -871,7 +871,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_bwd.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/fmha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
@@ -914,7 +914,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/fmha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -937,7 +937,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/fmha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -981,7 +981,7 @@
         ]
     },
     "libmha_bwd": {
-        "srcs": ["f'{AITER_CSRC_DIR}/cpp_itfs/fmha_bwd.cpp'"],
+        "srcs": ["f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'"],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 0)}'"

@@ -1,8 +1,8 @@
 #include "aiter_hip_common.h"
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include "mha_bwd.h"
-#include <string>
 #include <memory>
+#include <string>
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
@@ -79,14 +79,15 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
             int tmp_ts_kv = 0;
             if(ts_kv == 0)
             {
-                ts_kv = cfg.ts;
+                ts_kv     = cfg.ts;
                 tmp_ts_kv = ts_kv;
-                if (cfg.atomic32 == 0 && ((arch_id == "gfx942") || (el.first.find("recompile") != std::string::npos)))
+                if(cfg.atomic32 == 0 &&
+                   ((arch_id == "gfx942") || (el.first.find("recompile") != std::string::npos)))
                 {
 
                     tmp_ts_kv = 64;
                 }
-                pssk  = (seqlen_q != seqlen_k) || (seqlen_k % tmp_ts_kv != 0);
+                pssk = (seqlen_q != seqlen_k) || (seqlen_k % tmp_ts_kv != 0);
             }
             if((cfg.pssk == pssk) && (cfg.pddv == pddv))
             {
@@ -268,7 +269,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         }
     }();
 
-    bool need_post_processing = ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
+    bool need_post_processing =
+        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
 
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
@@ -456,21 +458,15 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
     dqdkdv_args.max_seqlen_dq = a.v3_atomic_fp32 ? a.max_seqlen_q : (a.max_seqlen_q + 15) / 16 * 16;
 
-    // convert l/r to x/y HERE
-    if(a.window_size_left == -1 && a.window_size_right == 0)
-    {
-        dqdkdv_args.mask_y = 0;
-        dqdkdv_args.mask_x = 0;
-    }
-    else
+    if(a.mask_type == 3)
     {
         auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
             a.window_size_left,
             a.window_size_right,
             a.seqlen_q,
             a.seqlen_k,
-            (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
-             a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+            (a.ck_mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
+             a.ck_mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
         dqdkdv_args.mask_y = generic_mask.at(ck_tile::number<0>{});
         dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
     }
@@ -483,7 +479,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         int gdz = a.batch;
 
         if((a.mask_type == 1) || (a.mask_type == 2))
-        { // sliding window
+        { // causal
             gdx = (gdx + 1) / 2;
         }
 
