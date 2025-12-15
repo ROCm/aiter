@@ -718,7 +718,8 @@ public:
         int64_t world_size,        // group size
         int64_t size_in_bytes,     // private data size
         int64_t comm_ptrs_buf_len, // cached ptrs size
-        int64_t max_thread_blocks = NBLOCKS_PER_GPU) {
+        int64_t max_thread_blocks = NBLOCKS_PER_GPU,
+        bool round_robin = true) {
         TORCH_CHECK(rank < world_size);
         gpuSetDevice(device_id);
         device_id_ = device_id;
@@ -734,6 +735,7 @@ public:
         gpuMemset(sync_clock_, 0, max_thread_blocks_ * sizeof(int));
         gpuMemset(barrier_flags_, 0, max_thread_blocks_ * world_size_ * sizeof(int));
         used_comm_ptrs_ = 0;
+        round_robin_ = round_robin;
     }
 
     ~CommWorkspace() {
@@ -757,12 +759,16 @@ public:
 
     void open_data_handles(std::vector<Tensor> handles) {
         ipc_details::open_handles(rank_, handles, data_, ipc_data_);
-        CommPtrs cptrs;
-        for (int i = 0; i < world_size_; ++i) {
-            cptrs.data_ptrs[i] = ipc_data_[i];
+        CommPtrs *cptrs = new CommPtrs[comm_ptrs_buf_len_];
+        for (int i = 0; i < comm_ptrs_buf_len_; ++i) {
+            for (int j = 0; j < world_size_; ++j) {
+                int r = round_robin_ ? ((rank_ + j) % world_size_) : j;
+                cptrs[i].data_ptrs[j] = ipc_data_[r];
+            }
         }
-        gpuMemcpy(comm_ptrs_ + 0, &cptrs, sizeof(CommPtrs), gpuMemcpyHostToDevice);
+        gpuMemcpy(comm_ptrs_, cptrs, comm_ptrs_buf_len_ * sizeof(CommPtrs), gpuMemcpyHostToDevice);
         used_comm_ptrs_ = 1;
+        delete[] cptrs;
     }
 
     std::tuple<CommMeta, CommPtrs *> get_comm_data(const Tensor &input, gpuStream_t stream) {
@@ -799,6 +805,7 @@ public:
 
     void capture_clear() {
         unregistered_ptrs_.clear();
+        unregistered_base_ptrs_.clear();
     }
 
     std::vector<Tensor> get_captured_handles() {
@@ -810,6 +817,7 @@ public:
             void *base_ptr;
             ipc_details::create_base_ptr(&base_ptr, ptr);
             ipc_handles.push_back(ipc_details::get_handle(base_ptr));
+            unregistered_base_ptrs_.push_back(base_ptr);
         }
         return ipc_handles;
     }
@@ -820,8 +828,7 @@ public:
         offsets.reserve(num_datas);
         for (int i = 0; i < num_datas; ++i) {
             void *ptr = unregistered_ptrs_[i];
-            void *base_ptr;
-            ipc_details::create_base_ptr(&base_ptr, ptr);
+            void *base_ptr = unregistered_base_ptrs_[i];
             int64_t offset = ((char *)ptr) - ((char *)base_ptr);
             offsets.push_back(offset);
         }
@@ -831,15 +838,17 @@ public:
     }
 
     void open_captured_handles(std::vector<Tensor> &handles, std::vector<int64_t> &offsets, int64_t ptr_idx) {
-        auto ptr = unregistered_ptrs_[ptr_idx];
-        void *base_ptr;
-        ipc_details::create_base_ptr(&base_ptr, ptr);
+        void *ptr = unregistered_ptrs_[ptr_idx];
+        void *base_ptr = unregistered_base_ptrs_[ptr_idx];
         std::vector<void *> ipc_data;
         ipc_details::open_handles(rank_, handles, base_ptr, ipc_data);
         CommPtrs cptrs;
         for (int i = 0; i < offsets.size(); ++i) {
             ipc_data[i] = (void *)((char *)ipc_data[i] + offsets[i]);
-            cptrs.data_ptrs[i] = ipc_data[i];
+        }
+        for (int i = 0; i < offsets.size(); ++i) {
+            int r = round_robin_ ? ((rank_ + i) % world_size_) : i;
+            cptrs.data_ptrs[i] = ipc_data[r];
         }
         gpuMemcpy(comm_ptrs_ + used_comm_ptrs_, &cptrs, sizeof(CommPtrs), gpuMemcpyHostToDevice);
         ptr_to_comm_ptrs_[ptr] = comm_ptrs_ + used_comm_ptrs_;
@@ -853,6 +862,7 @@ private:
     int size_in_bytes_;
     int comm_ptrs_buf_len_;
     int max_thread_blocks_;
+    bool round_robin_;
     void *sync_clock_;
     void *barrier_flags_;
     void *data_;
@@ -860,6 +870,7 @@ private:
     std::vector<void *> ipc_data_;
     // graph
     std::vector<void *> unregistered_ptrs_;
+    std::vector<void *> unregistered_base_ptrs_;
     CommPtrs *comm_ptrs_;
     int used_comm_ptrs_;
     std::unordered_map<void *, CommPtrs *> ptr_to_comm_ptrs_;
