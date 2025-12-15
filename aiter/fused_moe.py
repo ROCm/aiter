@@ -706,6 +706,29 @@ def get_2stage_cfgs(
             False,
         )
     if (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and q_dtype_w in [dtypes.fp4x2]
+        and token <= 128
+    ):
+        return MOEMetadata(
+            functools.partial(
+                aiter.ck_moe_stage1_fwd,
+                kernelName=kernelName1,
+                activation=activation,
+                quant_type=q_type,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                bias2=bias2,
+            ),
+            32 if token < 16384 else 64,
+            ksplit,
+            run_1stage,
+        )
+    if (
         "ck2stages" in kernelName1
         or (q_type == QuantType.per_1x128 and doweight_stage1)
         or q_dtype_w
@@ -891,7 +914,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
-        and activation == ActivationType.Swiglu
+        and (activation == ActivationType.Swiglu or token_num <= 128)
     ):
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
@@ -1306,6 +1329,7 @@ def cktile_moe_stage1(
     n_pad_zeros=0,
     k_pad_zeros=0,
     bias1=None,
+    activation=ActivationType.Silu,
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -1333,6 +1357,7 @@ def cktile_moe_stage1(
         a1_scale,
         w1_scale,
         bias1,
+        activation,
         block_m,
     )
     return out

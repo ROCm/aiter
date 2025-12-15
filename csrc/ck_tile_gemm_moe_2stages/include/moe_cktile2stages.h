@@ -32,7 +32,8 @@ using MoeKernel        = std::function<torch::Tensor(torch::Tensor&,
                                               std::optional<torch::Tensor>,
                                               std::optional<torch::Tensor>,
                                               std::optional<torch::Tensor>,
-                                              std::optional<torch::Tensor>)>;
+                                              std::optional<torch::Tensor>,
+                                              std::optional<int>)>;
 using ck_stream_config = ck_tile::stream_config;
 using row_major        = ck_tile::tensor_layout::gemm::RowMajor;
 using col_major        = ck_tile::tensor_layout::gemm::ColumnMajor;
@@ -55,6 +56,7 @@ cktile_moe_gemm1(torch::Tensor& XQ,
                  std::optional<torch::Tensor> x_scale,
                  std::optional<torch::Tensor> w_scale,
                  std::optional<torch::Tensor> exp_bias,
+                 std::optional<int> activation,
                  std::optional<int> block_m);
 
 __attribute__((visibility("default"))) torch::Tensor
@@ -71,4 +73,5 @@ cktile_moe_gemm2(torch::Tensor& XQ,
                  std::optional<torch::Tensor> x_scale,
                  std::optional<torch::Tensor> w_scale,
                  std::optional<torch::Tensor> exp_bias,
+                 std::optional<int> activation,
                  std::optional<int> block_m);

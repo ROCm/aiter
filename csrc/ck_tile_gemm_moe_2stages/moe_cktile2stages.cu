@@ -77,19 +77,21 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                                std::optional<torch::Tensor> x_scale,
                                std::optional<torch::Tensor> w_scale,
                                std::optional<torch::Tensor> exp_bias,
+                               std::optional<int> activation,
                                std::optional<int> block_m)
 {
     TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16 || Y.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!");
-    if(x_scale != std::nullopt && w_scale != std::nullopt)
+    if(x_scale.has_value() && w_scale.has_value())
     {
         TORCH_CHECK(x_scale.value().dtype() == w_scale.value().dtype(),
                     "Scales should have the same dtype!");
     }
-    int M         = sorted_ids.size(0);
+    int64_t token     = XQ.size(0);
+    int M         = std::min(sorted_ids.size(0), token * topk * block_m.value());
     int N         = WQ.size(1);
     int K         = XQ.size(-1);
-    int MPerBlock = block_m.value();
+    int MPerBlock = block_m.has_value() ? block_m.value() : 32;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
     at::hip::getCurrentHIPStream();
@@ -134,7 +136,8 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                                                                            topk_weight,
                                                                            x_scale,
                                                                            w_scale,
-                                                                           exp_bias);
+                                                                           exp_bias,
+                                                                           activation);
         }
     }
     else
@@ -157,12 +160,15 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                                std::optional<torch::Tensor> x_scale,
                                std::optional<torch::Tensor> w_scale,
                                std::optional<torch::Tensor> exp_bias,
+                               std::optional<int> activation,
                                std::optional<int> block_m)
 {
-    int M         = sorted_ids.size(0);
+    int64_t token     = XQ.size(0);
+    int MPerBlock = block_m.has_value() ? block_m.value() : 32;
+    int M         = std::min(sorted_ids.size(0), token * topk * MPerBlock);
     int N         = WQ.size(1);
     int K         = XQ.size(-1);
-    int MPerBlock = block_m.value();
+    
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
     at::hip::getCurrentHIPStream();
@@ -207,7 +213,8 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                                                                            topk_weight,
                                                                            x_scale,
                                                                            w_scale,
-                                                                           exp_bias);
+                                                                           exp_bias,
+                                                                           0);
         }
     }
     else

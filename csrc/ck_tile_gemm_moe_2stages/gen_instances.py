@@ -2,10 +2,12 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import argparse
+import itertools
 from pathlib import Path
 import shutil
 import re
 from moe_cktile2stages_common import (
+    act_dict,
     kernelInstance,
     get_gemm1_kernels_list,
     get_gemm2_kernels_list,
@@ -78,7 +80,8 @@ torch::Tensor
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,
     std::optional<torch::Tensor> w_scale,
-    std::optional<torch::Tensor> exp_bias)
+    std::optional<torch::Tensor> exp_bias,
+    std::optional<int> activation)
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
     int NumTokens = XQ.size(0);
@@ -120,7 +123,12 @@ torch::Tensor
             biasGran = "1"
             xptr = "nullptr"
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
-            biasptr = "static_cast<float*>(exp_bias.value().data_ptr())"
+            biasptr = "static_cast<float*>(exp_bias.has_value() ? exp_bias.value().data_ptr() : nullptr)"
+
+        if k.HasBias:
+            biasGran = "1"
+        else:
+            biasGran = "-1"
 
         INSTANCE_CONTENT = f"""auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranA}>{{{xptr}}};
     auto per_b_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranB}>{{{wptr}}};
@@ -145,8 +153,8 @@ torch::Tensor
                 stride_A,
                 stride_B,
                 stride_C,
-                n_padded_zeros.value(),
-                k_padded_zeros.value(),
+                n_padded_zeros.has_value() ? n_padded_zeros.value() : 0,
+                k_padded_zeros.has_value() ? k_padded_zeros.value() : 0,
                 per_a_scale_dev_ptr,
                 per_b_scale_dev_ptr,
                 exp_bias_dev_ptr
@@ -174,7 +182,8 @@ torch::Tensor
                 ck_tile::tuple<>,
                 row_major,
                 {"ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up" if k.stage == 1 else "ck_tile::MoeFlatmmKind::kFFN_gemm2"},
-                ck_tile::element_wise::PassThrough
+                ck_tile::element_wise::PassThrough,
+                {act_dict[k.ActOP]}
                 >(kernel_args, stream_config);
 """
 
@@ -202,7 +211,8 @@ template torch::Tensor
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,
     std::optional<torch::Tensor> w_scale,
-    std::optional<torch::Tensor> exp_bias);
+    std::optional<torch::Tensor> exp_bias,
+    std::optional<int> activation);
 
 """
 
@@ -307,7 +317,6 @@ template torch::Tensor
         ) as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
-                print(":", k.name)
                 # if not tunning, tuned mnk = {stage, m, n, k}
                 if not self.istune and (
                     isinstance(mnk, tuple) and (len(mnk) == 4) and mnk[1] > 0
@@ -354,7 +363,8 @@ torch::Tensor
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,
     std::optional<torch::Tensor> w_scale,
-    std::optional<torch::Tensor> exp_bias);
+    std::optional<torch::Tensor> exp_bias,
+    std::optional<int> activation);
 """
         MAINFEST_end = """
 
@@ -372,12 +382,6 @@ torch::Tensor
     """generate all instances and headers"""
 
     def gen_instances(self, tag, kernels_dict):
-        if os.path.exists(self.impl_path):
-            shutil.rmtree(self.impl_path)
-        os.mkdir(self.impl_path)
-        if os.path.exists(self.instances_path):
-            shutil.rmtree(self.instances_path)
-        os.mkdir(self.instances_path)
 
         for mnk, k in kernels_dict.items():
             self.gen_instance(k)
@@ -480,7 +484,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu"],
+        choices=["silu", "gelu", "swiglu"],
         help="select activation",
     )
 
@@ -544,35 +548,52 @@ if __name__ == "__main__":
     # b_type = "fp8"
     # quant_type = "per_token"
 
-    a_type = "bf16"
+    a_types = ["bf16"]
     b_type = "fp4"
     quant_type = "1x32"
 
     acc_type = "float"
-    c_type = "bf16"
-    act_type = "silu"
-    codegen = cktile_moe_2stage_gemm_codegen(
-        args.working_path, a_type, acc_type, c_type, quant_type, act_type, 2, False
-    )
-    # gen all instances for gemm1 and gemm2
-    _, gemm1_kernel_list = get_gemm1_kernels_list(
-        a_type,
-        b_type,
-        quant_type,
-        act_type,
-        False,
-    )
-    tag, gemm2_kernel_list = get_gemm2_kernels_list(
-        a_type,
-        b_type,
-        quant_type,
-        "",
-        True,
-    )
-    # merge gemm1/gemm2 dict with key = {stage, key}
-    kernel_dict_merge = {
-        **{(1, key): value for key, value in gemm1_kernel_list.items()},
-        **{(2, key): value for key, value in gemm2_kernel_list.items()},
-    }
-    # print(kernel_dict_merge)
-    codegen.gen_instances(tag, kernel_dict_merge)
+    act_types = ["silu", "swiglu"]
+    c_dtypes = ["bf16"]
+
+    impl_path = os.path.join(args.working_path, "impl")
+    instances_path = os.path.join(args.working_path, "instances")
+
+    if os.path.exists(impl_path):
+        shutil.rmtree(impl_path)
+    os.mkdir(impl_path)
+    if os.path.exists(instances_path):
+        shutil.rmtree(instances_path)
+    os.mkdir(instances_path)
+
+    for a_type, c_dtype, act_type in itertools.product(
+        a_types, c_dtypes, act_types
+    ):
+        has_bias = True if act_type == "swiglu" else False
+        codegen = cktile_moe_2stage_gemm_codegen(
+            args.working_path, a_type, acc_type, c_dtype, quant_type, act_type, 2, False
+        )
+        # gen all instances for gemm1 and gemm2
+        _, gemm1_kernel_list = get_gemm1_kernels_list(
+            a_type,
+            b_type,
+            quant_type,
+            act_type,
+            False,
+            has_bias,
+        )
+        tag, gemm2_kernel_list = get_gemm2_kernels_list(
+            a_type,
+            b_type,
+            quant_type,
+            "no",
+            True,
+            has_bias,
+        )
+        # merge gemm1/gemm2 dict with key = {stage, key}
+        kernel_dict_merge = {
+            **{(1, key): value for key, value in gemm1_kernel_list.items()},
+            **{(2, key): value for key, value in gemm2_kernel_list.items()},
+        }
+
+        codegen.gen_instances(tag, kernel_dict_merge)

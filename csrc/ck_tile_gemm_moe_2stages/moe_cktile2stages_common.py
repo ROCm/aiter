@@ -17,6 +17,14 @@ sys.path.insert(0, AITER_CORE_DIR)
 from chip_info import get_gfx  # noqa: E402
 
 
+act_dict = {
+    "no": -1,
+    "silu": 0,
+    # "gelu": 1,
+    "swiglu": 2,
+}
+
+
 @dataclass
 class kernelInstance:
     stage: int
@@ -31,6 +39,7 @@ class kernelInstance:
     WAVE_MAP_N: int
     Block_Per_CU: int = 1
     MulRoutedWeight: bool = False
+    HasBias: bool = False
     ActOP: str = "silu"
     QuantType: str = "per_tensor"
 
@@ -61,6 +70,7 @@ class kernelInstance:
                 str(self.Block_Per_CU) + "perCU",
                 self.QuantType,
                 "MulRoutedWeight" if self.MulRoutedWeight else "",
+                "HasBias" if self.HasBias else "",
                 "" if (self.stage == 2) else self.ActOP,
             ]
             if element != ""
@@ -370,6 +380,7 @@ def get_gemm1_kernels_list(
     QuantType: str = "none",
     ActOP: str = "silu",
     MulRoutedWeight: bool = False,
+    HasBias: bool = False,
 ) -> list:
     arch = get_gfx()
     if Adtype.lower() in bit8_list and Bdtype.lower() in bit8_list and Adtype == Bdtype:
@@ -389,6 +400,7 @@ def get_gemm1_kernels_list(
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.ActOP = ActOP
         kernel.QuantType = QuantType
+        kernel.HasBias = HasBias
         # if tag == "a8w4":
         # kernel.CDEElementOp = "MulABScaleWint4"
         # elif tag == "a8w8blkscale":
@@ -409,6 +421,7 @@ def get_gemm2_kernels_list(
     QuantType: str = "",
     ActOP: str = "",
     MulRoutedWeight: bool = True,
+    HasBias: bool = False,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit8_list and Bdtype in bit8_list and Adtype == Bdtype:
@@ -426,8 +439,9 @@ def get_gemm2_kernels_list(
     kernels_list = gemm2_kernels_dict[tag]
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
-        kernel.ActOP = ""
+        kernel.ActOP = ActOP
         kernel.QuantType = QuantType
+        kernel.HasBias = HasBias
         # if tag == "a8w4":
         #     kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         # elif tag == "a8w8blkscale":
