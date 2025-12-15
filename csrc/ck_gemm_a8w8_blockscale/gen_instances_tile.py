@@ -92,14 +92,13 @@ torch::Tensor
 
 """    
         TILE_INSTANCE = f"""using TileGemmInstance = TileGemmConfig<
-            DDataType, EDataType,
             {k.M_Tile}, {k.N_Tile}, {k.K_Tile},
             {k.M_Warp}, {k.N_Warp}, {k.K_Warp},
             {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
+            {str(k.kPadM).lower()}, {str(k.kPadN).lower()}, {str(k.kPadK).lower()},
             {str(k.TransposeC).lower()},
             {str(k.DoubleSmemBuffer).lower()},
             {str(k.UsePersistentKernel).lower()},
-            {str(k.kPadM).lower()}, {str(k.kPadN).lower()}, {str(k.kPadK).lower()},
             ck_tile::GemmPipelineScheduler::{k.Scheduler}>;
             
         // Run kernel instance.

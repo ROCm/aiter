@@ -43,8 +43,13 @@ using CLayout  = ck_tile::tensor_layout::gemm::RowMajor;
 
 using CDEElementWise = ck_tile::element_wise::PassThrough;
 
-using AQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>; // M, N, K
-using BQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>; // M, N, K
+// Quantization group sizes: QuantGroupShape<sequence<M, N, K>>
+// For block-scale quantization with block size 128: every 128 elements along K share one scale
+using AQuantGroupSize =
+    ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>; // A: grouped along K (M=1, N=1, K=128)
+using BQuantGroupSize =
+    ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>; // B: grouped along N and K (M=1,
+                                                              // N=128, K=128)
 
 template <ck_tile::index_t M_Tile,
           ck_tile::index_t N_Tile,
@@ -246,9 +251,9 @@ __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     const int N = WQ.size(0);
     const int K = XQ.size(1);
 
-    TORCH_CHECK(K % AQuantGroupSize::kK == 0, "K must be aligned with QuantGroupSize");
-    TORCH_CHECK(K % BQuantGroupSize::kK == 0, "K must be aligned with QuantGroupSize");
-    TORCH_CHECK(K % BQuantGroupSize::kN == 0, "N must be aligned with QuantGroupSize");
+    TORCH_CHECK(K % AQuantGroupSize::kK == 0, "K must be aligned with AQuantGroupSize::kK");
+    TORCH_CHECK(K % BQuantGroupSize::kK == 0, "K must be aligned with BQuantGroupSize::kK");
+    TORCH_CHECK(N % BQuantGroupSize::kN == 0, "N must be aligned with BQuantGroupSize::kN");
 
     // prepare args
     ck_tile::QuantGemmHostArgs args;
