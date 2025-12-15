@@ -43,13 +43,8 @@ using CLayout  = ck_tile::tensor_layout::gemm::RowMajor;
 
 using CDEElementWise = ck_tile::element_wise::PassThrough;
 
-// Quantization group sizes: QuantGroupShape<sequence<M, N, K>>
-// For block-scale quantization with block size 128: every 128 elements along K share one scale
-using AQuantGroupSize =
-    ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>; // A: grouped along K (M=1, N=1, K=128)
-using BQuantGroupSize =
-    ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>; // B: grouped along N and K (M=1,
-                                                              // N=128, K=128)
+using AQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>;
+using BQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>;
 
 template <ck_tile::index_t M_Tile,
           ck_tile::index_t N_Tile,
@@ -265,13 +260,15 @@ __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
 
     // split-k is not supported yet for tile quant gemm, set k_batch to 1
     args.k_batch = 1;
-    args.M       = XQ.size(0);
-    args.N       = WQ.size(0);
-    args.K       = XQ.size(1);
+    args.M       = M;
+    args.N       = N;
+    args.K       = K;
 
-    const int AQK = K / AQuantGroupSize::kK;
-    const int BQK = K / BQuantGroupSize::kK;
-    const int BQN = ck_tile::integer_divide_ceil(N, BQuantGroupSize::kN);
+    // Quantization parameters for ABQuantGrouped mode
+    // A: [M, K] with scale [M, K/128] (AQK per row)
+    const int AQK = K / AQuantGroupSize::kK;                              // K/128
+    const int BQK = K / BQuantGroupSize::kK;                              // K/128
+    const int BQN = ck_tile::integer_divide_ceil(N, BQuantGroupSize::kN); // N/128 (ceil)
 
     const int stride_A  = K;
     const int stride_B  = K;
