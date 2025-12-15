@@ -493,43 +493,39 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_2stage(
     int warp_id = threadIdx.x / WARP_SIZE_;
     int lane_id = threadIdx.x % WARP_SIZE_;
 
+    vec_t<T, VEC_SIZE> val;
+    vec_t<float, VEC_SIZE> acc;
+
     comm.template sync<true, false>();
 
     for (
         int idx = ((blockIdx.x * NRanks + params.rank) * WARP_SIZE_ + lane_id) * VEC_SIZE;
         idx < params.size;
         idx += gridDim.x * NRanks * WARP_SIZE_ * VEC_SIZE) {
-        vec_t<T, VEC_SIZE> val;
         val.load(reinterpret_cast<T *>(cptrs->data_ptrs[warp_id]) + idx);
         val.store(&shared[0] + threadIdx.x * VEC_SIZE);
         __syncthreads();
         if (warp_id == 0) {
-            vec_t<T, VEC_SIZE> vec;
-            vec_t<float, VEC_SIZE> acc;
-            vec.load(&shared[0] + lane_id * VEC_SIZE);
 #pragma unroll
             for (int v = 0; v < VEC_SIZE; ++v) {
-                acc.data[v] = (float)vec.data[v];
+                acc.data[v] = (float)val.data[v];
             }
 #pragma unroll
             for (int r = 1; r < NRanks; ++r) {
-                vec.load(&shared[0] + (r * WARP_SIZE_ + lane_id) * VEC_SIZE);
+                val.load(&shared[0] + (r * WARP_SIZE_ + lane_id) * VEC_SIZE);
 #pragma unroll
                 for (int v = 0; v < VEC_SIZE; ++v) {
-                    acc.data[v] += (float)vec.data[v];
+                    acc.data[v] += (float)val.data[v];
                 }
             }
 #pragma unroll
             for (int v = 0; v < VEC_SIZE; ++v) {
-                vec.data[v] = (T)acc.data[v];
+                val.data[v] = (T)acc.data[v];
             }
-            vec.store(&shared[0] + lane_id * VEC_SIZE);
+            val.store(&shared[0] + lane_id * VEC_SIZE);
         }
         __syncthreads();
         val.load(&shared[0] + lane_id * VEC_SIZE);
-        vec_t<T, VEC_SIZE> res;
-        res.load(reinterpret_cast<T *>(params.residual_in) + idx);
-        vec_add_<T, VEC_SIZE>(val, res);
         val.store(reinterpret_cast<T *>(cptrs->data_ptrs[warp_id]) + idx);
     }
 
@@ -541,8 +537,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_2stage(
         int idx = blockIdx.x * params.hidden_dim + access_id_in_token, tidx = blockIdx.x;
         idx < params.size;
         idx += gridDim.x * params.hidden_dim, tidx += gridDim.x) {
-        vec_t<T, VEC_SIZE> val;
-        val.load(reinterpret_cast<T *>(cptrs->data_ptrs[params.rank]) + idx);
+        val.load(reinterpret_cast<T *>(cptrs->data_ptrs[0]) + idx);
+        vec_t<T, VEC_SIZE> res;
+        res.load(reinterpret_cast<T *>(params.residual_in) + idx);
+        vec_add_<T, VEC_SIZE>(val, res);
         epilogue<T, VEC_SIZE, true, BLOCK_SIZE, QUANT_TYPE>(params, val, gamma, idx, tidx);
     }
 }
