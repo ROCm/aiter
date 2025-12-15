@@ -1910,6 +1910,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
+
     if KV_QUANT_MODE >= 0:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
     else:
@@ -1955,9 +1956,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     K_HEAD_SIZE_SPLITS: gl.constexpr = (
         HEAD_SIZE_POW2 // CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
     )
-    MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = (
-        CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
-    )
+    MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
 
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access
@@ -1993,19 +1992,19 @@ def paged_attention_decode_v2_gluon_dot_kernel(
 
     # Register allocation configuration based on group size and compute block size
     if QUERY_GROUP_SIZE_POW2 == 16:
-        if CONTEXT_PARTITION_SIZE == 128:
+        if KV_COMPUTE_BLOCK_SIZE == 128:
             register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
-        elif CONTEXT_PARTITION_SIZE == 256:
+        elif KV_COMPUTE_BLOCK_SIZE == 256:
             register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
     elif QUERY_GROUP_SIZE_POW2 == 32:
-        if CONTEXT_PARTITION_SIZE == 128:
+        if KV_COMPUTE_BLOCK_SIZE == 128:
             register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
-        elif CONTEXT_PARTITION_SIZE == 256:
+        elif KV_COMPUTE_BLOCK_SIZE == 256:
             register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128), (16, 0))
     elif QUERY_GROUP_SIZE_POW2 == 64:
-        if CONTEXT_PARTITION_SIZE == 128:
+        if KV_COMPUTE_BLOCK_SIZE == 128:
             register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0), (32, 0))
-        elif CONTEXT_PARTITION_SIZE == 256:
+        elif KV_COMPUTE_BLOCK_SIZE == 256:
             register_bases: gl.constexpr = (
                 (0, 1),
                 (0, 2),
@@ -2021,7 +2020,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
         warp_bases=((0, 16), (0, 32)),
         block_bases=[],
-        shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
+        shape=[QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE],
     )
 
     # Value cache layout configuration based on transpose flag
