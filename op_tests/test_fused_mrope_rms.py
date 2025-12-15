@@ -280,9 +280,9 @@ def run_torch_mrope_3d_rms_set_kv(
     is_interleaved: bool,
     eps: float,
     q_out: Tensor,
-    k_cache: Tensor, # contiguous (-1, num_heads_k, head_size)
-    v_cache: Tensor, # contiguous (-1, num_heads_v, head_size)
-    kv_loc: Tensor, # contiguous (num_tokens)
+    k_cache: Tensor,  # contiguous (-1, num_heads_k, head_size)
+    v_cache: Tensor,  # contiguous (-1, num_heads_v, head_size)
+    kv_loc: Tensor,  # contiguous (num_tokens)
     k_scale: float,
     v_scale: float,
     is_mrope: bool,
@@ -354,9 +354,9 @@ def run_fused_mrope_3d_rms_set_kv(
     is_interleaved: bool,
     eps: float,
     q_out: Tensor,
-    k_cache: Tensor, # contiguous (-1, num_heads_k, head_size)
-    v_cache: Tensor, # contiguous (-1, num_heads_v, head_size)
-    kv_loc: Tensor, # contiguous (num_tokens)
+    k_cache: Tensor,  # contiguous (-1, num_heads_k, head_size)
+    v_cache: Tensor,  # contiguous (-1, num_heads_v, head_size)
+    kv_loc: Tensor,  # contiguous (num_tokens)
     k_scale: float,
     v_scale: float,
     is_mrope: bool,
@@ -439,14 +439,20 @@ def test_mrope_3d_rms_set_kv(
         0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
     )
 
-    q_out_ref = torch.empty(num_tokens, num_heads_q, head_size, dtype=dtype, device="cuda")
+    q_out_ref = torch.empty(
+        num_tokens, num_heads_q, head_size, dtype=dtype, device="cuda"
+    )
     q_out = torch.empty(num_tokens, num_heads_q, head_size, dtype=dtype, device="cuda")
-    k_cache_ref = torch.rand(max_positions, num_heads_k, head_size, device="cuda").to(torch.float8_e4m3fn)
-    v_cache_ref = torch.rand(max_positions, num_heads_v, head_size, device="cuda").to(torch.float8_e4m3fn)
+    k_cache_ref = torch.rand(max_positions, num_heads_k, head_size, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    v_cache_ref = torch.rand(max_positions, num_heads_v, head_size, device="cuda").to(
+        torch.float8_e4m3fn
+    )
     k_cache = k_cache_ref.clone()
     v_cache = v_cache_ref.clone()
     kv_loc = torch.randint(
-        0, max_positions, (num_tokens, ), dtype=torch.int64, device="cuda"
+        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
     )
     k_scale = 1.5
     v_scale = 2.0
@@ -500,13 +506,23 @@ def test_mrope_3d_rms_set_kv(
 
     info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
     if is_mrope:
-        info += (
-            f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
-        )
+        info += f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
     checkAllclose(q_out_ref, q_out, msg="q_out", rtol=1e-2, atol=0.05)
-    checkAllclose(k_cache_ref[kv_loc].float(), k_cache[kv_loc].float(), msg="k_cache", rtol=1e-2, atol=0.05)
-    checkAllclose(v_cache_ref[kv_loc].float(), v_cache[kv_loc].float(), msg=msg, rtol=1e-2, atol=0.05)
+    checkAllclose(
+        k_cache_ref[kv_loc].float(),
+        k_cache[kv_loc].float(),
+        msg="k_cache",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_cache_ref[kv_loc].float(),
+        v_cache[kv_loc].float(),
+        msg=msg,
+        rtol=1e-2,
+        atol=0.05,
+    )
 
 
 if __name__ == "__main__":
