@@ -42,3 +42,16 @@ void fused_mrope_3d_rms_set_kv(Tensor& qkv,
                                Tensor& kv_loc,
                                double k_scale,
                                double v_scale);
+
+void fused_rope_rms(Tensor& qkv,
+                    Tensor& qw,
+                    Tensor& kw,
+                    Tensor& cos_sin,
+                    Tensor& positions,
+                    int64_t num_tokens,
+                    int64_t num_heads_q,
+                    int64_t num_heads_k,
+                    int64_t num_heads_v,
+                    int64_t head_size,
+                    bool is_neox_style,
+                    double eps);

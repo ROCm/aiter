@@ -319,6 +319,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  bias_type,
                                  has_lse,
                                  quant_scale_enum::no_scale,
+                                 true,
                                  how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }

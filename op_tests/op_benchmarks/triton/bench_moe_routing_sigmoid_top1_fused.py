@@ -14,7 +14,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.test_moe_routing_sigmoid_top1_fused import (
+from op_tests.triton_tests.moe.test_moe_routing_sigmoid_top1_fused import (
     torch_routing_sigmoid_top1,
 )
 
