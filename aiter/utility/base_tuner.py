@@ -60,6 +60,8 @@ class TunerCommon:
         self.remain_untuned = pd.DataFrame(columns=self.keys)
         self.sort_keys = key
         self.start_time = 0
+        self.num_warmup = 5
+        self.num_iters = 101
 
     def get_arg_defaults(self):
         """get default arguments"""
@@ -67,6 +69,11 @@ class TunerCommon:
 
     def get_bpe(self, dtype):
         return self.dtype2bpe_dict[dtype]
+
+    def set_run_iters(self, input, indtype):
+        """set warm iters and run iter for profiling"""
+        """suggest warm iters * time1_per_iter > 100us"""
+        pass
 
     def _setup_common_arguments(self):
         """set common arguments"""
@@ -590,3 +597,12 @@ class GemmCommonTuner(TunerCommon):
             resultdf.loc[i, "bw"] = bw
             resultdf.loc[i, "errRatio"] = 0
         resultdf.to_csv(file, index=False, na_rep="Null")
+
+    def set_run_iters(self, input, inputdtype):
+        cu_num, m, n, k, *rest = input
+        flops = m * n * k * 2
+        bpe = self.get_bpe(inputdtype)
+        if flops < 128 * 5120 * 256:
+            self.num_warmup = 30
+        elif flops < 256 * 5120 * 256:
+            self.num_warmup = 15

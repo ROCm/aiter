@@ -173,6 +173,7 @@ class Gemm:
         mp=1,
         err_ratio=0.01,
         profile_file="",
+        num_warms=5,
         # splitK=None,
     ):
         torch.cuda.empty_cache()
@@ -207,6 +208,7 @@ class Gemm:
         # self.outbpe = self.ref.element_size()
         self.asm_map = {}
         self.has_bias = bias
+        self.num_warm = num_warms
 
     def find_hipblas_sols(self):
         sols = aiter.hipb_findallsols(
@@ -366,7 +368,10 @@ class Gemm:
                         ),
                         run_gemm_bf16_asm,
                         ([0, 6, 5, 3], splitK, kernelName, self.is_shuffle),
-                        {},
+                        {
+                            "num_warmup": self.num_warm,
+                            "num_iters": 101,
+                        },
                         get_gemm_ref,
                         ([0, 1, 3, 4], self.indtype, self.outdtype),
                         {},
@@ -440,7 +445,10 @@ class Gemm:
                 ),
                 run_triton_gemm_bf16,
                 ([0, 1, 3], self.outdtype),
-                {},
+                {
+                    "num_warmup": self.num_warm,
+                    "num_iters": 101,
+                },
                 get_gemm_ref,
                 ([0, 1, 3, 4], self.indtype, self.outdtype),
                 {},
@@ -452,8 +460,8 @@ class Gemm:
         return task
 
     def hipb_time_all_sols(self, fast_mode=0, top_sols=0):
-        coldi = 20
-        warmi = 20
+        coldi = 50
+        warmi = self.num_warm
         if fast_mode:
             coldi = 2
             warmi = 5
@@ -801,6 +809,8 @@ class GemmTuner(GemmCommonTuner):
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
             outdtype = outdtype if outdtype is not None else indtype
+            self.set_run_iters((self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype))
+
             gemmobj = Gemm(
                 ds["M"],
                 ds["N"],
@@ -813,6 +823,7 @@ class GemmTuner(GemmCommonTuner):
                 mp=args.mp,
                 err_ratio=args.errRatio,
                 profile_file=args.profile_file,
+                num_warms=self.num_warmup,
             )
 
             ret.extend(gemmobj.run_solutions())
