@@ -9,6 +9,8 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     sage_attn_1,
     get_fwd_configs,
 )
+from aiter.ops.triton.mha_v3 import _quantize_bshd
+
 
 from aiter.ops.triton.attn_qk_int8_per_block import (
     per_block_int8,
@@ -67,8 +69,9 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
         q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
             q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout=tensor_layout
         )
-
+        fp8_dtype = torch.float8_e4m3fnuz
         v_fp16 = v.to(torch.float16)
+        v_fp8, v_descale = _quantize_bshd(v_fp16, fp8_dtype)
 
         # For GQA/MQA: quantize query with grouped scaling
         #group_size = (
@@ -109,7 +112,7 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
         out, softmax_lse = sage_attn_1.fwd(
             q_int8,
             k_int8,
-            v_fp16,
+            v_fp8,
             None,
             None,
             None,
@@ -129,7 +132,7 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
             None,  # rotary_cos, rotary_sin, seqlens_rotary
             q_descale,
             k_descale,
-            None, # v_descale
+            v_descale, # v_descale
             softmax_scale,
             causal,
             int(window_size[0]),
