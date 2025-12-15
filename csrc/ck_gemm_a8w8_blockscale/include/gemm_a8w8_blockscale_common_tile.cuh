@@ -177,7 +177,7 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
                                                                     has_hot_loop_v,
                                                                     tail_number_v>;
 
-        using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<PipelineProblem>;
+        using GemmPipeline = ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>;
 
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ADataType,
