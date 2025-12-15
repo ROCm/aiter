@@ -48,6 +48,8 @@ def fwd(
     num_splits: int = 1,
     pack_gqa=None,
     sm_margin: int = 0,
+    return_lse: bool = True,
+    layout: str = "bshd",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sage Attention v1 forward pass compatible interface for AMD Triton implementation.
@@ -158,6 +160,8 @@ def fwd(
         print("num_splits:", num_splits)
         print("pack_gqa:", pack_gqa)
         print("sm_margin:", sm_margin)
+        print("return_lse:", return_lse)
+        print("layout:", layout)
 
     # Handle qv packed input
     if qv is not None:
@@ -229,11 +233,12 @@ def fwd(
             cu_seqlens_k_local = None
             max_seqlens_k_local = k.shape[1] if len(k.shape) == 4 else max_seqlen_k
     else:
-        layout = "bshd"
+        #layout is "bshd" or "bhsd"
+        seq_dim = 1 if layout == "bshd" else 2
         cu_seqlens_q_local = None
         cu_seqlens_k_local = None
-        max_seqlens_q_local = q.shape[1] if max_seqlen_q is None else max_seqlen_q
-        max_seqlens_k_local = k.shape[1] if max_seqlen_k is None else max_seqlen_k
+        max_seqlens_q_local = q.shape[seq_dim] if max_seqlen_q is None else max_seqlen_q
+        max_seqlens_k_local = k.shape[seq_dim] if max_seqlen_k is None else max_seqlen_k
 
     # Now determine if we should use decode or prefill kernel
     # Decode kernel should be used for KV cache scenarios where:
@@ -271,7 +276,7 @@ def fwd(
     if out is None:
         # NOTE: Using types that are lower precision than float32 such as bfloat16 for fp8 causes mismatches on a small set of tests.
         out_dtype = torch.float16
-        if layout == "bshd":
+        if layout in ["bshd", "bhsd"]:
             out = torch.zeros(
                 q.shape[0],
                 q.shape[1],
@@ -286,7 +291,7 @@ def fwd(
             )
         else:
             raise ValueError(
-                f"Unsupported layout: {layout}. Only 'bshd' and 'thd' layouts are supported."
+                f"Unsupported layout: {layout}. Only 'bshd', 'bhsd' and 'thd' layouts are supported."
             )
     else:
         out = out.zero_()
@@ -357,13 +362,16 @@ def fwd(
             total_q, nheads_q, _ = q.shape
             softmax_lse = torch.zeros(
                 (nheads_q, total_q), device=q.device, dtype=torch.float32
-            )
+            ) if return_lse else None
         else:
             # bshd: (B, Hq, Sq)
-            batch, seqlen_q, nheads_q, _ = q.shape
+            if layout == "bshd":
+                batch, seqlen_q, nheads_q, _ = q.shape
+            else:
+                batch, nheads_q, seqlen_q, _ = q.shape
             softmax_lse = torch.zeros(
                 (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
-            )
+            ) if return_lse else None
 
         # sd_mask is not returned in v3 interface
         sd_mask = None
@@ -444,19 +452,23 @@ def fwd(
         ), f"[fwd_v3] out.shape[3] {out.shape[3]} != v.shape[-1] {v.shape[-1]}"
 
     # softmax_lse dtype
-    assert (
-        softmax_lse.dtype == torch.float32
-    ), f"[fwd_v3] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
-    # softmax_lse shape depends on layout
-    if layout == "thd":
-        # varlen: (Hq, Total_Q)
-        expected_lse_shape = (q.shape[1], q.shape[0])
-    else:
-        # bshd: (B, Hq, Sq)
-        expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
-    assert (
-        softmax_lse.shape == expected_lse_shape
-    ), f"[fwd_v3] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    if softmax_lse is not None:
+        assert (
+            softmax_lse.dtype == torch.float32
+        ), f"[fwd_v3] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+        # softmax_lse shape depends on layout
+        if layout == "thd":
+            # varlen: (Hq, Total_Q)
+            expected_lse_shape = (q.shape[1], q.shape[0])
+        elif layout == "bshd":
+            # bshd: (B, Sq, Hq)
+            expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+        else:
+            # bhsd: (B, Hq, Sq)
+            expected_lse_shape = (q.shape[0], q.shape[1], q.shape[2])
+        assert (
+            softmax_lse.shape == expected_lse_shape
+        ), f"[fwd_v3] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
 
     # Return format compatible with v3
     # V3 returns (out, softmax_lse, *rest) where rest can be empty or contain additional outputs
