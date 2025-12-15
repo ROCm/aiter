@@ -103,6 +103,72 @@ python op_tests/sagev1_tests/stitch_comparison.py \
     --input_dir ./rendered_videos \
     --fps 24
 ```
+## Saving Inputs for Benchmarking
+
+The `sageattn_cogvideo.py` script can capture attention inputs (Q, K, V tensors) during video generation for later benchmarking with different attention kernels.
+
+### Capture Inputs During Rendering
+
+```bash
+# Save first 10 attention inputs (default)
+python op_tests/sagev1_tests/sageattn_cogvideo.py \
+    --attention_type sagev1 \
+    --save_inputs \
+    --input_dir ./captured_inputs
+
+# Save more inputs for comprehensive benchmarking
+python op_tests/sagev1_tests/sageattn_cogvideo.py \
+    --attention_type sagev1 \
+    --save_inputs \
+    --input_dir ./captured_inputs \
+    --max_captures 100
+
+# Save all inputs (use with caution - can be large)
+python op_tests/sagev1_tests/sageattn_cogvideo.py \
+    --attention_type sagev1 \
+    --save_inputs \
+    --input_dir ./captured_inputs \
+    --max_captures 0
+```
+
+### Captured Input Format
+
+Each captured input is saved as a `.pt` file containing:
+- `q`, `k`, `v` - The input tensors (CPU, cloned)
+- `q_shape`, `k_shape`, `v_shape` - Tensor shapes
+- `dtype` - Data type string
+- `call_idx` - Index of this attention call in the pipeline
+- `kwargs` - Non-tensor keyword arguments (e.g., `is_causal`, `softmax_scale`)
+
+A metadata file `{kernel_name}_metadata.pt` is also saved with:
+- Total number of attention calls
+- Number of inputs saved
+- Unique shape configurations encountered
+
+### Benchmark with Captured Inputs
+
+Use the benchmark script to evaluate different attention kernels on the captured inputs:
+
+```bash
+# Benchmark sagev1 kernel
+python op_tests/op_benchmarks/triton/bench_cogvideo.py \
+    --input_dir ./captured_inputs \
+    --kernel sagev1
+
+# Benchmark FA3 FP8 kernel
+python op_tests/op_benchmarks/triton/bench_cogvideo.py \
+    --input_dir ./captured_inputs \
+    --kernel fa3_fp8
+
+# Compare throughput across kernels
+python op_tests/op_benchmarks/triton/bench_cogvideo.py \
+    --input_dir ./captured_inputs \
+    --kernel sdpa \
+    -metric throughput
+
+# Available kernels: sagev1, sage_fa3, sdpa, fa2, fa3, fa3_fp8
+```
+
 ## Script Reference
 
 ### `render_all_attention.sh`
