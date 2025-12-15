@@ -110,28 +110,13 @@ jobs:
             kv_cache_dtype: 'fp8_kvcache'
         
     steps:
-      - name: Checkout aiter repo
-        uses: actions/checkout@v4
-        
-      - name: Checkout vLLM repo with retry
-        uses: nick-fields/retry@v2
-        with:
-          timeout_minutes: 20
-          max_attempts: 10
-          command: |
-            git clone --depth=1 --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
-
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download the vLLM image
         run: |
           docker pull rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
-      
-      - name: Clean up Rocm processes
-        run: |
-          ./.github/scripts/clean_up_rocm.sh
-
+    
       - name: Run benchmarks
         run: |
           set -x -o pipefail
@@ -160,10 +145,12 @@ jobs:
               -tp 8 --load-format dummy ${extraArgs} |& tee ${logFile}
           grep "Avg latency:" ${logFile} | awk '{print $3}'
   
-      - name: Clean up Rocm processes
+      - name: Clean up
         if: always()
         run: |
-          ./.github/scripts/clean_up_rocm.sh
+          docker stop aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
+          docker rm -f aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
+          docker rmi rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
 
   skip-job:
     if: ${{ github.event.pull_request.head.repo.fork }}
