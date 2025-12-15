@@ -16,17 +16,17 @@ from typing import Optional, Tuple
 
 import torch
 
-from aiter.ops.triton._triton_kernels.gdr_sglang.chunk import (
+from .chunk import (
     chunk_gated_delta_rule as _chunk_gated_delta_rule,
 )
-from aiter.ops.triton._triton_kernels.gdr_sglang.fused_recurrent import (
+from .fused_recurrent import (
     fused_recurrent_gated_delta_rule as _fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_update as _fused_recurrent_update,
 )
-from aiter.ops.triton._triton_kernels.gdr_sglang.fused_sigmoid_gating_recurrent import (
+from .fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update as _fused_sigmoid_gating,
 )
-from aiter.ops.triton._triton_kernels.gdr_sglang.fused_gdn_gating import (
+from .fused_gdn_gating import (
     fused_gdn_gating,
 )
 

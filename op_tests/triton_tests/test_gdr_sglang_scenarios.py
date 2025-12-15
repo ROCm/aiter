@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from typing import Optional
 
-from aiter.ops.gated_delta_rule import (
+from aiter.ops.triton._triton_kernels.gdr_sglang import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_update,
