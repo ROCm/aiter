@@ -25,7 +25,14 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter.ops.triton.fused_mxfp4_quant import (
+    fused_dynamic_mxfp4_quant_moe_sort,
+    fused_quant_fp8_sort,
+)
+from aiter.ops.quant import (
+    per_1x32_f8_scale_f8_quant,
+)
+
 
 BLOCK_SIZE_M = 32
 
@@ -110,6 +117,7 @@ def fused_moe(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    q_dtype_a=None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -135,6 +143,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        q_dtype_a=q_dtype_a,
     )
 
 
@@ -196,6 +205,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    q_dtype_a: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -222,8 +232,15 @@ def fused_moe_(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
+
+    if q_dtype_a is not None:
+        pass
+    elif w1.dtype != torch.uint32:
+        q_dtype_a = w1.dtype
+    elif quant_type == QuantType.per_1x32:
+        q_dtype_a = dtypes.fp4x2
+    else:
+        q_dtype_a = dtypes.fp8
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -821,11 +838,25 @@ def fused_moe_2stages(
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
         and activation == ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
+    elif (
+        quant_type == aiter.QuantType.per_1x32
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_a == dtypes.fp8
+        and w1.dtype == dtypes.fp4x2
+        and activation == aiter.ActivationType.Swiglu
+    ):
+        a1, a1_scale = fused_quant_fp8_sort(
+            hidden_states,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
+        )
     elif quant_type == QuantType.per_1x32:
         if token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -893,13 +924,31 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
 
+
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
         and activation == ActivationType.Swiglu
     ):
         a2_scale = None
+    elif (
+        quant_type == aiter.QuantType.per_1x32
+        and dtype in [dtypes.bf16]
+        and q_dtype_a == dtypes.fp8
+        and w1.dtype == dtypes.fp4x2
+        and activation == aiter.ActivationType.Swiglu
+    ):
+        a2 = a2.view(-1, inter_dim)
+        a2, a2_scale = fused_quant_fp8_sort(
+            a2,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
+        )
+
+        a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         if token_num <= token_num_quant_moe_sort_switch:
