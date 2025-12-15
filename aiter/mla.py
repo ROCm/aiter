@@ -353,8 +353,16 @@ def mla_decode_fwd(
                     torch.einsum("qhd,khd->hqk", query.float(), key.float()).squeeze(1)
                     * sm_scale
                 )
+                qk_exp = torch.empty_like(qk)
+                for kv_start in range(0, qk.shape[1], 32):
+                    kv_end = min(kv_start + 32, qk.shape[1])
+                    max_tile = qk[:, :kv_end]
+                    m = max_tile.max(-1).values
+                    p_tile = torch.exp(qk[:, kv_start:kv_end] - m.unsqueeze(-1))
+                    qk_exp[:, kv_start:kv_end] = p_tile
                 dbg_qk = dbg_tr[i * nhead : (i + 1) * nhead, : qk.shape[1]]
-                checkAllclose(dbg_qk, qk, msg=f"dbg[{i}] vs. qk[{i}]")
+                checkAllclose(dbg_qk, qk_exp, msg=f"dbg[{i}] vs. qk[{i}]")
+                print(dbg_qk[4])
 
             exit()
 
