@@ -43,8 +43,8 @@ using CLayout  = ck_tile::tensor_layout::gemm::RowMajor;
 
 using CDEElementWise = ck_tile::element_wise::PassThrough;
 
-using AQuantGroupSize = ck_tile::sequence<1, 128, 128>; // M, N, K
-using BQuantGroupSize = ck_tile::sequence<1, 128, 128>; // M, N, K
+using AQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>; // M, N, K
+using BQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>; // M, N, K
 
 template <ck_tile::index_t M_Tile,
           ck_tile::index_t N_Tile,
@@ -163,9 +163,10 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
         constexpr bool transpose_c    = GemmConfig::TransposeC_v;
 
         using PipelineProblem = ck_tile::GemmABQuantPipelineProblem<ADataType,
-                                                                    QDataType, // For AQ
+                                                                    QDataType, // AQDataType
                                                                     BDataType,
-                                                                    QDataType, // For BQ
+                                                                    QDataType, // BQDataType
+                                                                    AccDataType,
                                                                     GemmShape,
                                                                     GemmTraits,
                                                                     AQuantGroupSize,
@@ -177,9 +178,6 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
                                                                     tail_number_v>;
 
         using GemmPipeline = ck_tile::GemmPipelineAgBgCrCompV3<PipelineProblem>;
-
-        constexpr bool TiledPermuteN =
-            (BQuantGroupSize::kN > 1) ? false : GemmConfig::TiledMMAPermuteN;
 
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ADataType,
@@ -202,7 +200,7 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
                                              1,
                                              false,
                                              1,
-                                             TiledPermuteN>>;
+                                             false>>;
 
         using Kernel = ck_tile::QuantGemmKernel<TilePartitioner,
                                                 GemmPipeline,
@@ -243,9 +241,14 @@ __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
-    TORCH_CHECK(args.K % AQuantGroupSize::kK == 0, K must be aligned with QuantGroupSize);
-    TORCH_CHECK(args.K % BQuantGroupSize::kK == 0, K must be aligned with QuantGroupSize);
-    TORCH_CHECK(args.K % BQuantGroupSize::kN == 0, N must be aligned with QuantGroupSize);
+    // M, N, K
+    const int M = XQ.size(0);
+    const int N = WQ.size(0);
+    const int K = XQ.size(1);
+
+    TORCH_CHECK(K % AQuantGroupSize::kK == 0, "K must be aligned with QuantGroupSize");
+    TORCH_CHECK(K % BQuantGroupSize::kK == 0, "K must be aligned with QuantGroupSize");
+    TORCH_CHECK(K % BQuantGroupSize::kN == 0, "N must be aligned with QuantGroupSize");
 
     // prepare args
     ck_tile::QuantGemmHostArgs args;
@@ -254,11 +257,6 @@ __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     args.b_ptr  = WQ.data_ptr();
     args.bq_ptr = w_scale.data_ptr();
     args.c_ptr  = Y.data_ptr();
-
-    // M, N, K
-    const int M = XQ.size(0);
-    const int N = WQ.size(0);
-    const int K = XQ.size(1);
 
     // split-k is not supported yet for tile quant gemm, set k_batch to 1
     args.k_batch = 1;
