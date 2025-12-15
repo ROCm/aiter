@@ -1,14 +1,17 @@
+import functools
 import json
 import os
 
 import triton
 
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 # Standard bounds for M_LEQ_x keys
 STANDARD_M_BOUNDS = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+
+USE_LRU_CACHE = True
 
 
 def _load_config_file(
@@ -36,7 +39,7 @@ def get_gemm_config(
     M: int,
     N: int | None = None,
     K: int | None = None,
-    bounds: list[int] | None = None,
+    bounds: list[int] | tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
 ) -> dict:
     """
@@ -62,6 +65,10 @@ def get_gemm_config(
     Returns:
         Dictionary with the config params
     """
+    # Convert bounds to tuple for LRU caching
+    if bounds is not None and not isinstance(bounds, tuple):
+        bounds = tuple(bounds)
+
     # Input validation
     assert M >= 0, "M must be positive."
     assert N is None or N > 0, "N must be positive when provided."
@@ -142,6 +149,10 @@ def get_gemm_config(
     raise KeyError(
         f"No matching configuration found for M={M}, N={N}, K={K} in config '{config_name}'."
     )
+
+
+if USE_LRU_CACHE:
+    get_gemm_config = functools.lru_cache(maxsize=1024)(get_gemm_config)
 
 
 def add_default_gemm_config_params(config: dict) -> dict:
