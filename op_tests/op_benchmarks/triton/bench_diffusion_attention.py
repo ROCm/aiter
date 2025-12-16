@@ -50,8 +50,8 @@ from op_tests.op_benchmarks.triton.mha_correctness_utils import (
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.mha_v3 import _quantize_bshd
 
-from aiter.ops.triton.sage_v1 import (
-    sage_attn_v1_func,
+from aiter.ops.triton.fav3_sage import (
+    fav3_sage_func,
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs,
@@ -183,9 +183,9 @@ def fav3_fp8_forward_func(
         sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
     )
 
-def qk_int8_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
+def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
     # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
-    # tensor_layout = args.qk_int8_layout
+    # tensor_layout = args.sagev1_layout
     config = _get_config()
     # Original tensors are in NHD format (batch, seq, heads, dim)
     if tensor_layout == "HND":
@@ -227,7 +227,7 @@ def fav2_forward_func(
         return_attn_probs=return_attn_probs,
     )
 
-def sagev1_forward_func(
+def fav3_sage_forward_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -249,11 +249,9 @@ def sagev1_forward_func(
     )
 
     fp8_dtype = torch.float8_e4m3fnuz
-    v_fp16 = v.to(torch.float16)
+    v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
 
-    v_fp8, v_descale = _quantize_bshd(v_fp16, fp8_dtype)
-
-    return lambda: sage_attn_v1_func(
+    return lambda: fav3_sage_func(
         q_int8, 
         k_int8, 
         v_fp8,
@@ -277,7 +275,7 @@ def nonvarlen_benchmark_configs():
     return configs
 
 
-def create_benchmark_configs(custom, args):
+def create_benchmark_configs(args):
     dtype = arg_to_torch_dtype[args.dtype]
     hk = args.hq if not args.hk else args.hk
     sk = args.sq if not args.sk else args.sk
@@ -285,7 +283,7 @@ def create_benchmark_configs(custom, args):
     head_size_v = head_size if not args.dv else args.dv
     mode = args.mode
     x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
-    causal = args.causal
+    causal = False
 
     configs = []
     plot_name = get_caller_name_no_ext()
@@ -382,7 +380,7 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
             plot_name=plot_name,
             args={
                 "inputs": inputs,
-                "causal": args.causal,
+                "causal": False,
                 "mode": args.mode,
             },
         )
@@ -401,7 +399,7 @@ def bench_kernel(q, k, v, args, provider):
     total_flops += (
         2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
     )
-    if args.fp8: #  fav3 fp8
+    if args.fav3_fp8: #  fav3 fp8
         fn = fav3_fp8_forward_func(
             q,
             k,
@@ -414,17 +412,17 @@ def bench_kernel(q, k, v, args, provider):
             deterministic=False,
             sm_margin=0,
         )
-    elif args.qk_int8: # sage v1
-        fn = qk_int8_forward_func(
+    elif args.sagev1: # sage v1
+        fn = sagev1_forward_func(
             q,
             k,
             v,
-            tensor_layout=args.qk_int8_layout,
+            tensor_layout=args.sagev1_layout,
             sm_scale=softmax_scale,
             k_smooth=k_smooth,
         )
-    elif args.sagev1_fa3: # sage v1, fused on fa3
-        fn = sagev1_forward_func(
+    elif args.fav3_sage: # sage v1, fused on fa3
+        fn = fav3_sage_forward_func(
             q,
             k,
             v,
@@ -463,12 +461,12 @@ def bench_kernel(q, k, v, args, provider):
                     deterministic=False,
                     sm_margin=0,
                 )
-            elif args.ref=="qk_int8": # sage v1
-                fn = qk_int8_forward_func(
+            elif args.ref=="sagev1": # sage v1
+                fn = sagev1_forward_func(
                     q,
                     k,
                     v,
-                    tensor_layout=args.qk_int8_layout,
+                    tensor_layout=args.sagev1_layout,
                     sm_scale=softmax_scale,
                     k_smooth=k_smooth,
                 )
@@ -496,9 +494,9 @@ def bench_kernel(q, k, v, args, provider):
         if args.print_compare_stats:
             print_output_comparison_stats(current_primary, reference_primary)
 
-    q_element_size = 1 if args.qk_int8 or args.fp8 or args.sagev1_fa3 else q.element_size()
-    k_element_size = 1 if args.qk_int8 or args.fp8 or args.sagev1_fa3 else k.element_size()
-    v_element_size = 1 if args.fp8 else v.element_size()
+    q_element_size = 1 if args.sagev1 or args.fav3_fp8 or args.fav3_sage else q.element_size()
+    k_element_size = 1 if args.sagev1 or args.fav3_fp8 or args.fav3_sage else k.element_size()
+    v_element_size = 1 if args.fav3_fp8 else v.element_size()
 
     
     total_num_tokens_q = BATCH * N_CTX_Q
@@ -577,9 +575,9 @@ def run_benchmark_captured(args):
 
 saved_output_keys = set()
 
-def run_benchmark(custom, args):
+def run_benchmark(args):
     torch.manual_seed(20)
-    @triton.testing.perf_report(create_benchmark_configs(custom, args))
+    @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mha(
         BATCH,
         HQ,
@@ -600,7 +598,7 @@ def run_benchmark(custom, args):
         """
         Benchmark function for attention kernels with generated random inputs.
         """
-        assert args.qk_int8_layout=="NHD"
+        assert args.sagev1_layout=="NHD"
         assert args.layout == "bshd"
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         assert causal == False, "Causal not supported in this benchmark."
@@ -661,13 +659,13 @@ def parse_args():
         help="Q and K head size, if -dv is absent then -d specifies V head size too",
     )
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
-    parser.add_argument("-causal", type=str2bool, default=None)
-    parser.add_argument("-fp8", action="store_true", default=False)
-    parser.add_argument("-qk_int8", action="store_true", default=False)
-    parser.add_argument("-sagev1_fa3", action="store_true", default=False)
+    # parser.add_argument("-causal", type=str2bool, default=None)
+    parser.add_argument("-fav3_fp8", action="store_true", default=False, help="Use fav3 fp8 kernel: per tensor quantization, QK and PV in fp8, accumulation in fp32")
+    parser.add_argument("-sagev1", action="store_true", default=False, help="Use sage v1 kernel: per block quantization, QK in int8, PV and accumulation in fp16")
+    parser.add_argument("-fav3_sage", action="store_true", default=False, help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.")
     parser.add_argument("-no_k_smooth", action="store_true", default=False)
-    parser.add_argument("-qk_int8_layout", type=str, default="NHD", choices=["HND", "NHD"],
-        help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")
+    parser.add_argument("-sagev1_layout", type=str, default="NHD", choices=["HND", "NHD"],
+        help="Tensor layout for sagev1: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: NHD.")
     parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)
@@ -737,81 +735,39 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+    # hardcode non-variable length and non-causal for now
+    args.causal = False
+    args.layout = "bshd"
 
     # Handle captured input mode separately
     if args.load_captured:
         logger.info(f"Running benchmark with captured inputs from: {args.captured_dir}")
-        
-        # Set defaults for captured mode
-        if args.causal is None:
-            args.causal = False
-        if args.layout is None:
-            args.layout = "bshd"
-        
         run_benchmark_captured(args)
         return 0
 
-    if args.model:
-        if args.causal is None:  # User didn't specify -causal
-            args.causal = True
-        if args.layout is None:  # User didn't specify -layout
-            args.layout = "thd"
-        print(
-            f"Note: using -model config defaults: causal={True}, layout={'thd'}. This is the most common real life scenario, but can be overridden with -causal and -layout flags."
-        )
-    else:
-        # the defaults for causal and varlen when not using the -model
-        if args.causal is None:  # User didn't specify -causal
-            args.causal = False
-        if args.layout is None:  # User didn't specify -layout
-            args.layout = "bshd"
-
-    custom_config = False
-
-    assert (
-        args.layout == "thd" or not args.equal_seqlens or args.model
-    ), "Equal sequence lengths arg must be used with the thd layout or a model config."
-    # if args.hq or args.hk or args.d or args.dv:
-    custom_config = True
     if not args.dv:
         args.dv = args.d
     assert (
         args.b and args.hq and args.sq and args.d and args.dv
-    ), "If custom config is specified, please provide \
+    ), "If not running on captured (--load_captured) please provide \
             all of batch, number of Q heads, Q sequence length \
             and head size."
-
-    if args.model:
-        assert not (
-            args.hq or args.hk or args.d or args.dv
-        ), "Specifying model fixes hq, hk and d already. Do not provide them!"
 
     assert (
         args.dtype in arg_to_torch_dtype
     ), "Only fp16, bf16 and f32 types currently supported."
-
-    assert (
-        args.layout in supported_layouts()
-    ), f"{args.layout} is not in supported layouts: {supported_layouts()}."
-
-    if args.layout == "thd" and args.equal_seqlens:
-        warnings.warn(
-            "Using 'thd' layout with equal_seqlen=True incurs an extra sequence length lookup cost "
-            "compared to 'bshd' layout. Consider using 'bshd' for better performance.",
-            category=RuntimeWarning,
-        )
 
     if args.print_vgpr:
         assert not args.bench_torch, "Do not use -bench_torch with -print_vgpr."
         print("Retrieving VGPR usage for Triton kernels...")
 
         def fun():
-            return run_benchmark(custom_config, args)
+            return run_benchmark(args)
 
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
 
-    run_benchmark(custom_config, args)
+    run_benchmark(args)
 
 
 if __name__ == "__main__":

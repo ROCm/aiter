@@ -39,10 +39,10 @@ sudo apt-get install imagemagick
 |------|-------------|
 | `sdpa` | PyTorch native scaled dot product attention |
 | `sagev1` | SageAttention v1 (INT8 quantized Q/K) |
-| `fa2` | Flash Attention v2 (Triton) |
-| `fa3` | Flash Attention v3 (Triton) |
-| `fa3_fp8` | Flash Attention v3 with FP8 quantization |
-| `sagev1_fa3` | SageAttention v1 fused on FA3 backend |
+| `fav2` | Flash Attention v2 (Triton) |
+| `fav3` | Flash Attention v3 (Triton) |
+| `fav3_fp8` | Flash Attention v3 with FP8 quantization |
+| `fav3_sage` | SageAttention v1 fused on FA3 backend |
 
 ## Usage
 
@@ -64,7 +64,7 @@ python op_tests/sagev1_tests/sageattn_cogvideo.py --attention_type sagev1
 
 # Render with a local model path
 python op_tests/sagev1_tests/sageattn_cogvideo.py \
-    --attention_type fa3_fp8 \
+    --attention_type fav3_fp8 \
     --model_path /path/to/local/model
 ```
 
@@ -75,7 +75,7 @@ python op_tests/sagev1_tests/sageattn_cogvideo.py \
 ./op_tests/sagev1_tests/render_all_attention.sh
 
 # Render specific types only
-./op_tests/sagev1_tests/render_all_attention.sh --types sagev1,fa3_fp8,sagev1_fa3
+./op_tests/sagev1_tests/render_all_attention.sh --types sagev1,fav3_fp8,fav3_sage
 
 # Custom output directory
 ./op_tests/sagev1_tests/render_all_attention.sh --output-dir ./my_videos
@@ -158,7 +158,7 @@ python op_tests/op_benchmarks/triton/bench_cogvideo.py \
 # Benchmark FA3 FP8 kernel
 python op_tests/op_benchmarks/triton/bench_cogvideo.py \
     --input_dir ./captured_inputs \
-    --kernel fa3_fp8
+    --kernel fav3_fp8
 
 # Compare throughput across kernels
 python op_tests/op_benchmarks/triton/bench_cogvideo.py \
@@ -166,7 +166,7 @@ python op_tests/op_benchmarks/triton/bench_cogvideo.py \
     --kernel sdpa \
     -metric throughput
 
-# Available kernels: sagev1, sage_fa3, sdpa, fa2, fa3, fa3_fp8
+# Available kernels: sagev1, fav3_sage, sdpa, fav2, fav3, fav3_fp8
 ```
 
 ## Script Reference

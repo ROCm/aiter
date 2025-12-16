@@ -29,8 +29,8 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
     per_block_int8,
 )
 
-from aiter.ops.triton.sage_v1 import (
-    sage_attn_v1_wrapper_func,
+from aiter.ops.triton.fav3_sage import (
+    fav3_sage_wrapper_func,
 )
 
 
@@ -1370,7 +1370,7 @@ def test_attn_qk_int8_per_block(
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 @pytest.mark.parametrize("LAYOUT", ["bshd", "bhsd"])
-def test_sage_v1(
+def test_fav3_sage(
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -1393,7 +1393,7 @@ def test_sage_v1(
     else:
         raise NotImplementedError(f"Expected layout to be 'bshd' or 'bhsd', got {LAYOUT}.")
 
-    triton_out = sage_attn_v1_wrapper_func(
+    triton_out = fav3_sage_wrapper_func(
         q,
         k,
         v,

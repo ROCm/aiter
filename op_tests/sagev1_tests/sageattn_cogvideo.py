@@ -138,7 +138,7 @@ logger = logging.getLogger(__name__)
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str, default="THUDM/CogVideoX-2b", help='Model path')
 parser.add_argument('--compile', action='store_true', help='Compile the model')
-parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sagev1', 'fa2', 'fa3', 'fa3_fp8', 'sagev1_fa3'], help='Attention type')
+parser.add_argument('--attention_type', type=str, default='sdpa', choices=['sdpa', 'sagev1', 'fav2', 'fav3', 'fav3_fp8', 'fav3_sage'], help='Attention type')
 parser.add_argument('--save_inputs', action='store_true', help='Save attention inputs for later benchmarking')
 parser.add_argument('--input_dir', type=str, default='./captured_inputs', help='Directory to save captured inputs')
 parser.add_argument('--max_captures', type=int, default=10, help='Maximum number of inputs to save (use 0 for unlimited)')
@@ -188,22 +188,22 @@ elif args.attention_type == 'sdpa':
         )
     attn_fn = sdpa_wrapper
 
-elif args.attention_type == 'fa2':
-    from aiter.ops.triton.mha import flash_attn_func as _fa2
-    attn_fn = make_bshd_wrapper(_fa2, dropout_p=0.0)
+elif args.attention_type == 'fav2':
+    from aiter.ops.triton.mha import flash_attn_func as _fav2
+    attn_fn = make_bshd_wrapper(_fav2, dropout_p=0.0)
 
-elif args.attention_type == 'fa3':
-    from aiter.ops.triton.mha_v3 import flash_attn_func as _fa3
-    attn_fn = make_bshd_wrapper(_fa3)
+elif args.attention_type == 'fav3':
+    from aiter.ops.triton.mha_v3 import flash_attn_func as _fav3
+    attn_fn = make_bshd_wrapper(_fav3)
 
-elif args.attention_type == 'fa3_fp8':
-    from aiter.ops.triton.mha_v3 import flash_attn_fp8_func as _fa3_fp8
-    attn_fn = make_bshd_wrapper(_fa3_fp8)
+elif args.attention_type == 'fav3_fp8':
+    from aiter.ops.triton.mha_v3 import flash_attn_fp8_func as _fav3_fp8
+    attn_fn = make_bshd_wrapper(_fav3_fp8)
 
-elif args.attention_type == 'sagev1_fa3':
-    from aiter.ops.triton.sage_v1 import sage_attn_v1_wrapper_func as _sagev1_fa3
-    kernel_name = "_sagev1_fa3"  # Override kernel name for this variant
-    attn_fn = make_bshd_wrapper(_sagev1_fa3)
+elif args.attention_type == 'fav3_sage':
+    from aiter.ops.triton.fav3_sage import fav3_sage_wrapper_func as _fav3_sage
+    kernel_name = "_fav3_sage"  # Override kernel name for this variant
+    attn_fn = make_bshd_wrapper(_fav3_sage)
 
 else:
     raise ValueError(f"Attention type {args.attention_type} not supported")

@@ -1628,7 +1628,7 @@ def attn_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
-def attention_forward_prefill_triton_impl(
+def fav3_sage_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

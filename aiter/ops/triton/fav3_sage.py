@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    sage_attn_1,
+    fav3_sage,
     get_fwd_configs,
 )
 
@@ -14,12 +14,14 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
     per_block_int8,
 )
 
+from aiter.ops.triton.mha_v3 import _quantize_bshd
+
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import (
     map_dims,
 )
 
 
-class _SageAttnV1WrapperFunc(torch.autograd.Function):
+class _FAv3SageWrapperFunc(torch.autograd.Function):
     """
     Sage Attention v1 wrapper that maintains high-precision inputs/outputs.
 
@@ -68,7 +70,8 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
             q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout=tensor_layout
         )
 
-        v_fp16 = v.to(torch.float16)
+        fp8_dtype = torch.float8_e4m3fnuz
+        v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
 
         # For GQA/MQA: quantize query with grouped scaling
         #group_size = (
@@ -106,10 +109,10 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
             assert return_lse, f"in train mode, return_lse is expected to be True, got {return_lse}"
 
         # Call flash attention forward
-        out, softmax_lse = sage_attn_1.fwd(
+        out, softmax_lse = fav3_sage.fwd(
             q_int8,
             k_int8,
-            v_fp16,
+            v_fp8,
             None,
             None,
             None,
@@ -129,7 +132,7 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
             None,  # rotary_cos, rotary_sin, seqlens_rotary
             q_descale,
             k_descale,
-            None, # v_descale
+            v_descale, # v_descale
             softmax_scale,
             causal,
             int(window_size[0]),
@@ -185,7 +188,7 @@ class _SageAttnV1WrapperFunc(torch.autograd.Function):
         )
 
 
-def sage_attn_v1_wrapper_func(
+def fav3_sage_wrapper_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -271,7 +274,7 @@ def sage_attn_v1_wrapper_func(
         )
 
     return_lse = (not inference_mode)
-    return _SageAttnV1WrapperFunc.apply(
+    return _FAv3SageWrapperFunc.apply(
         q,
         k,
         v,
@@ -291,7 +294,7 @@ def sage_attn_v1_wrapper_func(
     )
 
 
-def sage_attn_v1_func(
+def fav3_sage_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -384,7 +387,7 @@ def sage_attn_v1_func(
 
     return_lse = (not inference_mode)
     # Call flash attention forward
-    out, _ = sage_attn_1.fwd(
+    out, _ = fav3_sage.fwd(
         q,
         k,
         v,
