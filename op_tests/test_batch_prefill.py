@@ -326,6 +326,84 @@ def run_ck(
         )
 
 
+def varlen_to_paged_kv(k_varlen, v_varlen, kv_lens, page_size=1):
+    """
+    Convert varlen format K/V to paged KV cache format.
+
+    Args:
+        k_varlen: [total_tokens, num_kv_heads, head_dim]
+        v_varlen: [total_tokens, num_kv_heads, head_dim]
+        kv_lens: [batch_size] - length of each sequence
+        page_size: tokens per page
+
+    Returns:
+        kv_data: [total_num_pages, 2, num_kv_heads, page_size, head_dim]
+        kv_indptr: [batch_size + 1]
+        kv_indices: [total_num_pages + padding]
+    """
+    batch_size = len(kv_lens)
+    num_kv_heads = k_varlen.shape[1]
+    head_dim = k_varlen.shape[2]
+    dtype = k_varlen.dtype
+    device = k_varlen.device
+
+    # Calculate number of pages needed
+    max_kv_len = kv_lens.max().item()
+    max_num_pages_per_seq = (max_kv_len + page_size - 1) // page_size
+    total_num_pages = max_num_pages_per_seq * batch_size
+
+    # Create paged KV cache
+    kv_data = torch.zeros(
+        total_num_pages,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+
+    # Create page indices (identity mapping for simplicity)
+    kv_indices = torch.arange(total_num_pages, dtype=torch.int32, device="cpu")
+    kv_indices = torch.nn.functional.pad(kv_indices, (0, 128), value=0)
+
+    # Fill in the data
+    def convert_lens_to_indptr_local(lens):
+        return torch.cumsum(torch.cat((torch.tensor([0]), lens)), dim=0).int()
+
+    kv_indptr = convert_lens_to_indptr_local(
+        ((kv_lens + page_size - 1) // page_size).cpu()
+    )
+    cu_kv_lens = convert_lens_to_indptr_local(kv_lens.cpu())
+
+    for batch_idx in range(batch_size):
+        seq_start = cu_kv_lens[batch_idx].item()
+        seq_end = cu_kv_lens[batch_idx + 1].item()
+        seq_len = seq_end - seq_start
+
+        page_start = kv_indptr[batch_idx].item()
+        num_pages = kv_indptr[batch_idx + 1].item() - page_start
+
+        # Copy K and V data into pages
+        for page_idx in range(num_pages):
+            global_page_idx = page_start + page_idx
+            token_start = page_idx * page_size
+            token_end = min(token_start + page_size, seq_len)
+            tokens_in_page = token_end - token_start
+
+            # K data
+            kv_data[global_page_idx, 0, :, :tokens_in_page, :] = k_varlen[
+                seq_start + token_start : seq_start + token_end, :, :
+            ]
+
+            # V data
+            kv_data[global_page_idx, 1, :, :tokens_in_page, :] = v_varlen[
+                seq_start + token_start : seq_start + token_end, :, :
+            ]
+
+    return kv_data, kv_indptr, kv_indices
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("batch_size", [1, 3])
@@ -522,6 +600,192 @@ def test_batch_prefill_fp8_output(
 
         # Also verify BF16 kernel matches reference (sanity check)
         torch.testing.assert_close(o_bf16_i, o_ref_i, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (8, 1)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize(
+    "qo_len,kv_len",
+    [
+        (128, 128),
+        (1024, 1024),
+        (2048, 2048),
+        (4096, 4096),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_batch_prefill_vs_varlen_fp8(
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    qo_len,
+    kv_len,
+    causal,
+    logits_soft_cap,
+):
+    """
+    Compare FP8 batch_prefill (paged KV) vs FP8 flash_attn_varlen.
+    Both use qr_async pipeline with FP8, should produce identical results.
+    Uses per-batch valid token comparison to avoid including padding data.
+    """
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    quant_dtype = dtypes.fp8
+
+    def create_tensor(min_val, max_val, *args, **kwargs):
+        """Create a tensor with values uniformly distributed in [min_val, max_val]."""
+        x = torch.randn(*args, **kwargs)
+        x = (x - x.min()) / (x.max() - x.min())
+        return min_val + (max_val - min_val) * x
+
+    def convert_lens_to_indptr(lens):
+        """Convert sequence lengths to cumulative index pointer."""
+        return torch.cumsum(torch.cat((torch.tensor([0]), lens)), dim=0).int()
+
+    # Create Q, K, V in varlen format (BF16 first)
+    if batch_size > 1:
+        qo_lens = torch.randint(qo_len // 2, qo_len + 1, (batch_size,)).int()
+        kv_lens = torch.maximum(
+            qo_lens, torch.randint(kv_len // 2, kv_len + 1, (batch_size,))
+        ).int()
+    else:
+        qo_lens = torch.full((batch_size,), qo_len).int()
+        kv_lens = torch.full((batch_size,), kv_len).int()
+
+    total_q_tokens = qo_lens.sum().item()
+    total_kv_tokens = kv_lens.sum().item()
+
+    q_bf16 = create_tensor(
+        -10, 10, total_q_tokens, num_qo_heads, head_dim, dtype=dtype
+    ).cuda()
+    k_bf16 = create_tensor(
+        -5, 5, total_kv_tokens, num_kv_heads, head_dim, dtype=dtype
+    ).cuda()
+    v_bf16 = create_tensor(
+        -5, 5, total_kv_tokens, num_kv_heads, head_dim, dtype=dtype
+    ).cuda()
+
+    # Quantize to FP8
+    scale = torch.tensor([1.0], dtype=torch.float32).cuda()
+    q_fp8, q_descale = per_tensor_quant(q_bf16, scale, quant_dtype=quant_dtype)
+    k_fp8, k_descale = per_tensor_quant(k_bf16, scale, quant_dtype=quant_dtype)
+    v_fp8, v_descale = per_tensor_quant(v_bf16, scale, quant_dtype=quant_dtype)
+
+    cu_seqlens_q = convert_lens_to_indptr(qo_lens).cuda()
+    cu_seqlens_k = convert_lens_to_indptr(kv_lens).cuda()
+
+    # Run flash_attn_varlen FP8
+    out_varlen = aiter.flash_attn_varlen_fp8_pertensor_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        q_descale,
+        k_descale,
+        v_descale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=qo_lens.max().item(),
+        max_seqlen_k=kv_lens.max().item(),
+        min_seqlen_q=0,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        window_size=(-1, -1),
+    )
+
+    # Convert to paged KV cache format
+    kv_data, kv_indptr, kv_indices = varlen_to_paged_kv(
+        k_fp8, v_fp8, kv_lens, page_size=1
+    )
+
+    # Extract K and V from paged format
+    k_paged = kv_data[:, 0, :, :, :].squeeze(2)
+    v_paged = kv_data[:, 1, :, :, :].squeeze(2)
+
+    # Run batch_prefill FP8
+    out_batch_prefill = aiter.mha_batch_prefill_func(
+        q_fp8,
+        k_paged,
+        v_paged,
+        cu_seqlens_q,
+        kv_indptr.cuda(),
+        kv_indices.cuda(),
+        max_seqlen_q=qo_lens.max().item(),
+        max_seqlen_k=kv_lens.max().item(),
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    # Compare results per-batch (only valid tokens)
+    print(f"\n=== FP8 Comparison: batch_prefill vs varlen ===")
+    print(
+        f"batch_size={batch_size}, heads={num_qo_heads}/{num_kv_heads}, "
+        f"dim={head_dim}, qo_len={qo_len}, kv_len={kv_len}"
+    )
+    print(f"causal={causal}, logits_soft_cap={logits_soft_cap}")
+
+    q_indptr_cpu = cu_seqlens_q.cpu()
+    max_diff_all = 0.0
+    mean_diff_all = 0.0
+    total_tokens = 0
+
+    for i in range(batch_size):
+        # Extract valid tokens for this batch
+        start_idx = q_indptr_cpu[i].item()
+        end_idx = q_indptr_cpu[i + 1].item()
+        num_tokens = end_idx - start_idx
+
+        out_varlen_i = out_varlen[start_idx:end_idx]
+        out_batch_prefill_i = out_batch_prefill[start_idx:end_idx]
+
+        # Compute differences only on valid tokens
+        diff_i = (out_varlen_i - out_batch_prefill_i).abs()
+        max_diff_i = diff_i.max().item()
+        mean_diff_i = diff_i.mean().item()
+
+        max_diff_all = max(max_diff_all, max_diff_i)
+        mean_diff_all += mean_diff_i * num_tokens
+        total_tokens += num_tokens
+
+        # Sanity check: outputs should not be all zeros
+        assert (
+            out_varlen_i.abs().max().item() > 1e-6
+        ), f"Batch {i}: Varlen output is all zeros - kernel may not have launched!"
+        assert (
+            out_batch_prefill_i.abs().max().item() > 1e-6
+        ), f"Batch {i}: Batch_prefill output is all zeros - kernel may not have launched!"
+
+    mean_diff_all /= total_tokens
+
+    print(f"Max diff (across all batches): {max_diff_all:.6e}")
+    print(f"Mean diff (across all batches): {mean_diff_all:.6e}")
+    print(f"Varlen output max: {out_varlen.abs().max().item():.6e}")
+    print(f"Batch_prefill output max: {out_batch_prefill.abs().max().item():.6e}")
+
+    if out_varlen.abs().max().item() > 0:
+        rel_error = max_diff_all / out_varlen.abs().max().item()
+        print(f"Relative error: {rel_error * 100:.4f}%")
+
+    # Should be nearly identical (same pipeline, same computation)
+    # FP8 may have slightly larger tolerance
+    rtol, atol = 5e-2, 5e-2
+
+    # Compare per-batch to ensure we only check valid tokens
+    for i in range(batch_size):
+        start_idx = q_indptr_cpu[i].item()
+        end_idx = q_indptr_cpu[i + 1].item()
+
+        out_varlen_i = out_varlen[start_idx:end_idx]
+        out_batch_prefill_i = out_batch_prefill[start_idx:end_idx]
+
+        torch.testing.assert_close(
+            out_batch_prefill_i, out_varlen_i, rtol=rtol, atol=atol
+        )
 
 
 l_causal = [False, True]
