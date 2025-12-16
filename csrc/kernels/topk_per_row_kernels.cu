@@ -2535,40 +2535,40 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
 //     }
 // }
 
-void top_k_per_row_decode(const torch::Tensor& logits,
-                          int64_t next_n,
-                          const torch::Tensor& seqLens,
-                          torch::Tensor& indices,
-                          int64_t numRows,
-                          int64_t stride0,
-                          int64_t stride1)
-{
-    size_t buf_size = 0; // will be overwritten by the kernel
+// void top_k_per_row_decode(const torch::Tensor& logits,
+//                           int64_t next_n,
+//                           const torch::Tensor& seqLens,
+//                           torch::Tensor& indices,
+//                           int64_t numRows,
+//                           int64_t stride0,
+//                           int64_t stride1)
+// {
+//     size_t buf_size = 0; // will be overwritten by the kernel
 
-    static constexpr int kTopK       = 2048;
-    static constexpr bool is_largest = true;
+//     static constexpr int kTopK       = 2048;
+//     static constexpr bool is_largest = true;
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    int64_t workspace_size =
-        invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Decode>(numRows, stride0);
-    auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
-    torch::Tensor workspace = torch::empty({workspace_size}, options);
+//     const hipStream_t stream = at::hip::getCurrentHIPStream();
+//     int64_t workspace_size =
+//         invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Decode>(numRows, stride0);
+//     auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
+//     torch::Tensor workspace = torch::empty({workspace_size}, options);
 
-    aiter::standalone_stable_radix_11bits<float, int, false, true, aiter::Phase::Decode>(
-        static_cast<void*>(workspace.data_ptr<uint8_t>()),
-        buf_size,
-        logits.data_ptr<float>(),
-        static_cast<int>(numRows),
-        stride0,
-        nullptr,
-        seqLens.data_ptr<int>(),
-        kTopK,
-        nullptr,
-        indices.data_ptr<int>(),
-        is_largest,
-        stream,
-        static_cast<int>(next_n));
-}
+//     aiter::standalone_stable_radix_11bits<float, int, false, true, aiter::Phase::Decode>(
+//         static_cast<void*>(workspace.data_ptr<uint8_t>()),
+//         buf_size,
+//         logits.data_ptr<float>(),
+//         static_cast<int>(numRows),
+//         stride0,
+//         nullptr,
+//         seqLens.data_ptr<int>(),
+//         kTopK,
+//         nullptr,
+//         indices.data_ptr<int>(),
+//         is_largest,
+//         stream,
+//         static_cast<int>(next_n));
+// }
 
 
 // void top_k_per_row_decode(const torch::Tensor& logits,
