@@ -362,7 +362,6 @@ def mla_decode_fwd(
                     qk_exp[:, kv_start:kv_end] = p_tile
                 dbg_qk = dbg_tr[i * nhead : (i + 1) * nhead, : qk.shape[1]]
                 checkAllclose(dbg_qk, qk_exp, msg=f"dbg[{i}] vs. qk[{i}]")
-                print(dbg_qk[4])
 
             exit()
 
