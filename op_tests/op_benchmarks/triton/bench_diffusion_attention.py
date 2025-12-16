@@ -8,7 +8,7 @@ import sys
 import warnings
 import argparse
 import itertools
-
+import aiter
 import triton
 
 from aiter.ops.triton.mha import (
@@ -44,9 +44,6 @@ from op_tests.op_benchmarks.triton.mha_correctness_utils import (
     print_output_comparison_stats,
     run_sage_reference,
 )
-
-
-
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.mha_v3 import _quantize_bshd
 
@@ -55,6 +52,7 @@ from aiter.ops.triton.fav3_sage import (
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs,
+    per_block_fp8
 )
 
 
@@ -248,16 +246,18 @@ def fav3_sage_forward_func(
         q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout="NHD"
     )
 
-    fp8_dtype = torch.float8_e4m3fnuz
-    v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+    fp8_dtype = aiter.dtypes.fp8
+    FP8_MAX = torch.finfo(fp8_dtype).max
+    v_fp8, v_descale = per_block_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
 
     return lambda: fav3_sage_func(
-        q_int8, 
-        k_int8, 
+        q_int8,
+        k_int8,
         v_fp8,
         q_descale,
         k_descale,
         v_descale,
+        FP8_MAX,
         causal=causal,
         inference_mode=inference_mode,
     )

@@ -4,6 +4,7 @@
 from __future__ import annotations
 from typing import Optional, Tuple, Union
 import torch
+import aiter
 
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     fav3_sage,
@@ -14,10 +15,12 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
     per_block_int8,
 )
 
-from aiter.ops.triton.mha_v3 import _quantize_bshd
-
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import (
     map_dims,
+)
+
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
+    per_block_fp8
 )
 
 
@@ -70,8 +73,10 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout=tensor_layout
         )
 
-        fp8_dtype = torch.float8_e4m3fnuz
-        v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+        fp8_dtype = aiter.dtypes.fp8
+        FP8_MAX = torch.finfo(fp8_dtype).max
+        v_fp8, v_descale = per_block_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
+
 
         # For GQA/MQA: quantize query with grouped scaling
         #group_size = (
@@ -133,6 +138,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             q_descale,
             k_descale,
             v_descale, # v_descale
+            FP8_MAX,
             softmax_scale,
             causal,
             int(window_size[0]),
@@ -301,6 +307,7 @@ def fav3_sage_func(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
+    FP8_MAX: float = 240.0,
     k_mean: torch.Tensor = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -411,6 +418,7 @@ def fav3_sage_func(
         q_descale,
         k_descale,
         v_descale, # v_descale
+        FP8_MAX,
         softmax_scale,
         causal,
         int(window_size[0]),
