@@ -234,7 +234,7 @@ def fwd(
             cu_seqlens_k_local = None
             max_seqlens_k_local = k.shape[1] if len(k.shape) == 4 else max_seqlen_k
     else:
-        #layout is "bshd" or "bhsd"
+        # layout is "bshd" or "bhsd"
         seq_dim = 1 if layout == "bshd" else 2
         cu_seqlens_q_local = None
         cu_seqlens_k_local = None
@@ -284,18 +284,24 @@ def fwd(
     if layout == "thd":
         # varlen: (Hq, Total_Q)
         total_q, nheads_q, _ = q.shape
-        softmax_lse = torch.zeros(
-            (nheads_q, total_q), device=q.device, dtype=torch.float32
-        ) if return_lse else None
+        softmax_lse = (
+            torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
+            if return_lse
+            else None
+        )
     else:
         # bshd: (B, Hq, Sq)
         if layout == "bshd":
             batch, seqlen_q, nheads_q, _ = q.shape
         else:
             batch, nheads_q, seqlen_q, _ = q.shape
-        softmax_lse = torch.zeros(
-            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
-        ) if return_lse else None
+        softmax_lse = (
+            torch.zeros(
+                (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+            )
+            if return_lse
+            else None
+        )
 
     # sd_mask is not returned in v3 interface
     sd_mask = None

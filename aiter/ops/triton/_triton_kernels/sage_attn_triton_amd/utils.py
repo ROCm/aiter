@@ -54,6 +54,7 @@ FP8_AUTO_DESCALE = False
 def map_dims(shape, indices):
     return [shape[i] for i in indices]
 
+
 def random_seqlens_composition(SEQ_LEN, BATCH):
     # generate a random composition of N into Z positive parts.
     idx = torch.randperm(SEQ_LEN - 1)[: BATCH - 1] + 1

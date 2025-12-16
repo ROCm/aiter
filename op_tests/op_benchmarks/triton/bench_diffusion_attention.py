@@ -1,11 +1,10 @@
 from __future__ import annotations
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any
 import torch
 import os
 import glob
 
 import sys
-import warnings
 import argparse
 import itertools
 import aiter
@@ -13,12 +12,6 @@ import triton
 
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_varlen_func,
-    mha_set_use_fused_bwd_kernel,
-)
-from aiter.ops.triton.mha_v3 import (
-    flash_attn_fp8_func,
-    flash_attn_varlen_fp8_func,
 )
 from aiter.ops.triton.attn_qk_int8_per_block import (
     attn_qk_int8_per_block,
@@ -26,23 +19,18 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
     _get_config,
 )
 from aiter.test_mha_common import (
-    generate_random_padding_mask,
-    generate_qkv,
     attention_ref,
 )
 from compare_outputs import save_benchmark_output
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
 )
 from op_tests.triton_tests.test_mha import check_attention_outputs
 from op_tests.op_benchmarks.triton.mha_correctness_utils import (
     primary_output,
-    restore_tensor_layout,
     print_output_comparison_stats,
-    run_sage_reference,
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.mha_v3 import _quantize_bshd
@@ -52,12 +40,13 @@ from aiter.ops.triton.fav3_sage import (
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs,
-    per_block_fp8
+    per_block_fp8,
 )
 
 
 # test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
 import logging
+
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -65,23 +54,23 @@ logger = logging.getLogger(__name__)
 def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
     """
     Load captured input tensors from disk.
-    
+
     Args:
         input_dir: Directory containing captured .pt files
-        
+
     Returns:
         List of dictionaries containing q, k, v tensors and metadata
     """
     input_files = sorted(glob.glob(os.path.join(input_dir, "*_input_*.pt")))
     if not input_files:
         raise FileNotFoundError(f"No captured input files found in {input_dir}")
-    
+
     inputs = []
     for i, f in enumerate(input_files):
         data = torch.load(f, weights_only=False)
         inputs.append(data)
         # logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
-    
+
     logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
     return inputs
 
@@ -106,9 +95,7 @@ def fav3_fp8_forward_func(
     fp8_dtype = torch.float8_e4m3fnuz
 
     # For GQA/MQA: quantize query with grouped scaling
-    group_size = (
-        num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
-    )
+    group_size = num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
     q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
     k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
     v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
@@ -135,9 +122,7 @@ def fav3_fp8_forward_func(
     if attention_chunk not in (0, 1):
         raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
     if softcap != 0.0:
-        raise NotImplementedError(
-            "softcap not implemented in FP8 high-precision API"
-        )
+        raise NotImplementedError("softcap not implemented in FP8 high-precision API")
     if sm_margin != 0:
         raise NotImplementedError(
             "sm_margin != 0 not supported in FP8 high-precision API"
@@ -181,6 +166,7 @@ def fav3_fp8_forward_func(
         sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
     )
 
+
 def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
     # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
     # tensor_layout = args.sagev1_layout
@@ -197,11 +183,27 @@ def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
     # k_mean = k.mean(dim=1, keepdim=True) if k_smooth else None # provide km as None and it gets computed inside per_block_int8
     # sm_scale = D_HEAD**-0.5
     q, q_scale, k, k_scale, _ = per_block_int8(
-        q, k, km=None, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout, smooth_k=k_smooth
+        q,
+        k,
+        km=None,
+        BLKQ=config["BLOCK_SIZE_M"],
+        BLKK=config["BLOCK_SIZE_N"],
+        sm_scale=sm_scale,
+        tensor_layout=tensor_layout,
+        smooth_k=k_smooth,
     )
     q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
     k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
-    return lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
+    return lambda: attn_qk_int8_per_block(
+        q,
+        k,
+        v,
+        q_scale,
+        k_scale,
+        tensor_layout=tensor_layout,
+        output_dtype=torch.bfloat16,
+        config=config,
+    )
 
 
 def fav2_forward_func(
@@ -225,15 +227,18 @@ def fav2_forward_func(
         return_attn_probs=return_attn_probs,
     )
 
+
 def fav3_sage_forward_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool,
-    inference_mode: bool, # not return softmax_lse
+    inference_mode: bool,  # not return softmax_lse
 ):
     config, _ = get_fwd_configs(False)
-    assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
+    assert (
+        len(config) == 1
+    ), f"Number of best config is expected to be 1, got {len(config)}"
     config = config[0].all_kwargs()
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
@@ -241,9 +246,15 @@ def fav3_sage_forward_func(
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
     k_mean = None
-    ## following quantization already considered softmax scale and RCP_LN2 
+    ## following quantization already considered softmax scale and RCP_LN2
     q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
-        q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout="NHD"
+        q,
+        k,
+        km=k_mean,
+        sm_scale=softmax_scale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        tensor_layout="NHD",
     )
 
     fp8_dtype = aiter.dtypes.fp8
@@ -261,6 +272,7 @@ def fav3_sage_forward_func(
         causal=causal,
         inference_mode=inference_mode,
     )
+
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
@@ -296,12 +308,19 @@ def create_benchmark_configs(args):
     }
     x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
     unit = ""
-    line_vals = ["time(ms)", "throughput(TFLOPS)", "bandwidth(GB/s)", "arithmetic_intensity(FLOP/byte)"]
+    line_vals = [
+        "time(ms)",
+        "throughput(TFLOPS)",
+        "bandwidth(GB/s)",
+        "arithmetic_intensity(FLOP/byte)",
+    ]
 
     # if comparing to reference, or specific metric provided, adjust line_vals accordingly
     if args.compare_to_ref or (args.metric and args.metric != "all"):
         if args.compare_to_ref:
-            line_vals = ["time(ms)"] # avoid redundant runs of other metrics when comparing to reference. default to time only.
+            line_vals = [
+                "time(ms)"
+            ]  # avoid redundant runs of other metrics when comparing to reference. default to time only.
         else:
             metric_map = {
                 "time": "time(ms)",
@@ -330,33 +349,47 @@ def create_benchmark_configs(args):
 def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
     """
     Create triton.testing.Benchmark configurations from captured inputs.
-    
+
     Captured inputs are in BHSD format (batch, heads, seqlen, dim).
     """
     # Extract x_vals from loaded inputs
     x_vals_list = []
     for i, inp in enumerate(inputs):
         # Shape from BHSD format: (batch, heads, seqlen, dim)
-        q_shape = inp['q_shape']
+        q_shape = inp["q_shape"]
         batch = q_shape[0]
         hq = q_shape[1]  # heads at index 1 in BHSD
         seq_q = q_shape[2]  # seqlen at index 2
         d_head = q_shape[3]
-        
-        k_shape = inp['k_shape']
+
+        k_shape = inp["k_shape"]
         hk = k_shape[1]
         seq_k = k_shape[2]
-        
-        v_shape = inp['v_shape']
+
+        v_shape = inp["v_shape"]
         d_head_v = v_shape[3]
-        
+
         x_vals_list.append((i, batch, hq, hk, seq_q, seq_k, d_head, d_head_v))
-    
-    x_names = ["INPUT_IDX", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
-    
+
+    x_names = [
+        "INPUT_IDX",
+        "BATCH",
+        "HQ",
+        "HK",
+        "N_CTX_Q",
+        "N_CTX_K",
+        "D_HEAD",
+        "D_HEAD_V",
+    ]
+
     # Determine line_vals based on metric
     if args.metric == "all" or args.metric is None:
-        line_vals = ["time(ms)", "throughput(TFLOPS)", "bandwidth(GB/s)", "arithmetic_intensity(FLOP/byte)"]
+        line_vals = [
+            "time(ms)",
+            "throughput(TFLOPS)",
+            "bandwidth(GB/s)",
+            "arithmetic_intensity(FLOP/byte)",
+        ]
     else:
         metric_map = {
             "time": "time(ms)",
@@ -365,9 +398,9 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
             "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
         }
         line_vals = [metric_map.get(args.metric, "throughput(TFLOPS)")]
-    
+
     plot_name = "bench_diffusion_attention_captured"
-    
+
     configs = [
         triton.testing.Benchmark(
             x_names=x_names,
@@ -387,19 +420,18 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
     ]
     return configs
 
+
 def bench_kernel(q, k, v, args, provider):
     # Default softmax scale
     BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
     _, N_CTX_K, HK, D_HEAD_V = v.shape
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = not args.no_k_smooth
-    
+
     # FLOPS calculation variables
     total_flops = 0.0
-    total_flops += (
-        2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-    )
-    if args.fav3_fp8: #  fav3 fp8
+    total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+    if args.fav3_fp8:  #  fav3 fp8
         fn = fav3_fp8_forward_func(
             q,
             k,
@@ -412,7 +444,7 @@ def bench_kernel(q, k, v, args, provider):
             deterministic=False,
             sm_margin=0,
         )
-    elif args.sagev1: # sage v1
+    elif args.sagev1:  # sage v1
         fn = sagev1_forward_func(
             q,
             k,
@@ -421,7 +453,7 @@ def bench_kernel(q, k, v, args, provider):
             sm_scale=softmax_scale,
             k_smooth=k_smooth,
         )
-    elif args.fav3_sage: # sage v1, fused on fav3
+    elif args.fav3_sage:  # sage v1, fused on fav3
         fn = fav3_sage_forward_func(
             q,
             k,
@@ -429,7 +461,7 @@ def bench_kernel(q, k, v, args, provider):
             causal=False,
             inference_mode=True,
         )
-    else: # fav2 (no quantization)
+    else:  # fav2 (no quantization)
         fn = fav2_forward_func(
             q,
             k,
@@ -442,13 +474,14 @@ def bench_kernel(q, k, v, args, provider):
         )
 
     ms = triton.testing.do_bench(fn)
-    
+
     if args.compare_to_ref:
         current_output = fn()
         assert current_output is not None
         current_primary = primary_output(current_output)
+
         def reference_output():
-            if args.ref=="fav3_fp8": #  fav3 fp8
+            if args.ref == "fav3_fp8":  #  fav3 fp8
                 fn = fav3_fp8_forward_func(
                     q,
                     k,
@@ -461,7 +494,7 @@ def bench_kernel(q, k, v, args, provider):
                     deterministic=False,
                     sm_margin=0,
                 )
-            elif args.ref=="sagev1": # sage v1
+            elif args.ref == "sagev1":  # sage v1
                 fn = sagev1_forward_func(
                     q,
                     k,
@@ -470,35 +503,36 @@ def bench_kernel(q, k, v, args, provider):
                     sm_scale=softmax_scale,
                     k_smooth=k_smooth,
                 )
-            elif args.ref=="fav2": # fav2 (no quantization)
+            elif args.ref == "fav2":  # fav2 (no quantization)
                 fn = fav2_forward_func(
-                        q,
-                        k,
-                        v,
-                        dropout_p=0.0,
-                        softmax_scale=softmax_scale,
-                        causal=False,
-                        return_lse=False,
-                        return_attn_probs=False,
-                    )
+                    q,
+                    k,
+                    v,
+                    dropout_p=0.0,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                    return_lse=False,
+                    return_attn_probs=False,
+                )
             else:
                 fn = lambda: attention_ref(
                     q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
                 )
             return fn()
-        
-        reference_primary = primary_output(
-            reference_output()
-        )
+
+        reference_primary = primary_output(reference_output())
         check_attention_outputs(current_primary, reference_primary, fp8=False)
         if args.print_compare_stats:
             print_output_comparison_stats(current_primary, reference_primary)
 
-    q_element_size = 1 if args.sagev1 or args.fav3_fp8 or args.fav3_sage else q.element_size()
-    k_element_size = 1 if args.sagev1 or args.fav3_fp8 or args.fav3_sage else k.element_size()
+    q_element_size = (
+        1 if args.sagev1 or args.fav3_fp8 or args.fav3_sage else q.element_size()
+    )
+    k_element_size = (
+        1 if args.sagev1 or args.fav3_fp8 or args.fav3_sage else k.element_size()
+    )
     v_element_size = 1 if args.fav3_fp8 else v.element_size()
 
-    
     total_num_tokens_q = BATCH * N_CTX_Q
     total_num_tokens_k = BATCH * N_CTX_K
     q_size = total_num_tokens_q * HQ * D_HEAD * q_element_size
@@ -523,17 +557,18 @@ def bench_kernel(q, k, v, args, provider):
         return total_flops / mem
     return ms
 
+
 def run_benchmark_captured(args):
     """
     Run benchmark using captured inputs from disk.
     Captured inputs are in BHSD format and need to be transposed to BSHD for kernels.
     """
     torch.manual_seed(20)
-    
+
     # Load captured inputs
     inputs = load_captured_inputs(args.captured_dir)
     # logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
-    
+
     @triton.testing.perf_report(create_benchmark_configs_from_captured(inputs, args))
     def bench_mha_captured(
         INPUT_IDX,
@@ -554,29 +589,31 @@ def run_benchmark_captured(args):
         Benchmark function for attention kernels using captured inputs.
         INPUT_IDX: Index in the loaded inputs list
         """
-        
+
         # Get the input tensors for this configuration
         inp = inputs[INPUT_IDX]
-        
+
         # Load tensors to GPU - captured inputs are in BHSD format (batch, heads, seq, dim)
-        q_bhsd = inp['q'].to(device)
-        k_bhsd = inp['k'].to(device)
-        v_bhsd = inp['v'].to(device)
-        
+        q_bhsd = inp["q"].to(device)
+        k_bhsd = inp["k"].to(device)
+        v_bhsd = inp["v"].to(device)
+
         # Transpose from BHSD to BSHD (batch, seq, heads, dim) for kernel compatibility
         q = q_bhsd.transpose(1, 2).contiguous()
         k = k_bhsd.transpose(1, 2).contiguous()
         v = v_bhsd.transpose(1, 2).contiguous()
-        
+
         return bench_kernel(q, k, v, args, provider)
-    
+
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
 
 
 saved_output_keys = set()
 
+
 def run_benchmark(args):
     torch.manual_seed(20)
+
     @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mha(
         BATCH,
@@ -598,7 +635,7 @@ def run_benchmark(args):
         """
         Benchmark function for attention kernels with generated random inputs.
         """
-        assert args.sagev1_layout=="NHD"
+        assert args.sagev1_layout == "NHD"
         assert args.layout == "bshd"
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         assert causal == False, "Causal not supported in this benchmark."
@@ -660,12 +697,32 @@ def parse_args():
     )
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     # parser.add_argument("-causal", type=str2bool, default=None)
-    parser.add_argument("-fav3_fp8", action="store_true", default=False, help="Use fav3 fp8 kernel: per tensor quantization, QK and PV in fp8, accumulation in fp32")
-    parser.add_argument("-sagev1", action="store_true", default=False, help="Use sage v1 kernel: per block quantization, QK in int8, PV and accumulation in fp16")
-    parser.add_argument("-fav3_sage", action="store_true", default=False, help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.")
+    parser.add_argument(
+        "-fav3_fp8",
+        action="store_true",
+        default=False,
+        help="Use fav3 fp8 kernel: per tensor quantization, QK and PV in fp8, accumulation in fp32",
+    )
+    parser.add_argument(
+        "-sagev1",
+        action="store_true",
+        default=False,
+        help="Use sage v1 kernel: per block quantization, QK in int8, PV and accumulation in fp16",
+    )
+    parser.add_argument(
+        "-fav3_sage",
+        action="store_true",
+        default=False,
+        help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.",
+    )
     parser.add_argument("-no_k_smooth", action="store_true", default=False)
-    parser.add_argument("-sagev1_layout", type=str, default="NHD", choices=["HND", "NHD"],
-        help="Tensor layout for sagev1: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: NHD.")
+    parser.add_argument(
+        "-sagev1_layout",
+        type=str,
+        default="NHD",
+        choices=["HND", "NHD"],
+        help="Tensor layout for sagev1: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: NHD.",
+    )
     parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)
@@ -674,7 +731,12 @@ def parse_args():
     parser.add_argument("-print_compare_stats", action="store_true", default=False)
 
     parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
-    parser.add_argument("-ref", type=str, default=None, help="fp8, qk_int8, fav2 or torch ref (default).")
+    parser.add_argument(
+        "-ref",
+        type=str,
+        default=None,
+        help="fp8, qk_int8, fav2 or torch ref (default).",
+    )
     parser.add_argument(
         "-metric",
         nargs="?",
