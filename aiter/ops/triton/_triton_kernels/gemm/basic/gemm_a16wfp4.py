@@ -10,8 +10,6 @@ from .quant import _mxfp4_quant_op
 from ..utils.gemm_config_utils import get_gemm_config
 =======
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 >>>>>>> c760bc93f ([TRITON] Move triton files into respective folders)
