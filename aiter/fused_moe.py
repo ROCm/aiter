@@ -19,10 +19,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.ops.triton.fused_mxfp4_quant import (
-    fused_dynamic_mxfp4_quant_moe_sort,
-    fused_quant_fp8_sort,
-)
+from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 
 BLOCK_SIZE_M = 32
 
@@ -851,12 +848,10 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
-        a1, a1_scale = fused_quant_fp8_sort(
-            hidden_states,
-            sorted_ids,
-            num_valid_ids,
-            token_num,
-        )
+        a1 = hidden_states.to(dtypes.fp8)
+        M = sorted_ids.shape[0]
+        N = a1.shape[-1]
+        a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
     elif quant_type == QuantType.per_1x32:
         if token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -920,7 +915,7 @@ def fused_moe_2stages(
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
-        w1_scale=w1_scale,
+        w1_scale=w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale,
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
 
@@ -940,15 +935,8 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
-        a2 = a2.view(-1, inter_dim)
-        a2, a2_scale = fused_quant_fp8_sort(
-            a2,
-            sorted_ids,
-            num_valid_ids,
-            token_num,
-        )
-
-        a2 = a2.view(token_num, topk, -1)
+        a2 = a2.to(dtypes.fp8)
+        a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         if token_num <= token_num_quant_moe_sort_switch:
@@ -1004,7 +992,7 @@ def fused_moe_2stages(
         num_valid_ids,
         moe_out,
         topk,
-        w2_scale=w2_scale,
+        w2_scale=w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale,
         a2_scale=a2_scale,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
