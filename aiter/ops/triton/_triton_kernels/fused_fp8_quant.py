@@ -728,8 +728,8 @@ def _fused_silu_mul_fp8_per_tensor_static_quant_kernel(
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
-    first_half_ptrs = inp_ptr * m_pid + n_offs * col_stride
-    second_half_ptrs = inp_ptr * m_pid + (n_cols + n_offs) * col_stride
+    first_half_ptrs = inp_ptr + m_pid * row_stride + n_offs * col_stride
+    second_half_ptrs = inp_ptr + m_pid * row_stride + (n_cols + n_offs) * col_stride
 
     mask = n_offs < n_cols
 
