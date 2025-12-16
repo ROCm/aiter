@@ -80,7 +80,7 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
     for i, f in enumerate(input_files):
         data = torch.load(f, weights_only=False)
         inputs.append(data)
-        logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
+        # logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
     
     logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
     return inputs
@@ -532,7 +532,7 @@ def run_benchmark_captured(args):
     
     # Load captured inputs
     inputs = load_captured_inputs(args.captured_dir)
-    logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
+    # logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
     
     @triton.testing.perf_report(create_benchmark_configs_from_captured(inputs, args))
     def bench_mha_captured(
