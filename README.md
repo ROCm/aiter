@@ -34,11 +34,8 @@ AITER supports GPU-initiated communication using the [Iris library](https://gith
 Install with Triton communication support:
 
 ```bash
-# Option 1: Install via extras
-pip install -e ".[triton_comms]"
-
-# Option 2: Install all optional dependencies
-pip install -e ".[all]"
+# Install via requirements.txt to use Triton communication.
+pip install -r requirements.txt
 ```
 
 For more details, see [docs/triton_comms.md](docs/triton_comms.md).
