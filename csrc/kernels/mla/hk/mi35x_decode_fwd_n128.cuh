@@ -127,12 +127,12 @@ struct HkMlaDecodeFwdParams
 };
 
 template <typename T, bool kCheckBoundary = true>
-inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
-                                    uintptr_t p_lds_k_rope,
-                                    typename T::gl_kv& kv_buffer,
-                                    const int32_t* p_kv_indices,
-                                    const int32_t kv_start,
-                                    const int32_t kv_end)
+__device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
+                                             uintptr_t p_lds_k_rope,
+                                             typename T::gl_kv& kv_buffer,
+                                             const int32_t* p_kv_indices,
+                                             const int32_t kv_start,
+                                             const int32_t kv_end)
 {
 #if defined(__HIP_DEVICE_COMPILE__)
     // Note: always assumes assert((kv_end - kv_start) <= T::kBlockN);
@@ -228,30 +228,32 @@ inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
                                             0,
                                             0);
     }
-    else
-    {
-        uintptr_t p_lds_warp_nope =
-            p_lds_k_nope + warp_idx * kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t);
-        uint4* p_lds_nope                    = reinterpret_cast<uint4*>(p_lds_warp_nope);
-        constexpr uint32_t kNumDw4PerThrNope = kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t) /
-                                               ckt::get_warp_size() / sizeof(uint4);
-#pragma unroll
-        for(uint32_t rid = 0; rid < kNumDw4PerThrNope; ++rid)
-        {
-            p_lds_nope[lane_idx + rid * ckt::get_warp_size()] = uint4(0u);
-        }
+//     else
+//     {
+//         uintptr_t p_lds_warp_nope =
+//             p_lds_k_nope + warp_idx * kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t);
+//         uint4* p_lds_nope                    = reinterpret_cast<uint4*>(p_lds_warp_nope);
+//         constexpr uint32_t kNumDw4PerThrNope = kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t)
+//         /
+//                                                ckt::get_warp_size() / sizeof(uint4);
+// #pragma unroll
+//         for(uint32_t rid = 0; rid < kNumDw4PerThrNope; ++rid)
+//         {
+//             p_lds_nope[lane_idx + rid * ckt::get_warp_size()] = uint4(0u);
+//         }
 
-        uintptr_t p_lds_warp_rope =
-            p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
-        uint32_t* p_lds_rope                = reinterpret_cast<uint32_t*>(p_lds_warp_rope);
-        constexpr uint32_t kNumDwPerThrRope = kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t) /
-                                              ckt::get_warp_size() / sizeof(uint32_t);
-#pragma unroll
-        for(uint32_t rid = 0; rid < kNumDwPerThrRope; ++rid)
-        {
-            p_lds_rope[lane_idx + rid * ckt::get_warp_size()] = 0u;
-        }
-    }
+//         uintptr_t p_lds_warp_rope =
+//             p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
+//         uint32_t* p_lds_rope                = reinterpret_cast<uint32_t*>(p_lds_warp_rope);
+//         constexpr uint32_t kNumDwPerThrRope = kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t)
+//         /
+//                                               ckt::get_warp_size() / sizeof(uint32_t);
+// #pragma unroll
+//         for(uint32_t rid = 0; rid < kNumDwPerThrRope; ++rid)
+//         {
+//             p_lds_rope[lane_idx + rid * ckt::get_warp_size()] = 0u;
+//         }
+//     }
 #endif
 }
 
@@ -261,10 +263,10 @@ template <typename T,
           int32_t kRowOffset,
           int32_t kColOffset,
           hkdart::all RT>
-inline __device__ void load_lds_to_gpr(RT& dst,
-                                       const uintptr_t p_lds_src,
-                                       const int32_t row_offset,
-                                       const int32_t col_offset)
+__device__ __forceinline__ void load_lds_to_gpr(RT& dst,
+                                                const uintptr_t p_lds_src,
+                                                const int32_t row_offset,
+                                                const int32_t col_offset)
 {
     constexpr int32_t tile_stride = 0;
     constexpr int32_t row_stride  = RT::base_tile_rows * kNumLdsCols;
@@ -305,6 +307,76 @@ inline __device__ void load_lds_to_gpr(RT& dst,
             ...);
     }
     (std::make_index_sequence<RT::height>{});
+}
+
+template <bool kIsTail, uint32_t GPR>
+__device__ __forceinline__ void
+softmax_scale_p(const uint32_t col_idx, const uint32_t kv_end, const float softmax_scale)
+{
+    if((kIsTail == false) || ((col_idx + 16) < kv_end))
+    {
+        asm volatile("v_mul_f32_e32 v[%0], %8, v[%0]\n\t"
+                     "v_mul_f32_e32 v[%1], %8, v[%1]\n\t"
+                     "v_mul_f32_e32 v[%2], %8, v[%2]\n\t"
+                     "v_mul_f32_e32 v[%3], %8, v[%3]\n\t"
+                     "v_mul_f32_e32 v[%4], %8, v[%4]\n\t"
+                     "v_mul_f32_e32 v[%5], %8, v[%5]\n\t"
+                     "v_mul_f32_e32 v[%6], %8, v[%6]\n\t"
+                     "v_mul_f32_e32 v[%7], %8, v[%7]"
+                     :
+                     : "n"(GPR),
+                       "n"(GPR + 1),
+                       "n"(GPR + 2),
+                       "n"(GPR + 3),
+                       "n"(GPR + 4),
+                       "n"(GPR + 5),
+                       "n"(GPR + 6),
+                       "n"(GPR + 7),
+                       "v"(softmax_scale));
+    }
+    else if(col_idx < kv_end)
+    {
+        asm volatile("v_mul_f32_e32 v[%0], %8, v[%0]\n\t"
+                     "v_mul_f32_e32 v[%1], %8, v[%1]\n\t"
+                     "v_mul_f32_e32 v[%2], %8, v[%2]\n\t"
+                     "v_mul_f32_e32 v[%3], %8, v[%3]\n\t"
+                     "v_mov_b32 v[%4], %9\n\t"
+                     "v_mov_b32 v[%5], %9\n\t"
+                     "v_mov_b32 v[%6], %9\n\t"
+                     "v_mov_b32 v[%7], %9"
+                     :
+                     : "n"(GPR),
+                       "n"(GPR + 1),
+                       "n"(GPR + 2),
+                       "n"(GPR + 3),
+                       "n"(GPR + 4),
+                       "n"(GPR + 5),
+                       "n"(GPR + 6),
+                       "n"(GPR + 7),
+                       "v"(softmax_scale),
+                       "i"(0xff800000)); // -inf
+    }
+    else
+    {
+        asm volatile("v_mov_b32 v[%0], %8\n\t"
+                     "v_mov_b32 v[%1], %8\n\t"
+                     "v_mov_b32 v[%2], %8\n\t"
+                     "v_mov_b32 v[%3], %8\n\t"
+                     "v_mov_b32 v[%4], %8\n\t"
+                     "v_mov_b32 v[%5], %8\n\t"
+                     "v_mov_b32 v[%6], %8\n\t"
+                     "v_mov_b32 v[%7], %8"
+                     :
+                     : "n"(GPR),
+                       "n"(GPR + 1),
+                       "n"(GPR + 2),
+                       "n"(GPR + 3),
+                       "n"(GPR + 4),
+                       "n"(GPR + 5),
+                       "n"(GPR + 6),
+                       "n"(GPR + 7),
+                       "i"(0xff800000)); // -inf
+    }
 }
 
 template <typename T>
@@ -501,7 +573,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
             });
 
-            hk::mul_vgpr(p_comp, p_comp, params.softmax_scale);
+            const uint32_t col_idx = lane_idx & 0xf;
+            softmax_scale_p<kIsTail, k_p_comp_begin>(
+                col_idx + kv_tile_start, kv_end, params.softmax_scale);
+
+            // float rr = hkm::v_max_f32<k_p_comp_begin, k_p_comp_begin+4>();
 
             // Softmax
             ckt::static_for<0, p_comp.elements_per_base_tile, 1>{}([&](auto row_idx) {
@@ -513,13 +589,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 float local_max = ckt::max(v0, v1);
 
-                const uint32_t subwarp_base_idx = lane_idx & 0xf0;
-                const uint32_t subwarp_idx      = lane_idx & 0xf;
+                const uint32_t row_base = lane_idx & 0xf0;
 #pragma unroll
                 for(uint32_t offset = 8; offset > 0; offset /= 2)
                 {
-                    const uint32_t src_lane =
-                        (((offset ^ 16) ^ subwarp_idx) & 0xf) | subwarp_base_idx;
+                    const uint32_t src_lane = (((offset ^ 16) ^ col_idx) & 0xf) | row_base;
                     local_max = ckt::max(local_max, ckt::warp_shuffle(local_max, src_lane));
                 }
                 const float new_row_max =
@@ -527,33 +601,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 const float rescale =
                     kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((local_max - new_row_max) * log2e);
 
-                if constexpr(kIsTail)
-                {
-                    const int32_t col_idx = lane_idx & 0xf; // lane_idx % 16
-                    if((col_idx + kv_tile_start) < kv_end)
-                    {
-                        v0 = __builtin_amdgcn_exp2f((v0 - new_row_max) * log2e);
-
-                        if((col_idx + 16 + kv_tile_start) < kv_end)
-                        {
-                            v1 = __builtin_amdgcn_exp2f((v1 - new_row_max) * log2e);
-                        }
-                        else
-                        {
-                            v1 = 0.0f;
-                        }
-                    }
-                    else
-                    {
-                        v0 = 0.0f;
-                        v1 = 0.0f;
-                    }
-                }
-                else
-                {
-                    v0 = __builtin_amdgcn_exp2f((v0 - new_row_max) * log2e);
-                    v1 = __builtin_amdgcn_exp2f((v1 - new_row_max) * log2e);
-                }
+                v0 = __builtin_amdgcn_exp2f((v0 - new_row_max) * log2e);
+                v1 = __builtin_amdgcn_exp2f((v1 - new_row_max) * log2e);
 
                 row_max[row_idx.value] = new_row_max;
 
@@ -562,8 +611,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 #pragma unroll
                 for(uint32_t offset = 8; offset > 0; offset /= 2)
                 {
-                    const uint32_t src_lane =
-                        (((offset ^ 16) ^ subwarp_idx) & 0xf) | subwarp_base_idx;
+                    const uint32_t src_lane = (((offset ^ 16) ^ col_idx) & 0xf) | row_base;
                     local_sum_e += ckt::warp_shuffle(local_sum_e, src_lane);
                 }
 
