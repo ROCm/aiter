@@ -74,7 +74,7 @@ from aiter import dtypes
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
-from ...jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(

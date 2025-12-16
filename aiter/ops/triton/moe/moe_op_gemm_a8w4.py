@@ -8,7 +8,7 @@ import torch
 import triton
 from enum import Enum, auto
 import math
-from aiter.ops.triton.moe_routing.routing import RoutingData
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4,
     _reduce_grouped,

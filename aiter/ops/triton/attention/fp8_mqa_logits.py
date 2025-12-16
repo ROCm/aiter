@@ -2,7 +2,9 @@ import torch
 import math
 import triton
 
-from aiter.ops.triton._triton_kernels.fp8_mqa_logits import _fp8_mqa_logits_kernel
+from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
+    _fp8_mqa_logits_kernel,
+)
 
 
 def fp8_mqa_logits(

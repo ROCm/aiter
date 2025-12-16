@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import triton
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton._triton_kernels.moe_routing_sigmoid_top1_fused import (
+from aiter.ops.triton._triton_kernels.moe.moe_routing_sigmoid_top1_fused import (
     _routing_sigmoid_top1_kernel,
     _get_config,
 )

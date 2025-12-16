@@ -1,7 +1,7 @@
 import torch
 import triton
 from typing import Type
-from aiter.ops.triton._triton_kernels.moe_routing.bitmatrix import (
+from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
     _sum_bitmatrix_memset,
     _sum_bitmatrix_rows,
 )
