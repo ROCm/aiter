@@ -35,13 +35,13 @@ template <typename scalar_t,
           int GQA_RATIO,
           int MTP,
           typename AttentionVariant,
-          bool SLIDING_WINDOW_ENABLED>
+          bool SLIDING_WINDOW_ENABLED,
+          bool USE_5D_VCACHE = false>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
-    const cache_t* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads,
-                                         // head_size]
-    const cache_t* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads,
-                                         // head_size]
+    const cache_t* __restrict__ k_cache, // [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    const cache_t* __restrict__ v_cache, // 4D: [num_blocks, num_kv_heads, head_size, block_size]
+                                         // 5D: [num_blocks, num_kv_heads, block_size/x, head_size, x]
     const float scale,
     const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ cu_query_lens,  // [num_seqs+1]
@@ -84,7 +84,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         return;
     }
     const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);    
+    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED, USE_5D_VCACHE>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);
 }
 
 // Grid: (num_heads, num_seqs).
@@ -136,13 +136,14 @@ template <typename scalar_t,
           int GQA_RATIO,
           int MTP,
           typename AttentionVariant,
-          bool SLIDING_WINDOW_ENABLED>
+          bool SLIDING_WINDOW_ENABLED,
+          bool USE_5D_VCACHE = false>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
     const cache_t* __restrict__ k_cache, // [num_blocks, num_kv_heads,
                                          // head_size/x, block_size, x]
-    const cache_t* __restrict__ v_cache, // [num_blocks, num_kv_heads,
-                                         // head_size, block_size]
+    const cache_t* __restrict__ v_cache, // 4D: [num_blocks, num_kv_heads, head_size, block_size]
+                                         // 5D: [num_blocks, num_kv_heads, block_size/x, head_size, x]
     const float scale,
     const int* __restrict__ block_tables,  // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ cu_query_lens,  // [num_seqs+1]

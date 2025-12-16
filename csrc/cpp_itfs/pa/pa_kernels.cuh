@@ -12,7 +12,8 @@ template <typename scalar_t,
           int GQA_RATIO,
           int MTP,
           typename AttentionVariant,
-          bool SLIDING_WINDOW_ENABLED>
+          bool SLIDING_WINDOW_ENABLED,
+          bool USE_5D_VCACHE = false>
 __inline__ __device__ void
 _paged_attention_kernel(const int* block_table_seq,
                         const int64_t query_loc,
@@ -221,10 +222,20 @@ _paged_attention_kernel(const int* block_table_seq,
             for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
             {
                 const int head_elem =
-                    row_head_elem + qkhe_depth * QKHE_PER_FETCH + head_loop * HEAD_SIZE_PER_LOOP;
-                const int offset1             = head_elem / KX;
-                const int offset2             = head_elem % KX;
-                const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * KX + offset2;
+                        row_head_elem + qkhe_depth * QKHE_PER_FETCH + head_loop * HEAD_SIZE_PER_LOOP;
+                const int offset1          = head_elem / KX;
+                const int offset2          = head_elem % KX;
+                const cache_t* k_fetch_ptr = [&] {
+                    if constexpr(USE_5D_VCACHE)
+                    {
+                        const int head_stride = BLOCK_SIZE * kv_seq_stride;
+                        return k_ptr3 + offset1 * head_stride + offset2;
+                    }
+                    else
+                    {
+                        return k_ptr3 + offset1 * KX + offset2;
+                    }
+                }();
                 const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
                 if constexpr(NT_KV_LOAD)
                 {
@@ -291,27 +302,62 @@ _paged_attention_kernel(const int* block_table_seq,
     static_assert(VBLOCKS_PER_LANE == VTLANELOOP,
                   "make sure we can keep un-shuffled data in Vlocal as well");
 
-    const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride +
-                           ((threadIdx.x / n_thread_per_block) % BLOCK_SIZE) * kv_seq_stride;
+    constexpr int V_X = CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
-    // v fetches are 16head elems across lanes x 16 tokens per lane
-    for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
+    if constexpr(USE_5D_VCACHE)
     {
-        for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
+        constexpr int V5D_TOKEN_GRP_STRIDE = HEAD_SIZE * V_X;
+        constexpr int V5D_HEAD_STRIDE = V_X;
+
+        for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
         {
-            for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
+            for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
             {
-                const int vlds_col_idx = laneid % n_thread_per_block;
-                const int vhead_elem =
-                    vhe_depth * NWARPS * 16 + vlds_col_idx * CONTIGUOUS_KV_ELEMS_16B_LOAD;
-                const cache_t* v_ptr2 = v_ptr + vhead_elem;
+                for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+                {
+                    const int vlocal_token_idx = rowid * VTOKENS_PER_LANE + vfetch_depth * V_X;
+                    const int global_token_idx = partition_start_token_idx +
+                                                 vtoken_depth * TOKENS_PER_WARP +
+                                                 vlocal_token_idx;
+                    const int block_idx = global_token_idx / BLOCK_SIZE;
+                    const int token_in_block = global_token_idx % BLOCK_SIZE;
+                    const int token_grp = token_in_block / V_X;
+                    const int safe_block_idx =
+                        (global_token_idx < context_len) ? block_idx : last_ctx_block;
+                    const int physical_block = block_table_seq[safe_block_idx];
+                    const int head_elem = (warpid * 16 + lane16id) + vhe_depth * NWARPS * 16;
+                    const int64_t v_offset = static_cast<int64_t>(physical_block) * kv_block_stride +
+                                             wg_start_kv_head_idx * kv_head_stride +
+                                             token_grp * V5D_TOKEN_GRP_STRIDE +
+                                             head_elem * V5D_HEAD_STRIDE;
+                    const cache_t* v_fetch_ptr = v_cache + v_offset;
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                }
+            }
+        }
+    }
+    else
+    {
+        const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride +
+                               ((threadIdx.x / n_thread_per_block) % BLOCK_SIZE) * kv_seq_stride;
 
-                const int64_t vblock_number =
-                    static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
-                const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
-
-                Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
-                    *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+        for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
+        {
+            for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
+            {
+                for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
+                {
+                    const int vlds_col_idx = laneid % n_thread_per_block;
+                    const int vhead_elem =
+                        vhe_depth * NWARPS * 16 + vlds_col_idx * V_X;
+                    const cache_t* v_ptr2 = v_ptr + vhead_elem;
+                    const int64_t vblock_number =
+                        static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
+                    const cache_t* v_fetch_ptr = v_ptr2 + (vblock_number * kv_block_stride);
+                    Vlocal[vtoken_depth][vhe_depth][vblock_depth] =
+                        *reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                }
             }
         }
     }
@@ -675,54 +721,52 @@ _paged_attention_kernel(const int* block_table_seq,
     constexpr int ELEMS8_ELEMS4_RATIO  = 8 / 4;
     constexpr int ELEMS16_ELEMS8_RATIO = 16 / 8;
 
-    for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
+    if constexpr(!USE_5D_VCACHE)
     {
-        for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
+        for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
         {
-            // 1. store data into LDS
-            for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
+            for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
             {
-                const int vlds_col_idx = laneid % n_thread_per_block;
-                const int vlocal_token_idx =
-                    vblock_depth * k_thread_per_block + threadIdx.x / n_thread_per_block;
-                *reinterpret_cast<_B16x8*>(vlds_ptr +
-                                           (/*row=*/vlocal_token_idx * n_thread_per_block +
-                                            /*col=*/vlds_col_idx) *
-                                               16) = Vlocal[vtoken_depth][vhe_depth][vblock_depth];
-            }
-            __syncthreads();
-
-            // 2. load data from LDS (transposed), then do multification
-            for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
-            {
-                const int vlocal_head_elem = warpid * 16 + lane16id;
-
-                const int vlds_col_idx  = vlocal_head_elem / CONTIGUOUS_KV_ELEMS_16B_LOAD;
-                const int vlds_elem_idx = vlocal_head_elem % CONTIGUOUS_KV_ELEMS_16B_LOAD;
-
-                const int vlocal_token_idx =
-                    rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
-
-                // read data points individually and save them into array
-                cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
-                for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
                 {
-                    const cache_t* fetched_elems = reinterpret_cast<const cache_t*>(
-                        vlds_ptr + (/*row=*/(vlocal_token_idx + d2) * n_thread_per_block +
-                                    /*col=*/vlds_col_idx) *
-                                       16);
-
-                    elems[d2] = fetched_elems[vlds_elem_idx];
+                    const int vlds_col_idx = laneid % n_thread_per_block;
+                    const int vlocal_token_idx =
+                        vblock_depth * k_thread_per_block + threadIdx.x / n_thread_per_block;
+                    *reinterpret_cast<_B16x8*>(vlds_ptr +
+                                               (/*row=*/vlocal_token_idx * n_thread_per_block +
+                                                /*col=*/vlds_col_idx) *
+                                                   16) = Vlocal[vtoken_depth][vhe_depth][vblock_depth];
                 }
+                __syncthreads();
 
-                // copy all the read data points together
-                Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
-                    *reinterpret_cast<const _B16x8*>(elems);
+                for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+                {
+                    const int vlocal_head_elem = warpid * 16 + lane16id;
+
+                    const int vlds_col_idx  = vlocal_head_elem / CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                    const int vlds_elem_idx = vlocal_head_elem % CONTIGUOUS_KV_ELEMS_16B_LOAD;
+
+                    const int vlocal_token_idx =
+                        rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+
+                    cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                    {
+                        const cache_t* fetched_elems = reinterpret_cast<const cache_t*>(
+                            vlds_ptr + (/*row=*/(vlocal_token_idx + d2) * n_thread_per_block +
+                                        /*col=*/vlds_col_idx) *
+                                           16);
+                        elems[d2] = fetched_elems[vlds_elem_idx];
+                    }
+
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        *reinterpret_cast<const _B16x8*>(elems);
+                }
+                __syncthreads();
             }
-            __syncthreads();
         }
     }
-
+    // For 5D, Vlocal is already in the correct format from the load phase
     _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
 
     // Softmax V mfma
