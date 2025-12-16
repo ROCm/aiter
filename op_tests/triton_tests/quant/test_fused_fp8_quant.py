@@ -7,7 +7,7 @@ from aiter.ops.triton.fused_fp8_quant import (
     fused_reduce_act_mul_fp8_group_quant,
     fused_reduce_rms_fp8_group_quant,
 )
-from op_tests.triton_tests.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 import aiter
 import torch.nn.functional as F
 

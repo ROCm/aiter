@@ -23,7 +23,8 @@ struct mha_fwd_traits : public fmha_fwd_traits
                    quant_scale_enum qscale_type,
                    bool use_ext_asm,
                    int how_v3_bf16_cvt,
-                   bool skip_min_seqlen_q)
+                   bool skip_min_seqlen_q,
+                   bool has_sink)
         : fmha_fwd_traits{head_size_q,
                           head_size_v,
                           dtype,
@@ -35,7 +36,8 @@ struct mha_fwd_traits : public fmha_fwd_traits
                           has_lse,
                           has_dropout,
                           qscale_type,
-                          skip_min_seqlen_q},
+                          skip_min_seqlen_q,
+                          has_sink},
           use_ext_asm(use_ext_asm),
           how_v3_bf16_cvt(how_v3_bf16_cvt)
     {
@@ -53,7 +55,8 @@ struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
                            bool has_logits_soft_cap,
                            mask_enum mask_type,
                            bias_enum bias_type,
-                           bool has_lse)
+                           bool has_lse,
+                           bool has_sink)
         : fmha_fwd_splitkv_traits{head_size_q,
                                   head_size_v,
                                   dtype,
@@ -63,7 +66,8 @@ struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
                                   mask_type,
                                   bias_type,
                                   has_lse,
-                                  false} // do_fp8_static_quant
+                                  false, // do_fp8_static_quant
+                                  has_sink} 
     {
     }
 };
@@ -81,6 +85,7 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      bool has_lse,
                                                      quant_scale_enum qscale_type,
                                                      bool use_ext_asm,
+                                                     bool has_sink = false,
                                                      int how_v3_bf16_cvt                = 1,
                                                      const void* seqstart_q_padding_ptr = nullptr,
                                                      const void* seqstart_k_padding_ptr = nullptr,
@@ -93,7 +98,8 @@ mha_fwd_splitkv(mha_fwd_splitkv_args args,
                 bool is_group_mode,
                 mask_enum mask_type,
                 bias_enum bias_type,
-                bool has_lse);
+                bool has_lse,
+                bool has_sink = false);
 
 __attribute__((visibility("default"))) float
 mha_batch_prefill(mha_batch_prefill_args args,
@@ -218,8 +224,6 @@ namespace gfx942 {
 float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqstart_q_padding_ptr = nullptr,
-                  const void* seqstart_k_padding_ptr = nullptr,
                   bool is_v3_api_check = false);
 }
 
@@ -227,8 +231,6 @@ namespace gfx950 {
 float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqstart_q_padding_ptr = nullptr,
-                  const void* seqstart_k_padding_ptr = nullptr,
                   bool is_v3_api_check = false);
 }
 } // namespace aiter
