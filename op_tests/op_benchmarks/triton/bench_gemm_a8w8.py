@@ -3,11 +3,11 @@ import triton
 import math
 from aiter.ops.triton.gemm_a8w8 import (
     gemm_a8w8 as triton_gemm_a8w8,
-    # gemm_a8w8_preshuffle as triton_gemm_a8w8_preshuffle,
+    gemm_a8w8_preshuffle as triton_gemm_a8w8_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8 as gluon_gemm_a8w8,
-    gemm_a8w8_preshuffle as triton_gemm_a8w8_preshuffle,
+    gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.test_gemm_a8w8 import (
@@ -41,11 +41,18 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: boo
     mem_write = (M * N) * bias.element_size()
     mem = mem_read + mem_write
     if shuffle:
-        ms = triton.testing.do_bench(
-            lambda: triton_gemm_a8w8_preshuffle(x, weight_shuffled, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
-            warmup=25,
-            rep=100,
-        )
+        if impl == triton_gemm_a8w8:
+            ms = triton.testing.do_bench(
+                lambda: triton_gemm_a8w8_preshuffle(x, weight_shuffled, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+                warmup=25,
+                rep=100,
+            )
+        else:
+            ms = triton.testing.do_bench(
+                lambda: gluon_gemm_a8w8_preshuffle(x, weight_shuffled, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+                warmup=25,
+                rep=100,
+            )
     else:
         ms = triton.testing.do_bench(
             lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
@@ -154,7 +161,7 @@ def parse_args():
     parser = get_parser(kernel_name="A8W8 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
-        "-gluon",
+        "--gluon",
         action="store_true",
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
     )

@@ -136,7 +136,7 @@ def _gemm_a8w8_kernel(
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16],
+        instr_shape=[16, 16, 128],
         transposed=True,
         warps_per_cta=[2, NUM_WARPS // 2],
     )
@@ -439,8 +439,8 @@ def _gemm_a8w8_preshuffled_kernel(
         pid_n = (pid % num_pid_in_group) // group_size_m
 
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[2, 32],
+        size_per_thread=[1, 16],
+        threads_per_warp=[4, 16],
         warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
