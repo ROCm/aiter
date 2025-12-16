@@ -91,8 +91,8 @@ def test_gemm(dtype, M, N, K):
         return
     ret = {}
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-    x = torch.randn((M, K), dtype=dtype)
-    w = torch.randn((N, K), dtype=dtype)
+    x = torch.rand((M, K), dtype=dtype)
+    w = torch.rand((N, K), dtype=dtype)
     _, x_scales = quant_func(x, shuffle=False)
     _, w_scales = quant_func(w, shuffle=False)
     x, x_scales_shuffle = quant_func(x, shuffle=True)
