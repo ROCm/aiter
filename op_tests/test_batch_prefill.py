@@ -295,40 +295,34 @@ def run_ck(
         and v_cache.dtype == dtypes.fp8
     ):
         # FP8 path
-        return (
-            aiter.mha_batch_prefill_func(
-                q,
-                k_cache,
-                v_cache,
-                cu_seqlens_q,
-                kv_indptr,
-                kv_page_indices,
-                max_seqlen_q,
-                max_seqlen_k,
-                causal=causal,
-                logits_soft_cap=logits_soft_cap,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-            ),
-            0.1,
+        return aiter.mha_batch_prefill_func(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_page_indices,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
     else:
         # Standard BF16/FP16 path
-        return (
-            aiter.mha_batch_prefill_func(
-                q,
-                k_cache,
-                v_cache,
-                cu_seqlens_q,
-                kv_indptr,
-                kv_page_indices,
-                max_seqlen_q,
-                max_seqlen_k,
-                causal=causal,
-                logits_soft_cap=logits_soft_cap,
-            ),
-            0.1,
+        return aiter.mha_batch_prefill_func(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_page_indices,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
         )
 
 
@@ -429,7 +423,7 @@ def test_batch_prefill_fp8_output(
     v_cache_quant, v_descale = per_tensor_quant(v_cache, quant_dtype=quant_dtype)
 
     # Run FP8 kernel
-    out_fp8, us_fp8 = run_ck(
+    out_fp8 = run_ck(
         q_quant,
         k_cache_quant,
         v_cache_quant,
@@ -446,7 +440,7 @@ def test_batch_prefill_fp8_output(
     )
 
     # Run BF16 reference kernel
-    out_ref, us_ref = run_ck(
+    out_ref = run_ck(
         q,
         k_cache,
         v_cache,
