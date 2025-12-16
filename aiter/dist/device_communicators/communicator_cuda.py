@@ -132,7 +132,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
             return out
-
+#test
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
