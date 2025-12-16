@@ -133,7 +133,6 @@ def test_topk(
             ),
         )
 
-
     return {
         "err": err,
         "us_aiter": us_aiter,
