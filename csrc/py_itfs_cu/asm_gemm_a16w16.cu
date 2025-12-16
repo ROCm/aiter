@@ -9,8 +9,6 @@
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
 
-#define DEBUG_SEMAPHORE 0
-
 struct __attribute__((packed)) KernelArgs
 {
     void *ptr_D;
@@ -55,8 +53,6 @@ struct __attribute__((packed)) KernelArgs
     p2 _p19;
     unsigned int add_bias;
     p3 _p20;
-    void *ptr_semaphore;
-    p2 _p21;
 };
 
 std::tuple<std::string, int>
@@ -249,24 +245,8 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A, torch::Tensor& B, torch::Tensor&
     int gdy = (Mdim + SUBM - 1) / SUBM;
     int gdz = selectedksplit;
 
-    void* SemaphoreBuffer = nullptr;
-    uint32_t* semaphore_host = nullptr;
-    int semaphore_size = gdx * gdy;
-    semaphore_host = new uint32_t[semaphore_size];
-    HIP_CALL(hipMalloc(&SemaphoreBuffer, sizeof(uint32_t) * semaphore_size));
-    HIP_CALL(hipMemcpy(SemaphoreBuffer, semaphore_host, sizeof(uint32_t) * semaphore_size, hipMemcpyHostToDevice));
-    args.ptr_semaphore = SemaphoreBuffer;
-
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
 
-    if(DEBUG_SEMAPHORE && selectedksplit > 1){
-        HIP_CALL(hipDeviceSynchronize());
-        HIP_CALL(hipMemcpy(semaphore_host, SemaphoreBuffer, sizeof(uint32_t) * semaphore_size, hipMemcpyDeviceToHost));
-        debug_semaphore(semaphore_host, semaphore_size, gdx, gdy);
-    }
-
-    HIP_CALL(hipFree(SemaphoreBuffer));
-    delete[] semaphore_host; 
     return out;
 }
