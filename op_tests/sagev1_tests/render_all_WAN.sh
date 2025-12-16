@@ -32,16 +32,30 @@ KEEP_TEMP=false
 #     "Wan2.1_fp8_attn"
 # )
 
+# VIDEO_SOURCES=(
+#     "results_Wan22_default/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4"
+#     "results_Wan22_hybrid_fp8_attn/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4"
+#     "results_Wan22_fp8_attn/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4"
+# )
+
+# VIDEO_LABELS=(
+#     "Wan2.2_default"
+#     "Wan2.2_hybrid_fp8_attn"
+#     "Wan2.2_fp8_attn"
+# )
+
 VIDEO_SOURCES=(
     "results_Wan22_default/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4"
-    "results_Wan22_hybrid_fp8_attn/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4"
     "results_Wan22_fp8_attn/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4"
+    "results_Wan22_fp8_attn_v1/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4"
+    "results_Wan22_fp8_attn_v2/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4"
 )
 
 VIDEO_LABELS=(
     "Wan2.2_default"
-    "Wan2.2_hybrid_fp8_attn"
     "Wan2.2_fp8_attn"
+    "Wan2.2_fp8_attn_v1"
+    "Wan2.2_fp8_attn_v2"
 )
 # --------------------------------------------------------------------------------------
 
