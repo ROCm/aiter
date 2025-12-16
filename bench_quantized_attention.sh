@@ -27,35 +27,35 @@ for i in ${!BATCH_SIZES[@]}; do
 
     echo ""
     
-    echo "--- SageAttnV1 (i.e -qk_int8) ---"
+    echo "--- SageAttnV1 (i.e -sagev1) ---"
     run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
         -b ${BATCH_SIZES[i]} \
         -hq ${NUM_HEADS[i]} \
         -sq ${SEQ_LENS[i]} \
         -d 128 \
-        -qk_int8 \
+        -sagev1 \
         -metric all \
         # -print_vgpr \
     
     echo ""
-    echo "--- FAv3 FP8 (i.e -fp8) ---"
+    echo "--- FAv3 FP8 (i.e -fav3_fp8) ---"
     run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
         -b ${BATCH_SIZES[i]} \
         -hq ${NUM_HEADS[i]} \
         -sq ${SEQ_LENS[i]} \
         -d 128 \
-        -fp8 \
+        -fav3_fp8 \
         -metric all
         
     echo ""
 
-    echo "--- SageAttnV1 (i.e -sagev1,  fused on fa3 fp8) ---"
+    echo "--- FAv3 Sage (i.e -fav3_sage, sage features fused on fav3 fp8 pipeline) ---"
     run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
         -b ${BATCH_SIZES[i]} \
         -hq ${NUM_HEADS[i]} \
         -sq ${SEQ_LENS[i]} \
         -d 128 \
-        -sagev1_fa3 \
+        -fav3_sage \
         -metric all \
         # -print_vgpr \
     

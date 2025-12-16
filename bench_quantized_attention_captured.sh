@@ -22,27 +22,27 @@ run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
     -metric all
 
 echo ""
-echo "--- SageAttnV1 (i.e -qk_int8) ---"
+echo "--- SageAttnV1 (i.e -sagev1) ---"
 run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
     --load_captured \
     --captured_dir "$CAPTURED_DIR" \
-    -qk_int8 \
+    -sagev1 \
     -metric all
 
 echo ""
-echo "--- FAv3 FP8 (i.e -fp8) ---"
+echo "--- FAv3 FP8 (i.e -fav3_fp8) ---"
 run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
     --load_captured \
     --captured_dir "$CAPTURED_DIR" \
-    -fp8 \
+    -fav3_fp8 \
     -metric all
 
 echo ""
-echo "--- SageAttnV1 (i.e -sagev1, fused on fa3 fp8) ---"
+echo "--- FAv3 Sage (i.e -fav3_sage, sage features fused on fav3 fp8 pipeline) ---"
 run_cmd python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
     --load_captured \
     --captured_dir "$CAPTURED_DIR" \
-    -sagev1_fa3 \
+    -fav3_sage \
     -metric all
 
 echo ""

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Render CogVideoX videos for all attention types
-# Supported types: sdpa, sagev1, fa2, fa3, fa3_fp8, sagev1_fa3
+# Supported types: sdpa, sagev1, fav2, fav3, fav3_fp8, fav3_sage
 
 set -o pipefail
 
@@ -12,7 +12,7 @@ MODEL_PATH="${MODEL_PATH:-THUDM/CogVideoX-2b}"
 AUTO_STITCH=false
 
 # All attention types to try
-ATTENTION_TYPES=("sdpa" "sagev1" "fa2" "fa3" "fa3_fp8" "sagev1_fa3")
+ATTENTION_TYPES=("sdpa" "sagev1" "fav2" "fav3" "fav3_fp8" "fav3_sage")
 
 # Track results
 declare -a SUCCEEDED=()
@@ -35,12 +35,12 @@ usage() {
     echo "  --model-path PATH   Path to CogVideoX model (default: THUDM/CogVideoX-2b)"
     echo "  --stitch            Automatically stitch videos after rendering"
     echo "  --types TYPES       Comma-separated list of attention types to render"
-    echo "                      (default: sdpa,sagev1,fa2,fa3,fa3_fp8,sagev1_fa3)"
+    echo "                      (default: sdpa,sagev1,fav2,fav3,fav3_fp8,fav3_sage)"
     echo "  -h, --help          Show this help message"
     echo ""
     echo "Example:"
     echo "  $0 --output-dir ./my_videos --stitch"
-    echo "  $0 --types sagev1,fa3_fp8,sagev1_fa3"
+    echo "  $0 --types sagev1,fav3_fp8,fav3_sage"
 }
 
 # Parse arguments

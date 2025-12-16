@@ -16,7 +16,7 @@ Benchmark different attention kernel implementations using either randomly gener
 | (none) | FA v2 | Flash Attention v2 (Triton), no quantization |
 | `-fp8` | FA v3 FP8 | Flash Attention v3 with FP8 quantization |
 | `-qk_int8` | SageAttn v1 | INT8 quantized Q/K with per-block scaling |
-| `-sagev1_fa3` | SageAttn v1 (FA3) | SageAttention v1 fused on FA3 backend |
+| `-fav3_sage` | SageAttn v1 (FA3) | SageAttention v1 fused on FA3 backend |
 
 ## Performance Metrics
 
@@ -53,7 +53,7 @@ python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
 # Single configuration - SageAttn v1 on FA3
 python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
     -b 2 -hq 30 -sq 17776 -d 64 \
-    -sagev1_fa3 \
+    -fav3_sage \
     -metric all
 ```
 
@@ -74,7 +74,7 @@ python op_tests/sagev1_tests/sageattn_cogvideo.py \
 python op_tests/op_benchmarks/triton/bench_diffusion_attention.py \
     --load_captured \
     --captured_dir ./captured_inputs \
-    -sagev1_fa3 \
+    -fav3_sage \
     -metric all
 ```
 
@@ -140,7 +140,7 @@ CAPTURED_DIR=/path/to/inputs ./bench_quantized_attention_captured.sh
 |----------|-------------|
 | `-fp8` | Use FA v3 with FP8 quantization |
 | `-qk_int8` | Use SageAttn v1 (INT8 Q/K) |
-| `-sagev1_fa3` | Use SageAttn v1 fused on FA3 |
+| `-fav3_sage` | Use SageAttn v1 fused on FA3 |
 | `-no_k_smooth` | Disable K smoothing for INT8 kernels |
 
 ### Captured Input Mode

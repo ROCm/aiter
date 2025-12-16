@@ -6,7 +6,7 @@ Usage:
     python op_tests/sagev1_tests/sageattn_cogvideo.py --attention_type sage --save_inputs --input_dir ./captured_inputs
 
     # Then run this benchmark with the captured inputs:
-    python op_tests/op_benchmarks/triton/bench_cogvideo.py --input_dir ./captured_inputs -sage_fa3 -metric throughput
+    python op_tests/op_benchmarks/triton/bench_cogvideo.py --input_dir ./captured_inputs -fav3_sage -metric throughput
 """
 from __future__ import annotations
 from typing import Optional, Tuple, List, Dict, Any
@@ -22,7 +22,7 @@ from aiter.ops.triton.mha_v3 import flash_attn_fp8_func
 from aiter.ops.triton.mha_v3 import flash_attn_func as flash_attn_v3_func
 from aiter.ops.triton.mha import flash_attn_func as flash_attn_v2_func
 from aiter.ops.triton.attn_qk_int8_per_block import per_block_int8
-from aiter.ops.triton.sage_v1 import sage_attn_v1_func
+from aiter.ops.triton.fav3_sage import fav3_sage_func
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import get_fwd_configs
 from op_tests.op_benchmarks.triton.bench_diffusion_attention import qk_int8_forward_func
 
@@ -104,9 +104,9 @@ def load_captured_inputs(input_dir: str, max_inputs: Optional[int] = None,
     return inputs
 
 
-def sage_fa3_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool = False):
+def fav3_sage_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool = False):
     """
-    Create a lambda for benchmarking sage_attn_v1_func kernel (fused on fa3).
+    Create a lambda for benchmarking fav3_sage kernel (sagev1 features fused to fav3 pipeline).
     
     Args:
         q, k, v: Input tensors in BHSD format (batch, heads, seqlen, dim)
@@ -115,7 +115,7 @@ def sage_fa3_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_
     Returns:
         Lambda function that executes the attention
     """
-    # Convert from BHSD to BSHD (NHD) for sage_attn_v1_func
+    # Convert from BHSD to BSHD (NHD) for fav3_sage
     q_bshd = q.transpose(1, 2).contiguous()
     k_bshd = k.transpose(1, 2).contiguous()
     v_bshd = v.transpose(1, 2).contiguous()
@@ -136,7 +136,7 @@ def sage_fa3_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_
     )
     v_fp16 = v_bshd.to(torch.float16)
     
-    return lambda: sage_attn_v1_func(
+    return lambda: fav3_sage_func(
         q_int8, 
         k_int8, 
         v_fp16,
@@ -146,7 +146,7 @@ def sage_fa3_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_
     )
 
 
-def fa3_fp8_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+def fav3_fp8_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
                           softmax_scale: Optional[float] = None, is_causal: bool = False):
     """
     Create a lambda for benchmarking flash_attn_fp8_func kernel.
@@ -190,10 +190,10 @@ def sdpa_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     )
 
 
-def fa2_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+def fav2_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
                        softmax_scale: Optional[float] = None, is_causal: bool = False):
     """
-    Create a lambda for benchmarking flash_attn_func (fa2) kernel.
+    Create a lambda for benchmarking flash_attn_func (fav2) kernel.
     
     Args:
         q, k, v: Input tensors in BHSD format (batch, heads, seqlen, dim)
@@ -211,10 +211,10 @@ def fa2_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return lambda: flash_attn_v2_func(q_bshd, k_bshd, v_bshd, dropout_p=0.0, softmax_scale=softmax_scale, causal=is_causal)
 
 
-def fa3_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+def fav3_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
                        softmax_scale: Optional[float] = None, is_causal: bool = False):
     """
-    Create a lambda for benchmarking flash_attn_func v3 (fa3) kernel.
+    Create a lambda for benchmarking flash_attn_func v3 (fav3) kernel.
     
     Args:
         q, k, v: Input tensors in BHSD format (batch, heads, seqlen, dim)
@@ -367,16 +367,16 @@ def run_benchmark(args):
             # After transpose, tensors are in NHD format
             fn = qk_int8_forward_func(q_nhd, k_nhd, v_nhd, tensor_layout="NHD", 
                                        sm_scale=softmax_scale, k_smooth=not no_k_smooth)
-        elif kernel == "sage_fa3":
-            fn = sage_fa3_forward_func(q, k, v, is_causal=is_causal)
+        elif kernel == "fav3_sage":
+            fn = fav3_sage_forward_func(q, k, v, is_causal=is_causal)
         elif kernel == "sdpa":
             fn = sdpa_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
-        elif kernel == "fa2":
-            fn = fa2_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
-        elif kernel == "fa3":
-            fn = fa3_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
-        elif kernel == "fa3_fp8":
-            fn = fa3_fp8_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
+        elif kernel == "fav2":
+            fn = fav2_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
+        elif kernel == "fav3":
+            fn = fav3_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
+        elif kernel == "fav3_fp8":
+            fn = fav3_fp8_forward_func(q, k, v, softmax_scale=softmax_scale, is_causal=is_causal)
         else:
             raise ValueError(f"Unknown kernel: {kernel}")
         
@@ -384,10 +384,10 @@ def run_benchmark(args):
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         
         # Calculate memory transfer
-        # sage_fa3 and sagev1 use int8 quantized Q/K; fa3_fp8 uses fp8; fa2 and fa3 use original dtype
-        q_element_size = 1 if kernel in ["sagev1", "sage_fa3", "fa3_fp8"] else q.element_size()
-        k_element_size = 1 if kernel in ["sagev1", "sage_fa3", "fa3_fp8"] else k.element_size()
-        v_element_size = 1 if kernel == "fa3_fp8" else v.element_size()
+        # fav3_sage and sagev1 use int8 quantized Q/K; fav3_fp8 uses fp8; fav2 and fav3 use original dtype
+        q_element_size = 1 if kernel in ["sagev1", "fav3_sage", "fav3_fp8"] else q.element_size()
+        k_element_size = 1 if kernel in ["sagev1", "fav3_sage", "fav3_fp8"] else k.element_size()
+        v_element_size = 1 if kernel == "fav3_fp8" else v.element_size()
         # Output is always in bfloat16 (2 bytes), regardless of input quantization
         o_element_size = 2
         
@@ -430,8 +430,8 @@ def parse_args():
         "--kernel",
         type=str,
         default="sagev1",
-        choices=["sagev1", "sage_fa3", "sdpa", "fa2", "fa3", "fa3_fp8"],
-        help="Kernel to benchmark: sagev1 (qk_int8_per_block), sage_fa3 (sage_attn_v1_func fused on fa3), sdpa (PyTorch native), fa2 (flash_attn_func v2), fa3 (flash_attn_func v3), fa3_fp8",
+        choices=["sagev1", "fav3_sage", "sdpa", "fav2", "fav3", "fav3_fp8"],
+        help="Kernel to benchmark: sagev1 (qk_int8_per_block), fav3_sage (sage_attn_v1_func fused on fav3), sdpa (PyTorch native), fav2 (flash_attn_func v2), fav3 (flash_attn_func v3), fav3_fp8",
     )
     parser.add_argument(
         "-metric",
@@ -477,12 +477,12 @@ def parse_args():
         help="Sample every Nth input for benchmarking (None = all)",
     )
     # Shorthand flags
-    parser.add_argument("-sage_fa3", action="store_true", help="Shorthand for --kernel sage_fa3")
+    parser.add_argument("-fav3_sage", action="store_true", help="Shorthand for --kernel fav3_sage")
     parser.add_argument("-sagev1", action="store_true", help="Shorthand for --kernel sagev1")
     parser.add_argument("-sdpa", action="store_true", help="Shorthand for --kernel sdpa")
-    parser.add_argument("-fa2", action="store_true", help="Shorthand for --kernel fa2")
-    parser.add_argument("-fa3", action="store_true", help="Shorthand for --kernel fa3")
-    parser.add_argument("-fa3_fp8", action="store_true", help="Shorthand for --kernel fa3_fp8")
+    parser.add_argument("-fav2", action="store_true", help="Shorthand for --kernel fav2")
+    parser.add_argument("-fav3", action="store_true", help="Shorthand for --kernel fav3")
+    parser.add_argument("-fav3_fp8", action="store_true", help="Shorthand for --kernel fav3_fp8")
     
     return parser.parse_args()
 
@@ -491,18 +491,18 @@ def main():
     args = parse_args()
     torch.cuda.set_device(7)
     # Handle shorthand flags
-    if args.sage_fa3:
-        args.kernel = "sage_fa3"
+    if args.fav3_sage:
+        args.kernel = "fav3_sage"
     elif args.sagev1:
         args.kernel = "sagev1"
     elif args.sdpa:
         args.kernel = "sdpa"
-    elif args.fa2:
-        args.kernel = "fa2"
-    elif args.fa3:
-        args.kernel = "fa3"
-    elif args.fa3_fp8:
-        args.kernel = "fa3_fp8"
+    elif args.fav2:
+        args.kernel = "fav2"
+    elif args.fav3:
+        args.kernel = "fav3"
+    elif args.fav3_fp8:
+        args.kernel = "fav3_fp8"
     
     logger.info(f"Benchmarking kernel: {args.kernel}")
     logger.info(f"Input directory: {args.input_dir}")

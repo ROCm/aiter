@@ -3,8 +3,8 @@
 Compare saved output tensors from different attention methods.
 
 Usage:
-    python compare_outputs.py output_fa3_*.pt output_fa3_fp8_*.pt
-    python compare_outputs.py output_fa3_*.pt output_sage_v1_triton_*.pt
+    python compare_outputs.py output_fav3_*.pt output_fav3_fp8_*.pt
+    python compare_outputs.py output_fav3_*.pt output_sage_v1_triton_*.pt
 """
 
 import argparse

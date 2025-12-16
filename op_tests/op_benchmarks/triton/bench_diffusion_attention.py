@@ -421,7 +421,7 @@ def bench_kernel(q, k, v, args, provider):
             sm_scale=softmax_scale,
             k_smooth=k_smooth,
         )
-    elif args.fav3_sage: # sage v1, fused on fa3
+    elif args.fav3_sage: # sage v1, fused on fav3
         fn = fav3_sage_forward_func(
             q,
             k,
