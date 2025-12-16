@@ -29,7 +29,7 @@ jobs:
 
   define-runners:
     runs-on: ubuntu-latest
-    needs: [check-signal]
+    # needs: [check-signal]
     outputs:
       standard_runners: ${{ steps.machines.outputs.standard_runners }}
       multigpu_runners: ${{ steps.machines.outputs.multigpu_runners }}
