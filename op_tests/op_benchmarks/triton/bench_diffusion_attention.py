@@ -21,7 +21,6 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
 from aiter.test_mha_common import (
     attention_ref,
 )
-from compare_outputs import save_benchmark_output
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
@@ -40,7 +39,7 @@ from aiter.ops.triton.fav3_sage import (
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs,
-    per_block_fp8,
+    quantize_v_fp8
 )
 
 
@@ -259,7 +258,7 @@ def fav3_sage_forward_func(
 
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
-    v_fp8, v_descale = per_block_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
+    v_fp8, v_descale = quantize_v_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
 
     return lambda: fav3_sage_func(
         q_int8,
