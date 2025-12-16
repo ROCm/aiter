@@ -389,6 +389,141 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
     ]
     return configs
 
+def bench_kernel(q, k, v, args, provider):
+    # Default softmax scale
+    BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
+    _, N_CTX_K, HK, D_HEAD_V = v.shape
+    softmax_scale = 1.0 / (D_HEAD**0.5)
+    k_smooth = not args.no_k_smooth
+    
+    # FLOPS calculation variables
+    total_flops = 0.0
+    total_flops += (
+        2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+    )
+    if args.fp8: #  fav3 fp8
+        fn = fav3_fp8_forward_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=False,
+            window_size=(-1, -1),
+            attention_chunk=0,
+            softcap=0.0,
+            deterministic=False,
+            sm_margin=0,
+        )
+    elif args.qk_int8: # sage v1
+        fn = qk_int8_forward_func(
+            q,
+            k,
+            v,
+            tensor_layout=args.qk_int8_layout,
+            sm_scale=softmax_scale,
+            k_smooth=k_smooth,
+        )
+    elif args.sagev1_fa3: # sage v1, fused on fa3
+        fn = sagev1_forward_func(
+            q,
+            k,
+            v,
+            causal=False,
+            inference_mode=True,
+        )
+    else: # fav2 (no quantization)
+        fn = fav2_forward_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=softmax_scale,
+            causal=False,
+            return_lse=False,
+            return_attn_probs=False,
+        )
+
+    ms = triton.testing.do_bench(fn)
+    
+    if args.compare_to_ref:
+        current_output = fn()
+        assert current_output is not None
+        current_primary = primary_output(current_output)
+        def reference_output():
+            if args.ref=="fav3_fp8": #  fav3 fp8
+                fn = fav3_fp8_forward_func(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                    window_size=(-1, -1),
+                    attention_chunk=0,
+                    softcap=0.0,
+                    deterministic=False,
+                    sm_margin=0,
+                )
+            elif args.ref=="qk_int8": # sage v1
+                fn = qk_int8_forward_func(
+                    q,
+                    k,
+                    v,
+                    tensor_layout=args.qk_int8_layout,
+                    sm_scale=softmax_scale,
+                    k_smooth=k_smooth,
+                )
+            elif args.ref=="fav2": # fav2 (no quantization)
+                fn = fav2_forward_func(
+                        q,
+                        k,
+                        v,
+                        dropout_p=0.0,
+                        softmax_scale=softmax_scale,
+                        causal=False,
+                        return_lse=False,
+                        return_attn_probs=False,
+                    )
+            else:
+                fn = lambda: attention_ref(
+                    q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
+                )
+            return fn()
+        
+        reference_primary = primary_output(
+            reference_output()
+        )
+        check_attention_outputs(current_primary, reference_primary, fp8=False)
+        if args.print_compare_stats:
+            print_output_comparison_stats(current_primary, reference_primary)
+
+    q_element_size = 1 if args.qk_int8 or args.fp8 or args.sagev1_fa3 else q.element_size()
+    k_element_size = 1 if args.qk_int8 or args.fp8 or args.sagev1_fa3 else k.element_size()
+    v_element_size = 1 if args.fp8 else v.element_size()
+
+    
+    total_num_tokens_q = BATCH * N_CTX_Q
+    total_num_tokens_k = BATCH * N_CTX_K
+    q_size = total_num_tokens_q * HQ * D_HEAD * q_element_size
+    k_size = total_num_tokens_k * HK * D_HEAD * k_element_size
+    v_size = total_num_tokens_k * HK * D_HEAD_V * v_element_size
+    o_size = total_num_tokens_q * HQ * D_HEAD_V * q_element_size
+
+    # read q, k, v
+    mem_read = q_size + k_size + v_size
+    # write o
+    mem_write = o_size
+    mem = mem_read + mem_write
+
+    # return ms
+    if "ms" in provider:
+        return ms
+    elif "TFLOPS" in provider:
+        return total_flops / ms * 1e-9
+    elif "GB/s" in provider:  # GB/s
+        return mem / ms * 1e-6
+    elif "arithmetic_intensity" in provider:
+        return total_flops / mem
+    return ms
 
 def run_benchmark_captured(args):
     """
@@ -421,7 +556,6 @@ def run_benchmark_captured(args):
         Benchmark function for attention kernels using captured inputs.
         INPUT_IDX: Index in the loaded inputs list
         """
-        k_smooth = not args.no_k_smooth
         
         # Get the input tensors for this configuration
         inp = inputs[INPUT_IDX]
@@ -436,97 +570,15 @@ def run_benchmark_captured(args):
         k = k_bhsd.transpose(1, 2).contiguous()
         v = v_bhsd.transpose(1, 2).contiguous()
         
-        # Get kwargs from capture
-        kwargs = inp.get('kwargs', {})
-        is_causal = kwargs.get('is_causal', causal)
-        softmax_scale = kwargs.get('softmax_scale', None)
-        
-        # Default softmax scale
-        if softmax_scale is None:
-            softmax_scale = 1.0 / (D_HEAD**0.5)
-        
-        # Calculate FLOPS: 2 * batch * heads * seq_q * seq_k * (head_dim + head_dim_v)
-        total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-        
-        # Select kernel and create benchmark function
-        if args.fp8:  # fav3 fp8
-            fn = fav3_fp8_forward_func(
-                q,
-                k,
-                v,
-                softmax_scale=softmax_scale,
-                causal=is_causal,
-                window_size=(-1, -1),
-                attention_chunk=0,
-                softcap=0.0,
-                deterministic=False,
-                sm_margin=0,
-            )
-        elif args.qk_int8:  # sage v1
-            fn = qk_int8_forward_func(
-                q,
-                k,
-                v,
-                tensor_layout=args.qk_int8_layout,
-                sm_scale=softmax_scale,
-                k_smooth=k_smooth,
-            )
-        elif args.sagev1_fa3:  # sage v1, fused on fa3
-            fn = sagev1_forward_func(
-                q,
-                k,
-                v,
-                causal=is_causal,
-                inference_mode=True,
-            )
-        else:  # fav2 (no quantization)
-            fn = fav2_forward_func(
-                q,
-                k,
-                v,
-                dropout_p=0.0,
-                softmax_scale=softmax_scale,
-                causal=is_causal,
-                return_lse=True,
-                return_attn_probs=False,
-            )
-        
-        # Run benchmark
-        ms = triton.testing.do_bench(fn)
-        
-        # Calculate memory transfer
-        q_element_size = 1 if args.qk_int8 or args.fp8 else q.element_size()
-        k_element_size = 1 if args.qk_int8 or args.fp8 else k.element_size()
-        v_element_size = 1 if args.fp8 else v.element_size()
-        
-        total_num_tokens_q = BATCH * N_CTX_Q
-        total_num_tokens_k = BATCH * N_CTX_K
-        q_size = total_num_tokens_q * HQ * D_HEAD * q_element_size
-        k_size = total_num_tokens_k * HK * D_HEAD * k_element_size
-        v_size = total_num_tokens_k * HK * D_HEAD_V * v_element_size
-        o_size = total_num_tokens_q * HQ * D_HEAD_V * q_element_size
-        
-        mem = q_size + k_size + v_size + o_size
-        
-        # Return appropriate metric
-        if "ms" in provider:
-            return ms
-        elif "TFLOPS" in provider:
-            return total_flops / ms * 1e-9
-        elif "GB/s" in provider:
-            return mem / ms * 1e-6
-        elif "arithmetic_intensity" in provider:
-            return total_flops / mem
-        
-        return ms  # default
+        return bench_kernel(q, k, v, args, provider)
     
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
 
 
+saved_output_keys = set()
+
 def run_benchmark(custom, args):
     torch.manual_seed(20)
-    saved_output_keys = set()
-
     @triton.testing.perf_report(create_benchmark_configs(custom, args))
     def bench_mha(
         BATCH,
@@ -546,29 +598,12 @@ def run_benchmark(custom, args):
         device="cuda",
     ):
         """
-        Benchmark or test function for multi-head attention backward pass.
-        In test_mode, verifies output matching with non-varlen inputs.
+        Benchmark function for attention kernels with generated random inputs.
         """
         assert args.qk_int8_layout=="NHD"
         assert args.layout == "bshd"
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         assert causal == False, "Causal not supported in this benchmark."
-        return_lse = True
-        return_attn_probs = False
-        varlen = args.layout == "thd"
-        k_smooth = not args.no_k_smooth
-        has_pe = D_HEAD > D_HEAD_V
-        assert not (
-            args.fp8 and has_pe
-        ), "Positional Encoding (PE) doesn't support FP8 data type."
-        assert not (
-            has_pe and "fused-bwd" in provider
-        ), "'Fused' backward implementation doesn't support Positional Encoding (PE)."
-
-
-        # Default softmax scale to match standard attention
-        if sm_scale is None:
-            sm_scale = 1.0 / (D_HEAD**0.5)
 
         # Generate base inputs
         q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
@@ -578,154 +613,7 @@ def run_benchmark(custom, args):
         k.requires_grad = False
         v.requires_grad = False
 
-        # FLOPS calculation variables
-        total_flops = 0.0
-        total_flops += (
-            2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-        )
-        if args.fp8: #  fav3 fp8
-            fn = fav3_fp8_forward_func(
-                q,
-                k,
-                v,
-                softmax_scale=sm_scale,
-                causal=False,
-                window_size=(-1, -1),
-                attention_chunk=0,
-                softcap=0.0,
-                deterministic=False,
-                sm_margin=0,
-            )
-        elif args.qk_int8: # sage v1
-            fn = qk_int8_forward_func(
-                q,
-                k,
-                v,
-                tensor_layout=args.qk_int8_layout,
-                sm_scale=sm_scale,
-                k_smooth=k_smooth,
-            )
-        elif args.sagev1_fa3: # sage v1, fused on fa3
-            fn = sagev1_forward_func(
-                q,
-                k,
-                v,
-                causal=False,
-                inference_mode=True,
-            )
-        else: # fav2 (no quantization)
-            fn = fav2_forward_func(
-                q,
-                k,
-                v,
-                dropout_p=dropout,
-                softmax_scale=sm_scale,
-                causal=causal,
-                return_lse=return_lse,
-                return_attn_probs=return_attn_probs,
-            )
-
-        ms = triton.testing.do_bench(fn)
-        current_output = fn()
-
-        if args.save_output:
-            assert current_output is not None
-            save_benchmark_output(
-                args,
-                lambda output=current_output: output,
-                saved_output_keys,
-                model or "",
-                BATCH,
-                HQ,
-                HK,
-                N_CTX_Q,
-                N_CTX_K,
-                D_HEAD,
-                D_HEAD_V,
-                dtype,
-                causal,
-                mode,
-                varlen,
-            )
-
-        if args.compare_to_ref:
-            assert current_output is not None
-            current_primary = primary_output(current_output)
-            def reference_output():
-                if args.ref=="fav3_fp8": #  fav3 fp8
-                    fn = fav3_fp8_forward_func(
-                        q,
-                        k,
-                        v,
-                        softmax_scale=sm_scale,
-                        causal=False,
-                        window_size=(-1, -1),
-                        attention_chunk=0,
-                        softcap=0.0,
-                        deterministic=False,
-                        sm_margin=0,
-                    )
-                elif args.ref=="qk_int8": # sage v1
-                    fn = qk_int8_forward_func(
-                        q,
-                        k,
-                        v,
-                        tensor_layout=args.qk_int8_layout,
-                        sm_scale=sm_scale,
-                        k_smooth=k_smooth,
-                    )
-                elif args.ref=="fav2": # fav2 (no quantization)
-                    fn = fav2_forward_func(
-                        q,
-                        k,
-                        v,
-                        dropout_p=dropout,
-                        softmax_scale=sm_scale,
-                        causal=False,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
-                    )
-                else:
-                    fn = lambda: attention_ref(
-                        q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
-                    )
-                return fn()
-            
-            reference_primary = primary_output(
-                reference_output()
-            )
-            check_attention_outputs(current_primary, reference_primary, fp8=False)
-            if args.print_compare_stats:
-                print_output_comparison_stats(current_primary, reference_primary)
-
-        q_element_size = 1 if args.qk_int8 or args.fp8 or args.sagev1_fa3 else q.element_size()
-        k_element_size = 1 if args.qk_int8 or args.fp8 or args.sagev1_fa3 else k.element_size()
-        v_element_size = 1 if args.fp8 else v.element_size()
-
-        
-        total_num_tokens_q = BATCH * N_CTX_Q
-        total_num_tokens_k = BATCH * N_CTX_K
-        q_size = total_num_tokens_q * HQ * D_HEAD * q_element_size
-        k_size = total_num_tokens_k * HK * D_HEAD * k_element_size
-        v_size = total_num_tokens_k * HK * D_HEAD_V * v_element_size
-        o_size = total_num_tokens_q * HQ * D_HEAD_V * q_element_size
-
-        # read q, k, v
-        mem_read = q_size + k_size + v_size
-        # write o
-        mem_write = o_size
-        mem = mem_read + mem_write
-
-        # return ms
-        if "ms" in provider:
-            return ms
-        elif "TFLOPS" in provider:
-            return total_flops / ms * 1e-9
-        elif "GB/s" in provider:  # GB/s
-            return mem / ms * 1e-6
-        elif "arithmetic_intensity" in provider:
-            return total_flops / mem
-
+        return bench_kernel(q, k, v, args, provider)
 
     bench_mha.run(save_path="." if args.o else None, print_data=True)
 

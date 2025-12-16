@@ -60,3 +60,9 @@ aiter/install_mode
 # vim 
 *.swo
 *.swp
+*.swo
+*.swp
+
+# captured inputs and videos
+*.mp4
+captured_inputs/*
