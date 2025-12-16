@@ -12,7 +12,9 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     run_torch as run_torch_gemm_a8w8_blockscale,
 )
-from op_tests.triton_tests.fusions.test_fused_mul_add import generate_fused_mul_add_inputs
+from op_tests.triton_tests.fusions.test_fused_mul_add import (
+    generate_fused_mul_add_inputs,
+)
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     run_torch as run_torch_fused_mul_add,
 )
