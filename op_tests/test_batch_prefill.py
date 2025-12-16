@@ -451,17 +451,16 @@ def test_batch_prefill_fp8_output(
     def convert_lens_to_indptr(lens):
         return torch.cumsum(torch.cat((torch.tensor([0]), lens)), dim=0).int()
 
-    # Create Q tensor following test_mha_varlen_fp8 pattern (using torch.rand for [0, 1) range)
-    q = torch.rand(
-        batch_size * qo_len, num_qo_heads, head_dim, device="cuda", dtype=dtype
-    )
-
-    # Create variable sequence lengths
+    # Create variable sequence lengths first
     if batch_size > 1:
         qo_lens = torch.randint(1, qo_len + 1, (batch_size,)).int()
     else:
         qo_lens = torch.full((batch_size,), qo_len).int()
     q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+
+    # Create Q tensor with actual total tokens needed
+    total_q_tokens = torch.sum(qo_lens).item()
+    q = torch.rand(total_q_tokens, num_qo_heads, head_dim, device="cuda", dtype=dtype)
 
     # Create paged KV cache following test_batch_prefill_with_paged_kv_cache pattern
     # Generate in FP32 first for accurate reference computation
@@ -531,51 +530,33 @@ def test_batch_prefill_fp8_output(
         logits_soft_cap=logits_soft_cap,
     )
 
-    # Compare outputs per-sequence (following test_batch_prefill_with_paged_kv_cache pattern)
-    # This ensures we only check valid tokens and avoid false-positive NaN detection
-    rtol, atol = (1e-3, 1e-3) if dtype == torch.float16 else (2e-2, 1e-2)
-    kv_layout = "NHD"
-
+    # Compute reference output for all sequences
+    o_ref_list = []
     for i in range(batch_size):
-        perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
-        perm_dims_last = [1, 0, 2] if kv_layout == "HND" else [0, 1, 2]
-
         # Extract valid Q for this sequence
         qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
 
-        # Extract valid K and V for this sequence
+        # Extract valid K and V for this sequence (NHD layout)
         used_kv_indices = kv_indices_cpu[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
         ki = torch.cat(
             [
-                kv_data_fp32[used_kv_indices[:-1], 0]
-                .permute(*perm_dims)
-                .reshape(-1, num_kv_heads, head_dim),
-                (
-                    kv_data_fp32[used_kv_indices[-1], 0, :, : kv_last_page_len_cpu[i]]
-                    if kv_layout == "HND"
-                    else kv_data_fp32[
-                        used_kv_indices[-1], 0, : kv_last_page_len_cpu[i], :
-                    ]
-                )
-                .permute(*perm_dims_last)
-                .reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_kv_indices[:-1], 0].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+                kv_data_fp32[
+                    used_kv_indices[-1], 0, : kv_last_page_len_cpu[i], :
+                ].reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
         ).to(dtype)
         vi = torch.cat(
             [
-                kv_data_fp32[used_kv_indices[:-1], 1]
-                .permute(*perm_dims)
-                .reshape(-1, num_kv_heads, head_dim),
-                (
-                    kv_data_fp32[used_kv_indices[-1], 1, :, : kv_last_page_len_cpu[i]]
-                    if kv_layout == "HND"
-                    else kv_data_fp32[
-                        used_kv_indices[-1], 1, : kv_last_page_len_cpu[i], :
-                    ]
-                )
-                .permute(*perm_dims_last)
-                .reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_kv_indices[:-1], 1].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+                kv_data_fp32[
+                    used_kv_indices[-1], 1, : kv_last_page_len_cpu[i], :
+                ].reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
         ).to(dtype)
@@ -584,22 +565,23 @@ def test_batch_prefill_fp8_output(
         o_ref_i = ref_masked_attention(
             qi, ki, vi, causal=causal, logits_soft_cap=logits_soft_cap
         )
+        o_ref_list.append(o_ref_i)
 
-        # Extract outputs for this sequence (only valid tokens)
-        o_fp8_i = out_fp8[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        o_bf16_i = out_ref[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+    # Concatenate all reference outputs
+    o_ref = torch.cat(o_ref_list, dim=0)
 
-        # Compare FP8 output with reference
-        # Following test_mha_varlen_fp8 threshold
-        max_diff = (o_fp8_i - o_ref_i).abs().max().item()
-        threshold = 0.055
-        assert max_diff < threshold, (
-            f"Sequence {i}: FP8 kernel vs reference difference too large: "
-            f"{max_diff} (threshold: {threshold})"
-        )
+    # Compare FP8 output with reference (entire tensor)
+    # Following test_mha_varlen_fp8 threshold
+    max_diff = (out_fp8 - o_ref).abs().max().item()
+    threshold = 0.055
+    assert max_diff < threshold, (
+        f"FP8 kernel vs reference difference too large: "
+        f"{max_diff} (threshold: {threshold})"
+    )
 
-        # Also verify BF16 kernel matches reference (sanity check)
-        torch.testing.assert_close(o_bf16_i, o_ref_i, rtol=rtol, atol=atol)
+    # Also verify BF16 kernel matches reference (sanity check)
+    rtol, atol = 2e-2, 1e-2  # bf16 tolerances
+    torch.testing.assert_close(out_ref, o_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("batch_size", [1, 3])
@@ -629,7 +611,6 @@ def test_batch_prefill_vs_varlen_fp8(
     """
     Compare FP8 batch_prefill (paged KV) vs FP8 flash_attn_varlen.
     Both use qr_async pipeline with FP8, should produce identical results.
-    Uses per-batch valid token comparison to avoid including padding data.
     """
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -669,10 +650,9 @@ def test_batch_prefill_vs_varlen_fp8(
     ).cuda()
 
     # Quantize to FP8
-    scale = torch.tensor([1.0], dtype=torch.float32).cuda()
-    q_fp8, q_descale = per_tensor_quant(q_bf16, scale, quant_dtype=quant_dtype)
-    k_fp8, k_descale = per_tensor_quant(k_bf16, scale, quant_dtype=quant_dtype)
-    v_fp8, v_descale = per_tensor_quant(v_bf16, scale, quant_dtype=quant_dtype)
+    q_fp8, q_descale = per_tensor_quant(q_bf16, quant_dtype=quant_dtype)
+    k_fp8, k_descale = per_tensor_quant(k_bf16, quant_dtype=quant_dtype)
+    v_fp8, v_descale = per_tensor_quant(v_bf16, quant_dtype=quant_dtype)
 
     cu_seqlens_q = convert_lens_to_indptr(qo_lens).cuda()
     cu_seqlens_k = convert_lens_to_indptr(kv_lens).cuda()
@@ -721,7 +701,7 @@ def test_batch_prefill_vs_varlen_fp8(
         v_descale=v_descale,
     )
 
-    # Compare results per-batch (only valid tokens)
+    # Compare results (all tokens are valid, no padding)
     print(f"\n=== FP8 Comparison: batch_prefill vs varlen ===")
     print(
         f"batch_size={batch_size}, heads={num_qo_heads}/{num_kv_heads}, "
@@ -729,41 +709,21 @@ def test_batch_prefill_vs_varlen_fp8(
     )
     print(f"causal={causal}, logits_soft_cap={logits_soft_cap}")
 
-    q_indptr_cpu = cu_seqlens_q.cpu()
-    max_diff_all = 0.0
-    mean_diff_all = 0.0
-    total_tokens = 0
+    # Sanity check: outputs should not be all zeros
+    assert (
+        out_varlen.abs().max().item() > 1e-6
+    ), "Varlen output is all zeros - kernel may not have launched!"
+    assert (
+        out_batch_prefill.abs().max().item() > 1e-6
+    ), "Batch_prefill output is all zeros - kernel may not have launched!"
 
-    for i in range(batch_size):
-        # Extract valid tokens for this batch
-        start_idx = q_indptr_cpu[i].item()
-        end_idx = q_indptr_cpu[i + 1].item()
-        num_tokens = end_idx - start_idx
+    # Compute differences on entire tensor
+    diff = (out_varlen - out_batch_prefill).abs()
+    max_diff_all = diff.max().item()
+    mean_diff_all = diff.mean().item()
 
-        out_varlen_i = out_varlen[start_idx:end_idx]
-        out_batch_prefill_i = out_batch_prefill[start_idx:end_idx]
-
-        # Compute differences only on valid tokens
-        diff_i = (out_varlen_i - out_batch_prefill_i).abs()
-        max_diff_i = diff_i.max().item()
-        mean_diff_i = diff_i.mean().item()
-
-        max_diff_all = max(max_diff_all, max_diff_i)
-        mean_diff_all += mean_diff_i * num_tokens
-        total_tokens += num_tokens
-
-        # Sanity check: outputs should not be all zeros
-        assert (
-            out_varlen_i.abs().max().item() > 1e-6
-        ), f"Batch {i}: Varlen output is all zeros - kernel may not have launched!"
-        assert (
-            out_batch_prefill_i.abs().max().item() > 1e-6
-        ), f"Batch {i}: Batch_prefill output is all zeros - kernel may not have launched!"
-
-    mean_diff_all /= total_tokens
-
-    print(f"Max diff (across all batches): {max_diff_all:.6e}")
-    print(f"Mean diff (across all batches): {mean_diff_all:.6e}")
+    print(f"Max diff: {max_diff_all:.6e}")
+    print(f"Mean diff: {mean_diff_all:.6e}")
     print(f"Varlen output max: {out_varlen.abs().max().item():.6e}")
     print(f"Batch_prefill output max: {out_batch_prefill.abs().max().item():.6e}")
 
@@ -773,19 +733,8 @@ def test_batch_prefill_vs_varlen_fp8(
 
     # Should be nearly identical (same pipeline, same computation)
     # FP8 may have slightly larger tolerance
-    rtol, atol = 5e-2, 5e-2
-
-    # Compare per-batch to ensure we only check valid tokens
-    for i in range(batch_size):
-        start_idx = q_indptr_cpu[i].item()
-        end_idx = q_indptr_cpu[i + 1].item()
-
-        out_varlen_i = out_varlen[start_idx:end_idx]
-        out_batch_prefill_i = out_batch_prefill[start_idx:end_idx]
-
-        torch.testing.assert_close(
-            out_batch_prefill_i, out_varlen_i, rtol=rtol, atol=atol
-        )
+    rtol, atol = 1e-4, 1e-4
+    torch.testing.assert_close(out_batch_prefill, out_varlen, rtol=rtol, atol=atol)
 
 
 l_causal = [False, True]
