@@ -332,8 +332,8 @@ setup(
     extras_require={
         # Triton-based communication using Iris
         # Note: Iris is not available on PyPI and must be installed separately
-        # Install with: pip install -r requirements-triton.txt
-        # (See requirements-triton.txt for pinned Iris version)
+        # Install with: pip install -r requirements-triton-comms.txt
+        # (See requirements-triton-comms.txt for pinned Iris version)
         "triton_comms": [],
         # Install all optional dependencies
         "all": [],
