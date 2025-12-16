@@ -142,6 +142,7 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         batch_stride_o,
                         mask.left,
                         mask.right,
+                        0,              // sink_size
                         static_cast<ck_tile::index_t>(mask.type),
                         min_seqlen_q,
                         p_dropout,
