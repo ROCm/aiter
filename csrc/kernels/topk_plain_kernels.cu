@@ -51,6 +51,14 @@
 
 // Forward declaration of topk_per_row kernel from topk_per_row_kernels.cu
 namespace aiter {
+
+// Phase enum for distinguishing prefill vs decode paths
+enum class Phase
+{
+    Prefill,
+    Decode,
+};
+
 template <int kNumThreadsPerBlock, bool useRadixSort, int Vector>
 __global__ void topk_per_row(const float* logits,
                              const int* rowStarts,
@@ -61,7 +69,11 @@ __global__ void topk_per_row(const float* logits,
                              int rowOffset);
 
 // Forward declaration of standalone_stable_radix_11bits from topk_per_row_kernels.cu
-template <typename T, typename IdxT, bool WRITE_TOPK_VALUES, bool sorted = false>
+template <typename T,
+          typename IdxT,
+          bool WRITE_TOPK_VALUES,
+          bool sorted = false,
+          Phase phase = Phase::Prefill>
 void standalone_stable_radix_11bits(void* buf,
                                     size_t& buf_size,
                                     T const* in,
@@ -73,14 +85,17 @@ void standalone_stable_radix_11bits(void* buf,
                                     T* out,
                                     IdxT* out_idx,
                                     bool greater,
-                                    hipStream_t stream);
+                                    hipStream_t stream,
+                                    int next_n = 0);
 
 } // namespace aiter
 
 // Forward declaration of workspace size calculation function (at global scope)
-template <typename T>
+template <typename T, aiter::Phase phase = aiter::Phase::Prefill>
 int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0);
-extern template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows, int32_t stride0);
+extern template int64_t
+invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(int32_t numRows,
+                                                                    int32_t stride0);
 
 // Forward declaration of helper function to call topk_per_row kernel
 template <typename IdxT>
@@ -976,6 +991,19 @@ using bf16x8_t  = __bf16 __attribute__((ext_vector_type(8)));
 using halfx8_t  = _Float16 __attribute__((ext_vector_type(8)));
 using index_t   = uint32_t;
 
+__device__ __forceinline__ static int32x4_t
+asm_buffer_load_dwordx4(int32x4_t srsrc,
+                        int32_t voffset,
+                        int32_t soffset,
+                        int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+
+template <typename VecType>
+__device__ __forceinline__ VecType
+buffer_load_dwordx4(int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux)
+{
+    return __builtin_bit_cast(VecType, asm_buffer_load_dwordx4(srsrc, voffset, soffset, aux));
+}
+
 } // namespace buffer_load_helpers
 
 // --- Wave-Level Priority Selection Primitives (AMD/HIP Optimized) ---
@@ -1707,12 +1735,12 @@ struct WaveTopkFilter
             uint32_t src_offset = (batch_start + start) * sizeof(DataT) + tid * sizeof(VecType);
 
             VecType arr[2];
-            arr[0] = aiter::buffer_load_dwordx4(
+            arr[0] = buffer_load_helpers::buffer_load_dwordx4<VecType>(
                 src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
             for(IdxT i = start + tid * tile; i < tail; i += stride * tile)
             {
                 src_offset += stride * sizeof(VecType);
-                arr[1] = aiter::buffer_load_dwordx4(
+                arr[1] = buffer_load_helpers::buffer_load_dwordx4<VecType>(
                     src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
 #pragma unroll
                 for(IdxT idx = 0; idx < tile; ++idx)
@@ -1745,12 +1773,12 @@ struct WaveTopkFilter
             uint32_t src_offset = (batch_start + start) * sizeof(DataT) + tid * sizeof(VecType);
 
             VecType arr[2];
-            arr[0] = aiter::buffer_load_dwordx4(
+            arr[0] = buffer_load_helpers::buffer_load_dwordx4<VecType>(
                 src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
             for(IdxT i = start + tid * tile; i < end_aligned; i += stride * tile)
             {
                 src_offset += stride * sizeof(VecType);
-                arr[1] = aiter::buffer_load_dwordx4(
+                arr[1] = buffer_load_helpers::buffer_load_dwordx4<VecType>(
                     src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
 #pragma unroll
                 for(IdxT idx = 0; idx < tile; ++idx)

@@ -895,16 +895,17 @@ __global__ void radix_kernel(T const* in,
 {
     const int64_t batch_id = blockIdx.y;
 
-    IdxT rowStart    = 0;
-    IdxT rowEnd      = len;
-
-    if (rowStarts && rowEnds)
+    IdxT row_len = 0;
+    if(phase == Phase::Prefill)
     {
-        rowStart = rowStarts[batch_id];
-        rowEnd   = rowEnds[batch_id];
+        const IdxT rowStart = rowStarts ? rowStarts[batch_id] : 0;
+        const IdxT rowEnd   = rowEnds ? rowEnds[batch_id] : len;
+        row_len             = rowEnd - rowStart;
     }
-
-    const IdxT row_len = rowEnd - rowStart;
+    else
+    {
+        row_len = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+    }
 
     auto counter = counters + batch_id;
     IdxT current_k;
@@ -1383,16 +1384,11 @@ __global__ void radix_topk_one_block_kernel(T const* in,
 
     const int64_t batch_id = blockIdx.x;
 
-    IdxT rowStart    = 0;
-    IdxT rowEnd      = len;
-
-    if (rowStarts && rowEnds)
-    {
-        rowStart = rowStarts[batch_id];
-        rowEnd   = rowEnds[batch_id];
-    }
-
-    const IdxT row_len = rowEnd - rowStart;
+    const IdxT rowStart = phase == Phase::Prefill ? rowStarts ? rowStarts[batch_id] : 0 : 0;
+    const IdxT rowEnd   = phase == Phase::Prefill
+                              ? rowEnds ? rowEnds[batch_id] : len
+                              : rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+    const IdxT row_len  = rowEnd - rowStart;
 
     if(threadIdx.x == 0)
     {
@@ -1831,33 +1827,33 @@ void standalone_stable_radix_11bits(void* buf,
 }
 
 // Explicit template instantiation for standalone_stable_radix_11bits
-template void standalone_stable_radix_11bits<float, int, true, true>(
-    void* buf,
-    size_t& buf_size,
-    float const* in,
-    int batch_size,
-    int64_t len,
-    int* rowStarts,
-    int* rowEnds,
-    int k,
-    float* out,
-    int* out_idx,
-    bool greater,
-    hipStream_t stream);
+template void standalone_stable_radix_11bits<float, int, true, true>(void* buf,
+                                                                     size_t& buf_size,
+                                                                     float const* in,
+                                                                     int batch_size,
+                                                                     int64_t len,
+                                                                     int* rowStarts,
+                                                                     int* rowEnds,
+                                                                     int k,
+                                                                     float* out,
+                                                                     int* out_idx,
+                                                                     bool greater,
+                                                                     hipStream_t stream,
+                                                                     int next_n);
 
-template void standalone_stable_radix_11bits<float, int, false, true>(
-    void* buf,
-    size_t& buf_size,
-    float const* in,
-    int batch_size,
-    int64_t len,
-    int* rowStarts,
-    int* rowEnds,
-    int k,
-    float* out,
-    int* out_idx,
-    bool greater,
-    hipStream_t stream);
+template void standalone_stable_radix_11bits<float, int, false, true>(void* buf,
+                                                                      size_t& buf_size,
+                                                                      float const* in,
+                                                                      int batch_size,
+                                                                      int64_t len,
+                                                                      int* rowStarts,
+                                                                      int* rowEnds,
+                                                                      int k,
+                                                                      float* out,
+                                                                      int* out_idx,
+                                                                      bool greater,
+                                                                      hipStream_t stream,
+                                                                      int next_n);
 
 // AIR TopK end
 
