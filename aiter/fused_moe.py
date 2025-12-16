@@ -223,7 +223,7 @@ def fused_moe_(
         if activation == ActivationType.Swiglu:
             if M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
-            elif  M >= bf16_fp8_bound:
+            elif M >= bf16_fp8_bound:
                 q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
@@ -245,7 +245,6 @@ def fused_moe_(
         intermediate_pad,
         bias1,
         bias2,
-        get_padded_M(M),  # only used in 2stage
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -549,7 +548,7 @@ def nextPow2(n):
 def get_padded_M(M):
     padded_m = M
     if M >= 1 and M <= 16:
-        padded_m = 16
+        return padded_m
     elif M < 1024:
         padded_m = nextPow2(padded_m)
     elif M < 2048:
@@ -588,7 +587,6 @@ def get_2stage_cfgs(
     intermediate_pad,
     bias1,
     bias2,
-    token_real,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -667,7 +665,7 @@ def get_2stage_cfgs(
             dtypes.fp8,
             QuantType.per_1x128,
         )
-        if problem_type == bypass_type and (token_real * topk) <= 128:  # bypass tuned
+        if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
             aiter.logger.info("bypass tuned results for fp8 blockscale")
             return False
         return True
@@ -718,7 +716,7 @@ def get_2stage_cfgs(
             ksplit
             if (run_1stage)
             else (
-                get_ksplit(token_real, topk, expert, inter_dim, model_dim)
+                get_ksplit(token, topk, expert, inter_dim, model_dim)
                 if q_type == QuantType.per_1x128
                 else ksplit
             )
@@ -887,7 +885,6 @@ def fused_moe_2stages(
         intermediate_pad,
         bias1,
         bias2,
-        token_num,
     )
     if (
         quant_type == QuantType.per_1x32
