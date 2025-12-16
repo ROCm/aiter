@@ -101,6 +101,10 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
     tl.assume(stride_ascale_k > 0)
     tl.assume(stride_bscale_k > 0)
     tl.assume(stride_bscale_n > 0)
+    tl.assume(stride_cam > 0)
+    tl.assume(stride_can > 0)
+    tl.assume(stride_cbm > 0)
+    tl.assume(stride_cbn > 0)
 
     GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -114,7 +118,8 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        # TODO: fix remap
+        # remap_xcd(pid, GRID_MN)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -132,7 +137,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
         # Create pointers for first block of A and B input matrices
         # The BLOCK sizes are of the elements and in fp4 we pack 2 per uint8 container.
         offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = pid_k * (SPLITK_BLOCK_SIZE) + offs_k
+        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         a_ptrs = a_ptr + (
@@ -285,6 +290,9 @@ def _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel(
 
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
