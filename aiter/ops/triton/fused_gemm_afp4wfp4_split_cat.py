@@ -8,8 +8,8 @@ from aiter.ops.triton._triton_kernels.fused_gemm_afp4wfp4_split_cat import (
     _fused_gemm_afp4wfp4_split_cat,
     _fused_gemm_afp4wfp4_preshuffle_split_cat,
     _fused_gemm_afp4wfp4_split_cat_reduce,
-    _get_config,
 )
+from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import _get_config
 from aiter.ops.triton.gemm_afp4wfp4 import get_splitk
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -250,7 +250,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     assert N == D * (S1 + S2), "N is not D * (S1 + S2)"
 
     if config is None:
-        config = _get_config(M, N, K)
+        config = _get_config(M, N, K, True)
 
     c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
     c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)

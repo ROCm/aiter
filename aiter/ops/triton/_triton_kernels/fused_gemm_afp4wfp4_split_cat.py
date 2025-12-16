@@ -26,7 +26,7 @@ _fused_gemm_afp4wfp4_split_cat_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "EVEN_K": lambda args: args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0,
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
@@ -286,7 +286,7 @@ _fused_gemm_afp4wfp4_preshuffle_split_cat_repr = make_kernel_repr(
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "EVEN_K": lambda args: args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0,
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
@@ -697,13 +697,3 @@ def _fused_gemm_afp4wfp4_split_cat_reduce(
         + stride_c1_s * (offs_s[None, :] + S1)
     )
     tl.store(c1_ptrs, y, mask=y_mask)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-) -> dict:
-
-    # Note: Config files use K=2*K in their naming
-    return get_gemm_config("GEMM-AFP4WFP4", M, N, 2 * K)
