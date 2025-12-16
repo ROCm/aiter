@@ -629,17 +629,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         warps_per_cta=[1, 4, 1],
         order=[2, 1, 0],
     )
-    # blocked_key_layout_f16: gl.constexpr = gl.BlockedLayout(
-    #     size_per_thread=[1, 1, 8],
-    #     threads_per_warp=[4, 16, 1],
-    #     warps_per_cta=[1, 4, 1],
-    #     order=[2, 1, 0],
-    # )
-    # blocked_key_layout: gl.constexpr = (
-    #     blocked_key_layout_fp8
-    #     if COMPUTE_TYPE == gl.float8e4b8
-    #     else blocked_key_layout_f16
-    # )
 
     # QK matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
