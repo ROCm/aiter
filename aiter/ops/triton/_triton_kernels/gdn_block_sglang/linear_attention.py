@@ -21,6 +21,7 @@ from ..gdr_sglang import (
     fused_sigmoid_gating_delta_rule_update,
     fused_gdn_gating,
 )
+from .causal_conv1d_triton import causal_conv1d_fn, causal_conv1d_update
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -47,6 +48,9 @@ class Qwen3GatedDeltaNet(nn.Module):
         rms_norm_eps (float): RMS normalization epsilon
         dtype (torch.dtype): Data type for computations
         device (torch.device): Device for computation
+        use_triton_conv1d (bool): Use Triton implementation for conv1d (default: True)
+            True: Use optimized Triton kernels (causal_conv1d_fn/causal_conv1d_update)
+            False: Use standard PyTorch Conv1d
         
     Example:
         >>> import torch
@@ -79,6 +83,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         rms_norm_eps: float = 1e-6,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device = None,
+        use_triton_conv1d: bool = True,
     ):
         super().__init__()
         
@@ -92,6 +97,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.value_dim = head_v_dim * num_v_heads
         self.conv_kernel_size = conv_kernel_size
         self.rms_norm_eps = rms_norm_eps
+        self.use_triton_conv1d = use_triton_conv1d
         
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -110,16 +116,31 @@ class Qwen3GatedDeltaNet(nn.Module):
         
         # 2. 1D Convolution for temporal sequence processing
         conv_dim = self.key_dim * 2 + self.value_dim
-        self.conv1d = nn.Conv1d(
-            in_channels=conv_dim,
-            out_channels=conv_dim,
-            kernel_size=conv_kernel_size,
-            groups=conv_dim,  # Depthwise convolution
-            bias=False,
-            padding=conv_kernel_size - 1,
-            dtype=dtype,
-            device=device,
-        )
+        self.conv_dim = conv_dim
+        
+        if use_triton_conv1d:
+            # Use Triton implementation: only need weight and bias parameters
+            self.conv1d_weight = nn.Parameter(
+                torch.randn(conv_dim, conv_kernel_size, dtype=dtype, device=device)
+            )
+            self.conv1d_bias = nn.Parameter(
+                torch.zeros(conv_dim, dtype=dtype, device=device)
+            )
+            self.conv1d = None  # No nn.Conv1d module
+        else:
+            # Use standard PyTorch Conv1d
+            self.conv1d = nn.Conv1d(
+                in_channels=conv_dim,
+                out_channels=conv_dim,
+                kernel_size=conv_kernel_size,
+                groups=conv_dim,  # Depthwise convolution
+                bias=False,
+                padding=conv_kernel_size - 1,
+                dtype=dtype,
+                device=device,
+            )
+            self.conv1d_weight = None
+            self.conv1d_bias = None
         
         # 3. Learnable gating parameters
         # A_log: log-space decay parameter (controls forgetting)
@@ -214,13 +235,23 @@ class Qwen3GatedDeltaNet(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         conv_state: Optional[torch.Tensor] = None,
+        query_start_loc: Optional[torch.Tensor] = None,
+        cache_indices: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Apply 1D convolution to Q, K, V.
         
+        When use_triton_conv1d=True:
+        - seq_len == 1: Uses causal_conv1d_update (optimized for decode)
+        - seq_len > 1: Uses causal_conv1d_fn (optimized for prefill)
+        
         Args:
             query, key, value: [batch, seq_len, num_heads, head_dim]
-            conv_state: Optional cached state for inference
+            conv_state: Optional cached state for inference [batch or cache_size, conv_dim, kernel_size-1]
+            query_start_loc: Optional cumulative seq lengths for Triton [batch+1]
+            cache_indices: Optional cache indices for Triton [batch]
+            has_initial_state: Optional flags for Triton [batch]
             
         Returns:
             Convolved query, key, value and updated conv_state
@@ -235,18 +266,81 @@ class Qwen3GatedDeltaNet(nn.Module):
         # Concatenate: [B, T, key_dim*2 + value_dim]
         mixed = torch.cat([query_flat, key_flat, value_flat], dim=-1)
         
-        # Transpose for Conv1d: [B, C, T]
-        mixed = mixed.transpose(1, 2)
-        
-        # Apply convolution
-        mixed = self.conv1d(mixed)
-        
-        # Remove extra padding
-        if self.conv_kernel_size > 1:
-            mixed = mixed[:, :, :seq_len]
-        
-        # Transpose back: [B, T, C]
-        mixed = mixed.transpose(1, 2)
+        if self.use_triton_conv1d:
+            # Use Triton implementation
+            # Initialize conv_state if needed
+            if conv_state is None:
+                conv_state = torch.zeros(
+                    batch_size, self.conv_dim, self.conv_kernel_size - 1,
+                    dtype=mixed.dtype, device=mixed.device
+                )
+            
+            if seq_len == 1:
+                # Use causal_conv1d_update for single-step decode (optimized)
+                # Input shape: [B, C, T=1]
+                mixed_update = mixed.transpose(1, 2)  # [B, T, C] → [B, C, T]
+                
+                # Call Triton causal_conv1d_update (modifies mixed_update in-place)
+                causal_conv1d_update(
+                    x=mixed_update,  # [B, C, T=1]
+                    conv_state=conv_state,  # [B, C, kernel_size-1]
+                    weight=self.conv1d_weight,  # [C, kernel_size]
+                    bias=self.conv1d_bias,  # [C]
+                    activation=None,  # No activation in conv layer
+                    cache_seqlens=None,  # Not using circular buffer
+                    conv_state_indices=cache_indices,  # For continuous batching
+                    pad_slot_id=-1,  # Default pad slot ID
+                )
+                
+                # Convert back: [B, C, T=1] → [B, T=1, C]
+                mixed = mixed_update.transpose(1, 2)
+                
+            else:
+                # Use causal_conv1d_fn for multi-step prefill
+                # Triton expects [dim, cu_seq_len] format
+                # Convert [B, T, C] → [C, B*T]
+                mixed_triton = mixed.reshape(-1, self.conv_dim).transpose(0, 1).contiguous()  # [C, B*T]
+                
+                # Create query_start_loc if not provided: [0, T, 2*T, ..., B*T]
+                if query_start_loc is None:
+                    query_start_loc = torch.arange(
+                        0, (batch_size + 1) * seq_len, seq_len,
+                        dtype=torch.int32, device=query.device
+                    )
+                
+                # Seq lengths for each batch
+                seq_lens_cpu = [seq_len] * batch_size
+                
+                # Call Triton causal_conv1d_fn
+                mixed_triton = causal_conv1d_fn(
+                    x=mixed_triton,
+                    weight=self.conv1d_weight,
+                    bias=self.conv1d_bias,
+                    conv_states=conv_state,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=seq_lens_cpu,
+                    cache_indices=cache_indices,
+                    has_initial_state=has_initial_state,
+                    activation=None,  # No activation in conv layer
+                )
+                
+                # Convert back: [C, B*T] → [B, T, C]
+                mixed = mixed_triton.transpose(0, 1).reshape(batch_size, seq_len, self.conv_dim)
+            
+        else:
+            # Use standard PyTorch Conv1d
+            # Transpose for Conv1d: [B, C, T]
+            mixed = mixed.transpose(1, 2)
+            
+            # Apply convolution
+            mixed = self.conv1d(mixed)
+            
+            # Remove extra padding
+            if self.conv_kernel_size > 1:
+                mixed = mixed[:, :, :seq_len]
+            
+            # Transpose back: [B, T, C]
+            mixed = mixed.transpose(1, 2)
         
         # Split back
         query_flat, key_flat, value_flat = torch.split(
@@ -260,7 +354,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         key = key_flat.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value_flat.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         
-        return query, key, value, None  # No conv_state for now
+        return query, key, value, conv_state
     
     def forward(
         self,
@@ -296,7 +390,12 @@ class Qwen3GatedDeltaNet(nn.Module):
         query, key, value, z, a, b = self._project_inputs(hidden_states)
         
         # 2. Apply convolution
-        query, key, value, _ = self._apply_conv1d(query, key, value)
+        # For Triton implementation, we can pass cu_seqlens if available
+        query, key, value, _ = self._apply_conv1d(
+            query, key, value,
+            conv_state=None,  # TODO: Add conv_state management for decode
+            query_start_loc=cu_seqlens,  # Pass cu_seqlens as query_start_loc
+        )
         
         # 3. Compute gating parameters
         # g: forget gate (in log space)
