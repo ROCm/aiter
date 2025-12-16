@@ -693,19 +693,21 @@ def get_2stage_cfgs(
                 cktile_moe_stage1,
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
                 bias1=bias1,
             ),
             functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
                 bias2=bias2,
             ),
             16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
             False,
         )
-    if (
+    elif (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
@@ -1375,6 +1377,7 @@ def cktile_moe_stage2(
     w2_scale,
     a2_scale,
     block_m,
+    activation=ActivationType.Swiglu,
     sorted_weights=None,
     zeros_out=False,
     n_pad_zeros=0,
@@ -1407,6 +1410,7 @@ def cktile_moe_stage2(
         a2_scale,
         w2_scale,
         bias2,
+        activation,
         block_m,
     )
     return out

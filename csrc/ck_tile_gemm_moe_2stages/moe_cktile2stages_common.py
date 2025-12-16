@@ -76,6 +76,20 @@ class kernelInstance:
             if element != ""
         )
 
+    @property
+    def dispatch_suffix(self) -> str:
+        return ("_").join(
+            element
+            for element in [
+                f"moe_cktile2stages",
+                self.QuantType,
+                "MulRoutedWeight" if self.MulRoutedWeight else "",
+                "Bias" if self.HasBias else "NoBias",
+                self.ActOP,
+            ]
+            if element != ""
+        )
+
 
 # fmt: off
 # gemm1 out:bf16/fp16 AB:fp8/i8
@@ -190,62 +204,68 @@ a8w8_gfx950_heuristic_dispatch = """#pragma once
 #include "moe_cktile2stages.h"
 
 template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+struct moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, {(activation)}, {(has_bias)}>
 {{
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 32)
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 32)
+        {{
+            return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(1, 2)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        //else if (block_m == 128)
+        //{{
+        //    return {(1, 4)}<ADataType, BDataType, AccDataType, CDataType>;
+        //}}
+        //else if (block_m == 256)
+        //{{
+        //    return {(1, 6)}<ADataType, BDataType, AccDataType, CDataType>;
+        //}}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
+                block_m);
+        }}
     }}
-    else if (block_m == 64)
-    {{
-        return {(1, 2)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    //else if (block_m == 128)
-    //{{
-    //    return {(1, 4)}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
-    //else if (block_m == 256)
-    //{{
-    //    return {(1, 6)}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
-            block_m);
-    }}
-}}
+}};
 
 template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+struct moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, {(activation)}, {(has_bias)}>
 {{
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 32)
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 32)
+        {{
+            return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        //else if (block_m == 128)
+        //{{
+        //    return {(2, 2)}<ADataType, BDataType, AccDataType, CDataType>;
+        //}}
+        //else if (block_m == 256)
+        //{{
+        //    return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        //}}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe_gemm1 heuristic dispatch: ",
+                block_m);
+        }}
     }}
-    else if (block_m == 64)
-    {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    //else if (block_m == 128)
-    //{{
-    //    return {(2, 2)}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
-    //else if (block_m == 256)
-    //{{
-    //    return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_gemm1 heuristic dispatch: ",
-            block_m);
-    }}
-}}
+}};
 """
 
 a16w4_gfx950_heuristic_dispatch = """#pragma once
@@ -254,54 +274,60 @@ a16w4_gfx950_heuristic_dispatch = """#pragma once
 #include "moe_cktile2stages.h"
 
 template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+struct moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, {(activation)}, {(has_bias)}>
 {{
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 16)
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 16)
+        {{
+            return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
+                block_m);
+        }}
     }}
-    else if (block_m == 32)
-    {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
-            block_m);
-    }}
-}}
+}};
 
 template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+struct moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, {(activation)}, {(has_bias)}>
 {{
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 16)
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 16)
+        {{
+            return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
+                block_m);
+        }}
     }}
-    else if (block_m == 32)
-    {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
-            block_m);
-    }}
-}}
+}};
 """
 
 a16w4_heuristic_dispatch = """#pragma once
@@ -310,54 +336,60 @@ a16w4_heuristic_dispatch = """#pragma once
 #include "moe_cktile2stages.h"
 
 template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+struct moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, {(activation)}, {(has_bias)}>
 {{
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 16)
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 16)
+        {{
+            return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
+                block_m);
+        }}
     }}
-    else if (block_m == 32)
-    {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
-            block_m);
-    }}
-}}
+}};
 
 template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+struct moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, {(activation)}, {(has_bias)}>
 {{
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 16)
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 16)
+        {{
+            return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
+                block_m);
+        }}
     }}
-    else if (block_m == 32)
-    {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
-            block_m);
-    }}
-}}
+}};
 """
 
 heuristic_dispatch_dict = {

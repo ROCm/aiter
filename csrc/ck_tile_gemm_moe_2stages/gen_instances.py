@@ -46,7 +46,7 @@ class cktile_moe_2stage_gemm_codegen:
         self.acc_dtype = acc_dtype.lower()
         self.c_dtype = c_dtype.lower()
         self.quant_type = quant_type
-        self.activation = activation
+        self.activation = act_dict[activation]
         self.mul_routed_weight_stage = mul_routed_weight_stage
 
     def get_suffix(self, stage: int) -> str:
@@ -125,9 +125,7 @@ torch::Tensor
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
             biasptr = "static_cast<float*>(exp_bias.has_value() ? exp_bias.value().data_ptr() : nullptr)"
 
-        if k.HasBias:
-            biasGran = "1"
-        else:
+        if act_dict[k.ActOP] != 2:
             biasGran = "-1"
 
         INSTANCE_CONTENT = f"""auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranA}>{{{xptr}}};
@@ -255,13 +253,18 @@ template torch::Tensor
 
     """genarete heuristic dispatch"""
 
-    def gen_heuristic_dispatch(self, tag, kernels_dict):
+    def gen_heuristic_dispatch(self, tag, dict):
         HEURISTIC_template = get_heuristic_dispatch_template(tag)
         # print(HEURISTIC_template)
 
         def validate_and_format(template: str, mapping: dict) -> str:
             # check all format element in dict.
-            str_mapping = {str(key): value.name for key, value in mapping.items()}
+            str_mapping = {
+                '(activation)': self.activation,
+                '(has_bias)': 'true' if self.activation == 2 else 'false',
+            }
+            format_args = {str(key): value.name for key, value in mapping.items()}
+            str_mapping.update(format_args)
             cleaned_template = template.replace("{{", "").replace("}}", "")
             placeholders = re.findall(r"\{([^{}]*)\}", cleaned_template)
             missing = [p for p in placeholders if p not in str_mapping]
@@ -275,21 +278,16 @@ template torch::Tensor
             # return result
             return template.format(**{k: v for k, v in str_mapping.items()})
 
+        _, k = next(iter(dict.items()))
         # create heuristic heirarchy
         with open(
-            os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"),
+            os.path.join(self.working_path, f"{k.dispatch_suffix}_heuristic_dispatch.h"),
             "w",
         ) as f:
-            f.write(validate_and_format(HEURISTIC_template, kernels_dict))
-            # arch = get_gfx()
-            # inst_k = "32" if self.quant_type == "1x32" else ("128" if arch == "gfx950" else "64")
-            # f.write(
-            #     HEURISTIC_template.format(
-            #         inst_k=inst_k,
-            #         suffix1 = self.get_suffix(1),
-            #         suffix2 = self.get_suffix(2)
-            #     )
-            # )
+            f.write(validate_and_format(HEURISTIC_template, dict))
+
+        return f"{k.dispatch_suffix}_heuristic_dispatch.h"
+
 
     """generate lookup.h linking MNK/datatype to specific instance"""
 
@@ -370,14 +368,16 @@ torch::Tensor
 
 // endif // USE_ROCM
 """
-
+        _, k0 = next(iter(kernels_dict.items()))
         with open(
-            os.path.join(self.working_path, "moe_cktile2stages_manifest.h"), "w"
+            os.path.join(self.working_path, f"{k0.dispatch_suffix}_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
             for mnk, k in kernels_dict.items():
                 f.write(MAINFEST_template.format(kernel_name=k.name))
             f.write(MAINFEST_end)
+
+        return f"{k0.dispatch_suffix}_manifest.h"
 
     """generate all instances and headers"""
 
@@ -387,8 +387,7 @@ torch::Tensor
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)
-        self.gen_manifest_head(kernels_dict)
-        self.gen_heuristic_dispatch(tag, kernels_dict)
+        return self.gen_heuristic_dispatch(tag, kernels_dict), self.gen_manifest_head(kernels_dict)
 
 
 # def get_tune_dict(tune_dict_csv):
@@ -407,6 +406,33 @@ torch::Tensor
 #             kid = tune_df.loc[i, "kernelId"]
 #             tune_dict[(M, N, K)] = kernels_list[kid]
 #     return tune_dict
+
+def generate_common_header(working_path, dispatch_files, manifest_files):
+
+    common_header = """// SPDX-License-Identifier: MIT
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+
+"""
+    dispatch_header = common_header
+    manifest_header = common_header
+
+    for file_name in sorted(dispatch_files):
+        include_path = f'"{file_name}"'
+        dispatch_header += f"#include {include_path}\n"
+
+    dispatch_common_header_path = os.path.join(working_path, "moe_cktile2stages_heuristic_dispatch_common.h")
+    with open(dispatch_common_header_path, "w") as f:
+        f.write(dispatch_header)
+
+    for file_name in sorted(manifest_files):
+        include_path = f'"{file_name}"'
+        manifest_header += f"#include {include_path}\n"
+
+    manifest_common_header_path = os.path.join(working_path, "moe_cktile2stages_manifest_common.h")
+    with open(manifest_common_header_path, "w") as f:
+        f.write(manifest_header)
+
 
 
 if __name__ == "__main__":
@@ -566,6 +592,9 @@ if __name__ == "__main__":
         shutil.rmtree(instances_path)
     os.mkdir(instances_path)
 
+    gen_dispatch_files = []
+    gen_manifest_files = []
+
     for a_type, c_dtype, act_type in itertools.product(
         a_types, c_dtypes, act_types
     ):
@@ -595,5 +624,9 @@ if __name__ == "__main__":
             **{(1, key): value for key, value in gemm1_kernel_list.items()},
             **{(2, key): value for key, value in gemm2_kernel_list.items()},
         }
+        dispatch_file, manifest_file = codegen.gen_instances(tag, kernel_dict_merge)
 
-        codegen.gen_instances(tag, kernel_dict_merge)
+        gen_dispatch_files.append(dispatch_file)
+        gen_manifest_files.append(manifest_file)
+
+    generate_common_header(args.working_path, gen_dispatch_files, gen_manifest_files)
