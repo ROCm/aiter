@@ -218,7 +218,13 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
+    bf16_fp8_bound = 512
+    if quant_type == QuantType.per_1x32 and M < bf16_fp8_bound:
+        q_dtype_a = dtypes.bf16
+    elif quant_type == QuantType.per_1x32 and M >= bf16_fp8_bound:
+        q_dtype_a = dtypes.fp8
+    elif quant_type == QuantType.per_1x32:
+        q_dtype_a = dtypes.fp4x2
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -729,6 +735,13 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
+
+    def get_block_m() -> int:
+        if q_dtype_a == dtypes.fp8:
+            return 32
+        else:
+            return 16 if token < 2048 else 32 if token < 16384 else 64
+
     if run_1stage:
         return MOEMetadata(
             functools.partial(
@@ -760,7 +773,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 bias2=bias2,
             ),
-            16 if token < 2048 else 32 if token < 16384 else 64,
+            get_block_m(),
             ksplit,
             False,
         )
@@ -877,11 +890,23 @@ def fused_moe_2stages(
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
         and activation == ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
+    elif (
+        quant_type == aiter.QuantType.per_1x32
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_a == dtypes.fp8
+        and w1.dtype == dtypes.fp4x2
+        and activation == aiter.ActivationType.Swiglu
+    ):
+        a1 = hidden_states.to(dtypes.fp8)
+        M = sorted_ids.shape[0]
+        N = a1.shape[-1]
+        a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
     elif quant_type == QuantType.per_1x32:
         if token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -945,17 +970,29 @@ def fused_moe_2stages(
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
-        w1_scale=w1_scale,
+        w1_scale=(
+            w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
+        ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
 
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
         and activation == ActivationType.Swiglu
     ):
         a2_scale = None
+    elif (
+        quant_type == aiter.QuantType.per_1x32
+        and dtype in [dtypes.bf16]
+        and q_dtype_a == dtypes.fp8
+        and w1.dtype == dtypes.fp4x2
+        and activation == aiter.ActivationType.Swiglu
+    ):
+        a2 = a2.to(dtypes.fp8)
+        a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         if token_num <= token_num_quant_moe_sort_switch:
@@ -1011,7 +1048,9 @@ def fused_moe_2stages(
         num_valid_ids,
         moe_out,
         topk,
-        w2_scale=w2_scale,
+        w2_scale=(
+            w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
+        ),
         a2_scale=a2_scale,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
@@ -1431,7 +1470,7 @@ def cktile_moe_stage1(
     if w1.dtype is torch.uint32:
         D = D * 8
     out = torch.empty(
-        (token_num, topk, D), dtype=hidden_states.dtype, device=hidden_states.device
+        (token_num, topk, D), dtype=dtypes.bf16, device=hidden_states.device
     )
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(

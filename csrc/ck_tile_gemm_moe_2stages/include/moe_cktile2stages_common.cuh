@@ -115,9 +115,12 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                                FlatmmConfig::NumWaveGroups,
                                                                true>; // Preshuffle_
 
-    constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t>;
+    constexpr bool AQUANT_Pipeline = std::is_same_v<ADataType, ck_tile::bf8_t> ||
+                                     std::is_same_v<ADataType, ck_tile::fp8_t> ||
+                                     std::is_same_v<ADataType, ck_tile::pk_fp4_t>;
+    constexpr bool BMXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t>;
 
-    if constexpr(!MXFP4_Pipeline && moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)
+    if constexpr(!BMXFP4_Pipeline && moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)
     {
         static_assert(
             FlatmmConfig::N_Tile % (FlatmmConfig::N_Warp * FlatmmConfig::N_Warp_Tile * 2) == 0,
@@ -128,8 +131,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     static_assert(sizeof(ComputeDataType) >= sizeof(BDataType),
                   "mixed_prec_flatmm requires ADataType is a wider type than BDataType");
 
-    using GemmPipelineProblem = ck_tile::GemmPipelineProblem<ComputeDataType,
-                                                             ComputeDataType,
+    using GemmPipelineProblem = ck_tile::GemmPipelineProblem<ADataType,
+                                                             BDataType,
                                                              AccDataType,
                                                              CodegenFlatmmShape,
                                                              Traits>;
@@ -161,28 +164,38 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         constexpr auto b_mem_nt_type_v  = b_mem_nt_type_.value;
 
         using CodegenPipelineProblem =
-            std::conditional_t<MXFP4_Pipeline,
-                               ck_tile::F16xMXF4FlatmmPipelineProblem<ADataType,
-                                                                      BDataType,
-                                                                      AccDataType,
-                                                                      CodegenFlatmmShape,
-                                                                      CodegenGemmTraits,
-                                                                      scheduler,
-                                                                      has_hot_loop_v,
-                                                                      tail_number_v,
-                                                                      b_mem_nt_type_v>,
-                               ck_tile::FlatmmPipelineProblem<ADataType,
-                                                              BDataType,
-                                                              AccDataType,
-                                                              CodegenFlatmmShape,
-                                                              CodegenGemmTraits,
-                                                              scheduler,
-                                                              has_hot_loop_v,
-                                                              tail_number_v,
-                                                              b_mem_nt_type_v>>;
+            std::conditional_t<BMXFP4_Pipeline,
+                std::conditional_t<AQUANT_Pipeline,
+                    ck_tile::F8xMXF4FlatmmPipelineProblem<ADataType,
+                                                          BDataType,
+                                                          AccDataType,
+                                                          CodegenFlatmmShape,
+                                                          CodegenGemmTraits,
+                                                          scheduler,
+                                                          has_hot_loop_v,
+                                                          tail_number_v,
+							  b_mem_nt_type_v>,
+                    ck_tile::F16xMXF4FlatmmPipelineProblem<ADataType,
+                                                           BDataType,
+                                                           AccDataType,
+                                                           CodegenFlatmmShape,
+                                                           CodegenGemmTraits,
+                                                           scheduler,
+                                                           has_hot_loop_v,
+                                                           tail_number_v,
+							   b_mem_nt_type_v>>,
+                ck_tile::FlatmmPipelineProblem<ADataType,
+                                               BDataType,
+                                               AccDataType,
+                                               CodegenFlatmmShape,
+                                               CodegenGemmTraits,
+                                               scheduler,
+                                               has_hot_loop_v,
+                                               tail_number_v,
+					       b_mem_nt_type_v>>;
 
         constexpr int BlockedXDLN_PerWarp =
-            (MXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up))
+            (BMXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up))
                 ? 2
                 : 1; // determined by scale shuffle pattern
 
@@ -211,12 +224,15 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                              BlockedXDLN_PerWarp>>;
 
         using CodegenFlatmmPipeline = std::conditional_t<
-            MXFP4_Pipeline,
-            ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>,
+            BMXFP4_Pipeline,
+            std::conditional_t<
+                AQUANT_Pipeline,
+                ck_tile::F8xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>,
+                ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
         using FusedAct =
-            std::conditional_t<MXFP4_Pipeline, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
+            std::conditional_t<BMXFP4_Pipeline, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
 
         using Kernel = ck_tile::MoeFlatmmKernel<TilePartitioner,
                                                 CodegenFlatmmPipeline,
