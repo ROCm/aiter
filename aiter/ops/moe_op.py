@@ -439,9 +439,10 @@ dtype2str_dict = {
 }
 
 str2dtype_dict = {
-    "f16" : dtypes.fp16,
-    "b16" : dtypes.bf16,
+    "f16": dtypes.fp16,
+    "b16": dtypes.bf16,
 }
+
 
 @functools.lru_cache(maxsize=1024)
 def get_moe_stage_module(
@@ -485,7 +486,6 @@ def get_moe_stage_module(
             quant_type,
             f"mulWeightStage{mul_routed_weight_stage}",
             "splitk" if is_splitk else "",
-
         ]
     )
     blob_gen_cmd = [

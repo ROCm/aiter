@@ -773,7 +773,9 @@ class ck_moe_2stage_gemm_codegen:
                         quanttype = "_mxfp4"
                 else:
                     quanttype = ""
-                gemm1_fp32 = self.splitk and (kernel.stage == 1) and (quanttype == "_blockscale")
+                gemm1_fp32 = (
+                    self.splitk and (kernel.stage == 1) and (quanttype == "_blockscale")
+                )
                 if not os.path.exists(f_instance):
                     with open(f_instance, "a") as f_ins:
                         stage_instance = STG_INSTANCE_IMPL.format(
@@ -1009,7 +1011,7 @@ if __name__ == "__main__":
                 act,
                 routed_weight,
                 preshuffle_mode,
-                False, #splitk
+                False,  # splitk
             )
             codegen.generate_instance_and_lookUpTable()
 
@@ -1053,7 +1055,7 @@ if __name__ == "__main__":
                 act,
                 routed_weight,
                 preshuffle_mode,
-                False, #splitk
+                False,  # splitk
             )
             codegen.generate_instance_and_lookUpTable()
     else:
