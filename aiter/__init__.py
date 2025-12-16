@@ -75,4 +75,5 @@ from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
 from .ops.fused_mrope_rms import *
+from .ops.fused_qk_norm_rope_cache_quant import *
 from . import mla
