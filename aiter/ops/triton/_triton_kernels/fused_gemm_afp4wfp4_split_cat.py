@@ -1,18 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
-import functools
-import json
-import os
-import torch
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
-
+from ..utils.gemm_config_utils import get_gemm_config
 
 _fused_gemm_afp4wfp4_split_cat_repr = make_kernel_repr(
     "_fused_gemm_afp4wfp4_split_cat",
@@ -395,50 +388,11 @@ def _fused_gemm_afp4wfp4_split_cat_reduce(
     tl.store(c1_ptrs, y, mask=y_mask)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
 ) -> dict:
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
 
-    key = f"{N}_{K}"
-    if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_arch()
-        fpath = (
-            f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4-N={N}-K={2*K}.json"
-        )
-        if os.path.exists(fpath):
-            with open(fpath, "r") as file:
-                config = json.load(file)
-                _get_config._config_dict[key] = config
-        else:
-            key = "default"  # fall back to default config
-
-    if M < 32 and "small" in _get_config._config_dict[key]:
-        return _get_config._config_dict[key]["small"]
-    elif M <= 128:
-        BLK_M = triton.next_power_of_2(M)
-        if BLK_M == 32 and "medium_M32" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["medium_M32"]
-        elif BLK_M == 64 and "medium_M64" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["medium_M64"]
-        elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["medium_M128"]
-    elif M <= 256 and "large" in _get_config._config_dict[key]:
-        return _get_config._config_dict[key]["large"]
-    else:
-        BLK_M = triton.next_power_of_2(M)
-        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
-        elif "xlarge" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["xlarge"]
-
-    return _get_config._config_dict[key]["any"]
+    # Note: Config files use K=2*K in their naming
+    return get_gemm_config("GEMM-AFP4WFP4", M, N, 2 * K)

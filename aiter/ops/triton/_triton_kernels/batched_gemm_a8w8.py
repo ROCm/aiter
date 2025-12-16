@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
-import json
 import triton
 import triton.language as tl
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
-
+from ..utils.gemm_config_utils import get_gemm_config
 
 _batched_gemm_a8w8_repr = make_kernel_repr(
     "_batched_gemm_a8w8_kernel",
@@ -197,21 +193,10 @@ def _batched_gemm_a8w8_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A8W8.json"
-        print(f"fpath={fpath}")
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
 
-    if M + N >= 4096:
-        return _get_config._config_dict["large"]
-    else:
-        return _get_config._config_dict["small"]
+    return get_gemm_config("BATCHED_GEMM-A8W8", M, N, K)
