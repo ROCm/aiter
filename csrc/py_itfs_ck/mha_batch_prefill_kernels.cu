@@ -206,7 +206,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     else if(is_qkv_fp8)
     {
         if(!out_.has_value() || out_.value().dtype() == at::ScalarType::BFloat16)
-            dtype_str = "fp8bf16"; // only support bf16 out for fp8
+            dtype_str = "fp8bf16"; // BF16 output is required for FP8 input due to current kernel implementation constraints
         else
             TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
     }
