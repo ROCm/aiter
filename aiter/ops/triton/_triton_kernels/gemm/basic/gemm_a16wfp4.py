@@ -1,19 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton
 import triton.language as tl
-<<<<<<< HEAD
-from ..utils._triton.pid_preprocessing import pid_grid
-from ..utils._triton.kernel_repr import make_kernel_repr
-from .quant import _mxfp4_quant_op
-from ..utils.gemm_config_utils import get_gemm_config
-=======
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
->>>>>>> c760bc93f ([TRITON] Move triton files into respective folders)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
+import triton
 
 _gemm_a16wfp4_repr = make_kernel_repr(
     "_gemm_a16wfp4_kernel",
