@@ -1,4 +1,4 @@
-name: Triton Test
+name: Triton Tests
 
 on:
   push:
@@ -28,9 +28,68 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      attention: ${{ steps.filter.outputs.attention }}
+      gemm: ${{ steps.filter.outputs.gemm }}
+      moe: ${{ steps.filter.outputs.moe }}
+      normalization: ${{ steps.filter.outputs.normalization }}
+      quant: ${{ steps.filter.outputs.quant }}
+      rope: ${{ steps.filter.outputs.rope }}
+      fusions: ${{ steps.filter.outputs.fusions }}
+      misc: ${{ steps.filter.outputs.misc }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            attention:
+              - 'op_tests/triton_tests/attention/**'
+              - 'aiter/ops/triton/**/attention/**'
+              - '.github/workflows/triton-test.yaml'
+            gemm:
+              - 'op_tests/triton_tests/gemm/**'
+              - 'aiter/ops/triton/**/gemm/**'
+              - '.github/workflows/triton-test.yaml'
+            moe:
+              - 'op_tests/triton_tests/moe/**'
+              - 'aiter/ops/triton/**/moe/**'
+              - '.github/workflows/triton-test.yaml'
+            normalization:
+              - 'op_tests/triton_tests/normalization/**'
+              - 'aiter/ops/triton/**/normalization/**'
+              - '.github/workflows/triton-test.yaml'
+            quant:
+              - 'op_tests/triton_tests/quant/**'
+              - 'aiter/ops/triton/**/quant/**'
+              - '.github/workflows/triton-test.yaml'
+            rope:
+              - 'op_tests/triton_tests/rope/**'
+              - 'aiter/ops/triton/**/rope/**'
+              - '.github/workflows/triton-test.yaml'
+            fusions:
+              - 'op_tests/triton_tests/fusions/**'
+              - 'aiter/ops/triton/**/fusions/**'
+              - '.github/workflows/triton-test.yaml'
+            misc:
+              - 'op_tests/triton_tests/test_*.py'
+              - 'aiter/ops/triton/**'
+              - '.github/workflows/triton-test.yaml'
+
   triton:
     runs-on: aiter-mi300-1gpu
-    needs: [check-signal]
+    needs: [check-signal, detect-changes]
+    if: |
+      needs.detect-changes.outputs.attention == 'true' ||
+      needs.detect-changes.outputs.gemm == 'true' ||
+      needs.detect-changes.outputs.moe == 'true' ||
+      needs.detect-changes.outputs.normalization == 'true' ||
+      needs.detect-changes.outputs.quant == 'true' ||
+      needs.detect-changes.outputs.rope == 'true' ||
+      needs.detect-changes.outputs.fusions == 'true' ||
+      needs.detect-changes.outputs.misc == 'true'
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -38,18 +97,28 @@ jobs:
         include:
           - name: attention
             test_path: op_tests/triton_tests/attention
+            enabled: ${{ needs.detect-changes.outputs.attention }}
           - name: gemm
             test_path: op_tests/triton_tests/gemm
+            enabled: ${{ needs.detect-changes.outputs.gemm }}
           - name: moe
             test_path: op_tests/triton_tests/moe
+            enabled: ${{ needs.detect-changes.outputs.moe }}
           - name: normalization
             test_path: op_tests/triton_tests/normalization
+            enabled: ${{ needs.detect-changes.outputs.normalization }}
           - name: quant
             test_path: op_tests/triton_tests/quant
+            enabled: ${{ needs.detect-changes.outputs.quant }}
           - name: rope
             test_path: op_tests/triton_tests/rope
+            enabled: ${{ needs.detect-changes.outputs.rope }}
+          - name: fusions
+            test_path: op_tests/triton_tests/fusions
+            enabled: ${{ needs.detect-changes.outputs.fusions }}
           - name: misc
             test_path: op_tests/triton_tests/test_*.py
+            enabled: ${{ needs.detect-changes.outputs.misc }}
 
     name: triton-${{ matrix.name }}
 
@@ -59,15 +128,18 @@ jobs:
 
     steps:
       - name: Checkout code
+        if: matrix.enabled == 'true'
         uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Clean up Rocm processes
+        if: matrix.enabled == 'true'
         run: |
           ./.github/scripts/clean_up_rocm.sh
 
       - name: Run the container
+        if: matrix.enabled == 'true'
         run: |
           set -ex
           echo "Starting container: ${{ env.CONTAINER_NAME }}"
@@ -89,6 +161,7 @@ jobs:
           ${{ env.DOCKER_IMAGE }}
 
       - name: Install speedtest-cli and test network
+        if: matrix.enabled == 'true'
         run: |
           set -ex
           echo "Installing speedtest-cli and testing network..."
@@ -98,11 +171,13 @@ jobs:
           bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
 
       - name: Setup pip config
+        if: matrix.enabled == 'true'
         run: |
           docker exec -u root ${{ env.CONTAINER_NAME }} bash -c "pip config set global.default-timeout 60"
           docker exec -u root ${{ env.CONTAINER_NAME }} bash -c "pip config set global.retries 10"
 
       - name: Setup Aiter and Triton
+        if: matrix.enabled == 'true'
         run: |
           set -ex
           echo "Setting up Aiter and Triton..."
@@ -112,6 +187,7 @@ jobs:
           ./.github/scripts/build_aiter_triton.sh
 
       - name: Install Pytest
+        if: matrix.enabled == 'true'
         run: |
           set -ex
           echo "Installing Pytest..."
@@ -121,6 +197,7 @@ jobs:
           pip install pytest
 
       - name: Triton ${{ matrix.name }} Tests
+        if: matrix.enabled == 'true'
         run: |
           set -ex
           echo "Running Triton ${{ matrix.name }} Tests..."
@@ -129,17 +206,17 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && matrix.enabled == 'true'
         with:
           name: triton-${{ matrix.name }}-test-logs
           path: test-reports/triton-${{ matrix.name }}.xml
 
       - name: Cleanup container
-        if: always()
+        if: always() && matrix.enabled == 'true'
         run: |
           docker rm -f ${{ env.CONTAINER_NAME }} || true
 
       - name: Clean up Rocm processes
-        if: always()
+        if: always() && matrix.enabled == 'true'
         run: |
           ./.github/scripts/clean_up_rocm.sh
