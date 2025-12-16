@@ -4,9 +4,7 @@
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 
