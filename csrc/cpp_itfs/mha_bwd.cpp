@@ -1,6 +1,6 @@
+#include "mha_bwd.h"
 #include "aiter_hip_common.h"
 #include "asm_fmha_v3_bwd_configs.hpp"
-#include "mha_bwd.h"
 #include <memory>
 #include <string>
 
@@ -235,16 +235,18 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
+    std::string arch_id = get_gpu_arch();
+
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
-       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic))
+       (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic) ||
+       ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
         return -1;
     }
 
-    std::string arch_id = get_gpu_arch();
-    auto pre_cfgs       = &cfg_fmha_bwd_odo;
-    auto dqdkdv_cfgs    = &cfg_fmha_bwd_dqdkdv;
-    auto post_cfgs      = [&]() {
+    auto pre_cfgs    = &cfg_fmha_bwd_odo;
+    auto dqdkdv_cfgs = &cfg_fmha_bwd_dqdkdv;
+    auto post_cfgs   = [&]() {
         if(arch_id == "gfx950")
         {
             if(a.v3_atomic_fp32)
