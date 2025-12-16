@@ -219,12 +219,14 @@ def fused_moe_(
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     bf16_fp8_bound = 512
-    if quant_type == QuantType.per_1x32 and M < bf16_fp8_bound:
-        q_dtype_a = dtypes.bf16
-    elif quant_type == QuantType.per_1x32 and M >= bf16_fp8_bound:
-        q_dtype_a = dtypes.fp8
-    elif quant_type == QuantType.per_1x32:
-        q_dtype_a = dtypes.fp4x2
+    if quant_type == QuantType.per_1x32:
+        if activation == ActivationType.Swiglu:
+            if M < bf16_fp8_bound:
+                q_dtype_a = dtypes.bf16
+            elif  M >= bf16_fp8_bound:
+                q_dtype_a = dtypes.fp8
+        else:
+            q_dtype_a = dtypes.fp4x2
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
