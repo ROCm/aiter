@@ -76,7 +76,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
     HAVE_SECOND_INPUT: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
     FIRST_INPUT_OUT: tl.constexpr,
-    CONVERT_TO_INP1_TYPE: tl.constexpr,
+    RMSNORM_CONVERT_TO_INP1_TYPE: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
@@ -109,7 +109,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
             mask=mask1,
         )
 
-    if CONVERT_TO_INP1_TYPE:
+    if RMSNORM_CONVERT_TO_INP1_TYPE:
         norm1 = norm1.to(inp1_ptr.dtype.element_ty)
         norm1 = norm1.to(tl.float32)
     # apply quantization

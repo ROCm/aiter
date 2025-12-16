@@ -38,7 +38,7 @@ def triton_rmsnorm_fp8_quantization_fuse(x, w, x_scale, eps, rocm_fp8_dtype):
                                                                      dtype_quant=rocm_fp8_dtype, 
                                                                      res1=None,
                                                                      output_unquantized_inp1=True,
-                                                                     intermediate_convert_to_inp1_type=True)
+                                                                     rmsnorm_convert_to_inp1_type=True)
     return quant_out, rms_out
 
 
