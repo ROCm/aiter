@@ -452,6 +452,7 @@ def run_benchmark(custom, args):
                     2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
                 )
 
+        # Benchmark mode
         if varlen:
             if args.fp8:
 
