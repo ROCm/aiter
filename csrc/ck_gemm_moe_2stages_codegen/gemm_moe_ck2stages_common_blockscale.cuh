@@ -33,7 +33,9 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         void *&num_valid_ids,           // [1]
                         void *&out,                     // [max_num_tokens_padded, inter_dim]
                         std::optional<void *> w1_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void *> a1_scale  // [m, 1], token scale
+                        std::optional<void *> a1_scale, // [m, 1], token scale
+                        std::optional<int>    splitk     // splitk
+
 )
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -45,8 +47,14 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
 
     ck::index_t StrideA = K;
     ck::index_t StrideB = K;
-    ck::index_t StrideE = N;
-    ck::index_t KBatch = 1;
+    ck::index_t SplitK = splitk.has_value() ? splitk.value() : 1;
+
+    ck::index_t KBatch = SplitK > 1 ? K / (SplitK * KPerBlock)  : 1;
+    if (KBatch > 1){
+        TORCH_CHECK((KBatch * KPerBlock * SplitK == K),
+        "K(", K, ") must be a multiple of KPerBlock(", KPerBlock, ") * splitk(", splitk.value(), ").\n");
+    }
+    ck::index_t StrideE = N * (KBatch > 1 ? 2 : 1);
 
     using A0Layout = Row;
     using B0Layout = Col;
@@ -83,6 +91,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t Scale_Block_M = 1;
     static constexpr ck::index_t Scale_Block_N = 128;
     static constexpr ck::index_t Scale_Block_K = 128;
+    static constexpr bool IsSplitK = std::is_same_v<CDEElementOp, MulABScaleExpertWeightA8W8blkscaleSplitk>;
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmBlockScale
         // clang-format off
           <     Row,  Col,  DsLayout, ELayout,
@@ -96,7 +105,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                 S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                 S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                 MXDLPerWave,    NXDLPerWave,   S<1, K0_M_A, 1, K0_A>, S<2, 1, 1, 1>,
-                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, int32_t, A0DataType>;
+                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, IsSplitK, MulRoutedWeight, int32_t, A0DataType>;
 
     // clang-format on
 
@@ -157,7 +166,8 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
         void *&num_valid_ids,                                                                                                                                                                                                   \
         void *&out,                                                                                                                                                                                                             \
         std::optional<void *> w1_scale,                                                                                                                                                                                         \
-        std::optional<void *> a1_scale);
+        std::optional<void *> a1_scale,                                                                                                                                                                                         \
+        std::optional<int>   splitk);
 
 template <
     typename A0DataType,
@@ -187,7 +197,8 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         void *&num_valid_ids,           //[1]
                         void *&out,                     // [m, out_dim]
                         std::optional<void *> w2_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void *> a2_scale  // [max_num_tokens_padded, 1], token scale
+                        std::optional<void *> a2_scale, // [max_num_tokens_padded, 1], token scale
+                        std::optional<int>   splitk     // splitk
 )
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -252,7 +263,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
               S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
               S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
               MXDLPerWave,    NXDLPerWave,   S<1, K0_M, 1, K0_A>, S<2, 1, 1, 1>,
-              ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, false, false, MulRoutedWeight, int32_t, A0DataType>;
+              ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, false, false, false, MulRoutedWeight, int32_t, A0DataType>;
 
 
 
@@ -313,4 +324,5 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
         void *&num_valid_ids,                                                                                                                                        \
         void *&out,                                                                                                                                                  \
         std::optional<void *> w2_scale,                                                                                                                              \
-        std::optional<void *> a2_scale);
+        std::optional<void *> a2_scale,                                                                                                                              \
+        std::optional<int>   splitk);
