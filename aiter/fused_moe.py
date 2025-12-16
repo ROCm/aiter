@@ -17,9 +17,9 @@ from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, PY, bd_dir, get_asm_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 
 BLOCK_SIZE_M = 32
 
@@ -216,7 +216,6 @@ def fused_moe_(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     bf16_fp8_bound = 512
     if quant_type == QuantType.per_1x32 and M < bf16_fp8_bound:
@@ -680,13 +679,10 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
-    print(dtype)
-    print(q_type)
-    print(activation)
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
-            return 32 # if token < 4096 else 64
+            return 32
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
@@ -915,10 +911,11 @@ def fused_moe_2stages(
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
-        w1_scale=w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale,
+        w1_scale=(
+            w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
+        ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
-
 
     if (
         quant_type == QuantType.per_1x32
@@ -992,7 +989,9 @@ def fused_moe_2stages(
         num_valid_ids,
         moe_out,
         topk,
-        w2_scale=w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale,
+        w2_scale=(
+            w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
+        ),
         a2_scale=a2_scale,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,

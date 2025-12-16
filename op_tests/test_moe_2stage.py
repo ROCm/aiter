@@ -11,8 +11,6 @@ from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
-import os
-import numpy as np
 import logging
 
 from aiter.fused_moe import (
@@ -28,7 +26,6 @@ from aiter.ops.shuffle import (
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
 )
-from aiter import ActivationType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
@@ -250,8 +247,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
-        num_iters=50,
-        num_warmup=100,
+        num_iters=5,
+        num_warmup=2,
     )
     err = checkAllclose(
         out2_ref,
@@ -358,7 +355,7 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
-    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,"""
+    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
 )
 
 parser.add_argument(
@@ -535,4 +532,3 @@ for (
                 df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
-

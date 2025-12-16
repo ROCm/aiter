@@ -230,7 +230,6 @@ template torch::Tensor
                     f"{name}_a{a_type}_b{b_type}_acc{acc_type}_C{c_type}.cpp",
                 )
             ).write_text(intsance)
-            # import pdb; pdb.set_trace()
 
         if (k.QuantType == "1x32") and (a_type in ["bf16", "fp16", "fp8"]):
             fill_template(k.name, a_type, "pk_fp4", self.acc_dtype, self.c_dtype)
@@ -274,7 +273,9 @@ template torch::Tensor
 
         # create heuristic heirarchy
         with open(
-            os.path.join(self.dispatchers_path, f"moe_cktile2stages_heuristic_dispatch_{tag}.h"),
+            os.path.join(
+                self.dispatchers_path, f"moe_cktile2stages_heuristic_dispatch_{tag}.h"
+            ),
             "w",
         ) as f:
             f.write(validate_and_format(HEURISTIC_template, kernels_dict))
@@ -302,7 +303,6 @@ template torch::Tensor
 """
             HEURISTIC_dispatch_header += HEURISTIC_headers
 
-
         HEURISTIC_function = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
@@ -317,12 +317,14 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m);
 """
         # create heuristic heirarchy
         with open(
-            os.path.join(self.working_path, f"moe_cktile2stages_heuristic_dispatch.h"),
+            os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"),
             "w",
         ) as f:
             f.write(HEURISTIC_dispatch_header)
         with open(
-            os.path.join(self.dispatchers_path, f"moe_cktile2stages_heuristic_dispatch_common.h"),
+            os.path.join(
+                self.dispatchers_path, "moe_cktile2stages_heuristic_dispatch_common.h"
+            ),
             "w",
         ) as f:
             f.write(HEURISTIC_function)
@@ -599,7 +601,6 @@ if __name__ == "__main__":
     # quant_type = "per_token"
 
     a_types = ["bf16", "fp8"]
-    # a_type = "bf16"
     b_type = "fp4"
     quant_type = "1x32"
 

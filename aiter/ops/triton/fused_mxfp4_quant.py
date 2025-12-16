@@ -5,7 +5,6 @@ import triton.language as tl
 from typing import Optional
 from aiter.utility import dtypes
 from aiter.ops.triton._triton_kernels.fused_mxfp4_quant import (
-    _rmsmorm_op,
     _fused_rms_mxfp4_quant_kernel,
     _fused_flatten_mxfp4_quant,
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
@@ -690,16 +689,6 @@ def _fused_quant_fp8_sort_kernel(
     if pid_m * BLOCK_SIZE_M >= num_valid_ids:
         return
 
-    # Cast strides
-    # stride_input_m = tl.cast(stride_input_m, tl.int64)
-    # stride_input_n = tl.cast(stride_input_n, tl.int64)
-    # stride_x_fp8_m = tl.cast(stride_x_fp8_m, tl.int64)
-    # stride_x_fp8_n = tl.cast(stride_x_fp8_n, tl.int64)
-    # stride_scale_o0 = tl.cast(stride_scale_o0, tl.int64)
-    # stride_scale_o1 = tl.cast(stride_scale_o1, tl.int64)
-    # stride_scale_o2 = tl.cast(stride_scale_o2, tl.int64)
-    # stride_scale_o3 = tl.cast(stride_scale_o3, tl.int64)
-
     out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
 
     for i in range(4):
@@ -721,14 +710,17 @@ def _fused_quant_fp8_sort_kernel(
         else:
             original_m_idx = token_ids * TOPK + topk_ids
 
-        input_offs_n = (pid_n * BLOCK_SIZE_N + n) * QUANT_BLOCK_SIZE + tl.arange(0, BLOCK_SIZE_N * QUANT_BLOCK_SIZE)
-        # tl.device_print("pid_n * BLOCK_SIZE_N + n", pid_n * BLOCK_SIZE_N + n)
-        input_offs = original_m_idx[:, None] * stride_input_m + input_offs_n[None, :] * stride_input_n
-        # if TOPK != 1:
-        #     tl.device_print("original_m_idx", original_m_idx)
-        input_mask = (original_m_idx < M_input)[:, None] & (input_offs_n < N_input)[None, :]
+        input_offs_n = (pid_n * BLOCK_SIZE_N + n) * QUANT_BLOCK_SIZE + tl.arange(
+            0, BLOCK_SIZE_N * QUANT_BLOCK_SIZE
+        )
+        input_offs = (
+            original_m_idx[:, None] * stride_input_m
+            + input_offs_n[None, :] * stride_input_n
+        )
+        input_mask = (original_m_idx < M_input)[:, None] & (input_offs_n < N_input)[
+            None, :
+        ]
 
-        # tl.device_print("input_offs", input_offs)
         x = tl.load(input_ptr + input_offs, mask=input_mask, other=0.0).to(tl.float32)
 
         x_reshaped = x.reshape(BLOCK_SIZE_M * BLOCK_SIZE_N, QUANT_BLOCK_SIZE)
@@ -749,12 +741,17 @@ def _fused_quant_fp8_sort_kernel(
         scale_e8m0 = (scale_e8m0_unbiased.to(tl.uint8) + 127).to(tl.uint8)
         scale_e8m0 = scale_e8m0.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N)  # [BLOCK_SIZE_M]
 
-        # tl.store(x_fp8_ptr + input_offs, x_fp8, mask=input_mask)
-        out_offs_n = (pid_n * BLOCK_SIZE_N + n) * QUANT_BLOCK_SIZE + tl.arange(0, BLOCK_SIZE_N * QUANT_BLOCK_SIZE)
-        out_offs = original_m_idx[:, None] * stride_x_fp8_m + out_offs_n[None, :] * stride_x_fp8_n
-        # tl.device_print("input_offs", input_offs)
+        out_offs_n = (pid_n * BLOCK_SIZE_N + n) * QUANT_BLOCK_SIZE + tl.arange(
+            0, BLOCK_SIZE_N * QUANT_BLOCK_SIZE
+        )
+        out_offs = (
+            original_m_idx[:, None] * stride_x_fp8_m
+            + out_offs_n[None, :] * stride_x_fp8_n
+        )
         out_mask = (original_m_idx < M_input)[:, None] & (out_offs_n < N_input)[None, :]
-        tl.store(x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.type.element_ty), mask=out_mask)
+        tl.store(
+            x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.type.element_ty), mask=out_mask
+        )
 
         out = out | (scale_e8m0.to(tl.uint32) << (i * 8))
 
@@ -786,8 +783,9 @@ def fused_quant_fp8_sort(
     BLOCK_SIZE_N_u32 = BLOCK_SIZE_N // 2
 
     M, N = input.shape
-    assert N % quant_block_size == 0, \
-        f"N ({N}) must be multiple of quant_block_size ({quant_block_size})"
+    assert (
+        N % quant_block_size == 0
+    ), f"N ({N}) must be multiple of quant_block_size ({quant_block_size})"
     assert block_size % 32 == 0, "block_size must be multiple of 32"
 
     M_sorted = sorted_ids.shape[0]
@@ -819,8 +817,8 @@ def fused_quant_fp8_sort(
     )
 
     grid = (
-        triton.cdiv(M_o, BLOCK_SIZE_M), # 32
-        triton.cdiv(N_o, BLOCK_SIZE_N), # 8
+        triton.cdiv(M_o, BLOCK_SIZE_M),  # 32
+        triton.cdiv(N_o, BLOCK_SIZE_N),  # 8
     )
 
     _fused_quant_fp8_sort_kernel[grid](
