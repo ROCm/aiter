@@ -781,7 +781,9 @@ namespace py = pybind11;
           py::arg("block_table")  = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
-          py::arg("gen")          = std::nullopt);
+          py::arg("gen")          = std::nullopt, \
+          py::arg("cu_seqlens_q_padded") = std::nullopt, \
+          py::arg("cu_seqlens_k_padded") = std::nullopt);
 
 #define MHA_VARLEN_BWD_PYBIND                            \
     m.def("mha_varlen_bwd",                              \
