@@ -1,6 +1,9 @@
 import triton
 import triton.language as tl
-from .rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
+from aiter.ops.triton._triton_kernels.rope.rope import (
+    _get_gptj_rotated_x_1D,
+    _get_neox_rotated_x_1D,
+)
 
 
 @triton.jit

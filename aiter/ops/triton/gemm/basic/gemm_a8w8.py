@@ -7,7 +7,10 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import _gemm_a8w8_kernel, _get_config
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
+    _gemm_a8w8_kernel,
+    _get_config,
+)
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger

@@ -7,7 +7,9 @@ from typing import Optional, Tuple
 import torch
 import pytest
 from math import ceil
-from aiter.ops.triton.attention.unified_attention_sparse_mla import unified_attention_sparse_mla
+from aiter.ops.triton.attention.unified_attention_sparse_mla import (
+    unified_attention_sparse_mla,
+)
 
 
 def cdiv(a, b):

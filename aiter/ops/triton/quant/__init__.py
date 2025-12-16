@@ -1,11 +1,9 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 from .quant import (
     static_per_tensor_quant_fp8_i8,
     dynamic_per_tensor_quant_fp8_i8,
     dynamic_per_token_quant_fp8_i8,
     dynamic_mxfp4_quant,
+    _mxfp4_quant_op,
 )
 
 from .fused_fp8_quant import (
@@ -30,6 +28,7 @@ __all__ = [
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_token_quant_fp8_i8",
     "dynamic_mxfp4_quant",
+    "_mxfp4_quant_op",
     # fused_fp8_quant.py exports
     "fused_rms_fp8_per_tensor_static_quant",
     "fused_rms_fp8_group_quant",
@@ -43,4 +42,3 @@ __all__ = [
     "fused_reduce_rms_mxfp4_quant",
     "fused_dynamic_mxfp4_quant_moe_sort",
 ]
-

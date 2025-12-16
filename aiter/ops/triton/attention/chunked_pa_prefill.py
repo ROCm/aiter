@@ -13,7 +13,7 @@
 import triton
 
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
-from aiter.ops.triton._triton_kernels.chunked_pa_prefill import (
+from aiter.ops.triton._triton_kernels.attention.chunked_pa_prefill import (
     _kernel_paged_attention_2d,
 )
 

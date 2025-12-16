@@ -1,7 +1,7 @@
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.moe_routing.topk import _topk
-from aiter.ops.triton.moe_routing.bitmatrix import Bitmatrix
+from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import _topk
+from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
 
 
 def topk(

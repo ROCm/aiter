@@ -18,7 +18,9 @@ import torch
 
 import triton
 import triton.language as tl
-from aiter.ops.triton._triton_kernels.attention.lean_atten_paged import la_persistent_paged
+from aiter.ops.triton._triton_kernels.attention.lean_atten_paged import (
+    la_persistent_paged,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

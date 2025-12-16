@@ -25,7 +25,7 @@ from aiter.ops.triton.utils.common_utils import (
     prev_power_of_2,
     switch_to_contiguous_if_needed,
 )
-from aiter.ops.triton._triton_kernels.hstu_attention import (
+from aiter.ops.triton._triton_kernels.attention.hstu_attention import (
     _hstu_attn_fwd,
     _get_fwd_config,
     _hstu_attn_bwd,

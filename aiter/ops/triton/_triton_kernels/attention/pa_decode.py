@@ -3,7 +3,7 @@
 
 import triton
 import triton.language as tl
-from ..utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 # This code is derived from sglang and FLASHNN projects
