@@ -14,158 +14,18 @@ from .utils import (
 )
 
 # 0 for per block quantization, 1 for per channel quantization
-V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
+V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "2"))
 
 def get_fwd_configs(autotune: bool):
-    configs = []
-    keys = [
-        "IS_CAUSAL",
-        "dropout_p",
-        "MAX_SEQLENS_Q",
-        "MAX_SEQLENS_K",
-        "ACTUAL_BLOCK_DMODEL_QK",
-        "ACTUAL_BLOCK_DMODEL_V",
-        "IS_VARLEN",
-        "HQ",
-        "HK",
-    ]
-
-    # get best config for the architecture
-    if not autotune:
-        arch = get_arch()
-        if arch == "gfx950":
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 128,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                )
-            )
-        elif arch == "gfx942":
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": True,
-                    },
-                    num_warps=4,
-                    num_stages=1,
-                )
-            )
-            # if get_cu_count() < 304:
-            #    configs.extend(
-            #        [
-            #            # best fp8 config
-            #            triton.Config(
-            #                {
-            #                    "BLOCK_M": 128,
-            #                    "BLOCK_N": 64,
-            #                    "waves_per_eu": 2,
-            #                    "PRE_LOAD_V": False,
-            #                },
-            #                num_stages=1,
-            #                num_warps=4,
-            #            ),
-            #            ## best f16 config
-            #            #triton.Config(
-            #            #    {
-            #            #        "BLOCK_M": 128,
-            #            #        "BLOCK_N": 32,
-            #            #        "waves_per_eu": 2,
-            #            #        "PRE_LOAD_V": False,
-            #            #    },
-            #            #    num_stages=2,
-            #            #    num_warps=4,
-            #            #),
-            #        ]
-            #    )
-            # else:
-            #    configs.append(
-            #        triton.Config(
-            #            {
-            #                "BLOCK_M": 128,
-            #                "BLOCK_N": 64,
-            #                "waves_per_eu": 2,
-            #                "PRE_LOAD_V": False,
-            #            },
-            #            num_stages=1,
-            #            num_warps=4,
-            #        )
-            #    )
-        elif arch in (
-            "gfx1030",
-            "gfx1100",
-            "gfx1101",
-            "gfx1102",
-            "gfx1200",
-            "gfx1201",
-        ):  # RDNA architectures
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 32,
-                        "BLOCK_N": 32,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=2,
-                )
-            )
-        else:
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 64,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                )
-            )
-
-        return configs, keys
-
-    # ===================== Autotune Sweep =====================
-    BLOCK_M_OPTIONS = [128, 64, 32]
-    BLOCK_N_OPTIONS = [128, 64, 32]
-    NUM_WARPS_OPTIONS = [2, 4, 8]
-    NUM_STAGES_OPTIONS = [1, 2]
-    WAVES_PER_EU_OPTIONS = [4, 2, 1]
-    PRE_LOAD_V_OPTIONS = [False]
-    for bm in BLOCK_M_OPTIONS:
-        for bn in BLOCK_N_OPTIONS:
-            for waves in WAVES_PER_EU_OPTIONS:
-                for nw in NUM_WARPS_OPTIONS:
-                    for ns in NUM_STAGES_OPTIONS:
-                        for preload_v in PRE_LOAD_V_OPTIONS:
-                            configs.append(
-                                triton.Config(
-                                    {
-                                        "BLOCK_M": bm,
-                                        "BLOCK_N": bn,
-                                        "waves_per_eu": waves,
-                                        "PRE_LOAD_V": preload_v,
-                                    },
-                                    num_stages=ns,
-                                    num_warps=nw,
-                                )
-                            )
-
-    return configs, keys
-
-
-fwd_prefill_autotune_configs, fwd_prefill_autotune_keys = get_fwd_configs(AUTOTUNE)
-
+    assert not autotune, "Autotuning not supported for AMD Triton kernels"
+    return {
+        "BLOCK_M": 256,
+        "BLOCK_N": 128,
+        "waves_per_eu": 2,
+        "PRE_LOAD_V": True,
+        "num_stages": 1,
+        "num_warps": 8,
+    }
 
 @triton.jit
 def _attn_fwd_no_mask(
@@ -204,6 +64,7 @@ def _attn_fwd_no_mask(
     v_descale_base_ptr,
     FP8_MAX,
     stride_k_descale_blk,
+    stride_v_descale_blk,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
@@ -222,7 +83,7 @@ def _attn_fwd_no_mask(
         RCP_LN2: tl.constexpr = 1.4426950408889634
 
     k_descale_ptr = k_descale_base_ptr
-    if V_QUANT_SCHEME == 0:
+    if V_QUANT_SCHEME >= 1:
         v_descale_ptr = v_descale_base_ptr
 
     # loop over k, v, and update accumulator
@@ -241,9 +102,9 @@ def _attn_fwd_no_mask(
 
         k_descale = tl.load(k_descale_ptr)
         k_descale_ptr += stride_k_descale_blk
-        if V_QUANT_SCHEME == 0:
+        if V_QUANT_SCHEME >= 1:
             v_descale = tl.load(v_descale_ptr)
-            v_descale_ptr += stride_k_descale_blk
+            v_descale_ptr += stride_v_descale_blk
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -361,7 +222,7 @@ def _attn_fwd_no_mask(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        if V_QUANT_SCHEME == 0:
+        if V_QUANT_SCHEME >= 1:
             acc += (
                 tl.dot((p * FP8_MAX).to(v.type.element_ty), v, out_dtype=tl.float32)
                 * v_descale
@@ -410,6 +271,7 @@ def _attn_fwd_mask(
     v_descale_base_ptr,
     FP8_MAX,
     stride_k_descale_blk,
+    stride_v_descale_blk,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -435,7 +297,7 @@ def _attn_fwd_mask(
     seqlen_delta_qk = seqlen_k - seqlen_q
 
     k_descale_ptr = k_descale_base_ptr
-    if V_QUANT_SCHEME == 0:
+    if V_QUANT_SCHEME >= 1:
         v_descale_ptr = v_descale_base_ptr
 
     # loop over k, v, and update accumulator
@@ -458,9 +320,9 @@ def _attn_fwd_mask(
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         k_descale = tl.load(k_descale_ptr)
         k_descale_ptr += stride_k_descale_blk
-        if V_QUANT_SCHEME == 0:
+        if V_QUANT_SCHEME >= 1:
             v_descale = tl.load(v_descale_ptr)
-            v_descale_ptr += stride_k_descale_blk
+            v_descale_ptr += stride_v_descale_blk
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
@@ -741,7 +603,7 @@ def _attn_fwd_mask(
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        if V_QUANT_SCHEME == 0:
+        if V_QUANT_SCHEME >= 1:
             acc += (
                 tl.dot((p * FP8_MAX).to(v.type.element_ty), v, out_dtype=tl.float32)
                 * v_descale
@@ -1042,11 +904,11 @@ def compute_block_masking(
         )
 
 
-@triton.autotune(
-    configs=fwd_prefill_autotune_configs,
-    key=fwd_prefill_autotune_keys,
-    use_cuda_graph=True,
-)
+# @triton.autotune(
+#     configs=fwd_prefill_autotune_configs,
+#     key=fwd_prefill_autotune_keys,
+#     use_cuda_graph=True,
+# )
 @triton.jit
 def attn_fwd(
     Q,
@@ -1065,6 +927,8 @@ def attn_fwd(
     stride_k_descale_blk,
     stride_v_descale_z,
     stride_v_descale_h,
+    stride_v_descale_d_v,
+    stride_v_descale_blk,
     LSE,
     Out,
     SD_MASK,
@@ -1207,12 +1071,7 @@ def attn_fwd(
     )  # MHA: use q head index
 
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
-    if V_QUANT_SCHEME == 1:
-        v_descale = tl.load(
-            V_Descale + off_z * stride_v_descale_z + off_h_k * stride_v_descale_h + offs_d_v,
-            mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
-            other=0.0
-        )
+    
 
     # figure out masking pattern
     (
@@ -1323,6 +1182,9 @@ def attn_fwd(
         q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :] < ACTUAL_BLOCK_DMODEL_QK)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
+    if V_QUANT_SCHEME == 2:
+        V_Descale += offs_d_v[None, :] * stride_v_descale_d_v
+    
     # ========== Process MASKED K Blocks in the front ==========
     # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
     if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
@@ -1333,7 +1195,7 @@ def attn_fwd(
             K_Descale + k_descale_offset + n_front_skip_blocks * stride_k_descale_blk
         )
         v_descale_ptr = (
-            V_Descale + k_descale_offset + n_front_skip_blocks * stride_k_descale_blk
+            V_Descale + k_descale_offset + n_front_skip_blocks * stride_v_descale_blk
         )
 
         acc, l_i, m_i = _attn_fwd_mask(
@@ -1370,9 +1232,10 @@ def attn_fwd(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            v_descale_ptr if V_QUANT_SCHEME == 0 else None,
+            v_descale_ptr if V_QUANT_SCHEME >= 1 else None,
             FP8_MAX,
             stride_k_descale_blk,
+            stride_v_descale_blk,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_N,
@@ -1410,6 +1273,7 @@ def attn_fwd(
             + (n_front_skip_blocks + n_front_masked_blocks) * stride_k_descale_blk
         )
 
+
         acc, l_i, m_i = _attn_fwd_no_mask(
             acc,
             l_i,
@@ -1443,9 +1307,10 @@ def attn_fwd(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            v_descale_ptr if V_QUANT_SCHEME == 0 else None,
+            v_descale_ptr if V_QUANT_SCHEME >= 1 else None,
             FP8_MAX,
             stride_k_descale_blk,
+            stride_v_descale_blk,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -1520,12 +1385,12 @@ def attn_fwd(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            v_descale_ptr if V_QUANT_SCHEME == 0 else None,
+            v_descale_ptr if V_QUANT_SCHEME >= 1 else None,
             FP8_MAX,
             stride_k_descale_blk,
+            stride_v_descale_blk,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
-
             BLOCK_N,
             PRE_LOAD_V,
             ENABLE_DROPOUT,
@@ -1558,9 +1423,15 @@ def attn_fwd(
     else:
         invalid_mask = None
         l_recip = 1 / l_i[:, None]
-    if V_QUANT_SCHEME == 0:
+    
+    if V_QUANT_SCHEME >= 1:
         acc = (acc * l_recip) / FP8_MAX
     else:
+        v_descale = tl.load(
+            V_Descale + off_z * stride_v_descale_z + off_h_k * stride_v_descale_h + offs_d_v[None,:],
+            mask=offs_d_v[None,:] < ACTUAL_BLOCK_DMODEL_V,
+            other=0.0
+        )
         acc = (acc * l_recip * v_descale) / FP8_MAX
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
@@ -1923,13 +1794,17 @@ def fav3_sage_triton_impl(
     stride_k_descale_z, stride_k_descale_h, stride_k_descale_blk = (
         k_descale.stride()
     )
-
-    if V_QUANT_SCHEME == 1:
-        stride_v_descale_z, stride_v_descale_h, _ = (
+    if V_QUANT_SCHEME == 2:
+        stride_v_descale_z, stride_v_descale_h, stride_v_descale_v_d, stride_v_descale_blk = (
             v_descale.stride()
         )
+    elif V_QUANT_SCHEME == 1:
+        stride_v_descale_z, stride_v_descale_h, stride_v_descale_blk = (
+            v_descale.stride()
+        )
+        stride_v_descale_v_d = 0
     else:
-        stride_v_descale_z = stride_v_descale_h = 0
+        stride_v_descale_z = stride_v_descale_h = stride_v_descale_v_d = stride_v_descale_blk = 0
 
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
@@ -1990,6 +1865,8 @@ def fav3_sage_triton_impl(
 
     return_lse = True if softmax_lse is not None else False
 
+    config = get_fwd_configs(False)
+
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     attn_fwd[grid](
@@ -2009,6 +1886,8 @@ def fav3_sage_triton_impl(
         stride_k_descale_blk,
         stride_v_descale_z,
         stride_v_descale_h,
+        stride_v_descale_v_d,
+        stride_v_descale_blk,
         softmax_lse,
         o,
         sd_mask,
@@ -2071,17 +1950,19 @@ def fav3_sage_triton_impl(
         USE_EXP2=use_exp2,
         RETURN_SCORES=return_scores,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
+        **config,
     )
 
 def quantize_v_fp8 (v: torch.Tensor, FP8_MAX: float, BLKK: int, tensor_layout: str = "NHD"):
     # call the corresponding quantization function with the V_QUANT_SCHEME
-
-    if V_QUANT_SCHEME == 0:
-        return _v_per_block_fp8(v, FP8_MAX, BLKK, tensor_layout=tensor_layout)
-    elif V_QUANT_SCHEME == 1:
+    if V_QUANT_SCHEME == 0: # per channel
         return _v_per_channel_fp8(v, FP8_MAX, tensor_layout=tensor_layout)
-
-def _v_per_block_fp8(v, FP8_MAX, BLKK=64, tensor_layout="NHD"):
+    elif V_QUANT_SCHEME == 1: # per block
+        return _v_per_block_fp8(v, FP8_MAX, BLKK, tensor_layout=tensor_layout)
+    elif V_QUANT_SCHEME == 2: # per block per channel
+        return _v_per_block_fp8(v, FP8_MAX, BLKK, tensor_layout=tensor_layout, per_channel=True)
+    
+def _v_per_block_fp8(v, FP8_MAX, BLKK=64, tensor_layout="NHD", per_channel=False):
     """
     Quantize V tensor to FP8 per-block scales.
 
@@ -2121,9 +2002,16 @@ def _v_per_block_fp8(v, FP8_MAX, BLKK=64, tensor_layout="NHD"):
     else:
         raise ValueError(f"Unknown tensor layout: {tensor_layout}")
 
-    v_scale = torch.empty(
-        (b, h_kv, (kv_len + BLKK - 1) // BLKK), device=v.device, dtype=torch.float32
-    )
+    if per_channel:
+        v_scale = torch.empty(
+            (b, h_kv, head_dim, (kv_len + BLKK - 1) // BLKK),
+            device=v.device,
+            dtype=torch.float32,
+        )
+    else:
+        v_scale = torch.empty(
+            (b, h_kv, (kv_len + BLKK - 1) // BLKK), device=v.device, dtype=torch.float32
+        )
 
     grid = ((kv_len + BLKK - 1) // BLKK, h_kv, b)
     quant_per_block_fp8_kernel[grid](
@@ -2139,9 +2027,11 @@ def _v_per_block_fp8(v, FP8_MAX, BLKK=64, tensor_layout="NHD"):
         stride_seq_ko,
         v_scale.stride(0),
         v_scale.stride(1),
+        v_scale.stride(2) if per_channel else 0,
         FP8_MAX=FP8_MAX,
         C=head_dim,
         BLK=BLKK,
+        per_channel=per_channel,
     )
 
     return v_fp8, v_scale
@@ -2161,10 +2051,17 @@ def quant_per_block_fp8_kernel(
     stride_on,
     stride_sz,
     stride_sh,
+    stride_sc,
     FP8_MAX: tl.constexpr,
     C: tl.constexpr,
     BLK: tl.constexpr,
+    per_channel: tl.constexpr = False,
 ):
+    """
+    Input: tensor of shape (B, N, H, D)
+    Output: tensor of shape (B, N, H, D) in FP8
+    Scale: tensor of shape (B, H, num_blocks) or (B, H, D, num_blocks) depending on per_channel
+    """
     off_blk = tl.program_id(0)
     off_h = tl.program_id(1)
     off_b = tl.program_id(2)
@@ -2172,30 +2069,58 @@ def quant_per_block_fp8_kernel(
     offs_n = off_blk * BLK + tl.arange(0, BLK)
     offs_k = tl.arange(0, C)
 
-    input_ptrs = (
-        Input
-        + off_b * stride_iz
-        + off_h * stride_ih
-        + offs_n[:, None] * stride_in
-        + offs_k[None, :]
-    )
-    output_ptrs = (
-        Output
-        + off_b * stride_oz
-        + off_h * stride_oh
-        + offs_n[:, None] * stride_on
-        + offs_k[None, :]
-    )
-    scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk
+    if per_channel:
+        for c in range(C):
+            input_ptrs = (
+                Input
+                + off_b * stride_iz
+                + off_h * stride_ih
+                + offs_n[:, None] * stride_in
+                + c
+            )
+            output_ptrs = (
+                Output
+                + off_b * stride_oz
+                + off_h * stride_oh
+                + offs_n[:, None] * stride_on
+                + c
+            )
+            scale_ptrs = (
+                Scale + off_b * stride_sz + off_h * stride_sh + c * stride_sc + off_blk
+            )
+            x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+            x = x.to(tl.float32)
+            scale = tl.max(tl.abs(x)) / FP8_MAX
+            x_fp8 = x / scale
+            # x_fp8 += 0.5 * tl.where(x_fp8 >= 0, 1, -1)
+            x_fp8 = x_fp8.to(Output.type.element_ty)
+            tl.store(output_ptrs, x_fp8, mask=offs_n[:, None] < L)
+            tl.store(scale_ptrs, scale)
+    else:
+        input_ptrs = (
+            Input
+            + off_b * stride_iz
+            + off_h * stride_ih
+            + offs_n[:, None] * stride_in
+            + offs_k[None, :]
+        )
+        output_ptrs = (
+            Output
+            + off_b * stride_oz
+            + off_h * stride_oh
+            + offs_n[:, None] * stride_on
+            + offs_k[None, :]
+        )
+        scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
-    x = x.to(tl.float32)
-    scale = tl.max(tl.abs(x)) / FP8_MAX
-    x_fp8 = x / scale
-    # x_fp8 += 0.5 * tl.where(x_fp8 >= 0, 1, -1)
-    x_fp8 = x_fp8.to(Scale.type.element_ty)
-    tl.store(output_ptrs, x_fp8, mask=offs_n[:, None] < L)
-    tl.store(scale_ptrs, scale)
+        x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+        x = x.to(tl.float32)
+        scale = tl.max(tl.abs(x)) / FP8_MAX
+        x_fp8 = x / scale
+        # x_fp8 += 0.5 * tl.where(x_fp8 >= 0, 1, -1)
+        x_fp8 = x_fp8.to(Output.type.element_ty)
+        tl.store(output_ptrs, x_fp8, mask=offs_n[:, None] < L)
+        tl.store(scale_ptrs, scale)
 
 
 def _v_per_channel_fp8(v, FP8_MAX, tensor_layout="NHD"):
