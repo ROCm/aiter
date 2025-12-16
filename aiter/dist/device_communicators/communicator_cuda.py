@@ -128,10 +128,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             qr_comm is not None
             and not qr_comm.disabled
             and qr_comm.should_quick_allreduce(input_)
+            and input_.shape[0] > 512 # input shape should be such that quick reduce will show benefits.
+            # input shape estimated at 2 * max concurrency for now. if performance issues, subject to change
         ):
+            print(f"qr used. shape: {input_.shape}")
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
             return out
+        print(f"qr skipped. shape: {input_.shape}")
 
         ca_comm = self.ca_comm
         if (
