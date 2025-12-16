@@ -213,22 +213,27 @@ def get_asm_stage1_kernels_for_2stage(block_m, act_type, q_type, q_dtype_a, use_
         return []
 
 
-def get_1stage_fused_asm_kernels(act_type, q_type, q_dtype_a, use_g1u1=True, doweight_stage1=False):
+def get_1stage_fused_asm_kernels(act_type, q_type, q_dtype_a, inter_dim, use_g1u1=True, doweight_stage1=False):
     """
     Get list of 1-stage fused ASM kernels from CSV inventory.
     
     1-stage kernels perform the complete MoE operation in a single fused kernel.
-    These are also pre-compiled and listed in CSV files.
+    These are pre-compiled and listed in CSV files.
+    
+    IMPORTANT: Filters kernels by dimension compatibility (like tune.py does):
+    - Only includes kernels where inter_dim % subGU_n == 0
+    - Only includes kernels where smf == 0
     
     Args:
         act_type: Activation function
         q_type: Quantization type
         q_dtype_a: Activation data type
+        inter_dim: Intermediate dimension (REQUIRED for filtering)
         use_g1u1: Whether using gate+up architecture
         doweight_stage1: Whether to apply routing weights
         
     Returns:
-        list: 1-stage fused kernel names
+        list: 1-stage fused kernel names compatible with inter_dim
     """
     acti_dir = "silu" if act_type == ActivationType.Silu else "gelu"
     up = 1 if use_g1u1 else 0
@@ -245,9 +250,17 @@ def get_1stage_fused_asm_kernels(act_type, q_type, q_dtype_a, use_g1u1=True, dow
     
     try:
         df = pd.read_csv(kernels_list_csv)
-        kernels = df['knl_name'].tolist()
-        return kernels
-    except:
+        
+        # CRITICAL FILTERING (from tune.py line 960-962):
+        # Filter by dimension compatibility and smf==0
+        compatible_kernels = df[
+            (inter_dim % df['subGU_n'] == 0) &  # inter_dim must divide evenly by kernel tile size
+            (df['smf'] == 0)                     # Only smf==0 kernels
+        ]['knl_name'].tolist()
+        
+        return compatible_kernels
+    except Exception as e:
+        print(f"  Warning: Could not load 1-stage kernels: {e}")
         return []
 
 
@@ -598,8 +611,14 @@ def benchmark_all_variants(
     
     if not skip_1stage:
         print(f"\nTesting 1-stage fused kernels...")
-        fused_kernels = get_1stage_fused_asm_kernels(act_type, q_type, q_dtype_a, True, doweight_stage1)
-        print(f"  Found {len(fused_kernels)} 1-stage fused kernels")
+        fused_kernels = get_1stage_fused_asm_kernels(act_type, q_type, q_dtype_a, inter_dim, True, doweight_stage1)
+        print(f"  Found {len(fused_kernels)} 1-stage fused kernels (after dimension filtering)")
+        
+        # Debug: Print kernel list to help identify problematic kernels
+        if fused_kernels:
+            print(f"  Kernel list:")
+            for i, kernel in enumerate(fused_kernels, 1):
+                print(f"    {i:2d}. {kernel}")
     else:
         print(f"\nSkipping 1-stage tests (--skip-1stage flag set)")
         fused_kernels = []
