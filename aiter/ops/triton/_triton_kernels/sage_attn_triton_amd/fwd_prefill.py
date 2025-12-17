@@ -1072,7 +1072,6 @@ def attn_fwd(
 
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
     v_descale_offset = off_z * stride_v_descale_z + off_h_k * stride_v_descale_h
-    
 
     # figure out masking pattern
     (
@@ -1428,8 +1427,8 @@ def attn_fwd(
         acc = (acc * l_recip) / FP8_MAX
     else:
         v_descale = tl.load(
-            V_Descale + off_z * stride_v_descale_z + off_h_k * stride_v_descale_h + offs_d_v[None,:],
-            mask=offs_d_v[None,:] < ACTUAL_BLOCK_DMODEL_V,
+            V_Descale + off_z * stride_v_descale_z + off_h_k * stride_v_descale_h + offs_d_v,
+            mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
             other=0.0
         )
         acc = (acc * l_recip * v_descale) / FP8_MAX
@@ -1802,10 +1801,12 @@ def fav3_sage_triton_impl(
         stride_v_descale_z, stride_v_descale_h, stride_v_descale_blk = (
             v_descale.stride()
         )
-        stride_v_descale_v_d = 0
-    else:
-        stride_v_descale_z = stride_v_descale_h = stride_v_descale_v_d = stride_v_descale_blk = 0
-
+        stride_v_descale_v_d = 1
+    else: # per channel
+        stride_v_descale_z, stride_v_descale_h, stride_v_descale_v_d = (
+            v_descale.stride()
+        )
+        stride_v_descale_blk = 1
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
     use_alibi, (stride_az, stride_ah) = (
