@@ -1385,18 +1385,22 @@ __global__ void radix_topk_one_block_kernel(T const* in,
 
     const int64_t batch_id = blockIdx.x;
 
-    IdxT row_len = len;
+    IdxT rowStart = 0;
+    IdxT rowEnd   = len;
     if(rowStarts && rowEnds)
     {
         if(phase == Phase::Prefill)
         {
-            row_len = rowEnds[batch_id] - rowStarts[batch_id];
+            rowStart = rowStarts[batch_id];
+            rowEnd   = rowEnds[batch_id];
         }
         else
         {
-            row_len = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+            rowEnd   = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+            rowStart = 0;
         }
     }
+    const IdxT row_len = rowEnd - rowStart;
 
     if(threadIdx.x == 0)
     {

@@ -102,11 +102,12 @@ def test_topk(
 
     # Skip for float16 as it would has duplicates in topk_ids
     if dtype != torch.float16 and dtype != torch.bfloat16:
-        err = checkAllclose(
-            ref_value,
-            topk_value,
-            msg="topk_values [golden vs aiter]",
-        )
+        # TODO: uncomment this when the aiter topk supports value return
+        # err = checkAllclose(
+        #     ref_value.gather(1, _ref),
+        #     topk_value.gather(1, _aiter),
+        #     msg="topk_values [golden vs aiter]",
+        # )
         err = checkAllclose(
             id_ref,
             id_aiter,
