@@ -456,8 +456,8 @@ def test_mla(
         reduce_final_map,
         reduce_partial_map,
         kv_granularity=max(page_size, 16),
-        max_seqlen_qo=int(max_seqlen_qo),
-        uni_seqlen_qo=decode_qlen,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
         fast_mode=True,
         max_split_per_batch=max_split_per_batch,
         topk=2048,
@@ -603,16 +603,6 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    # if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-    #     (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
-    # ):
-    #     err, us_asm_decode = test_sparse_mla_bf16()
-    # elif kvtype == dtypes.fp8 and (
-    #     (dtype == dtypes.fp8 and nhead in [16, 128])
-    #     or (dtype == dtypes.bf16 and nhead in [16])
-    #     or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
-    # ):
-    #     err, us_asm_decode = test_absorb_decode_fp8()
     if dtype == torch.bfloat16:
         err, us_asm_decode = test_sparse_mla_bf16()
     elif kvtype == dtypes.fp8:
