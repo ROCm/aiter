@@ -399,6 +399,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                 has_lse,
                                 quant_scale_enum::no_scale,
                                 true,
+                                false,
                                 how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd 3");
     }
