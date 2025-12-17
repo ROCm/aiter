@@ -13,18 +13,18 @@ from .utils import (
     map_dims,
 )
 
-# 0 for per block quantization, 1 for per channel quantization
+# 0 for per channel  quantization, 1 for per block quantization, 2 for per block & per channel quantization
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "2"))
 
 def get_fwd_configs(autotune: bool):
     assert not autotune, "Autotuning not supported for AMD Triton kernels"
     return {
-        "BLOCK_M": 256,
+        "BLOCK_M": 128,
         "BLOCK_N": 128,
         "waves_per_eu": 2,
         "PRE_LOAD_V": True,
         "num_stages": 1,
-        "num_warps": 8,
+        "num_warps": 4,
     }
 
 @triton.jit
@@ -1071,6 +1071,7 @@ def attn_fwd(
     )  # MHA: use q head index
 
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
+    v_descale_offset = off_z * stride_v_descale_z + off_h_k * stride_v_descale_h
     
 
     # figure out masking pattern
@@ -1195,7 +1196,7 @@ def attn_fwd(
             K_Descale + k_descale_offset + n_front_skip_blocks * stride_k_descale_blk
         )
         v_descale_ptr = (
-            V_Descale + k_descale_offset + n_front_skip_blocks * stride_v_descale_blk
+            V_Descale + v_descale_offset + n_front_skip_blocks * stride_v_descale_blk
         )
 
         acc, l_i, m_i = _attn_fwd_mask(
@@ -1269,10 +1270,9 @@ def attn_fwd(
         )
         v_descale_ptr = (
             V_Descale
-            + k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks) * stride_k_descale_blk
+            + v_descale_offset
+            + (n_front_skip_blocks + n_front_masked_blocks) * stride_v_descale_blk
         )
-
 
         acc, l_i, m_i = _attn_fwd_no_mask(
             acc,
@@ -1346,9 +1346,9 @@ def attn_fwd(
         )
         v_descale_ptr = (
             V_Descale
-            + k_descale_offset
+            + v_descale_offset
             + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
-            * stride_k_descale_blk
+            * stride_v_descale_blk
         )
 
         acc, l_i, m_i = _attn_fwd_mask(
