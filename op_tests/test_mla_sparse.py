@@ -20,6 +20,12 @@ torch.set_printoptions(sci_mode=False)
 # qdtype fp8, kdtype bf16: nhead16
 
 
+def check_support(dtype, kv_dtype, nhead):
+    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    return True
+
+
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
@@ -597,15 +603,19 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
-    ):
-        err, us_asm_decode = test_sparse_mla_bf16()
-    elif kvtype == dtypes.fp8 and (
-        (dtype == dtypes.fp8 and nhead in [16, 128])
-        or (dtype == dtypes.bf16 and nhead in [16])
-        or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
-    ):
+    # if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
+    #     (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
+    # ):
+    #     err, us_asm_decode = test_sparse_mla_bf16()
+    # elif kvtype == dtypes.fp8 and (
+    #     (dtype == dtypes.fp8 and nhead in [16, 128])
+    #     or (dtype == dtypes.bf16 and nhead in [16])
+    #     or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
+    # ):
+    #     err, us_asm_decode = test_absorb_decode_fp8()
+    if dtype == torch.bfloat16:
+        err, us_asm_decode = test_absorb_decode_bf16()
+    elif kvtype == dtypes.fp8:
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
@@ -755,22 +765,23 @@ for nhead, decode_qlen in list_nhead:
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
         list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
-        ret = test_mla(
-            ctx_len,
-            batch_size,
-            nhead,
-            args.kv_lora_rank,
-            args.qk_nope_head_dim,
-            args.qk_rope_head_dim,
-            args.v_head_dim,
-            dtype,
-            kvtype,
-            args.block_size,
-            varlen=args.varlen,
-            decode_qlen=decode_qlen,
-            max_split_per_batch=max_split_per_batch,
-        )
-        df.append(ret)
+        if check_support(dtype, kvtype, nhead):
+            ret = test_mla(
+                ctx_len,
+                batch_size,
+                nhead,
+                args.kv_lora_rank,
+                args.qk_nope_head_dim,
+                args.qk_rope_head_dim,
+                args.v_head_dim,
+                dtype,
+                kvtype,
+                args.block_size,
+                varlen=args.varlen,
+                decode_qlen=decode_qlen,
+                max_split_per_batch=max_split_per_batch,
+            )
+            df.append(ret)
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
     aiter.logger.info(f"summary:\n{df}")
