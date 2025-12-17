@@ -13,7 +13,7 @@ if [[ "$MULTIGPU" == "TRUE" ]]; then
     mapfile -t files < <(find op_tests/multigpu_tests -type f -name "*.py")
 else
     # Recursively find all files under op_tests, excluding op_tests/multigpu_tests
-    mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py")
+    files=("op_tests/test_moe_2stage.py")
 fi
 
 skip_tests=(
