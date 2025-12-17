@@ -1481,12 +1481,15 @@ def paged_attention_decode_sliding_window(
 
     # ==================== SEQUENCE PROCESSING ====================
     query_converted = query_shared.load(qk_lhs_operand_layout)
-    # query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
-    sequence_partition_start_idx = (
-        context_length - SLIDING_WINDOW
-    ) // CONTEXT_PARTITION_SIZE
+
+    if SLIDING_WINDOW > 0:
+        sequence_partition_start_idx = (
+            context_length - SLIDING_WINDOW
+        ) // CONTEXT_PARTITION_SIZE
+    else:
+        sequence_partition_start_idx = 0
     sequence_partition_end_idx = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
-    # num_iterations = sequence_partition_end_idx - sequence_partition_start_idx
+
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
         # Quantize bf16 query to fp8
         # Convert query to float32 for computation
@@ -2549,7 +2552,14 @@ def paged_attention_decode_v2_reduce_kernel(
     head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
 
     # Initialize global accumulation variables
-    global_max = tl.full((QUERY_GROUP_SIZE_POW2,), float("-inf"), dtype=tl.float32)
+    if USE_SINKS:
+        global_max = tl.load(
+            sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
+            mask=query_group_offsets < query_group_size,
+            other=float("-inf"),
+        ).to(tl.float32)
+    else:
+        global_max = tl.full((QUERY_GROUP_SIZE_POW2,), float("-inf"), dtype=tl.float32)
     global_max_prev = global_max
     global_exp_sum = tl.zeros((QUERY_GROUP_SIZE_POW2,), dtype=tl.float32)
     final_output = tl.zeros((QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=tl.float32)
@@ -2595,13 +2605,6 @@ def paged_attention_decode_v2_reduce_kernel(
         # Update and accumulate global exponential sum
         global_exp_sum = update_scale * global_exp_sum + tl.sum(exp_sums, axis=0)
         global_max_prev = global_max
-
-    if USE_SINKS:
-        sink_token_values = gl.load(
-            sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
-            mask=query_group_offsets < query_group_size,
-        )
-        global_exp_sum += gl.exp(sink_token_values - global_max)
 
     # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
     for iter_idx in range(num_iterations):
@@ -2972,6 +2975,7 @@ def pa_decode_gluon(
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
+    one_shot=None,
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -3263,7 +3267,8 @@ def pa_decode_gluon(
         fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
 
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
-    one_shot = sliding_window > 0
+    if one_shot is None:
+        one_shot = sliding_window > 0
     _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         grid,
         exp_sums,
