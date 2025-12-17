@@ -816,13 +816,17 @@ def _get_config(
     K: int,
     shuffle: bool = False,
 ):
-    config_name = (
-        "FUSED-GEMM-AFP4WFP4-A16W16"
-        if not shuffle
-        else "FUSED-GEMM-AFP4WFP4_PRESHUFFLED-A16W16"
-    )
     # Custom file naming: N4={N_fp4}-N16={N_bf16}-K={2*K}
     # Note: N and K are not passed to get_gemm_config here, as they are encoded in the specialized_filename.
     # This differs from most other usages, where N and K are required as explicit arguments.
     specialized_filename = f"N4={N_fp4}-N16={N_bf16}-K={2*K}"
-    return get_gemm_config(config_name, M, specialized_filename=specialized_filename)
+    if shuffle:
+        return get_gemm_config(
+            "FUSED-GEMM-AFP4WFP4_PRESHUFFLED-A16W16",
+            M,
+            specialized_filename=specialized_filename,
+        )
+    else:
+        return get_gemm_config(
+            "FUSED-GEMM-AFP4WFP4-A16W16", M, specialized_filename=specialized_filename
+        )
