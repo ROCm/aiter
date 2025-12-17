@@ -1,5 +1,5 @@
 import torch
-import pytest 
+import pytest
 from aiter.test_common import (
     checkAllclose,
 )
@@ -14,6 +14,7 @@ from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_per_tensor_static_qua
 import aiter as rocm_aiter
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+
 
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
@@ -30,19 +31,25 @@ def rmsnorm_fp8_quantization_ref(x, w, x_scale, eps, n, rocm_fp8_dtype):
 
 
 def triton_rmsnorm_fp8_quantization_fuse(x, w, x_scale, eps, rocm_fp8_dtype):
-    quant_out, rms_out, _, _ = fused_rms_fp8_per_tensor_static_quant(x, w, eps, x_scale, None, None, eps, 
-                                                                     dtype_quant=rocm_fp8_dtype, 
-                                                                     res1=None,
-                                                                     output_unquantized_inp1=True,
-                                                                     intermediate_convert_to_inp1_type=True)
+    quant_out, rms_out, _, _ = fused_rms_fp8_per_tensor_static_quant(
+        x,
+        w,
+        eps,
+        x_scale,
+        None,
+        None,
+        eps,
+        dtype_quant=rocm_fp8_dtype,
+        res1=None,
+        output_unquantized_inp1=True,
+        intermediate_convert_to_inp1_type=True,
+    )
     return quant_out, rms_out
 
 
-@pytest.mark.parametrize("m, n", [
-    (m, n) 
-    for m in [1, 2, 4, 8, 256, 1024, 8192]
-    for n in [128, 4096, 8192]
-])
+@pytest.mark.parametrize(
+    "m, n", [(m, n) for m in [1, 2, 4, 8, 256, 1024, 8192] for n in [128, 4096, 8192]]
+)
 def test_rms_quantization_fuse(m, n):
     eps = 0.0001
     rocm_fp8_dtype = rocm_aiter_fp8_dtype
@@ -50,7 +57,7 @@ def test_rms_quantization_fuse(m, n):
 
     x_shape = (m, n)
     dtype = torch.bfloat16
-    x = torch.randn(x_shape, dtype=dtype, device='cuda')
+    x = torch.randn(x_shape, dtype=dtype, device="cuda")
     w = torch.ones(n, dtype=dtype).cuda()
 
     DTYPE_MAX = (
@@ -64,10 +71,14 @@ def test_rms_quantization_fuse(m, n):
     rms_out_abs = torch.abs(rms_out)
     rms_out_abs_max = torch.max(rms_out_abs)
     scale_val = rms_out_abs_max / DTYPE_MAX
-    x_scale = torch.tensor((scale_val), dtype=torch.float32, device='cuda')
+    x_scale = torch.tensor((scale_val), dtype=torch.float32, device="cuda")
 
-    fp8_x_ref, rms_out_ref = rmsnorm_fp8_quantization_ref(x, w, x_scale, eps, n, rocm_fp8_dtype)
-    fp8_x, rms_out = triton_rmsnorm_fp8_quantization_fuse(x, w, x_scale, eps, rocm_fp8_dtype)
+    fp8_x_ref, rms_out_ref = rmsnorm_fp8_quantization_ref(
+        x, w, x_scale, eps, n, rocm_fp8_dtype
+    )
+    fp8_x, rms_out = triton_rmsnorm_fp8_quantization_fuse(
+        x, w, x_scale, eps, rocm_fp8_dtype
+    )
 
     checkAllclose(rms_out, rms_out_ref)
     checkAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
