@@ -1560,7 +1560,7 @@ def paged_attention_decode_sliding_window(
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE),
             dtype=gl.float32,
-            layout=qk_mfma_layout,q
+            layout=qk_mfma_layout,
         )
         # Load key quantization scales if needed (overlaps with key tensor load)
         if KV_QUANT_MODE >= 0:
