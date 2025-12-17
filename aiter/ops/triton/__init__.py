@@ -41,7 +41,12 @@ if _COMMS_AVAILABLE:
         ]
     )
 
-
+"""
+These following help implement backward-compatibility 
+for modules that were reorganized so that external repos (like sglang for example),
+which depend on the old module names, can still import it the old "way" of importing.
+"""
+# This is a mapping of the old module names to the new module names
 _BACKWARD_COMPAT_MAP = {
     # Batched GEMM modules (gemm/batched/)
     "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant": "gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant",
@@ -169,4 +174,6 @@ def _backward_compat_find_spec(fullname, path, target=None):
     return None
 
 
+# The SimpleNamespace is just to avoid creating a class and then creating an object
+# This keeps it simple by letting us treat it like an object and makes it much more readable
 sys.meta_path.insert(0, SimpleNamespace(find_spec=_backward_compat_find_spec))
