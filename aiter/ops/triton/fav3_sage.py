@@ -60,9 +60,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
 
         # Quantize K, V to int8, and convert v to float16
-        config, _ = get_fwd_configs(False)
-        assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
-        config = config[0].all_kwargs()
+        config = get_fwd_configs(False)
+        # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
+        # config = config[0].all_kwargs()
         BLKQ = config["BLOCK_M"]
         BLKK = config["BLOCK_N"]
 

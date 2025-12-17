@@ -120,9 +120,9 @@ def fav3_sage_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is
     k_bshd = k.transpose(1, 2).contiguous()
     v_bshd = v.transpose(1, 2).contiguous()
     
-    config, _ = get_fwd_configs(False)
-    assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
-    config = config[0].all_kwargs()
+    config = get_fwd_configs(False)
+    # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
+    # config = config[0].all_kwargs()
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
