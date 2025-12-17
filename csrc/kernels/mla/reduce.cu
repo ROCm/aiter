@@ -318,7 +318,7 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_massive(
         else
         {
             const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
-            return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
+            return MlaPartialTileInfo{{tile_idx * qo_len, (tile_idx + 1) * qo_len}};
         }
     }();
 
