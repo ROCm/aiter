@@ -1664,14 +1664,23 @@ namespace aiter
 
       int part = size / 8;
       int buf_size = sizeof(T) * part;
+      hipStream_t ss[7];
+      for (int i = 0; i < 7; ++i)
+      {
+	HIP_CALL(hipStreamCreate(&ss[i]));
+      }
       for (int i = 1; i < world_size_; ++i)
       {
         int device_id = (rank_ + i) % world_size_;
         T* dst_start = reinterpret_cast<T*>(sg_.signals[device_id] + 1);
         void* dst = reinterpret_cast<void*>(dst_start + rank_ * part);
         void* inp = reinterpret_cast<void*>(input + device_id * part);
-        // HIP_CALL(hipMemcpyAsync(dst, inp, buf_size, hipMemcpyDeviceToDevice, streams[i - 1]));
-        HIP_CALL(hipMemcpyAsync(dst, inp, buf_size, hipMemcpyDeviceToDevice, stream));
+        HIP_CALL(hipMemcpyAsync(dst, inp, buf_size, hipMemcpyDeviceToDevice, ss[i - 1]));
+        // HIP_CALL(hipMemcpyAsync(dst, inp, buf_size, hipMemcpyDeviceToDevice, stream));
+      }
+      for (int i = 0; i < 7; ++i)
+      {
+	HIP_CALL(hipStreamSynchronize(ss[i]));
       }
       int g_num = (part / d + 512 - 1) / 512;
       dim3 block(512);
