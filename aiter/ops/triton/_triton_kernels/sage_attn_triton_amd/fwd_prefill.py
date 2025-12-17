@@ -17,6 +17,16 @@ from .utils import (
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
 
 def get_fwd_configs(autotune: bool):
+    assert not autotune, "Autotuning is not supported."
+    return {
+        "BLOCK_M": 256,
+        "BLOCK_N": 128,
+        "waves_per_eu": 2,
+        "PRE_LOAD_V": True,
+        "num_stages": 1,
+        "num_warps": 8,
+    }
+    
     configs = []
     keys = [
         "IS_CAUSAL",
@@ -164,7 +174,7 @@ def get_fwd_configs(autotune: bool):
     return configs, keys
 
 
-fwd_prefill_autotune_configs, fwd_prefill_autotune_keys = get_fwd_configs(AUTOTUNE)
+# fwd_prefill_autotune_configs, fwd_prefill_autotune_keys = get_fwd_configs(AUTOTUNE)
 
 
 @triton.jit
@@ -1042,11 +1052,11 @@ def compute_block_masking(
         )
 
 
-@triton.autotune(
-    configs=fwd_prefill_autotune_configs,
-    key=fwd_prefill_autotune_keys,
-    use_cuda_graph=True,
-)
+# @triton.autotune(
+#     configs=fwd_prefill_autotune_configs,
+#     key=fwd_prefill_autotune_keys,
+#     use_cuda_graph=True,
+# )
 @triton.jit
 def attn_fwd(
     Q,
@@ -1992,6 +2002,7 @@ def fav3_sage_triton_impl(
 
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
+    config = get_fwd_configs(False)
     attn_fwd[grid](
         q,
         k,
@@ -2071,6 +2082,7 @@ def fav3_sage_triton_impl(
         USE_EXP2=use_exp2,
         RETURN_SCORES=return_scores,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
+        **config
     )
 
 def quantize_v_fp8 (v: torch.Tensor, FP8_MAX: float, BLKK: int, tensor_layout: str = "NHD"):

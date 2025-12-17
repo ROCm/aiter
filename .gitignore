@@ -66,3 +66,4 @@ aiter/install_mode
 # captured inputs and videos
 *.mp4
 captured_inputs/*
+*.pt

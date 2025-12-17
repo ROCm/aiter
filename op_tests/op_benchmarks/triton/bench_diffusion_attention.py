@@ -234,11 +234,11 @@ def fav3_sage_forward_func(
     causal: bool,
     inference_mode: bool,  # not return softmax_lse
 ):
-    config, _ = get_fwd_configs(False)
-    assert (
-        len(config) == 1
-    ), f"Number of best config is expected to be 1, got {len(config)}"
-    config = config[0].all_kwargs()
+    config = get_fwd_configs(False)
+    # assert (
+    #     len(config) == 1
+    # ), f"Number of best config is expected to be 1, got {len(config)}"
+    # config = config[0].all_kwargs()
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
@@ -354,29 +354,20 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
     # Extract x_vals from loaded inputs
     x_vals_list = []
     for i, inp in enumerate(inputs):
-        # Shape from BHSD format: (batch, heads, seqlen, dim)
-        q_shape = inp["q_shape"]
-        batch = q_shape[0]
-        hq = q_shape[1]  # heads at index 1 in BHSD
-        seq_q = q_shape[2]  # seqlen at index 2
-        d_head = q_shape[3]
+        # Shape from BSHD format: (batch, seqlen, heads, dim)
+        batch, seq_q, hq, d_head = inp["q"].shape
+        _, seq_k, hk, _ = inp["k"].shape
+        d_head_v = inp["v_shape"][-1]
 
-        k_shape = inp["k_shape"]
-        hk = k_shape[1]
-        seq_k = k_shape[2]
-
-        v_shape = inp["v_shape"]
-        d_head_v = v_shape[3]
-
-        x_vals_list.append((i, batch, hq, hk, seq_q, seq_k, d_head, d_head_v))
+        x_vals_list.append((i, batch, seq_q, seq_k, hq, hk, d_head, d_head_v))
 
     x_names = [
         "INPUT_IDX",
         "BATCH",
-        "HQ",
-        "HK",
         "N_CTX_Q",
         "N_CTX_K",
+        "HQ",
+        "HK",
         "D_HEAD",
         "D_HEAD_V",
     ]
@@ -588,20 +579,13 @@ def run_benchmark_captured(args):
         Benchmark function for attention kernels using captured inputs.
         INPUT_IDX: Index in the loaded inputs list
         """
-
         # Get the input tensors for this configuration
         inp = inputs[INPUT_IDX]
 
-        # Load tensors to GPU - captured inputs are in BHSD format (batch, heads, seq, dim)
-        q_bhsd = inp["q"].to(device)
-        k_bhsd = inp["k"].to(device)
-        v_bhsd = inp["v"].to(device)
-
-        # Transpose from BHSD to BSHD (batch, seq, heads, dim) for kernel compatibility
-        q = q_bhsd.transpose(1, 2).contiguous()
-        k = k_bhsd.transpose(1, 2).contiguous()
-        v = v_bhsd.transpose(1, 2).contiguous()
-
+        # Load tensors to GPU - captured inputs are in BSHD format (batch, seq, heads, dim)
+        q = inp["q"].to(device)
+        k = inp["k"].to(device)
+        v = inp["v"].to(device)
         return bench_kernel(q, k, v, args, provider)
 
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)

@@ -3,6 +3,8 @@ import importlib
 import aiter
 from pathlib import Path
 
+from utils import InputCaptureWrapper
+
 ############### Monkey patch the usp._attention from the rest of imports
 _flash_attn_fp8_func_v3 = None
 
@@ -10,7 +12,8 @@ def _get_flash_attn_fp8_func_v3():
     global _flash_attn_fp8_func_v3
     if _flash_attn_fp8_func_v3 is None:
         from aiter.ops.triton.fav3_sage import fav3_sage_wrapper_func as fav3_sage
-        _flash_attn_fp8_func_v3 = fav3_sage
+        _capture_wrapper = InputCaptureWrapper(fav3_sage, "results_Wan22", name="fav3_sage", max_captures=10)
+        _flash_attn_fp8_func_v3 = _capture_wrapper
     return _flash_attn_fp8_func_v3
 
 try:
@@ -29,8 +32,7 @@ def _aiter_fp8_attn_call_v3(query, key, value, dropout_p, is_causal):
 
     # Direct call - automatic FP8 quantization inside
     output = flash_attn_fp8_func(
-        query, key, value,
-        causal=is_causal,
+        query, key, value
     )
     
     output = torch.permute(output, [0, 2, 1, 3])

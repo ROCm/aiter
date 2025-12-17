@@ -1,0 +1,622 @@
+W1217 13:20:33.355000 417554 torch/distributed/run.py:803] 
+W1217 13:20:33.355000 417554 torch/distributed/run.py:803] *****************************************
+W1217 13:20:33.355000 417554 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1217 13:20:33.355000 417554 torch/distributed/run.py:803] *****************************************
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+INFO 12-17 13:20:39 [envs.py:196] Using AITER as the attention library
+INFO 12-17 13:20:39 [envs.py:196] Using AITER as the attention library
+WARNING 12-17 13:20:39 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 13:20:39 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+WARNING 12-17 13:20:39 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 13:20:39 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+INFO 12-17 13:20:39 [envs.py:196] Using AITER as the attention library
+WARNING 12-17 13:20:40 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 13:20:40 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+INFO 12-17 13:20:40 [envs.py:196] Using AITER as the attention library
+INFO 12-17 13:20:40 [envs.py:196] Using AITER as the attention library
+INFO 12-17 13:20:40 [envs.py:196] Using AITER as the attention library
+WARNING 12-17 13:20:40 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 13:20:40 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+WARNING 12-17 13:20:40 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 13:20:40 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+WARNING 12-17 13:20:40 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 13:20:40 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+INFO 12-17 13:20:40 [envs.py:196] Using AITER as the attention library
+INFO 12-17 13:20:40 [envs.py:196] Using AITER as the attention library
+WARNING 12-17 13:20:40 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 13:20:40 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+WARNING 12-17 13:20:40 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 13:20:40 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+[Gloo] Rank 0 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 4 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7[Gloo] Rank 
+1 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 2 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 5 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+INFO 12-17 13:20:40 [config.py:124] Ring degree not set, using default value 1
+[Gloo] Rank 6 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 7 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+INFO 12-17 13:20:40 [config.py:166] Pipeline patch number not set, using default value 1
+--------------------PARAMETERS--------------------
+                             height = 720
+                              width = 1280
+                         num_frames = 81
+             use_resolution_binning = True
+                         batch_size = 1
+                      img_file_path = /app/Wan/i2v_input.JPG
+                             prompt = ["Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."]
+                    negative_prompt = 
+                num_inference_steps = 40
+                max_sequence_length = 256
+                               seed = 42
+                        output_type = pil
+                     guidance_scale = 3.5
+                              model = Wan-AI/Wan2.2-I2V-A14B-Diffusers
+                       download_dir = None
+                  trust_remote_code = False
+                       warmup_steps = 1
+                              dtype = torch.float16
+                     use_cuda_graph = FalseINFO 12-17 13:20:40 [config.py:124] Ring degree not set, using default value 1
+
+                   use_parallel_vae = False
+                       use_profiler = False
+                  use_torch_compile = True
+                        use_onediff = False
+                 use_fp8_t5_encoder = False
+                       use_teacache = False
+                        use_fbcache = FalseINFO 12-17 13:20:40 [config.py:166] Pipeline patch number not set, using default value 1
+
+                          dp_degree = 1
+                   use_cfg_parallel = False
+                  dit_parallel_size = 8
+                         cfg_degree = 1
+                     ulysses_degree = 8
+                        ring_degree = 1
+                  dit_parallel_size = 8
+                          sp_degree = 8
+                          pp_degree = 1
+                 num_pipeline_patch = 1
+              attn_layer_num_for_pp = None
+                  dit_parallel_size = 8
+                          tp_degree = 1
+                       split_scheme = row
+INFO 12-17 13:20:40 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 13:20:40 [config.py:124] Ring degree not set, using default value 1
+                  dit_parallel_size = 8
+                           filename = /home/jukorhon/aiter/op_tests/sagev1_tests/run_wan.py
+--------------------PARAMETERS--------------------
+INFO 12-17 13:20:40 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 13:20:40 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 13:20:40 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 13:20:40 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 13:20:40 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 13:20:40 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 13:20:40 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 13:20:40 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 13:20:40 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 13:20:40 [config.py:166] Pipeline patch number not set, using default value 1
+Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]`torch_dtype` is deprecated! Use `dtype` instead!
+Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]`torch_dtype` is deprecated! Use `dtype` instead!
+Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 150.46it/s]
+Loading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 126.20it/s]
+
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 115.94it/s]
+
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][ALoading pipeline components...:  33%|███▎      | 2/6 [00:00<00:00,  8.56it/s]Loading pipeline components...:  33%|███▎      | 2/6 [00:00<00:00,  7.51it/s]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][ALoading pipeline components...:  33%|███▎      | 2/6 [00:00<00:00,  5.83it/s]Loading pipeline components...:  33%|███▎      | 2/6 [00:00<00:00,  4.30it/s]Loading pipeline components...:  33%|███▎      | 2/6 [00:00<00:01,  3.83it/s]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][ALoading pipeline components...:  50%|█████     | 3/6 [00:00<00:00,  3.18it/s]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:15,  1.42s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:16,  1.48s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:15,  1.40s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:15,  1.42s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:17,  1.61s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:15,  1.38s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:15,  1.38s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:16,  1.47s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:14,  1.44s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:14,  1.49s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:14,  1.42s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:14,  1.43s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:13,  1.40s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:13,  1.40s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:03<00:17,  1.76s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:03<00:16,  1.69s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:13,  1.48s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:12,  1.41s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:12,  1.39s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:12,  1.39s/it][A
+
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:15,  1.70s/it]Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:14,  1.59s/it][A[A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:05<00:15,  1.76s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:05<00:15,  1.71s/it][A
+
+
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:11,  1.38s/it]Loading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:11,  1.45s/it]Loading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:12,  1.50s/it][A[A[A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:10,  1.37s/it][A
+
+
+
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:06<00:09,  1.39s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:07<00:09,  1.42s/it][A[ALoading checkpoint shards:  42%|████▏     | 5/12 [00:07<00:10,  1.47s/it][ALoading checkpoint shards:  42%|████▏     | 5/12 [00:07<00:10,  1.50s/it][A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:06<00:13,  1.72s/it][A
+
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:07<00:17,  2.15s/it]Loading checkpoint shards:  33%|███▎      | 4/12 [00:07<00:17,  2.21s/it][A[A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:07<00:16,  2.08s/it][A
+
+
+Loading checkpoint shards:  50%|█████     | 6/12 [00:08<00:08,  1.43s/it]Loading checkpoint shards:  50%|█████     | 6/12 [00:08<00:08,  1.49s/it]Loading checkpoint shards:  50%|█████     | 6/12 [00:08<00:08,  1.42s/it][A[A[A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:08<00:08,  1.47s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:08<00:12,  1.72s/it][A
+
+
+
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:09<00:07,  1.43s/it]Loading checkpoint shards:  58%|█████▊    | 7/12 [00:10<00:07,  1.47s/it]Loading checkpoint shards:  58%|█████▊    | 7/12 [00:09<00:07,  1.44s/it]Loading checkpoint shards:  58%|█████▊    | 7/12 [00:10<00:07,  1.46s/it][A[A[A[A
+
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:10<00:17,  2.45s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:10<00:17,  2.50s/it][A[A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:10<00:16,  2.41s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:10<00:10,  1.71s/it][A
+
+
+
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:11<00:05,  1.46s/it]Loading checkpoint shards:  67%|██████▋   | 8/12 [00:11<00:05,  1.44s/it]Loading checkpoint shards:  67%|██████▋   | 8/12 [00:11<00:05,  1.45s/it]Loading checkpoint shards:  67%|██████▋   | 8/12 [00:11<00:05,  1.43s/it][A[A[A[A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:11<00:08,  1.70s/it][A
+
+
+
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:12<00:04,  1.45s/it]Loading checkpoint shards:  75%|███████▌  | 9/12 [00:12<00:04,  1.44s/it][A[ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:13<00:04,  1.46s/it][ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:13<00:04,  1.46s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:14<00:16,  2.80s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:14<00:16,  2.77s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:14<00:16,  2.83s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:13<00:06,  1.70s/it][A
+
+
+
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:14<00:02,  1.44s/it]Loading checkpoint shards:  83%|████████▎ | 10/12 [00:14<00:02,  1.44s/it][A[ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:14<00:02,  1.46s/it][ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:14<00:02,  1.45s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:15<00:11,  2.35s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:15<00:11,  2.35s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:15<00:11,  2.38s/it][A
+
+
+
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:15<00:01,  1.43s/it]Loading checkpoint shards:  92%|█████████▏| 11/12 [00:15<00:01,  1.43s/it][A[ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:16<00:01,  1.44s/it][ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:15<00:01,  1.44s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:15<00:05,  1.71s/it][A
+
+
+
+Loading checkpoint shards: 100%|██████████| 12/12 [00:16<00:00,  1.28s/it]Loading checkpoint shards: 100%|██████████| 12/12 [00:16<00:00,  1.28s/it][A[ALoading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.29s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:16<00:00,  1.29s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:16<00:00,  1.39s/it]Loading checkpoint shards: 100%|██████████| 12/12 [00:16<00:00,  1.38s/it]
+
+Loading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.42s/it]Loading checkpoint shards: 100%|██████████| 12/12 [00:16<00:00,  1.40s/it]
+
+Loading pipeline components...:  50%|█████     | 3/6 [00:17<00:21,  7.12s/it]Loading pipeline components...:  67%|██████▋   | 4/6 [00:17<00:09,  5.00s/it]Loading pipeline components...:  50%|█████     | 3/6 [00:17<00:21,  7.09s/it]Loading pipeline components...:  33%|███▎      | 2/6 [00:17<00:34,  8.58s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 211.41it/s]
+
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:16<00:08,  2.05s/it][ALoading pipeline components...:  50%|█████     | 3/6 [00:17<00:15,  5.07s/it]Loading pipeline components...:  83%|████████▎ | 5/6 [00:17<00:03,  3.57s/it]
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:17<00:08,  2.07s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:17<00:08,  2.09s/it][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:16<00:03,  1.65s/it][ALoading pipeline components...:  67%|██████▋   | 4/6 [00:17<00:06,  3.35s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 209.36it/s]
+
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:14,  1.34s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:14,  1.33s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:18<00:05,  1.86s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:14,  1.34s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:18<00:05,  1.89s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:18<00:05,  1.91s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:18<00:01,  1.60s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:14,  1.36s/it][A
+
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:13,  1.36s/it][ALoading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:13,  1.39s/it][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:19<00:03,  1.73s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:13,  1.38s/it][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:19<00:00,  1.40s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:19<00:00,  1.60s/it]
+Loading pipeline components...:  67%|██████▋   | 4/6 [00:20<00:14,  7.40s/it]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:20<00:03,  1.76s/it][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:20<00:03,  1.76s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:13,  1.38s/it][A
+
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:12,  1.37s/it][ALoading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:12,  1.38s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:12,  1.38s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:21<00:01,  1.64s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:15,  1.41s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:21<00:01,  1.66s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:21<00:01,  1.67s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:12,  1.38s/it][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:22<00:00,  1.41s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:22<00:00,  1.84s/it]
+Loading pipeline components...:  50%|█████     | 3/6 [00:22<00:27,  9.32s/it]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:22<00:00,  1.42s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:22<00:00,  1.88s/it]
+Loading pipeline components...:  17%|█▋        | 1/6 [00:22<01:53, 22.61s/it]
+
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:10,  1.37s/it][ALoading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:10,  1.37s/it][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:22<00:00,  1.44s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:22<00:00,  1.88s/it]
+Loading pipeline components...:  33%|███▎      | 2/6 [00:22<00:45, 11.36s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 231.91it/s]
+
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:11,  1.38s/it][ALoading pipeline components...:  67%|██████▋   | 4/6 [00:22<00:09,  4.75s/it]Loading pipeline components...:  33%|███▎      | 2/6 [00:23<00:38,  9.59s/it]
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:14,  1.43s/it][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][ALoading pipeline components...:  83%|████████▎ | 5/6 [00:23<00:03,  3.45s/it]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:11,  1.39s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:14,  1.35s/it][A
+
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:06<00:09,  1.37s/it][ALoading checkpoint shards:  42%|████▏     | 5/12 [00:06<00:09,  1.38s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:06<00:09,  1.41s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:15,  1.41s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:13,  1.45s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:15,  1.45s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:07<00:10,  1.44s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:14,  1.48s/it][A
+
+Loading checkpoint shards:  50%|█████     | 6/12 [00:08<00:08,  1.42s/it][ALoading checkpoint shards:  50%|█████     | 6/12 [00:08<00:08,  1.42s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:08<00:08,  1.45s/it][A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:05<00:11,  1.47s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:02<00:14,  1.48s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:03<00:15,  1.53s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:08<00:08,  1.48s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:13,  1.55s/it][A
+
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:09<00:07,  1.46s/it][ALoading checkpoint shards:  58%|█████▊    | 7/12 [00:09<00:07,  1.46s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:10<00:07,  1.50s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:07<00:10,  1.50s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:13,  1.54s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:14,  1.56s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:10<00:07,  1.52s/it][A
+
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:11<00:05,  1.48s/it][ALoading checkpoint shards:  67%|██████▋   | 8/12 [00:11<00:05,  1.48s/it][A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:06<00:12,  1.59s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:11<00:06,  1.52s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:08<00:09,  1.51s/it][A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:06<00:12,  1.56s/it][A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:06<00:12,  1.56s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:11<00:06,  1.54s/it][A
+
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:12<00:04,  1.50s/it][ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:13<00:04,  1.50s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:07<00:11,  1.61s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:13<00:04,  1.55s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:10<00:07,  1.54s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:07<00:11,  1.58s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:07<00:11,  1.58s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:13<00:04,  1.56s/it][A
+
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:14<00:03,  1.52s/it][ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:14<00:03,  1.52s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:09<00:09,  1.62s/it][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:14<00:03,  1.55s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:12<00:06,  1.56s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:09<00:09,  1.58s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:09<00:09,  1.58s/it][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:14<00:03,  1.57s/it][A
+
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:16<00:01,  1.53s/it][ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:16<00:01,  1.53s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:11<00:08,  1.62s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:16<00:01,  1.56s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:13<00:04,  1.57s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:10<00:07,  1.57s/it][A
+
+Loading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.37s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.37s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.42s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.43s/it]
+Loading pipeline components...:  83%|████████▎ | 5/6 [00:34<00:07,  7.90s/it]Loading pipeline components...:  67%|██████▋   | 4/6 [00:34<00:21, 10.87s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:10<00:07,  1.58s/it][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 190.59it/s]
+
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:16<00:01,  1.57s/it][ALoading pipeline components...: 100%|██████████| 6/6 [00:34<00:00,  5.75s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:34<00:00,  5.76s/it]
+WARNING 12-17 13:21:15 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+
+Loading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.38s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.45s/it]
+Loading pipeline components...: 100%|██████████| 6/6 [00:34<00:00,  7.70s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:34<00:00,  5.80s/it]
+WARNING 12-17 13:21:15 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Loading pipeline components...: 100%|██████████| 6/6 [00:34<00:00,  5.41s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:34<00:00,  5.82s/it]
+WARNING 12-17 13:21:15 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:12<00:06,  1.62s/it][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.39s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.46s/it]
+Loading pipeline components...: 100%|██████████| 6/6 [00:35<00:00,  6.18s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:35<00:00,  5.91s/it]
+WARNING 12-17 13:21:16 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:15<00:03,  1.58s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:12<00:06,  1.57s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:12<00:06,  1.58s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:14<00:04,  1.62s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:16<00:01,  1.59s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:14<00:04,  1.57s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:14<00:04,  1.57s/it][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.41s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.49s/it]
+Loading pipeline components...:  83%|████████▎ | 5/6 [00:38<00:11, 11.07s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:38<00:00,  6.36s/it]
+WARNING 12-17 13:21:19 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:15<00:03,  1.60s/it][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:15<00:03,  1.56s/it][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:15<00:03,  1.56s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:17<00:01,  1.60s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:17<00:01,  1.54s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:17<00:01,  1.57s/it][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:18<00:00,  1.41s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:18<00:00,  1.54s/it]
+Loading pipeline components...:  67%|██████▋   | 4/6 [00:40<00:25, 12.76s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.36s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:17<00:00,  1.50s/it]
+Loading pipeline components...:  50%|█████     | 3/6 [00:41<00:40, 13.45s/it]Loading pipeline components...:  67%|██████▋   | 4/6 [00:41<00:16,  8.22s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 190.32it/s]
+Loading pipeline components...: 100%|██████████| 6/6 [00:41<00:00,  6.90s/it]
+WARNING 12-17 13:21:22 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Loading pipeline components...: 100%|██████████| 6/6 [00:41<00:00,  6.29s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:41<00:00,  6.91s/it]
+WARNING 12-17 13:21:22 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+
+Loading checkpoint shards: 100%|██████████| 12/12 [00:18<00:00,  1.37s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:18<00:00,  1.51s/it]
+Loading pipeline components...: 100%|██████████| 6/6 [00:41<00:00,  7.84s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:41<00:00,  6.92s/it]
+WARNING 12-17 13:21:22 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 6 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 0 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 1 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 4 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 2 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 5 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 7 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0[Gloo] Rank  is connected to 0 peer ranks. 0Expected number of connected peer ranks is :  is connected to 00 peer ranks. Expected number of connected peer ranks is : 
+0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Running i2v task
+Input width and height are used to calculate the max area for the video and the output video's aspect ratio is retained from the input image.
+Input image resolution: 1104x832
+Generating a video with resolution: 1104x832
+  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+/venv/lib/python3.12/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+[rank1]:W1217 13:22:34.906000 417907 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank1]:W1217 13:22:34.908000 417907 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank1]:W1217 13:22:34.909000 417907 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank5]:W1217 13:22:35.116000 417911 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank5]:W1217 13:22:35.118000 417911 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank5]:W1217 13:22:35.118000 417911 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank4]:W1217 13:22:35.126000 417910 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank4]:W1217 13:22:35.128000 417910 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank4]:W1217 13:22:35.129000 417910 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank6]:W1217 13:22:35.219000 417912 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank6]:W1217 13:22:35.220000 417912 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank6]:W1217 13:22:35.221000 417912 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank7]:W1217 13:22:35.371000 417913 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank7]:W1217 13:22:35.373000 417913 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank7]:W1217 13:22:35.374000 417913 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank3]:W1217 13:22:35.453000 417909 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank3]:W1217 13:22:35.455000 417909 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank3]:W1217 13:22:35.456000 417909 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank2]:W1217 13:22:35.625000 417908 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank2]:W1217 13:22:35.627000 417908 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank2]:W1217 13:22:35.628000 417908 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank0]:W1217 13:22:36.121000 417906 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank0]:W1217 13:22:36.124000 417906 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+[rank0]:W1217 13:22:36.125000 417906 torch/_inductor/utils.py:2357] [11/1_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank1]:W1217 13:22:41.997000 417907 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank1]:W1217 13:22:41.998000 417907 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank1]:W1217 13:22:41.999000 417907 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank3]:W1217 13:22:42.220000 417909 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank3]:W1217 13:22:42.222000 417909 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank3]:W1217 13:22:42.223000 417909 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank2]:W1217 13:22:42.645000 417908 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank2]:W1217 13:22:42.646000 417908 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank2]:W1217 13:22:42.647000 417908 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank4]:W1217 13:22:42.766000 417910 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank4]:W1217 13:22:42.767000 417910 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank4]:W1217 13:22:42.768000 417910 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank7]:W1217 13:22:43.712000 417913 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank7]:W1217 13:22:43.713000 417913 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank7]:W1217 13:22:43.714000 417913 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank6]:W1217 13:22:44.394000 417912 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank6]:W1217 13:22:44.395000 417912 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank6]:W1217 13:22:44.396000 417912 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank5]:W1217 13:22:46.581000 417911 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank5]:W1217 13:22:46.582000 417911 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank5]:W1217 13:22:46.583000 417911 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank0]:W1217 13:22:49.589000 417906 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank0]:W1217 13:22:49.591000 417906 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+[rank0]:W1217 13:22:49.592000 417906 torch/_inductor/utils.py:2357] [11/2_1] DeviceCopy in input program
+final peak_memory=0
+final peak_memory=0
+final peak_memory=0
+[rank3]:W1217 13:22:58.584000 417909 torch/_dynamo/convert_frame.py:1358] [11/8] torch._dynamo hit config.recompile_limit (8)
+[rank3]:W1217 13:22:58.584000 417909 torch/_dynamo/convert_frame.py:1358] [11/8]    function: '__call__' (/home/jukorhon/aiter/op_tests/sagev1_tests/utils.py:37)
+[rank3]:W1217 13:22:58.584000 417909 torch/_dynamo/convert_frame.py:1358] [11/8]    last reason: 11/7: tensor 'k' size mismatch at index 1. expected 512, actual 75352
+[rank3]:W1217 13:22:58.584000 417909 torch/_dynamo/convert_frame.py:1358] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank3]:W1217 13:22:58.584000 417909 torch/_dynamo/convert_frame.py:1358] [11/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[rank7]:W1217 13:22:58.584000 417913 torch/_dynamo/convert_frame.py:1358] [11/8] torch._dynamo hit config.recompile_limit (8)
+[rank7]:W1217 13:22:58.584000 417913 torch/_dynamo/convert_frame.py:1358] [11/8]    function: '__call__' (/home/jukorhon/aiter/op_tests/sagev1_tests/utils.py:37)
+[rank7]:W1217 13:22:58.584000 417913 torch/_dynamo/convert_frame.py:1358] [11/8]    last reason: 11/7: tensor 'k' size mismatch at index 1. expected 512, actual 75352
+[rank7]:W1217 13:22:58.584000 417913 torch/_dynamo/convert_frame.py:1358] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank7]:W1217 13:22:58.584000 417913 torch/_dynamo/convert_frame.py:1358] [11/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[rank0]:W1217 13:22:58.586000 417906 torch/_dynamo/convert_frame.py:1358] [11/8] torch._dynamo hit config.recompile_limit (8)
+[rank0]:W1217 13:22:58.586000 417906 torch/_dynamo/convert_frame.py:1358] [11/8]    function: '__call__' (/home/jukorhon/aiter/op_tests/sagev1_tests/utils.py:37)
+[rank0]:W1217 13:22:58.586000 417906 torch/_dynamo/convert_frame.py:1358] [11/8]    last reason: 11/7: tensor 'k' size mismatch at index 1. expected 512, actual 75352
+[rank0]:W1217 13:22:58.586000 417906 torch/_dynamo/convert_frame.py:1358] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank0]:W1217 13:22:58.586000 417906 torch/_dynamo/convert_frame.py:1358] [11/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[rank2]:W1217 13:22:58.587000 417908 torch/_dynamo/convert_frame.py:1358] [11/8] torch._dynamo hit config.recompile_limit (8)
+[rank2]:W1217 13:22:58.587000 417908 torch/_dynamo/convert_frame.py:1358] [11/8]    function: '__call__' (/home/jukorhon/aiter/op_tests/sagev1_tests/utils.py:37)
+[rank2]:W1217 13:22:58.587000 417908 torch/_dynamo/convert_frame.py:1358] [11/8]    last reason: 11/7: tensor 'k' size mismatch at index 1. expected 512, actual 75352
+[rank2]:W1217 13:22:58.587000 417908 torch/_dynamo/convert_frame.py:1358] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank2]:W1217 13:22:58.587000 417908 torch/_dynamo/convert_frame.py:1358] [11/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[rank4]:W1217 13:22:58.793000 417910 torch/_dynamo/convert_frame.py:1358] [11/8] torch._dynamo hit config.recompile_limit (8)
+[rank4]:W1217 13:22:58.793000 417910 torch/_dynamo/convert_frame.py:1358] [11/8]    function: '__call__' (/home/jukorhon/aiter/op_tests/sagev1_tests/utils.py:37)
+[rank4]:W1217 13:22:58.793000 417910 torch/_dynamo/convert_frame.py:1358] [11/8]    last reason: 11/7: tensor 'k' size mismatch at index 1. expected 512, actual 75352
+[rank4]:W1217 13:22:58.793000 417910 torch/_dynamo/convert_frame.py:1358] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank4]:W1217 13:22:58.793000 417910 torch/_dynamo/convert_frame.py:1358] [11/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[rank1]:W1217 13:22:58.793000 417907 torch/_dynamo/convert_frame.py:1358] [11/8] torch._dynamo hit config.recompile_limit (8)
+[rank1]:W1217 13:22:58.793000 417907 torch/_dynamo/convert_frame.py:1358] [11/8]    function: '__call__' (/home/jukorhon/aiter/op_tests/sagev1_tests/utils.py:37)
+[rank1]:W1217 13:22:58.793000 417907 torch/_dynamo/convert_frame.py:1358] [11/8]    last reason: 11/7: tensor 'k' size mismatch at index 1. expected 512, actual 75352
+[rank1]:W1217 13:22:58.793000 417907 torch/_dynamo/convert_frame.py:1358] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank1]:W1217 13:22:58.793000 417907 torch/_dynamo/convert_frame.py:1358] [11/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[rank5]:W1217 13:22:58.794000 417911 torch/_dynamo/convert_frame.py:1358] [11/8] torch._dynamo hit config.recompile_limit (8)
+[rank5]:W1217 13:22:58.794000 417911 torch/_dynamo/convert_frame.py:1358] [11/8]    function: '__call__' (/home/jukorhon/aiter/op_tests/sagev1_tests/utils.py:37)
+[rank5]:W1217 13:22:58.794000 417911 torch/_dynamo/convert_frame.py:1358] [11/8]    last reason: 11/7: tensor 'k' size mismatch at index 1. expected 512, actual 75352
+[rank5]:W1217 13:22:58.794000 417911 torch/_dynamo/convert_frame.py:1358] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank5]:W1217 13:22:58.794000 417911 torch/_dynamo/convert_frame.py:1358] [11/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+[rank6]:W1217 13:22:58.795000 417912 torch/_dynamo/convert_frame.py:1358] [11/8] torch._dynamo hit config.recompile_limit (8)
+[rank6]:W1217 13:22:58.795000 417912 torch/_dynamo/convert_frame.py:1358] [11/8]    function: '__call__' (/home/jukorhon/aiter/op_tests/sagev1_tests/utils.py:37)
+[rank6]:W1217 13:22:58.795000 417912 torch/_dynamo/convert_frame.py:1358] [11/8]    last reason: 11/7: tensor 'k' size mismatch at index 1. expected 512, actual 75352
+[rank6]:W1217 13:22:58.795000 417912 torch/_dynamo/convert_frame.py:1358] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+[rank6]:W1217 13:22:58.795000 417912 torch/_dynamo/convert_frame.py:1358] [11/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+INFO:utils:Reached capture limit of 10. Continuing without saving.
+INFO:utils:Reached capture limit of 10. Continuing without saving.
+INFO:utils:Reached capture limit of 10. Continuing without saving.
+INFO:utils:Reached capture limit of 10. Continuing without saving.
+INFO:utils:Reached capture limit of 10. Continuing without saving.
+INFO:utils:Reached capture limit of 10. Continuing without saving.
+INFO:utils:Reached capture limit of 10. Continuing without saving.
+INFO:utils:Reached capture limit of 10. Continuing without saving.
+  2%|▎         | 1/40 [01:43<1:07:32, 103.90s/it]  2%|▎         | 1/40 [01:52<1:13:18, 112.78s/it]  2%|▎         | 1/40 [01:54<1:14:18, 114.31s/it]  2%|▎         | 1/40 [01:53<1:13:44, 113.45s/it]  2%|▎         | 1/40 [01:53<1:13:41, 113.37s/it]  2%|▎         | 1/40 [01:49<1:11:25, 109.88s/it]  2%|▎         | 1/40 [01:52<1:13:08, 112.54s/it]  2%|▎         | 1/40 [01:43<1:07:16, 103.49s/it]  5%|▌         | 2/40 [01:47<28:29, 45.00s/it]     5%|▌         | 2/40 [01:56<30:48, 48.65s/it]     5%|▌         | 2/40 [01:57<30:58, 48.90s/it]     5%|▌         | 2/40 [01:58<31:12, 49.29s/it]     5%|▌         | 2/40 [01:57<30:59, 48.93s/it]     5%|▌         | 2/40 [01:53<30:03, 47.46s/it]     5%|▌         | 2/40 [01:56<30:45, 48.55s/it]     5%|▌         | 2/40 [01:47<28:23, 44.83s/it]     8%|▊         | 3/40 [02:01<17:28, 28.35s/it]  8%|▊         | 3/40 [01:51<16:09, 26.22s/it]  8%|▊         | 3/40 [02:00<17:28, 28.33s/it]  8%|▊         | 3/40 [02:01<17:36, 28.54s/it]  8%|▊         | 3/40 [01:57<16:59, 27.55s/it]  8%|▊         | 3/40 [02:00<17:23, 28.20s/it]  8%|▊         | 3/40 [02:00<17:21, 28.15s/it]  8%|▊         | 3/40 [01:51<16:06, 26.12s/it] 10%|█         | 4/40 [02:13<13:06, 21.85s/it] 10%|█         | 4/40 [02:12<13:02, 21.74s/it] 10%|█         | 4/40 [02:12<12:59, 21.65s/it] 10%|█         | 4/40 [02:12<13:02, 21.73s/it] 10%|█         | 4/40 [02:09<12:45, 21.25s/it] 10%|█         | 4/40 [02:02<12:13, 20.39s/it] 10%|█         | 4/40 [02:11<12:58, 21.61s/it] 10%|█         | 4/40 [02:03<12:16, 20.44s/it] 12%|█▎        | 5/40 [02:26<10:47, 18.51s/it] 12%|█▎        | 5/40 [02:25<10:45, 18.43s/it] 12%|█▎        | 5/40 [02:25<10:44, 18.42s/it] 12%|█▎        | 5/40 [02:24<10:42, 18.35s/it] 12%|█▎        | 5/40 [02:24<10:43, 18.37s/it] 12%|█▎        | 5/40 [02:21<10:34, 18.12s/it] 12%|█▎        | 5/40 [02:15<10:14, 17.57s/it] 12%|█▎        | 5/40 [02:15<10:16, 17.60s/it] 15%|█▌        | 6/40 [02:37<09:18, 16.44s/it] 15%|█▌        | 6/40 [02:38<09:20, 16.49s/it] 15%|█▌        | 6/40 [02:37<09:18, 16.43s/it] 15%|█▌        | 6/40 [02:36<09:17, 16.39s/it] 15%|█▌        | 6/40 [02:37<09:17, 16.40s/it] 15%|█▌        | 6/40 [02:34<09:11, 16.23s/it] 15%|█▌        | 6/40 [02:27<08:59, 15.87s/it] 15%|█▌        | 6/40 [02:28<09:00, 15.89s/it] 18%|█▊        | 7/40 [02:51<08:21, 15.19s/it] 18%|█▊        | 7/40 [02:50<08:20, 15.16s/it] 18%|█▊        | 7/40 [02:46<08:15, 15.02s/it] 18%|█▊        | 7/40 [02:49<08:19, 15.13s/it] 18%|█▊        | 7/40 [02:49<08:19, 15.12s/it] 18%|█▊        | 7/40 [02:40<08:07, 14.78s/it] 18%|█▊        | 7/40 [02:50<08:20, 15.16s/it] 18%|█▊        | 7/40 [02:40<08:08, 14.79s/it] 20%|██        | 8/40 [03:02<07:37, 14.31s/it] 20%|██        | 8/40 [03:03<07:38, 14.33s/it] 20%|██        | 8/40 [02:59<07:34, 14.22s/it] 20%|██        | 8/40 [03:02<07:37, 14.29s/it] 20%|██        | 8/40 [03:02<07:37, 14.31s/it] 20%|██        | 8/40 [02:52<07:29, 14.05s/it] 20%|██        | 8/40 [03:01<07:37, 14.29s/it] 20%|██        | 8/40 [02:53<07:29, 14.06s/it] 22%|██▎       | 9/40 [03:14<06:51, 13.26s/it] 22%|██▎       | 9/40 [03:13<06:50, 13.24s/it] 22%|██▎       | 9/40 [03:04<06:45, 13.07s/it] 22%|██▎       | 9/40 [03:13<06:50, 13.23s/it] 22%|██▎       | 9/40 [03:10<06:48, 13.18s/it] 22%|██▎       | 9/40 [03:13<06:50, 13.25s/it] 22%|██▎       | 9/40 [03:03<06:45, 13.07s/it] 22%|██▎       | 9/40 [03:12<06:50, 13.23s/it] 25%|██▌       | 10/40 [03:18<05:09, 10.32s/it] 25%|██▌       | 10/40 [03:17<05:09, 10.31s/it] 25%|██▌       | 10/40 [03:07<05:05, 10.19s/it] 25%|██▌       | 10/40 [03:07<05:05, 10.19s/it] 25%|██▌       | 10/40 [03:16<05:09, 10.30s/it] 25%|██▌       | 10/40 [03:13<05:07, 10.27s/it] 25%|██▌       | 10/40 [03:16<05:08, 10.30s/it] 25%|██▌       | 10/40 [03:17<05:09, 10.31s/it] 28%|██▊       | 11/40 [03:21<04:00,  8.30s/it] 28%|██▊       | 11/40 [03:22<04:00,  8.31s/it] 28%|██▊       | 11/40 [03:11<03:58,  8.22s/it] 28%|██▊       | 11/40 [03:21<04:00,  8.30s/it] 28%|██▊       | 11/40 [03:20<04:00,  8.30s/it] 28%|██▊       | 11/40 [03:17<03:59,  8.27s/it] 28%|██▊       | 11/40 [03:20<04:00,  8.29s/it] 28%|██▊       | 11/40 [03:11<03:58,  8.22s/it] 30%|███       | 12/40 [03:15<03:12,  6.86s/it] 30%|███       | 12/40 [03:24<03:13,  6.92s/it] 30%|███       | 12/40 [03:24<03:13,  6.92s/it] 30%|███       | 12/40 [03:24<03:13,  6.91s/it] 30%|███       | 12/40 [03:25<03:13,  6.92s/it] 30%|███       | 12/40 [03:15<03:11,  6.86s/it] 30%|███       | 12/40 [03:24<03:13,  6.91s/it] 30%|███       | 12/40 [03:21<03:13,  6.89s/it] 32%|███▎      | 13/40 [03:19<02:39,  5.92s/it] 32%|███▎      | 13/40 [03:28<02:40,  5.95s/it] 32%|███▎      | 13/40 [03:29<02:40,  5.96s/it] 32%|███▎      | 13/40 [03:28<02:40,  5.96s/it] 32%|███▎      | 13/40 [03:25<02:40,  5.94s/it] 32%|███▎      | 13/40 [03:28<02:40,  5.96s/it] 32%|███▎      | 13/40 [03:18<02:39,  5.91s/it] 32%|███▎      | 13/40 [03:27<02:40,  5.95s/it] 35%|███▌      | 14/40 [03:32<02:17,  5.30s/it] 35%|███▌      | 14/40 [03:22<02:17,  5.28s/it] 35%|███▌      | 14/40 [03:32<02:17,  5.30s/it] 35%|███▌      | 14/40 [03:33<02:17,  5.31s/it] 35%|███▌      | 14/40 [03:31<02:17,  5.30s/it] 35%|███▌      | 14/40 [03:28<02:17,  5.29s/it] 35%|███▌      | 14/40 [03:22<02:17,  5.27s/it] 35%|███▌      | 14/40 [03:31<02:17,  5.30s/it] 38%|███▊      | 15/40 [03:26<02:00,  4.82s/it] 38%|███▊      | 15/40 [03:36<02:00,  4.84s/it] 38%|███▊      | 15/40 [03:36<02:00,  4.84s/it] 38%|███▊      | 15/40 [03:37<02:00,  4.84s/it] 38%|███▊      | 15/40 [03:26<02:00,  4.82s/it] 38%|███▊      | 15/40 [03:35<02:00,  4.84s/it] 38%|███▊      | 15/40 [03:35<02:00,  4.83s/it] 38%|███▊      | 15/40 [03:32<02:00,  4.83s/it] 40%|████      | 16/40 [03:40<01:48,  4.51s/it] 40%|████      | 16/40 [03:30<01:47,  4.50s/it] 40%|████      | 16/40 [03:40<01:48,  4.51s/it] 40%|████      | 16/40 [03:39<01:48,  4.51s/it] 40%|████      | 16/40 [03:30<01:47,  4.50s/it] 40%|████      | 16/40 [03:39<01:48,  4.51s/it] 40%|████      | 16/40 [03:36<01:48,  4.50s/it] 40%|████      | 16/40 [03:39<01:48,  4.51s/it] 42%|████▎     | 17/40 [03:43<01:38,  4.28s/it] 42%|████▎     | 17/40 [03:34<01:38,  4.27s/it] 42%|████▎     | 17/40 [03:44<01:38,  4.28s/it] 42%|████▎     | 17/40 [03:43<01:38,  4.28s/it] 42%|████▎     | 17/40 [03:40<01:38,  4.28s/it] 42%|████▎     | 17/40 [03:43<01:38,  4.28s/it] 42%|████▎     | 17/40 [03:33<01:38,  4.27s/it] 42%|████▎     | 17/40 [03:42<01:38,  4.28s/it] 45%|████▌     | 18/40 [03:47<01:30,  4.13s/it] 45%|████▌     | 18/40 [03:37<01:30,  4.12s/it] 45%|████▌     | 18/40 [03:46<01:30,  4.13s/it] 45%|████▌     | 18/40 [03:48<01:30,  4.13s/it] 45%|████▌     | 18/40 [03:47<01:30,  4.13s/it] 45%|████▌     | 18/40 [03:37<01:30,  4.12s/it] 45%|████▌     | 18/40 [03:43<01:30,  4.12s/it] 45%|████▌     | 18/40 [03:46<01:30,  4.12s/it] 48%|████▊     | 19/40 [03:51<01:24,  4.01s/it] 48%|████▊     | 19/40 [03:52<01:24,  4.01s/it] 48%|████▊     | 19/40 [03:41<01:24,  4.01s/it] 48%|████▊     | 19/40 [03:50<01:24,  4.01s/it] 48%|████▊     | 19/40 [03:41<01:24,  4.01s/it] 48%|████▊     | 19/40 [03:51<01:24,  4.01s/it] 48%|████▊     | 19/40 [03:47<01:24,  4.01s/it] 48%|████▊     | 19/40 [03:50<01:24,  4.01s/it] 50%|█████     | 20/40 [03:55<01:18,  3.94s/it] 50%|█████     | 20/40 [03:55<01:18,  3.94s/it] 50%|█████     | 20/40 [03:45<01:18,  3.94s/it] 50%|█████     | 20/40 [03:51<01:18,  3.94s/it] 50%|█████     | 20/40 [03:54<01:18,  3.94s/it] 50%|█████     | 20/40 [03:54<01:18,  3.94s/it] 50%|█████     | 20/40 [03:45<01:18,  3.94s/it] 50%|█████     | 20/40 [03:54<01:18,  3.94s/it] 52%|█████▎    | 21/40 [03:58<01:13,  3.89s/it] 52%|█████▎    | 21/40 [03:49<01:13,  3.88s/it] 52%|█████▎    | 21/40 [03:59<01:13,  3.89s/it] 52%|█████▎    | 21/40 [03:58<01:13,  3.89s/it] 52%|█████▎    | 21/40 [03:57<01:13,  3.89s/it] 52%|█████▎    | 21/40 [03:58<01:13,  3.89s/it] 52%|█████▎    | 21/40 [03:55<01:13,  3.89s/it] 52%|█████▎    | 21/40 [03:48<01:13,  3.88s/it] 55%|█████▌    | 22/40 [04:02<01:09,  3.85s/it] 55%|█████▌    | 22/40 [04:03<01:09,  3.85s/it] 55%|█████▌    | 22/40 [03:53<01:09,  3.85s/it] 55%|█████▌    | 22/40 [03:52<01:09,  3.85s/it] 55%|█████▌    | 22/40 [04:01<01:09,  3.85s/it] 55%|█████▌    | 22/40 [04:02<01:09,  3.85s/it] 55%|█████▌    | 22/40 [03:59<01:09,  3.85s/it] 55%|█████▌    | 22/40 [04:01<01:09,  3.85s/it] 57%|█████▊    | 23/40 [03:56<01:04,  3.82s/it] 57%|█████▊    | 23/40 [04:06<01:05,  3.82s/it] 57%|█████▊    | 23/40 [04:07<01:05,  3.82s/it] 57%|█████▊    | 23/40 [04:02<01:05,  3.82s/it] 57%|█████▊    | 23/40 [04:06<01:05,  3.82s/it] 57%|█████▊    | 23/40 [04:05<01:05,  3.82s/it] 57%|█████▊    | 23/40 [03:56<01:04,  3.82s/it] 57%|█████▊    | 23/40 [04:05<01:05,  3.82s/it] 60%|██████    | 24/40 [04:00<01:00,  3.81s/it] 60%|██████    | 24/40 [04:10<01:00,  3.81s/it] 60%|██████    | 24/40 [04:09<01:00,  3.81s/it] 60%|██████    | 24/40 [04:10<01:00,  3.81s/it] 60%|██████    | 24/40 [04:10<01:00,  3.81s/it] 60%|██████    | 24/40 [04:00<01:00,  3.81s/it] 60%|██████    | 24/40 [04:09<01:00,  3.81s/it] 60%|██████    | 24/40 [04:06<01:00,  3.81s/it] 62%|██████▎   | 25/40 [04:13<00:56,  3.80s/it] 62%|██████▎   | 25/40 [04:14<00:56,  3.80s/it] 62%|██████▎   | 25/40 [04:04<00:56,  3.80s/it] 62%|██████▎   | 25/40 [04:13<00:56,  3.80s/it] 62%|██████▎   | 25/40 [04:03<00:56,  3.80s/it] 62%|██████▎   | 25/40 [04:13<00:56,  3.80s/it] 62%|██████▎   | 25/40 [04:10<00:56,  3.80s/it] 62%|██████▎   | 25/40 [04:12<00:56,  3.80s/it] 65%|██████▌   | 26/40 [04:17<00:53,  3.79s/it] 65%|██████▌   | 26/40 [04:08<00:53,  3.79s/it] 65%|██████▌   | 26/40 [04:18<00:53,  3.79s/it] 65%|██████▌   | 26/40 [04:16<00:53,  3.79s/it] 65%|██████▌   | 26/40 [04:17<00:53,  3.79s/it] 65%|██████▌   | 26/40 [04:16<00:53,  3.79s/it] 65%|██████▌   | 26/40 [04:07<00:53,  3.79s/it] 65%|██████▌   | 26/40 [04:14<00:53,  3.79s/it] 68%|██████▊   | 27/40 [04:21<00:49,  3.79s/it] 68%|██████▊   | 27/40 [04:11<00:49,  3.79s/it] 68%|██████▊   | 27/40 [04:22<00:49,  3.79s/it] 68%|██████▊   | 27/40 [04:21<00:49,  3.79s/it] 68%|██████▊   | 27/40 [04:20<00:49,  3.79s/it] 68%|██████▊   | 27/40 [04:17<00:49,  3.79s/it] 68%|██████▊   | 27/40 [04:20<00:49,  3.79s/it] 68%|██████▊   | 27/40 [04:11<00:49,  3.79s/it] 70%|███████   | 28/40 [04:15<00:45,  3.78s/it] 70%|███████   | 28/40 [04:26<00:45,  3.78s/it] 70%|███████   | 28/40 [04:25<00:45,  3.78s/it] 70%|███████   | 28/40 [04:21<00:45,  3.78s/it] 70%|███████   | 28/40 [04:24<00:45,  3.78s/it] 70%|███████   | 28/40 [04:24<00:45,  3.78s/it] 70%|███████   | 28/40 [04:25<00:45,  3.78s/it] 70%|███████   | 28/40 [04:15<00:45,  3.78s/it] 72%|███████▎  | 29/40 [04:34<01:00,  5.52s/it] 72%|███████▎  | 29/40 [04:33<01:00,  5.52s/it] 72%|███████▎  | 29/40 [04:25<01:00,  5.52s/it] 72%|███████▎  | 29/40 [04:34<01:00,  5.52s/it] 72%|███████▎  | 29/40 [04:34<01:00,  5.52s/it] 72%|███████▎  | 29/40 [04:35<01:00,  5.52s/it] 72%|███████▎  | 29/40 [04:31<01:00,  5.52s/it] 72%|███████▎  | 29/40 [04:24<01:00,  5.53s/it] 75%|███████▌  | 30/40 [04:50<01:27,  8.72s/it] 75%|███████▌  | 30/40 [04:41<01:27,  8.72s/it] 75%|███████▌  | 30/40 [04:50<01:27,  8.72s/it] 75%|███████▌  | 30/40 [04:50<01:27,  8.72s/it] 75%|███████▌  | 30/40 [04:50<01:27,  8.72s/it] 75%|███████▌  | 30/40 [04:47<01:27,  8.72s/it] 75%|███████▌  | 30/40 [04:51<01:27,  8.72s/it] 75%|███████▌  | 30/40 [04:41<01:27,  8.72s/it] 78%|███████▊  | 31/40 [04:55<01:09,  7.72s/it] 78%|███████▊  | 31/40 [04:57<01:09,  7.72s/it] 78%|███████▊  | 31/40 [04:55<01:09,  7.72s/it] 78%|███████▊  | 31/40 [04:46<01:09,  7.72s/it] 78%|███████▊  | 31/40 [04:46<01:09,  7.72s/it] 78%|███████▊  | 31/40 [04:52<01:09,  7.72s/it] 78%|███████▊  | 31/40 [04:56<01:09,  7.72s/it] 78%|███████▊  | 31/40 [04:56<01:09,  7.72s/it] 80%|████████  | 32/40 [05:02<00:59,  7.43s/it] 80%|████████  | 32/40 [05:02<00:59,  7.43s/it] 80%|████████  | 32/40 [05:03<00:59,  7.43s/it] 80%|████████  | 32/40 [05:03<00:59,  7.43s/it] 80%|████████  | 32/40 [04:53<00:59,  7.43s/it] 80%|████████  | 32/40 [05:03<00:59,  7.43s/it] 80%|████████  | 32/40 [04:59<00:59,  7.43s/it] 80%|████████  | 32/40 [04:53<00:59,  7.43s/it] 82%|████████▎ | 33/40 [05:00<00:50,  7.18s/it] 82%|████████▎ | 33/40 [05:09<00:50,  7.18s/it] 82%|████████▎ | 33/40 [05:10<00:50,  7.18s/it] 82%|████████▎ | 33/40 [05:09<00:50,  7.18s/it] 82%|████████▎ | 33/40 [05:08<00:50,  7.18s/it] 82%|████████▎ | 33/40 [05:09<00:50,  7.18s/it] 82%|████████▎ | 33/40 [04:59<00:50,  7.18s/it] 82%|████████▎ | 33/40 [05:06<00:50,  7.18s/it] 85%|████████▌ | 34/40 [05:04<00:37,  6.21s/it] 85%|████████▌ | 34/40 [05:13<00:37,  6.21s/it] 85%|████████▌ | 34/40 [05:14<00:37,  6.21s/it] 85%|████████▌ | 34/40 [05:13<00:37,  6.21s/it] 85%|████████▌ | 34/40 [05:12<00:37,  6.21s/it] 85%|████████▌ | 34/40 [05:12<00:37,  6.21s/it] 85%|████████▌ | 34/40 [05:10<00:37,  6.21s/it] 85%|████████▌ | 34/40 [05:03<00:37,  6.21s/it] 88%|████████▊ | 35/40 [05:07<00:27,  5.48s/it] 88%|████████▊ | 35/40 [05:17<00:27,  5.48s/it] 88%|████████▊ | 35/40 [05:18<00:27,  5.48s/it] 88%|████████▊ | 35/40 [05:17<00:27,  5.48s/it] 88%|████████▊ | 35/40 [05:16<00:27,  5.48s/it] 88%|████████▊ | 35/40 [05:16<00:27,  5.48s/it] 88%|████████▊ | 35/40 [05:13<00:27,  5.48s/it] 88%|████████▊ | 35/40 [05:07<00:27,  5.48s/it] 90%|█████████ | 36/40 [05:21<00:19,  4.99s/it] 90%|█████████ | 36/40 [05:11<00:19,  4.99s/it] 90%|█████████ | 36/40 [05:20<00:19,  4.99s/it] 90%|█████████ | 36/40 [05:22<00:19,  4.99s/it] 90%|█████████ | 36/40 [05:20<00:19,  4.99s/it] 90%|█████████ | 36/40 [05:17<00:19,  4.99s/it] 90%|█████████ | 36/40 [05:21<00:19,  4.99s/it] 90%|█████████ | 36/40 [05:11<00:19,  4.98s/it] 92%|█████████▎| 37/40 [05:15<00:13,  4.66s/it] 92%|█████████▎| 37/40 [05:26<00:13,  4.66s/it] 92%|█████████▎| 37/40 [05:25<00:13,  4.66s/it] 92%|█████████▎| 37/40 [05:24<00:13,  4.66s/it] 92%|█████████▎| 37/40 [05:25<00:13,  4.66s/it] 92%|█████████▎| 37/40 [05:24<00:13,  4.66s/it] 92%|█████████▎| 37/40 [05:15<00:13,  4.66s/it] 92%|█████████▎| 37/40 [05:21<00:13,  4.66s/it] 95%|█████████▌| 38/40 [05:19<00:08,  4.40s/it] 95%|█████████▌| 38/40 [05:25<00:08,  4.40s/it] 95%|█████████▌| 38/40 [05:28<00:08,  4.40s/it] 95%|█████████▌| 38/40 [05:29<00:08,  4.40s/it] 95%|█████████▌| 38/40 [05:28<00:08,  4.40s/it] 95%|█████████▌| 38/40 [05:28<00:08,  4.40s/it] 95%|█████████▌| 38/40 [05:28<00:08,  4.40s/it] 95%|█████████▌| 38/40 [05:18<00:08,  4.40s/it] 98%|█████████▊| 39/40 [05:23<00:04,  4.21s/it] 98%|█████████▊| 39/40 [05:33<00:04,  4.21s/it] 98%|█████████▊| 39/40 [05:32<00:04,  4.21s/it] 98%|█████████▊| 39/40 [05:32<00:04,  4.21s/it] 98%|█████████▊| 39/40 [05:29<00:04,  4.21s/it] 98%|█████████▊| 39/40 [05:32<00:04,  4.21s/it] 98%|█████████▊| 39/40 [05:31<00:04,  4.21s/it] 98%|█████████▊| 39/40 [05:22<00:04,  4.21s/it]100%|██████████| 40/40 [05:37<00:00,  4.08s/it]100%|██████████| 40/40 [05:26<00:00,  4.08s/it]100%|██████████| 40/40 [05:36<00:00,  4.08s/it]100%|██████████| 40/40 [05:32<00:00,  4.08s/it]100%|██████████| 40/40 [05:37<00:00,  8.43s/it]
+100%|██████████| 40/40 [05:26<00:00,  8.17s/it]
+100%|██████████| 40/40 [05:36<00:00,  8.41s/it]
+100%|██████████| 40/40 [05:35<00:00,  4.08s/it]100%|██████████| 40/40 [05:35<00:00,  4.08s/it]100%|██████████| 40/40 [05:32<00:00,  8.32s/it]
+100%|██████████| 40/40 [05:35<00:00,  8.39s/it]
+100%|██████████| 40/40 [05:35<00:00,  8.40s/it]
+100%|██████████| 40/40 [05:36<00:00,  4.08s/it]100%|██████████| 40/40 [05:36<00:00,  8.41s/it]
+100%|██████████| 40/40 [05:26<00:00,  4.08s/it]100%|██████████| 40/40 [05:26<00:00,  8.16s/it]
+  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  2%|▎         | 1/40 [00:03<02:29,  3.83s/it]  2%|▎         | 1/40 [00:03<02:29,  3.82s/it]  2%|▎         | 1/40 [00:04<02:40,  4.11s/it]  2%|▎         | 1/40 [00:04<02:40,  4.12s/it]  2%|▎         | 1/40 [00:03<02:29,  3.84s/it]  2%|▎         | 1/40 [00:03<02:28,  3.80s/it]  2%|▎         | 1/40 [00:04<02:40,  4.11s/it]  2%|▎         | 1/40 [00:04<02:40,  4.12s/it]  5%|▌         | 2/40 [00:07<02:24,  3.80s/it]  5%|▌         | 2/40 [00:07<02:24,  3.81s/it]  5%|▌         | 2/40 [00:07<02:24,  3.81s/it]  5%|▌         | 2/40 [00:07<02:29,  3.93s/it]  5%|▌         | 2/40 [00:07<02:29,  3.93s/it]  5%|▌         | 2/40 [00:07<02:25,  3.82s/it]  5%|▌         | 2/40 [00:07<02:29,  3.93s/it]  5%|▌         | 2/40 [00:07<02:29,  3.93s/it]  8%|▊         | 3/40 [00:11<02:20,  3.81s/it]  8%|▊         | 3/40 [00:11<02:23,  3.87s/it]  8%|▊         | 3/40 [00:11<02:23,  3.87s/it]  8%|▊         | 3/40 [00:11<02:23,  3.87s/it]  8%|▊         | 3/40 [00:11<02:20,  3.81s/it]  8%|▊         | 3/40 [00:11<02:20,  3.81s/it]  8%|▊         | 3/40 [00:11<02:23,  3.87s/it]  8%|▊         | 3/40 [00:11<02:20,  3.80s/it] 10%|█         | 4/40 [00:15<02:16,  3.81s/it] 10%|█         | 4/40 [00:15<02:18,  3.84s/it] 10%|█         | 4/40 [00:15<02:16,  3.80s/it] 10%|█         | 4/40 [00:15<02:16,  3.80s/it] 10%|█         | 4/40 [00:15<02:18,  3.84s/it] 10%|█         | 4/40 [00:15<02:18,  3.84s/it] 10%|█         | 4/40 [00:15<02:16,  3.80s/it] 10%|█         | 4/40 [00:15<02:18,  3.84s/it] 12%|█▎        | 5/40 [00:19<02:13,  3.83s/it] 12%|█▎        | 5/40 [00:19<02:13,  3.83s/it] 12%|█▎        | 5/40 [00:19<02:13,  3.83s/it] 12%|█▎        | 5/40 [00:19<02:14,  3.83s/it] 12%|█▎        | 5/40 [00:19<02:13,  3.80s/it] 12%|█▎        | 5/40 [00:19<02:13,  3.80s/it] 12%|█▎        | 5/40 [00:19<02:13,  3.80s/it] 12%|█▎        | 5/40 [00:19<02:13,  3.80s/it] 15%|█▌        | 6/40 [00:22<02:09,  3.81s/it] 15%|█▌        | 6/40 [00:23<02:09,  3.82s/it] 15%|█▌        | 6/40 [00:23<02:09,  3.82s/it] 15%|█▌        | 6/40 [00:23<02:09,  3.82s/it] 15%|█▌        | 6/40 [00:22<02:09,  3.80s/it] 15%|█▌        | 6/40 [00:22<02:09,  3.81s/it] 15%|█▌        | 6/40 [00:22<02:09,  3.80s/it] 15%|█▌        | 6/40 [00:23<02:09,  3.82s/it] 18%|█▊        | 7/40 [00:26<02:05,  3.82s/it] 18%|█▊        | 7/40 [00:26<02:05,  3.82s/it] 18%|█▊        | 7/40 [00:26<02:05,  3.82s/it] 18%|█▊        | 7/40 [00:26<02:05,  3.81s/it] 18%|█▊        | 7/40 [00:26<02:05,  3.81s/it] 18%|█▊        | 7/40 [00:26<02:05,  3.82s/it] 18%|█▊        | 7/40 [00:26<02:05,  3.81s/it] 18%|█▊        | 7/40 [00:26<02:05,  3.81s/it] 20%|██        | 8/40 [00:30<02:02,  3.82s/it] 20%|██        | 8/40 [00:30<02:01,  3.81s/it] 20%|██        | 8/40 [00:30<02:01,  3.81s/it] 20%|██        | 8/40 [00:30<02:01,  3.81s/it] 20%|██        | 8/40 [00:30<02:02,  3.82s/it] 20%|██        | 8/40 [00:30<02:01,  3.81s/it] 20%|██        | 8/40 [00:30<02:02,  3.82s/it] 20%|██        | 8/40 [00:30<02:02,  3.82s/it] 22%|██▎       | 9/40 [00:34<01:58,  3.81s/it] 22%|██▎       | 9/40 [00:34<01:58,  3.81s/it] 22%|██▎       | 9/40 [00:34<01:58,  3.81s/it] 22%|██▎       | 9/40 [00:34<01:58,  3.81s/it] 22%|██▎       | 9/40 [00:34<01:58,  3.81s/it] 22%|██▎       | 9/40 [00:34<01:58,  3.81s/it] 22%|██▎       | 9/40 [00:34<01:58,  3.81s/it] 22%|██▎       | 9/40 [00:34<01:58,  3.81s/it] 25%|██▌       | 10/40 [00:38<01:54,  3.81s/it] 25%|██▌       | 10/40 [00:38<01:54,  3.81s/it] 25%|██▌       | 10/40 [00:38<01:54,  3.81s/it] 25%|██▌       | 10/40 [00:38<01:54,  3.81s/it] 25%|██▌       | 10/40 [00:38<01:54,  3.81s/it] 25%|██▌       | 10/40 [00:38<01:54,  3.81s/it] 25%|██▌       | 10/40 [00:38<01:54,  3.81s/it] 25%|██▌       | 10/40 [00:38<01:54,  3.81s/it] 28%|██▊       | 11/40 [00:42<01:50,  3.81s/it] 28%|██▊       | 11/40 [00:42<01:50,  3.81s/it] 28%|██▊       | 11/40 [00:41<01:50,  3.81s/it] 28%|██▊       | 11/40 [00:41<01:50,  3.81s/it] 28%|██▊       | 11/40 [00:41<01:50,  3.81s/it] 28%|██▊       | 11/40 [00:42<01:50,  3.81s/it] 28%|██▊       | 11/40 [00:41<01:50,  3.81s/it] 28%|██▊       | 11/40 [00:42<01:50,  3.81s/it] 30%|███       | 12/40 [00:45<01:46,  3.81s/it] 30%|███       | 12/40 [00:45<01:46,  3.81s/it] 30%|███       | 12/40 [00:45<01:46,  3.81s/it] 30%|███       | 12/40 [00:45<01:46,  3.81s/it] 30%|███       | 12/40 [00:45<01:46,  3.81s/it] 30%|███       | 12/40 [00:45<01:46,  3.81s/it] 30%|███       | 12/40 [00:45<01:46,  3.81s/it] 30%|███       | 12/40 [00:45<01:46,  3.81s/it] 32%|███▎      | 13/40 [00:49<01:42,  3.81s/it] 32%|███▎      | 13/40 [00:49<01:42,  3.81s/it] 32%|███▎      | 13/40 [00:49<01:42,  3.81s/it] 32%|███▎      | 13/40 [00:49<01:42,  3.81s/it] 32%|███▎      | 13/40 [00:49<01:42,  3.81s/it] 32%|███▎      | 13/40 [00:49<01:42,  3.81s/it] 32%|███▎      | 13/40 [00:49<01:42,  3.81s/it] 32%|███▎      | 13/40 [00:49<01:42,  3.81s/it] 35%|███▌      | 14/40 [00:53<01:39,  3.81s/it] 35%|███▌      | 14/40 [00:53<01:39,  3.81s/it] 35%|███▌      | 14/40 [00:53<01:39,  3.81s/it] 35%|███▌      | 14/40 [00:53<01:39,  3.81s/it] 35%|███▌      | 14/40 [00:53<01:39,  3.81s/it] 35%|███▌      | 14/40 [00:53<01:39,  3.81s/it] 35%|███▌      | 14/40 [00:53<01:39,  3.81s/it] 35%|███▌      | 14/40 [00:53<01:39,  3.81s/it] 38%|███▊      | 15/40 [00:57<01:35,  3.81s/it] 38%|███▊      | 15/40 [00:57<01:35,  3.81s/it] 38%|███▊      | 15/40 [00:57<01:35,  3.81s/it] 38%|███▊      | 15/40 [00:57<01:35,  3.81s/it] 38%|███▊      | 15/40 [00:57<01:35,  3.81s/it] 38%|███▊      | 15/40 [00:57<01:35,  3.81s/it] 38%|███▊      | 15/40 [00:57<01:35,  3.81s/it] 38%|███▊      | 15/40 [00:57<01:35,  3.81s/it] 40%|████      | 16/40 [01:00<01:31,  3.81s/it] 40%|████      | 16/40 [01:00<01:31,  3.81s/it] 40%|████      | 16/40 [01:00<01:31,  3.81s/it] 40%|████      | 16/40 [01:01<01:31,  3.81s/it] 40%|████      | 16/40 [01:01<01:31,  3.81s/it] 40%|████      | 16/40 [01:00<01:31,  3.81s/it] 40%|████      | 16/40 [01:01<01:31,  3.81s/it] 40%|████      | 16/40 [01:01<01:31,  3.81s/it] 42%|████▎     | 17/40 [01:05<01:27,  3.81s/it] 42%|████▎     | 17/40 [01:05<01:27,  3.81s/it] 42%|████▎     | 17/40 [01:04<01:27,  3.81s/it] 42%|████▎     | 17/40 [01:04<01:27,  3.81s/it] 42%|████▎     | 17/40 [01:04<01:27,  3.81s/it] 42%|████▎     | 17/40 [01:04<01:27,  3.81s/it] 42%|████▎     | 17/40 [01:05<01:27,  3.81s/it] 42%|████▎     | 17/40 [01:05<01:27,  3.81s/it] 45%|████▌     | 18/40 [01:08<01:23,  3.81s/it] 45%|████▌     | 18/40 [01:08<01:23,  3.81s/it] 45%|████▌     | 18/40 [01:08<01:23,  3.81s/it] 45%|████▌     | 18/40 [01:08<01:23,  3.81s/it] 45%|████▌     | 18/40 [01:08<01:23,  3.81s/it] 45%|████▌     | 18/40 [01:08<01:23,  3.81s/it] 45%|████▌     | 18/40 [01:08<01:23,  3.81s/it] 45%|████▌     | 18/40 [01:08<01:23,  3.81s/it] 48%|████▊     | 19/40 [01:12<01:19,  3.80s/it] 48%|████▊     | 19/40 [01:12<01:19,  3.80s/it] 48%|████▊     | 19/40 [01:12<01:19,  3.80s/it] 48%|████▊     | 19/40 [01:12<01:19,  3.81s/it] 48%|████▊     | 19/40 [01:12<01:19,  3.81s/it] 48%|████▊     | 19/40 [01:12<01:19,  3.80s/it] 48%|████▊     | 19/40 [01:12<01:19,  3.80s/it] 48%|████▊     | 19/40 [01:12<01:19,  3.81s/it] 50%|█████     | 20/40 [01:16<01:16,  3.80s/it] 50%|█████     | 20/40 [01:16<01:16,  3.80s/it] 50%|█████     | 20/40 [01:16<01:16,  3.80s/it] 50%|█████     | 20/40 [01:16<01:16,  3.80s/it] 50%|█████     | 20/40 [01:16<01:16,  3.80s/it] 50%|█████     | 20/40 [01:16<01:16,  3.80s/it] 50%|█████     | 20/40 [01:16<01:16,  3.80s/it] 50%|█████     | 20/40 [01:16<01:16,  3.80s/it] 52%|█████▎    | 21/40 [01:19<01:12,  3.80s/it] 52%|█████▎    | 21/40 [01:20<01:12,  3.80s/it] 52%|█████▎    | 21/40 [01:19<01:12,  3.80s/it] 52%|█████▎    | 21/40 [01:19<01:12,  3.80s/it] 52%|█████▎    | 21/40 [01:19<01:12,  3.80s/it] 52%|█████▎    | 21/40 [01:20<01:12,  3.80s/it] 52%|█████▎    | 21/40 [01:20<01:12,  3.80s/it] 52%|█████▎    | 21/40 [01:20<01:12,  3.80s/it] 55%|█████▌    | 22/40 [01:23<01:08,  3.81s/it] 55%|█████▌    | 22/40 [01:23<01:08,  3.81s/it] 55%|█████▌    | 22/40 [01:23<01:08,  3.81s/it] 55%|█████▌    | 22/40 [01:23<01:08,  3.81s/it] 55%|█████▌    | 22/40 [01:24<01:08,  3.81s/it] 55%|█████▌    | 22/40 [01:24<01:08,  3.81s/it] 55%|█████▌    | 22/40 [01:24<01:08,  3.81s/it] 55%|█████▌    | 22/40 [01:24<01:08,  3.81s/it] 57%|█████▊    | 23/40 [01:27<01:04,  3.81s/it] 57%|█████▊    | 23/40 [01:27<01:04,  3.81s/it] 57%|█████▊    | 23/40 [01:27<01:04,  3.81s/it] 57%|█████▊    | 23/40 [01:27<01:04,  3.81s/it] 57%|█████▊    | 23/40 [01:27<01:04,  3.81s/it] 57%|█████▊    | 23/40 [01:27<01:04,  3.81s/it] 57%|█████▊    | 23/40 [01:27<01:04,  3.81s/it] 57%|█████▊    | 23/40 [01:27<01:04,  3.81s/it] 60%|██████    | 24/40 [01:31<01:00,  3.81s/it] 60%|██████    | 24/40 [01:31<01:00,  3.81s/it] 60%|██████    | 24/40 [01:31<01:00,  3.81s/it] 60%|██████    | 24/40 [01:31<01:00,  3.81s/it] 60%|██████    | 24/40 [01:31<01:00,  3.81s/it] 60%|██████    | 24/40 [01:31<01:00,  3.81s/it] 60%|██████    | 24/40 [01:31<01:00,  3.81s/it] 60%|██████    | 24/40 [01:31<01:00,  3.81s/it] 62%|██████▎   | 25/40 [01:35<00:57,  3.81s/it] 62%|██████▎   | 25/40 [01:35<00:57,  3.81s/it] 62%|██████▎   | 25/40 [01:35<00:57,  3.81s/it] 62%|██████▎   | 25/40 [01:35<00:57,  3.81s/it] 62%|██████▎   | 25/40 [01:35<00:57,  3.81s/it] 62%|██████▎   | 25/40 [01:35<00:57,  3.81s/it] 62%|██████▎   | 25/40 [01:35<00:57,  3.81s/it] 62%|██████▎   | 25/40 [01:35<00:57,  3.81s/it] 65%|██████▌   | 26/40 [01:39<00:53,  3.81s/it] 65%|██████▌   | 26/40 [01:39<00:53,  3.81s/it] 65%|██████▌   | 26/40 [01:38<00:53,  3.81s/it] 65%|██████▌   | 26/40 [01:38<00:53,  3.81s/it] 65%|██████▌   | 26/40 [01:39<00:53,  3.81s/it] 65%|██████▌   | 26/40 [01:38<00:53,  3.81s/it] 65%|██████▌   | 26/40 [01:39<00:53,  3.81s/it] 65%|██████▌   | 26/40 [01:39<00:53,  3.81s/it] 68%|██████▊   | 27/40 [01:42<00:49,  3.81s/it] 68%|██████▊   | 27/40 [01:42<00:49,  3.81s/it] 68%|██████▊   | 27/40 [01:42<00:49,  3.81s/it] 68%|██████▊   | 27/40 [01:42<00:49,  3.81s/it] 68%|██████▊   | 27/40 [01:43<00:49,  3.81s/it] 68%|██████▊   | 27/40 [01:43<00:49,  3.81s/it] 68%|██████▊   | 27/40 [01:43<00:49,  3.81s/it] 68%|██████▊   | 27/40 [01:43<00:49,  3.81s/it] 70%|███████   | 28/40 [01:46<00:45,  3.81s/it] 70%|███████   | 28/40 [01:46<00:45,  3.81s/it] 70%|███████   | 28/40 [01:46<00:45,  3.81s/it] 70%|███████   | 28/40 [01:46<00:45,  3.81s/it] 70%|███████   | 28/40 [01:46<00:45,  3.81s/it] 70%|███████   | 28/40 [01:46<00:45,  3.81s/it] 70%|███████   | 28/40 [01:46<00:45,  3.81s/it] 70%|███████   | 28/40 [01:46<00:45,  3.81s/it] 72%|███████▎  | 29/40 [01:50<00:41,  3.80s/it] 72%|███████▎  | 29/40 [01:50<00:41,  3.80s/it] 72%|███████▎  | 29/40 [01:50<00:41,  3.80s/it] 72%|███████▎  | 29/40 [01:50<00:41,  3.80s/it] 72%|███████▎  | 29/40 [01:50<00:41,  3.80s/it] 72%|███████▎  | 29/40 [01:50<00:41,  3.80s/it] 72%|███████▎  | 29/40 [01:50<00:41,  3.80s/it] 72%|███████▎  | 29/40 [01:50<00:41,  3.80s/it] 75%|███████▌  | 30/40 [01:54<00:38,  3.81s/it] 75%|███████▌  | 30/40 [01:54<00:38,  3.81s/it] 75%|███████▌  | 30/40 [01:54<00:38,  3.81s/it] 75%|███████▌  | 30/40 [01:54<00:38,  3.81s/it] 75%|███████▌  | 30/40 [01:54<00:38,  3.81s/it] 75%|███████▌  | 30/40 [01:54<00:38,  3.81s/it] 75%|███████▌  | 30/40 [01:54<00:38,  3.81s/it] 75%|███████▌  | 30/40 [01:54<00:38,  3.81s/it] 78%|███████▊  | 31/40 [01:58<00:34,  3.81s/it] 78%|███████▊  | 31/40 [01:58<00:34,  3.81s/it] 78%|███████▊  | 31/40 [01:57<00:34,  3.81s/it] 78%|███████▊  | 31/40 [01:58<00:34,  3.81s/it] 78%|███████▊  | 31/40 [01:58<00:34,  3.81s/it] 78%|███████▊  | 31/40 [01:58<00:34,  3.81s/it] 78%|███████▊  | 31/40 [01:58<00:34,  3.81s/it] 78%|███████▊  | 31/40 [01:58<00:34,  3.81s/it] 80%|████████  | 32/40 [02:01<00:30,  3.81s/it] 80%|████████  | 32/40 [02:01<00:30,  3.81s/it] 80%|████████  | 32/40 [02:01<00:30,  3.81s/it] 80%|████████  | 32/40 [02:01<00:30,  3.81s/it] 80%|████████  | 32/40 [02:02<00:30,  3.81s/it] 80%|████████  | 32/40 [02:02<00:30,  3.81s/it] 80%|████████  | 32/40 [02:02<00:30,  3.81s/it] 80%|████████  | 32/40 [02:02<00:30,  3.81s/it] 82%|████████▎ | 33/40 [02:05<00:26,  3.82s/it] 82%|████████▎ | 33/40 [02:05<00:26,  3.82s/it] 82%|████████▎ | 33/40 [02:05<00:26,  3.82s/it] 82%|████████▎ | 33/40 [02:05<00:26,  3.82s/it] 82%|████████▎ | 33/40 [02:05<00:26,  3.82s/it] 82%|████████▎ | 33/40 [02:05<00:26,  3.82s/it] 82%|████████▎ | 33/40 [02:05<00:26,  3.82s/it] 82%|████████▎ | 33/40 [02:05<00:26,  3.82s/it] 85%|████████▌ | 34/40 [02:09<00:22,  3.81s/it] 85%|████████▌ | 34/40 [02:09<00:22,  3.81s/it] 85%|████████▌ | 34/40 [02:09<00:22,  3.82s/it] 85%|████████▌ | 34/40 [02:09<00:22,  3.82s/it] 85%|████████▌ | 34/40 [02:09<00:22,  3.81s/it] 85%|████████▌ | 34/40 [02:09<00:22,  3.82s/it] 85%|████████▌ | 34/40 [02:09<00:22,  3.82s/it] 85%|████████▌ | 34/40 [02:09<00:22,  3.81s/it] 88%|████████▊ | 35/40 [02:13<00:19,  3.81s/it] 88%|████████▊ | 35/40 [02:13<00:19,  3.81s/it] 88%|████████▊ | 35/40 [02:13<00:19,  3.81s/it] 88%|████████▊ | 35/40 [02:13<00:19,  3.81s/it] 88%|████████▊ | 35/40 [02:13<00:19,  3.81s/it] 88%|████████▊ | 35/40 [02:13<00:19,  3.81s/it] 88%|████████▊ | 35/40 [02:13<00:19,  3.81s/it] 88%|████████▊ | 35/40 [02:13<00:19,  3.81s/it] 90%|█████████ | 36/40 [02:17<00:15,  3.81s/it] 90%|█████████ | 36/40 [02:17<00:15,  3.81s/it] 90%|█████████ | 36/40 [02:17<00:15,  3.81s/it] 90%|█████████ | 36/40 [02:17<00:15,  3.81s/it] 90%|█████████ | 36/40 [02:17<00:15,  3.81s/it] 90%|█████████ | 36/40 [02:17<00:15,  3.81s/it] 90%|█████████ | 36/40 [02:17<00:15,  3.81s/it] 90%|█████████ | 36/40 [02:17<00:15,  3.81s/it] 92%|█████████▎| 37/40 [02:20<00:11,  3.81s/it] 92%|█████████▎| 37/40 [02:20<00:11,  3.81s/it] 92%|█████████▎| 37/40 [02:20<00:11,  3.81s/it] 92%|█████████▎| 37/40 [02:21<00:11,  3.81s/it] 92%|█████████▎| 37/40 [02:20<00:11,  3.81s/it] 92%|█████████▎| 37/40 [02:21<00:11,  3.81s/it] 92%|█████████▎| 37/40 [02:21<00:11,  3.81s/it] 92%|█████████▎| 37/40 [02:21<00:11,  3.81s/it] 95%|█████████▌| 38/40 [02:24<00:07,  3.81s/it] 95%|█████████▌| 38/40 [02:24<00:07,  3.81s/it] 95%|█████████▌| 38/40 [02:24<00:07,  3.81s/it] 95%|█████████▌| 38/40 [02:24<00:07,  3.81s/it] 95%|█████████▌| 38/40 [02:24<00:07,  3.81s/it] 95%|█████████▌| 38/40 [02:24<00:07,  3.81s/it] 95%|█████████▌| 38/40 [02:24<00:07,  3.81s/it] 95%|█████████▌| 38/40 [02:24<00:07,  3.81s/it] 98%|█████████▊| 39/40 [02:28<00:03,  3.81s/it] 98%|█████████▊| 39/40 [02:28<00:03,  3.81s/it] 98%|█████████▊| 39/40 [02:28<00:03,  3.81s/it] 98%|█████████▊| 39/40 [02:28<00:03,  3.81s/it] 98%|█████████▊| 39/40 [02:28<00:03,  3.81s/it] 98%|█████████▊| 39/40 [02:28<00:03,  3.81s/it] 98%|█████████▊| 39/40 [02:28<00:03,  3.81s/it] 98%|█████████▊| 39/40 [02:28<00:03,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.81s/it]
+100%|██████████| 40/40 [02:32<00:00,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.81s/it]
+100%|██████████| 40/40 [02:32<00:00,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.81s/it]
+100%|██████████| 40/40 [02:32<00:00,  3.82s/it]
+100%|██████████| 40/40 [02:32<00:00,  3.82s/it]
+100%|██████████| 40/40 [02:32<00:00,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.81s/it]
+100%|██████████| 40/40 [02:32<00:00,  3.81s/it]100%|██████████| 40/40 [02:32<00:00,  3.82s/it]
+100%|██████████| 40/40 [02:32<00:00,  3.82s/it]
+Iteration 1
+Pipe epoch time: 160.22 sec
+VAE decode epoch time: 5.25 sec
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using `tokenizers` before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+video saved to /home/jukorhon/aiter/op_tests/sagev1_tests/results_Wan22/results/wan_result_i2v_ulysses8_ringNone_True_720x1280.mp4
+########## Timings: ##########
+[{'pipe_time': 160.221203125, 'vae_decode_time': 5.24661767578125}]
