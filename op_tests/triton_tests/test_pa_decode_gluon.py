@@ -1915,13 +1915,13 @@ def run_multi_pa_gluon_test(
                                                         for (
                                                             use_aot_impl
                                                         ) in use_aot_impl_options:
-                                                            if (
-                                                                ct != aiter.dtypes.fp8
-                                                                and bs == 64
-                                                            ):
-                                                                context_partition_size = (
-                                                                    128
-                                                                )
+                                                            # if (
+                                                            #     ct != aiter.dtypes.fp8
+                                                            #     and bs == 64
+                                                            # ):
+                                                            #     context_partition_size = (
+                                                            #         128
+                                                            #     )
                                                             test_config = {
                                                                 "use_torch_flash_ref": use_torch_flash_ref,
                                                                 "compute_type": ct,
