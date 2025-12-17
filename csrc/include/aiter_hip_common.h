@@ -137,16 +137,18 @@ class AiterAsmKernelFast
 static const std::string get_gpu_arch()
 {
     int device_count;
-    hipError_t err = hipGetDeviceCount(&device_count);
-    if(err != hipSuccess || device_count == 0)
+    HIP_CALL(hipGetDeviceCount(&device_count));
+    if(device_count == 0)
     {
         return "No GPU Found";
     }
 
-    hipDeviceProp_t prop;
-    hipGetDeviceProperties(&prop, 0);
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDevice(&dev));
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
-    std::string arch_full = prop.gcnArchName;
+    std::string arch_full = dev_prop.gcnArchName;
     size_t colon_pos      = arch_full.find(':');
     if(colon_pos != std::string::npos)
     {
@@ -158,7 +160,7 @@ static const std::string get_gpu_arch()
     }
 }
 
-static const uint32_t get_num_cu_func()
+static uint32_t get_num_cu_func()
 {
     auto get_num_cu_local = []() {
         hipDevice_t dev;

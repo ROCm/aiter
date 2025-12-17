@@ -13,17 +13,14 @@ from jit.utils.chip_info import get_gfx_list
 
 
 FWD_CODEGEN_CMD = []
-BWD_CODEGEN_CMD = []
+BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"]
 
 
 def get_asm_dir():
     for gfx in get_gfx_list():
         FWD_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/fmha_v3_fwd"
-        BWD_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/fmha_v3_bwd"
         if os.path.exists(FWD_ASM_DIR):
             FWD_CODEGEN_CMD.append(f"{FWD_ASM_DIR}/codegen.py --output_dir {{}}")
-        if os.path.exists(BWD_ASM_DIR):
-            BWD_CODEGEN_CMD.append(f"{BWD_ASM_DIR}/codegen.py --output_dir {{}}")
 
 
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
@@ -55,20 +52,17 @@ def compile_mha_fwd(ck_exclude: bool): ...
 
 def cmdGenFunc_mha_bwd(ck_exclude: bool):
     if ck_exclude:
-        blob_gen_cmd = [
-            f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter "*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*" --output_dir {{}}',
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}",
-        ]
+        blob_gen_cmd = []
     else:
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}",
-            f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter "*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*" --output_dir {{}}',
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}",
         ]
     blob_gen_cmd.extend(BWD_CODEGEN_CMD)
+    flag_use_v3 = "-DONLY_FAV3" if ck_exclude else None
     return {
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": [flag_use_v3],
     }
 
 
