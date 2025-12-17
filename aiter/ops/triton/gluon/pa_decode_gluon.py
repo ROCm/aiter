@@ -1463,22 +1463,13 @@ def paged_attention_decode_sliding_window(
         * stride_output_head
         + output_head_size_offsets[None, :]
     )
-    if sinks_ptr is not None:
-        max_logits_offsets = gl.arange(
-            0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
-        )
-        max_logits = gl.load(
-            sinks_ptr + (kv_head_idx * query_group_size + max_logits_offsets),
-            mask=max_logits_offsets < query_group_size,
-            other=float("-inf"),
-        ).to(gl.float32)
-    else:
-        max_logits = gl.full(
-            (QUERY_GROUP_SIZE_POW2,),
-            float("-inf"),
-            dtype=gl.float32,
-            layout=gl.SliceLayout(1, qk_linear_layout),
-        )
+
+    max_logits = gl.full(
+        (QUERY_GROUP_SIZE_POW2,),
+        float("-inf"),
+        dtype=gl.float32,
+        layout=gl.SliceLayout(1, qk_linear_layout),
+    )
     exp_sums = gl.full(
         (QUERY_GROUP_SIZE_POW2,),
         0.0,
@@ -1790,6 +1781,14 @@ def paged_attention_decode_sliding_window(
             attention_accumulator += attention_output
         max_logits = new_max_logits
 
+    if sinks_ptr is not None:
+        sinks_values = gl.load(
+            sinks_ptr + (kv_head_idx * query_group_size + query_group_offsets),
+            mask=query_group_offsets < query_group_size,
+        )
+        exp_sums += gl.exp(
+            gl.convert_layout(sinks_values, layout=max_logits.type.layout) - max_logits
+        )
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
 
@@ -2541,14 +2540,14 @@ def paged_attention_decode_v2_reduce_kernel(
     head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
 
     # Initialize global accumulation variables
-    if USE_SINKS:
-        global_max = tl.load(
-            sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
-            mask=query_group_offsets < query_group_size,
-            other=float("-inf"),
-        ).to(tl.float32)
-    else:
-        global_max = tl.full((QUERY_GROUP_SIZE_POW2,), float("-inf"), dtype=tl.float32)
+    # if USE_SINKS:
+    #     global_max = tl.load(
+    #         sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
+    #         mask=query_group_offsets < query_group_size,
+    #         other=float("-inf"),
+    #     ).to(tl.float32)
+    # else:
+    global_max = tl.full((QUERY_GROUP_SIZE_POW2,), float("-inf"), dtype=tl.float32)
     global_max_prev = global_max
     global_exp_sum = tl.zeros((QUERY_GROUP_SIZE_POW2,), dtype=tl.float32)
     final_output = tl.zeros((QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=tl.float32)
@@ -2595,6 +2594,12 @@ def paged_attention_decode_v2_reduce_kernel(
         global_exp_sum = update_scale * global_exp_sum + tl.sum(exp_sums, axis=0)
         global_max_prev = global_max
 
+    if USE_SINKS:
+        sink_token_values = gl.load(
+            sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
+            mask=query_group_offsets < query_group_size,
+        )
+        global_exp_sum += gl.exp(sink_token_values - global_max)
     # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
     for iter_idx in range(num_iterations):
         partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
