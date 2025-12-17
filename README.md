@@ -61,3 +61,18 @@ There are number of op test, you can run them with: `python3 op_tests/test_layer
 |LAYERNORM                      | x = (x - u) / (σ2 + ϵ) e*0.5                                                                                                                                      |
 |ROPE                           | Rotary Position Embedding                                                                                                                                         |
 |GEMM                           | D=αAβB+C                                                                                                                                                          |
+
+## GEAK Kernels
+
+This Branch contains GEAK optimized Triton kernels. These kernels are named with the convention: `geak_<model>_<kernel_name>.py` where:
+- `oh` = OpenHands agent
+- `oe` = OpenEvolve agent
+
+| Kernel Name | 12/2 |
+|-------------|------|
+| geak_oh_topk | 1.12X |
+| geak_oh_fused_fp8_quant | 1.31X|
+| geak_oh_fused_qkv_split_qk_rope | 1X |
+| geak_oh_moe_mxfp4 | 1.02X |
+| geak_oe_gemm_a16w16 | 2.44X |
+| geak_oe_unified_attention | 1.64X |
