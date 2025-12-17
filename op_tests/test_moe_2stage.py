@@ -132,7 +132,7 @@ def test_fmoe(
         a1_scale = a1_scale.squeeze(-1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16] or token <= 128)
+        and (AQDType in [dtypes.bf16, dtypes.fp16] or token <= 4)
         and WQDType == dtypes.fp4x2
     ):  # a16w4
         a1_qt = input
@@ -210,7 +210,7 @@ def test_fmoe(
         a2_scale = a2_scale.view(token, topk, -1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16] or token <= 128)
+        and (AQDType in [dtypes.bf16, dtypes.fp16] or token <= 4)
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         a2_qt = out1_ref
@@ -282,15 +282,15 @@ l_tokenNum = [
     # 1,
     # 2,
     4,
-    # 8,
-    # 16,
-    # 32,
-    # 64,
-    # 128,
-    # 256,
-    # 1024,
-    # 2048,
-    # 4096,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    1024,
+    2048,
+    4096,
     # 8192,
     # 163840,
 ]

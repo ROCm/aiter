@@ -477,9 +477,7 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     if aiter_ksplit != 0:
         return aiter_ksplit
     # only for moe_blk gemm1 a8w8 decode scenario
-    if token * topk > expert:
-        return 0
-    cu_num = get_cu_num()
+    cu_num = get_cu_num() * 2 # a4w4 blkperCU = 2
     tileN = 128
 
     tgM = token * topk  # decode tile num
@@ -488,14 +486,14 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     tg_num = tgN * tgM
     # if all cu already active
     if tg_num >= cu_num:
-        return 0
+        return 1
     tilek = 256
     split_max = (cu_num + tg_num - 1) // tg_num
     # at least split = 2
     for i in reversed(range(2, split_max + 1)):
         if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
             return i
-    return 0
+    return 1
 
 
 cfg_2stages = None
@@ -744,7 +742,7 @@ def get_2stage_cfgs(
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
-        and token <= 128
+        and ksplit > 1
     ):
         return MOEMetadata(
             functools.partial(
@@ -877,7 +875,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
-        and (activation == ActivationType.Swiglu or token_num <= 128)
+        and (activation == ActivationType.Swiglu or metadata.ksplit > 1)
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
@@ -951,7 +949,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
-        and (activation == ActivationType.Swiglu or token_num <= 128)
+        and (activation == ActivationType.Swiglu or metadata.ksplit > 1)
     ):
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
