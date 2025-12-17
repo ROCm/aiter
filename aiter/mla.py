@@ -294,7 +294,11 @@ def mla_decode_fwd(
             dtype=dtypes.fp32,
             device=device,
         )
-        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device) if return_lse else None
+        final_lse = (
+            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            if return_lse
+            else None
+        )
 
         aiter.mla_decode_stage1_asm_fwd(
             q,
