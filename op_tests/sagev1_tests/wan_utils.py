@@ -381,6 +381,24 @@ def create_arg_parser():
             action="store_true",
             help="Force the output to match the defined dimensions by resizing and cropping the input image.",
         )
+        parser.add_argument(
+            "--attention_type",
+            type=str,
+            default="default",
+            choices=["default", "sagev1", "fav3_sage", "fav3_fp8"],
+            help="Attention type to use. 'default' uses the internal built-in attention.",
+        )
+        parser.add_argument(
+            "--save_inputs",
+            action="store_true",
+            help="Save attention inputs for later benchmarking (saved to benchmark_output_directory).",
+        )
+        parser.add_argument(
+            "--max_captures",
+            type=int,
+            default=10,
+            help="Maximum number of inputs to save (use 0 for unlimited).",
+        )
         return xFuserArgs.add_cli_args(parser).parse_args()
 
 

@@ -1,56 +1,3 @@
-import sys
-import importlib
-import aiter
-from pathlib import Path
-
-from utils import InputCaptureWrapper
-
-############### Monkey patch the usp._attention from the rest of imports
-_flash_attn_fp8_func_v3 = None
-
-def _get_flash_attn_fp8_func_v3():
-    global _flash_attn_fp8_func_v3
-    if _flash_attn_fp8_func_v3 is None:
-        from aiter.ops.triton.fav3_sage import fav3_sage_wrapper_func as fav3_sage
-        _capture_wrapper = InputCaptureWrapper(fav3_sage, "results_Wan22", name="fav3_sage", max_captures=10)
-        _flash_attn_fp8_func_v3 = _capture_wrapper
-    return _flash_attn_fp8_func_v3
-
-try:
-    _get_flash_attn_fp8_func_v3()
-except Exception:
-    # Swallow errors so BF16 path can still run; function will re-attempt on call.
-    _flash_attn_fp8_func_v3 = None
-
-def _aiter_fp8_attn_call_v3(query, key, value, dropout_p, is_causal):
-    # Get the preloaded function from module level
-    flash_attn_fp8_func = _get_flash_attn_fp8_func_v3()
-    
-    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
-    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
-    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
-
-    # Direct call - automatic FP8 quantization inside
-    output = flash_attn_fp8_func(
-        query, key, value
-    )
-    
-    output = torch.permute(output, [0, 2, 1, 3])
-    return output, None
-
-def _mod_attention(query, key, value, dropout_p, is_causal):
-    """
-    Calls the correct attention mechanism based on the available libraries
-    """
-    output, _ = _aiter_fp8_attn_call_v3(query, key, value, dropout_p, is_causal)
-    return output
-
-
-import xfuser.model_executor.layers.usp as usp_mod
-
-usp_mod._attention = _mod_attention
-###########################################################################
-
 import os
 import time
 import json
@@ -85,10 +32,70 @@ from wan_utils import (
 )
 
 
+def setup_attention(args):
+    """
+    Configure attention based on --attention_type.
+    Returns True if monkey-patch was applied, False otherwise.
+    """
+    if args.attention_type == 'default':
+        return False  # Use internal attention, no monkey-patch
+    
+    import xfuser.model_executor.layers.usp as usp_mod
+    from utils import InputCaptureWrapper
+    
+    # Select base attention function with appropriate layout for BHSD input
+    if args.attention_type == 'sagev1':
+        from op_tests.sagev1_tests.core import sageattn
+        # sageattn uses tensor_layout="HND" (BHSD) by default
+        attn_fn = sageattn
+        needs_permute = False
+        
+    elif args.attention_type == 'fav3_sage':
+        from aiter.ops.triton.fav3_sage import fav3_sage_wrapper_func
+        from functools import partial
+        # Pass layout="bhsd" to avoid permutation
+        attn_fn = partial(fav3_sage_wrapper_func, layout="bhsd")
+        needs_permute = False
+        
+    elif args.attention_type == 'fav3_fp8':
+        from aiter.ops.triton.mha_v3 import flash_attn_fp8_func
+        # fav3_fp8 expects BSHD format, needs permutation
+        attn_fn = flash_attn_fp8_func
+        needs_permute = True
+    
+    # Optionally wrap with input capture
+    if args.save_inputs:
+        import os
+        os.makedirs(args.benchmark_output_directory, exist_ok=True)
+        max_caps = args.max_captures if args.max_captures > 0 else None
+        attn_fn = InputCaptureWrapper(
+            attn_fn, args.benchmark_output_directory, 
+            name=args.attention_type, max_captures=max_caps
+        )
+    
+    # Create wrapper matching usp._attention signature: (query, key, value, dropout_p, is_causal)
+    # Returns just the output tensor (not a tuple)
+    if needs_permute:
+        # BHSD -> BSHD permutation for fav3_fp8
+        def usp_attention_wrapper(query, key, value, dropout_p, is_causal):
+            q = query.permute(0, 2, 1, 3).contiguous()
+            k = key.permute(0, 2, 1, 3).contiguous()
+            v = value.permute(0, 2, 1, 3).contiguous()
+            output = attn_fn(q, k, v)
+            return output.permute(0, 2, 1, 3)
+    else:
+        # No permute needed for sagev1/fav3_sage
+        def usp_attention_wrapper(query, key, value, dropout_p, is_causal):
+            return attn_fn(query, key, value)
+    
+    # Monkey-patch
+    usp_mod._attention = usp_attention_wrapper
+    return True
 
 
 def main():
     args = create_arg_parser()
+    setup_attention(args)
     engine_args = xFuserArgs.from_cli_args(args)
     engine_config, input_config = engine_args.create_config()
     rank = os.environ.get("RANK")
@@ -265,8 +272,10 @@ def main():
                 all_experiments_data.append(data)
 
     parallel_info = f"ulysses{engine_args.ulysses_degree}_ring{engine_args.ring_degree}"
+    compile_info = f"compile{engine_args.use_torch_compile}"
+    attention_info = f"attn_{args.attention_type}"
     if is_last_process:
-        video_name = f"wan_result_{args.task}_{parallel_info}_{engine_args.use_torch_compile}_{input_config.height}x{input_config.width}.mp4"
+        video_name = f"wan_result_{args.task}_{parallel_info}_{compile_info}_{attention_info}_{input_config.height}x{input_config.width}.mp4"
         destination = os.path.join(args.benchmark_output_directory, "results")
         os.makedirs(destination, exist_ok=True)
         video_filename = os.path.abspath(os.path.join(destination, video_name))

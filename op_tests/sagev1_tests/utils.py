@@ -34,6 +34,7 @@ class InputCaptureWrapper:
         if max_captures:
             logging.getLogger(__name__).info(f"Input capture limited to {max_captures} saves")
     
+    @torch.compiler.disable
     def __call__(self, q, k, v, **kwargs):
         # Create a unique key based on shapes and dtype
         shape_key = (tuple(q.shape), tuple(k.shape), tuple(v.shape), str(q.dtype))

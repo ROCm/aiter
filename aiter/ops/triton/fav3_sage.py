@@ -75,7 +75,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         fp8_dtype = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(fp8_dtype).max
-        v_fp8, v_descale = quantize_v_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
+        v_fp8, v_descale = quantize_v_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout=tensor_layout)
 
 
         # For GQA/MQA: quantize query with grouped scaling
