@@ -143,9 +143,17 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
                                                     qo_state.get_end(curr_batch));
                     work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
+                    int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
+                    if constexpr(!Traits::kIsSparse)
+                    {
+                        if (params.qk_batch_ratio != 1)
+                        {
+                            batch_tail = num_qo_tiles - (work_info.qo_start / params.qk_batch_ratio) % params.ori_seqlen_qo - 1;
+                        }
+                    }
                     work_info.kv_end   = ck_tile::min(
                         work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
-                        curr_kv_end - (num_qo_tiles - 1 - curr_qo_tile_idx));
+                        curr_kv_end - batch_tail);
                     work_info.kv_offset = curr_kv_end - work_info.kv_end;
 
                     // split related info
@@ -251,9 +259,17 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                                         qo_state.get_end(curr_batch));
                         work_info.kv_start =
                             curr_kv_begin + (curr_kv_block * params.kv_granularity);
+                        int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
+                        if constexpr(!Traits::kIsSparse)
+                        {
+                            if (params.qk_batch_ratio != 1)
+                            {
+                                batch_tail = num_qo_tiles - (work_info.qo_start / params.qk_batch_ratio) % params.ori_seqlen_qo - 1;
+                            }
+                        }
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (consuming_blks * params.kv_granularity),
-                            curr_kv_end - (num_qo_tiles - 1 - curr_qo_tile_idx));
+                            curr_kv_end - batch_tail);
                         work_info.kv_offset        = curr_kv_end - work_info.kv_end;
                         work_info.partial_qo_loc   = partial_idx;
                         p_work_info_set[num_works] = work_info;
