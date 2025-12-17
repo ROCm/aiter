@@ -33,6 +33,7 @@ using MoeKernel        = std::function<torch::Tensor(torch::Tensor&,
                                               std::optional<torch::Tensor>,
                                               std::optional<torch::Tensor>,
                                               std::optional<torch::Tensor>,
+                                              std::optional<int>,
                                               std::optional<int>)>;
 
 using ck_stream_config = ck_tile::stream_config;
@@ -43,13 +44,13 @@ using fp16             = ck_tile::half_t;
 using fp8              = ck_tile::fp8_t;
 using pk_fp4           = ck_tile::pk_fp4_t;
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType, int activation, bool kHasBias>
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType, int activation, bool kHasBias, int split_k>
 struct moe_gemm1_heuristic_dispatcher{
     static MoeKernel dispatch(int M, int N, int K, int block_m){}
 };
 
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType, int activation, bool kHasBias>
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType, int activation, bool kHasBias, int split_k>
 struct moe_gemm2_heuristic_dispatcher{
     static MoeKernel dispatch(int M, int N, int K, int block_m){}
 };
@@ -69,7 +70,8 @@ cktile_moe_gemm1(torch::Tensor& XQ,
                  std::optional<torch::Tensor> w_scale,
                  std::optional<torch::Tensor> exp_bias,
                  std::optional<int> activation,
-                 std::optional<int> block_m);
+                 std::optional<int> block_m,
+                 std::optional<int> split_k);
 
 __attribute__((visibility("default"))) torch::Tensor
 cktile_moe_gemm2(torch::Tensor& XQ,
@@ -86,4 +88,5 @@ cktile_moe_gemm2(torch::Tensor& XQ,
                  std::optional<torch::Tensor> w_scale,
                  std::optional<torch::Tensor> exp_bias,
                  std::optional<int> activation,
-                 std::optional<int> block_m);
+                 std::optional<int> block_m,
+                 std::optional<int> split_k);

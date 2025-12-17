@@ -36,6 +36,7 @@ class cktile_moe_2stage_gemm_codegen:
         quant_type,
         activation,
         mul_routed_weight_stage,
+        is_split_k,
         istune=False,
     ):
         self.working_path = working_path
@@ -46,6 +47,7 @@ class cktile_moe_2stage_gemm_codegen:
         self.acc_dtype = acc_dtype.lower()
         self.c_dtype = c_dtype.lower()
         self.quant_type = quant_type
+        self.is_split_k = is_split_k
         self.activation = act_dict[activation]
         self.mul_routed_weight_stage = mul_routed_weight_stage
 
@@ -81,7 +83,8 @@ torch::Tensor
     std::optional<torch::Tensor> x_scale,
     std::optional<torch::Tensor> w_scale,
     std::optional<torch::Tensor> exp_bias,
-    std::optional<int> activation)
+    std::optional<int> activation,
+    std::optional<int> k_batch)
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
     int NumTokens = XQ.size(0);
@@ -89,10 +92,10 @@ torch::Tensor
     int N = WQ.size(1);
     int K = XQ.size(-1);
     int E = WQ.size(0);
-    int KBatch = 1;
+    int KBatch = k_batch.has_value() ? k_batch.value() : 1;
     int stride_A = K;
     int stride_B = K;
-    int stride_C = N / {3 - k.stage}; //gemm1 gate+up need / 2.
+    int stride_C = KBatch > 1 ? N : N / {3 - k.stage}; //gemm1 gate+up need / 2.
     void *sorted_weights_ptr = topk_weight.has_value() ? topk_weight.value().data_ptr() : nullptr;
 
     {{INSTANCE_CONTENT}}
@@ -144,7 +147,7 @@ torch::Tensor
                 NumTokens,
                 E,
                 topk,
-                1, // k_batch
+                KBatch, // k_batch
                 M,
                 N,
                 K,
@@ -179,7 +182,9 @@ torch::Tensor
                 col_major,
                 ck_tile::tuple<>,
                 row_major,
-                {"ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up" if k.stage == 1 else "ck_tile::MoeFlatmmKind::kFFN_gemm2"},
+                {"ck_tile::MoeFlatmmKind::kFFN_gemm1_split_k" if self.is_split_k else
+                "ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up" if k.stage == 1 else
+                "ck_tile::MoeFlatmmKind::kFFN_gemm2"},
                 ck_tile::element_wise::PassThrough,
                 {act_dict[k.ActOP]}
                 >(kernel_args, stream_config);
@@ -210,7 +215,8 @@ template torch::Tensor
     std::optional<torch::Tensor> x_scale,
     std::optional<torch::Tensor> w_scale,
     std::optional<torch::Tensor> exp_bias,
-    std::optional<int> activation);
+    std::optional<int> activation,
+    std::optional<int> k_batch);
 
 """
 
@@ -262,6 +268,7 @@ template torch::Tensor
             str_mapping = {
                 '(activation)': self.activation,
                 '(has_bias)': 'true' if self.activation == 2 else 'false',
+                '(split_k)': 'true' if self.is_split_k else 'false',
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
             str_mapping.update(format_args)
@@ -362,7 +369,8 @@ torch::Tensor
     std::optional<torch::Tensor> x_scale,
     std::optional<torch::Tensor> w_scale,
     std::optional<torch::Tensor> exp_bias,
-    std::optional<int> activation);
+    std::optional<int> activation,
+    std::optional<int> k_batch);
 """
         MAINFEST_end = """
 
@@ -581,6 +589,7 @@ if __name__ == "__main__":
     acc_type = "float"
     act_types = ["silu", "swiglu"]
     c_dtypes = ["bf16"]
+    is_split_k_l = [True, False]
 
     impl_path = os.path.join(args.working_path, "impl")
     instances_path = os.path.join(args.working_path, "instances")
@@ -595,12 +604,12 @@ if __name__ == "__main__":
     gen_dispatch_files = []
     gen_manifest_files = []
 
-    for a_type, c_dtype, act_type in itertools.product(
-        a_types, c_dtypes, act_types
+    for a_type, c_dtype, act_type, is_split_k in itertools.product(
+        a_types, c_dtypes, act_types, is_split_k_l
     ):
         has_bias = True if act_type == "swiglu" else False
         codegen = cktile_moe_2stage_gemm_codegen(
-            args.working_path, a_type, acc_type, c_dtype, quant_type, act_type, 2, False
+            args.working_path, a_type, acc_type, c_dtype, quant_type, act_type, 2, is_split_k, False
         )
         # gen all instances for gemm1 and gemm2
         _, gemm1_kernel_list = get_gemm1_kernels_list(
@@ -610,6 +619,7 @@ if __name__ == "__main__":
             act_type,
             False,
             has_bias,
+            is_split_k,
         )
         tag, gemm2_kernel_list = get_gemm2_kernels_list(
             a_type,

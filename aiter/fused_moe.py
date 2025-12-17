@@ -715,18 +715,21 @@ def get_2stage_cfgs(
     ):
         return MOEMetadata(
             functools.partial(
-                aiter.ck_moe_stage1_fwd,
-                kernelName=kernelName1,
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                quant_type=q_type,
+                bias1=bias1,
+                split_k=4,
             ),
             functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
                 bias2=bias2,
             ),
-            32 if token < 16384 else 64,
+            16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
             run_1stage,
         )
@@ -841,7 +844,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
-        and activation == ActivationType.Swiglu
+        and (activation == ActivationType.Swiglu or token_num <= 128)
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
@@ -911,7 +914,6 @@ def fused_moe_2stages(
         w1_scale=w1_scale,
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
-
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1221,7 +1223,7 @@ def torch_moe_stage1(
             if w1_bias is not None:
                 out[mask] = out[mask] + w1_bias[E_id].view(1, -1)
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
-    use_swiglu = (a1_scale is None) and (quant_type == QuantType.per_1x32)
+    use_swiglu = activation == aiter.ActivationType.Swiglu
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
@@ -1332,6 +1334,7 @@ def cktile_moe_stage1(
     k_pad_zeros=0,
     bias1=None,
     activation=ActivationType.Silu,
+    split_k=1,
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -1344,11 +1347,20 @@ def cktile_moe_stage1(
     out = torch.empty(
         (token_num, topk, D), dtype=hidden_states.dtype, device=hidden_states.device
     )
+
+    tmp_out = (
+        torch.zeros(
+            (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
+        )
+        if split_k > 1
+        else out
+    )
+
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
-        out,
+        tmp_out,
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
@@ -1361,7 +1373,14 @@ def cktile_moe_stage1(
         bias1,
         activation,
         block_m,
+        split_k,
     )
+
+    if split_k > 1:
+        if activation == ActivationType.Silu:
+            aiter.silu_and_mul(out, tmp_out.to(out.dtype))
+        else:
+            aiter.gelu_and_mul(out, tmp_out.to(out.dtype))
     return out
 
 
