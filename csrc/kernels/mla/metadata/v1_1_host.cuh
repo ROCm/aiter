@@ -95,7 +95,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1_1_host(
     // Step.3.1. Allocates output buffers except indptrs
     std::vector<std::vector<MlaWorkInfo>> work_info_set(num_clusters, std::vector<MlaWorkInfo>());
     std::vector<std::vector<index_t>> reduce_partial_map(num_qo_clusters_indptr.back(), std::vector<index_t>());
-    std::vector<MlaPartialTileInfo> reduce_partial_info(num_qo_clusters_indptr.back(), {-1, -2});
+    std::vector<MlaPartialTileInfo> reduce_partial_info(num_qo_clusters_indptr.back(), {{-1, -2}});
 
     // Step.3.2. Declare priority queue
     using ClusterCost = std::tuple<int32_t, int32_t>; // cluster_id(cid), cost
@@ -175,7 +175,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1_1_host(
                     if (reduce_partial_map[global_cluster_q_idx].empty())
                     {
                         ++num_reduce_row;
-                        reduce_partial_info[global_cluster_q_idx] = { work_info.qo_start, work_info.qo_end };
+                        reduce_partial_info[global_cluster_q_idx] = {{ work_info.qo_start, work_info.qo_end }};
                     }
                     reduce_partial_map[global_cluster_q_idx].push_back(loc_partial_outputs);
                     ++num_partial_outputs;

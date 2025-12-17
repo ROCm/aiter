@@ -160,7 +160,7 @@ static const std::string get_gpu_arch()
     }
 }
 
-static const uint32_t get_num_cu_func()
+static uint32_t get_num_cu_func()
 {
     auto get_num_cu_local = []() {
         hipDevice_t dev;
