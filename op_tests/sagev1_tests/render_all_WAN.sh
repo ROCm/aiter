@@ -155,7 +155,7 @@ mkdir -p "$OUTPUT_DIR"
 # Function to find video for an attention type
 find_video_for_type() {
     local attn_type="$1"
-    local pattern="$OUTPUT_DIR/*_attn_${attn_type}_*.mp4"
+    local pattern="$OUTPUT_DIR/results/*_attn_${attn_type}_*.mp4"
     local video
     video=$(ls $pattern 2>/dev/null | head -1)
     if [[ -f "$video" ]]; then
@@ -279,7 +279,7 @@ if [[ "$AUTO_STITCH" == true ]]; then
         
         # Build stitch command
         STITCH_CMD=("python" "$STITCH_SCRIPT" 
-            "--input_dir" "$OUTPUT_DIR" 
+            "--input_dir" "$OUTPUT_DIR/results" 
             "--output" "$OUTPUT_DIR/comparison_grid.mp4" 
             "--pattern" "wan_result_*.mp4"
             "--font_size" "$FONT_SIZE")

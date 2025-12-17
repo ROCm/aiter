@@ -64,15 +64,27 @@ logger = logging.getLogger(__name__)
 
 def extract_attention_type(filename: str) -> str:
     """
-    Extract attention type from filename.
-    Expected format: cogvideox-2b_{attention_type}.mp4
+    Extract kernel name from filename.
+    
+    Supports multiple naming formats:
+    - WAN format: wan_result_{task}_{options}_attn_{kernel_name}_{resolution}.mp4
+      Example: wan_result_i2v_ulysses8_ringNone_compileTrue_attn_fav3_fp8_720x1280.mp4 -> fav3_fp8
+    - CogVideoX format: cogvideox-{model}_{attention_type}.mp4
+      Example: cogvideox-2b_sagev1.mp4 -> sagev1
     """
     basename = os.path.basename(filename)
-    # Match pattern: cogvideox-{model}_(.+).mp4 where model is alphanumeric (no underscores)
-    # Using [^_]+ to match the model part (e.g., "2b") without consuming underscores
-    match = re.search(r'cogvideox-[^_]+_(.+)\.mp4$', basename)
-    if match:
-        return match.group(1)
+    
+    # Try WAN format: extract kernel name between _attn_ and _<resolution>
+    # Resolution pattern: _\d+x\d+ (e.g., _720x1280)
+    wan_match = re.search(r'_attn_(.+?)_\d+x\d+\.mp4$', basename)
+    if wan_match:
+        return wan_match.group(1)
+    
+    # Try CogVideoX format: cogvideox-{model}_{attention_type}.mp4
+    cogvideo_match = re.search(r'cogvideox-[^_]+_(.+)\.mp4$', basename)
+    if cogvideo_match:
+        return cogvideo_match.group(1)
+    
     # Fallback: use filename without extension
     return os.path.splitext(basename)[0]
 
