@@ -221,12 +221,13 @@ class fmha_fwd_v3_kernel
         int gdx = ((fmha_v3_traits.s + fmha_v3_traits.ts_qo - 1) / fmha_v3_traits.ts_qo + tg_div - 1) / tg_div;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
+
+        gdx = fmha_v3_traits.h;
+        gdy = (fmha_v3_traits.s + fmha_v3_traits.ts_qo - 1) / fmha_v3_traits.ts_qo; //do not merge the head and tail in seqlen_q direction
+        gdz = fmha_v3_traits.b;
         if (args.s_qk_head_dim == 192 && args.s_v_head_dim == 128)
         {
             bdx = 256; // 4waves
-            gdx = fmha_v3_traits.h;
-            gdy = (fmha_v3_traits.s + fmha_v3_traits.ts_qo - 1) / fmha_v3_traits.ts_qo; //do not merge the head and tail in seqlen_q direction
-            gdz = fmha_v3_traits.b;
         }
         HIP_CALL(hipModuleLaunchKernel(kernel_func,
                                        gdx,
@@ -254,10 +255,10 @@ class fmha_fwd_v3_kernel
         int tg_div = (fmha_v3_traits.mask != 0) ? 2 : 1;
 
         int bdx = 512;
+        tg_div = 1; //do not merge the head and tail in seqlen_q direction
         if (args.s_qk_head_dim == 192 && args.s_v_head_dim == 128)
         {
             bdx = 256; // 4waves
-            tg_div = 1; //do not merge the head and tail in seqlen_q direction
         }
         int gdx = fmha_v3_traits.h;
         int gdy = fmha_v3_traits.b;
@@ -291,10 +292,8 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a)
     {
         tune_opt -= 2;
     }
-    if (a.hdim_q == 192 && a.hdim_v == 128)
-    {
-        tune_opt = 0;
-    }
+
+    tune_opt = 0;
 
     fmha_fwd_v3_args args;
     args.ptr_o   = a.o_ptr;
@@ -358,10 +357,9 @@ float fmha_fwd_v3_group_dispatcher(const ck_tile::stream_config& s, mha_fwd_args
     {
         tune_opt -= 2;
     }
-    if (a.hdim_q == 192 && a.hdim_v == 128)
-    {
+
         tune_opt = 0;
-    }
+
 
     fmha_fwd_v3_args args;
     args.ptr_o   = a.o_ptr;
