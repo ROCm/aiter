@@ -79,6 +79,53 @@ def _get_flash_attn_fp8_func_v2():
     
     return _flash_attn_fp8_func_v2
 
+
+# Load flash_attn_fp8_func from aiter at module level
+_flash_attn_fp8_func_v3 = None
+def _get_flash_attn_fp8_func_v3():
+    global _flash_attn_fp8_func_v3
+    if _flash_attn_fp8_func_v3 is None:
+        import importlib.util
+        import sys
+        import types
+        
+        # Create minimal mock modules for the aiter package hierarchy
+        if 'aiter.ops.triton._triton_kernels.flash_attn_triton_amd' not in sys.modules:
+            # Load the flash_attn_triton_amd package __init__.py
+            fa3_init_path = "/workspace/aiter/aiter/ops/triton/_triton_kernels/sage_attn_triton_amd/__init__.py"
+            fa3_spec = importlib.util.spec_from_file_location(
+                "aiter.ops.triton._triton_kernels.flash_attn_triton_amd", 
+                fa3_init_path
+            )
+            fa3_module = importlib.util.module_from_spec(fa3_spec)
+            sys.modules[fa3_spec.name] = fa3_module
+            
+            # Create mock parent modules
+            sys.modules['aiter.ops.triton._triton_kernels'] = types.ModuleType('aiter.ops.triton._triton_kernels')
+            sys.modules['aiter.ops.triton'] = types.ModuleType('aiter.ops.triton')
+            sys.modules['aiter.ops'] = types.ModuleType('aiter.ops')
+            sys.modules['aiter.ops.triton._triton_kernels.sage_attn_triton_amd'] = fa3_module
+            
+            fa3_spec.loader.exec_module(fa3_module)
+        
+        # Load mha_v3 which will use the already-loaded flash_attn_triton_amd
+        mha_v3_path = "/workspace/aiter/aiter/ops/triton/fav3_sage.py"
+        spec = importlib.util.spec_from_file_location("mha_v3_workspace", mha_v3_path)
+        mha_v3_module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mha_v3_module
+        spec.loader.exec_module(mha_v3_module)
+        
+        _flash_attn_fp8_func_v3 = mha_v3_module.flash_attn_fp8_func
+    
+    return _flash_attn_fp8_func_v3
+
+
+
+
+
+
+
+
 # Preload FP8 function at module import to avoid torch.compile discovering
 # a missing dynamically created module later.
 try:
@@ -86,6 +133,13 @@ try:
 except Exception:
     # Swallow errors so BF16 path can still run; function will re-attempt on call.
     _flash_attn_fp8_func_v2 = None
+
+try:
+    _get_flash_attn_fp8_func_v3()
+except Exception:
+    # Swallow errors so BF16 path can still run; function will re-attempt on call.
+    _flash_attn_fp8_func_v3 = None
+
 
 aten = torch.ops.aten
 
@@ -174,7 +228,7 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 def _check_if_use_fp8_attn():
-    use_fp8_attn = False
+    use_fp8_attn = True
     try:
         use_fp8_attn = get_runtime_state().use_fp8_attn
     except:
@@ -279,6 +333,23 @@ def _aiter_fp8_attn_call_v2(query, key, value, dropout_p, is_causal):
     output = torch.permute(output, [0, 2, 1, 3])
     return output, None
 
+def _aiter_fp8_attn_call_v3(query, key, value, dropout_p, is_causal):
+    # Get the preloaded function from module level
+    flash_attn_fp8_func = _get_flash_attn_fp8_func_v3()
+    
+    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
+    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
+    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    # Direct call - automatic FP8 quantization inside
+    output = flash_attn_fp8_func(
+        query, key, value,
+        causal=is_causal,
+    )
+    
+    output = torch.permute(output, [0, 2, 1, 3])
+    return output, None
+
 def _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal):
     """
     Performs the necessary tensor permutes and
@@ -338,7 +409,8 @@ def _attention(query, key, value, dropout_p, is_causal):
             # output, _ = _aiter_fp8_attn_call_v1(query, key, value, dropout_p, is_causal)
             #
             # # print("******************** Using FP8 attention from /workspace/aiter/aiter/ops/triton/mha_v3.py ********************")
-            output, _ = _aiter_fp8_attn_call_v2(query, key, value, dropout_p, is_causal)
+            output, _ = _aiter_fp8_attn_call_v3(query, key, value, dropout_p, is_causal)
+            # output, _ = _aiter_fp8_attn_call_v2(query, key, value, dropout_p, is_causal)
         else:
             output, _ = _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal)
         return output
