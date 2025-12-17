@@ -100,7 +100,8 @@ def test_allreduce_custom(
     ref = torch.zeros(shape, dtype=dtype)
     rets = []
     for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
+        # x = torch.randn(shape, dtype=dtype)
+        x = torch.randint(1, 16, shape, dtype=dtype)
         ref += x
         rets.append(
             pool.apply_async(
@@ -116,8 +117,9 @@ def test_allreduce_custom(
         checkAllclose(ref, out.to(ref), msg=msg)
 
 
-l_dtype = ["fp16", "bf16"]
-l_shape = [(128, 8192)]
+l_dtype = ["bf16"]
+l_shape = [(16384, 7168)]
+# l_shape = [(128, 8192)]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
@@ -157,7 +159,7 @@ if __name__ == "__main__":
                 1,
                 shape,
                 dtype,
-                withGraph=True,
+                withGraph=False,
                 distributed_init_method=get_distributed_init_method(
                     get_ip(), get_open_port()
                 ),

@@ -88,10 +88,10 @@ void _all_reduce(
     switch(out.scalar_type())
     {
     case at::ScalarType::Float: {
-        fa->allreduce<float>(stream,
-                             reinterpret_cast<float*>(inp.data_ptr()),
-                             reinterpret_cast<float*>(out.data_ptr()),
-                             out.numel(), use_new);
+        fa->allreduce_sdma_impl<float>(stream,
+                                       reinterpret_cast<float*>(inp.data_ptr()),
+                                       reinterpret_cast<float*>(out.data_ptr()),
+                                       out.numel());
         break;
     }
     case at::ScalarType::Half: {
@@ -108,19 +108,25 @@ void _all_reduce(
         }
         else
         {
-            fa->allreduce<half>(stream,
-                                reinterpret_cast<half*>(inp.data_ptr()),
-                                reinterpret_cast<half*>(out.data_ptr()),
-                                out.numel(), use_new);
+            fa->allreduce_sdma_impl<half>(stream,
+                                          reinterpret_cast<half*>(inp.data_ptr()),
+                                          reinterpret_cast<half*>(out.data_ptr()),
+                                          out.numel());
         }
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
+        fa->allreduce_sdma_impl<__hip_bfloat16>(stream,
+                                                reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
+                                                reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+                                                out.numel());
+                                     /*
         fa->allreduce<__hip_bfloat16>(stream,
-                                      reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
-                                      reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
-                                      out.numel(), use_new);
+                                                reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
+                                                reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+                                                out.numel(), use_new);
+                                                */
         break;
     }
 #endif

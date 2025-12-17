@@ -1190,6 +1190,156 @@ namespace aiter
     }
   }
 
+  // ----- SDMA allreduce impl -----
+  template <typename T>
+  DINLINE void add_p(typename packed_t<T>::A &inp_, typename packed_t<T>::P other)
+  {
+    constexpr int pack_size = packed_t<T>::P::size;
+#pragma unroll
+    for (int i = 0; i < pack_size; ++i)
+    {
+      inp_.data[i] += ck_tile::type_convert<float>(other.data[i]);
+    }
+  }
+
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) local_reduce_cal(
+      T* __restrict__ input,
+      RankSignals sg,
+      Signal* self_sg,
+      int rank,
+      int size
+  )
+  {
+    constexpr int pack_size = packed_t<T>::P::size;
+    using P = packed_t<T>::P;
+    using A = packed_t<T>::A;
+    int part = size / (ngpus * pack_size);
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    P* tmp_out = get_tmp_buf<P>(sg.signals[rank]);
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = index; idx < part; idx += gridDim.x * blockDim.x)
+    {
+      A add_reg;
+      P loc_inp_reg = *(reinterpret_cast<P*>(input) + rank * part + idx);
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        add_reg.data[i] = ck_tile::type_convert<float>(loc_inp_reg.data[i]);
+      }
+#pragma unroll
+      for (int i = 1; i < ngpus; ++i)
+      {
+        P remote_inp_reg = tmp_out[(rank + i) % ngpus * part + idx];
+        add_p<T>(add_reg, remote_inp_reg);
+      }
+
+      P reduce_rslt;
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        reduce_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+      }
+      tmp_out[rank * part + idx] = reduce_rslt;
+    }
+    // make sure all calculate kernel finish
+    end_sync<ngpus, true>(sg, self_sg, rank);
+  }
+
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) local_copy(
+      T* __restrict__ output,
+      RankSignals sg,
+      Signal* self_sg,
+      int rank,
+      int size
+  )
+  {
+    constexpr int pack_size = packed_t<T>::P::size;
+    using P = packed_t<T>::P;
+    using A = packed_t<T>::A;
+    int p_size = size / (pack_size * ngpus);
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    P* tmp_out = get_tmp_buf<P>(sg.signals[rank]);
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = index; idx < p_size; idx += gridDim.x * blockDim.x)
+    {
+#pragma unroll
+      for (int i = 1; i < ngpus; ++i)
+      {
+        int p_id = (rank + i) % ngpus;
+        *(reinterpret_cast<P*>(output) + p_id * p_size + idx) = tmp_out[p_id * p_size + idx];
+      }
+    }
+  }
+
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) part_reduce(
+      T* __restrict__ input,
+      T* __restrict__ output,
+      RankSignals sg,
+      Signal* self_sg,
+      int rank,
+      int size
+  )
+  {
+    constexpr int pack_size = packed_t<T>::P::size;
+    using P = packed_t<T>::P;
+    using A = packed_t<T>::A;
+    int part = size / (ngpus * pack_size);
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    P* tmp_out = get_tmp_buf<P>(sg.signals[rank]);
+
+    P* tmps[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+      tmps[i] = get_tmp_buf<P>(sg.signals[(rank + i) % 8]);
+    }
+
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = index; idx < part; idx += gridDim.x * blockDim.x)
+    {
+      A add_reg;
+      P loc_inp_reg = *(reinterpret_cast<P*>(input) + rank * part + idx);
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        add_reg.data[i] = ck_tile::type_convert<float>(loc_inp_reg.data[i]);
+      }
+#pragma unroll
+      for (int i = 1; i < ngpus; ++i)
+      {
+        P remote_inp_reg = tmp_out[(rank + i) % ngpus * part + idx];
+        add_p<T>(add_reg, remote_inp_reg);
+      }
+
+      P reduce_rslt;
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        reduce_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+      }
+      tmp_out[rank * part + idx] = reduce_rslt;
+      // *(reinterpret_cast<P*>(output) + rank * part + idx) = reduce_rslt;
+    }
+    // make sure all calculate kernel finish
+    end_sync<ngpus>(sg, self_sg, rank);
+    for (int idx = index; idx < part; idx += gridDim.x * blockDim.x)
+    {
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+      {
+        int op_id = (rank + i) % ngpus;
+        *(reinterpret_cast<P*>(output) + op_id * part + idx) = tmps[i][op_id * part + idx];
+      }
+    }
+  }
+  // -------------------------------
+
   using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
   static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
   static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
@@ -1211,6 +1361,10 @@ namespace aiter
     std::vector<void *> graph_unreg_buffers_;
     // a map from IPC handles to opened IPC pointers
     std::map<IPC_KEY, char *> ipc_handles_;
+
+    void* local_inp[8];
+    void* remote_inp[8];
+    RankData h_rank_data;
 
     /**
      * meta is a pointer to device metadata and temporary buffer for allreduce.
@@ -1247,6 +1401,33 @@ namespace aiter
         }
         sg_.signals[i] = rank_sg;
       }
+
+      bool can_use = can_use_sdma();
+      printf("device %d can set peer? %d\n", rank_, can_use);
+      // malloc local buffer and set peer access
+      for (int i = 0; i < world_size_; ++i)
+      {
+        if (i != rank_)
+        {
+          HIP_CALL(hipDeviceEnablePeerAccess(i, 0));
+          // HIP_CALL(hipMalloc(&local_inp[i], 8192 * 8192 / world_size_));
+        }
+      }
+    }
+
+    bool can_use_sdma()
+    {
+      bool enable = true;
+      for (int peer_device = 0; peer_device < world_size_; ++peer_device)
+      {
+        if (peer_device != rank_)
+        {
+          int can_access;
+          HIP_CALL(hipDeviceCanAccessPeer(&can_access, rank_, peer_device));
+          enable &= can_access;
+        }
+      }
+      return enable;
     }
 
     char *open_ipc_handle(const void *ipc_handle)
@@ -1313,12 +1494,20 @@ namespace aiter
           char *handle = open_ipc_handle((void*)ipc_handle_ptr);
           handle += offsets[i];
           data.ptrs[i] = handle;
+          // -----
+          remote_inp[i] = handle;
         }
         else
         {
           data.ptrs[i] = self;
+          remote_inp[i] = self;
+          // -----
         }
       }
+      // sdma cross device addr (host)
+      // h_rank_data = data;
+      // -----------------------------
+
       auto d_data = d_rank_data_base_++;
       HIP_CALL(
           hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
@@ -1456,6 +1645,92 @@ namespace aiter
       {
         DISPATCH_CALL(8, 256, 8);
       }
+    }
+
+    // support eager mode only
+    template <typename T>
+    void allreduce_sdma_impl(hipStream_t stream, T* input, T* output, int size)
+    {
+      auto d = packed_t<T>::P::size;
+      RankData* ptrs = get_buffer_RD(stream, input);
+
+      /*
+      std::vector<hipStream_t> streams(world_size_ - 1);
+      for (int i = 0; i < world_size_ - 1; ++i)
+      {
+        HIP_CALL(hipStreamCreate(&streams[i]));
+      }
+      */
+
+      int part = size / 8;
+      int buf_size = sizeof(T) * part;
+      for (int i = 1; i < world_size_; ++i)
+      {
+        int device_id = (rank_ + i) % world_size_;
+        T* dst_start = reinterpret_cast<T*>(sg_.signals[device_id] + 1);
+        void* dst = reinterpret_cast<void*>(dst_start + rank_ * part);
+        void* inp = reinterpret_cast<void*>(input + device_id * part);
+        // HIP_CALL(hipMemcpyAsync(dst, inp, buf_size, hipMemcpyDeviceToDevice, streams[i - 1]));
+        HIP_CALL(hipMemcpyAsync(dst, inp, buf_size, hipMemcpyDeviceToDevice, stream));
+      }
+      int g_num = (part / d + 512 - 1) / 512;
+      dim3 block(512);
+      dim3 grid;
+      grid.x = min(g_num, 80);
+      part_reduce<T, 8><<<grid, block, 0, stream>>>(
+          input,
+          output,
+          sg_,
+          self_sg_,
+          rank_,
+          size
+      );
+      /*
+      for (int i = 0; i < 8; ++i)
+      {
+        int device_id = (rank_ + i) % world_size_;
+        T* dst_start = reinterpret_cast<T*>(sg_.signals[device_id] + 1);
+        void* dst = reinterpret_cast<void*>(dst_start + rank_ * part);
+        T* src_start = reinterpret_cast<T*>(sg_.signals[rank_] + 1);
+        void* src = reinterpret_cast<void*>(src_start + rank_ * part);
+        HIP_CALL(hipMemcpyAsync(dst, src, buf_size, hipMemcpyDeviceToDevice, stream));
+      }
+      local_copy<T, 8><<<grid, block, 0, stream>>>(
+          output,
+          sg_,
+          self_sg_,
+          rank_,
+          size
+      );
+      */
+      /*
+      local_reduce_cal<T, 8><<<grid, block, 0, stream>>>(
+          input,
+          sg_,
+          self_sg_,
+          rank_,
+          size
+      );
+
+      T* src_start = reinterpret_cast<T*>(sg_.signals[rank_] + 1);
+      void* src = reinterpret_cast<void*>(src_start + rank_ * part);
+      for (int i = 1; i < world_size_; ++i)
+      {
+        int device_id = (rank_ + i) % world_size_;
+        T* dst_start = reinterpret_cast<T*>(sg_.signals[device_id] + 1);
+        void* dst = reinterpret_cast<void*>(dst_start + rank_ * part);
+        HIP_CALL(hipMemcpyAsync(dst, src, buf_size, hipMemcpyDeviceToDevice, stream));
+      }
+      grid.x = min(80, (size / d + 512 - 1) / 512);
+      local_copy<T, 8><<<grid, block, 0, stream>>>(
+          output,
+          sg_,
+          self_sg_,
+          rank_,
+          size
+      );
+      */
+
     }
 
     /**
