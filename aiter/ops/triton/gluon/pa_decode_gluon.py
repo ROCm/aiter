@@ -1463,12 +1463,22 @@ def paged_attention_decode_sliding_window(
         * stride_output_head
         + output_head_size_offsets[None, :]
     )
-    max_logits = gl.full(
-        (QUERY_GROUP_SIZE_POW2,),
-        float("-inf"),
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, qk_linear_layout),
-    )
+    if sinks_ptr is not None:
+        max_logits_offsets = gl.arange(
+            0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
+        )
+        max_logits = gl.load(
+            sinks_ptr + (kv_head_idx * query_group_size + max_logits_offsets),
+            mask=max_logits_offsets < query_group_size,
+            other=float("-inf"),
+        ).to(gl.float32)
+    else:
+        max_logits = gl.full(
+            (QUERY_GROUP_SIZE_POW2,),
+            float("-inf"),
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, qk_linear_layout),
+        )
     exp_sums = gl.full(
         (QUERY_GROUP_SIZE_POW2,),
         0.0,
@@ -1527,11 +1537,11 @@ def paged_attention_decode_sliding_window(
         )
         # Create mask for valid blocks
         valid_block_mask = block_indices < num_kv_blocks
-        # masked_block_indices = gl.where(valid_block_mask, block_indices, 0)
+        masked_block_indices = gl.where(valid_block_mask, block_indices, 0)
         block_table_start_ptr = block_tables_ptr + sequence_idx * stride_block_table_seq
         kv_block_numbers = gl.amd.cdna3.buffer_load(
-            ptr=block_table_start_ptr + kv_block_start_idx, offsets=block_indices
-        ).to(gl.uint32)
+            ptr=block_table_start_ptr + kv_block_start_idx, offsets=masked_block_indices
+        ).to(gl.int64)
 
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
@@ -1543,20 +1553,15 @@ def paged_attention_decode_sliding_window(
             * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
             + contiguous_kv_element_offsets[None, None, None, :]
         )
-        # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
-        key_tensor = gl.amd.cdna3.buffer_load(
-            ptr=key_cache_ptr,
-            offsets=key_block_offsets,
-            mask=valid_block_mask[:, None, None, None],
-        )
 
+        # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
+        key_tensor = gl.load(key_cache_ptr + key_block_offsets)
         # Prepare QK MFMA while key loads (these don't depend on key data)
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE),
             dtype=gl.float32,
-            layout=qk_mfma_layout,
+            layout=qk_mfma_layout,q
         )
-
         # Load key quantization scales if needed (overlaps with key tensor load)
         if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 0:
@@ -1625,11 +1630,7 @@ def paged_attention_decode_sliding_window(
                 * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
                 + value_dim3_offsets[None, None, None, :]
             )
-            value_tensor = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr,
-                offsets=value_block_offsets,
-                mask=valid_block_mask[:, None, None, None],
-            )
+            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
             # Compute QK attention scores using MFMA (overlaps with value load)
             attention_scores = gl.amd.cdna3.mfma(
                 query_converted, key_converted, qk_accumulator
@@ -1658,11 +1659,7 @@ def paged_attention_decode_sliding_window(
             )
 
             # Schedule: Start value VMEM load, then QK MFMA
-            value_tensor = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr,
-                offsets=value_block_offsets,
-                mask=valid_block_mask[:, None, None],
-            )
+            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
             # Compute QK attention scores using MFMA (overlaps with value load)
             attention_scores = gl.amd.cdna3.mfma(
                 query_converted, key_converted, qk_accumulator
@@ -1795,14 +1792,6 @@ def paged_attention_decode_sliding_window(
 
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
-    if sinks_ptr is not None:
-        sinks_values = gl.load(
-            sinks_ptr + (kv_head_idx * query_group_size + query_group_offsets),
-            mask=query_group_offsets < query_group_size,
-        )
-        exp_sums += gl.exp(
-            gl.convert_layout(sinks_values, layout=max_logits.type.layout) - max_logits
-        )
 
     exp_sums_reciprocal = 1.0 / exp_sums
     exp_sums_reciprocal_cvt = gl.convert_layout(
