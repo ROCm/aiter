@@ -50,6 +50,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     const int32_t lane_idx = ck_tile::get_lane_id();
 
+    const int32_t num_sub_heads =
+        (params.qk_batch_ratio) > 1 ? (params.qk_batch_ratio * params.ori_seqlen_qo) : 1;
+
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
     int32_t sum_blocks = 0;
@@ -57,7 +60,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     {
         const int32_t bid_ori = Traits::kIsSparse
                                     ? (bid / params.ori_seqlen_qo / params.qk_batch_ratio)
-                                    : (bid / params.qk_batch_ratio);
+                                    : (bid / num_sub_heads);
         const int32_t kv_end  = params.p_seqlens_kv_indptr[bid_ori + 1];
         const int32_t seqlen_kv =
             Traits::kIsSparse ? min(kv_end - params.p_seqlens_kv_indptr[bid_ori], params.topk)
@@ -127,6 +130,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
+            // if (threadIdx.x ==0 && blockIdx.x == 0)
+            //     printf("[mddbg] remain_kv_blocks=%d, num_kv_blocks=%d, curr_kv_block=%d\n",
+            //         remain_kv_blocks, num_kv_blocks, curr_kv_block);
 
             // If current cu part is able to handle this batch of seqences
             if(remain_payload >= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks))
@@ -145,8 +151,18 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
                     work_info.kv_end   = ck_tile::min(
                         work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
-                        curr_kv_end - (num_qo_tiles - 1 - curr_qo_tile_idx));
+                        curr_kv_end - (num_qo_tiles - 1 - curr_qo_tile_idx) -
+                            (params.ori_seqlen_qo - 1 -
+                             (curr_batch % num_sub_heads) / params.qk_batch_ratio));
                     work_info.kv_offset = curr_kv_end - work_info.kv_end;
+
+                    // if (threadIdx.x ==0 && blockIdx.x == 0) {
+                    //     printf("[mddbg] wi.start/end/off=(%d, %d, %d), curr_kv_begin=%d,
+                    //     curr_kv_block=%d, remainKvBlk=%d, #qotiles=%d, qotileIdx=%d\n",
+                    //         work_info.kv_start, work_info.kv_end, work_info.kv_offset,
+                    //         curr_kv_begin, curr_kv_block,
+                    //         remain_kv_blocks, num_qo_tiles, curr_qo_tile_idx);
+                    // }
 
                     // split related info
                     if(curr_n_split_idx > 0)
@@ -198,10 +214,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 if((Traits::kQoSplits == false) || (curr_qo_tile_idx == 0))
                 {
                     ++curr_batch;
-                    // same as curr_sub_head_idx = (curr_sub_head_idx + 1) % params.qk_batch_ratio;
-                    curr_sub_head_idx = (curr_sub_head_idx == (params.qk_batch_ratio - 1))
-                                            ? 0
-                                            : (curr_sub_head_idx + 1);
+                    // same as curr_sub_head_idx = (curr_sub_head_idx + 1) % num_sub_heads;
+                    curr_sub_head_idx =
+                        (curr_sub_head_idx == (num_sub_heads - 1)) ? 0 : (curr_sub_head_idx + 1);
                     if(curr_batch < params.num_batches)
                     {
                         if(curr_sub_head_idx == 0)
@@ -215,7 +230,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                 const int32_t bid_ori = Traits::kIsSparse
                                                             ? (curr_batch / params.ori_seqlen_qo /
                                                                params.qk_batch_ratio)
-                                                            : (curr_batch / params.qk_batch_ratio);
+                                                            : (curr_batch / num_sub_heads);
                                 curr_kv_seqlen        = params.p_seqlens_kv_indptr[bid_ori + 1] -
                                                  params.p_seqlens_kv_indptr[bid_ori];
                                 curr_kv_seqlen = Traits::kIsSparse
@@ -253,7 +268,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             curr_kv_begin + (curr_kv_block * params.kv_granularity);
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (consuming_blks * params.kv_granularity),
-                            curr_kv_end - (num_qo_tiles - 1 - curr_qo_tile_idx));
+                            curr_kv_end - (num_qo_tiles - 1 - curr_qo_tile_idx) -
+                                (params.ori_seqlen_qo - 1 -
+                                 (curr_batch % num_sub_heads) / params.qk_batch_ratio));
                         work_info.kv_offset        = curr_kv_end - work_info.kv_end;
                         work_info.partial_qo_loc   = partial_idx;
                         p_work_info_set[num_works] = work_info;
@@ -362,14 +379,17 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     {
         qk_batch_ratio = num_heads / 16;
         num_heads      = 16;
-        num_batches *= qk_batch_ratio;
+        num_batches *= qk_batch_ratio * uni_seqlen_qo;
+        uni_seqlen_qo = 1;
     }
-
-    if(is_sparse)
+    else if(is_sparse)
     {
         num_batches *= uni_seqlen_qo;
         uni_seqlen_qo = 1;
     }
+
+    // printf("[mddbg-host] #batch=%d, #head=%d, qk_batch_ratio=%d, uni_seqlen_qo=%d\n",
+    //     num_batches, num_heads, qk_batch_ratio, uni_seqlen_qo);
 
     TORCH_CHECK((num_heads == 16) || (num_heads == 128),
                 __func__,
