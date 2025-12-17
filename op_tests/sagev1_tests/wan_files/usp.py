@@ -23,6 +23,9 @@ from packaging.version import parse
 from xfuser.envs import PACKAGES_CHECKER
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed import get_runtime_state
+
+
+
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_FLASH_ATTN = env_info["has_flash_attn"]
 if HAS_FLASH_ATTN:
@@ -40,11 +43,13 @@ if HAS_AITER:
         import os
         HOW_V3_BF16_CVT = int(os.environ.get("HOW_V3_BF16_CVT", "2"))
 
-# Load flash_attn_fp8_func from aiter at module level
-_flash_attn_fp8_func_v2 = None
-def _get_flash_attn_fp8_func_v2():
-    global _flash_attn_fp8_func_v2
-    if _flash_attn_fp8_func_v2 is None:
+DEBUG_FLAG = True
+
+
+_fav3_fp8_func = None
+def _get_fav3_fp8_func():
+    global _fav3_fp8_func
+    if _fav3_fp8_func is None:
         import importlib.util
         import sys
         import types
@@ -75,64 +80,139 @@ def _get_flash_attn_fp8_func_v2():
         sys.modules[spec.name] = mha_v3_module
         spec.loader.exec_module(mha_v3_module)
         
-        _flash_attn_fp8_func_v2 = mha_v3_module.flash_attn_fp8_func
+        _fav3_fp8_func = mha_v3_module.flash_attn_fp8_func
     
-    return _flash_attn_fp8_func_v2
+    return _fav3_fp8_func
 
 
-# Load flash_attn_fp8_func from aiter at module level
-_flash_attn_fp8_func_v3 = None
-def _get_flash_attn_fp8_func_v3():
-    global _flash_attn_fp8_func_v3
-    if _flash_attn_fp8_func_v3 is None:
-        import importlib.util
-        import sys
-        import types
-        
-        # Create minimal mock modules for the aiter package hierarchy
-        if 'aiter.ops.triton._triton_kernels.flash_attn_triton_amd' not in sys.modules:
-            # Load the flash_attn_triton_amd package __init__.py
-            fa3_init_path = "/workspace/aiter/aiter/ops/triton/_triton_kernels/sage_attn_triton_amd/__init__.py"
-            fa3_spec = importlib.util.spec_from_file_location(
-                "aiter.ops.triton._triton_kernels.flash_attn_triton_amd", 
-                fa3_init_path
-            )
-            fa3_module = importlib.util.module_from_spec(fa3_spec)
-            sys.modules[fa3_spec.name] = fa3_module
-            
-            # Create mock parent modules
-            sys.modules['aiter.ops.triton._triton_kernels'] = types.ModuleType('aiter.ops.triton._triton_kernels')
-            sys.modules['aiter.ops.triton'] = types.ModuleType('aiter.ops.triton')
-            sys.modules['aiter.ops'] = types.ModuleType('aiter.ops')
-            sys.modules['aiter.ops.triton._triton_kernels.sage_attn_triton_amd'] = fa3_module
-            
-            fa3_spec.loader.exec_module(fa3_module)
-        
-        # Load mha_v3 which will use the already-loaded flash_attn_triton_amd
-        mha_v3_path = "/workspace/aiter/aiter/ops/triton/fav3_sage.py"
-        spec = importlib.util.spec_from_file_location("mha_v3_workspace", mha_v3_path)
-        mha_v3_module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = mha_v3_module
-        spec.loader.exec_module(mha_v3_module)
-        
-        _flash_attn_fp8_func_v3 = mha_v3_module.flash_attn_fp8_func
-    
-    return _flash_attn_fp8_func_v3
+def _load_workspace_module(module_name: str, module_path: str, raise_on_error: bool = False):
+    """Load a module directly from a workspace path and return it, or None on failure."""
+    import importlib.util
+    import sys
+
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
+            spec.loader.exec_module(mod)
+            return mod
+        if raise_on_error:
+            raise ImportError(f"spec/loader missing for {module_path}")
+    except Exception as exc:
+        if raise_on_error:
+            raise
+        return None
+    return None
 
 
+def _ensure_attn_qk_module():
+    """Ensure aiter.ops.triton.attn_qk_int8_per_block is importable from workspace."""
+    import importlib
+    import importlib.util
+    import sys
+    import types
+
+    module_name = "aiter.ops.triton.attn_qk_int8_per_block"
+    if module_name in sys.modules:
+        return
+
+    # Ensure workspace path is on sys.path so package imports resolve
+    workspace_root = "/workspace/aiter"
+    if workspace_root not in sys.path:
+        sys.path.insert(0, workspace_root)
+
+    # Create parent packages with stubs like fav3
+    if "aiter" not in sys.modules:
+        sys.modules["aiter"] = types.ModuleType("aiter")
+    if "aiter.ops" not in sys.modules:
+        sys.modules["aiter.ops"] = types.ModuleType("aiter.ops")
+    if "aiter.ops.triton" not in sys.modules:
+        sys.modules["aiter.ops.triton"] = types.ModuleType("aiter.ops.triton")
+    if "aiter.ops.triton._triton_kernels" not in sys.modules:
+        sys.modules["aiter.ops.triton._triton_kernels"] = types.ModuleType("aiter.ops.triton._triton_kernels")
+
+    # Load the _triton_kernels submodule that attn_qk_int8_per_block depends on
+    kernel_module_name = "aiter.ops.triton._triton_kernels.attn_qk_int8_per_block"
+    if kernel_module_name not in sys.modules:
+        kernel_path = "/workspace/aiter/aiter/ops/triton/_triton_kernels/attn_qk_int8_per_block.py"
+        kernel_spec = importlib.util.spec_from_file_location(kernel_module_name, kernel_path)
+        if kernel_spec and kernel_spec.loader:
+            kernel_mod = importlib.util.module_from_spec(kernel_spec)
+            sys.modules[kernel_module_name] = kernel_mod
+            kernel_spec.loader.exec_module(kernel_mod)
+
+    # Now load the main attn_qk_int8_per_block module
+    attn_path = "/workspace/aiter/aiter/ops/triton/attn_qk_int8_per_block.py"
+    spec = importlib.util.spec_from_file_location(module_name, attn_path)
+    if spec and spec.loader:
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        spec.loader.exec_module(mod)
 
 
+_sagev1_func = None
+def _get_sagev1_func():
+    """Lazy-load sagev1 attention from the canonical workspace path."""
+
+    global _sagev1_func
+    if _sagev1_func is not None:
+        return _sagev1_func
+
+    module_path = "/workspace/aiter/op_tests/sagev1_tests/core.py"
+    _ensure_attn_qk_module()
+    try:
+        mod = _load_workspace_module("sagev1_tests.core_workspace", module_path, raise_on_error=True)
+    except Exception as exc:
+        raise RuntimeError(f"kernel 'sagev1' load failed from {module_path}: {exc}") from exc
+
+    fn = getattr(mod, "sageattn", None)
+    if fn is None:
+        raise RuntimeError(f"kernel 'sagev1' missing sageattn in {module_path}")
+
+    _sagev1_func = fn
+    return _sagev1_func
 
 
+_fav3_sage_fn = None
+def _get_fav3_sage_attn():
+    """Lazy-load fav3_sage attention from /workspace/aiter/aiter/ to mirror fav3_fp8 path."""
+    global _fav3_sage_fn
+    if _fav3_sage_fn is not None:
+        return _fav3_sage_fn
 
+    import importlib.util
+    import sys
+    import types
 
-# Preload FP8 function at module import to avoid torch.compile discovering
-# a missing dynamically created module later.
-try:
-    _get_flash_attn_fp8_func_v2()
-except Exception:
-    # Swallow errors so BF16 path can still run; function will re-attempt on call.
-    _flash_attn_fp8_func_v2 = None
+    # Ensure parent packages exist like fav3_fp8 and sagev1
+    if "aiter" not in sys.modules:
+        sys.modules["aiter"] = types.ModuleType("aiter")
+    if "aiter.ops" not in sys.modules:
+        sys.modules["aiter.ops"] = types.ModuleType("aiter.ops")
+    if "aiter.ops.triton" not in sys.modules:
+        sys.modules["aiter.ops.triton"] = types.ModuleType("aiter.ops.triton")
+
+    module_path = "/workspace/aiter/aiter/ops/triton/fav3_sage.py"
+    spec = importlib.util.spec_from_file_location("aiter.ops.triton.fav3_sage_workspace", module_path)
+    if spec and spec.loader:
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+            _fav3_sage_fn = getattr(mod, "fav3_sage_wrapper_func", None)
+        except Exception:
+            _fav3_sage_fn = None
+
+    # Fallback to installed aiter package if direct path load failed
+    if _fav3_sage_fn is None:
+        try:
+            from aiter.ops.triton.fav3_sage import fav3_sage_wrapper_func as _fa
+            _fav3_sage_fn = _fa
+        except Exception:
+            _fav3_sage_fn = None
+
+    return _fav3_sage_fn
 
 try:
     _get_flash_attn_fp8_func_v3()
@@ -228,14 +308,16 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 def _check_if_use_fp8_attn():
-    use_fp8_attn = True
+    use_fp8_attn = False
+    kernel = "default"
     try:
         use_fp8_attn = get_runtime_state().use_fp8_attn
+        kernel = get_runtime_state().kernel
     except:
         pass
     if not HAS_AITER and use_fp8_attn:
         raise RuntimeError("FP8 attention requested but AITER is not available.")
-    return use_fp8_attn
+    return use_fp8_attn, kernel
 
 
 def _sdpa_all_to_all_single(x):
@@ -299,54 +381,53 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal):
     output = torch.permute(output, [0, 2, 1, 3])
     return output, softmax_lse
 
-def _aiter_fp8_attn_call_v1(query, key, value, dropout_p, is_causal):
-    # Use flash_attn_fp8_func from already-loaded aiter package
-    from aiter.ops.triton.mha import flash_attn_fp8_func
+def _fav3_fp8_call(query, key, value, dropout_p, is_causal):
+    fn = _get_fav3_fp8_func()
+    if fn is None:
+        raise RuntimeError("kernel 'fav3_fp8' requested but flash_attn_fp8_func not found")
     
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
-    # Direct call - automatic FP8 quantization inside
-    output = flash_attn_fp8_func(
+    output = fn(
         query, key, value,
         causal=is_causal,
     )
     
     output = torch.permute(output, [0, 2, 1, 3])
-    return output, None  # No LSE returned from FP8 func
+    return output
 
-def _aiter_fp8_attn_call_v2(query, key, value, dropout_p, is_causal):
-    # Get the preloaded function from module level
-    flash_attn_fp8_func = _get_flash_attn_fp8_func_v2()
-    
+
+def _sagev1_call(query, key, value, dropout_p, is_causal):
+    """Call local sagev1 (expects HND) without caching the fn."""
+    fn = _get_sagev1_func()
+    if fn is None:
+        raise RuntimeError("kernel 'sagev1' requested but sageattn is not available")
+    output = fn(query, key, value, tensor_layout="HND", is_causal=is_causal)
+    return output
+
+
+def _fav3_sage_call(query, key, value, dropout_p, is_causal):
+    """Call fav3_sage wrapper (expects BSHD), converting from BHSD and back."""
+    fav3_sage_fn = _get_fav3_sage_attn()
+    if fav3_sage_fn is None:
+        raise RuntimeError("kernel 'fav3_sage' requested but fav3_sage_wrapper_func not found")
+
+    # Convert BHSD -> BSHD
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
-    # Direct call - automatic FP8 quantization inside
-    output = flash_attn_fp8_func(
-        query, key, value,
+    output = fav3_sage_fn(
+        query,
+        key,
+        value,
         causal=is_causal,
+        layout="bshd",
     )
-    
-    output = torch.permute(output, [0, 2, 1, 3])
-    return output, None
 
-def _aiter_fp8_attn_call_v3(query, key, value, dropout_p, is_causal):
-    # Get the preloaded function from module level
-    flash_attn_fp8_func = _get_flash_attn_fp8_func_v3()
-    
-    query = torch.permute(query, [0, 2, 1, 3]).contiguous()
-    key = torch.permute(key, [0, 2, 1, 3]).contiguous()
-    value = torch.permute(value, [0, 2, 1, 3]).contiguous()
-
-    # Direct call - automatic FP8 quantization inside
-    output = flash_attn_fp8_func(
-        query, key, value,
-        causal=is_causal,
-    )
-    
+    # Convert back BSHD -> BHSD
     output = torch.permute(output, [0, 2, 1, 3])
     return output, None
 
@@ -400,18 +481,28 @@ def _attention(query, key, value, dropout_p, is_causal):
     """
     Calls the correct attention mechanism based on the available libraries
     """
-    use_fp8_attn = _check_if_use_fp8_attn()
+    global DEBUG_FLAG
+    use_fp8_attn, kernel = _check_if_use_fp8_attn()
     if HAS_AITER:
         if use_fp8_attn:
-            # output, _ = _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal)
-            #
-            # print("******************** Using FP8 attention from /app/external/aiter/aiter/ops/triton/mha.py ********************")
-            # output, _ = _aiter_fp8_attn_call_v1(query, key, value, dropout_p, is_causal)
-            #
-            # # print("******************** Using FP8 attention from /workspace/aiter/aiter/ops/triton/mha_v3.py ********************")
-            output, _ = _aiter_fp8_attn_call_v3(query, key, value, dropout_p, is_causal)
-            # output, _ = _aiter_fp8_attn_call_v2(query, key, value, dropout_p, is_causal)
+            if kernel == "fav3_fp8":
+                output = _fav3_fp8_call(query, key, value, dropout_p, is_causal)
+            elif kernel == "sagev1":
+                output = _sagev1_call(query, key, value, dropout_p, is_causal)
+            elif kernel == "fav3_sage":
+                fav3s_fn = _get_fav3_sage_attn()
+                if fav3s_fn is None:
+                    raise RuntimeError("kernel 'fav3_sage' requested but fav3_sage_wrapper_func is not available")
+                output, _ = _fav3_sage_call(query, key, value, dropout_p, is_causal)
+            else:
+                if DEBUG_FLAG:
+                    print(f"***** kernel: {kernel} - using default FP8 attention _aiter_fp8_attn_call *****")
+                    DEBUG_FLAG = False
+                output, _ = _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal)
         else:
+            if DEBUG_FLAG:
+                print(f"***** Using default BF16 attention _aiter_bf16_attn_call *****")
+                DEBUG_FLAG = False
             output, _ = _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal)
         return output
     elif HAS_FLASH_ATTN:
