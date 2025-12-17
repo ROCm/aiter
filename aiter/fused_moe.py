@@ -471,6 +471,32 @@ def get_block_size_M(token, topk, expert, inter_dim):
         tmp.append((rnd, empty, el))
     return sorted(tmp, key=lambda x: x[:2])[0][-1]
 
+@functools.lru_cache(maxsize=2048)
+def get_ksplit(token, topk, expert, inter_dim, model_dim):
+    aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
+    if aiter_ksplit != 0:
+        return aiter_ksplit
+    # only for moe_blk gemm1 a8w8 decode scenario
+    if token * topk > expert:
+        return 0
+    cu_num = get_cu_num()
+    tileN = 128
+
+    tgM = token * topk  # decode tile num
+    tgN = (inter_dim * 2 + tileN - 1) // tileN
+
+    tg_num = tgN * tgM
+    # if all cu already active
+    if tg_num >= cu_num:
+        return 0
+    tilek = 256
+    split_max = (cu_num + tg_num - 1) // tg_num
+    # at least split = 2
+    for i in reversed(range(2, split_max + 1)):
+        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
+            return i
+    return 0
+
 
 cfg_2stages = None
 # fmt: off
@@ -504,16 +530,14 @@ quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
 
 
 def nextPow2(n):
-    if n <= 0:
+    if n <= 1:
         return 1
     return 1 << (n - 1).bit_length()
 
 
 def get_padded_M(M):
     padded_m = M
-    if M >= 1 and M <= 16:
-        padded_m = 16
-    elif M < 1024:
+    if M < 1024:
         padded_m = nextPow2(padded_m)
     elif M < 2048:
         padded_m = 1024
@@ -659,6 +683,15 @@ def get_2stage_cfgs(
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
         )
+        ksplit = (
+            ksplit
+            if (run_1stage)
+            else (
+                get_ksplit(token, topk, expert, inter_dim, model_dim)
+                if q_type in [QuantType.per_1x128, QuantType.per_1x32]
+                else ksplit
+            )
+        )
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
@@ -720,7 +753,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
                 bias1=bias1,
-                split_k=4,
+                split_k=ksplit * 2, # multiple with blkperCU.
             ),
             functools.partial(
                 cktile_moe_stage2,
