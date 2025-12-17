@@ -49,10 +49,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 PyNcclCommunicator,
             )
 
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group,
-                device=self.device,
-            )
+            try:
+                self.pynccl_comm = PyNcclCommunicator(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize PyNcclCommunicator for group "
+                    f"{self.unique_name}. Exception: {e}"
+                )
             # if is_symmetric_memory_enabled():
             #     register_nccl_symmetric_ops(self.pynccl_comm)
 
