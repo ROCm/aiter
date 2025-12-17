@@ -42,7 +42,10 @@ class TunerCommon:
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
     }
-    INVALID_TIME = -1
+    INVALID_TIME = -1 # op not support or error
+
+    INF_TIME = float("inf") # op time is too large
+    INVLAID_ERR_RATIO = 1.0 # err ratio is too large
 
     def __init__(self, name, key, resultList, description=None):
         self.parser = argparse.ArgumentParser(description=description)
@@ -344,7 +347,7 @@ class TunerCommon:
                 for info_ex, us, max_err_ratio in sorted_time
                 if max_err_ratio <= tol_err_ratio
                 and us != self.INVALID_TIME
-                and us != float("inf")
+                and us != self.INF_TIME
             ]
             if len(filtered_time) == 0:
                 logger.error(
@@ -509,7 +512,7 @@ class GemmCommonTuner(TunerCommon):
         ### gemm flops,bw
         info, time, err_ratio = results
         if time == -1:
-            return -1, -1
+            return 0, 0
         cu_num, m, n, k, *rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
@@ -527,7 +530,7 @@ class GemmCommonTuner(TunerCommon):
             keys, kernelId, splitK, kernelName = info
             kernelName = (
                 "None"
-                if time == self.INVALID_TIME
+                if time == self.INVALID_TIME or time == self.INF_TIME
                 else self.getKernelName(kernelId) if kernelName == "" else kernelName
             )
             tflops, bw = self.calculate(el)
@@ -559,14 +562,14 @@ class GemmCommonTuner(TunerCommon):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
         self.failed = pd.concat(
-            [self.failed, resultdf[resultdf["us"] == self.INVALID_TIME]],
+            [self.failed, resultdf[resultdf["us"] == self.INVALID_TIME or resultdf["us"] == self.INF_TIME]],
             ignore_index=True,
         )
         self.success = pd.concat(
-            [self.success, resultdf[resultdf["us"] != self.INVALID_TIME]],
+            [self.success, resultdf[resultdf["us"] != self.INVALID_TIME and resultdf["us"] != self.INF_TIME]],
             ignore_index=True,
         )
-        update_tunedf = resultdf[resultdf["us"] != self.INVALID_TIME]  # self.success
+        update_tunedf = resultdf[resultdf["us"] != self.INVALID_TIME and resultdf["us"] != self.INF_TIME]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:

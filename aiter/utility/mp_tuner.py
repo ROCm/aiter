@@ -38,11 +38,17 @@ def worker(
         res = None
         us = float("inf")
         try:
+<<<<<<< Updated upstream
             # print(f"run_perftest: info:{info}")
+=======
+            print(f"run_perftest: info:{info}, func:{func}", flush=True)
+>>>>>>> Stashed changes
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
         except RuntimeError as e:
             print(f"run gpu func error: info:{info}\t {e}")
+            us = -1 # not support or error
+            max_err_ratio = 1.0
         max_retries = 3
         retry_count = 0
 
@@ -100,7 +106,11 @@ def worker(
                 pass
         else:
             print(f"Runtime Error in process:{pid} info:{info}: {e}")
+<<<<<<< Updated upstream
         us = float("inf")
+=======
+        us = -1 #float("inf")
+>>>>>>> Stashed changes
         max_err_ratio = 1.0
     except TimeoutError as e:
         print(f"Timeout in process:{pid} info:{info}: {e}")
@@ -108,10 +118,17 @@ def worker(
         max_err_ratio = 1.0
     except Exception as e:
         print(f"Unexpected Error in process:{pid} info:{info}: {e}")
+<<<<<<< Updated upstream
         import traceback
 
         traceback.print_exc()
         us = float("inf")
+=======
+        #import traceback
+
+        #traceback.print_exc()
+        us = -1 # float("inf")
+>>>>>>> Stashed changes
         max_err_ratio = 1.0
     finally:
         # Ensure GPU state is cleaned up
@@ -184,12 +201,22 @@ def work_group(gpu_id, fast_mode, err_ratio, in_data, tasks):
         if ref is None and not fast_mode or (ref_func is not None and fast_mode):
             ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
             updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
+<<<<<<< Updated upstream
             ref = ref_func(*updated_ref_args, **ref_kwargs)
+=======
+            print(f"run_ref: info:{info}, func:{func}", flush=True)
+            #ref = ref_func(*updated_ref_args, **ref_kwargs)
+            ref = None
+>>>>>>> Stashed changes
             torch.cuda.synchronize()
 
         rets = []
         shape_grouped = isinstance(tasks, list)
         solutions = 1 if not shape_grouped else kernels_num
+<<<<<<< Updated upstream
+=======
+        print(f"solutions: {solutions}")
+>>>>>>> Stashed changes
         for i in range(solutions):
             (
                 info,
@@ -249,7 +276,11 @@ def mp_tuner(
     fast_mode=False,
     shape_grouped=False,
     err_ratio=0.05,
+<<<<<<< Updated upstream
     timeout=30,
+=======
+    timeout=100,
+>>>>>>> Stashed changes
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -279,10 +310,7 @@ def mp_tuner(
     if mp_num == 1 & fast_mode == 0:
         shape_grouped = True
 
-    # Set maxtasksperchild=1 so each task runs in a fresh process
-    # This ensures GPU faults in one task don't affect others
-    # GPU ID will be explicitly passed to each work_group
-    pool = mp.Pool(processes=parallel_num, maxtasksperchild=1)  #
+    print(f"mp_num: {mp_num}, fast_mode: {fast_mode}, shape_grouped: {shape_grouped}")
 
     task_group = []
     # dispatch per shape to one pid
@@ -305,93 +333,176 @@ def mp_tuner(
             cumulative, np.arange(len(task_group)), side="right"
         )
 
-    # Assign GPU ID for each task group using round-robin distribution
-    # This ensures tasks are evenly distributed across all available GPUs
     print(f"Distributing {len(task_group)} task groups across {mp_num} GPUs")
 
-    rets = [
-        pool.apply_async(
-            work_group,
-            args=(
-                k % mp_num + start_idx,  # GPU ID (round-robin assignment)
-                fast_mode,
-                err_ratio,
-                in_datas[ref_data_index[k]],
-                task_group[k],
-            ),
-        )
-        for k in range(len(task_group))
-    ]
+    # Helper function to submit tasks to pool
+    def submit_tasks(pool, task_indices):
+        """Submit tasks to the pool and return async results as a dict"""
+        return {
+            k: pool.apply_async(
+                work_group,
+                args=(
+                    k % mp_num + start_idx,  # GPU ID (round-robin assignment)
+                    fast_mode,
+                    err_ratio,
+                    in_datas[ref_data_index[k]],
+                    task_group[k],
+                ),
+            )
+            for k in task_indices
+        }
+
+    # Create initial pool and submit all tasks
+    pool = mp.Pool(processes=parallel_num)
+    rets_dict = submit_tasks(pool, range(len(task_group)))
+    # Convert to list for compatibility with existing code
+    rets = [rets_dict[k] for k in range(len(task_group))]
     pool.close()
 
     # Collect results with timeout and error handling
+    # Use "first-done-first-processed" strategy for better performance
     import itertools
+    import time
 
-    result = []
+    result_dict = {}  # Store results by task index
     failed_tasks = []
+    remaining_tasks = list(enumerate(rets))
 
-    for k, async_result in enumerate(rets):
-        try:
-            # Wait for result with timeout
-            task_result = async_result.get(timeout=timeout)
+    # Track start time for each task
+    task_start_times = {k: time.time() for k, _ in remaining_tasks}
+    check_interval = 30  # Check every 0.1 seconds
 
-            if shape_grouped:
-                result.extend(task_result)
-            else:
-                result.append(task_result[0])
+    print(f"Waiting for {len(remaining_tasks)} tasks to complete (timeout={timeout}s each)...")
 
-        except MPTimeoutError:
-            error_msg = f"[!]  Task {k} timed out after {timeout}s - likely GPU hang or infinite loop"
-            print(error_msg)
-            logger.error(error_msg)
-            failed_tasks.append((k, "timeout"))
-            # Add dummy failed result
-            if shape_grouped:
-                task_info = (
-                    task_group[k]
-                    if isinstance(task_group[k], list)
-                    else [task_group[k]]
-                )
-                for task in task_info:
-                    info = task[0] if len(task) > 0 else f"task_{k}"
-                    result.append((info, float("inf"), 1.0))
-            else:
-                task = task_group[k]
+    def add_dummy_result(k, results_list):
+        """Helper function to add dummy failed result"""
+        if shape_grouped:
+            task_info = (
+                task_group[k]
+                if isinstance(task_group[k], list)
+                else [task_group[k]]
+            )
+            for task in task_info:
                 info = task[0] if len(task) > 0 else f"task_{k}"
-                result.append((info, float("inf"), 1.0))
+                results_list.append((info, float("inf"), 1.0))
+        else:
+            task = task_group[k]
+            info = task[0] if len(task) > 0 else f"task_{k}"
+            results_list.append((info, float("inf"), 1.0))
 
-        except Exception as e:
-            # Check if it's a process crash (segfault, memory fault, etc.)
-            error_type = type(e).__name__
-            error_str = str(e)
+    # Process tasks as they complete
+    pool_restart_needed = False
 
-            if (
-                "died" in error_str.lower()
-                or "terminated" in error_str.lower()
-                or "segmentation" in error_str.lower()
-            ):
-                error_msg = f"[Crash] Task {k} crashed (likely GPU memory access fault): {error_type} - {e}"
-            else:
-                error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
+    while remaining_tasks:
+        completed_this_round = []
+        crashed_tasks = []
 
-            print(error_msg)
-            logger.error(error_msg)
-            failed_tasks.append((k, error_type))
+        for k, async_result in remaining_tasks:
+            try:
+                # Non-blocking check with short timeout
+                task_result = async_result.get(timeout=check_interval)
 
-            # Add dummy failed result
-            if shape_grouped:
-                task_info = (
-                    task_group[k]
-                    if isinstance(task_group[k], list)
-                    else [task_group[k]]
-                )
-                for task in task_info:
-                    info = task[0] if len(task) > 0 else f"task_{k}"
-                    result.append((info, float("inf"), 1.0))
-            else:
-                task = task_group[k]
-                info = task[0] if len(task) > 0 else f"task_{k}"
-                result.append((info, float("inf"), 1.0))
+                # Task completed successfully
+                result_dict[k] = task_result
+                completed_this_round.append((k, async_result))
+                elapsed = time.time() - task_start_times[k]
+                print(f"? Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)")
+
+            except MPTimeoutError:
+                # Check if this specific task has exceeded its timeout
+                elapsed = time.time() - task_start_times[k]
+                if elapsed > timeout:
+                    error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
+                    print(error_msg)
+                    logger.error(error_msg)
+                    failed_tasks.append((k, "timeout"))
+
+                    # Add dummy result
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = dummy_results if shape_grouped else [dummy_results[0]]
+                    completed_this_round.append((k, async_result))
+                # else: still within timeout, continue waiting
+
+            #except Exception as e:
+                # Check if it's a process crash (segfault, memory fault, etc.)
+                    #error_type = type(e).__name__
+                    #error_str = str(e)
+
+                    is_crash = True
+                    #(
+                    #    "died" in error_str.lower()
+                    #    or "terminated" in error_str.lower()
+                    #    or "segmentation" in error_str.lower()
+                    #    or "memory" in error_str.lower()
+                    #)
+
+                    if is_crash:
+                        error_msg = f"[Crash] Task {k} crashed (likely GPU memory fault):"
+                        crashed_tasks.append(k)
+                        pool_restart_needed = True
+                    else:
+                        error_msg = f"[Failed] Task {k} failed with:"
+    #
+                    #print(error_msg)
+                    #logger.error(error_msg)
+                    #failed_tasks.append((k, error_type))
+
+                    # Add dummy result
+                    #dummy_results = []
+                    #add_dummy_result(k, dummy_results)
+                    #result_dict[k] = dummy_results if shape_grouped else [dummy_results[0]]
+                    #completed_this_round.append((k, async_result))
+
+        # Remove completed tasks from remaining list
+        for item in completed_this_round:
+            remaining_tasks.remove(item)
+
+        # If pool restart needed due to crash, restart pool and resubmit remaining tasks
+        if pool_restart_needed and remaining_tasks:
+            print(f"\n{'='*60}")
+            print(f"? Pool restart needed due to crash. Restarting pool...")
+            print(f"Remaining tasks: {len(remaining_tasks)}")
+            print(f"{'='*60}\n")
+
+            # Terminate old pool
+            try:
+                pool.terminate()
+                pool.join(timeout=5)
+            except Exception as e:
+                print(f"Warning: Error during pool termination: {e}")
+
+            # Create new pool
+            pool = mp.Pool(processes=parallel_num)
+
+            # Resubmit remaining tasks
+            remaining_task_indices = [k for k, _ in remaining_tasks]
+            new_rets_dict = submit_tasks(pool, remaining_task_indices)
+            pool.close()
+
+            # Update remaining_tasks with new async results
+            remaining_tasks = [(k, new_rets_dict[k]) for k in remaining_task_indices]
+
+            # Reset start times for resubmitted tasks
+            for k in remaining_task_indices:
+                task_start_times[k] = time.time()
+
+            # Reset pool restart flag
+            pool_restart_needed = False
+            print(f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n")
+
+        # Small sleep to avoid busy waiting
+        if remaining_tasks:
+            time.sleep(1)
+
+    # Reconstruct results in original task order
+    result = []
+    for k in range(len(rets)):
+        task_result = result_dict[k]
+        if shape_grouped:
+            result.extend(task_result)
+        else:
+            result.append(task_result[0])
 
     # Clean up the pool
     try:
@@ -416,7 +527,7 @@ def mp_tuner(
             f"{'='*60}"
         )
         print(summary)
-        logger.warning(f"Failed task indices: {[k for k, _ in failed_tasks]}")
+        logger.warning(f"Failed task indices: {[k for k, _ in failed_tasks]}, config is {task_group[k]}")
     else:
         print(f"[Done] All {len(rets)} tasks completed successfully")
 

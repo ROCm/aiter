@@ -805,8 +805,8 @@ class FmoeTuner(TunerCommon):
             num_valid_ids,  # 7
             moe_buf,  # 8
             a1_scale,  # 9
-            w1_scale,  # 10
-            w2_scale,  # 11
+            w1_scale.reshape(w1_scale.shape[0], -1),  # 10
+            w2_scale.reshape(w2_scale.shape[0], -1),  # 11
             w1_qt,  # 12
             w2_qt,  # 13
             topk_weights,  # 14
@@ -1222,8 +1222,8 @@ class FmoeTuner(TunerCommon):
             use_g1u1,
             doweight_stage1,
         ) = key
-        if us == self.INVALID_TIME:
-            return -1, -1
+        if us == self.INVALID_TIME or us == self.INF_TIME:
+            return 0, 0
         flop = 0
         data_bytes = 0
         stage = ""
@@ -1403,6 +1403,7 @@ class FmoeTuner(TunerCommon):
                         True,
                     )
                 )
+
         return task_1stage
 
     def gen_2stages_asm1_task(self, key, blockMs):
@@ -1819,7 +1820,7 @@ class FmoeTuner(TunerCommon):
 
             ## remove invalid candidate
             profileDF = profileDF[
-                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf"))
+                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf")) & (profileDF["us"] != -1)
             ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
