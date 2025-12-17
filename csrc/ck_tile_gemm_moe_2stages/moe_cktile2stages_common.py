@@ -472,7 +472,9 @@ def get_gemm1_kernels_list(
         if arch == "gfx950":
             tag = "a8w4_gfx950"
         else:
-            raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}")
+            raise ValueError(
+                f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}"
+            )
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
@@ -516,7 +518,9 @@ def get_gemm2_kernels_list(
         if arch == "gfx950":
             tag = "a8w4_gfx950"
         else:
-            raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}")
+            raise ValueError(
+                f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}"
+            )
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm2_kernels_dict[tag]
