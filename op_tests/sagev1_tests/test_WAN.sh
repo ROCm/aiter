@@ -55,22 +55,27 @@ for k in $k_list; do
 done
 
 
-# ################################## run exp without fp8
-# res_dir=results_Wan22_default; model_type=/workspace/wan_models/Wan2.2-I2V-A14B-Diffusers; mkdir -p $res_dir
-# torchrun --nproc_per_node=8 /app/Wan/run.py \
-#     --task i2v \
-#     --height 720 \
-#     --width 1280 \
-#     --model $model_type \
-#     --img_file_path /app/Wan/i2v_input.JPG \
-#     --ulysses_degree 8 \
-#     --seed 42 \
-#     --num_frames 81 \
-#     --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside." \
-#     --num_repetitions 1 \
-#     --num_inference_steps 40 \
-#     --use_torch_compile \
-#     --benchmark_output_directory $res_dir 2>&1 | tee $res_dir/logs.txt
+################################## run exp without fp8
+model_name="Wan2.2-I2V-A14B-Diffusers"
+res_dir_base=results/${model_name}_BF16; model_path=/workspace/wan_models/$model_name
+cd /workspace
+rm -rf "$res_dir" # remove previous results (optional)
+mkdir -p "$res_dir"
+torchrun --nproc_per_node=8 /app/Wan/run.py \
+    --task i2v \
+    --height 720 \
+    --width 1280 \
+    --model $model_path \
+    --img_file_path /app/Wan/i2v_input.JPG \
+    --ulysses_degree 8 \
+    --seed 42 \
+    --num_frames 81 \
+    --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside." \
+    --num_repetitions 1 \
+    --num_inference_steps 40 \
+    --use_torch_compile \
+    --benchmark_output_directory "$res_dir" 2>&1 | tee "$res_dir/logs.txt"
+
 
 ################################## run rendering script
 # bash aiter/op_tests/sagev1_tests/render_all_WAN.sh --output Wan22_FP8_compare.mp4

@@ -175,50 +175,87 @@ def _get_sagev1_func():
 
 
 _fav3_sage_fn = None
-def _get_fav3_sage_attn():
-    """Lazy-load fav3_sage attention from /workspace/aiter/aiter/ to mirror fav3_fp8 path."""
-    global _fav3_sage_fn
-    if _fav3_sage_fn is not None:
-        return _fav3_sage_fn
-
+def _ensure_sage_attn_module():
+    """Preload sage_attn_triton_amd dependencies for fav3_sage."""
     import importlib.util
     import sys
     import types
 
-    # Ensure parent packages exist like fav3_fp8 and sagev1
+    # Create parent module chain
     if "aiter" not in sys.modules:
         sys.modules["aiter"] = types.ModuleType("aiter")
     if "aiter.ops" not in sys.modules:
         sys.modules["aiter.ops"] = types.ModuleType("aiter.ops")
     if "aiter.ops.triton" not in sys.modules:
         sys.modules["aiter.ops.triton"] = types.ModuleType("aiter.ops.triton")
+    if "aiter.ops.triton._triton_kernels" not in sys.modules:
+        sys.modules["aiter.ops.triton._triton_kernels"] = types.ModuleType("aiter.ops.triton._triton_kernels")
 
-    module_path = "/workspace/aiter/aiter/ops/triton/fav3_sage.py"
-    spec = importlib.util.spec_from_file_location("aiter.ops.triton.fav3_sage_workspace", module_path)
+    # Load sage_attn_triton_amd package
+    sage_init_path = "/workspace/aiter/aiter/ops/triton/_triton_kernels/sage_attn_triton_amd/__init__.py"
+    spec = importlib.util.spec_from_file_location("aiter.ops.triton._triton_kernels.sage_attn_triton_amd", sage_init_path)
     if spec and spec.loader:
         mod = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = mod
-        try:
-            spec.loader.exec_module(mod)
-            _fav3_sage_fn = getattr(mod, "fav3_sage_wrapper_func", None)
-        except Exception:
-            _fav3_sage_fn = None
+        spec.loader.exec_module(mod)
 
-    # Fallback to installed aiter package if direct path load failed
+    # Load sage_attn_triton_amd.utils
+    utils_path = "/workspace/aiter/aiter/ops/triton/_triton_kernels/sage_attn_triton_amd/utils.py"
+    spec = importlib.util.spec_from_file_location("aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils", utils_path)
+    if spec and spec.loader:
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+
+def _get_fav3_sage_attn():
+    """Lazy-load fav3_sage attention from /workspace/aiter/aiter/ with dependency preloading and patching."""
+    global _fav3_sage_fn
+    if _fav3_sage_fn is not None:
+        return _fav3_sage_fn
+
+    import importlib.util
+    import sys
+
+    # Preload dependencies that fav3_sage.py imports
+    _ensure_attn_qk_module()  # Loads attn_qk_int8_per_block
+    _ensure_sage_attn_module()  # Loads sage_attn_triton_amd and utils
+
+    # Patch get_fwd_configs to return format expected by fav3_sage.py
+    # fav3_sage.py expects: config, _ = get_fwd_configs(False) where config is a list with config[0].all_kwargs()
+    # But get_fwd_configs returns a dict directly, so we need to wrap it
+    sage_mod = sys.modules.get("aiter.ops.triton._triton_kernels.sage_attn_triton_amd")
+    if sage_mod:
+        original_get_fwd_configs = sage_mod.get_fwd_configs
+        def patched_get_fwd_configs(autotune):
+            config_dict = original_get_fwd_configs(autotune)
+            # Wrap dict in a list-like object with all_kwargs() method
+            class ConfigWrapper:
+                def __init__(self, d):
+                    self.d = d
+                def all_kwargs(self):
+                    return self.d
+            return [ConfigWrapper(config_dict)], None
+        sage_mod.get_fwd_configs = patched_get_fwd_configs
+
+    module_path = "/workspace/aiter/aiter/ops/triton/fav3_sage.py"
+    spec = importlib.util.spec_from_file_location("aiter.ops.triton.fav3_sage_workspace", module_path)
+    if not spec or not spec.loader:
+        raise RuntimeError(f"Failed to create spec for {module_path}")
+
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        raise RuntimeError(f"Failed to execute module {module_path}: {e}")
+
+    _fav3_sage_fn = getattr(mod, "fav3_sage_wrapper_func", None)
     if _fav3_sage_fn is None:
-        try:
-            from aiter.ops.triton.fav3_sage import fav3_sage_wrapper_func as _fa
-            _fav3_sage_fn = _fa
-        except Exception:
-            _fav3_sage_fn = None
+        raise RuntimeError(f"Module {module_path} loaded but 'fav3_sage_wrapper_func' not found")
 
     return _fav3_sage_fn
-
-try:
-    _get_flash_attn_fp8_func_v3()
-except Exception:
-    # Swallow errors so BF16 path can still run; function will re-attempt on call.
-    _flash_attn_fp8_func_v3 = None
 
 
 aten = torch.ops.aten
