@@ -311,9 +311,14 @@ __device__ __forceinline__ void load_lds_to_gpr(RT& dst,
 
 template <bool kIsTail, uint32_t GPR>
 __device__ __forceinline__ void
-softmax_scale_p(const uint32_t col_idx, const uint32_t kv_end, const float softmax_scale)
+softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const float softmax_scale)
 {
-    if((kIsTail == false) || ((col_idx + 16) < kv_end))
+    constexpr uint32_t minus_inf_f32     = 0xff800000;
+    constexpr uint32_t num_elem_per_tile = 4;
+    const uint32_t col_0_last_idx        = col_0_start_idx + num_elem_per_tile - 1;
+    const uint32_t col_1_start_idx       = col_0_start_idx + 16;
+    const uint32_t col_1_last_idx        = col_1_start_idx + num_elem_per_tile - 1;
+    if((kIsTail == false) || (col_1_last_idx < kv_end))
     {
         asm volatile("v_mul_f32_e32 v[%0], %8, v[%0]\n\t"
                      "v_mul_f32_e32 v[%1], %8, v[%1]\n\t"
@@ -334,29 +339,7 @@ softmax_scale_p(const uint32_t col_idx, const uint32_t kv_end, const float softm
                        "n"(GPR + 7),
                        "v"(softmax_scale));
     }
-    else if(col_idx < kv_end)
-    {
-        asm volatile("v_mul_f32_e32 v[%0], %8, v[%0]\n\t"
-                     "v_mul_f32_e32 v[%1], %8, v[%1]\n\t"
-                     "v_mul_f32_e32 v[%2], %8, v[%2]\n\t"
-                     "v_mul_f32_e32 v[%3], %8, v[%3]\n\t"
-                     "v_mov_b32 v[%4], %9\n\t"
-                     "v_mov_b32 v[%5], %9\n\t"
-                     "v_mov_b32 v[%6], %9\n\t"
-                     "v_mov_b32 v[%7], %9"
-                     :
-                     : "n"(GPR),
-                       "n"(GPR + 1),
-                       "n"(GPR + 2),
-                       "n"(GPR + 3),
-                       "n"(GPR + 4),
-                       "n"(GPR + 5),
-                       "n"(GPR + 6),
-                       "n"(GPR + 7),
-                       "v"(softmax_scale),
-                       "i"(0xff800000)); // -inf
-    }
-    else
+    else if(col_0_start_idx >= kv_end)
     {
         asm volatile("v_mov_b32 v[%0], %8\n\t"
                      "v_mov_b32 v[%1], %8\n\t"
@@ -375,7 +358,128 @@ softmax_scale_p(const uint32_t col_idx, const uint32_t kv_end, const float softm
                        "n"(GPR + 5),
                        "n"(GPR + 6),
                        "n"(GPR + 7),
-                       "i"(0xff800000)); // -inf
+                       "i"(minus_inf_f32));
+    }
+    else if(col_0_last_idx < kv_end)
+    {
+        asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
+                     "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
+                     "v_mul_f32_e32 v[%2], %4, v[%2]\n\t"
+                     "v_mul_f32_e32 v[%3], %4, v[%3]"
+                     :
+                     : "n"(GPR), "n"(GPR + 1), "n"(GPR + 2), "n"(GPR + 3), "v"(softmax_scale));
+
+        if((col_1_start_idx + 2) < kv_end)
+        {
+            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
+                         "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
+                         "v_mul_f32_e32 v[%2], %4, v[%2]\n\t"
+                         "v_mov_b32 v[%3], %5"
+                         :
+                         : "n"(GPR + 4),
+                           "n"(GPR + 4 + 1),
+                           "n"(GPR + 4 + 2),
+                           "n"(GPR + 4 + 3),
+                           "v"(softmax_scale),
+                           "i"(minus_inf_f32));
+        }
+        else if((col_1_start_idx + 1) < kv_end)
+        {
+            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
+                         "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
+                         "v_mov_b32 v[%2], %5\n\t"
+                         "v_mov_b32 v[%3], %5"
+                         :
+                         : "n"(GPR + 4),
+                           "n"(GPR + 4 + 1),
+                           "n"(GPR + 4 + 2),
+                           "n"(GPR + 4 + 3),
+                           "v"(softmax_scale),
+                           "i"(minus_inf_f32));
+        }
+        else if(col_1_start_idx < kv_end)
+        {
+            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
+                         "v_mov_b32 v[%1], %5\n\t"
+                         "v_mov_b32 v[%2], %5\n\t"
+                         "v_mov_b32 v[%3], %5"
+                         :
+                         : "n"(GPR + 4),
+                           "n"(GPR + 4 + 1),
+                           "n"(GPR + 4 + 2),
+                           "n"(GPR + 4 + 3),
+                           "v"(softmax_scale),
+                           "i"(minus_inf_f32));
+        }
+        else
+        {
+            asm volatile("v_mov_b32 v[%0], %4\n\t"
+                         "v_mov_b32 v[%1], %4\n\t"
+                         "v_mov_b32 v[%2], %4\n\t"
+                         "v_mov_b32 v[%3], %4"
+                         :
+                         : "n"(GPR + 4),
+                           "n"(GPR + 4 + 1),
+                           "n"(GPR + 4 + 2),
+                           "n"(GPR + 4 + 3),
+                           "i"(minus_inf_f32));
+        }
+    }
+    else
+    {
+        asm volatile("v_mov_b32 v[%0], %4\n\t"
+                     "v_mov_b32 v[%1], %4\n\t"
+                     "v_mov_b32 v[%2], %4\n\t"
+                     "v_mov_b32 v[%3], %4"
+                     :
+                     : "n"(GPR + 4),
+                       "n"(GPR + 4 + 1),
+                       "n"(GPR + 4 + 2),
+                       "n"(GPR + 4 + 3),
+                       "i"(minus_inf_f32));
+
+        if((col_0_start_idx + 2) < kv_end)
+        {
+            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
+                         "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
+                         "v_mul_f32_e32 v[%2], %4, v[%2]\n\t"
+                         "v_mov_b32 v[%3], %5"
+                         :
+                         : "n"(GPR),
+                           "n"(GPR + 1),
+                           "n"(GPR + 2),
+                           "n"(GPR + 3),
+                           "v"(softmax_scale),
+                           "i"(minus_inf_f32));
+        }
+        else if((col_0_start_idx + 1) < kv_end)
+        {
+            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
+                         "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
+                         "v_mov_b32 v[%2], %5\n\t"
+                         "v_mov_b32 v[%3], %5"
+                         :
+                         : "n"(GPR),
+                           "n"(GPR + 1),
+                           "n"(GPR + 2),
+                           "n"(GPR + 3),
+                           "v"(softmax_scale),
+                           "i"(minus_inf_f32));
+        }
+        else
+        {
+            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
+                         "v_mov_b32 v[%1], %5\n\t"
+                         "v_mov_b32 v[%2], %5\n\t"
+                         "v_mov_b32 v[%3], %5"
+                         :
+                         : "n"(GPR),
+                           "n"(GPR + 1),
+                           "n"(GPR + 2),
+                           "n"(GPR + 3),
+                           "v"(softmax_scale),
+                           "i"(minus_inf_f32));
+        }
     }
 }
 
@@ -390,7 +494,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
     using G = hk::group<T::kNumWarps>;
 
-    constexpr float log2e = 1.4426950408889634;
+    constexpr comp_t log2e = 1.4426950408889634;
 
     const int32_t worker_idx     = blockIdx.x;
     const int32_t work_start_idx = __builtin_amdgcn_readfirstlane(params.p_work_indptr[worker_idx]);
@@ -471,17 +575,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hk::art<q_t, T::kTileM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_s, q_rope_ranges> q_rope;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_ranges> kv_1;
-    hk::art<comp_t, T::kTileM, T::kBlockN, hk::col_l, hk::rt_16x16_s, p_comp_ranges> p_comp;
-    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges> p_mfma;
+    hk::art<comp_t, T::kBlockN, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_ranges> p_comp;
+    // hk::art<kv_t, T::kBlockN, T::kTileM, hk::row_l, hk::rt_16x16_s, p_mfma_ranges> p_mfma;
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
     // Runtime constants
-    const int32_t warp_idx = ckt::get_warp_id();
-    const int32_t lane_idx = ckt::get_lane_id();
+    const uint32_t warp_idx = ckt::get_warp_id();
+    const uint32_t lane_idx = __lane_id();
 
     // Store some of values in sgpr
     /// TODO: asm cannot use sgpr as operand!!!
-    const float softmax_scale = __builtin_amdgcn_readfirstlane(params.softmax_scale);
+    const comp_t softmax_scale = __builtin_amdgcn_readfirstlane(params.softmax_scale);
 
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
@@ -496,14 +600,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         const int32_t kv_end = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5]);
 
-        /// TODO: Remove duplicates of the following regs across threads in a subwarp (16 thrs)
-        float row_max[p_comp.elements_per_base_tile];
-        float row_sum_e[p_comp.elements_per_base_tile];
+        comp_t row_max;
+        comp_t row_sum_e;
 
         // Load Q from VRAM to GPRs
-        hk::load<2, 0>(q_nope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
+        hk::load<2, 0>(q_nope, params.query, {qo_start, 0, 0, 0}, {0, int32_t(warp_idx), 0, 0});
         hk::load<2, T::kQkNopeHeadDim>(
-            q_rope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
+            q_rope, params.query, {qo_start, 0, 0, 0}, {0, int32_t(warp_idx), 0, 0});
 
         auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_tile_start,
                                                              const int32_t kv_tile_end) {
@@ -541,13 +644,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 if constexpr(idx.value == k_q_nope_begin)
                 {
-                    hk::mma_ABt(p_comp, q_0, kv_0);
+                    hk::mma_ABt(p_comp, kv_0, q_0);
                 }
                 else
                 {
-                    hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
+                    hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
                 }
-                hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
+                hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
             });
 
             // GEMM on RoPE
@@ -569,59 +672,84 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 asm volatile("s_waitcnt lgkmcnt(0)");
 
-                hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
-                hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
+                hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
+                hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
             });
 
-            const uint32_t col_idx = lane_idx & 0xf;
+            const uint32_t col_0_idx = lane_idx >> 4;
             softmax_scale_p<kIsTail, k_p_comp_begin>(
-                col_idx + kv_tile_start, kv_end, params.softmax_scale);
+                col_0_idx * 4 + kv_tile_start, kv_end, params.softmax_scale);
 
             // float rr = hkm::v_max_f32<k_p_comp_begin, k_p_comp_begin+4>();
 
-            // Softmax
-            ckt::static_for<0, p_comp.elements_per_base_tile, 1>{}([&](auto row_idx) {
-                // Get max of each row of p_comp
-                constexpr uint32_t vgpr_off = k_p_comp_begin + row_idx.value;
-                /// TODO: It would be better to do the cal on vgpr_off and vgpr_off+4 directly.
-                float v0 = hkm::v_get_gpr<vgpr_off, float>();
-                float v1 = hkm::v_get_gpr<vgpr_off + 4, float>();
+            ///
+            /// Softmax
+            ///
 
-                float local_max = ckt::max(v0, v1);
+            /// TODO: It would be better to work on the pinned vgprs directly. However, embeding
+            /// inst like v_max_f32
+            ///       will break the compiler...
+            comp_t v0 = hkm::v_get_gpr<k_p_comp_begin + 0, comp_t>();
+            comp_t v1 = hkm::v_get_gpr<k_p_comp_begin + 1, comp_t>();
+            comp_t v2 = hkm::v_get_gpr<k_p_comp_begin + 2, comp_t>();
+            comp_t v3 = hkm::v_get_gpr<k_p_comp_begin + 3, comp_t>();
+            comp_t v4 = hkm::v_get_gpr<k_p_comp_begin + 4, comp_t>();
+            comp_t v5 = hkm::v_get_gpr<k_p_comp_begin + 5, comp_t>();
+            comp_t v6 = hkm::v_get_gpr<k_p_comp_begin + 6, comp_t>();
+            comp_t v7 = hkm::v_get_gpr<k_p_comp_begin + 7, comp_t>();
 
-                const uint32_t row_base = lane_idx & 0xf0;
+            // 1. Get max of row
+            comp_t local_max = ckt::max(v0, v1);
+            local_max        = ckt::max(local_max, v2);
+            local_max        = ckt::max(local_max, v3);
+            local_max        = ckt::max(local_max, v4);
+            local_max        = ckt::max(local_max, v5);
+            local_max        = ckt::max(local_max, v6);
+            local_max        = ckt::max(local_max, v7);
+
 #pragma unroll
-                for(uint32_t offset = 8; offset > 0; offset /= 2)
-                {
-                    const uint32_t src_lane = (((offset ^ 16) ^ col_idx) & 0xf) | row_base;
-                    local_max = ckt::max(local_max, ckt::warp_shuffle(local_max, src_lane));
-                }
-                const float new_row_max =
-                    kIsFirstIter ? local_max : ckt::max(local_max, row_max[row_idx.value]);
-                const float rescale =
-                    kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((local_max - new_row_max) * log2e);
+            for(uint32_t offset = 32; offset >= 16; offset /= 2)
+            {
+                const uint32_t src_lane = (offset ^ 64) ^ lane_idx;
+                local_max = ckt::max(local_max, ckt::warp_shuffle(local_max, src_lane));
+            }
 
-                v0 = __builtin_amdgcn_exp2f((v0 - new_row_max) * log2e);
-                v1 = __builtin_amdgcn_exp2f((v1 - new_row_max) * log2e);
+            const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, row_max);
+            const comp_t rescale =
+                kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((local_max - new_row_max) * log2e);
 
-                row_max[row_idx.value] = new_row_max;
+            row_max = new_row_max;
 
-                // Get sum of exp of each row
-                float local_sum_e = v0 + v1;
+            // calculate exp
+            v0 = __builtin_amdgcn_exp2f((v0 - new_row_max) * log2e);
+            v1 = __builtin_amdgcn_exp2f((v1 - new_row_max) * log2e);
+            v2 = __builtin_amdgcn_exp2f((v2 - new_row_max) * log2e);
+            v3 = __builtin_amdgcn_exp2f((v3 - new_row_max) * log2e);
+            v4 = __builtin_amdgcn_exp2f((v4 - new_row_max) * log2e);
+            v5 = __builtin_amdgcn_exp2f((v5 - new_row_max) * log2e);
+            v6 = __builtin_amdgcn_exp2f((v6 - new_row_max) * log2e);
+            v7 = __builtin_amdgcn_exp2f((v7 - new_row_max) * log2e);
+
+            // Get sum of exp of each row
+            float local_sum_e = ((v0 + v1) + (v2 + v3)) + ((v4 + v5) + (v6 + v7));
 #pragma unroll
-                for(uint32_t offset = 8; offset > 0; offset /= 2)
-                {
-                    const uint32_t src_lane = (((offset ^ 16) ^ col_idx) & 0xf) | row_base;
-                    local_sum_e += ckt::warp_shuffle(local_sum_e, src_lane);
-                }
+            for(uint32_t offset = 32; offset >= 16; offset /= 2)
+            {
+                const uint32_t src_lane = (offset ^ 64) ^ lane_idx;
+                local_sum_e += ckt::warp_shuffle(local_sum_e, src_lane);
+            }
 
-                row_sum_e[row_idx.value] =
-                    kIsFirstIter ? local_sum_e : (rescale * row_sum_e[row_idx.value] + local_sum_e);
+            row_sum_e = kIsFirstIter ? local_sum_e : (rescale * row_sum_e + local_sum_e);
 
-                // Move exp from unpinned reg to pinned reg
-                hkm::v_mov_b32_up2p<vgpr_off>(v0);
-                hkm::v_mov_b32_up2p<vgpr_off + 4>(v1);
-            });
+            // Move exp from unpinned reg to pinned reg
+            hkm::v_mov_b32_up2p<k_p_comp_begin + 0>(v0);
+            hkm::v_mov_b32_up2p<k_p_comp_begin + 1>(v1);
+            hkm::v_mov_b32_up2p<k_p_comp_begin + 2>(v2);
+            hkm::v_mov_b32_up2p<k_p_comp_begin + 3>(v3);
+            hkm::v_mov_b32_up2p<k_p_comp_begin + 4>(v4);
+            hkm::v_mov_b32_up2p<k_p_comp_begin + 5>(v5);
+            hkm::v_mov_b32_up2p<k_p_comp_begin + 6>(v6);
+            hkm::v_mov_b32_up2p<k_p_comp_begin + 7>(v7);
 
             float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
             float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
@@ -632,21 +760,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             float r12 = FUI(hkm::v_get_gpr<k_p_comp_begin + 6>()).f32;
             float r13 = FUI(hkm::v_get_gpr<k_p_comp_begin + 7>()).f32;
 
-            int row0 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4;
-            int row1 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 1;
-            int row2 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 2;
-            int row3 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx / 16) * 4 + 3;
-            int col0 = lane_idx % 16 + (kv_tile_start - kv_start);
+            int row0 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx & 0xf);
+            int col0 = (kv_tile_start - kv_start) + (lane_idx / 16) * 4;
             int col1 = col0 + 16;
 
             int off00 = row0 * 576 + col0;
-            int off01 = row1 * 576 + col0;
-            int off02 = row2 * 576 + col0;
-            int off03 = row3 * 576 + col0;
+            int off01 = row0 * 576 + col0 + 1;
+            int off02 = row0 * 576 + col0 + 2;
+            int off03 = row0 * 576 + col0 + 3;
             int off10 = row0 * 576 + col1;
-            int off11 = row1 * 576 + col1;
-            int off12 = row2 * 576 + col1;
-            int off13 = row3 * 576 + col1;
+            int off11 = row0 * 576 + col1 + 1;
+            int off12 = row0 * 576 + col1 + 2;
+            int off13 = row0 * 576 + col1 + 3;
 
             params.p_dbg[off00] = r00;
             params.p_dbg[off01] = r01;
