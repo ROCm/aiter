@@ -895,16 +895,17 @@ __global__ void radix_kernel(T const* in,
 {
     const int64_t batch_id = blockIdx.y;
 
-    IdxT row_len = 0;
-    if(phase == Phase::Prefill)
+    IdxT row_len = len;
+    if(rowStarts && rowEnds)
     {
-        const IdxT rowStart = rowStarts ? rowStarts[batch_id] : 0;
-        const IdxT rowEnd   = rowEnds ? rowEnds[batch_id] : len;
-        row_len             = rowEnd - rowStart;
-    }
-    else
-    {
-        row_len = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+        if(phase == Phase::Prefill)
+        {
+            row_len = rowEnds[batch_id] - rowStarts[batch_id];
+        }
+        else
+        {
+            row_len = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+        }
     }
 
     auto counter = counters + batch_id;
@@ -1384,11 +1385,18 @@ __global__ void radix_topk_one_block_kernel(T const* in,
 
     const int64_t batch_id = blockIdx.x;
 
-    const IdxT rowStart = phase == Phase::Prefill ? rowStarts ? rowStarts[batch_id] : 0 : 0;
-    const IdxT rowEnd   = phase == Phase::Prefill
-                              ? rowEnds ? rowEnds[batch_id] : len
-                              : rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
-    const IdxT row_len  = rowEnd - rowStart;
+    IdxT row_len = len;
+    if(rowStarts && rowEnds)
+    {
+        if(phase == Phase::Prefill)
+        {
+            row_len = rowEnds[batch_id] - rowStarts[batch_id];
+        }
+        else
+        {
+            row_len = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+        }
+    }
 
     if(threadIdx.x == 0)
     {
