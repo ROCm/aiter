@@ -12,7 +12,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 import torch
 import argparse
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.triton_tests.test_extend_attention import input_helper
+from op_tests.triton_tests.attention.test_extend_attention import input_helper
 
 
 def extend_forward(

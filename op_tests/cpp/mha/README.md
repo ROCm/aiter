@@ -24,9 +24,6 @@ Device library `libmha_fwd.so` and `libmha_bwd.so` will be built under current f
 
 To benchmark asm kernel, try following commands:
 ```
-# Set this env before you run
-export AITER_ASM_DIR={path_to_aiter}/hsa/{arch_name}/
-
 # fwd_v3
 ./benchmark_mha_fwd -prec=bf16 -b=1 -h=64 -d=128 -s=8192 -iperm=1 -operm=1 -mask=1 -lse=1 -fwd_v3=1 -mode=0 -kname=1 -v=0
 

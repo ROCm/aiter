@@ -195,7 +195,7 @@ CK_TILE_DEVICE void generate_work(
                     if (p_reduce_partial_map[global_cluster_q_idx].q_start == -1)
                     {
                         p_reduce_partial_map[global_cluster_q_idx].q_start = *p_loc_partial_outputs;
-                        p_reduce_final_map[global_cluster_q_idx] = { work_info.qo_start, work_info.qo_end };
+                        p_reduce_final_map[global_cluster_q_idx] = {{ work_info.qo_start, work_info.qo_end }};
                     }
                     ++(*p_num_partial_outputs);
                     *p_loc_partial_outputs += (work_info.qo_end - work_info.qo_start);
@@ -424,8 +424,8 @@ __global__ void kn_get_mla_metadata_v1_1(
     MlaPartialTileInfo* p_reduce_final_map = p_reduce_partial_map + tot_qo_tiles;
     for (int32_t cluster_q_idx = threadIdx.x; cluster_q_idx < tot_qo_tiles; cluster_q_idx += ck_tile::get_warp_size())
     {
-        p_reduce_partial_map[cluster_q_idx] = MlaPartialTileInfo{-1, -2};
-        p_reduce_final_map[cluster_q_idx] = MlaPartialTileInfo{-1, -2};
+        p_reduce_partial_map[cluster_q_idx] = MlaPartialTileInfo{{-1, -2}};
+        p_reduce_final_map[cluster_q_idx] = MlaPartialTileInfo{{-1, -2}};
     }
 
     // Step.5.3. Output work info

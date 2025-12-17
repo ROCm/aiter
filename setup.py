@@ -17,7 +17,7 @@ from jit import core
 from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
-PACKAGE_NAME = "aiter"
+PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
 if BUILD_TARGET == "auto":
@@ -42,7 +42,8 @@ def getMaxJobs():
     import psutil
 
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)
+    # free memory in GB
     max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
@@ -328,6 +329,15 @@ setup(
         "einops",
         "psutil",
     ],
+    extras_require={
+        # Triton-based communication using Iris
+        # Note: Iris is not available on PyPI and must be installed separately
+        # Install with: pip install -r requirements-triton-comms.txt
+        # (See requirements-triton-comms.txt for pinned Iris version)
+        "triton_comms": [],
+        # Install all optional dependencies
+        "all": [],
+    },
     setup_requires=setup_requires,
     distclass=ForcePlatlibDistribution,
 )

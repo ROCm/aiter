@@ -962,8 +962,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.max_seqlen_q = max_seqlen_q;
 
             args.scale_s = scale_s;
-            args.scale_p = scale_p;
-            args.scale_o = scale_o;
 
             args.logits_soft_cap = logits_soft_cap;
 
@@ -1053,7 +1051,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
                               mask.type,
                               bias.type,
                               lse,
+                              quant_scale_enum::no_scale,
                               fwd_v3,
+                              false, /*has_sink*/
                               v3_bf16_cvt,
                               nullptr,
                               nullptr,
