@@ -209,7 +209,7 @@ def _ensure_sage_attn_module():
 
 
 def _get_fav3_sage_attn():
-    """Lazy-load fav3_sage attention from /workspace/aiter/aiter/ with dependency preloading and patching."""
+    """Lazy-load fav3_sage attention from /workspace/aiter/aiter/ with dependency preloading."""
     global _fav3_sage_fn
     if _fav3_sage_fn is not None:
         return _fav3_sage_fn
@@ -220,23 +220,6 @@ def _get_fav3_sage_attn():
     # Preload dependencies that fav3_sage.py imports
     _ensure_attn_qk_module()  # Loads attn_qk_int8_per_block
     _ensure_sage_attn_module()  # Loads sage_attn_triton_amd and utils
-
-    # Patch get_fwd_configs to return format expected by fav3_sage.py
-    # fav3_sage.py expects: config, _ = get_fwd_configs(False) where config is a list with config[0].all_kwargs()
-    # But get_fwd_configs returns a dict directly, so we need to wrap it
-    sage_mod = sys.modules.get("aiter.ops.triton._triton_kernels.sage_attn_triton_amd")
-    if sage_mod:
-        original_get_fwd_configs = sage_mod.get_fwd_configs
-        def patched_get_fwd_configs(autotune):
-            config_dict = original_get_fwd_configs(autotune)
-            # Wrap dict in a list-like object with all_kwargs() method
-            class ConfigWrapper:
-                def __init__(self, d):
-                    self.d = d
-                def all_kwargs(self):
-                    return self.d
-            return [ConfigWrapper(config_dict)], None
-        sage_mod.get_fwd_configs = patched_get_fwd_configs
 
     module_path = "/workspace/aiter/aiter/ops/triton/fav3_sage.py"
     spec = importlib.util.spec_from_file_location("aiter.ops.triton.fav3_sage_workspace", module_path)
