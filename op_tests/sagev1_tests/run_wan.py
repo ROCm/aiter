@@ -38,6 +38,9 @@ def setup_attention(args):
     Returns True if monkey-patch was applied, False otherwise.
     """
     if args.attention_type == 'default':
+        # NOTE: Using 'default' attention requires aiter JIT modules (aiter.jit.module_fmha_v3_fwd)
+        # which is not available when installing aiter from source (e.g., aiter >= 0.1.7).
+        # please use one of the alternative attention types: 'sagev1', 'fav3_sage', or 'fav3_fp8'.
         return False  # Use internal attention, no monkey-patch
     
     import xfuser.model_executor.layers.usp as usp_mod
