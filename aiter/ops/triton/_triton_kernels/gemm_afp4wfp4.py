@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
-import json
-import os
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 _gemm_afp4wfp4_repr = make_kernel_repr(
@@ -710,52 +706,14 @@ def _gemm_afp4wfp4_reduce_kernel(
     tl.store(c_out_ptrs, c)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
     shuffle: bool = False,
 ):
-    shuffle_filename_suffix = "" if not shuffle else "_PRESHUFFLED"
-    if not hasattr(_get_config, "_config_dict") or not hasattr(
-        _get_config._config_dict, f"default{shuffle_filename_suffix}"
-    ):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict[f"default{shuffle_filename_suffix}"] = config
+    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
+    config_name = f"GEMM-AFP4WFP4{shuffle_suffix}"
 
-    key = f"{N}_{K}{shuffle_filename_suffix}"
-    if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}-N={N}-K={2*K}.json"
-        if os.path.exists(fpath):
-            with open(fpath, "r") as file:
-                config = json.load(file)
-                _get_config._config_dict[key] = config
-        else:
-            key = f"default{shuffle_filename_suffix}"  # fall back to default config
-
-    if M < 32:
-        BLK_M = triton.next_power_of_2(M)
-        if BLK_M >= 16 and "small_M16" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["small_M16"]
-        return _get_config._config_dict[key]["small"]
-    elif M <= 128:
-        BLK_M = triton.next_power_of_2(M)
-        if BLK_M == 32:
-            return _get_config._config_dict[key]["medium_M32"]
-        elif BLK_M == 64:
-            return _get_config._config_dict[key]["medium_M64"]
-        elif BLK_M == 128:
-            return _get_config._config_dict[key]["medium_M128"]
-    elif M <= 256:
-        return _get_config._config_dict[key]["large"]
-    else:
-        BLK_M = triton.next_power_of_2(M)
-        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
-        return _get_config._config_dict[key]["xlarge"]
+    # Note: Config files use K=2*K in their naming
+    return get_gemm_config(config_name, M, N, 2 * K)

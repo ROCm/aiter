@@ -82,19 +82,7 @@ def perftest(
                     latencies.append(start_event.elapsed_time(end_event))
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
-            if testGraph:
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    data = run_iters_rotate(num_iters, func, rotate_args)
-                with tpf.profile(
-                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-                    profile_memory=True,
-                    with_stack=True,
-                    with_modules=True,
-                ) as prof:
-                    run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
-                logger.info(f"avg: {avg} us/iter with hipgraph")
+
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
@@ -110,6 +98,20 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+
+            if testGraph:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    data = run_iters_rotate(num_iters, func, rotate_args)
+                with tpf.profile(
+                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                    profile_memory=True,
+                    with_stack=True,
+                    with_modules=True,
+                ) as prof:
+                    run_iters(1, graph.replay)
+                avg = get_trace_perf(prof, num_iters)
+                logger.info(f"avg: {avg} us/iter with hipgraph")
 
             avg = get_trace_perf(prof, num_iters)
             return data, avg
@@ -409,7 +411,7 @@ def checkAllclose(
             a_msked = a[mask]
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
-        except RuntimeError as e:
+        except RuntimeError:
             mask = ~isClose.to("cpu")
             num = mask.sum()
             printNum = min(printNum, num)
