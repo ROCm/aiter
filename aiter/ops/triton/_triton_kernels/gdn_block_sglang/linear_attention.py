@@ -22,6 +22,7 @@ from ..gdr_sglang import (
     fused_gdn_gating,
 )
 from .causal_conv1d_triton import causal_conv1d_fn, causal_conv1d_update
+from .gdn_attn_backend import GDNAttnBackend
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -166,344 +167,125 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.value_dim, hidden_size, bias=False, dtype=dtype, device=device
         )
         
-    def _project_inputs(
-        self, 
-        hidden_states: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Project hidden states to Q, K, V, Z, a, b.
-        
-        Args:
-            hidden_states: [batch, seq_len, hidden_size]
-            
-        Returns:
-            query: [batch, seq_len, num_k_heads, head_k_dim]
-            key: [batch, seq_len, num_k_heads, head_k_dim]
-            value: [batch, seq_len, num_v_heads, head_v_dim]
-            z: [batch, seq_len, num_v_heads, head_v_dim] - gating signal
-            a: [batch, seq_len, num_v_heads] - gate parameter
-            b: [batch, seq_len, num_v_heads] - beta parameter
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        # Project to QKVZ
-        projected_qkvz = self.in_proj_qkvz(hidden_states)  # [B, T, 2*key_dim + 2*value_dim]
-        
-        # Project to ba
-        projected_ba = self.in_proj_ba(hidden_states)  # [B, T, 2*num_v_heads]
-        
-        # Split QKVZ
-        # Reshape to [B, T, num_k_heads, dims_per_head]
-        projected_qkvz = projected_qkvz.view(
-            batch_size, seq_len, self.num_k_heads,
-            self.head_k_dim * 2 + (self.head_v_dim * 2 * self.num_v_heads // self.num_k_heads)
-        )
-        
-        # Split into Q, K, V, Z
-        splits = [
-            self.head_k_dim,  # Q
-            self.head_k_dim,  # K
-            self.head_v_dim * self.num_v_heads // self.num_k_heads,  # V
-            self.head_v_dim * self.num_v_heads // self.num_k_heads,  # Z
-        ]
-        query, key, value, z = torch.split(projected_qkvz, splits, dim=-1)
-        
-        # Reshape V and Z to have separate head dimension
-        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
-        z = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
-        
-        # Split ba
-        projected_ba = projected_ba.view(
-            batch_size, seq_len, self.num_k_heads, 
-            2 * self.num_v_heads // self.num_k_heads
-        )
-        b, a = torch.split(
-            projected_ba, 
-            [self.num_v_heads // self.num_k_heads] * 2, 
-            dim=-1
-        )
-        
-        # Reshape a and b
-        b = b.reshape(batch_size, seq_len, self.num_v_heads)
-        a = a.reshape(batch_size, seq_len, self.num_v_heads)
-        
-        return query, key, value, z, a, b
-    
-    def _apply_conv1d(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        conv_state: Optional[torch.Tensor] = None,
-        query_start_loc: Optional[torch.Tensor] = None,
-        cache_indices: Optional[torch.Tensor] = None,
-        has_initial_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Apply 1D convolution to Q, K, V.
-        
-        When use_triton_conv1d=True:
-        - seq_len == 1: Uses causal_conv1d_update (optimized for decode)
-        - seq_len > 1: Uses causal_conv1d_fn (optimized for prefill)
-        
-        Args:
-            query, key, value: [batch, seq_len, num_heads, head_dim]
-            conv_state: Optional cached state for inference [batch or cache_size, conv_dim, kernel_size-1]
-            query_start_loc: Optional cumulative seq lengths for Triton [batch+1]
-            cache_indices: Optional cache indices for Triton [batch]
-            has_initial_state: Optional flags for Triton [batch]
-            
-        Returns:
-            Convolved query, key, value and updated conv_state
-        """
-        batch_size, seq_len, num_heads, head_dim = query.shape
-        
-        # Flatten heads: [B, T, H, D] → [B, T, H*D]
-        query_flat = query.reshape(batch_size, seq_len, -1)
-        key_flat = key.reshape(batch_size, seq_len, -1)
-        value_flat = value.reshape(batch_size, seq_len, -1)
-        
-        # Concatenate: [B, T, key_dim*2 + value_dim]
-        mixed = torch.cat([query_flat, key_flat, value_flat], dim=-1)
-        
-        if self.use_triton_conv1d:
-            # Use Triton implementation
-            # Initialize conv_state if needed
-            if conv_state is None:
-                conv_state = torch.zeros(
-                    batch_size, self.conv_dim, self.conv_kernel_size - 1,
-                    dtype=mixed.dtype, device=mixed.device
-                )
-            
-            if seq_len == 1:
-                # Use causal_conv1d_update for single-step decode (optimized)
-                # Input shape: [B, C, T=1]
-                mixed_update = mixed.transpose(1, 2)  # [B, T, C] → [B, C, T]
-                
-                # Call Triton causal_conv1d_update (modifies mixed_update in-place)
-                causal_conv1d_update(
-                    x=mixed_update,  # [B, C, T=1]
-                    conv_state=conv_state,  # [B, C, kernel_size-1]
-                    weight=self.conv1d_weight,  # [C, kernel_size]
-                    bias=self.conv1d_bias,  # [C]
-                    activation=None,  # No activation in conv layer
-                    cache_seqlens=None,  # Not using circular buffer
-                    conv_state_indices=cache_indices,  # For continuous batching
-                    pad_slot_id=-1,  # Default pad slot ID
-                )
-                
-                # Convert back: [B, C, T=1] → [B, T=1, C]
-                mixed = mixed_update.transpose(1, 2)
-                
-            else:
-                # Use causal_conv1d_fn for multi-step prefill
-                # Triton expects [dim, cu_seq_len] format
-                # Convert [B, T, C] → [C, B*T]
-                mixed_triton = mixed.reshape(-1, self.conv_dim).transpose(0, 1).contiguous()  # [C, B*T]
-                
-                # Create query_start_loc if not provided: [0, T, 2*T, ..., B*T]
-                if query_start_loc is None:
-                    query_start_loc = torch.arange(
-                        0, (batch_size + 1) * seq_len, seq_len,
-                        dtype=torch.int32, device=query.device
-                    )
-                
-                # Seq lengths for each batch
-                seq_lens_cpu = [seq_len] * batch_size
-                
-                # Call Triton causal_conv1d_fn
-                mixed_triton = causal_conv1d_fn(
-                    x=mixed_triton,
-                    weight=self.conv1d_weight,
-                    bias=self.conv1d_bias,
-                    conv_states=conv_state,
-                    query_start_loc=query_start_loc,
-                    seq_lens_cpu=seq_lens_cpu,
-                    cache_indices=cache_indices,
-                    has_initial_state=has_initial_state,
-                    activation=None,  # No activation in conv layer
-                )
-                
-                # Convert back: [C, B*T] → [B, T, C]
-                mixed = mixed_triton.transpose(0, 1).reshape(batch_size, seq_len, self.conv_dim)
-            
-        else:
-            # Use standard PyTorch Conv1d
-            # Transpose for Conv1d: [B, C, T]
-            mixed = mixed.transpose(1, 2)
-            
-            # Apply convolution
-            mixed = self.conv1d(mixed)
-            
-            # Remove extra padding
-            if self.conv_kernel_size > 1:
-                mixed = mixed[:, :, :seq_len]
-            
-            # Transpose back: [B, T, C]
-            mixed = mixed.transpose(1, 2)
-        
-        # Split back
-        query_flat, key_flat, value_flat = torch.split(
-            mixed, 
-            [self.key_dim, self.key_dim, self.value_dim], 
-            dim=-1
-        )
-        
-        # Reshape back to multi-head format
-        query = query_flat.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
-        key = key_flat.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
-        value = value_flat.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
-        
-        return query, key, value, conv_state
     
     def forward(
         self,
         hidden_states: torch.Tensor,
-        mode: str = "auto",
-        initial_state: Optional[torch.Tensor] = None,
-        output_final_state: bool = False,
-        cu_seqlens: Optional[torch.Tensor] = None,
+        attn_backend: Optional['GDNAttnBackend'] = None,
+        conv_state: Optional[torch.Tensor] = None,
+        ssm_state: Optional[torch.Tensor] = None,
+        cache_indices: Optional[torch.Tensor] = None,
+        query_start_loc: Optional[torch.Tensor] = None,
+        has_initial_state: Optional[torch.Tensor] = None,
+        seq_lens_cpu: Optional[list] = None,
         use_qk_l2norm: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        is_target_verify: bool = False,
+        intermediate_state_cache: Optional[torch.Tensor] = None,
+        intermediate_conv_window_cache: Optional[torch.Tensor] = None,
+        retrieve_next_token: Optional[torch.Tensor] = None,
+        retrieve_next_sibling: Optional[torch.Tensor] = None,
+        retrieve_parent_token: Optional[torch.Tensor] = None,
+        draft_token_num: Optional[int] = None,
+    ) -> torch.Tensor:
         """
         Forward pass of Qwen3GatedDeltaNet.
         
+        Reference: SGLang Qwen3GatedDeltaNet._forward (qwen3_next.py, lines 391-473)
+        
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden_size]
-            mode: Computation mode
-                - "auto": Automatically select based on seq_len
-                - "chunk": Use chunk-based parallel computation (prefill)
-                - "recurrent": Use recurrent computation (decode)
-                - "fused_decode": Use fully fused decode kernel (single-step)
-            initial_state: Initial hidden state [batch, num_v_heads, head_k_dim, head_v_dim]
-            output_final_state: Whether to return final state
-            cu_seqlens: Cumulative sequence lengths for variable-length sequences
-            use_qk_l2norm: Apply L2 normalization to Q and K (Qwen3-Next default: True)
+            hidden_states: Input tensor [seq_len, hidden_size] or [batch, seq_len, hidden_size]
+            attn_backend: GDN attention backend (required for inference with cache)
+            conv_state: Convolution state cache [cache_size, conv_dim, kernel_size-1]
+            ssm_state: SSM state cache [cache_size, num_v_heads, head_k_dim, head_v_dim]
+            cache_indices: Cache indices [batch]
+            query_start_loc: Cumulative sequence lengths [batch+1]
+            has_initial_state: Flags for initial state [batch]
+            seq_lens_cpu: Sequence lengths on CPU [batch]
+            use_qk_l2norm: Apply L2 normalization to Q and K
+            is_target_verify: Whether in target verification mode
+            intermediate_state_cache: Intermediate SSM states
+            intermediate_conv_window_cache: Intermediate conv windows
+            retrieve_next_token: Token retrieval indices [batch, draft_token_num]
+            retrieve_next_sibling: Sibling retrieval indices [batch, draft_token_num]
+            retrieve_parent_token: Parent retrieval indices [batch, draft_token_num]
+            draft_token_num: Number of draft tokens
             
         Returns:
-            output: [batch, seq_len, hidden_size]
-            final_state: [batch, num_v_heads, head_k_dim, head_v_dim] if output_final_state=True
+            output: [seq_len, hidden_size] or [batch, seq_len, hidden_size]
         """
-        batch_size, seq_len, _ = hidden_states.shape
+        seq_len = hidden_states.shape[0] if hidden_states.dim() == 2 else hidden_states.shape[1]
         
-        # 1. Project inputs
-        query, key, value, z, a, b = self._project_inputs(hidden_states)
+        # 1. Input projection
+        projected_qkvz = self.in_proj_qkvz(hidden_states)
+        projected_ba = self.in_proj_ba(hidden_states)
         
-        # 2. Apply convolution
-        # For Triton implementation, we can pass cu_seqlens if available
-        query, key, value, _ = self._apply_conv1d(
-            query, key, value,
-            conv_state=None,  # TODO: Add conv_state management for decode
-            query_start_loc=cu_seqlens,  # Pass cu_seqlens as query_start_loc
-        )
+        # 2. Split projections
+        key_split_dim = self.key_dim
+        value_split_dim = self.value_dim
         
-        # 3. Compute gating parameters
-        # g: forget gate (in log space)
-        # beta: input gate
-        g, beta = fused_gdn_gating(
-            A_log=self.A_log,
-            a=a.reshape(-1, self.num_v_heads),  # Flatten batch and seq
-            b=b.reshape(-1, self.num_v_heads),
-            dt_bias=self.dt_bias,
-        )
-        # Reshape back: [1, B*T, H] → [B, T, H]
-        g = g.squeeze(0).reshape(batch_size, seq_len, self.num_v_heads)
-        beta = beta.squeeze(0).reshape(batch_size, seq_len, self.num_v_heads)
+        # Extract mixed_qkv (Q, K, V concatenated)
+        mixed_qkv = projected_qkvz[..., :key_split_dim * 2 + value_split_dim]
+        # Extract z (gating signal)
+        z = projected_qkvz[..., key_split_dim * 2 + value_split_dim:]
         
-        # 4. Select computation mode
-        if mode == "auto":
-            # Auto-select based on sequence length
-            if seq_len == 1:
-                mode = "fused_decode"
-            elif seq_len > 128:
-                mode = "chunk"
-            else:
-                mode = "recurrent"
+        # Extract a and b
+        b, a = torch.split(projected_ba, [self.num_v_heads, self.num_v_heads], dim=-1)
         
-        # 5. GDN computation
-        if mode == "chunk":
-            # Chunk-based parallel computation (prefill)
-            output, final_state = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                cu_seqlens=cu_seqlens,
-                head_first=False,
-                use_qk_l2norm_in_kernel=use_qk_l2norm,
-            )
-        elif mode == "recurrent":
-            # Recurrent computation (short sequences or decode)
-            # Note: This mode requires initial_state and indices for state management
-            if initial_state is None:
-                # Create zero initial state
-                initial_state = torch.zeros(
-                    batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim,
-                    dtype=torch.float32, device=hidden_states.device
-                )
-            
-            # Always provide indices for state management
-            state_indices = torch.arange(batch_size, dtype=torch.int32, device=hidden_states.device)
-            
-            output = fused_recurrent_gated_delta_rule_update(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state_source=initial_state,
-                initial_state_indices=state_indices,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=use_qk_l2norm,
-            )
-            final_state = None
-        elif mode == "fused_decode":
-            # Fully fused single-step decode
-            # Reshape for decode kernel expectations
-            output = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=a.reshape(-1, self.num_v_heads),
-                dt_bias=self.dt_bias,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                q=query.unsqueeze(0) if query.dim() == 3 else query,  # Ensure [1, T, H, K]
-                k=key.unsqueeze(0) if key.dim() == 3 else key,
-                v=value.unsqueeze(0) if value.dim() == 3 else value,
-                b=b.reshape(-1, self.num_v_heads),
-                initial_state_source=initial_state,
-                initial_state_indices=torch.arange(batch_size, device=hidden_states.device) if initial_state is not None else None,
-                use_qk_l2norm_in_kernel=use_qk_l2norm,
-                cu_seqlens=cu_seqlens,
-            )
-            final_state = None
-            if output.dim() == 4:
-                output = output.squeeze(0)  # Remove batch dim if added
+        # 3. Call backend
+        is_decode = seq_len == 1
+        
+        kwargs = {
+            "mixed_qkv": mixed_qkv,
+            "conv_weights": self.conv1d_weight,
+            "bias": self.conv1d_bias,
+            "activation": None,
+            "key_dim": self.key_dim,
+            "value_dim": self.value_dim,
+            "attention_tp_size": 1,
+            "head_k_dim": self.head_k_dim,
+            "head_v_dim": self.head_v_dim,
+            "a": a,
+            "b": b,
+            "A_log": self.A_log,
+            "dt_bias": self.dt_bias,
+            "conv_state": conv_state,
+            "ssm_state": ssm_state,
+            "cache_indices": cache_indices,
+            "query_start_loc": query_start_loc,
+            "use_qk_l2norm": use_qk_l2norm,
+        }
+        
+        if is_decode:
+            core_attn_out = attn_backend.forward_decode(**kwargs)
         else:
-            raise ValueError(f"Unknown mode: {mode}")
+            kwargs.update({
+                "seq_len": seq_len,
+                "has_initial_state": has_initial_state,
+                "seq_lens_cpu": seq_lens_cpu,
+                "is_target_verify": is_target_verify,
+                "intermediate_state_cache": intermediate_state_cache,
+                "intermediate_conv_window_cache": intermediate_conv_window_cache,
+                "retrieve_next_token": retrieve_next_token,
+                "retrieve_next_sibling": retrieve_next_sibling,
+                "retrieve_parent_token": retrieve_parent_token,
+                "draft_token_num": draft_token_num,
+            })
+            core_attn_out = attn_backend.forward_extend(**kwargs)
         
-        # 6. Gated normalization
-        # Flatten for normalization
-        output_flat = output.reshape(-1, self.head_v_dim)
+        # 4. Gated normalization
+        original_shape = core_attn_out.shape
+        output_flat = core_attn_out.reshape(-1, self.head_v_dim)
         z_flat = z.reshape(-1, self.head_v_dim)
-        
-        # Apply gated RMSNorm: norm(output) * sigmoid(z)
         output_flat = self.norm(output_flat, z_flat)
         
-        # Reshape back
-        output = output_flat.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        # Reshape back and flatten heads
+        core_attn_out = output_flat.reshape(original_shape)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
         
-        # Flatten heads for output projection
-        output = output.reshape(batch_size, seq_len, self.value_dim)
+        # 5. Output projection
+        output = self.out_proj(core_attn_out)
         
-        # 7. Output projection
-        output = self.out_proj(output)
-        
-        if output_final_state:
-            return output, final_state
-        return output, None
+        return output
 
 
 class RMSNormGated(nn.Module):
