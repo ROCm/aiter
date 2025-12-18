@@ -182,8 +182,8 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
 
 
 def run_benchmark(args: argparse.Namespace):
-    ChunkK = 256
-    WavePerEU = 2
+    ChunkK = 128
+    WavePerEU = 5
 
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def test_deepgemm_fp8_paged_mqa_logits(
@@ -193,8 +193,8 @@ def run_benchmark(args: argparse.Namespace):
         random.seed(0)
 
         max_model_len = 2 * avg_kv_length
-        num_blocks = max_model_len
         blocksize = args.blocksize if args.kv_preshuffle else 1
+        num_blocks = (max_model_len + blocksize - 1) // blocksize
 
         assert blocksize == 1 or args.kv_preshuffle and blocksize % 16 == 0
 

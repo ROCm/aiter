@@ -381,7 +381,7 @@ def deepgemm_fp8_paged_mqa_logits(
     TileQCount = batch_size * next_n
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
-    assert ChunkK % KVBlockSize == 0
+    assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
     if Preshuffle:
         assert (
