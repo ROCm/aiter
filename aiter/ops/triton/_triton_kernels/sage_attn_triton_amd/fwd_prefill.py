@@ -1069,6 +1069,7 @@ def attn_fwd(
     K_Descale,
     V_Descale,
     FP8_MAX,
+    V_Mean,
     stride_q_descale_z,
     stride_q_descale_h,
     stride_q_descale_blk,
@@ -1077,6 +1078,8 @@ def attn_fwd(
     stride_k_descale_blk,
     stride_v_descale_z,
     stride_v_descale_h,
+    stride_v_mean_z,
+    stride_v_mean_h,
     LSE,
     Out,
     SD_MASK,
@@ -1572,10 +1575,25 @@ def attn_fwd(
     else:
         invalid_mask = None
         l_recip = 1 / l_i[:, None]
+
     if V_QUANT_SCHEME == 0:
         acc = (acc * l_recip) / FP8_MAX
     else:
         acc = (acc * l_recip * v_descale) / FP8_MAX
+
+    if V_Mean is not None:
+        v_mean_ptr = (
+            V_Mean
+            + off_z * stride_v_mean_z
+            + off_h_k * stride_v_mean_h
+        )
+        v_mean = tl.load(
+            v_mean_ptr + offs_n[None, :],
+            mask=offs_n[None, :] < seqlen_k,
+            other=0.0,
+        )
+        acc += v_mean
+
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
@@ -1717,6 +1735,7 @@ def fav3_sage_triton_impl(
     k_descale: Optional[torch.Tensor],
     v_descale: Optional[torch.Tensor],
     FP8_MAX: float,
+    v_mean: Optional[torch.Tensor] = None,
     # seqused for FA v3
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
@@ -2001,6 +2020,7 @@ def fav3_sage_triton_impl(
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     config = get_fwd_configs(False)
+    # print v_mean
     attn_fwd[grid](
         q,
         k,
@@ -2010,6 +2030,7 @@ def fav3_sage_triton_impl(
         k_descale,
         v_descale,
         FP8_MAX,
+        v_mean,
         stride_q_descale_z,
         stride_q_descale_h,
         stride_q_descale_blk,
@@ -2018,6 +2039,8 @@ def fav3_sage_triton_impl(
         stride_k_descale_blk,
         stride_v_descale_z,
         stride_v_descale_h,
+        v_mean.stride(0) if v_mean is not None else 0,
+        v_mean.stride(1) if v_mean is not None else 0,
         softmax_lse,
         o,
         sd_mask,
@@ -2121,12 +2144,11 @@ def sage_quant(
     v,
     FP8_TYPE,
     FP8_MAX,
-    km=None,
     BLKQ=128,
     BLKK=64,
     sm_scale=None,
     tensor_layout="NHD",
-    smooth_k=True,
+    smooth_kv=True,
 ):
     """
     Quantize Q and K tensors to INT8 with per-block scaling.
@@ -2148,18 +2170,6 @@ def sage_quant(
         k_scale: Per-block scales for K
         k_smooth: K smoothing factors applied (or None if smooth_k=False)
     """
-    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
-    k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
-    v_fp8 = torch.empty(v.shape, dtype=FP8_TYPE, device=v.device)
-
-    # Apply K tensor smoothing following SageAttention approach
-    k_smooth = None
-    if smooth_k:
-        if km is None:
-            # TOOD maybe we turn this into a kernel?
-            km = compute_k_smoothing_factors(k, tensor_layout)
-            k_smooth = km
-        k = k - km
 
     if tensor_layout == "HND":
         b, h_qo, qo_len, head_dim = q.shape
@@ -2176,6 +2186,43 @@ def sage_quant(
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
     else:
         raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+
+    # Apply K tensor smoothing following SageAttention approach
+    v_mean = None
+    if smooth_kv:
+        # Allocate output tensors for smoothed K and V
+        k_smoothed = torch.empty_like(k)
+        v_smoothed = torch.empty_like(v)
+
+        v_mean = torch.empty((b, h_kv, head_dim), device=v.device, dtype=torch.float32)
+
+        # Launch kernel
+        SEQLEN_K_PADDED = triton.next_power_of_2(kv_len)
+        grid = (b * h_kv * head_dim,)
+
+        kv_smooth_kernel[grid](
+            k,
+            v,
+            v_smoothed,
+            k_smoothed,
+            v_mean,
+            stride_bz_k,
+            stride_h_k,
+            stride_seq_k,
+            b,
+            h_kv,
+            kv_len,
+            SEQLEN_K_PADDED,
+            head_dim,
+        )
+
+        k = k_smoothed
+        v = v_smoothed
+
+    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
+    k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+    v_fp8 = torch.empty(v.shape, dtype=FP8_TYPE, device=v.device)
+
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
@@ -2242,7 +2289,46 @@ def sage_quant(
         V_QUANT_SCHEME=V_QUANT_SCHEME,
     )
 
-    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, k_smooth
+    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, v_mean
+
+
+@triton.jit
+def kv_smooth_kernel(
+    K_ptrs,
+    V_ptrs,
+    V_smoothed_ptrs,
+    K_smoothed_ptrs,
+    V_mean_ptrs,
+    stride_bz,
+    stride_h,
+    stride_seq,
+    B,
+    H,
+    SEQLEN,
+    SEQLEN_PADDED: tl.constexpr,
+    D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    off_d, off_h, off_b = pid_grid_3d(pid, D, H, B)
+    offs_k = tl.arange(0, SEQLEN_PADDED)
+    k_offs = off_b * stride_bz + off_h * stride_h + offs_k * stride_seq + off_d
+    k_ptrs = K_ptrs + k_offs
+    v_ptrs = V_ptrs + k_offs
+
+    k_vals = tl.load(k_ptrs, mask=offs_k < SEQLEN, other=0.0).to(tl.float32)
+    k_mean = tl.sum(k_vals, axis=0) / SEQLEN
+    k_smooth = k_vals - k_mean
+    k_smoothed_ptrs = K_smoothed_ptrs + k_offs
+    tl.store(k_smoothed_ptrs, k_smooth, mask=offs_k < SEQLEN)
+
+    v_vals = tl.load(v_ptrs, mask=offs_k < SEQLEN, other=0.0).to(tl.float32)
+    v_mean = tl.sum(v_vals, axis=0) / SEQLEN
+    v_smooth = v_vals - v_mean
+    v_smoothed_ptrs = V_smoothed_ptrs + k_offs
+    tl.store(v_smoothed_ptrs, v_smooth, mask=offs_k < SEQLEN)
+
+    v_mean_out_ptrs = V_mean_ptrs + off_b * stride_bz + off_h * stride_h + off_d
+    tl.store(v_mean_out_ptrs, v_mean)
 
 
 @triton.jit

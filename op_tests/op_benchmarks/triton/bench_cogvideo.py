@@ -21,11 +21,12 @@ import triton
 from aiter.ops.triton.mha_v3 import flash_attn_fp8_func
 from aiter.ops.triton.mha_v3 import flash_attn_func as flash_attn_v3_func
 from aiter.ops.triton.mha import flash_attn_func as flash_attn_v2_func
-from aiter.ops.triton.attn_qk_int8_per_block import per_block_int8
 from aiter.ops.triton.fav3_sage import fav3_sage_func
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import get_fwd_configs
 from op_tests.op_benchmarks.triton.bench_diffusion_attention import qk_int8_forward_func
-
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
+    sage_quant
+)
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -128,20 +129,30 @@ def fav3_sage_forward_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is
 
     head_dim = q_bshd.shape[-1]
     softmax_scale = head_dim**-0.5
-    k_mean = None
-    
-    # Quantization with softmax scale and RCP_LN2 
-    q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
-        q_bshd, k_bshd, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout="NHD"
+
+    fp8_dtype = aiter.dtypes.fp8
+    FP8_MAX = torch.finfo(fp8_dtype).max
+    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, v_mean = sage_quant(
+        q,
+        k,
+        v,
+        fp8_dtype,
+        FP8_MAX,
+        sm_scale=softmax_scale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        tensor_layout="NHD",
     )
-    v_fp16 = v_bshd.to(torch.float16)
-    
+
     return lambda: fav3_sage_func(
-        q_int8, 
-        k_int8, 
-        v_fp16,
+        q_int8,
+        k_int8,
+        v_fp8,
         q_descale,
         k_descale,
+        v_descale,
+        FP8_MAX,
+        v_mean,
         causal=is_causal,
     )
 

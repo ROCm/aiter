@@ -253,13 +253,12 @@ def fav3_sage_forward_func(
     FP8_MAX = torch.finfo(fp8_dtype).max
 
     # Method 2: Current sage_quant (unified quantization)
-    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, _ = sage_quant(
+    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, v_mean = sage_quant(
         q,
         k,
         v,
         fp8_dtype,
         FP8_MAX,
-        km=k_mean,
         sm_scale=softmax_scale,
         BLKQ=BLKQ,
         BLKK=BLKK,
@@ -274,10 +273,10 @@ def fav3_sage_forward_func(
         k_descale,
         v_descale,
         FP8_MAX,
+        v_mean,
         causal=causal,
         inference_mode=inference_mode,
     )
-
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]

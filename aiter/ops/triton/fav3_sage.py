@@ -72,13 +72,12 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         fp8_dtype = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(fp8_dtype).max
 
-        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, _ = sage_quant(
+        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, v_mean = sage_quant(
             q,
             k,
             v,
             fp8_dtype,
             FP8_MAX,
-            km=k_mean,
             sm_scale=softmax_scale,
             BLKQ=BLKQ,
             BLKK=BLKK,
@@ -146,6 +145,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             k_descale,
             v_descale, # v_descale
             FP8_MAX,
+            v_mean,
             softmax_scale,
             causal,
             int(window_size[0]),
@@ -315,7 +315,7 @@ def fav3_sage_func(
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
     FP8_MAX: float = 240.0,
-    k_mean: torch.Tensor = None,
+    v_mean: torch.Tensor = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     qv: Optional[torch.Tensor] = None,
@@ -426,6 +426,7 @@ def fav3_sage_func(
         k_descale,
         v_descale, # v_descale
         FP8_MAX,
+        v_mean,
         softmax_scale,
         causal,
         int(window_size[0]),
