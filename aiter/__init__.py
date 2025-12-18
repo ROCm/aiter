@@ -60,8 +60,8 @@ from .ops.activation import *
 from .ops.attention import *
 from .ops.custom import *
 from .ops.custom_all_reduce import *
-from .ops.trtllm_all_reduce_fusion import *
 from .ops.quick_all_reduce import *
+from .ops.trtllm_all_reduce_fusion import *
 from .ops.moe_op import *
 from .ops.moe_sorting import *
 from .ops.pos_encoding import *
