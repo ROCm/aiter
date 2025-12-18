@@ -74,9 +74,9 @@ def worker(
             print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10000))
         ref_norm_out = ref_norm_out.float() * ref_scale_out
         norm_out = norm_out.float() * scale_out
-        residual_out_maxdiff = (residual_out.cpu().float() - ref_residual_out.cpu().float()).abs().max()
-        norm_out_maxdiff = (norm_out.cpu().float() - ref_norm_out.cpu().float()).abs().max()
-        scale_out_maxdiff = (scale_out.cpu().float() - ref_scale_out.cpu().float()).abs().max()
+        # residual_out_maxdiff = (residual_out.cpu().float() - ref_residual_out.cpu().float()).abs().max()
+        # norm_out_maxdiff = (norm_out.cpu().float() - ref_norm_out.cpu().float()).abs().max()
+        # scale_out_maxdiff = (scale_out.cpu().float() - ref_scale_out.cpu().float()).abs().max()
         # print(f"ref_norm_out:{ref_norm_out.float().cpu()}, norm_out:{norm_out.float().cpu()}")
         # print(f"device_id:{device_id}, residual_out_maxdiff:{residual_out_maxdiff}, norm_out_maxdiff:{norm_out_maxdiff}, scale_out_maxdiff:{scale_out_maxdiff}")
         checkAllclose(
