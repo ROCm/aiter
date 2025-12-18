@@ -195,6 +195,7 @@ for attn_type in "${RENDER_TYPES[@]}"; do
         --num_inference_steps "$NUM_INFERENCE_STEPS" \
         --use_torch_compile \
         --benchmark_output_directory "$OUTPUT_DIR" \
+        --save_inputs \
         --attention_type "$attn_type"; then
         
         # Check if video was created
