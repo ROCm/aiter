@@ -3,7 +3,6 @@
 
 from typing import Optional
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.gemm_a16w16_agnostic import (
     _gemm_a16_w16_kernel,
     _get_config,

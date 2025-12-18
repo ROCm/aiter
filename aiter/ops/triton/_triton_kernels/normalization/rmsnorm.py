@@ -3,7 +3,6 @@
 
 import triton
 import triton.language as tl
-from typing import Optional
 
 
 @triton.jit

@@ -1,6 +1,4 @@
 import torch
-import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.fusions.fused_qk_concat import (
     _qk_rope_cat_kernel,
     _qk_cat_kernel,

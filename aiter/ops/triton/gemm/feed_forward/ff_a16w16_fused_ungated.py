@@ -5,7 +5,6 @@ from typing import Optional
 import torch
 import warnings
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.gemm.feed_forward.ff_a16w16_fused_ungated import (
     _ff_a16w16_fused_ungated,
     _get_config,

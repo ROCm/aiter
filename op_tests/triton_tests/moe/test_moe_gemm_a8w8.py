@@ -2,11 +2,8 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
 from dataclasses import dataclass, fields
-import itertools
 import pytest
 import torch
-from typing import Union
-import triton
 
 # routing utilities
 from aiter.ops.triton.moe.moe_routing.routing import routing

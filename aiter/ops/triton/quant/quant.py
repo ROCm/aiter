@@ -2,13 +2,11 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
-import triton.language as tl
 import torch
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
-    _mxfp4_quant_op,
     _dynamic_mxfp4_quant_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger

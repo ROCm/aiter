@@ -4,9 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _gemm_a8w8_blockscale_kernel,
     _gemm_a8w8_blockscale_preshuffle_kernel,

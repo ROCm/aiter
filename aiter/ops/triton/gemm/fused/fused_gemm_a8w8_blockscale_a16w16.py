@@ -2,12 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
-import functools
-import json
-import os
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     _fused_gemm_a8w8_blockscale_a16w16_kernel,
     _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,

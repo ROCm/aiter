@@ -1,4 +1,3 @@
-import math
 import torch
 import triton
 from dataclasses import dataclass, field

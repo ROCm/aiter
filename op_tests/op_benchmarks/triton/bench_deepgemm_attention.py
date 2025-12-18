@@ -380,7 +380,7 @@ def run_benchmark(args: argparse.Namespace):
 
         if args.aot:
             triton_cache_dir = str(triton.knobs.cache.dir)
-            aot_kernel_dir = f"./paged_mqa_logits/aot"
+            aot_kernel_dir = "./paged_mqa_logits/aot"
 
             padded_str = "T" if args.padding else "F"
             os.makedirs(aot_kernel_dir, exist_ok=True)
@@ -393,7 +393,7 @@ def run_benchmark(args: argparse.Namespace):
             os.system(f"mv {src} {dst}")
             print(f"Moved cache from {src} to {dst}")
 
-            os.system(f"zip -r paged_mqa_logits_aot_kernel paged_mqa_logits")
+            os.system("zip -r paged_mqa_logits_aot_kernel paged_mqa_logits")
 
         return flops
 

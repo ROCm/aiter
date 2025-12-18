@@ -1,11 +1,9 @@
 import sys
-import os
 import torch
 import triton
 import math
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
-    gemm_afp4wfp4_preshuffled_scales,
     gemm_afp4wfp4_preshuffled_weight_scales,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (

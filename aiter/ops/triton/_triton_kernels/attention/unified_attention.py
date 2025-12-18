@@ -4,7 +4,6 @@ import triton
 import triton.language as tl
 import torch
 from aiter.ops.triton.utils.types import e4m3_dtype
-import math
 
 float8_info = torch.finfo(e4m3_dtype)
 
