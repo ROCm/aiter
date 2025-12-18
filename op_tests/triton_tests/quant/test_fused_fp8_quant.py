@@ -14,7 +14,7 @@ from aiter import (
     silu_and_mul,
 )
 
-from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from aiter.ops.quant import per_tensor_quant_hip
 import aiter
 import torch.nn.functional as F
 
@@ -217,7 +217,7 @@ def triton_rmsnorm_fp8_quantization_fuse(x, w, x_scale, eps, rocm_fp8_dtype):
     "m, n", [(m, n) for m in [1, 2, 4, 8, 256, 1024, 8192] for n in [128, 4096, 8192]]
 )
 def test_rmsnorm_quant_fuse(m, n):
-    eps = 0.0001
+    eps = 0.0012
     rocm_fp8_dtype = rocm_aiter_fp8_dtype
 
     x_shape = (m, n)
