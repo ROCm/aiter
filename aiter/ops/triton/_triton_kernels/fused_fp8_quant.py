@@ -1,4 +1,3 @@
-
 import triton
 import triton.language as tl
 
@@ -9,6 +8,7 @@ except ImportError:
         from triton.language.extra.cuda.libdevice import fast_dividef, fast_expf
     except ImportError:
         from triton.language.math import fast_dividef, fast_expf
+
 
 @triton.jit
 def _rmsmorm_op(row, weight, n_cols, epsilon):
