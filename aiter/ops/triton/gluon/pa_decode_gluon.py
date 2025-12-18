@@ -1420,8 +1420,10 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             shape=[MAX_NUM_KV_BLOCKS_PER_COMPUTE, 128, 64],
         )
 
-        # blocked_value_layout: gl.constexpr = v_blK_layout if KV_BLOCK_SIZE == 16 else v_blK_64_layout
-        blocked_value_layout: gl.constexpr = v_blK_layout
+        blocked_value_layout: gl.constexpr = (
+            v_blK_layout if KV_BLOCK_SIZE == 16 else v_blK_64_layout
+        )
+        # blocked_value_layout: gl.constexpr = v_blK_layout
 
         value_dim1_offsets = gl.arange(
             0,
@@ -1639,47 +1641,51 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
         key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
 
-        # # ==================== VALUE LOADING AND PROCESSING ====================
-        # if VALUE_TRANSPOSED:
-        #     # Load values from transposed cache layout
-        #     kv_block_numbers_reshaped = gl.convert_layout(
-        #         kv_block_numbers,
-        #         layout=gl.SliceLayout(
-        #             1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
-        #         ),
-        #     )
-        #     value_block_offsets = (
-        #         kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
-        #         + kv_head_idx * stride_value_head
-        #         + value_dim1_offsets[None, :, None, None] * stride_value_head_size
-        #         + value_dim2_offsets[None, None, :, None]
-        #         * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
-        #         + value_dim3_offsets[None, None, None, :]
-        #     )
-        #     value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-        #     # Permute and reshape for matrix multiplication
-        #     value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
-        #     value_tensor = gl.reshape(
-        #         value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
-        #     )
-        # else:
-        #     # Load values from standard cache layout
-        #     kv_block_numbers_reshaped = gl.convert_layout(
-        #         kv_block_numbers,
-        #         layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
-        #     )
-        #     value_block_offsets = (
-        #         kv_block_numbers_reshaped[:, None, None] * stride_value_block
-        #         + kv_head_idx * stride_value_head
-        #         + value_dim1_offsets[None, :, None] * stride_value_head_size
-        #         + value_dim2_offsets[None, None, :]
-        #     )
-        #     value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-        #     # Permute and reshape for matrix multiplication
-        #     value_tensor = gl.permute(value_tensor, [0, 2, 1])
-        #     value_tensor = gl.reshape(
-        #         value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
-        #     )
+        LOAD_V_BEFORE_QK: gl.constexpr = True
+        # LOAD_V_BEFORE_QK: gl.constexpr = False
+
+        if LOAD_V_BEFORE_QK:
+            # ==================== VALUE LOADING AND PROCESSING ====================
+            if VALUE_TRANSPOSED:
+                # Load values from transposed cache layout
+                kv_block_numbers_reshaped = gl.convert_layout(
+                    kv_block_numbers,
+                    layout=gl.SliceLayout(
+                        1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
+                    ),
+                )
+                value_block_offsets = (
+                    kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
+                    + kv_head_idx * stride_value_head
+                    + value_dim1_offsets[None, :, None, None] * stride_value_head_size
+                    + value_dim2_offsets[None, None, :, None]
+                    * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
+                    + value_dim3_offsets[None, None, None, :]
+                )
+                value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+                # Permute and reshape for matrix multiplication
+                value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
+                value_tensor = gl.reshape(
+                    value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
+                )
+            else:
+                # Load values from standard cache layout
+                kv_block_numbers_reshaped = gl.convert_layout(
+                    kv_block_numbers,
+                    layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
+                )
+                value_block_offsets = (
+                    kv_block_numbers_reshaped[:, None, None] * stride_value_block
+                    + kv_head_idx * stride_value_head
+                    + value_dim1_offsets[None, :, None] * stride_value_head_size
+                    + value_dim2_offsets[None, None, :]
+                )
+                value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+                # Permute and reshape for matrix multiplication
+                value_tensor = gl.permute(value_tensor, [0, 2, 1])
+                value_tensor = gl.reshape(
+                    value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
+                )
 
         # ==================== ATTENTION SCORE COMPUTATION ====================
         # Initialize QK accumulator
@@ -1715,47 +1721,48 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             attention_scores, [QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         )
 
-        # ==================== VALUE LOADING AND PROCESSING ====================
-        if VALUE_TRANSPOSED:
-            # Load values from transposed cache layout
-            kv_block_numbers_reshaped = gl.convert_layout(
-                kv_block_numbers,
-                layout=gl.SliceLayout(
-                    1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
-                ),
-            )
-            value_block_offsets = (
-                kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
-                + kv_head_idx * stride_value_head
-                + value_dim1_offsets[None, :, None, None] * stride_value_head_size
-                + value_dim2_offsets[None, None, :, None]
-                * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
-                + value_dim3_offsets[None, None, None, :]
-            )
-            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-            # Permute and reshape for matrix multiplication
-            value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
-            value_tensor = gl.reshape(
-                value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
-            )
-        else:
-            # Load values from standard cache layout
-            kv_block_numbers_reshaped = gl.convert_layout(
-                kv_block_numbers,
-                layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
-            )
-            value_block_offsets = (
-                kv_block_numbers_reshaped[:, None, None] * stride_value_block
-                + kv_head_idx * stride_value_head
-                + value_dim1_offsets[None, :, None] * stride_value_head_size
-                + value_dim2_offsets[None, None, :]
-            )
-            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-            # Permute and reshape for matrix multiplication
-            value_tensor = gl.permute(value_tensor, [0, 2, 1])
-            value_tensor = gl.reshape(
-                value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
-            )
+        if not LOAD_V_BEFORE_QK:
+            # ==================== VALUE LOADING AND PROCESSING ====================
+            if VALUE_TRANSPOSED:
+                # Load values from transposed cache layout
+                kv_block_numbers_reshaped = gl.convert_layout(
+                    kv_block_numbers,
+                    layout=gl.SliceLayout(
+                        1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
+                    ),
+                )
+                value_block_offsets = (
+                    kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
+                    + kv_head_idx * stride_value_head
+                    + value_dim1_offsets[None, :, None, None] * stride_value_head_size
+                    + value_dim2_offsets[None, None, :, None]
+                    * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
+                    + value_dim3_offsets[None, None, None, :]
+                )
+                value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+                # Permute and reshape for matrix multiplication
+                value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
+                value_tensor = gl.reshape(
+                    value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
+                )
+            else:
+                # Load values from standard cache layout
+                kv_block_numbers_reshaped = gl.convert_layout(
+                    kv_block_numbers,
+                    layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
+                )
+                value_block_offsets = (
+                    kv_block_numbers_reshaped[:, None, None] * stride_value_block
+                    + kv_head_idx * stride_value_head
+                    + value_dim1_offsets[None, :, None] * stride_value_head_size
+                    + value_dim2_offsets[None, None, :]
+                )
+                value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+                # Permute and reshape for matrix multiplication
+                value_tensor = gl.permute(value_tensor, [0, 2, 1])
+                value_tensor = gl.reshape(
+                    value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
+                )
 
         # Apply quantization scaling to attention scores
         if KV_QUANT_MODE >= 0:
