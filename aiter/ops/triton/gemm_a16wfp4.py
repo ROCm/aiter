@@ -8,7 +8,7 @@ import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import deserialize_dict
+from aiter.ops.triton.utils.common_utils import deserialize_str
 from aiter.ops.triton._triton_kernels.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
     _get_config,
@@ -80,7 +80,7 @@ def gemm_a16wfp4(
     if config is None:
         config = _get_config(M, N, K)
     else:
-        config = deserialize_dict(config)
+        config = deserialize_str(config)
 
     if y is None:
         if atomic_add:

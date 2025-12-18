@@ -11,7 +11,7 @@ from aiter.ops.triton._triton_kernels.batched_gemm_a16wfp4 import (
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import deserialize_dict
+from aiter.ops.triton.utils.common_utils import deserialize_str
 from aiter.ops.triton.gemm_a16wfp4 import (
     get_splitk,
 )
@@ -92,7 +92,7 @@ def batched_gemm_a16wfp4(
     if config is None:
         config = _get_config(M, N, K)
     else:
-        config = deserialize_dict(config)
+        config = deserialize_str(config)
 
     if y is None:
         if transpose_bm:

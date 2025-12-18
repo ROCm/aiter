@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_dict
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_kernel,
     _gemm_afp4wfp4_kernel_preshuffle_scales,
@@ -124,7 +124,7 @@ def gemm_afp4wfp4_(
     if config is None:
         config = _get_config(M, N, K)
     else:
-        config = deserialize_dict(config)
+        config = deserialize_str(config)
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List, Dict, Any
+from typing import List
 
 import torch
 import triton
@@ -35,11 +35,8 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
         return x
     return x.contiguous()
 
-def serialize_dict(d: Dict[str, Any]) -> str:
-    items_list = list(d.items())
-    sorted_items = sorted(items_list)
-    return json.dumps(sorted_items)
+def serialize_dict(d: dict) -> str:
+    return json.dumps(d)
 
-def deserialize_dict(s: str) -> Dict[str, Any]:
-    items_list = json.loads(s)
-    return dict(items_list)
+def deserialize_str(s: str) -> dict:
+    return json.loads(s)
