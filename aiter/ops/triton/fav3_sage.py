@@ -76,6 +76,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             q,
             k,
             v,
+            fp8_dtype,
             FP8_MAX,
             km=k_mean,
             sm_scale=softmax_scale,
