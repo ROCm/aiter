@@ -1,7 +1,6 @@
 from typing import Literal
 import torch
 import triton
-import triton.language as tl
 from typing import Optional
 from aiter.utility import dtypes
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (

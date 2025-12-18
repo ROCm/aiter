@@ -881,7 +881,6 @@ class GemmTuner(GemmCommonTuner):
         else:
             resultsdf = pd.DataFrame(self.columns)
         self.save_profile(resultsdf, args.profile_file)
-        import numpy as np
 
         best_gtimedfs = pd.DataFrame(columns=self.columns)
         for key, df in gtimedf_dic.items():

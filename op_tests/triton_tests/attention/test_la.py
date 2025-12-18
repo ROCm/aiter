@@ -12,7 +12,6 @@ from aiter.ops.triton.attention.lean_atten import (
 )
 from aiter.ops.triton._triton_kernels.attention.lean_atten import _get_config
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-import pytest
 
 DEBUG_MODE = False
 

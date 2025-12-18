@@ -374,16 +374,14 @@ def test_fused_qk_rope_reshape_and_cache(
             triton_key_cache[slot_t, slot_b],
             atol=1e-1,
             rtol=1e-1,
-            equal_nan=not (
-                arch_info.get_arch() in ["gfx950"]
-            ),  # TODO: investigate nan elements for non-gfx950 arch
+            equal_nan=arch_info.get_arch() not in ["gfx950"],  # TODO: investigate nan elements for non-gfx950 arch
         )
         torch.testing.assert_close(
             torch_value_cache[slot_t, slot_b],
             triton_value_cache[slot_t, slot_b],
             atol=1e-1,
             rtol=1e-1,
-            equal_nan=not (arch_info.get_arch() in ["gfx950"]),
+            equal_nan=arch_info.get_arch() not in ["gfx950"],
         )
     else:
         torch.testing.assert_close(
@@ -391,14 +389,14 @@ def test_fused_qk_rope_reshape_and_cache(
             triton_key_cache[slot_t, :, :, slot_b, :],
             atol=1e-1,
             rtol=1e-1,
-            equal_nan=not (arch_info.get_arch() in ["gfx950"]),
+            equal_nan=arch_info.get_arch() not in ["gfx950"],
         )
         torch.testing.assert_close(
             torch_value_cache[slot_t, :, :, slot_b],
             triton_value_cache[slot_t, :, :, slot_b],
             atol=1e-1,
             rtol=1e-1,
-            equal_nan=not (arch_info.get_arch() in ["gfx950"]),
+            equal_nan=arch_info.get_arch() not in ["gfx950"],
         )
 
     torch.testing.assert_close(
@@ -406,14 +404,14 @@ def test_fused_qk_rope_reshape_and_cache(
         triton_key_cache,
         atol=1e-1,
         rtol=1e-1,
-        equal_nan=not (arch_info.get_arch() in ["gfx950"]),
+        equal_nan=arch_info.get_arch() not in ["gfx950"],
     )
     torch.testing.assert_close(
         torch_value_cache,
         triton_value_cache,
         atol=1e-1,
         rtol=1e-1,
-        equal_nan=not (arch_info.get_arch() in ["gfx950"]),
+        equal_nan=arch_info.get_arch() not in ["gfx950"],
     )
 
 

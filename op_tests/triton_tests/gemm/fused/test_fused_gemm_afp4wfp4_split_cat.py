@@ -12,7 +12,6 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
 )
 
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
-import torch.nn.functional as F
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 

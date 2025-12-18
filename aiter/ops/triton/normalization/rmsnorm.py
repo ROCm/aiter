@@ -3,12 +3,10 @@
 
 import torch
 import triton
-import triton.language as tl
 from typing import Optional
 from aiter.ops.triton.utils.types import get_dtype_max
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
-    _per_token_quant,
     _rms_norm_kernel,
     _quant_rms_norm_kernel,
     _fused_add_rmsnorm_kernel,

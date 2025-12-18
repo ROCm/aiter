@@ -3,10 +3,8 @@
 
 import torch
 import triton
-import triton.language as tl
 from typing import Optional
 from aiter.ops.triton._triton_kernels.normalization.norm import (
-    _per_token_quant,
     _layernorm_kernel,
     _fused_add_layernorm_kernel,
     _quant_layernorm_kernel,

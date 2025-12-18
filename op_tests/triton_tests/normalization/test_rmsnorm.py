@@ -14,7 +14,6 @@ from aiter.ops.triton.normalization.rmsnorm import (
     rmsnorm2d_fwd_with_add_dynamicquant,
 )
 
-import time
 
 
 def generate_rmsnorm_inputs(M, N, dtype):

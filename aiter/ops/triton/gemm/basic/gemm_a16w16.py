@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
     _gemm_a16_w16_kernel,
     _gemm_a16w16_reduce_kernel,

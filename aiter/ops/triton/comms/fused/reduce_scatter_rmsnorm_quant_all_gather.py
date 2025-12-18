@@ -23,7 +23,6 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from ..iris import IrisCommContext
 
-import iris
 
 # If we got here, iris is available
 IRIS_AVAILABLE = True
