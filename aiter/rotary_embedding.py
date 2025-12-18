@@ -28,7 +28,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
-from aiter import dtypes, fused_mrope_3d_rms, fused_mrope_3d_rms_set_kv, fused_rope_rms, fused_rope_rms_set_kv
+from aiter import (
+    dtypes,
+    fused_mrope_3d_rms,
+    fused_mrope_3d_rms_set_kv,
+    fused_rope_rms,
+    fused_rope_rms_set_kv,
+)
 
 # from custom_op import CustomOp
 
@@ -1223,7 +1229,13 @@ class RotaryEmbeddingFusedQKNorm(nn.Module):
         num_heads_k = num_kv_heads
         num_heads_v = num_kv_heads
         if fused_set_kv_buffer_arg is not None:
-            q_out = torch.empty(num_tokens, num_heads_q, self.head_size, dtype=qkv.dtype, device=qkv.device)
+            q_out = torch.empty(
+                num_tokens,
+                num_heads_q,
+                self.head_size,
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
             fused_rope_rms_set_kv(
                 qkv,
                 q_weight,
@@ -1284,7 +1296,9 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
         mrope_section: Optional[List[int]] = None,
         mrope_interleaved: bool = False,
     ) -> None:
-        super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
         self.mrope_interleaved = mrope_interleaved
         self.mrope_section = mrope_section
         if self.mrope_section:
@@ -1341,7 +1355,13 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
         )
         assert is_interleaved == self.mrope_interleaved
         if fused_set_kv_buffer_arg is not None:
-            q_out = torch.empty(num_tokens, num_heads_q, self.head_size, dtype=qkv.dtype, device=qkv.device)
+            q_out = torch.empty(
+                num_tokens,
+                num_heads_q,
+                self.head_size,
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
             fused_mrope_3d_rms_set_kv(
                 qkv,
                 q_weight,
