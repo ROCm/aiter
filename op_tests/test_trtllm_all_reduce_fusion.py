@@ -22,6 +22,7 @@ def init_world(device_id, num_devices, parts, port=24534):
     group_id = device_id // group_size
     group_ranks = list(range(group_id * group_size, (group_id + 1) * group_size))
     _GROUP = dist.new_group(ranks=group_ranks)
+
     print(f"[init_world] device_id:{device_id}, group_ranks:{group_ranks}", flush=True)
     return _GROUP
 
