@@ -2156,19 +2156,20 @@ def sage_quant(
     Args:
         q: Query tensor
         k: Key tensor
-        km: Optional pre-computed K smoothing factors (if None and smooth_k=True, will be computed)
         BLKQ: Block size for Q quantization
         BLKK: Block size for K quantization
         sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
         tensor_layout: Either "NHD" or "HND"
-        smooth_k: Whether to apply SageAttention-style smoothing to K tensor (default: True)
+        smooth_kv: Whether to apply K tensor smoothing before quantization
 
     Returns:
         q_int8: Quantized Q tensor
         q_scale: Per-block scales for Q
         k_int8: Quantized K tensor
         k_scale: Per-block scales for K
-        k_smooth: K smoothing factors applied (or None if smooth_k=False)
+        v_fp8: Quantized V tensor in FP8
+        v_scale: Per-block scales for V
+        v_mean: Mean of V tensor if smoothing applied, else None
     """
 
     if tensor_layout == "HND":
