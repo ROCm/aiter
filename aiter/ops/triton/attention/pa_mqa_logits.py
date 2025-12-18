@@ -29,6 +29,12 @@ import triton
 from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
+from aiter import dtypes
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
+
+from aiter.jit.utils.chip_info import get_gfx
+
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
     "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
 )
@@ -68,13 +74,6 @@ else:
 
     enable_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits
     enable_jit_gluon_pa_mqa_logits_kernel = False
-
-
-from aiter import dtypes
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
-
-from aiter.jit.utils.chip_info import get_gfx
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
