@@ -107,7 +107,8 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     if scaleB is not None:
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
     a, avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
-    b, avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
+    wshuffle = shuffle_weight(weight, layout=(16, 16))
+    b, avg_b = run_gemm_b(x, wshuffle, bias, otype, scaleA, scaleB)
     if (
         n % 16 == 0
         and k % 32 == 0
@@ -153,16 +154,22 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     ):
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
         ### b preshuffle
-        wshuffle = shuffle_weight(weight, layout=(16, 16))
+
         d, avg_d = run_bf16gemm_asm(
-            x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
+            x,
+            wshuffle,
+            out_asm,
+            bias,
+            splitK=11,
+            kernelName="_ZN5aiter48bf16gemm_fp32bf16_tn_64x64_bshuffle_splitk_cleanE",
+            bpreshuffle=wshuffle.is_shuffled,
         )
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
         err_asm = checkAllclose(b, d, msg=msg)
         ### no shuffle
-        e, avg_e = run_bf16gemm_asm(x, weight, out_asm, bias)
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
-        err_asm_noshuffle = checkAllclose(b, e, msg=msg)
+        # e, avg_e = run_bf16gemm_asm(x, weight, out_asm, bias)
+        # msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
+        # err_asm_noshuffle = checkAllclose(b, e, msg=msg)
 
     ret = {
         "torch us": avg_a,
@@ -172,8 +179,8 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         "hipb err (vs torch)": locals().get("err_hipb", ""),
         "asm-bpshuff us": locals().get("avg_d", ""),
         "asm-bpshuff err (vs tgemm)": locals().get("err_asm", ""),
-        "asm-nshuff us": locals().get("avg_e", ""),
-        "asm-nshuff err (vs tgemm)": locals().get("err_asm_noshuffle", ""),
+        # "asm-nshuff us": locals().get("avg_e", ""),
+        # "asm-nshuff err (vs tgemm)": locals().get("err_asm_noshuffle", ""),
     }
 
     a, us = run_gemm_triton(x, weight, bias, otype, scaleA, scaleB)

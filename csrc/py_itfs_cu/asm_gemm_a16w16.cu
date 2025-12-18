@@ -11,13 +11,13 @@
 
 struct __attribute__((packed)) KernelArgs
 {
-    void *ptr_D;
+    void* ptr_D;
     p2 _p0;
-    void *ptr_C;
+    void* ptr_C;
     p2 _p1;
-    void *ptr_A;
+    void* ptr_A;
     p2 _p2;
-    void *ptr_B;
+    void* ptr_B;
     p2 _p3;
     float alpha;
     p3 _p4;
@@ -49,16 +49,24 @@ struct __attribute__((packed)) KernelArgs
     p3 _p17;
     unsigned int is_out_b16;
     p3 _p18;
-    void *ptr_Bias;
+    void* ptr_Bias;
     p2 _p19;
     unsigned int add_bias;
     p3 _p20;
+    void* ptr_semaphore;
+    p2 _p21;
 };
 
 std::tuple<std::string, int>
-get_heuristic_kernel(int M, int N, int K, CFG* cfgs, std::string arch_id,
-                     bool bpreshuffle, int add_bias,
-                     std::optional<int> splitk = std::nullopt,
+get_heuristic_kernel(int M,
+                     int N,
+                     int K,
+                     CFG* cfgs,
+                     std::string arch_id,
+                     bool bpreshuffle,
+                     int add_bias,
+                     int clean                             = 1,
+                     std::optional<int> splitk             = std::nullopt,
                      std::optional<std::string> kernelName = std::nullopt)
 {
     hipDevice_t dev;
@@ -67,50 +75,55 @@ get_heuristic_kernel(int M, int N, int K, CFG* cfgs, std::string arch_id,
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
     uint32_t num_cu = dev_prop.multiProcessorCount;
 
-    uint32_t empty_cu = num_cu;
-    uint32_t pure_tg_num = 0;
-    uint32_t round = 0xffffffff;
+    uint32_t empty_cu      = num_cu;
+    uint32_t pure_tg_num   = 0;
+    uint32_t round         = 0xffffffff;
     float compute2mem_effi = 1.0;
-    int oob = M;
+    int oob                = M;
 
     std::string selectedKernelName = "";
-    int selectedsplitK = 1;
+    int selectedsplitK             = 1;
 
     for(const auto& el : *cfgs)
     {
-        if (el.first.find(arch_id) != 0)
+        if(el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
         if(kernelName.has_value() && el.first != (arch_id + kernelName.value()))
             continue;
         if(kernelName.has_value())
         {
-            TORCH_CHECK(
-                N % cfg.tileN == 0 && 
-                cfg.bPreshuffle == (bpreshuffle ? 1 : 0) && 
-                (add_bias == 0 || cfg.bias == 1),
-                __func__, 
-                " the specified kernel name ", el.first, 
-                " cannot support the input shape (N=", N, ", tileN=", cfg.tileN, 
-                ") or bias/preshuffle setting (preshuffle=", bpreshuffle, 
-                ", bias=", add_bias, ")."
-            );
+            TORCH_CHECK(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
+                            (add_bias == 0 || cfg.bias == 1),
+                        __func__,
+                        " the specified kernel name ",
+                        el.first,
+                        " cannot support the input shape (N=",
+                        N,
+                        ", tileN=",
+                        cfg.tileN,
+                        ") or bias/preshuffle setting (preshuffle=",
+                        bpreshuffle,
+                        ", bias=",
+                        add_bias,
+                        ").");
         }
-        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) && (add_bias == 0 || cfg.bias == 1))
+        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
+           (add_bias == 0 || cfg.bias == 1) && clean == cfg.clean)
         {
             int split_K = 1;
             if(splitk.has_value())
                 split_K = splitk.value();
-            else if (cfg.splitK == 1)
+            else if(cfg.splitK == 1)
             {
                 pure_tg_num = ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN);
                 if(pure_tg_num < num_cu)
                 {
-                    TORCH_CHECK(cfg.subK > 0, __func__, " cfg.subK must be greater than 0 to avoid division by zero.");
-                    int max_split = std::min(
-                        std::min(static_cast<int>(num_cu / pure_tg_num), 16),
-                        static_cast<int>(K / cfg.subK)
-                    );
+                    TORCH_CHECK(cfg.subK > 0,
+                                __func__,
+                                " cfg.subK must be greater than 0 to avoid division by zero.");
+                    int max_split = std::min(std::min(static_cast<int>(num_cu / pure_tg_num), 16),
+                                             static_cast<int>(K / cfg.subK));
                     for(int i = max_split; i >= 1; i--)
                     {
                         if(K % 64 == 0)
@@ -124,9 +137,10 @@ get_heuristic_kernel(int M, int N, int K, CFG* cfgs, std::string arch_id,
                 }
             }
 
-            uint32_t tg_num = pure_tg_num * split_K;
+            uint32_t tg_num      = pure_tg_num * split_K;
             uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-            float local_compute2mem_effi = static_cast<float>(cfg.tileM * cfg.tileN) / (cfg.tileM + cfg.tileN);
+            float local_compute2mem_effi =
+                static_cast<float>(cfg.tileM * cfg.tileN) / (cfg.tileM + cfg.tileN);
             bool is_earlier_round        = (local_round < round);
             bool is_same_round           = (local_round == round);
             bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
@@ -147,96 +161,84 @@ get_heuristic_kernel(int M, int N, int K, CFG* cfgs, std::string arch_id,
             }
         }
     }
-    TORCH_CHECK(selectedKernelName != "", __func__, " not find kernel for bf16gemm~ " + selectedKernelName);
+    TORCH_CHECK(
+        selectedKernelName != "", __func__, " not find kernel for bf16gemm~ " + selectedKernelName);
     return std::make_tuple(selectedKernelName, selectedsplitK);
 }
 
-AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName, CFG* config_map,
-                                   unsigned int& SUBM, unsigned int& SUBN)
+AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
+                                   CFG* config_map,
+                                   unsigned int& SUBM,
+                                   unsigned int& SUBN)
 {
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    
+
     auto it_kl = config_map->find(selectedKernelName);
     TORCH_CHECK(it_kl != config_map->end(), __func__, " not find kernel~ " + selectedKernelName);
-    
-    const auto& cfg = it_kl->second;
-    const char* name = cfg.knl_name.c_str();
+
+    const auto& cfg     = it_kl->second;
+    const char* name    = cfg.knl_name.c_str();
     const char* co_name = cfg.co_name.c_str();
-    SUBM = cfg.tileM;
-    SUBN = cfg.tileN;
-    
+    SUBM                = cfg.tileM;
+    SUBN                = cfg.tileN;
+
     auto result = impl_ptr_map.emplace(name, nullptr);
     if(result.second)
         result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-    
+
     return result.first->second.get();
 }
 
-void debug_semaphore(uint32_t* semaphore_host,int semaphore_size, int gdx, int gdy)
-{
-    bool all_correct = true;
-    for(int j = 0; j < semaphore_size; j++)
-    {
-        uint32_t tgidX = j % gdx;
-        uint32_t tgidY = j / gdx;
-        uint32_t expected_value = 0x12340000 + tgidY * gdx + tgidX;  // Unique value for each (tgidX, tgidY)
-        
-        all_correct &= (semaphore_host[j] == expected_value);
-        if(!all_correct){
-            printf("semaphore_host[%d]: %d, expected_value: %d\n", j, semaphore_host[j], expected_value);
-        }
-    }
-    if(all_correct)
-        printf("All %d semaphores verified successfully\n", semaphore_size);
-    else
-        printf("Some semaphores verification failed\n");
-}
 
-torch::Tensor gemm_a16w16_asm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& out,
+torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
+                              torch::Tensor& B,
+                              torch::Tensor& out,
                               std::optional<torch::Tensor> bias,
                               std::optional<int> splitK,
                               std::optional<std::string> kernelName,
                               bool bpreshuffle = false)
 {
-    TORCH_CHECK(out.dtype() == torch::ScalarType::Float || out.dtype() == torch::ScalarType::BFloat16,
+    TORCH_CHECK(out.dtype() == torch::ScalarType::Float ||
+                    out.dtype() == torch::ScalarType::BFloat16,
                 "GEMM A16W16 asm only support Float32 or Bf16 output now!");
-    
+
     std::string arch_id = get_gpu_arch();
-    int Mdim = A.size(0);
-    int Ndim = B.size(0);
-    int Kdim = A.size(1);
+    int Mdim            = A.size(0);
+    int Ndim            = B.size(0);
+    int Kdim            = A.size(1);
 
     unsigned int SUBM = 32;
     unsigned int SUBN = 64;
 
     KernelArgs args = {};
-    args.ptr_D = (void*)out.data_ptr();
-    args.ptr_C = nullptr;
-    args.ptr_A = (void*)A.data_ptr();
-    args.ptr_B = (void*)B.data_ptr();
-    args.ptr_Bias = bias.has_value() ? (void*)bias.value().data_ptr() : nullptr;
-    args.alpha = 1.0f;
-    args.beta = 0.0f;
-    args.stride_A0 = A.stride(0) * A.element_size();
-    args.stride_B0 = B.stride(0) * B.element_size();
+    args.ptr_D      = (void*)out.data_ptr();
+    args.ptr_C      = nullptr;
+    args.ptr_A      = (void*)A.data_ptr();
+    args.ptr_B      = (void*)B.data_ptr();
+    args.ptr_Bias   = bias.has_value() ? (void*)bias.value().data_ptr() : nullptr;
+    args.alpha      = 1.0f;
+    args.beta       = 0.0f;
+    args.stride_A0  = A.stride(0) * A.element_size();
+    args.stride_B0  = B.stride(0) * B.element_size();
     args.stride_C0 = args.stride_D0 = Ndim * out.element_size();
-    args.M = Mdim;
-    args.N = Ndim;
-    args.K = Kdim;
-    args.is_out_b16 = (out.dtype() == torch::ScalarType::BFloat16) ? 1 : 0;
-    args.add_bias = bias.has_value() ? 1 : 0;
+    args.M                          = Mdim;
+    args.N                          = Ndim;
+    args.K                          = Kdim;
+    args.is_out_b16                 = (out.dtype() == torch::ScalarType::BFloat16) ? 1 : 0;
+    args.add_bias                   = bias.has_value() ? 1 : 0;
 
-    CFG* config_map = &cfg_bf16gemm_fp32bf16;
+    CFG* config_map                = &cfg_bf16gemm_fp32bf16;
     std::string selectedKernelName = kernelName.has_value() ? arch_id + kernelName.value() : "";
     int selectedksplit             = splitK.value_or(0) ?: 1;
     if(!kernelName.has_value() || kernelName.value_or("").empty() || !splitK.has_value())
     {
-        auto [name, split] = get_heuristic_kernel(Mdim, Ndim, Kdim, config_map, arch_id,
-                                                  bpreshuffle, args.add_bias, splitK, kernelName);
+        auto [name, split] = get_heuristic_kernel(
+            Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, 1, splitK, kernelName);
         selectedKernelName = name;
-        selectedksplit = split;
+        selectedksplit     = split;
     }
-    args.splitk = selectedksplit;
+    args.splitk              = selectedksplit;
+    //printf("splitk: %u\n", args.splitk);
     AiterAsmKernel* impl_ptr = get_or_load_kernel(selectedKernelName, config_map, SUBM, SUBN);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -244,6 +246,17 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A, torch::Tensor& B, torch::Tensor&
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
     int gdz = selectedksplit;
+
+    uint32_t* semaphore = new uint32_t[gdx * gdy];
+    for(int i = 0; i < gdx * gdy; i++)
+    {
+        semaphore[i] = selectedksplit;
+    }
+    uint32_t *SemaphoreBuffer;
+    HIP_CALL(hipMalloc(&SemaphoreBuffer, sizeof(uint32_t) * gdx * gdy));
+    HIP_CALL(
+        hipMemcpy(SemaphoreBuffer, semaphore, sizeof(uint32_t) * gdx * gdy, hipMemcpyHostToDevice));
+    args.ptr_semaphore = (void*)SemaphoreBuffer;
 
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
