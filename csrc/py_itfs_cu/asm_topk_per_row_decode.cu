@@ -16,7 +16,7 @@ struct __attribute__((packed)) TopKDecodeKernelArgs
     int32_t next_n;
 };
 
-void top_k_per_row_decode(const torch::Tensor& logits,
+void top_k_per_row_decode_fast(const torch::Tensor& logits,
                                int64_t next_n,
                                const torch::Tensor& seqLens,
                                torch::Tensor& indices,
