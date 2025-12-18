@@ -164,11 +164,8 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
 
     const auto Run = [&](const auto has_hot_loop_, const auto tail_number_) {
-        constexpr bool has_hot_loop_v      = has_hot_loop_.value;
-        constexpr auto tail_number_v       = tail_number_.value;
-        constexpr bool transpose_c         = GemmConfig::TransposeC_v;
-        constexpr bool tiled_mma_permute_n = GemmConfig::TiledMMAPermuteN_v;
-        constexpr int gemm_block_per_cu    = GemmConfig::BlockPerCu_v;
+        constexpr bool has_hot_loop_v = has_hot_loop_.value;
+        constexpr auto tail_number_v  = tail_number_.value;
 
         using PipelineProblem = ck_tile::GemmABQuantPipelineProblem<ADataType,
                                                                     QDataType, // AQDataType
@@ -179,9 +176,9 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
                                                                     GemmTraits,
                                                                     AQuantGroupSize,
                                                                     BQuantGroupSize,
-                                                                    transpose_c,
+                                                                    GemmConfig::TransposeC_v,
                                                                     ComputeDataType,
-                                                                    Scheduler,
+                                                                    GemmConfig::Scheduler_v,
                                                                     has_hot_loop_v,
                                                                     tail_number_v>;
 
@@ -203,12 +200,12 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
                                              GemmConfig::M_Warp_Tile_v,
                                              GemmConfig::N_Warp_Tile_v,
                                              GemmConfig::K_Warp_Tile_v,
-                                             transpose_c,
+                                             GemmConfig::TransposeC_v,
                                              ck_tile::memory_operation_enum::set,
                                              1,
                                              false,
                                              1,
-                                             tiled_mma_permute_n>>;
+                                             GemmConfig::TiledMMAPermuteN_v>>;
 
         using Kernel = ck_tile::QuantGemmKernel<TilePartitioner,
                                                 GemmPipeline,
@@ -232,7 +229,7 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 
         ck_tile::launch_kernel(
             ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
-            ck_tile::make_kernel<gemm_block_per_cu>(Kernel{}, grids, blocks, 0, kargs));
+            ck_tile::make_kernel<GemmConfig::BlockPerCu_v>(Kernel{}, grids, blocks, 0, kargs));
     };
 
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
