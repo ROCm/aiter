@@ -39,7 +39,7 @@ from aiter.ops.triton.fav3_sage import (
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs,
-    quantize_v_fp8
+    sage_quant,
 )
 
 
@@ -246,19 +246,25 @@ def fav3_sage_forward_func(
     softmax_scale = head_dim**-0.5
     k_mean = None
     ## following quantization already considered softmax scale and RCP_LN2
-    q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
+    # Enable both methods and compare results
+    # Method 1: Original separate quantization (commented code)
+    # Method 1: Original separate quantization
+    fp8_dtype = aiter.dtypes.fp8
+    FP8_MAX = torch.finfo(fp8_dtype).max
+
+    # Method 2: Current sage_quant (unified quantization)
+    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, _ = sage_quant(
         q,
         k,
+        v,
+        fp8_dtype,
+        FP8_MAX,
         km=k_mean,
         sm_scale=softmax_scale,
         BLKQ=BLKQ,
         BLKK=BLKK,
         tensor_layout="NHD",
     )
-
-    fp8_dtype = aiter.dtypes.fp8
-    FP8_MAX = torch.finfo(fp8_dtype).max
-    v_fp8, v_descale = quantize_v_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
 
     return lambda: fav3_sage_func(
         q_int8,
@@ -817,5 +823,6 @@ def main():
 
 if __name__ == "__main__":
     import sys
+    import time
 
     sys.exit(main())
