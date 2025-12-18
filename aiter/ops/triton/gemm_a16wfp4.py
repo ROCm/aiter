@@ -29,7 +29,7 @@ def gemm_a16wfp4_fake_tensor(
     w: torch.Tensor,
     w_scales: torch.Tensor,
     atomic_add: bool = False,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
 ) -> torch.Tensor:
@@ -45,10 +45,10 @@ def gemm_a16wfp4(
     w: torch.Tensor,
     w_scales: torch.Tensor,
     atomic_add: bool = False,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
-):
+) -> torch.Tensor:
     """
     Computes the matmul Y = X x W
     W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
