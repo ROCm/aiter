@@ -743,6 +743,7 @@ namespace py = pybind11;
           py::arg("is_causal"),                    \
           py::arg("window_size_left"),             \
           py::arg("window_size_right"),            \
+          py::arg("sink_size"),                    \
           py::arg("return_softmax_lse"),           \
           py::arg("return_dropout_randval"),       \
           py::arg("cu_seqlens_q")  = std::nullopt, \
@@ -780,7 +781,9 @@ namespace py = pybind11;
           py::arg("block_table")  = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
-          py::arg("gen")          = std::nullopt);
+          py::arg("gen")          = std::nullopt, \
+          py::arg("cu_seqlens_q_padded") = std::nullopt, \
+          py::arg("cu_seqlens_k_padded") = std::nullopt);
 
 #define MHA_VARLEN_BWD_PYBIND                            \
     m.def("mha_varlen_bwd",                              \
@@ -903,6 +906,7 @@ namespace py = pybind11;
           py::arg("is_causal"),                          \
           py::arg("window_size_left"),                   \
           py::arg("window_size_right"),                  \
+          py::arg("sink_size"),                          \
           py::arg("return_softmax_lse"),                 \
           py::arg("return_dropout_randval"),             \
           py::arg("out")                 = std::nullopt, \
