@@ -27,7 +27,15 @@ def init_world(device_id, num_devices, parts, port=24534):
 
 
 def worker(
-    device_id, world_size, parts, dtype, allreduce_in_, residual_in_, rms_weight_, eps, show_profile=False
+    device_id,
+    world_size,
+    parts,
+    dtype,
+    allreduce_in_,
+    residual_in_,
+    rms_weight_,
+    eps,
+    show_profile=False,
 ):
     group = init_world(device_id, world_size, parts)
     dist_env = aiter.AiterDistEnv(device_id=device_id, group=group, dtype=dtype)
@@ -115,12 +123,20 @@ def testcase(
     rms_weight_ = []
     for i in range(nsamples):
         allreduce_in_.append(
-            torch.randn(world_size, num_tokens, hidden_dim, dtype=dtype, device='cuda').uniform_(-1, 1).cpu()
+            torch.randn(world_size, num_tokens, hidden_dim, dtype=dtype, device="cuda")
+            .uniform_(-1, 1)
+            .cpu()
         )
         residual_in_.append(
-            torch.randn(num_tokens, hidden_dim, dtype=dtype, device='cuda').uniform_(-1, 1).cpu()
+            torch.randn(num_tokens, hidden_dim, dtype=dtype, device="cuda")
+            .uniform_(-1, 1)
+            .cpu()
         )
-        rms_weight_.append(torch.randn(hidden_dim, dtype=dtype, device='cuda').uniform_(-2/hidden_dim, 2/hidden_dim).cpu())
+        rms_weight_.append(
+            torch.randn(hidden_dim, dtype=dtype, device="cuda")
+            .uniform_(-2 / hidden_dim, 2 / hidden_dim)
+            .cpu()
+        )
     mp.spawn(
         worker,
         args=(
@@ -149,7 +165,11 @@ def main(world_size=4, parts=2):
 
     num_tokens = 129
     testcase(
-        world_size=world_size, parts=parts, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.float
+        world_size=world_size,
+        parts=parts,
+        num_tokens=num_tokens,
+        hidden_dim=1024,
+        dtype=torch.float,
     )
     testcase(
         world_size=world_size,
@@ -159,15 +179,27 @@ def main(world_size=4, parts=2):
         dtype=torch.bfloat16,
     )
     testcase(
-        world_size=world_size, parts=parts, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.half
+        world_size=world_size,
+        parts=parts,
+        num_tokens=num_tokens,
+        hidden_dim=1024,
+        dtype=torch.half,
     )
 
     num_tokens = 128
     testcase(
-        world_size=world_size, parts=parts, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.float
+        world_size=world_size,
+        parts=parts,
+        num_tokens=num_tokens,
+        hidden_dim=1024,
+        dtype=torch.float,
     )
     testcase(
-        world_size=world_size, parts=parts, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.half
+        world_size=world_size,
+        parts=parts,
+        num_tokens=num_tokens,
+        hidden_dim=1024,
+        dtype=torch.half,
     )
     testcase(
         world_size=world_size,
@@ -178,7 +210,11 @@ def main(world_size=4, parts=2):
     )
 
     testcase(
-        world_size=world_size, parts=parts, num_tokens=32768, hidden_dim=4096, dtype=torch.bfloat16
+        world_size=world_size,
+        parts=parts,
+        num_tokens=32768,
+        hidden_dim=4096,
+        dtype=torch.bfloat16,
     )
 
 

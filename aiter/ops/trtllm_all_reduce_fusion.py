@@ -114,7 +114,7 @@ class AiterDistEnv:
         device_id: int = None,
         max_size_in_bytes=16384 * 16384,
         comm_ptrs_buf_len=1024 * 256,
-        dtype: torch.dtype=torch.bfloat16,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self.group = group
         self.device_id = device_id
@@ -129,7 +129,13 @@ class AiterDistEnv:
         if self.world_size not in AiterDistEnv._SUPPORTED_WORLD_SIZES:
             return
 
-        self.fptr = trtllm_init_ar_fusion(self.device_id, self.rank, self.world_size, max_size_in_bytes, comm_ptrs_buf_len)
+        self.fptr = trtllm_init_ar_fusion(
+            self.device_id,
+            self.rank,
+            self.world_size,
+            max_size_in_bytes,
+            comm_ptrs_buf_len,
+        )
         barrier_handle = trtllm_get_ar_fusion_barrier_handle(self.fptr)
         data_handle = trtllm_get_ar_fusion_data_handle(self.fptr)
         self.barrier()
@@ -157,9 +163,13 @@ class AiterDistEnv:
             handle_list = [None] * self.world_size
             offset_list = [None] * self.world_size
             dist.all_gather_object(handle_list, handles[idx], group=self.group)
-            dist.all_gather_object(offset_list, int(offsets[idx].item()), group=self.group)
+            dist.all_gather_object(
+                offset_list, int(offsets[idx].item()), group=self.group
+            )
             self.barrier()
-            trtllm_open_ar_fusion_captured_handles(self.fptr, handle_list, offset_list, idx)
+            trtllm_open_ar_fusion_captured_handles(
+                self.fptr, handle_list, offset_list, idx
+            )
         trtllm_ar_fusion_capture_clear(self.fptr)
         self.barrier()
 
@@ -195,6 +205,7 @@ class AiterDistEnv:
             x = x * torch.rsqrt(variance + eps)
             x = x.to(input_dtype)
             return weight * x
+
         dist.all_reduce(allreduce_in, group=self.group)
         residual_out = allreduce_in + residual_in
         norm_out = rms_norm_forward(residual_out, rms_weight, eps)
