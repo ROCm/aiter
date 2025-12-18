@@ -2366,7 +2366,7 @@ def sage_quant_kernel(
                 mask=None,
             )
         else:
-            off_d, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
+            off_d, off_h, off_b = pid_grid_3d(_pid, D, K_HEAD, BATCH)
             offs_k = tl.arange(0, SEQLEN_K_PADDED)
 
             v_offs = off_b * stride_kz + off_h * stride_kh + offs_k * stride_kn + off_d
