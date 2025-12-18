@@ -11,15 +11,10 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     mxfp4_to_f32,
     e8m0_to_f32,
 )
-
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
-import torch.nn.functional as F
-
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.shuffle import shuffle_weight
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales
-
-DEVICE_ARCH = arch_info.get_arch()
 
 SCALE_GROUP_SIZE = 32
 
@@ -54,9 +49,6 @@ def run_triton(
         else fused_gemm_afp4wfp4_split_cat
     )
     return fn(x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype)
-
-
-e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def get_shapes():
