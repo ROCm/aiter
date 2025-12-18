@@ -3,7 +3,6 @@
 
 from typing import Optional
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -19,12 +18,12 @@ _LOGGER = AiterTritonLogger()
 
 
 def gemm_a16w16_atomic_fake_tensor(
-    x: Tensor,
-    w: Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
-) -> Tensor:
+) -> torch.Tensor:
     if y is None:
         M, _ = x.shape
         _, N = w.shape
@@ -33,12 +32,12 @@ def gemm_a16w16_atomic_fake_tensor(
 
 @torch_compile_guard(gen_fake=gemm_a16w16_atomic_fake_tensor)
 def gemm_a16w16_atomic_(
-    x: Tensor,
-    w: Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
-) -> Tensor:
+) -> torch.Tensor:
     _LOGGER.info(
         f"GEMM_A16W16_ATOMIC: x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)} "
     )
@@ -94,12 +93,12 @@ def gemm_a16w16_atomic_(
     return y
 
 def gemm_a16w16_atomic(
-    x: Tensor,
-    w: Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-) -> Tensor:
+) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
 
