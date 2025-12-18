@@ -58,27 +58,32 @@ template <ck_tile::index_t M_Tile,
           bool kPadM,
           bool kPadN,
           bool kPadK,
+          bool TiledMMAPermuteN                    = false,
           bool TransposeC                          = false,
           bool DoubleSmemBuffer                    = false,
           bool UsePersistentKernel                 = false,
-          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave>
+          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
+          int BlockPerCu                           = 1>
 struct CreateTileGemmConfig
 {
-    static constexpr ck_tile::index_t M_Tile_v      = M_Tile;
-    static constexpr ck_tile::index_t N_Tile_v      = N_Tile;
-    static constexpr ck_tile::index_t K_Tile_v      = K_Tile;
-    static constexpr ck_tile::index_t M_Warp_v      = M_Warp;
-    static constexpr ck_tile::index_t N_Warp_v      = N_Warp;
-    static constexpr ck_tile::index_t K_Warp_v      = K_Warp;
-    static constexpr ck_tile::index_t M_Warp_Tile_v = M_Warp_Tile;
-    static constexpr ck_tile::index_t N_Warp_Tile_v = N_Warp_Tile;
-    static constexpr ck_tile::index_t K_Warp_Tile_v = K_Warp_Tile;
-    static constexpr bool kPadM_v                   = kPadM;
-    static constexpr bool kPadN_v                   = kPadN;
-    static constexpr bool kPadK_v                   = kPadK;
-    static constexpr bool TransposeC_v              = TransposeC;
-    static constexpr bool DoubleSmemBuffer_v        = DoubleSmemBuffer;
-    static constexpr bool UsePersistentKernel_v     = UsePersistentKernel;
+    static constexpr ck_tile::index_t M_Tile_v                  = M_Tile;
+    static constexpr ck_tile::index_t N_Tile_v                  = N_Tile;
+    static constexpr ck_tile::index_t K_Tile_v                  = K_Tile;
+    static constexpr ck_tile::index_t M_Warp_v                  = M_Warp;
+    static constexpr ck_tile::index_t N_Warp_v                  = N_Warp;
+    static constexpr ck_tile::index_t K_Warp_v                  = K_Warp;
+    static constexpr ck_tile::index_t M_Warp_Tile_v             = M_Warp_Tile;
+    static constexpr ck_tile::index_t N_Warp_Tile_v             = N_Warp_Tile;
+    static constexpr ck_tile::index_t K_Warp_Tile_v             = K_Warp_Tile;
+    static constexpr bool kPadM_v                               = kPadM;
+    static constexpr bool kPadN_v                               = kPadN;
+    static constexpr bool kPadK_v                               = kPadK;
+    static constexpr bool TiledMMAPermuteN_v                    = TiledMMAPermuteN;
+    static constexpr bool TransposeC_v                          = TransposeC;
+    static constexpr bool DoubleSmemBuffer_v                    = DoubleSmemBuffer;
+    static constexpr bool UsePersistentKernel_v                 = UsePersistentKernel;
+    static constexpr ck_tile::GemmPipelineScheduler Scheduler_v = Scheduler;
+    static constexpr int BlockPerCu_v                           = BlockPerCu;
 };
 
 template <ck_tile::index_t M_Tile,
@@ -93,10 +98,12 @@ template <ck_tile::index_t M_Tile,
           bool kPadM,
           bool kPadN,
           bool kPadK,
+          bool TiledMMAPermuteN                    = false,
           bool TransposeC                          = false,
           bool DoubleSmemBuffer                    = false,
           bool UsePersistentKernel                 = false,
-          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave>
+          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
+          int BlockPerCu                           = 1>
 using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             N_Tile,
                                             K_Tile,
@@ -109,15 +116,14 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             kPadM,
                                             kPadN,
                                             kPadK,
+                                            TiledMMAPermuteN,
                                             TransposeC,
                                             DoubleSmemBuffer,
                                             UsePersistentKernel,
-                                            Scheduler>;
+                                            Scheduler,
+                                            BlockPerCu>;
 
-template <typename QDataType,
-          typename OutDataType,
-          typename GemmConfig,
-          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave>
+template <typename QDataType, typename OutDataType, typename GemmConfig>
 void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 {
 
@@ -158,9 +164,11 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
 
     const auto Run = [&](const auto has_hot_loop_, const auto tail_number_) {
-        constexpr bool has_hot_loop_v = has_hot_loop_.value;
-        constexpr auto tail_number_v  = tail_number_.value;
-        constexpr bool transpose_c    = GemmConfig::TransposeC_v;
+        constexpr bool has_hot_loop_v      = has_hot_loop_.value;
+        constexpr auto tail_number_v       = tail_number_.value;
+        constexpr bool transpose_c         = GemmConfig::TransposeC_v;
+        constexpr bool tiled_mma_permute_n = GemmConfig::TiledMMAPermuteN_v;
+        constexpr int gemm_block_per_cu    = GemmConfig::BlockPerCu_v;
 
         using PipelineProblem = ck_tile::GemmABQuantPipelineProblem<ADataType,
                                                                     QDataType, // AQDataType
@@ -200,7 +208,7 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
                                              1,
                                              false,
                                              1,
-                                             false>>;
+                                             tiled_mma_permute_n>>;
 
         using Kernel = ck_tile::QuantGemmKernel<TilePartitioner,
                                                 GemmPipeline,
@@ -224,7 +232,7 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 
         ck_tile::launch_kernel(
             ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
-            ck_tile::make_kernel<1>(Kernel{}, grids, blocks, 0, kargs));
+            ck_tile::make_kernel<gemm_block_per_cu>(Kernel{}, grids, blocks, 0, kargs));
     };
 
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);

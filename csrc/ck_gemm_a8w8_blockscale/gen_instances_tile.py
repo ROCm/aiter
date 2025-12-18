@@ -96,10 +96,12 @@ torch::Tensor
             {k.M_Warp}, {k.N_Warp}, {k.K_Warp},
             {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
             {str(k.kPadM).lower()}, {str(k.kPadN).lower()}, {str(k.kPadK).lower()},
+            {str(k.TiledMMAPermuteN).lower()},
             {str(k.TransposeC).lower()},
             {str(k.DoubleSmemBuffer).lower()},
             {str(k.UsePersistentKernel).lower()},
-            ck_tile::GemmPipelineScheduler::{k.Scheduler}>;
+            ck_tile::GemmPipelineScheduler::{k.Scheduler},
+            {k.BlockPerCu}>;
             
         // Run kernel instance.
         return tile_gemm_a8w8_blockscale_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
