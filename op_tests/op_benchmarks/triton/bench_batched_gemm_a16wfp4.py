@@ -2,9 +2,6 @@ import sys
 import torch
 import triton
 import math
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
-    generate_batched_gemm_a16wfp4_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,

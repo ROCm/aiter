@@ -2,12 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
-import functools
-import json
 import os
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
@@ -18,7 +15,6 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 impo
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
-import os
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()

@@ -1,6 +1,5 @@
 import torch
 import triton
-import triton.language as tl
 from typing import Optional
 from aiter.ops.triton._triton_kernels.fusions.fused_mul_add import _fused_mul_add_kernel
 from aiter.ops.triton.utils.logger import AiterTritonLogger

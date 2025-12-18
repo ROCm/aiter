@@ -11,7 +11,9 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     mxfp4_to_f32,
     e8m0_to_f32,
 )
-from aiter.ops.triton.utils.types import str_to_torch_dtype
+
+from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
+
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.shuffle import shuffle_weight
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales
