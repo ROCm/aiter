@@ -116,13 +116,13 @@ def gemm_a4w4(
     ):
         splitK = 0 if splitK is None else splitK
         return gemm_a4w4_blockscale(
-            A.view(-1, A.shape[-1]), B, A_scale, B_scale, out, splitK=splitK
+            A.view(m, k // 2), B, A_scale, B_scale, out, splitK=splitK
         )[:m]
     assert (
         out.shape[0] % 32 == 0
     ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"
     gemm_a4w4_asm(
-        A.view(-1, A.shape[-1]),
+        A.view(m, k // 2),
         B,
         A_scale,
         B_scale,
