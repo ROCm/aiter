@@ -167,7 +167,7 @@ class DiTRuntimeState(RuntimeState):
             )
         self.use_hybrid_fp8_attn = False
         self.use_fp8_attn = False
-        self.kernel = "default"
+        self.kernel = "default_fp8"
 
     def check_fp8_availability(self, use_fp8_attn: bool, use_hybrid_fp8_attn: bool):
         if (use_fp8_attn or use_hybrid_fp8_attn):

@@ -367,8 +367,8 @@ def create_arg_parser():
         parser.add_argument(
             "--kernel",
             type=str,
-            default="default",
-            choices=["default", "fav3_fp8", "fav3_sage", "sagev1"],
+            default="default_fp8",
+            choices=["default_fp8", "fav3_fp8", "fav3_sage", "sagev1"],
             help="The kernel to run.")
         parser.add_argument(
             "--use_hybrid_fp8_attn",

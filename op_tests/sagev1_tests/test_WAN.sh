@@ -5,6 +5,14 @@
 # bash aiter/op_tests/sagev1_tests/test_WAN.sh
 
 
+################################## Git relted
+# cd /home/waqahmed/codes/aiter
+# git checkout main && git fetch && git pull
+# git submodule sync && git submodule update --init --recursive
+# git checkout anguyenh/sageattn
+# git pull && git submodule sync && git submodule update --init --recursive
+
+
 ################################## setup docker
 # docker pull amdsiloai/pytorch-xdit:v25.13.1
 # docker run -it --rm --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host -v /home/waqahmed/codes:/workspace -w /workspace amdsiloai/pytorch-xdit:v25.13.1 /bin/bash
@@ -12,11 +20,8 @@
 # huggingface-cli download Wan-AI/Wan2.1-I2V-14B-720P-Diffusers --local-dir /workspace/wan_models/Wan2.1-I2V-14B-720P-Diffusers --local-dir-use-symlinks False
 # huggingface-cli download Wan-AI/Wan2.2-I2V-A14B-Diffusers --local-dir /workspace/wan_models/Wan2.2-I2V-A14B-Diffusers --local-dir-use-symlinks False
 # cd /workspace
-# we will now follow /app/Wan/RUN.md below
-
-
-################################## debuging tips
 # cp -r /app /workspace/
+# we will now follow /app/Wan/RUN.md below
 
 
 ################################## copy required files
@@ -31,7 +36,7 @@ cp runtime_state.py /app/external/xDiT/xfuser/core/distributed/runtime_state.py
 model_name="Wan2.2-I2V-A14B-Diffusers"
 res_dir_base=results/$model_name; model_path=/workspace/wan_models/$model_name
 cd /workspace
-k_list="fav3_sage sagev1 fav3_fp8 default"
+k_list="default_fp8 sagev1 fav3_sage fav3_fp8"
 for k in $k_list; do
     res_dir=${res_dir_base}_${k}
     rm -rf "$res_dir" # remove previous results (optional)
@@ -57,7 +62,7 @@ done
 
 ################################## run exp without fp8
 model_name="Wan2.2-I2V-A14B-Diffusers"
-res_dir_base=results/${model_name}_BF16; model_path=/workspace/wan_models/$model_name
+res_dir=results/${model_name}_BF16; model_path=/workspace/wan_models/$model_name
 cd /workspace
 rm -rf "$res_dir" # remove previous results (optional)
 mkdir -p "$res_dir"
@@ -78,4 +83,4 @@ torchrun --nproc_per_node=8 /app/Wan/run.py \
 
 
 ################################## run rendering script
-# bash aiter/op_tests/sagev1_tests/render_all_WAN.sh --output Wan22_FP8_compare.mp4
+# bash aiter/op_tests/sagev1_tests/wan_files/render_all_wan.sh --output Wan22_FP8_compare.mp4

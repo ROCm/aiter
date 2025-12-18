@@ -43,8 +43,6 @@ if HAS_AITER:
         import os
         HOW_V3_BF16_CVT = int(os.environ.get("HOW_V3_BF16_CVT", "2"))
 
-DEBUG_FLAG = True
-
 
 _fav3_fp8_func = None
 def _get_fav3_fp8_func():
@@ -329,7 +327,7 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 def _check_if_use_fp8_attn():
     use_fp8_attn = False
-    kernel = "default"
+    kernel = "default_fp8"
     try:
         use_fp8_attn = get_runtime_state().use_fp8_attn
         kernel = get_runtime_state().kernel
@@ -501,7 +499,6 @@ def _attention(query, key, value, dropout_p, is_causal):
     """
     Calls the correct attention mechanism based on the available libraries
     """
-    global DEBUG_FLAG
     use_fp8_attn, kernel = _check_if_use_fp8_attn()
     if HAS_AITER:
         if use_fp8_attn:
@@ -510,19 +507,10 @@ def _attention(query, key, value, dropout_p, is_causal):
             elif kernel == "sagev1":
                 output = _sagev1_call(query, key, value, dropout_p, is_causal)
             elif kernel == "fav3_sage":
-                fav3s_fn = _get_fav3_sage_attn()
-                if fav3s_fn is None:
-                    raise RuntimeError("kernel 'fav3_sage' requested but fav3_sage_wrapper_func is not available")
                 output, _ = _fav3_sage_call(query, key, value, dropout_p, is_causal)
             else:
-                if DEBUG_FLAG:
-                    print(f"***** kernel: {kernel} - using default FP8 attention _aiter_fp8_attn_call *****")
-                    DEBUG_FLAG = False
                 output, _ = _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal)
         else:
-            if DEBUG_FLAG:
-                print(f"***** Using default BF16 attention _aiter_bf16_attn_call *****")
-                DEBUG_FLAG = False
             output, _ = _aiter_bf16_attn_call(query, key, value, dropout_p, is_causal)
         return output
     elif HAS_FLASH_ATTN:
