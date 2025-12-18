@@ -12,6 +12,7 @@ from .utils import (
     get_arch,
     map_dims,
 )
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 # 0 for per block quantization, 1 for per channel quantization
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
@@ -2398,44 +2399,14 @@ def sage_quant(
         _, h_kv, kv_len, _ = k.shape
 
         stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
-        stride_bz_qo, stride_h_qo, stride_seq_qo = (
-            q_int8.stride(0),
-            q_int8.stride(1),
-            q_int8.stride(2),
-        )
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
-        stride_bz_ko, stride_h_ko, stride_seq_ko = (
-            k_int8.stride(0),
-            k_int8.stride(1),
-            k_int8.stride(2),
-        )
 
-        stride_bz_vo, stride_h_vo, stride_seq_vo = (
-            v_fp8.stride(0),
-            v_fp8.stride(1),
-            v_fp8.stride(2),
-        )
     elif tensor_layout == "NHD":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = k.shape
 
         stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
-        stride_bz_qo, stride_h_qo, stride_seq_qo = (
-            q_int8.stride(0),
-            q_int8.stride(2),
-            q_int8.stride(1),
-        )
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
-        stride_bz_ko, stride_h_ko, stride_seq_ko = (
-            k_int8.stride(0),
-            k_int8.stride(2),
-            k_int8.stride(1),
-        )
-        stride_bz_vo, stride_h_vo, stride_seq_vo = (
-            v_fp8.stride(0),
-            v_fp8.stride(2),
-            v_fp8.stride(1),
-        )
     else:
         raise ValueError(f"Unknown tensor layout: {tensor_layout}")
 
@@ -2478,18 +2449,9 @@ def sage_quant(
         stride_bz_q,
         stride_h_q,
         stride_seq_q,
-        stride_bz_qo,
-        stride_h_qo,
-        stride_seq_qo,
         stride_bz_k,
         stride_h_k,
         stride_seq_k,
-        stride_bz_ko,
-        stride_h_ko,
-        stride_seq_ko,
-        stride_bz_vo,
-        stride_h_vo,
-        stride_seq_vo,
         q_scale.stride(0),
         q_scale.stride(1),
         k_scale.stride(0),
@@ -2511,13 +2473,9 @@ def sage_quant(
         D=head_dim,
         BLK_Q=BLKQ,
         BLK_K=BLKK,
-        IS_V_PER_CHANNEL=(V_QUANT_SCHEME == 1),
+        V_QUANT_SCHEME=V_QUANT_SCHEME,
     )
 
-    # print(grid)
-    # print(q_int8)
-    # print(v_fp8)
-    # print(v_scale)
     return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, k_smooth
 
 
@@ -2535,18 +2493,9 @@ def sage_quant_kernel(
     stride_qz,
     stride_qh,
     stride_qn,
-    stride_qoz,
-    stride_qoh,
-    stride_qon,
     stride_kz,
     stride_kh,
     stride_kn,
-    stride_koz,
-    stride_koh,
-    stride_kon,
-    stride_voz,
-    stride_voh,
-    stride_von,
     stride_qsz,
     stride_qsh,
     stride_ksz,
@@ -2568,7 +2517,7 @@ def sage_quant_kernel(
     D: tl.constexpr,
     BLK_Q: tl.constexpr,
     BLK_K: tl.constexpr,
-    IS_V_PER_CHANNEL: tl.constexpr,
+    V_QUANT_SCHEME: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -2577,25 +2526,13 @@ def sage_quant_kernel(
     offs_d = tl.arange(0, D)
 
     if pid < q_task_count:
-        off_blk = pid % Q_NUM_BLKS
-        off_h = (pid // Q_NUM_BLKS) % Q_HEAD
-        off_b = ((pid // Q_NUM_BLKS) // Q_HEAD) % BATCH
+        off_blk, off_h, off_b = pid_grid_3d(pid, Q_NUM_BLKS, Q_HEAD, BATCH)
         offs_qn = off_blk * BLK_Q + offs_blk_q
 
-        q_input_ptrs = (
-            Q_Input
-            + off_b * stride_qz
-            + off_h * stride_qh
-            + offs_qn[:, None] * stride_qn
-            + offs_d[None, :]
-        )
-        q_output_ptrs = (
-            Q_Output
-            + off_b * stride_qoz
-            + off_h * stride_qoh
-            + offs_qn[:, None] * stride_qon
-            + offs_d[None, :]
-        )
+        q_offs = off_b * stride_qz +off_h * stride_qh +offs_qn[:, None] * stride_qn +offs_d[None, :]
+
+        q_input_ptrs = Q_Input + q_offs
+        q_output_ptrs = Q_Output + q_offs
         q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
 
         _general_quant_kernel(
@@ -2609,25 +2546,14 @@ def sage_quant_kernel(
     elif pid >= q_task_count and pid < q_task_count + k_task_count:
         # here we do K
         _pid = pid - q_task_count
-        off_blk = _pid % K_NUM_BLKS
-        off_h = (_pid // K_NUM_BLKS) % K_HEAD
-        off_b = ((_pid // K_NUM_BLKS) // K_HEAD) % BATCH
+        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
+
         offs_kn = off_blk * BLK_K + offs_blk_k
 
-        k_input_ptrs = (
-            K_Input
-            + off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
-        )
-        k_output_ptrs = (
-            K_Output
-            + off_b * stride_koz
-            + off_h * stride_koh
-            + offs_kn[:, None] * stride_kon
-            + offs_d[None, :]
-        )
+        k_offs = off_b * stride_kz +off_h * stride_kh +offs_kn[:, None] * stride_kn +offs_d[None, :]
+
+        k_input_ptrs = K_Input + k_offs
+        k_output_ptrs = K_Output + k_offs
         k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
 
         _general_quant_kernel(
@@ -2641,27 +2567,15 @@ def sage_quant_kernel(
     else:
         # V
         _pid = pid - (q_task_count + k_task_count)
-        if IS_V_PER_CHANNEL:
-            off_blk = _pid % K_NUM_BLKS
-            off_h = (_pid // K_NUM_BLKS) % K_HEAD
-            off_b = ((_pid // K_NUM_BLKS) // K_HEAD) % BATCH
+        if V_QUANT_SCHEME == 0:
+            off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
             offs_kn = off_blk * BLK_K + offs_blk_k
 
-            v_input_ptrs = (
-                V_Input
-                + off_b * stride_kz
-                + off_h * stride_kh
-                + offs_kn[:, None] * stride_kn
-                + offs_d[None, :]
-            )
-            v_output_ptrs = (
-                V_Output
-                + off_b * stride_voz
-                + off_h * stride_voh
-                + offs_kn[:, None] * stride_von
-                + offs_d[None, :]
-            )
-            v_scale_ptrs = V_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
+            v_offs = off_b * stride_kz +off_h * stride_kh +offs_kn[:, None] * stride_kn +offs_d[None, :]
+
+            v_input_ptrs = V_Input + v_offs
+            v_output_ptrs = V_Output + v_offs
+            v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_blk
             _general_quant_kernel(
                 v_input_ptrs,
                 v_output_ptrs,
@@ -2670,26 +2584,15 @@ def sage_quant_kernel(
                 offs_kn[:, None] < K_NUM_BLKS,
             )
         else:
-            off_d = _pid % D
-            off_h = (_pid // D) % K_HEAD
-            off_b = ((_pid // D) // K_HEAD) % BATCH
+            off_d, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
             offs_k = tl.arange(0, SEQLEN_K_PADDED)
 
-            v_input_ptrs = (
-                V_Input
-                + off_b * stride_kz
-                + off_h * stride_kh
-                + offs_k * stride_kn
-                + off_d
-            )
-            v_output_ptrs = (
-                V_Output
-                + off_b * stride_voz
-                + off_h * stride_voh
-                + offs_k * stride_von
-                + off_d
-            )
-            v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_blk
+            v_offs = off_b * stride_kz +off_h * stride_kh +offs_k * stride_kn +off_d
+
+            v_input_ptrs = V_Input + v_offs
+            v_output_ptrs = V_Output + v_offs
+
+            v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_d
             _general_quant_kernel(
                 v_input_ptrs, v_output_ptrs, v_scale_ptrs, FP8_MAX, offs_k < SEQLEN_K
             )
