@@ -562,14 +562,14 @@ class GemmCommonTuner(TunerCommon):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
         self.failed = pd.concat(
-            [self.failed, resultdf[resultdf["us"] == self.INVALID_TIME or resultdf["us"] == self.INF_TIME]],
+            [self.failed, resultdf[(resultdf["us"] == self.INVALID_TIME) | (resultdf["us"] == self.INF_TIME)]],
             ignore_index=True,
         )
         self.success = pd.concat(
-            [self.success, resultdf[resultdf["us"] != self.INVALID_TIME and resultdf["us"] != self.INF_TIME]],
+            [self.success, resultdf[(resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)]],
             ignore_index=True,
         )
-        update_tunedf = resultdf[resultdf["us"] != self.INVALID_TIME and resultdf["us"] != self.INF_TIME]  # self.success
+        update_tunedf = resultdf[(resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:

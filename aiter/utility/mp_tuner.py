@@ -38,13 +38,10 @@ def worker(
         res = None
         us = float("inf")
         try:
-<<<<<<< Updated upstream
-            # print(f"run_perftest: info:{info}")
-=======
-            print(f"run_perftest: info:{info}, func:{func}", flush=True)
->>>>>>> Stashed changes
+            print(f"gpu id : {gpu_id} run_perftest: info:{info}, func:{func}", flush=True)
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
+            print(f"run_perftest: info:{info}, func:{func} us:{us}", flush=True)
         except RuntimeError as e:
             print(f"run gpu func error: info:{info}\t {e}")
             us = -1 # not support or error
@@ -106,11 +103,7 @@ def worker(
                 pass
         else:
             print(f"Runtime Error in process:{pid} info:{info}: {e}")
-<<<<<<< Updated upstream
-        us = float("inf")
-=======
         us = -1 #float("inf")
->>>>>>> Stashed changes
         max_err_ratio = 1.0
     except TimeoutError as e:
         print(f"Timeout in process:{pid} info:{info}: {e}")
@@ -118,25 +111,19 @@ def worker(
         max_err_ratio = 1.0
     except Exception as e:
         print(f"Unexpected Error in process:{pid} info:{info}: {e}")
-<<<<<<< Updated upstream
-        import traceback
-
-        traceback.print_exc()
-        us = float("inf")
-=======
         #import traceback
 
         #traceback.print_exc()
         us = -1 # float("inf")
->>>>>>> Stashed changes
         max_err_ratio = 1.0
     finally:
         # Ensure GPU state is cleaned up
-        try:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-        except:
-            pass
+        #try:
+        #    torch.cuda.synchronize()
+        #    torch.cuda.empty_cache()
+        #except:
+        #    pass
+        pass
 
     return info, us, round(max_err_ratio, 4)
 
@@ -175,7 +162,7 @@ def work_group(gpu_id, fast_mode, err_ratio, in_data, tasks):
         pid = mp.current_process().pid
         device = torch.device(f"cuda:{gpu_id}")
         torch.cuda.set_device(device)
-        print(f"Process {pid} using GPU {gpu_id} for task group")
+        #print(f"Process {pid} using GPU {gpu_id} for task group")
     except Exception as e:
         print(f"Error initializing work_group: {e}")
         # Return dummy failed results for all tasks
@@ -201,22 +188,12 @@ def work_group(gpu_id, fast_mode, err_ratio, in_data, tasks):
         if ref is None and not fast_mode or (ref_func is not None and fast_mode):
             ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
             updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
-<<<<<<< Updated upstream
             ref = ref_func(*updated_ref_args, **ref_kwargs)
-=======
-            print(f"run_ref: info:{info}, func:{func}", flush=True)
-            #ref = ref_func(*updated_ref_args, **ref_kwargs)
-            ref = None
->>>>>>> Stashed changes
             torch.cuda.synchronize()
 
         rets = []
         shape_grouped = isinstance(tasks, list)
         solutions = 1 if not shape_grouped else kernels_num
-<<<<<<< Updated upstream
-=======
-        print(f"solutions: {solutions}")
->>>>>>> Stashed changes
         for i in range(solutions):
             (
                 info,
@@ -276,11 +253,7 @@ def mp_tuner(
     fast_mode=False,
     shape_grouped=False,
     err_ratio=0.05,
-<<<<<<< Updated upstream
-    timeout=30,
-=======
     timeout=100,
->>>>>>> Stashed changes
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -406,7 +379,7 @@ def mp_tuner(
                 result_dict[k] = task_result
                 completed_this_round.append((k, async_result))
                 elapsed = time.time() - task_start_times[k]
-                print(f"? Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)")
+                #print(f"[Done] Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)")
 
             except MPTimeoutError:
                 # Check if this specific task has exceeded its timeout
@@ -424,35 +397,34 @@ def mp_tuner(
                     completed_this_round.append((k, async_result))
                 # else: still within timeout, continue waiting
 
-            #except Exception as e:
+            except Exception as e:
                 # Check if it's a process crash (segfault, memory fault, etc.)
-                    #error_type = type(e).__name__
-                    #error_str = str(e)
+                error_type = type(e).__name__
+                error_str = str(e)
 
-                    is_crash = True
-                    #(
-                    #    "died" in error_str.lower()
-                    #    or "terminated" in error_str.lower()
-                    #    or "segmentation" in error_str.lower()
-                    #    or "memory" in error_str.lower()
-                    #)
+                is_crash = (
+                    "died" in error_str.lower()
+                    or "terminated" in error_str.lower()
+                    or "segmentation" in error_str.lower()
+                    or "memory" in error_str.lower()
+                )
 
-                    if is_crash:
-                        error_msg = f"[Crash] Task {k} crashed (likely GPU memory fault):"
-                        crashed_tasks.append(k)
-                        pool_restart_needed = True
-                    else:
-                        error_msg = f"[Failed] Task {k} failed with:"
-    #
-                    #print(error_msg)
-                    #logger.error(error_msg)
-                    #failed_tasks.append((k, error_type))
+                if is_crash:
+                    error_msg = f"[Crash] Task {k} crashed (likely GPU memory fault): {error_type} - {e}"
+                    crashed_tasks.append(k)
+                    pool_restart_needed = True
+                else:
+                    error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
 
-                    # Add dummy result
-                    #dummy_results = []
-                    #add_dummy_result(k, dummy_results)
-                    #result_dict[k] = dummy_results if shape_grouped else [dummy_results[0]]
-                    #completed_this_round.append((k, async_result))
+                print(error_msg)
+                logger.error(error_msg)
+                failed_tasks.append((k, error_type))
+
+                # Add dummy result
+                dummy_results = []
+                add_dummy_result(k, dummy_results)
+                result_dict[k] = dummy_results if shape_grouped else [dummy_results[0]]
+                completed_this_round.append((k, async_result))
 
         # Remove completed tasks from remaining list
         for item in completed_this_round:
