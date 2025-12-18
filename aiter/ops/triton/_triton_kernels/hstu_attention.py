@@ -871,7 +871,7 @@ def _get_fwd_config(
     AUTOTUNE_Z: int,
 ):
     if not hasattr(_get_fwd_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_FWD.json"
         with open(fpath, "r") as file:
             config = json.load(file)
@@ -892,7 +892,7 @@ def _get_bwd_config(
     AUTOTUNE_Z: int,
 ):
     if not hasattr(_get_bwd_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_BWD.json"
         with open(fpath, "r") as file:
             config = json.load(file)

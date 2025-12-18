@@ -49,7 +49,7 @@ class FmoeTuner(TunerCommon):
         "untune_file": "aiter/configs/untuned_fmoe.csv",
         "errRatio": 0.5,
         "batch": 100,
-        "profile_file": "aiter/configs/profile_fmoe.csv",  # for all results
+        "profile_file": "",  # for all results
     }
 
     def _setup_specific_arguments(self):
@@ -1539,6 +1539,7 @@ class FmoeTuner(TunerCommon):
             int(q_type),
             str(act_type).split(".")[-1].lower(),
             doweight_stage1,
+            False,  # bpreshuffle
         )
         _, ck_stage2_kernels = get_gemm2_kernels_list(
             dtype2str_dict[q_dtype_a],
@@ -1547,6 +1548,7 @@ class FmoeTuner(TunerCommon):
             False,
             int(q_type),
             not doweight_stage1,
+            False,  # bpreshuffle
         )
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
@@ -1815,6 +1817,10 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
+            ## remove invalid candidate
+            profileDF = profileDF[
+                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf"))
+            ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
             )
@@ -1895,14 +1901,6 @@ class FmoeTuner(TunerCommon):
             )
             profileDF["run_1stage"] = 0
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
-            ## remove invalid candidate
-            profileDF = profileDF[
-                (profileDF["err1"] < args.errRatio)
-                & (profileDF["err2"] < args.errRatio)
-            ]
-            profileDF = profileDF[
-                (profileDF["us1"] != float("inf")) & (profileDF["us2"] != float("-inf"))
-            ]
             if len(profileDF) == 0:
                 print(
                     f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"
@@ -1960,6 +1958,13 @@ class FmoeTuner(TunerCommon):
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
             profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
             profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
+            if args.profile_file != "":
+                if os.path.exists(args.profile_file):
+                    old_df = pd.read_csv(args.profile_file)
+                else:
+                    old_df = pd.DataFrame(columns=self.columns)
+                tmpprofileDF = pd.concat([old_df, profileDF], ignore_index=True)
+                tmpprofileDF.to_csv(args.profile_file, index=False)
             best_one = profileDF.loc[profileDF["us"].idxmin()].copy()
             print(
                 f"Tuning result for {key} is {best_one['block_m'] ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
@@ -1973,12 +1978,12 @@ class FmoeTuner(TunerCommon):
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
             profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")
+            profile_file = f"aiter/configs/profile_fmoe.csv"
             old_profile = self.get_tuned_gemm_list(
-                args.profile_file, profile_result.columns.tolist()
+                profile_file, profile_result.columns.tolist()
             )
-
             profile_result = pd.concat([old_profile, profile_result])
-            profile_result.to_csv(args.profile_file, index=False)
+            profile_result.to_csv(profile_file, index=False)
         if len(bests) > 0:
             return pd.concat(bests, axis=1).T
         else:

@@ -101,9 +101,7 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)  # type: ignore
 
 
-def all_reduce_fake(
-    tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
-) -> torch.Tensor:
+def all_reduce_fake(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
@@ -125,8 +123,8 @@ def fused_allreduce_rmsnorm_fake(
     w: torch.Tensor,
     eps: float,
     group_name: str,
-) -> torch.Tensor:
-    return torch.empty_like(inp)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(res_inp), torch.empty_like(inp)
 
 
 @torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
@@ -323,7 +321,7 @@ class GroupCoordinator:
             yield graph_capture_context
 
     def all_reduce(
-        self, input_: torch.Tensor, ca_use_new: bool = False, ca_fp8_quant: bool = False
+        self, input_: torch.Tensor, ca_use_new: bool = True, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -396,7 +394,6 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatter(input_, dim)
-
 
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
@@ -818,6 +815,10 @@ class GroupCoordinator:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
+        if self.device_communicator is not None:
+            self.device_communicator.prepare_communication_buffer_for_model(model)
+
     def destroy(self):
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
@@ -885,7 +886,6 @@ _PP: Optional[GroupCoordinator] = None
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
-
 
 
 _DP: Optional[GroupCoordinator] = None
@@ -1364,3 +1364,21 @@ def _node_count(pg: ProcessGroup) -> int:
                 node_assignment[other_rank] = next_node_id
 
     return next_node_id
+
+
+def prepare_communication_buffer_for_model(model: torch.nn.Module):
+    """Prepare the communication buffer for the model.
+    Traditional communication libraries like NCCL are almost
+    model agnostic. However, emerging new communication libraries like
+    MoE all2all (DeepEP) usually allocate the communication buffer
+    based on the model shape for optimal performance.
+    """
+    logger.debug(f"prepare_communication_buffer_for_model: {_TP} {_PP} {_DP} {_EP}")
+    if _TP is not None:
+        _TP.prepare_communication_buffer_for_model(model)
+    if _PP is not None:
+        _PP.prepare_communication_buffer_for_model(model)
+    if _DP is not None:
+        _DP.prepare_communication_buffer_for_model(model)
+    if _EP is not None:
+        _EP.prepare_communication_buffer_for_model(model)

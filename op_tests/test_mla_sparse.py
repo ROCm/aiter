@@ -326,6 +326,7 @@ def test_mla(
     page_size,
     varlen,
     decode_qlen,
+    max_split_per_batch,
 ):
     ret = {}
 
@@ -408,10 +409,11 @@ def test_mla(
         batch_size,
         max_seqlen_qo,
         nhead,
-        q.dtype,
-        kv_buffer.dtype,
+        dtype,
+        kvtype,
         is_sparse=True,
         fast_mode=True,
+        num_kv_splits=max_split_per_batch,
     )
 
     # aiter implementation
@@ -451,7 +453,10 @@ def test_mla(
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
         topk=2048,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
     )
 
     # generate kv topk per token & convert indices into per token
@@ -499,6 +504,7 @@ def test_mla(
             kv_last_page_lens,
             1,
             sm_scale,
+            num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
@@ -559,6 +565,7 @@ def test_mla(
             kv_last_page_lens,
             1,
             sm_scale,
+            num_kv_splits=max_split_per_batch,
             q_scale=q_scale,
             kv_scale=kv_scale,
             work_meta_data=work_meta_data,
@@ -589,13 +596,15 @@ def test_mla(
         return err, us_asm_decode
 
     err = None
-    us_asm_decode = 10000000000
+    us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 512 + 1, 16))
+        (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
     ):
         err, us_asm_decode = test_sparse_mla_bf16()
     elif kvtype == dtypes.fp8 and (
-        (nhead in [16, 128]) or (max_seqlen_qo == 1 and nhead in range(32, 512 + 1, 16))
+        (dtype == dtypes.fp8 and nhead in [16, 128])
+        or (dtype == dtypes.bf16 and nhead in [16])
+        or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
     ):
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
@@ -718,6 +727,15 @@ parser.add_argument(
     e.g.: -n 16,1""",
 )
 parser.add_argument(
+    "-ms",
+    "--max_split_per_batch",
+    type=int,
+    nargs="*",
+    default=[16],
+    help="""kv seqlens max split num for per batch.
+    e.g.: -ms 32""",
+)
+parser.add_argument(
     "--varlen",
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
@@ -734,8 +752,8 @@ if args.nhead is not None:
 
 for nhead, decode_qlen in list_nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
+    for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
+        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
         ret = test_mla(
             ctx_len,
@@ -750,6 +768,7 @@ for nhead, decode_qlen in list_nhead:
             args.block_size,
             varlen=args.varlen,
             decode_qlen=decode_qlen,
+            max_split_per_batch=max_split_per_batch,
         )
         df.append(ret)
     df = pd.DataFrame(df)
