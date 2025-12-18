@@ -183,56 +183,113 @@ class AITER_CONFIG(object):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
             return file_path
-        df_list = []
-        ## merge config files
-        ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
-        import pandas as pd
 
-        df_list.append(pd.read_csv(path_list[0]))
-        for i, path in enumerate(path_list[1:]):
-            if os.path.exists(path):
-                df = pd.read_csv(path)
-                ## check columns
-                assert (
-                    df.columns.tolist() == df_list[0].columns.tolist()
-                ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
-
-                df_list.append(df)
-            else:
-                logger.info(f"path {i+1}: {path} (not exist)")
-        merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
-        ## get keys from untuned file to drop_duplicates
-        untuned_name = (
-            re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
-            if re.search(r"(?:_)?tuned$", merge_name)
-            else merge_name.replace("tuned", "untuned")
-        )
-        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
-        if os.path.exists(untuned_path):
-            untunedf = pd.read_csv(untuned_path)
-            keys = untunedf.columns.to_list()
-            keys.append("cu_num")
-            merge_df = (
-                merge_df.sort_values("us")
-                .drop_duplicates(subset=keys, keep="first")
-                .reset_index(drop=True)
-            )
-        else:
-            logger.warning(
-                f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
-            )
         from pathlib import Path
+        import hashlib
 
         config_path = Path("/tmp/aiter_configs/")
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
-        new_file_path = f"{config_path}/{merge_name}.csv"
+
+        # Compute hash of input files (paths + modification times) to detect changes
+        def compute_input_hash():
+            hash_input = []
+            for path in path_list:
+                if os.path.exists(path):
+                    # Include file path and modification time
+                    mtime = os.path.getmtime(path)
+                    hash_input.append(f"{path}:{mtime}")
+                else:
+                    hash_input.append(f"{path}:missing")
+            hash_str = "|".join(sorted(hash_input))
+            return hashlib.md5(hash_str.encode()).hexdigest()[:8]
+
+        input_hash = compute_input_hash()
+        new_file_path = f"{config_path}/{merge_name}_{input_hash}.csv"
         lock_path = f"{new_file_path}.lock"
 
-        def write_config():
-            merge_df.to_csv(new_file_path, index=False)
+        def merge_and_write():
+            # Clean up old config files with different hashes
+            try:
+                for old_file in config_path.glob(f"{merge_name}_*.csv"):
+                    if old_file.name != f"{merge_name}_{input_hash}.csv":
+                        old_file.unlink()
+                        logger.info(f"Removed old config file: {old_file}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up old config files: {e}")
+            # Check if file already exists and is valid (created by another process)
+            if os.path.exists(new_file_path):
+                try:
+                    import pandas as pd
 
-        mp_lock(lock_path, write_config)
+                    # Verify the file is readable
+                    pd.read_csv(new_file_path)
+                    logger.info(
+                        f"Config file {new_file_path} already exists (hash={input_hash}), skipping merge"
+                    )
+                    return
+                except Exception as e:
+                    logger.warning(
+                        f"Existing config file is invalid: {e}, regenerating..."
+                    )
+
+            # Perform merge inside the lock
+            import pandas as pd
+
+            df_list = []
+
+            df_list.append(pd.read_csv(path_list[0]))
+            for i, path in enumerate(path_list[1:]):
+                if os.path.exists(path):
+                    df = pd.read_csv(path)
+                    ## check columns
+                    assert (
+                        df.columns.tolist() == df_list[0].columns.tolist()
+                    ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+
+                    df_list.append(df)
+                else:
+                    logger.info(f"path {i+1}: {path} (not exist)")
+            merge_df = (
+                pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+            )
+            ## get keys from untuned file to drop_duplicates
+            untuned_name = (
+                re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
+                if re.search(r"(?:_)?tuned$", merge_name)
+                else merge_name.replace("tuned", "untuned")
+            )
+            untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+            if os.path.exists(untuned_path):
+                untunedf = pd.read_csv(untuned_path)
+                keys = untunedf.columns.to_list()
+                keys.append("cu_num")
+                merge_df = (
+                    merge_df.sort_values("us")
+                    .drop_duplicates(subset=keys, keep="first")
+                    .reset_index(drop=True)
+                )
+            else:
+                logger.warning(
+                    f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
+                )
+
+            # Use atomic write: write to temp file then rename
+            import tempfile
+
+            temp_fd, temp_path = tempfile.mkstemp(dir=config_path, suffix=".csv")
+            try:
+                os.close(temp_fd)
+                merge_df.to_csv(temp_path, index=False)
+                # Atomic rename (on POSIX systems)
+                os.replace(temp_path, new_file_path)
+            except Exception:
+                # Clean up temp file on error
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
+
+        mp_lock(lock_path, merge_and_write)
         return new_file_path
 
     @functools.lru_cache(maxsize=20)
