@@ -1,4 +1,3 @@
-import os
 import time
 import torch
 import torch.multiprocessing as mp
