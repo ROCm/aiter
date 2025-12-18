@@ -707,11 +707,6 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
     kv_indices += split_kv_start + cur_batch_kv_start_idx
     split_kv_end -= split_kv_start
 
-    q = gl.amd.cdna3.buffer_load(
-        ptr=Q,
-        offsets=offs_q,
-        mask=(mask_h[:, None]) & (mask_c[None, :]),
-    )
     q_pe = gl.amd.cdna3.buffer_load(
         ptr=Q,
         offsets=off_q_pe,
@@ -721,23 +716,46 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
         ptr=kv_indices,
         offsets=cur_N_pe
     )
-
-    kv_loc = gl.amd.cdna3.buffer_load(
-        ptr=kv_indices,
-        offsets=cur_N
+    q = gl.amd.cdna3.buffer_load(
+        ptr=Q,
+        offsets=offs_q,
+        mask=(mask_h[:, None]) & (mask_c[None, :]),
     )
+
+    # kv_loc = gl.amd.cdna3.buffer_load(
+    #     ptr=kv_indices,
+    #     offsets=cur_N
+    # )
+
 
     q = gl.reshape(q, [BLOCK_H, 2, BLOCK_C // 2])
     q = gl.permute(q, (0, 2, 1))
     q0, q1 = gl.split(q)
 
+    smem_q_rope.store(q_pe)
+    offs_buf_k_pe = kv_pe_loc[:, None] * stride_buf_kbs + offs_k_r[None, :]
+    k_pe = gl.amd.cdna3.buffer_load(
+        ptr=K_Buffer,
+        offsets=offs_buf_k_pe,
+    )  # positional embedding part of keys
+    kv_loc = gl.convert_layout(kv_pe_loc, gl.SliceLayout(1, blocked_ld_k_nope_kn))
     smem_q0_nope.store(q0)
     smem_q1_nope.store(q1)
-    q0 = smem_q0_nope.load(layout=dot_q_layout)
-    q1 = smem_q1_nope.load(layout=dot_q_layout)
 
-    smem_q_rope.store(q_pe)
+    offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_k_c[None, :]
+
+    kv1 = gl.amd.cdna3.buffer_load(
+        ptr=K_Buffer,
+        offsets=offs_buf_kv,
+    )  # the shared latent tensor for keys and values
+
     q_pe = smem_q_rope.load(layout=dot_q_layout)
+    q0 = smem_q0_nope.load(layout=dot_q_layout)
+    kv2 = gl.amd.cdna3.buffer_load(
+        ptr=K_Buffer,
+        offsets=offs_buf_kv + 256,
+    )  # the shared latent tensor for keys and values
+    q1 = smem_q1_nope.load(layout=dot_q_layout)
 
     smem_q0_nope._keep_alive()
     smem_q1_nope._keep_alive()
@@ -765,34 +783,17 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
         (BLOCK_H, BLOCK_N), dtype=gl.float32, layout=mfma_layout_qk,
     )
 
-    offs_buf_k_pe = kv_pe_loc[:, None] * stride_buf_kbs + offs_k_r[None, :]
-    offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_k_c[None, :]
-
-    k_pe = gl.amd.cdna3.buffer_load(
-        ptr=K_Buffer,
-        offsets=offs_buf_k_pe,
-    )  # positional embedding part of keys
-
-    kv1 = gl.amd.cdna3.buffer_load(
-        ptr=K_Buffer,
-        offsets=offs_buf_kv,
-    )  # the shared latent tensor for keys and values
-
-    kv2 = gl.amd.cdna3.buffer_load(
-        ptr=K_Buffer,
-        offsets=offs_buf_kv + 256,
-    )  # the shared latent tensor for keys and values
+    smem_k_rope.store(k_pe.T)
     kv_pe_loc = gl.amd.cdna3.buffer_load(
         ptr = kv_indices,
         offsets = cur_N_pe + BLOCK_N
     )
-    kv_loc = gl.amd.cdna3.buffer_load(
-        ptr = kv_indices,
-        offsets = cur_N + BLOCK_N
-    )
-
-    smem_k_rope.store(k_pe.T)
+    # kv_loc = gl.amd.cdna3.buffer_load(
+    #     ptr = kv_indices,
+    #     offsets = cur_N + BLOCK_N
+    # )
     smem_kv1.store(kv1.T)
+
     smem_kv2.store(kv2.T)
 
     e_sum = gl.full((BLOCK_H,), 0, dtype=gl.float32, layout = gl.SliceLayout(1, mfma_layout_qk))
@@ -809,6 +810,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
             ptr=K_Buffer,
             offsets=offs_buf_k_pe,
         )  # positional embedding part of keys
+        kv_loc = gl.convert_layout(kv_pe_loc, gl.SliceLayout(1, blocked_ld_k_nope_kn))
         cur_k2 = smem_kv2.load(layout=dot_k_layout)
         qk = gl.amd.cdna3.mfma(q0, cur_k1, qk)
         qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
@@ -877,6 +879,10 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
     qk = gl.amd.cdna3.mfma(q0, cur_k1, qk)
     qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
 
+    smem_k_rope._keep_alive()
+    smem_kv1._keep_alive()
+    smem_kv2._keep_alive()
+
     cur_k1 = gl.amd.in_thread_transpose(kv1, blocked_v)
     cur_k2 = gl.amd.in_thread_transpose(kv2, blocked_v)
 
@@ -904,35 +910,52 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
     acc1 = acc1 * re_scale1[None, :, None]
     acc2 = acc2 * re_scale1[None, :, None]
     e_sum = e_sum * re_scale + gl.sum(p, 1)
-    cur_p = smem_p.load(layout=gl.SliceLayout(0, dot_p_layout))[None,:,:]
-    cur_p = tl.broadcast_to(cur_p, (4, 16, 64))
     e_max = n_e_max
-
-    acc1 = gl.amd.cdna3.mfma(cur_p, cur_k1, acc1)
-    acc2 = gl.amd.cdna3.mfma(cur_p, cur_k2, acc2)
-
-    smem_kv1._keep_alive()
-    smem_kv2._keep_alive()
-
-    acc = gl.join(acc1, acc2)  # 4, 16, 64, 2
-    acc  = gl.permute(acc, (1, 3, 2, 0))
-    acc = gl.reshape(acc, (BLOCK_H, BLOCK_C))
-
-    smem_o = gl.allocate_shared_memory(
-        Att_Out.type.element_ty, [BLOCK_H, kv_lora_rank], layout=shared_o
+    
+    offs_mid_lse = (
+        cur_batch * stride_mid_lse_b
+        + offs_om * stride_mid_lse_h
+        + split_kv_id * stride_mid_lse_s 
     )
 
-    e_sum = 1 / e_sum
-    e_sum_acc = gl.convert_layout(e_sum, gl.SliceLayout(1, acc.type.layout))
-    smem_o.store(acc * e_sum_acc[:, None])
-    # smem_o.store(acc)
-    cur_o = smem_o.load(layout=blocked_o)
+    e_sum_rev = 1 / e_sum
+
+    cur_p = smem_p.load(layout=gl.SliceLayout(0, dot_p_layout))[None,:,:]
+    cur_p = tl.broadcast_to(cur_p, (4, 16, 64))
+
+    gl.amd.cdna3.buffer_store(
+        stored_value=e_max - gl.log(e_sum),
+        ptr=Att_Lse,
+        offsets=offs_mid_lse,
+        # mask=mask_om,
+    )
+
+    acc1 = gl.amd.cdna3.mfma(cur_p, cur_k1, acc1)
+    acc1  = gl.permute(acc1, (1, 2, 0))
+    acc1 = gl.reshape(acc1, (BLOCK_H, BLOCK_C //2))
+
+    e_sum_rev = gl.convert_layout(e_sum_rev, gl.SliceLayout(1, acc1.type.layout))
+
+    acc2 = gl.amd.cdna3.mfma(cur_p, cur_k2, acc2)
+    acc2  = gl.permute(acc2, (1, 2, 0))
+    acc2 = gl.reshape(acc2, (BLOCK_H, BLOCK_C //2))
+
+    smem_p._keep_alive()
+
+    smem_o1 = gl.allocate_shared_memory(
+        Att_Out.type.element_ty, [BLOCK_H, kv_lora_rank//2], layout=shared_o
+    )
+    smem_o2 = gl.allocate_shared_memory(
+        Att_Out.type.element_ty, [BLOCK_H, kv_lora_rank//2], layout=shared_o
+    )
+    smem_o1.store(acc1 * e_sum_rev[:, None])
+    smem_o2.store(acc2 * e_sum_rev[:, None])
 
     cur_head_o = cur_head_id * VALID_BLOCK_H + gl.arange(
         0, BLOCK_H, layout=gl.SliceLayout(1, blocked_o)
     )
     offs_c_o = gl.arange(
-        0, BLOCK_C, layout=gl.SliceLayout(0, blocked_o)
+        0, BLOCK_C//2, layout=gl.SliceLayout(0, blocked_o)
     )
     offs_mid_o = (
         cur_batch * stride_mid_ob
@@ -940,6 +963,10 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
         + split_kv_id * stride_mid_os
         + offs_c_o[None, :]
     )
+
+    cur_o1 = smem_o1.load(layout=blocked_o)
+    cur_o2 = smem_o2.load(layout=blocked_o)
+
     # offs_mid_o = (
     #     cur_batch * stride_mid_ob
     #     + offs_om[:, None] * stride_mid_oh
@@ -948,23 +975,17 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
     # )
 
     gl.amd.cdna3.buffer_store(
-        stored_value=cur_o,
+        stored_value=cur_o1,
         ptr=Att_Out,
         offsets=offs_mid_o,
         # mask=(mask_om[:, none]) & (mask_on[none, :]),
     )
 
-    offs_mid_lse = (
-        cur_batch * stride_mid_lse_b
-        + offs_om * stride_mid_lse_h
-        + split_kv_id * stride_mid_lse_s 
-    )
-
     gl.amd.cdna3.buffer_store(
-        stored_value=e_max - gl.log(e_sum),
-        ptr=Att_Lse,
-        offsets=offs_mid_lse,
-        # mask=mask_om,
+        stored_value=cur_o2,
+        ptr=Att_Out,
+        offsets=offs_mid_o + 256,
+        # mask=(mask_om[:, none]) & (mask_on[none, :]),
     )
 
 
