@@ -22,8 +22,19 @@ from aiter.ops.triton._triton_kernels.rope.rope import (
     _rope_kernel_cached_thd_2c_gqa_onehead_bwd,
     _rope_fwd_2d_kernel_neox,
     _rope_fwd_3d,
+    _get_neox_rotated_x_1D,
+    _get_gptj_rotated_x_1D,
+    _get_neox_rotated_x,
+    _get_gptj_rotated_x,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+__all__ = [
+    "_get_neox_rotated_x_1D",
+    "_get_gptj_rotated_x_1D",
+    "_get_neox_rotated_x",
+    "_get_gptj_rotated_x",
+]
 
 _LOGGER = AiterTritonLogger()
 
