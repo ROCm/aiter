@@ -133,10 +133,6 @@ _BACKWARD_COMPAT_MAP = {
     # Quant modules (quant/)
     "fused_fp8_quant": "quant.fused_fp8_quant",
     "fused_mxfp4_quant": "quant.fused_mxfp4_quant",
-    "activation": "activation",
-    "gmm": "gmm",
-    "softmax": "softmax",
-    "topk": "topk",
 }
 
 
