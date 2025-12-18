@@ -149,10 +149,10 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         shuffle_df = (
             df[df["bpreshuffle"] == 1]
             .reset_index()
-            .sort_values(by=["tile_m", "tile_n", "splitK"])
+            .sort_values(by=["tile_M", "tile_N", "splitK"])
         )
         kernel_dict = (
-            shuffle_df.groupby(["tile_m", "tile_n", "splitK"])["knl_name"]
+            shuffle_df.groupby(["tile_M", "tile_N", "splitK"])["knl_name"]
             .apply(list)
             .to_dict()
         )
