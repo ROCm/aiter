@@ -13,16 +13,11 @@ import logging
 import math
 from typing import Optional
 
-try:
-    import torch
-    import iris
+import torch
+import iris
 
-    IRIS_AVAILABLE = True
-except ImportError:
-    IRIS_AVAILABLE = False
-    logging.warning(
-        "Iris library not available. Iris-based communication will not work."
-    )
+# If we got here, iris is available
+IRIS_AVAILABLE = True
 
 logger = logging.getLogger("aiter")
 
@@ -70,8 +65,19 @@ def calculate_heap_size(
             )
         world_size = torch.distributed.get_world_size()
 
-    # Calculate element size in bytes
-    elem_bytes = torch.tensor(0, dtype=dtype).element_size()
+    # Calculate element size in bytes (fast path for common types)
+    if dtype in (torch.float32, torch.int32):
+        elem_bytes = 4
+    elif dtype in (torch.float16, torch.bfloat16, torch.int16):
+        elem_bytes = 2
+    elif dtype in (torch.float64, torch.int64):
+        elem_bytes = 8
+    elif dtype == torch.int8:
+        elem_bytes = 1
+    else:
+        # Fallback for uncommon types (e.g., float8, complex types, future dtypes)
+        elem_bytes = torch.empty(0, dtype=dtype).element_size()
+
     M_shard = M // world_size
 
     # Memory for input tensor (M x N)
@@ -191,8 +197,13 @@ class IrisCommContext:
         # Iris context cleanup is handled automatically
         pass
 
+    @property
+    def is_initialized(self) -> bool:
+        """Check if the Iris context has been initialized."""
+        return self._initialized
+
     def get_heap_bases(self):
         """Get the heap bases tensor for use in Triton kernels."""
-        if not self._initialized:
+        if not self.is_initialized:
             raise RuntimeError("Iris context not initialized. Use as context manager.")
         return self.iris_ctx.heap_bases

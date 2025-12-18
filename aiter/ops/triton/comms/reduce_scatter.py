@@ -14,15 +14,10 @@ import triton
 import triton.language as tl
 import logging
 
-try:
-    import iris
+import iris
 
-    IRIS_AVAILABLE = True
-except ImportError:
-    IRIS_AVAILABLE = False
-    logging.warning(
-        "Iris library not available. Reduce-scatter operations will not work."
-    )
+# If we got here, iris is available
+IRIS_AVAILABLE = True
 
 logger = logging.getLogger("aiter")
 
@@ -202,7 +197,7 @@ def reduce_scatter(
             "Iris library is not available. Cannot perform reduce-scatter."
         )
 
-    if not ctx._initialized:
+    if not ctx.is_initialized:
         raise RuntimeError(
             "Iris context not initialized. Use IrisCommContext as context manager."
         )

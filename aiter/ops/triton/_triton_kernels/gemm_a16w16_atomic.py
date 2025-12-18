@@ -1,16 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
-import functools
-import os
-import json
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 _gemm_a16w16_atomic_repr = make_kernel_repr(
@@ -144,43 +139,9 @@ def _gemm_a16_w16_atomic_kernel(
             tl.atomic_add(c_ptrs, c, mask=c_mask, sem="relaxed")
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-ATOMIC.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
-
-    key = f"{N}_{K}"
-    if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-ATOMIC-N={N}-K={K}.json"
-        if os.path.exists(fpath):
-            with open(fpath, "r") as file:
-                config = json.load(file)
-                _get_config._config_dict[key] = config
-        else:
-            key = "default"  # fall back to default config
-            # single config. for the default path
-            return _get_config._config_dict[key]["any"]
-    if M < 32:
-        return _get_config._config_dict[key]["small"]
-    elif M <= 128:
-        BLK_M = triton.next_power_of_2(M)
-        if BLK_M == 32:
-            return _get_config._config_dict[key]["medium_M32"]
-        elif BLK_M == 64:
-            return _get_config._config_dict[key]["medium_M64"]
-        elif BLK_M == 128:
-            return _get_config._config_dict[key]["medium_M128"]
-    elif M <= 256:
-        return _get_config._config_dict[key]["large"]
-    else:
-        return _get_config._config_dict[key]["xlarge"]
+    return get_gemm_config("GEMM-A16W16-ATOMIC", M, N, K)

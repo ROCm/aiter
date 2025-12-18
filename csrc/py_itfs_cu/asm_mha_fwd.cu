@@ -133,6 +133,7 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         batch_stride_o,
                         mask.left,
                         mask.right,
+                        0, // sink_size
                         static_cast<ck_tile::index_t>(mask.type),
                         0, // min_seqlen_q
                         p_dropout,
@@ -320,6 +321,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  has_lse,
                                  quant_scale_enum::no_scale,
                                  true,
+                                 false,
                                  how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }

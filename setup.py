@@ -17,7 +17,7 @@ from jit import core
 from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
-PACKAGE_NAME = "aiter"
+PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
 if BUILD_TARGET == "auto":
@@ -95,6 +95,15 @@ if IS_ROCM:
                 "module_fmha_v3_varlen_fwd",
                 "module_mha_bwd",
                 "module_mha_varlen_bwd",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+                "module_gemm_mi350_a8w8_blockscale_asm",
             ]
         elif PREBUILD_KERNELS == 2:
             return [
@@ -104,6 +113,15 @@ if IS_ROCM:
                 "module_fmha_v3_varlen_bwd",
                 "module_mha_bwd",
                 "module_mha_varlen_bwd",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+                "module_gemm_mi350_a8w8_blockscale_asm",
             ]
         elif PREBUILD_KERNELS == 3:
             return [
@@ -174,59 +192,82 @@ if IS_ROCM:
                 "module_top_k_per_row",
                 "module_mla_metadata",
                 "module_mla_reduce",
+                "module_topk_plain",
             ]
         else:
-            return []
+            return [
+                "module_gemm_mi350_a8w8_blockscale_asm",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+            ]
 
     exclude_ops = get_exclude_ops()
 
+    has_torch = True
+    try:
+        import torch as _
+    except Exception:
+        has_torch = False
+
     if PREBUILD_KERNELS != 0:
-        all_opts_args_build, prebuild_link_param = core.get_args_of_build(
-            "all", exclude=exclude_ops
-        )
-        os.system(f"rm -rf {core.get_user_jit_dir()}/build")
-        os.system(f"rm -rf {core.get_user_jit_dir()}/*.so")
-        prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
-        os.makedirs(prebuild_dir + "/srcs")
-
-        def build_one_module(one_opt_args):
-            flags_cc = list(one_opt_args["flags_extra_cc"]) + [
-                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
-            ]
-            flags_hip = list(one_opt_args["flags_extra_hip"]) + [
-                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
-            ]
-
-            core.build_module(
-                md_name=one_opt_args["md_name"],
-                srcs=one_opt_args["srcs"],
-                flags_extra_cc=flags_cc,
-                flags_extra_hip=flags_hip,
-                blob_gen_cmd=one_opt_args["blob_gen_cmd"],
-                extra_include=one_opt_args["extra_include"],
-                extra_ldflags=None,
-                verbose=False,
-                is_python_module=True,
-                is_standalone=False,
-                torch_exclude=False,
+        if not has_torch:
+            print(
+                "[aiter] PREBUILD_KERNELS set but torch not installed, skip precompilation in this environment"
             )
-
-        prebuid_thread_num = 5
-        max_jobs = os.environ.get("MAX_JOBS")
-        if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
-            prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
         else:
-            prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
-        os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
+            all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
-        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-            list(executor.map(build_one_module, all_opts_args_build))
+            bd = f"{core.get_user_jit_dir()}/build"
+            import glob
+
+            shutil.rmtree(bd, ignore_errors=True)
+            for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+            def build_one_module(one_opt_args):
+                flags_cc = list(one_opt_args["flags_extra_cc"]) + [
+                    f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+                ]
+                flags_hip = list(one_opt_args["flags_extra_hip"]) + [
+                    f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+                ]
+
+                core.build_module(
+                    md_name=one_opt_args["md_name"],
+                    srcs=one_opt_args["srcs"],
+                    flags_extra_cc=flags_cc,
+                    flags_extra_hip=flags_hip,
+                    blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+                    extra_include=one_opt_args["extra_include"],
+                    extra_ldflags=None,
+                    verbose=False,
+                    is_python_module=True,
+                    is_standalone=False,
+                    torch_exclude=False,
+                )
+
+            prebuid_thread_num = 5
+            max_jobs = os.environ.get("MAX_JOBS")
+            if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
+                prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
+            else:
+                prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
+            os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
+
+            with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+                list(executor.map(build_one_module, all_opts_args_build))
 
 else:
     raise NotImplementedError("Only ROCM is supported")
-
-
-# aiter_meta prepared above
 
 
 class NinjaBuildExtension(BuildExtension):
@@ -279,7 +320,6 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
-    # ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
@@ -291,14 +331,12 @@ setup(
     ],
     extras_require={
         # Triton-based communication using Iris
-        # Pinned to commit 905ec1c (Nov 18, 2024) for reproducibility and API stability
-        "triton_comms": [
-            "iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429",
-        ],
+        # Note: Iris is not available on PyPI and must be installed separately
+        # Install with: pip install -r requirements-triton-comms.txt
+        # (See requirements-triton-comms.txt for pinned Iris version)
+        "triton_comms": [],
         # Install all optional dependencies
-        "all": [
-            "iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429",
-        ],
+        "all": [],
     },
     setup_requires=setup_requires,
     distclass=ForcePlatlibDistribution,

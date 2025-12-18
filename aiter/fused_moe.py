@@ -14,18 +14,12 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
-from aiter.jit.core import (
-    AITER_CONFIGS,
-    PY,
-    bd_dir,
-    get_asm_dir,
-    mp_lock,
-)
+from aiter.jit.core import AITER_CONFIGS, PY, bd_dir, get_asm_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 
 BLOCK_SIZE_M = 32
 
@@ -75,7 +69,7 @@ def moe_sorting(
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def get_inter_dim(w1_shape, w2_shape):
     E, _, model_dim = w1_shape
     E, model_dim, inter_dim = w2_shape
@@ -461,7 +455,7 @@ def fused_moe_1stage(
     return moe_buf
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
     cu_num = get_cu_num()
     tileN = 128
@@ -521,8 +515,12 @@ def get_padded_M(M):
         padded_m = 16
     elif M < 1024:
         padded_m = nextPow2(padded_m)
-    else:
+    elif M < 2048:
         padded_m = 1024
+    elif M < 16384:
+        padded_m = 2048
+    else:
+        padded_m = 16384
     return padded_m
 
 
@@ -535,7 +533,7 @@ class MOEMetadata:
     run_1stage: bool = False
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
     model_dim,
@@ -617,6 +615,9 @@ def get_2stage_cfgs(
         )
 
     def FinalFunc():
+        logger.info(
+            f"[Hint] tuned configs are saved in {tune_file}, you can set AITER_CONFIG_FMOE to this file to use tuned configs"
+        )
         logger.info("\033[0m")
 
     # cfg = cfg_2stages.get(keys, None)
@@ -703,7 +704,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 bias2=bias2,
             ),
-            16 if token < 2048 else 32,
+            16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
             False,
         )

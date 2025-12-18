@@ -541,6 +541,7 @@ def test_pa_mtp(
         aiter.get_pa_metadata_v1(
             qo_indptr,
             kv_indptr,
+            seq_lens_kv,
             num_query_heads // num_kv_heads,
             num_kv_heads,
             True,
@@ -551,6 +552,7 @@ def test_pa_mtp(
             reduce_final_map,
             reduce_partial_map,
             kv_granularity=max(block_size, 16),
+            block_size=block_size,
             max_seqlen_qo=int(max_qlen),
             uni_seqlen_qo=qlen,
             fast_mode=True,
@@ -854,4 +856,4 @@ for dtype in l_dtype:
         df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
-    df.to_csv("mla_prefill.csv")
+    df.to_csv("pa_ps.csv")

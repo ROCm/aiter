@@ -861,9 +861,12 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_bwd.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DONLY_FAV3=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
         ],
@@ -873,18 +876,19 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}'"
         ]
     },
     "module_fmha_v3_varlen_bwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_bwd.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_asm_pybind.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DONLY_FAV3=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
         ],
@@ -894,9 +898,8 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}'"
+
         ]
     },
     "module_fmha_v3_varlen_fwd": {
@@ -923,6 +926,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -938,13 +942,14 @@
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_bwd --output_dir {{}}'"
         ]
     },
     "module_mha_varlen_bwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -960,7 +965,7 @@
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_bwd --output_dir {{}}'"
         ]
     },
     "libmha_fwd": {
@@ -988,7 +993,7 @@
         ]
     },
     "libmha_bwd": {
-        "srcs": [],
+        "srcs": ["f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'"],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 0)}'"
@@ -1002,10 +1007,7 @@
         "is_standalone": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'"
         ]
     },
     "module_rocsolgemm": {

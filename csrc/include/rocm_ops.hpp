@@ -190,6 +190,16 @@ namespace py = pybind11;
           py::arg("bias")   = std::nullopt, \
           py::arg("splitK") = 0);
 
+#define BATCHED_GEMM_BF16_PYBIND            \
+    m.def("batched_gemm_bf16",              \
+          &batched_gemm_bf16,               \
+          "batched_gemm_bf16",              \
+          py::arg("XQ"),                    \
+          py::arg("WQ"),                    \
+          py::arg("Out"),                   \
+          py::arg("bias")   = std::nullopt, \
+          py::arg("splitK") = 0);
+
 #define BATCHED_GEMM_A8W8_TUNE_PYBIND \
     m.def("batched_gemm_a8w8_tune",   \
           &batched_gemm_a8w8_tune,    \
@@ -466,6 +476,30 @@ namespace py = pybind11;
           py::arg("bpreshuffle")  = true,         \
           py::arg("log2_k_split") = std::nullopt);
 
+#define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
+    m.def("flatmm_a8w8_blockscale_asm",   \
+          &flatmm_a8w8_blockscale_asm,    \
+          "flatmm_a8w8_blockscale_asm",   \
+          py::arg("XQ"),                  \
+          py::arg("WQ"),                  \
+          py::arg("x_scale"),             \
+          py::arg("w_scale"),             \
+          py::arg("Out"));
+
+#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_ASM_PYBIND                  \
+    m.def("gemm_a8w8_blockscale_bpreshuffle_asm",                    \
+          &gemm_a8w8_blockscale_bpreshuffle_asm,                     \
+          "FP8 blockscale BpreShuffle GEMM assembly implementation", \
+          py::arg("A"),                                              \
+          py::arg("B"),                                              \
+          py::arg("out"),                                            \
+          py::arg("A_scale"),                                        \
+          py::arg("B_scale"),                                        \
+          py::arg("bias")        = py::none(),                       \
+          py::arg("splitK")      = py::none(),                       \
+          py::arg("kernelName")  = py::none(),                       \
+          py::arg("bpreshuffle") = true);
+
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
           &gemm_a4w4_blockscale,    \
@@ -709,6 +743,7 @@ namespace py = pybind11;
           py::arg("is_causal"),                    \
           py::arg("window_size_left"),             \
           py::arg("window_size_right"),            \
+          py::arg("sink_size"),                    \
           py::arg("return_softmax_lse"),           \
           py::arg("return_dropout_randval"),       \
           py::arg("cu_seqlens_q")  = std::nullopt, \
@@ -746,7 +781,9 @@ namespace py = pybind11;
           py::arg("block_table")  = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
-          py::arg("gen")          = std::nullopt);
+          py::arg("gen")          = std::nullopt, \
+          py::arg("cu_seqlens_q_padded") = std::nullopt, \
+          py::arg("cu_seqlens_k_padded") = std::nullopt);
 
 #define MHA_VARLEN_BWD_PYBIND                            \
     m.def("mha_varlen_bwd",                              \
@@ -869,6 +906,7 @@ namespace py = pybind11;
           py::arg("is_causal"),                          \
           py::arg("window_size_left"),                   \
           py::arg("window_size_right"),                  \
+          py::arg("sink_size"),                          \
           py::arg("return_softmax_lse"),                 \
           py::arg("return_dropout_randval"),             \
           py::arg("out")                 = std::nullopt, \
@@ -1469,6 +1507,7 @@ namespace py = pybind11;
           "get_pa_metadata_v1",                  \
           py::arg("seqlens_qo_indptr"),          \
           py::arg("pages_kv_indptr"),            \
+          py::arg("context_lens"),               \
           py::arg("num_heads_per_head_k"),       \
           py::arg("num_heads_k"),                \
           py::arg("is_causal"),                  \
@@ -1479,6 +1518,7 @@ namespace py = pybind11;
           py::arg("reduce_final_map"),           \
           py::arg("reduce_partial_map"),         \
           py::arg("kv_granularity")      = 16,   \
+          py::arg("block_size")          = 16,   \
           py::arg("max_seqlen_qo")       = -1,   \
           py::arg("uni_seqlen_qo")       = -1,   \
           py::arg("fast_mode")           = true, \

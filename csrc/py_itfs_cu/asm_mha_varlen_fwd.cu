@@ -26,7 +26,9 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           const at::Tensor k,
                                           const at::Tensor v,
                                           const at::Tensor cu_seqlens_q,
-                                          std::optional<const at::Tensor> &cu_seqlens_k,
+                                          const at::Tensor cu_seqlens_k,
+                                          std::optional<const at::Tensor> &cu_seqlens_q_padded,
+                                          std::optional<const at::Tensor> &cu_seqlens_k_padded,
                                           std::optional<const at::Tensor> &seqlens_k,
                                           std::optional<const at::Tensor> &bias_,
                                           std::optional<const at::Tensor> &alibi_slopes_,
@@ -94,6 +96,24 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
+    const void* seqstart_q_ptr = nullptr;
+    const void* seqstart_k_ptr = nullptr;
+    const void* cu_seqlen_q_ptr = nullptr;
+    const void* cu_seqlen_k_ptr = nullptr;
+
+    if (cu_seqlens_k_padded.has_value()) {
+        seqstart_k_ptr = cu_seqlens_k_padded.value().data_ptr();
+        cu_seqlen_k_ptr = cu_seqlens_k.data_ptr();
+    } else {
+        seqstart_k_ptr = cu_seqlens_k.data_ptr();
+    }
+
+    if (cu_seqlens_q_padded.has_value()) {
+        seqstart_q_ptr = cu_seqlens_q_padded.value().data_ptr();
+        cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
+    } else {
+        seqstart_q_ptr = cu_seqlens_q.data_ptr();
+    }
     return mha_fwd_args{q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
@@ -104,12 +124,12 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                         has_lse ? softmax_lse.data_ptr() : nullptr,
                         out.data_ptr(),
-                        cu_seqlens_q.data_ptr(), // seqstart_q_ptr (cumulative physical)
-                        cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k_ptr
+                        seqstart_q_ptr, // seqstart_q_ptr (cumulative physical)
+                        seqstart_k_ptr, // seqstart_k_ptr
                         nullptr, // seqlen_q_ptr (per-sequence logical, not used here)
                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
-                        nullptr, // cu_seqlen_q_ptr (not used in this mode)
-                        nullptr, // cu_seqlen_k_ptr (not used in this mode)
+                        cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                        cu_seqlen_k_ptr, // cu_seqlen_k_ptr
                         total_q,
                         total_k,
                         b,
@@ -142,6 +162,7 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         batch_stride_o,
                         mask.left,
                         mask.right,
+                        0,              // sink_size
                         static_cast<ck_tile::index_t>(mask.type),
                         min_seqlen_q,
                         p_dropout,
@@ -155,11 +176,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
-               std::optional<const at::Tensor> &cu_seqlens_k, // [b+1]
-                // FIXME: this two args currently not support on ck side
-                //        and has no host code on aiter side
-                //    const at::Tensor& cu_seqlens_q_padded,   // [b+1]
-                //    const at::Tensor& cu_seqlens_k_padded,   // [b+1]
+               const at::Tensor &cu_seqlens_k, // [b+1]
                int max_seqlen_q,
                int max_seqlen_k,
                int min_seqlen_q,
@@ -177,7 +194,9 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
                std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-               std::optional<at::Generator> gen_)
+               std::optional<at::Generator> gen_,
+               std::optional<const at::Tensor> cu_seqlens_q_padded,   // [b+1]
+               std::optional<const at::Tensor> cu_seqlens_k_padded)   // [b+1])
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -186,17 +205,13 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
-    if (cu_seqlens_k.has_value()) {
-        TORCH_CHECK(cu_seqlens_k.value().dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
-    }
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(cu_seqlens_q);
-    if (cu_seqlens_k.has_value()) {
-        CHECK_DEVICE(cu_seqlens_k.value());
-    }
+    CHECK_DEVICE(cu_seqlens_k);
 
     at::Tensor block_table;
     const bool paged_KV = block_table_.has_value();
@@ -211,9 +226,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     CHECK_CONTIGUOUS(cu_seqlens_q);
-    if (cu_seqlens_k.has_value()) {
-        CHECK_CONTIGUOUS(cu_seqlens_k.value());
-    }
+    CHECK_CONTIGUOUS(cu_seqlens_k);
 
     const auto sizes = q.sizes();
 
@@ -279,9 +292,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     }
 
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-    if (cu_seqlens_k.has_value()) {
-        CHECK_SHAPE(cu_seqlens_k.value(), batch_size + 1);
-    }
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+
     auto opts = q.options();
 
     at::Tensor out;
@@ -347,7 +359,6 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
-        TORCH_CHECK(cu_seqlens_k.has_value(), "cu_seqlens_k must be provided if paged_KV is false");
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto args =
             get_asm_mha_varlen_fwd_args(
@@ -366,6 +377,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                cu_seqlens_q_padded,
+                cu_seqlens_k_padded,
                 seqlens_k,
                 bias_,
                 alibi_slopes_,
@@ -386,6 +399,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                 has_lse,
                                 quant_scale_enum::no_scale,
                                 true,
+                                false,
                                 how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd 3");
     }
