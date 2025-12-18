@@ -15,7 +15,6 @@ from aiter.ops.triton.normalization.rmsnorm import (
 )
 
 
-
 def generate_rmsnorm_inputs(M, N, dtype):
     x = torch.randn((M, N), dtype=dtype, device="cuda")
     weight = torch.randn(N, dtype=dtype, device="cuda")
