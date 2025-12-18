@@ -805,8 +805,8 @@ class FmoeTuner(TunerCommon):
             num_valid_ids,  # 7
             moe_buf,  # 8
             a1_scale,  # 9
-            w1_scale.reshape(w1_scale.shape[0], -1),  # 10
-            w2_scale.reshape(w2_scale.shape[0], -1),  # 11
+            w1_scale,  # 10
+            w2_scale,  # 11
             w1_qt,  # 12
             w2_qt,  # 13
             topk_weights,  # 14
