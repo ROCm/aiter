@@ -16,6 +16,7 @@ from .utils import (
 # 0 for per block quantization, 1 for per channel quantization
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
 
+
 def get_fwd_configs(autotune: bool):
     assert not autotune, "Autotuning is not supported."
     return {
@@ -26,7 +27,7 @@ def get_fwd_configs(autotune: bool):
         "num_stages": 1,
         "num_warps": 8,
     }
-    
+
     configs = []
     keys = [
         "IS_CAUSAL",
@@ -1139,7 +1140,7 @@ def attn_fwd(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
-    V_QUANT_SCHEME: tl.constexpr
+    V_QUANT_SCHEME: tl.constexpr,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
@@ -1219,9 +1220,12 @@ def attn_fwd(
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
     if V_QUANT_SCHEME == 1:
         v_descale = tl.load(
-            V_Descale + off_z * stride_v_descale_z + off_h_k * stride_v_descale_h + offs_d_v,
+            V_Descale
+            + off_z * stride_v_descale_z
+            + off_h_k * stride_v_descale_h
+            + offs_d_v,
             mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
-            other=0.0
+            other=0.0,
         )
 
     # figure out masking pattern
@@ -1535,7 +1539,6 @@ def attn_fwd(
             stride_k_descale_blk,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
-
             BLOCK_N,
             PRE_LOAD_V,
             ENABLE_DROPOUT,
@@ -1927,17 +1930,11 @@ def fav3_sage_triton_impl(
             torch.float32,
         ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
 
-    stride_q_descale_z, stride_q_descale_h, stride_q_descale_blk = (
-        q_descale.stride()
-    )
-    stride_k_descale_z, stride_k_descale_h, stride_k_descale_blk = (
-        k_descale.stride()
-    )
+    stride_q_descale_z, stride_q_descale_h, stride_q_descale_blk = q_descale.stride()
+    stride_k_descale_z, stride_k_descale_h, stride_k_descale_blk = k_descale.stride()
 
     if V_QUANT_SCHEME == 1:
-        stride_v_descale_z, stride_v_descale_h, _ = (
-            v_descale.stride()
-        )
+        stride_v_descale_z, stride_v_descale_h, _ = v_descale.stride()
     else:
         stride_v_descale_z = stride_v_descale_h = 0
 
@@ -2082,16 +2079,20 @@ def fav3_sage_triton_impl(
         USE_EXP2=use_exp2,
         RETURN_SCORES=return_scores,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
-        **config
+        **config,
     )
 
-def quantize_v_fp8 (v: torch.Tensor, FP8_MAX: float, BLKK: int, tensor_layout: str = "NHD"):
+
+def quantize_v_fp8(
+    v: torch.Tensor, FP8_MAX: float, BLKK: int, tensor_layout: str = "NHD"
+):
     # call the corresponding quantization function with the V_QUANT_SCHEME
 
     if V_QUANT_SCHEME == 0:
         return _v_per_block_fp8(v, FP8_MAX, BLKK, tensor_layout=tensor_layout)
     elif V_QUANT_SCHEME == 1:
         return _v_per_channel_fp8(v, FP8_MAX, tensor_layout=tensor_layout)
+
 
 def _v_per_block_fp8(v, FP8_MAX, BLKK=64, tensor_layout="NHD"):
     """
@@ -2250,9 +2251,7 @@ def _v_per_channel_fp8(v, FP8_MAX, tensor_layout="NHD"):
     else:
         raise ValueError(f"Unknown tensor layout: {tensor_layout}")
 
-    v_scale = torch.empty(
-        (b, h_kv, head_dim), device=v.device, dtype=torch.float32
-    )
+    v_scale = torch.empty((b, h_kv, head_dim), device=v.device, dtype=torch.float32)
 
     grid = (head_dim, h_kv, b)
     quant_per_channel_fp8_kernel[grid](
@@ -2273,6 +2272,7 @@ def _v_per_channel_fp8(v, FP8_MAX, tensor_layout="NHD"):
     )
 
     return v_fp8, v_scale
+
 
 @triton.jit
 def quant_per_channel_fp8_kernel(
@@ -2299,18 +2299,10 @@ def quant_per_channel_fp8_kernel(
     offs_l = tl.arange(0, L_PADDED)
 
     input_ptrs = (
-        Input
-        + off_b * stride_iz
-        + off_h * stride_ih
-        + offs_l * stride_in
-        + off_d
+        Input + off_b * stride_iz + off_h * stride_ih + offs_l * stride_in + off_d
     )
     output_ptrs = (
-        Output
-        + off_b * stride_oz
-        + off_h * stride_oh
-        + offs_l * stride_on
-        + off_d
+        Output + off_b * stride_oz + off_h * stride_oh + offs_l * stride_on + off_d
     )
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_d
 
@@ -2321,4 +2313,401 @@ def quant_per_channel_fp8_kernel(
     # x_fp8 += 0.5 * tl.where(x_fp8 >= 0, 1, -1)
     x_fp8 = x_fp8.to(Scale.type.element_ty)
     tl.store(output_ptrs, x_fp8, mask=offs_l < L)
+    tl.store(scale_ptrs, scale)
+
+
+def compute_k_smoothing_factors(
+    k: torch.Tensor, tensor_layout: str = "NHD"
+) -> torch.Tensor:
+    """
+    Compute per-channel smoothing factors for K tensor following SageAttention approach.
+
+    This computes the mean across the sequence dimension for each channel (head_dim)
+    to reduce outliers before quantization, improving INT8 accuracy.
+
+    Args:
+        k: Key tensor with shape (B, kv_len, H, head_dim) for NHD layout
+           or (B, H, kv_len, head_dim) for HND layout
+        tensor_layout: Either "NHD" or "HND"
+
+    Returns:
+        k_smooth: Smoothing factors with shape matching k, computed as per-channel mean
+    """
+    if tensor_layout == "NHD":
+        # k shape: [B, kv_len, H, head_dim]
+        # Compute mean across sequence dimension (dim=1), keep dims for broadcasting
+        k_mean = k.mean(dim=1, keepdim=True)  # [B, 1, H, head_dim]
+    elif tensor_layout == "HND":
+        # k shape: [B, H, kv_len, head_dim]
+        # Compute mean across sequence dimension (dim=2), keep dims for broadcasting
+        k_mean = k.mean(dim=2, keepdim=True)  # [B, H, 1, head_dim]
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+
+    return k_mean
+
+
+def sage_quant(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    km=None,
+    BLKQ=128,
+    BLKK=64,
+    sm_scale=None,
+    tensor_layout="NHD",
+    smooth_k=True,
+):
+    """
+    Quantize Q and K tensors to INT8 with per-block scaling.
+
+    Args:
+        q: Query tensor
+        k: Key tensor
+        km: Optional pre-computed K smoothing factors (if None and smooth_k=True, will be computed)
+        BLKQ: Block size for Q quantization
+        BLKK: Block size for K quantization
+        sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
+        tensor_layout: Either "NHD" or "HND"
+        smooth_k: Whether to apply SageAttention-style smoothing to K tensor (default: True)
+
+    Returns:
+        q_int8: Quantized Q tensor
+        q_scale: Per-block scales for Q
+        k_int8: Quantized K tensor
+        k_scale: Per-block scales for K
+        k_smooth: K smoothing factors applied (or None if smooth_k=False)
+    """
+    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
+    k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+    v_fp8 = torch.empty(v.shape, dtype=FP8_TYPE, device=v.device)
+
+    # Apply K tensor smoothing following SageAttention approach
+    k_smooth = None
+    if smooth_k:
+        if km is None:
+            # TOOD maybe we turn this into a kernel?
+            km = compute_k_smoothing_factors(k, tensor_layout)
+            k_smooth = km
+        k = k - km
+
+    if tensor_layout == "HND":
+        b, h_qo, qo_len, head_dim = q.shape
+        _, h_kv, kv_len, _ = k.shape
+
+        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
+        stride_bz_qo, stride_h_qo, stride_seq_qo = (
+            q_int8.stride(0),
+            q_int8.stride(1),
+            q_int8.stride(2),
+        )
+        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
+        stride_bz_ko, stride_h_ko, stride_seq_ko = (
+            k_int8.stride(0),
+            k_int8.stride(1),
+            k_int8.stride(2),
+        )
+
+        stride_bz_vo, stride_h_vo, stride_seq_vo = (
+            v_fp8.stride(0),
+            v_fp8.stride(1),
+            v_fp8.stride(2),
+        )
+    elif tensor_layout == "NHD":
+        b, qo_len, h_qo, head_dim = q.shape
+        _, kv_len, h_kv, _ = k.shape
+
+        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
+        stride_bz_qo, stride_h_qo, stride_seq_qo = (
+            q_int8.stride(0),
+            q_int8.stride(2),
+            q_int8.stride(1),
+        )
+        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
+        stride_bz_ko, stride_h_ko, stride_seq_ko = (
+            k_int8.stride(0),
+            k_int8.stride(2),
+            k_int8.stride(1),
+        )
+        stride_bz_vo, stride_h_vo, stride_seq_vo = (
+            v_fp8.stride(0),
+            v_fp8.stride(2),
+            v_fp8.stride(1),
+        )
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+
+    q_scale = torch.empty(
+        (b, h_qo, (qo_len + BLKQ - 1) // BLKQ), device=q.device, dtype=torch.float32
+    )
+    k_scale = torch.empty(
+        (b, h_kv, (kv_len + BLKK - 1) // BLKK), device=q.device, dtype=torch.float32
+    )
+    if V_QUANT_SCHEME == 0:
+        v_scale = torch.empty(
+            (b, h_kv, (kv_len + BLKK - 1) // BLKK), device=v.device, dtype=torch.float32
+        )
+    else:
+        v_scale = torch.empty((b, h_kv, head_dim), device=v.device, dtype=torch.float32)
+
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    q_task_count = b * h_qo * ((qo_len + BLKQ - 1) // BLKQ)
+    k_task_count = b * h_kv * ((kv_len + BLKK - 1) // BLKK)
+    if V_QUANT_SCHEME == 0:
+        v_task_count = b * h_kv * ((kv_len + BLKK - 1) // BLKK)
+    else:
+        v_task_count = b * h_kv * head_dim
+
+    grid = (q_task_count + k_task_count + v_task_count,)
+
+    # call sage_quant_kernel
+    sage_quant_kernel[grid](
+        q,
+        q_int8,
+        q_scale,
+        k,
+        k_int8,
+        k_scale,
+        v,
+        v_fp8,
+        v_scale,
+        stride_bz_q,
+        stride_h_q,
+        stride_seq_q,
+        stride_bz_qo,
+        stride_h_qo,
+        stride_seq_qo,
+        stride_bz_k,
+        stride_h_k,
+        stride_seq_k,
+        stride_bz_ko,
+        stride_h_ko,
+        stride_seq_ko,
+        stride_bz_vo,
+        stride_h_vo,
+        stride_seq_vo,
+        q_scale.stride(0),
+        q_scale.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        sm_scale,
+        q_task_count,
+        k_task_count,
+        b,
+        h_qo,
+        h_kv,
+        (qo_len + BLKQ - 1) // BLKQ,
+        (kv_len + BLKK - 1) // BLKK,
+        kv_len,
+        triton.next_power_of_2(kv_len),
+        FP8_MAX=FP8_MAX,
+        INT8_MAX=torch.iinfo(q_int8.dtype).max,
+        D=head_dim,
+        BLK_Q=BLKQ,
+        BLK_K=BLKK,
+        IS_V_PER_CHANNEL=(V_QUANT_SCHEME == 1),
+    )
+
+    # print(grid)
+    # print(q_int8)
+    # print(v_fp8)
+    # print(v_scale)
+    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, k_smooth
+
+
+@triton.jit
+def sage_quant_kernel(
+    Q_Input,
+    Q_Output,
+    Q_Scale,
+    K_Input,
+    K_Output,
+    K_Scale,
+    V_Input,
+    V_Output,
+    V_Scale,
+    stride_qz,
+    stride_qh,
+    stride_qn,
+    stride_qoz,
+    stride_qoh,
+    stride_qon,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_koz,
+    stride_koh,
+    stride_kon,
+    stride_voz,
+    stride_voh,
+    stride_von,
+    stride_qsz,
+    stride_qsh,
+    stride_ksz,
+    stride_ksh,
+    stride_vsz,
+    stride_vsh,
+    sm_scale,
+    q_task_count,
+    k_task_count,
+    BATCH,
+    Q_HEAD,
+    K_HEAD,
+    Q_NUM_BLKS,
+    K_NUM_BLKS,
+    SEQLEN_K,
+    SEQLEN_K_PADDED: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    INT8_MAX: tl.constexpr,
+    D: tl.constexpr,
+    BLK_Q: tl.constexpr,
+    BLK_K: tl.constexpr,
+    IS_V_PER_CHANNEL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    offs_blk_q = tl.arange(0, BLK_Q)
+    offs_blk_k = tl.arange(0, BLK_K)
+    offs_d = tl.arange(0, D)
+
+    if pid < q_task_count:
+        off_blk = pid % Q_NUM_BLKS
+        off_h = (pid // Q_NUM_BLKS) % Q_HEAD
+        off_b = ((pid // Q_NUM_BLKS) // Q_HEAD) % BATCH
+        offs_qn = off_blk * BLK_Q + offs_blk_q
+
+        q_input_ptrs = (
+            Q_Input
+            + off_b * stride_qz
+            + off_h * stride_qh
+            + offs_qn[:, None] * stride_qn
+            + offs_d[None, :]
+        )
+        q_output_ptrs = (
+            Q_Output
+            + off_b * stride_qoz
+            + off_h * stride_qoh
+            + offs_qn[:, None] * stride_qon
+            + offs_d[None, :]
+        )
+        q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
+
+        _general_quant_kernel(
+            q_input_ptrs,
+            q_output_ptrs,
+            q_scale_ptrs,
+            INT8_MAX,
+            offs_qn[:, None] < Q_NUM_BLKS,
+        )
+        # here we do Q
+    elif pid >= q_task_count and pid < q_task_count + k_task_count:
+        # here we do K
+        _pid = pid - q_task_count
+        off_blk = _pid % K_NUM_BLKS
+        off_h = (_pid // K_NUM_BLKS) % K_HEAD
+        off_b = ((_pid // K_NUM_BLKS) // K_HEAD) % BATCH
+        offs_kn = off_blk * BLK_K + offs_blk_k
+
+        k_input_ptrs = (
+            K_Input
+            + off_b * stride_kz
+            + off_h * stride_kh
+            + offs_kn[:, None] * stride_kn
+            + offs_d[None, :]
+        )
+        k_output_ptrs = (
+            K_Output
+            + off_b * stride_koz
+            + off_h * stride_koh
+            + offs_kn[:, None] * stride_kon
+            + offs_d[None, :]
+        )
+        k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
+
+        _general_quant_kernel(
+            k_input_ptrs,
+            k_output_ptrs,
+            k_scale_ptrs,
+            INT8_MAX,
+            offs_kn[:, None] < K_NUM_BLKS,
+            sm_scale,
+        )
+    else:
+        # V
+        _pid = pid - (q_task_count + k_task_count)
+        if IS_V_PER_CHANNEL:
+            off_blk = _pid % K_NUM_BLKS
+            off_h = (_pid // K_NUM_BLKS) % K_HEAD
+            off_b = ((_pid // K_NUM_BLKS) // K_HEAD) % BATCH
+            offs_kn = off_blk * BLK_K + offs_blk_k
+
+            v_input_ptrs = (
+                V_Input
+                + off_b * stride_kz
+                + off_h * stride_kh
+                + offs_kn[:, None] * stride_kn
+                + offs_d[None, :]
+            )
+            v_output_ptrs = (
+                V_Output
+                + off_b * stride_voz
+                + off_h * stride_voh
+                + offs_kn[:, None] * stride_von
+                + offs_d[None, :]
+            )
+            v_scale_ptrs = V_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
+            _general_quant_kernel(
+                v_input_ptrs,
+                v_output_ptrs,
+                v_scale_ptrs,
+                FP8_MAX,
+                offs_kn[:, None] < K_NUM_BLKS,
+            )
+        else:
+            off_d = _pid % D
+            off_h = (_pid // D) % K_HEAD
+            off_b = ((_pid // D) // K_HEAD) % BATCH
+            offs_k = tl.arange(0, SEQLEN_K_PADDED)
+
+            v_input_ptrs = (
+                V_Input
+                + off_b * stride_kz
+                + off_h * stride_kh
+                + offs_k * stride_kn
+                + off_d
+            )
+            v_output_ptrs = (
+                V_Output
+                + off_b * stride_voz
+                + off_h * stride_voh
+                + offs_k * stride_von
+                + off_d
+            )
+            v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_blk
+            _general_quant_kernel(
+                v_input_ptrs, v_output_ptrs, v_scale_ptrs, FP8_MAX, offs_k < SEQLEN_K
+            )
+
+
+@triton.jit
+def _general_quant_kernel(
+    input_ptrs, output_ptrs, scale_ptrs, DTYPE_MAX, mask, sm_scale=None
+):
+    x = tl.load(input_ptrs, mask=mask, other=0.0)
+    x = x.to(tl.float32)
+    if sm_scale is not None:
+        x *= sm_scale
+    max_value = tl.max(tl.abs(x))
+    scale = max_value / DTYPE_MAX
+    x_quant = x / scale
+    if output_ptrs.dtype.element_ty == tl.int8:
+        x_quant += 0.5 * tl.where(x_quant >= 0, 1, -1)
+    x_quant = x_quant.to(output_ptrs.dtype.element_ty)
+    tl.store(output_ptrs, x_quant, mask=mask)
     tl.store(scale_ptrs, scale)

@@ -20,7 +20,8 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import (
 )
 
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    quantize_v_fp8
+    quantize_v_fp8,
+    sage_quant
 )
 
 
@@ -69,14 +70,27 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         softmax_scale = head_dim**-0.5
         tensor_layout = "NHD" if layout == "bshd" else "HND"
         ## following quantization already considered softmax scale and RCP_LN2 
-        q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
-            q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout=tensor_layout
-        )
+        # q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
+        #     q, k, km=k_mean, sm_scale=softmax_scale, BLKQ=BLKQ, BLKK=BLKK, tensor_layout=tensor_layout
+        # )
 
+        # fp8_dtype = aiter.dtypes.fp8
+        # FP8_MAX = torch.finfo(fp8_dtype).max
+        # v_fp8, v_descale = quantize_v_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
         fp8_dtype = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(fp8_dtype).max
-        v_fp8, v_descale = quantize_v_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
 
+        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, _ = sage_quant(
+            q,
+            k,
+            v,
+            FP8_MAX,
+            km=k_mean,
+            sm_scale=softmax_scale,
+            BLKQ=BLKQ,
+            BLKK=BLKK,
+            tensor_layout="NHD",
+        )
 
         # For GQA/MQA: quantize query with grouped scaling
         #group_size = (

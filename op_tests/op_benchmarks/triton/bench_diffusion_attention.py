@@ -39,7 +39,8 @@ from aiter.ops.triton.fav3_sage import (
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs,
-    quantize_v_fp8
+    quantize_v_fp8,
+    sage_quant,
 )
 
 
@@ -246,7 +247,9 @@ def fav3_sage_forward_func(
     softmax_scale = head_dim**-0.5
     k_mean = None
     ## following quantization already considered softmax scale and RCP_LN2
-    q_int8, q_descale, k_int8, k_descale, _ = per_block_int8(
+    # Enable both methods and compare results
+    # Method 1: Original separate quantization (commented code)
+    q_int8_old, q_descale_old, k_int8_old, k_descale_old, _ = per_block_int8(
         q,
         k,
         km=k_mean,
@@ -258,7 +261,34 @@ def fav3_sage_forward_func(
 
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
-    v_fp8, v_descale = quantize_v_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
+    v_fp8_old, v_descale_old = quantize_v_fp8(v, FP8_MAX, BLKK=BLKK, tensor_layout="NHD")
+
+    # Method 2: Current sage_quant (unified quantization)
+    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, _ = sage_quant(
+        q,
+        k,
+        v,
+        fp8_dtype,
+        FP8_MAX,
+        km=k_mean,
+        sm_scale=softmax_scale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        tensor_layout="NHD",
+    )
+
+    print("q_int8", torch.abs(q_int8.float() - q_int8_old.float()))
+    # print("q_int8_old", q_int8_old)
+
+    # Compare results
+    print("\n=== Quantization Method Comparison ===")
+    print(f"Q int8 - Max abs diff: {torch.max(torch.abs(q_int8.float() - q_int8_old.float())).item()}")
+    print(f"Q descale - Max abs diff: {torch.max(torch.abs(q_descale - q_descale_old)).item()}")
+    print(f"K int8 - Max abs diff: {torch.max(torch.abs(k_int8.float() - k_int8_old.float())).item()}")
+    print(f"K descale - Max abs diff: {torch.max(torch.abs(k_descale - k_descale_old)).item()}")
+    print(f"V fp8 - Max abs diff: {torch.max(torch.abs(v_fp8.float() - v_fp8_old.float())).item()}")
+    print(f"V descale - Max abs diff: {torch.max(torch.abs(v_descale - v_descale_old)).item()}")
+    print("=" * 40 + "\n")
 
     return lambda: fav3_sage_func(
         q_int8,
