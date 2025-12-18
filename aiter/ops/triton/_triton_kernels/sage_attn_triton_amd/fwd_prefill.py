@@ -1588,8 +1588,8 @@ def attn_fwd(
             + off_h_k * stride_v_mean_h
         )
         v_mean = tl.load(
-            v_mean_ptr + offs_n[None, :],
-            mask=offs_n[None, :] < seqlen_k,
+            v_mean_ptr + offs_d_v[None, :],
+            mask=offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V,
             other=0.0,
         )
         acc += v_mean
@@ -2208,6 +2208,8 @@ def sage_quant(
             v_mean,
             stride_bz_k,
             stride_h_k,
+            v_mean.stride(0),
+            v_mean.stride(1),
             stride_seq_k,
             b,
             h_kv,
@@ -2301,6 +2303,8 @@ def kv_smooth_kernel(
     V_mean_ptrs,
     stride_bz,
     stride_h,
+    stride_mean_bz,
+    stride_mean_h,
     stride_seq,
     B,
     H,
@@ -2327,7 +2331,7 @@ def kv_smooth_kernel(
     v_smoothed_ptrs = V_smoothed_ptrs + k_offs
     tl.store(v_smoothed_ptrs, v_smooth, mask=offs_k < SEQLEN)
 
-    v_mean_out_ptrs = V_mean_ptrs + off_b * stride_bz + off_h * stride_h + off_d
+    v_mean_out_ptrs = V_mean_ptrs + off_b * stride_mean_bz + off_h * stride_mean_h + off_d
     tl.store(v_mean_out_ptrs, v_mean)
 
 
