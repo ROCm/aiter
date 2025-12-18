@@ -96,7 +96,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     ret = {}
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
-    weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
+    weight = torch.randn(n, k, dtype=otype, device="cuda").to(dtype)
     if otype is None:
         otype = dtype
     if bias:
@@ -471,7 +471,7 @@ parser.add_argument(
     "-o",
     "--otype",
     type=dtypes.str2Dtype,
-    default=[None, torch.float16, torch.bfloat16, torch.float32],
+    default=[torch.float16, torch.bfloat16, torch.float32],
     help="""Data type of output.
     e.g.: -d bf16""",
 )
