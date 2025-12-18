@@ -61,7 +61,6 @@ from .ops.attention import *
 from .ops.custom import *
 from .ops.custom_all_reduce import *
 from .ops.quick_all_reduce import *
-from .ops.trtllm_all_reduce_fusion import *
 from .ops.moe_op import *
 from .ops.moe_sorting import *
 from .ops.pos_encoding import *
@@ -76,6 +75,7 @@ from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
 from .ops.fused_mrope_rms import *
+from .ops.trtllm_all_reduce_fusion import *
 from . import mla
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
