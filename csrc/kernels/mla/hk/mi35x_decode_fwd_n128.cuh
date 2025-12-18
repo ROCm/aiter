@@ -228,32 +228,6 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
                                             0,
                                             0);
     }
-//     else
-//     {
-//         uintptr_t p_lds_warp_nope =
-//             p_lds_k_nope + warp_idx * kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t);
-//         uint4* p_lds_nope                    = reinterpret_cast<uint4*>(p_lds_warp_nope);
-//         constexpr uint32_t kNumDw4PerThrNope = kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t)
-//         /
-//                                                ckt::get_warp_size() / sizeof(uint4);
-// #pragma unroll
-//         for(uint32_t rid = 0; rid < kNumDw4PerThrNope; ++rid)
-//         {
-//             p_lds_nope[lane_idx + rid * ckt::get_warp_size()] = uint4(0u);
-//         }
-
-//         uintptr_t p_lds_warp_rope =
-//             p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
-//         uint32_t* p_lds_rope                = reinterpret_cast<uint32_t*>(p_lds_warp_rope);
-//         constexpr uint32_t kNumDwPerThrRope = kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t)
-//         /
-//                                               ckt::get_warp_size() / sizeof(uint32_t);
-// #pragma unroll
-//         for(uint32_t rid = 0; rid < kNumDwPerThrRope; ++rid)
-//         {
-//             p_lds_rope[lane_idx + rid * ckt::get_warp_size()] = 0u;
-//         }
-//     }
 #endif
 }
 
@@ -483,6 +457,115 @@ softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const flo
     }
 }
 
+template <bool kIsFirstIter, bool kIsTail, uint32_t k_p_comp_begin, typename comp_t = float>
+__device__ __forceinline__ void softmax(comp_t* p_row_max,
+                                        comp_t* p_row_sum_e,
+                                        comp_t* p_rescale,
+                                        uint32_t kv_tile_start,
+                                        uint32_t kv_end,
+                                        float softmax_scale)
+{
+    constexpr comp_t log2e = 1.4426950408889634;
+
+    const uint32_t lane_idx = __lane_id();
+
+    // Element-wise scale. Boundary problem is handled here as well.
+    const uint32_t col_0_idx = lane_idx >> 4;
+    softmax_scale_p<kIsTail, k_p_comp_begin>(col_0_idx * 4 + kv_tile_start, kv_end, softmax_scale);
+
+    // Get max of row
+    comp_t local_max, tmp0, tmp1;
+    asm volatile("v_max3_f32 %1, v[%3], v[%4], v[%5]\n\t"
+                 "v_max3_f32 %2, v[%6], v[%7], v[%8]\n\t"
+                 "v_max_f32_e32 %0, v[%9], v[%10]\n\t"
+                 "v_max3_f32 %0, %1, %2, %0"
+                 : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
+                 : "n"(k_p_comp_begin),
+                   "n"(k_p_comp_begin + 1),
+                   "n"(k_p_comp_begin + 2),
+                   "n"(k_p_comp_begin + 3),
+                   "n"(k_p_comp_begin + 4),
+                   "n"(k_p_comp_begin + 5),
+                   "n"(k_p_comp_begin + 6),
+                   "n"(k_p_comp_begin + 7));
+
+#pragma unroll
+    for(uint32_t offset = 32; offset >= 16; offset /= 2)
+    {
+        const uint32_t src_lane = (offset ^ 64) ^ lane_idx;
+        local_max               = ckt::max(local_max, ckt::warp_shuffle(local_max, src_lane));
+    }
+
+    const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, *p_row_max);
+    *p_rescale = kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((local_max - new_row_max) * log2e);
+
+    *p_row_max = new_row_max;
+
+    asm volatile("v_sub_f32_e32 v[%0], v[%0], %8\n\t"
+                 "v_sub_f32_e32 v[%1], v[%1], %8\n\t"
+                 "v_sub_f32_e32 v[%2], v[%2], %8\n\t"
+                 "v_sub_f32_e32 v[%3], v[%3], %8\n\t"
+                 "v_sub_f32_e32 v[%4], v[%4], %8\n\t"
+                 "v_sub_f32_e32 v[%5], v[%5], %8\n\t"
+                 "v_sub_f32_e32 v[%6], v[%6], %8\n\t"
+                 "v_sub_f32_e32 v[%7], v[%7], %8\n\t"
+                 "v_mul_f32_e32 v[%0], %9, v[%0]\n\t"
+                 "v_mul_f32_e32 v[%1], %9, v[%1]\n\t"
+                 "v_mul_f32_e32 v[%2], %9, v[%2]\n\t"
+                 "v_mul_f32_e32 v[%3], %9, v[%3]\n\t"
+                 "v_mul_f32_e32 v[%4], %9, v[%4]\n\t"
+                 "v_mul_f32_e32 v[%5], %9, v[%5]\n\t"
+                 "v_mul_f32_e32 v[%6], %9, v[%6]\n\t"
+                 "v_mul_f32_e32 v[%7], %9, v[%7]\n\t"
+                 "v_exp_f32_e32 v[%0], v[%0]\n\t"
+                 "v_exp_f32_e32 v[%1], v[%1]\n\t"
+                 "v_exp_f32_e32 v[%2], v[%2]\n\t"
+                 "v_exp_f32_e32 v[%3], v[%3]\n\t"
+                 "v_exp_f32_e32 v[%4], v[%4]\n\t"
+                 "v_exp_f32_e32 v[%5], v[%5]\n\t"
+                 "v_exp_f32_e32 v[%6], v[%6]\n\t"
+                 "v_exp_f32_e32 v[%7], v[%7]"
+                 :
+                 : "n"(k_p_comp_begin),
+                   "n"(k_p_comp_begin + 1),
+                   "n"(k_p_comp_begin + 2),
+                   "n"(k_p_comp_begin + 3),
+                   "n"(k_p_comp_begin + 4),
+                   "n"(k_p_comp_begin + 5),
+                   "n"(k_p_comp_begin + 6),
+                   "n"(k_p_comp_begin + 7),
+                   "v"(new_row_max),
+                   "i"(0x3fb8aa3b) // log2e
+    );
+
+    // Get sum of exp of each row
+    float local_sum_e;
+    asm volatile("v_add_f32 %1, v[%3], v[%4]\n\t"
+                 "v_add_f32 %2, v[%5], v[%6]\n\t"
+                 "v_add_f32 %0, %1, %2\n\t"
+                 "v_add_f32 %1, v[%7], v[%8]\n\t"
+                 "v_add_f32 %2, v[%9], v[%10]\n\t"
+                 "v_add_f32 %1, %2, %1\n\t"
+                 "v_add_f32 %0, %1, %0"
+                 : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
+                 : "n"(k_p_comp_begin),
+                   "n"(k_p_comp_begin + 1),
+                   "n"(k_p_comp_begin + 2),
+                   "n"(k_p_comp_begin + 3),
+                   "n"(k_p_comp_begin + 4),
+                   "n"(k_p_comp_begin + 5),
+                   "n"(k_p_comp_begin + 6),
+                   "n"(k_p_comp_begin + 7));
+#pragma unroll
+    for(uint32_t offset = 32; offset >= 16; offset /= 2)
+    {
+        const uint32_t src_lane = (offset ^ 64) ^ lane_idx;
+        local_sum_e += ckt::warp_shuffle(local_sum_e, src_lane);
+    }
+
+    *p_row_sum_e = kIsFirstIter ? local_sum_e : ((*p_rescale) * (*p_row_sum_e) + local_sum_e);
+}
+
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(72))) void kn_mla_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
@@ -583,10 +666,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     const uint32_t warp_idx = ckt::get_warp_id();
     const uint32_t lane_idx = __lane_id();
 
-    // Store some of values in sgpr
-    /// TODO: asm cannot use sgpr as operand!!!
-    const comp_t softmax_scale = __builtin_amdgcn_readfirstlane(params.softmax_scale);
-
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
         const int32_t partial_qo_loc = __builtin_amdgcn_readfirstlane(
@@ -676,107 +755,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
             });
 
-            const uint32_t col_0_idx = lane_idx >> 4;
-            softmax_scale_p<kIsTail, k_p_comp_begin>(
-                col_0_idx * 4 + kv_tile_start, kv_end, params.softmax_scale);
+            float rescale;
+            softmax<kIsFirstIter, kIsTail, k_p_comp_begin, comp_t>(
+                &row_max, &row_sum_e, &rescale, kv_tile_start, kv_end, params.softmax_scale);
 
             ///
-            /// Softmax
+            /// KV GEMM
             ///
 
-            // 1. Get max of row
-            comp_t local_max, tmp0, tmp1;
-            asm volatile("v_max3_f32 %1, v[%3], v[%4], v[%5]\n\t"
-                         "v_max3_f32 %2, v[%6], v[%7], v[%8]\n\t"
-                         "v_max_f32_e32 %0, v[%9], v[%10]\n\t"
-                         "v_max3_f32 %0, %1, %2, %0"
-                         : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
-                         : "n"(k_p_comp_begin),
-                           "n"(k_p_comp_begin + 1),
-                           "n"(k_p_comp_begin + 2),
-                           "n"(k_p_comp_begin + 3),
-                           "n"(k_p_comp_begin + 4),
-                           "n"(k_p_comp_begin + 5),
-                           "n"(k_p_comp_begin + 6),
-                           "n"(k_p_comp_begin + 7));
-
-#pragma unroll
-            for(uint32_t offset = 32; offset >= 16; offset /= 2)
-            {
-                const uint32_t src_lane = (offset ^ 64) ^ lane_idx;
-                local_max = ckt::max(local_max, ckt::warp_shuffle(local_max, src_lane));
-            }
-
-            const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, row_max);
-            const comp_t rescale =
-                kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((local_max - new_row_max) * log2e);
-
-            row_max = new_row_max;
-
-            asm volatile("v_sub_f32_e32 v[%0], v[%0], %8\n\t"
-                         "v_sub_f32_e32 v[%1], v[%1], %8\n\t"
-                         "v_sub_f32_e32 v[%2], v[%2], %8\n\t"
-                         "v_sub_f32_e32 v[%3], v[%3], %8\n\t"
-                         "v_sub_f32_e32 v[%4], v[%4], %8\n\t"
-                         "v_sub_f32_e32 v[%5], v[%5], %8\n\t"
-                         "v_sub_f32_e32 v[%6], v[%6], %8\n\t"
-                         "v_sub_f32_e32 v[%7], v[%7], %8\n\t"
-                         "v_mul_f32_e32 v[%0], %9, v[%0]\n\t"
-                         "v_mul_f32_e32 v[%1], %9, v[%1]\n\t"
-                         "v_mul_f32_e32 v[%2], %9, v[%2]\n\t"
-                         "v_mul_f32_e32 v[%3], %9, v[%3]\n\t"
-                         "v_mul_f32_e32 v[%4], %9, v[%4]\n\t"
-                         "v_mul_f32_e32 v[%5], %9, v[%5]\n\t"
-                         "v_mul_f32_e32 v[%6], %9, v[%6]\n\t"
-                         "v_mul_f32_e32 v[%7], %9, v[%7]\n\t"
-                         "v_exp_f32_e32 v[%0], v[%0]\n\t"
-                         "v_exp_f32_e32 v[%1], v[%1]\n\t"
-                         "v_exp_f32_e32 v[%2], v[%2]\n\t"
-                         "v_exp_f32_e32 v[%3], v[%3]\n\t"
-                         "v_exp_f32_e32 v[%4], v[%4]\n\t"
-                         "v_exp_f32_e32 v[%5], v[%5]\n\t"
-                         "v_exp_f32_e32 v[%6], v[%6]\n\t"
-                         "v_exp_f32_e32 v[%7], v[%7]"
-                         :
-                         : "n"(k_p_comp_begin),
-                           "n"(k_p_comp_begin + 1),
-                           "n"(k_p_comp_begin + 2),
-                           "n"(k_p_comp_begin + 3),
-                           "n"(k_p_comp_begin + 4),
-                           "n"(k_p_comp_begin + 5),
-                           "n"(k_p_comp_begin + 6),
-                           "n"(k_p_comp_begin + 7),
-                           "v"(new_row_max),
-                           "i"(0x3fb8aa3b) // log2e
-            );
-
-            // Get sum of exp of each row
-            float local_sum_e;
-            asm volatile("v_add_f32 %1, v[%3], v[%4]\n\t"
-                         "v_add_f32 %2, v[%5], v[%6]\n\t"
-                         "v_add_f32 %0, %1, %2\n\t"
-                         "v_add_f32 %1, v[%7], v[%8]\n\t"
-                         "v_add_f32 %2, v[%9], v[%10]\n\t"
-                         "v_add_f32 %1, %2, %1\n\t"
-                         "v_add_f32 %0, %1, %0"
-                         : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
-                         : "n"(k_p_comp_begin),
-                           "n"(k_p_comp_begin + 1),
-                           "n"(k_p_comp_begin + 2),
-                           "n"(k_p_comp_begin + 3),
-                           "n"(k_p_comp_begin + 4),
-                           "n"(k_p_comp_begin + 5),
-                           "n"(k_p_comp_begin + 6),
-                           "n"(k_p_comp_begin + 7));
-#pragma unroll
-            for(uint32_t offset = 32; offset >= 16; offset /= 2)
-            {
-                const uint32_t src_lane = (offset ^ 64) ^ lane_idx;
-                local_sum_e += ckt::warp_shuffle(local_sum_e, src_lane);
-            }
-
-            row_sum_e = kIsFirstIter ? local_sum_e : (rescale * row_sum_e + local_sum_e);
-
+            // Debug code
             float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
             float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
             float r02 = FUI(hkm::v_get_gpr<k_p_comp_begin + 2>()).f32;
