@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
     _dynamic_mxfp4_quant_kernel,
+    _mxfp4_quant_op,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
