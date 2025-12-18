@@ -169,7 +169,7 @@ def _backward_compat_find_spec(fullname, path, target=None):
             try:
                 sys.modules[fullname] = importlib.import_module(new_path)
                 return importlib.util.find_spec(new_path)
-            except:
+            except ImportError:
                 pass
     return None
 
