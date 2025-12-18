@@ -680,32 +680,25 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             softmax_scale_p<kIsTail, k_p_comp_begin>(
                 col_0_idx * 4 + kv_tile_start, kv_end, params.softmax_scale);
 
-            // float rr = hkm::v_max_f32<k_p_comp_begin, k_p_comp_begin+4>();
-
             ///
             /// Softmax
             ///
 
-            /// TODO: It would be better to work on the pinned vgprs directly. However, embeding
-            /// inst like v_max_f32
-            ///       will break the compiler...
-            comp_t v0 = hkm::v_get_gpr<k_p_comp_begin + 0, comp_t>();
-            comp_t v1 = hkm::v_get_gpr<k_p_comp_begin + 1, comp_t>();
-            comp_t v2 = hkm::v_get_gpr<k_p_comp_begin + 2, comp_t>();
-            comp_t v3 = hkm::v_get_gpr<k_p_comp_begin + 3, comp_t>();
-            comp_t v4 = hkm::v_get_gpr<k_p_comp_begin + 4, comp_t>();
-            comp_t v5 = hkm::v_get_gpr<k_p_comp_begin + 5, comp_t>();
-            comp_t v6 = hkm::v_get_gpr<k_p_comp_begin + 6, comp_t>();
-            comp_t v7 = hkm::v_get_gpr<k_p_comp_begin + 7, comp_t>();
-
             // 1. Get max of row
-            comp_t local_max = ckt::max(v0, v1);
-            local_max        = ckt::max(local_max, v2);
-            local_max        = ckt::max(local_max, v3);
-            local_max        = ckt::max(local_max, v4);
-            local_max        = ckt::max(local_max, v5);
-            local_max        = ckt::max(local_max, v6);
-            local_max        = ckt::max(local_max, v7);
+            comp_t local_max, tmp0, tmp1;
+            asm volatile("v_max3_f32 %1, v[%3], v[%4], v[%5]\n\t"
+                         "v_max3_f32 %2, v[%6], v[%7], v[%8]\n\t"
+                         "v_max_f32_e32 %0, v[%9], v[%10]\n\t"
+                         "v_max3_f32 %0, %1, %2, %0"
+                         : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
+                         : "n"(k_p_comp_begin),
+                           "n"(k_p_comp_begin + 1),
+                           "n"(k_p_comp_begin + 2),
+                           "n"(k_p_comp_begin + 3),
+                           "n"(k_p_comp_begin + 4),
+                           "n"(k_p_comp_begin + 5),
+                           "n"(k_p_comp_begin + 6),
+                           "n"(k_p_comp_begin + 7));
 
 #pragma unroll
             for(uint32_t offset = 32; offset >= 16; offset /= 2)
@@ -720,18 +713,61 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
             row_max = new_row_max;
 
-            // calculate exp
-            v0 = __builtin_amdgcn_exp2f((v0 - new_row_max) * log2e);
-            v1 = __builtin_amdgcn_exp2f((v1 - new_row_max) * log2e);
-            v2 = __builtin_amdgcn_exp2f((v2 - new_row_max) * log2e);
-            v3 = __builtin_amdgcn_exp2f((v3 - new_row_max) * log2e);
-            v4 = __builtin_amdgcn_exp2f((v4 - new_row_max) * log2e);
-            v5 = __builtin_amdgcn_exp2f((v5 - new_row_max) * log2e);
-            v6 = __builtin_amdgcn_exp2f((v6 - new_row_max) * log2e);
-            v7 = __builtin_amdgcn_exp2f((v7 - new_row_max) * log2e);
+            asm volatile("v_sub_f32_e32 v[%0], v[%0], %8\n\t"
+                         "v_sub_f32_e32 v[%1], v[%1], %8\n\t"
+                         "v_sub_f32_e32 v[%2], v[%2], %8\n\t"
+                         "v_sub_f32_e32 v[%3], v[%3], %8\n\t"
+                         "v_sub_f32_e32 v[%4], v[%4], %8\n\t"
+                         "v_sub_f32_e32 v[%5], v[%5], %8\n\t"
+                         "v_sub_f32_e32 v[%6], v[%6], %8\n\t"
+                         "v_sub_f32_e32 v[%7], v[%7], %8\n\t"
+                         "v_mul_f32_e32 v[%0], %9, v[%0]\n\t"
+                         "v_mul_f32_e32 v[%1], %9, v[%1]\n\t"
+                         "v_mul_f32_e32 v[%2], %9, v[%2]\n\t"
+                         "v_mul_f32_e32 v[%3], %9, v[%3]\n\t"
+                         "v_mul_f32_e32 v[%4], %9, v[%4]\n\t"
+                         "v_mul_f32_e32 v[%5], %9, v[%5]\n\t"
+                         "v_mul_f32_e32 v[%6], %9, v[%6]\n\t"
+                         "v_mul_f32_e32 v[%7], %9, v[%7]\n\t"
+                         "v_exp_f32_e32 v[%0], v[%0]\n\t"
+                         "v_exp_f32_e32 v[%1], v[%1]\n\t"
+                         "v_exp_f32_e32 v[%2], v[%2]\n\t"
+                         "v_exp_f32_e32 v[%3], v[%3]\n\t"
+                         "v_exp_f32_e32 v[%4], v[%4]\n\t"
+                         "v_exp_f32_e32 v[%5], v[%5]\n\t"
+                         "v_exp_f32_e32 v[%6], v[%6]\n\t"
+                         "v_exp_f32_e32 v[%7], v[%7]"
+                         :
+                         : "n"(k_p_comp_begin),
+                           "n"(k_p_comp_begin + 1),
+                           "n"(k_p_comp_begin + 2),
+                           "n"(k_p_comp_begin + 3),
+                           "n"(k_p_comp_begin + 4),
+                           "n"(k_p_comp_begin + 5),
+                           "n"(k_p_comp_begin + 6),
+                           "n"(k_p_comp_begin + 7),
+                           "v"(new_row_max),
+                           "i"(0x3fb8aa3b) // log2e
+            );
 
             // Get sum of exp of each row
-            float local_sum_e = ((v0 + v1) + (v2 + v3)) + ((v4 + v5) + (v6 + v7));
+            float local_sum_e;
+            asm volatile("v_add_f32 %1, v[%3], v[%4]\n\t"
+                         "v_add_f32 %2, v[%5], v[%6]\n\t"
+                         "v_add_f32 %0, %1, %2\n\t"
+                         "v_add_f32 %1, v[%7], v[%8]\n\t"
+                         "v_add_f32 %2, v[%9], v[%10]\n\t"
+                         "v_add_f32 %1, %2, %1\n\t"
+                         "v_add_f32 %0, %1, %0"
+                         : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
+                         : "n"(k_p_comp_begin),
+                           "n"(k_p_comp_begin + 1),
+                           "n"(k_p_comp_begin + 2),
+                           "n"(k_p_comp_begin + 3),
+                           "n"(k_p_comp_begin + 4),
+                           "n"(k_p_comp_begin + 5),
+                           "n"(k_p_comp_begin + 6),
+                           "n"(k_p_comp_begin + 7));
 #pragma unroll
             for(uint32_t offset = 32; offset >= 16; offset /= 2)
             {
@@ -740,16 +776,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
 
             row_sum_e = kIsFirstIter ? local_sum_e : (rescale * row_sum_e + local_sum_e);
-
-            // Move exp from unpinned reg to pinned reg
-            hkm::v_mov_b32_up2p<k_p_comp_begin + 0>(v0);
-            hkm::v_mov_b32_up2p<k_p_comp_begin + 1>(v1);
-            hkm::v_mov_b32_up2p<k_p_comp_begin + 2>(v2);
-            hkm::v_mov_b32_up2p<k_p_comp_begin + 3>(v3);
-            hkm::v_mov_b32_up2p<k_p_comp_begin + 4>(v4);
-            hkm::v_mov_b32_up2p<k_p_comp_begin + 5>(v5);
-            hkm::v_mov_b32_up2p<k_p_comp_begin + 6>(v6);
-            hkm::v_mov_b32_up2p<k_p_comp_begin + 7>(v7);
 
             float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
             float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
