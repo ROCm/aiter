@@ -143,6 +143,10 @@ a16w16_gemm1_kernels_list= {
      8: kernelInstanceGEMM1(       256,       128,       128,        64,     1,       4,        3,),
      9: kernelInstanceGEMM1(       256,       256,       128,        64,     1,       4,        3,),
     10: kernelInstanceGEMM1(       256,       256,        64,        64,     1,       4,        1,),
+    11: kernelInstanceGEMM1(       256,        32,        32,       128,     1,       1,        1,),
+    12: kernelInstanceGEMM1(       256,        64,        32,       128,     1,       1,        1,),
+    13: kernelInstanceGEMM1(       256,       128,        32,       128,     1,       1,        1,),
+    14: kernelInstanceGEMM1(       256,       256,        32,       128,     1,       1,        1,),
 }
 # gemm1 out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_kernels_list_gfx950= {
@@ -254,6 +258,10 @@ a16w16_gemm2_kernels_list= {
      9: kernelInstanceGEMM2(       256,        64,        64,        64,     1,       4,         1,),
     10: kernelInstanceGEMM2(       256,       128,        64,        64,     1,       4,         3,),
     11: kernelInstanceGEMM2(       256,       256,        64,        64,     1,       4,         3,),
+    12: kernelInstanceGEMM2(        64,        32,        64,        32,     1,       1,         1,),
+    13: kernelInstanceGEMM2(        64,        64,        64,        32,     1,       1,         1,),
+    14: kernelInstanceGEMM2(        64,       128,        64,        32,     1,       1,         1,),
+    15: kernelInstanceGEMM2(        64,       256,        64,        32,     1,       1,         1,),
 }
 
 # gemm2 out:bf16/fp16 AB:fp8/i8
@@ -291,6 +299,12 @@ a8w8_gemm2_kernels_list= {
      14: kernelInstanceGEMM2(       256,       128,        64,       64,     1,       4,         3,),
      15: kernelInstanceGEMM2(       256,       256,       128,       64,     1,       4,         3,),
      16: kernelInstanceGEMM2(       256,       256,        64,       64,     1,       4,         3,),
+     # inter_dim=192 default instances with KPerBlock=64
+    #  17: kernelInstanceGEMM2(        64,        16,        64,       64,     1,       1,         1,),
+     18: kernelInstanceGEMM2(        64,        32,        64,       64,     1,       1,         1,),
+     19: kernelInstanceGEMM2(        64,        64,        64,       64,     1,       1,         1,),
+     20: kernelInstanceGEMM2(        64,       128,        64,       64,     1,       1,         1,),
+     21: kernelInstanceGEMM2(        64,       256,        64,       64,     1,       1,         1,),
 }
 
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
