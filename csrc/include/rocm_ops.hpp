@@ -2,8 +2,6 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
-#include "../../gradlib/include/hipbsolgemm.cuh"
-#include "../../gradlib/include/rocsolgemm.cuh"
 #include <pybind11/pybind11.h>
 
 namespace py = pybind11;
