@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "aiter_hip_common.h"
 #include "dispatch_utils.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
@@ -2648,6 +2649,32 @@ __global__ void kn_entry_1c_2d_cached_inplace(scalar_t* __restrict__ p_inout,
         }                                                      \
     }
 
+template <bool ReuseFreqsFrontPart, bool Is2D>
+std::tuple<dim3, dim3> get_grid_config(const int32_t size_s_h,
+                                       const int32_t size_s_w,
+                                       const int32_t size_b,
+                                       const int32_t size_f)
+{
+    constexpr int32_t kNumWarps   = 4;
+    constexpr int32_t kNumThreads = kNumWarps * ck_tile::get_warp_size();
+
+    const int32_t size_r              = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+    const int32_t size_half_r         = size_r >> 1;
+    const int32_t aligned_size_half_r = ck_tile::next_power_of_two(size_half_r);
+
+    const int32_t block_dim_x = min(aligned_size_half_r, ck_tile::get_warp_size());
+    const int32_t block_dim_y = max(kNumThreads / block_dim_x, 1);
+
+    if constexpr(Is2D)
+    {
+        return {dim3(size_s_h, size_s_w, size_b), dim3(block_dim_x, block_dim_y)};
+    }
+    else
+    {
+        return {dim3(size_s_h * size_s_w, size_b), dim3(block_dim_x, block_dim_y)};
+    }
+}
+
 template <typename Op,
           int32_t RotateStyle,
           bool ReuseFreqsFrontPart,
@@ -2673,8 +2700,7 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_s, 1, size_b, size_f);
 
     if(p_output == p_input)
     {
@@ -2764,8 +2790,7 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_s, 1, size_b, size_f);
 
     if((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
@@ -2873,8 +2898,7 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_s, 1, size_b, size_f);
 
     if(p_output == p_input)
     {
@@ -2967,8 +2991,7 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_s, 1, size_b, size_f);
 
     if((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
@@ -3079,8 +3102,7 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_s, 1, size_b, size_f);
 
     if(p_output == p_input)
     {
@@ -3180,8 +3202,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_s, 1, size_b, size_f);
 
     if((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
@@ -3298,8 +3319,7 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_s, 1, size_b, size_f);
 
     if(p_output == p_input)
     {
@@ -3403,8 +3423,7 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_s, 1, size_b, size_f);
 
     if((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
@@ -3519,8 +3538,7 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(size_max_s, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+    auto [grid, block] = get_grid_config<ReuseFreqsFrontPart, false>(size_max_s, 1, size_b, size_f);
 
     if(p_output == p_input)
     {
@@ -3600,8 +3618,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    const dim3 grid(img_height, img_width, size_b);
-    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+    auto [grid, block] =
+        get_grid_config<ReuseFreqsFrontPart, true>(img_height, img_width, size_b, size_d >> 1);
 
     if(p_output == p_input)
     {
