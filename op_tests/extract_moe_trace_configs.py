@@ -1,4 +1,6 @@
-#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
 """
 Extract MOE configuration from trace files.
 """
@@ -126,10 +128,17 @@ def extract_moe_configs_from_trace(trace_file):
                 if doweight_val in ['True', 'true', '1']:
                     doweight_stage1 = 1
             
-            # Get dtype for weights from Input Types
-            w_dtype = input_types[1] if len(input_types) > 1 else 'c10::BFloat16'
-            q_dtype_w = map_dtype(w_dtype)
-            q_dtype_a = q_dtype_w
+            # Extract dtypes from Input Types
+            # input_types[0]: hidden_states dtype (output dtype)
+            # input_types[1]: w1 weight dtype
+            # input_types[2]: w2 weight dtype (can be used for activation quant dtype)
+            hidden_dtype = input_types[0] if len(input_types) > 0 else 'c10::BFloat16'
+            w1_dtype = input_types[1] if len(input_types) > 1 else 'c10::BFloat16'
+            w2_dtype = input_types[2] if len(input_types) > 2 else 'c10::BFloat16'
+            
+            dtype = map_dtype(hidden_dtype)      # Output dtype
+            q_dtype_w = map_dtype(w1_dtype)      # Weight quant dtype
+            q_dtype_a = map_dtype(w1_dtype)      # Activation quant dtype (extracted from input_types)
             
             config = {
                 'model_dim': model_dim,
@@ -137,7 +146,7 @@ def extract_moe_configs_from_trace(trace_file):
                 'expert': expert,
                 'topk': topk,
                 'act_type': act_type,
-                'dtype': 'torch.bfloat16',
+                'dtype': dtype,
                 'q_dtype_a': q_dtype_a,
                 'q_dtype_w': q_dtype_w,
                 'q_type': q_type,
@@ -193,34 +202,46 @@ def main():
     
     print("\nExtracted MOE Configuration:")
     print("=" * 80)
+    
+    # Check if all kernel calls have the same configuration
+    if len(grouped) > 1:
+        print(f"WARNING: Found {len(grouped)} different configurations in trace!")
+        print("Showing all configurations:\n")
+        for idx, row in grouped.iterrows():
+            print(f"Config {idx+1} (used {row['count']} times):")
+            for col in config_cols:
+                print(f"  {col}: {row[col]}")
+            print()
+    
     if len(grouped) > 0:
         row = grouped.iloc[0]
+        print(f"Using configuration from {row['count']} kernel calls:")
         print(f"  Model Dim: {row['model_dim']}")
         print(f"  Inter Dim: {row['inter_dim']}")
         print(f"  Expert: {row['expert']}")
         print(f"  TopK: {row['topk']}")
         print(f"  Quant: {row['q_type']}")
+        print(f"  dtype: {row['dtype']}")
         print(f"  Q_dtype_a: {row['q_dtype_a']}, Q_dtype_w: {row['q_dtype_w']}")
         print(f"  Activation: {row['act_type']}")
         print(f"  use_g1u1: {row['use_g1u1']}, doweight_stage1: {row['doweight_stage1']}")
     
-    # Generate multiple configs with different token values based on get_padded_M
-    # Padding logic: 1-16→16, 17-1023→pow2, 1024-2047→1024, 2048-16383→2048
+    
     token_values = [
         1,
         2,
         4,
         8,
         16,     
-        32,     # pow2
-        64,     # pow2
-        128,    # pow2
-        256,    # pow2
-        512,    # pow2
-        1024,   # 1024-2047
-        2048,   # 2048-16383
-        4096,   # Large value
-        8192,   # Large value
+        32,     
+        64,     
+        128,    
+        256,    
+        512,    
+        1024,   
+        2048,   
+        4096,   
+        8192,   
         16384,
     ]
     
@@ -248,12 +269,6 @@ def main():
     else:
         print("No configuration found!")
         return
-    
-    print(f"\n{'='*80}")
-    print("Next steps:")
-    print(f"1. Review the extracted configurations in {args.output}")
-    print(f"2. Run: python op_tests/test_all_moe_kernels.py -i {args.output} -o trace_benchmark_results.csv")
-    print(f"3. Compare results to see if better kernels are available for different token counts!")
     
 
 if __name__ == "__main__":
