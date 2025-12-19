@@ -208,16 +208,56 @@ def main():
         print(f"  Activation: {row['act_type']}")
         print(f"  use_g1u1: {row['use_g1u1']}, doweight_stage1: {row['doweight_stage1']}")
     
-    # Save configuration to CSV with token column first but empty
-    output_df = grouped[config_cols].head(1)
-    output_df.insert(0, 'token', '')
-    output_df.to_csv(args.output, index=False)
+    # Generate multiple configs with different token values based on get_padded_M
+    # Padding logic: 1-16→16, 17-1023→pow2, 1024-2047→1024, 2048-16383→2048
+    token_values = [
+        1,
+        2,
+        4,
+        8,
+        16,     
+        32,     # pow2
+        64,     # pow2
+        128,    # pow2
+        256,    # pow2
+        512,    # pow2
+        1024,   # 1024-2047
+        2048,   # 2048-16383
+        4096,   # Large value
+        8192,   # Large value
+        16384,
+    ]
+    
+    print(f"\n{'='*80}")
+    print(f"Generating {len(token_values)} token configurations based on get_padded_M logic")
+    
+    # Replicate config for each token value
+    if len(grouped) > 0:
+        base_config = grouped.iloc[0]
+        output_rows = []
+        
+        for token in token_values:
+            row_dict = {'token': token}
+            for col in config_cols:
+                row_dict[col] = base_config[col]
+            output_rows.append(row_dict)
+        
+        output_df = pd.DataFrame(output_rows)
+        # Reorder columns to have token first
+        cols = ['token'] + config_cols
+        output_df = output_df[cols]
+        output_df.to_csv(args.output, index=False)
+        
+        print(f"Saved {len(output_rows)} configurations with token values: {token_values}")
+    else:
+        print("No configuration found!")
+        return
     
     print(f"\n{'='*80}")
     print("Next steps:")
-    print(f"1. Review the extracted configuration in {args.output}")
+    print(f"1. Review the extracted configurations in {args.output}")
     print(f"2. Run: python op_tests/test_all_moe_kernels.py -i {args.output} -o trace_benchmark_results.csv")
-    print(f"3. Compare results to see if better kernels are available!")
+    print(f"3. Compare results to see if better kernels are available for different token counts!")
     
 
 if __name__ == "__main__":
