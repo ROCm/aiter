@@ -166,21 +166,12 @@ def fav3_fp8_forward_func(
     )
 
 
-def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
-    # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
-    # tensor_layout = args.sagev1_layout
+def sagev1_forward_func(q, k, v, sm_scale, k_smooth=True):
     config = _get_config()
-    # Original tensors are in NHD format (batch, seq, heads, dim)
-    if tensor_layout == "HND":
-        # Convert from NHD to HND for better memory access
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous().to(torch.float16)
-    else:  # NHD
-        # Keep original layout
-        v = v.to(torch.float16)
-    # k_mean = k.mean(dim=1, keepdim=True) if k_smooth else None # provide km as None and it gets computed inside per_block_int8
-    # sm_scale = D_HEAD**-0.5
+    # permute back to BHSD which is the underlying tensor format
+    q = q.permute(0,2,1,3)
+    k = k.permute(0,2,1,3)
+    v = v.permute(0,2,1,3).to(torch.float16)
     q, q_scale, k, k_scale, _ = per_block_int8(
         q,
         k,
@@ -188,7 +179,7 @@ def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
         BLKQ=config["BLOCK_SIZE_M"],
         BLKK=config["BLOCK_SIZE_N"],
         sm_scale=sm_scale,
-        tensor_layout=tensor_layout,
+        tensor_layout="HND",
         smooth_k=k_smooth,
     )
     q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
@@ -199,7 +190,7 @@ def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
         v,
         q_scale,
         k_scale,
-        tensor_layout=tensor_layout,
+        tensor_layout="HND",
         output_dtype=torch.bfloat16,
         config=config,
     )
@@ -247,7 +238,6 @@ def fav3_sage_forward_func(
     k_mean = None
     ## following quantization already considered softmax scale and RCP_LN2
     # Enable both methods and compare results
-    # Method 1: Original separate quantization (commented code)
     # Method 1: Original separate quantization
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
@@ -264,7 +254,6 @@ def fav3_sage_forward_func(
         BLKK=BLKK,
         tensor_layout="NHD",
     )
-
     return lambda: fav3_sage_func(
         q_int8,
         k_int8,
@@ -418,7 +407,9 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
 
 def bench_kernel(q, k, v, args, provider):
     # Default softmax scale
-    BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
+    print("bench kernel assumes shape BSHD")
+    print(f"q.shape = {q.shape}. Should correspond to BSHD, make sure that this is right!")
+    BATCH, N_CTX_Q, HQ,  D_HEAD = q.shape
     _, N_CTX_K, HK, D_HEAD_V = v.shape
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = not args.no_k_smooth
@@ -444,7 +435,6 @@ def bench_kernel(q, k, v, args, provider):
             q,
             k,
             v,
-            tensor_layout=args.sagev1_layout,
             sm_scale=softmax_scale,
             k_smooth=k_smooth,
         )
@@ -474,6 +464,9 @@ def bench_kernel(q, k, v, args, provider):
         current_output = fn()
         assert current_output is not None
         current_primary = primary_output(current_output)
+        if args.sagev1:
+            current_primary = current_primary.permute(0,2,1,3) # sagev1 output is BHSD
+
 
         def reference_output():
             if args.ref == "fav3_fp8":  #  fav3 fp8
@@ -494,7 +487,7 @@ def bench_kernel(q, k, v, args, provider):
                     q,
                     k,
                     v,
-                    tensor_layout=args.sagev1_layout,
+                    tensor_layout="NHD",
                     sm_scale=softmax_scale,
                     k_smooth=k_smooth,
                 )
@@ -516,6 +509,8 @@ def bench_kernel(q, k, v, args, provider):
             return fn()
 
         reference_primary = primary_output(reference_output())
+        if args.ref == "sagev1":
+            reference_primary = reference_primary.permute(0,2,1,3) # sagev1 output is BHSD
         check_attention_outputs(current_primary, reference_primary, fp8=False)
         if args.print_compare_stats:
             print_output_comparison_stats(current_primary, reference_primary)
@@ -587,10 +582,11 @@ def run_benchmark_captured(args):
         # Get the input tensors for this configuration
         inp = inputs[INPUT_IDX]
 
-        # Load tensors to GPU - captured inputs are in BSHD format (batch, seq, heads, dim)
-        q = inp["q"].to(device)
-        k = inp["k"].to(device)
-        v = inp["v"].to(device)
+        # Load tensors to GPU - captured inputs are in BHSD format (batch, heads, seq, dim). Permute it to the BSHD which bench kernel expects.
+        # Permute shouldnt move data, so contiguousness of dimensions should stay intact.
+        q = inp["q"].permute(0,2,1,3).to(device)
+        k = inp["k"].permute(0,2,1,3).to(device)
+        v = inp["v"].permute(0,2,1,3).to(device)
         return bench_kernel(q, k, v, args, provider)
 
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
@@ -623,18 +619,22 @@ def run_benchmark(args):
         """
         Benchmark function for attention kernels with generated random inputs.
         """
-        assert args.sagev1_layout == "NHD"
         assert args.layout == "bshd"
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         assert causal == False, "Causal not supported in this benchmark."
 
-        # Generate base inputs
-        q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD_V), device=device, dtype=dtype)
+        # Generate base inputs in BHSD layout which is the layout used in wan model.
+        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
         q.requires_grad = False
         k.requires_grad = False
         v.requires_grad = False
+        # permute to the BSHD layout which is expected by the bench_kernel
+        # permute does not move data so this doesnt affect the performance
+        q = q.permute(0,2,1,3)
+        k = k.permute(0,2,1,3)
+        v = v.permute(0,2,1,3)
 
         return bench_kernel(q, k, v, args, provider)
 
@@ -704,13 +704,6 @@ def parse_args():
         help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.",
     )
     parser.add_argument("-no_k_smooth", action="store_true", default=False)
-    parser.add_argument(
-        "-sagev1_layout",
-        type=str,
-        default="NHD",
-        choices=["HND", "NHD"],
-        help="Tensor layout for sagev1: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: NHD.",
-    )
     parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)

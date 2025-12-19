@@ -2171,7 +2171,6 @@ def sage_quant(
         v_scale: Per-block scales for V
         v_mean: Mean of V tensor if smoothing applied, else None
     """
-
     if tensor_layout == "HND":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = k.shape
@@ -2222,9 +2221,9 @@ def sage_quant(
         k = k_smoothed
         v = v_smoothed
 
-    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
-    k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
-    v_fp8 = torch.empty(v.shape, dtype=FP8_TYPE, device=v.device)
+    q_int8 = torch.empty_like(q, dtype=torch.int8, device=q.device)
+    k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
+    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
@@ -2457,6 +2456,7 @@ def sage_quant_kernel(
                 mask=None,
             )
         else:
+            # TODO Blocked access for the SEQLEN_K_PADDED
             off_d, off_h, off_b = pid_grid_3d(_pid, D, K_HEAD, BATCH)
             offs_k = tl.arange(0, SEQLEN_K_PADDED)
 
@@ -2475,7 +2475,10 @@ def sage_quant_kernel(
 def _general_quant_kernel(
     input_ptrs, output_ptrs, scale_ptrs, DTYPE_MAX, mask, sm_scale=None
 ):
-    x = tl.load(input_ptrs, mask=mask, other=0.0)
+    if mask is not None:
+        x = tl.load(input_ptrs, mask=mask, other=0.0)
+    else:
+        x = tl.load(input_ptrs)
     x = x.to(tl.float32)
     if sm_scale is not None:
         x *= sm_scale
