@@ -922,4 +922,4 @@ cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 256,8,7168,2048,29,0,5.836,_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E,40.25,1278.77,0.0
 256,8,512,7168,29,0,9.6677,_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E,6.07,193.62,0.0
 256,32768,2112,7168,48,0,293.0219,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_160x384E,3385.88,898.98,0.0
-256,32800,2112,7168,48,0,291.7112,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_160x384E,3404.42,903.88,0.0
+256,65536,2112,7168,48,0,575.6528,_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_160x384E,3447.0,902.06,0.0
