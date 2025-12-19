@@ -3,6 +3,7 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
+
 namespace py = pybind11;
 
 #define ACTIVATION_PYBIND                               \
@@ -658,6 +659,64 @@ namespace py = pybind11;
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
+#define ROCSOLGEMM_PYBIND                                                          \
+    m.def("rocb_create_extension", &rocb_create_extension, "create_extension");    \
+    m.def("rocb_destroy_extension", &rocb_destroy_extension, "destroy_extension"); \
+    m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
+    m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
+
+#define HIPBSOLGEMM_PYBIND                                                         \
+    m.def("hipb_create_extension", &hipb_create_extension, "create_extension");    \
+    m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension"); \
+    m.def("hipb_mm",                                                               \
+          &hipb_mm,                                                                \
+          "hipb_mm",                                                               \
+          py::arg("mat1"),                                                         \
+          py::arg("mat2"),                                                         \
+          py::arg("solution_index"),                                               \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleOut")    = std::nullopt,                                   \
+          py::arg("bpreshuffle") = std::nullopt);                                  \
+    m.def("hipb_findallsols",                                                      \
+          &hipb_findallsols,                                                       \
+          "hipb_findallsols",                                                      \
+          py::arg("mat1"),                                                         \
+          py::arg("mat2"),                                                         \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleC")      = std::nullopt,                                   \
+          py::arg("bpreshuffle") = false);                                         \
+    m.def("getHipblasltKernelName", &getHipblasltKernelName);
+
+#define LIBMHA_BWD_PYBIND                         \
+    m.def("libmha_bwd",                           \
+          &aiter::torch_itfs::mha_bwd,            \
+          py::arg("dout"),                        \
+          py::arg("q"),                           \
+          py::arg("k"),                           \
+          py::arg("v"),                           \
+          py::arg("out"),                         \
+          py::arg("softmax_lse"),                 \
+          py::arg("dropout_p"),                   \
+          py::arg("softmax_scale"),               \
+          py::arg("is_causal"),                   \
+          py::arg("window_size_left"),            \
+          py::arg("window_size_right"),           \
+          py::arg("deterministic"),               \
+          py::arg("dq")           = std::nullopt, \
+          py::arg("dk")           = std::nullopt, \
+          py::arg("dv")           = std::nullopt, \
+          py::arg("dbias")        = std::nullopt, \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alibi_slopes") = std::nullopt, \
+          py::arg("rng_state")    = std::nullopt, \
+          py::arg("gen")          = std::nullopt);
+
 #define MHA_VARLEN_BWD_ASM_PYBIND                        \
     m.def("fmha_v3_varlen_bwd",                          \
           &aiter::torch_itfs::fmha_v3_varlen_bwd,        \
@@ -756,32 +815,56 @@ namespace py = pybind11;
           py::arg("v_descale")     = std::nullopt, \
           py::arg("gen")           = std::nullopt);
 
-#define MHA_VARLEN_FWD_ASM_PYBIND                 \
-    m.def("fmha_v3_varlen_fwd",                   \
-          &aiter::torch_itfs::fmha_v3_varlen_fwd, \
-          py::arg("q"),                           \
-          py::arg("k"),                           \
-          py::arg("v"),                           \
-          py::arg("cu_seqlens_q"),                \
-          py::arg("cu_seqlens_k"),                \
-          py::arg("max_seqlen_q"),                \
-          py::arg("max_seqlen_k"),                \
-          py::arg("min_seqlen_q"),                \
-          py::arg("dropout_p"),                   \
-          py::arg("softmax_scale"),               \
-          py::arg("logits_soft_cap"),             \
-          py::arg("zero_tensors"),                \
-          py::arg("is_causal"),                   \
-          py::arg("window_size_left"),            \
-          py::arg("window_size_right"),           \
-          py::arg("return_softmax_lse"),          \
-          py::arg("return_dropout_randval"),      \
-          py::arg("how_v3_bf16_cvt"),             \
-          py::arg("out")          = std::nullopt, \
-          py::arg("block_table")  = std::nullopt, \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alibi_slopes") = std::nullopt, \
-          py::arg("gen")          = std::nullopt, \
+#define LIBMHA_FWD_PYBIND                          \
+    m.def("libmha_fwd",                            \
+          &aiter::torch_itfs::mha_fwd,             \
+          py::arg("q"),                            \
+          py::arg("k"),                            \
+          py::arg("v"),                            \
+          py::arg("dropout_p"),                    \
+          py::arg("softmax_scale"),                \
+          py::arg("is_causal"),                    \
+          py::arg("window_size_left"),             \
+          py::arg("window_size_right"),            \
+          py::arg("sink_size"),                    \
+          py::arg("return_softmax_lse"),           \
+          py::arg("return_dropout_randval"),       \
+          py::arg("cu_seqlens_q")  = std::nullopt, \
+          py::arg("cu_seqlens_kv") = std::nullopt, \
+          py::arg("out")           = std::nullopt, \
+          py::arg("bias")          = std::nullopt, \
+          py::arg("alibi_slopes")  = std::nullopt, \
+          py::arg("q_descale")     = std::nullopt, \
+          py::arg("k_descale")     = std::nullopt, \
+          py::arg("v_descale")     = std::nullopt, \
+          py::arg("gen")           = std::nullopt);
+
+#define MHA_VARLEN_FWD_ASM_PYBIND                        \
+    m.def("fmha_v3_varlen_fwd",                          \
+          &aiter::torch_itfs::fmha_v3_varlen_fwd,        \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("v"),                                  \
+          py::arg("cu_seqlens_q"),                       \
+          py::arg("cu_seqlens_k"),                       \
+          py::arg("max_seqlen_q"),                       \
+          py::arg("max_seqlen_k"),                       \
+          py::arg("min_seqlen_q"),                       \
+          py::arg("dropout_p"),                          \
+          py::arg("softmax_scale"),                      \
+          py::arg("logits_soft_cap"),                    \
+          py::arg("zero_tensors"),                       \
+          py::arg("is_causal"),                          \
+          py::arg("window_size_left"),                   \
+          py::arg("window_size_right"),                  \
+          py::arg("return_softmax_lse"),                 \
+          py::arg("return_dropout_randval"),             \
+          py::arg("how_v3_bf16_cvt"),                    \
+          py::arg("out")                 = std::nullopt, \
+          py::arg("block_table")         = std::nullopt, \
+          py::arg("bias")                = std::nullopt, \
+          py::arg("alibi_slopes")        = std::nullopt, \
+          py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
 
