@@ -4,9 +4,7 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import deserialize_str
 from aiter.ops.triton._triton_kernels.gemm_a16wfp4 import (

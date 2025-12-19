@@ -3,8 +3,6 @@
 
 from typing import Optional
 import torch
-import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import serialize_dict
 from aiter.ops.triton.batched_gemm_a16wfp4 import (

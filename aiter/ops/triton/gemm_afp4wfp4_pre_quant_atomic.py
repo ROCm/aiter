@@ -3,14 +3,11 @@
 
 from typing import Optional
 import torch
-import triton
-import triton.language as tl
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import serialize_dict
 from aiter.ops.triton.gemm_a16wfp4 import (
     gemm_a16wfp4,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
