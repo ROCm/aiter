@@ -379,6 +379,37 @@ struct alignas(1) fp8e4m3fn {
     }
 };
 
+struct alignas(1) fp8e4m3fnuz {
+    enum {
+        max_value = 120,
+    };
+    struct from_bits_t {
+    };
+    __host__ __device__ static constexpr from_bits_t from_bits() {
+        return from_bits_t();
+    }
+    uint8_t data;
+
+    fp8e4m3fnuz() = default;
+    __host__ __device__ constexpr fp8e4m3fnuz(const fp8e4m3fnuz &) = default;
+    __host__ __device__ constexpr fp8e4m3fnuz(uint8_t v) = delete;
+    explicit __host__ __device__ constexpr fp8e4m3fnuz(uint8_t v, from_bits_t) :
+        data(v) {
+    }
+
+    explicit __host__ __device__ fp8e4m3fnuz(float v) {
+        data = hip_fp8_impl::to_float8<4, 3, float, true /*negative_zero_nan*/, true /*clip*/>(v);
+    }
+
+    explicit __host__ __device__ fp8e4m3fnuz(double v) :
+        fp8e4m3fnuz(static_cast<float>(v)) {
+    }
+
+    explicit inline __host__ __device__ operator float() const {
+        return hip_fp8_impl::from_float8<4, 3, float, true /*negative_zero_nan*/>(data);
+    }
+};
+
 template <typename T, int VEC_SIZE, typename OutT>
 __device__ __forceinline__ vec_t<OutT, VEC_SIZE> convert_to(vec_t<T, VEC_SIZE> &in_vec, float scale) {
     vec_t<OutT, VEC_SIZE> out_vec;
@@ -395,7 +426,8 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps,
-    T *q = nullptr, KVT *k_cache = nullptr, KVT *v_cache = nullptr, int64_t *kv_loc = nullptr, float k_scale = 1.0, float v_scale = 1.0) {
+    T *q = nullptr, KVT *k_cache = nullptr, KVT *v_cache = nullptr, int64_t *kv_loc = nullptr, float k_scale = 1.0, float v_scale = 1.0,
+    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false) {
     constexpr int VEC_SIZE = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     const auto warp_id = threadIdx.x / WARP_SIZE;
@@ -453,9 +485,19 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
             auto offset = (kv_loc[token_id] * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
             if constexpr (std::is_same_v<T, KVT>) {
                 out_vec.store(k_cache + offset);
+                if (return_kv && k_out != nullptr) {
+                    // Write to varlen output buffer: (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head
+                    auto k_out_offset = (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
+                    out_vec.store(k_out + k_out_offset);
+                }
             } else {
-                auto out_vec_fp8 = convert_to<T, VEC_SIZE, fp8e4m3fn>(out_vec, k_scale);
+                auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
                 out_vec_fp8.store(k_cache + offset);
+                if (return_kv && k_out != nullptr) {
+                    // Write to varlen output buffer
+                    auto k_out_offset = (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
+                    out_vec_fp8.store(k_out + k_out_offset);
+                }
             }
         }
 
@@ -465,9 +507,19 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
         auto offset = (kv_loc[token_id] * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
         if constexpr (std::is_same_v<T, KVT>) {
             v_vec.store(v_cache + offset);
+            if (return_kv && v_out != nullptr) {
+                // Write to varlen output buffer: (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head
+                auto v_out_offset = (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
+                v_vec.store(v_out + v_out_offset);
+            }
         } else {
-            auto v_vec_fp8 = convert_to<T, VEC_SIZE, fp8e4m3fn>(v_vec, v_scale);
+            auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
             v_vec_fp8.store(v_cache + offset);
+            if (return_kv && v_out != nullptr) {
+                // Write to varlen output buffer
+                auto v_out_offset = (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
+                v_vec_fp8.store(v_out + v_out_offset);
+            }
         }
     }
 }
@@ -477,7 +529,8 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps,
-    T *q = nullptr, KVT *k_cache = nullptr, KVT *v_cache = nullptr, int64_t *kv_loc = nullptr, float k_scale = 1.0, float v_scale = 1.0) {
+    T *q = nullptr, KVT *k_cache = nullptr, KVT *v_cache = nullptr, int64_t *kv_loc = nullptr, float k_scale = 1.0, float v_scale = 1.0,
+    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false) {
     constexpr int VEC_SIZE = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     const auto warp_id = threadIdx.x / WARP_SIZE;
@@ -529,9 +582,19 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
             auto offset = (kv_loc[token_id] * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
             if constexpr (std::is_same_v<T, KVT>) {
                 out_vec.store(k_cache + offset);
+                if (return_kv && k_out != nullptr) {
+                    // Write to varlen output buffer: (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head
+                    auto k_out_offset = (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
+                    out_vec.store(k_out + k_out_offset);
+                }
             } else {
-                auto out_vec_fp8 = convert_to<T, VEC_SIZE, fp8e4m3fn>(out_vec, k_scale);
+                auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
                 out_vec_fp8.store(k_cache + offset);
+                if (return_kv && k_out != nullptr) {
+                    // Write to varlen output buffer
+                    auto k_out_offset = (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
+                    out_vec_fp8.store(k_out + k_out_offset);
+                }
             }
         }
     } else {
@@ -540,9 +603,19 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
         auto offset = (kv_loc[token_id] * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
         if constexpr (std::is_same_v<T, KVT>) {
             v_vec.store(v_cache + offset);
+            if (return_kv && v_out != nullptr) {
+                // Write to varlen output buffer: (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head
+                auto v_out_offset = (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
+                v_vec.store(v_out + v_out_offset);
+            }
         } else {
-            auto v_vec_fp8 = convert_to<T, VEC_SIZE, fp8e4m3fn>(v_vec, v_scale);
+            auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
             v_vec_fp8.store(v_cache + offset);
+            if (return_kv && v_out != nullptr) {
+                // Write to varlen output buffer
+                auto v_out_offset = (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
+                v_vec_fp8.store(v_out + v_out_offset);
+            }
         }
     }
 }
@@ -552,7 +625,8 @@ void fused_mrope_rms_set_kv(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
     bool is_neox_style, double eps, std::array<int64_t, M> mrope_section, bool is_interleaved,
-    T *q, KVT *k_cache, KVT *v_cache, int64_t *kv_loc, float k_scale, float v_scale, hipStream_t stream) {
+    T *q, KVT *k_cache, KVT *v_cache, int64_t *kv_loc, float k_scale, float v_scale, hipStream_t stream,
+    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     TORCH_CHECK(dim == head_size / 2);
@@ -566,11 +640,11 @@ void fused_mrope_rms_set_kv(
     if (is_neox_style) {                                                                                                                     \
         fused_mrope_rms_neox_kv_kernel<T, HEAD_SIZE, true, IS_INTERLEAVED, M, KVT><<<numBlocks, threadsPerBlock, 0, stream>>>(              \
             qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps, \
-            q, k_cache, v_cache, kv_loc, k_scale, v_scale);                                                                                  \
+            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv);                                                                                  \
     } else {                                                                                                                                 \
         fused_mrope_rms_noneox_kv_kernel<T, HEAD_SIZE, true, IS_INTERLEAVED, M, KVT><<<numBlocks, threadsPerBlock, 0, stream>>>(            \
             qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps, \
-            q, k_cache, v_cache, kv_loc, k_scale, v_scale);                                                                                  \
+            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv);                                                                                  \
     }
 
     if (is_interleaved) {
@@ -607,7 +681,8 @@ void fused_rope_rms_set_kv(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
     bool is_neox_style, double eps, 
-    T *q, KVT *k_cache, KVT *v_cache, int64_t *kv_loc, float k_scale, float v_scale, hipStream_t stream) {
+    T *q, KVT *k_cache, KVT *v_cache, int64_t *kv_loc, float k_scale, float v_scale, hipStream_t stream,
+    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int block_size = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
@@ -620,11 +695,11 @@ void fused_rope_rms_set_kv(
     if (is_neox_style) {                                                                                                                     \
         fused_mrope_rms_neox_kv_kernel<T, HEAD_SIZE, false, false, 1, KVT><<<numBlocks, threadsPerBlock, 0, stream>>>(              \
             qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps, \
-            q, k_cache, v_cache, kv_loc, k_scale, v_scale);                                                                                  \
+            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv);                                                                                  \
     } else {                                                                                                                                 \
         fused_mrope_rms_noneox_kv_kernel<T, HEAD_SIZE, false, false, 1, KVT><<<numBlocks, threadsPerBlock, 0, stream>>>(            \
             qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps, \
-            q, k_cache, v_cache, kv_loc, k_scale, v_scale);                                                                                  \
+            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv);                                                                                  \
     }
 
         switch (head_size) {
@@ -702,7 +777,8 @@ void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Te
 void fused_mrope_3d_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Tensor &positions,
                                int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
                                bool is_neox_style, std::vector<int64_t> mrope_section_, bool is_interleaved, double eps,
-                               Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &kv_loc, double k_scale, double v_scale) {
+                               Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &kv_loc, double k_scale, double v_scale,
+                               std::optional<Tensor> k_out, std::optional<Tensor> v_out, bool return_kv) {
     TORCH_CHECK(mrope_section_.size() == 3);
     TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() && cos_sin.is_contiguous());
     TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && kv_loc.is_contiguous());
@@ -722,7 +798,10 @@ void fused_mrope_3d_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_
         qkv_dtype,
         "fused_mrope_3d_rms_set_kv", [&] {
             using T = KernelElementType<scalar_t>::type;
+            
             if (kv_cache_dtype == qkv_dtype) {
+                T *k_out_ptr = (return_kv && k_out.has_value()) ? (T *)k_out.value().data_ptr<scalar_t>() : nullptr;
+                T *v_out_ptr = (return_kv && v_out.has_value()) ? (T *)v_out.value().data_ptr<scalar_t>() : nullptr;
                 rope_rms::fused_mrope_rms_set_kv<T, 3, T>(
                     (T *)qkv.data_ptr<scalar_t>(),
                     (T *)qw.data_ptr<scalar_t>(),
@@ -746,32 +825,75 @@ void fused_mrope_3d_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_
                     kv_loc.data_ptr<int64_t>(),
                     (float)k_scale,
                     (float)v_scale,
-                    stream);
+                    stream,
+                    k_out_ptr,
+                    v_out_ptr,
+                    return_kv);
             } else {
-                rope_rms::fused_mrope_rms_set_kv<T, 3, rope_rms::fp8e4m3fn>(
-                    (T *)qkv.data_ptr<scalar_t>(),
-                    (T *)qw.data_ptr<scalar_t>(),
-                    (T *)kw.data_ptr<scalar_t>(),
-                    (T *)cos_sin.data_ptr<scalar_t>(),
-                    positions.data_ptr<int64_t>(),
-                    pos_strides[0],
-                    pos_strides[1],
-                    num_tokens,
-                    num_heads_q,
-                    num_heads_k,
-                    num_heads_v,
-                    head_size,
-                    is_neox_style,
-                    eps,
-                    mrope_section,
-                    is_interleaved,
-                    (T *)q.data_ptr<scalar_t>(),
-                    (rope_rms::fp8e4m3fn *)k_cache.data_ptr(),
-                    (rope_rms::fp8e4m3fn *)v_cache.data_ptr(),
-                    kv_loc.data_ptr<int64_t>(),
-                    (float)k_scale,
-                    (float)v_scale,
-                    stream);
+                // Check if kv_cache_dtype is fp8e4m3fnuz or fp8e4m3fn
+                if (kv_cache_dtype == at::ScalarType::Float8_e4m3fnuz) {
+                    rope_rms::fp8e4m3fnuz *k_out_fp8_ptr = (return_kv && k_out.has_value()) ? (rope_rms::fp8e4m3fnuz *)k_out.value().data_ptr() : nullptr;
+                    rope_rms::fp8e4m3fnuz *v_out_fp8_ptr = (return_kv && v_out.has_value()) ? (rope_rms::fp8e4m3fnuz *)v_out.value().data_ptr() : nullptr;
+                    rope_rms::fused_mrope_rms_set_kv<T, 3, rope_rms::fp8e4m3fnuz>(
+                        (T *)qkv.data_ptr<scalar_t>(),
+                        (T *)qw.data_ptr<scalar_t>(),
+                        (T *)kw.data_ptr<scalar_t>(),
+                        (T *)cos_sin.data_ptr<scalar_t>(),
+                        positions.data_ptr<int64_t>(),
+                        pos_strides[0],
+                        pos_strides[1],
+                        num_tokens,
+                        num_heads_q,
+                        num_heads_k,
+                        num_heads_v,
+                        head_size,
+                        is_neox_style,
+                        eps,
+                        mrope_section,
+                        is_interleaved,
+                        (T *)q.data_ptr<scalar_t>(),
+                        (rope_rms::fp8e4m3fnuz *)k_cache.data_ptr(),
+                        (rope_rms::fp8e4m3fnuz *)v_cache.data_ptr(),
+                        kv_loc.data_ptr<int64_t>(),
+                        (float)k_scale,
+                        (float)v_scale,
+                        stream,
+                        k_out_fp8_ptr,
+                        v_out_fp8_ptr,
+                        return_kv);
+                } else if (kv_cache_dtype == at::ScalarType::Float8_e4m3fn) {
+                    rope_rms::fp8e4m3fn *k_out_fp8_ptr = (return_kv && k_out.has_value()) ? (rope_rms::fp8e4m3fn *)k_out.value().data_ptr() : nullptr;
+                    rope_rms::fp8e4m3fn *v_out_fp8_ptr = (return_kv && v_out.has_value()) ? (rope_rms::fp8e4m3fn *)v_out.value().data_ptr() : nullptr;
+                    rope_rms::fused_mrope_rms_set_kv<T, 3, rope_rms::fp8e4m3fn>(
+                        (T *)qkv.data_ptr<scalar_t>(),
+                        (T *)qw.data_ptr<scalar_t>(),
+                        (T *)kw.data_ptr<scalar_t>(),
+                        (T *)cos_sin.data_ptr<scalar_t>(),
+                        positions.data_ptr<int64_t>(),
+                        pos_strides[0],
+                        pos_strides[1],
+                        num_tokens,
+                        num_heads_q,
+                        num_heads_k,
+                        num_heads_v,
+                        head_size,
+                        is_neox_style,
+                        eps,
+                        mrope_section,
+                        is_interleaved,
+                        (T *)q.data_ptr<scalar_t>(),
+                        (rope_rms::fp8e4m3fn *)k_cache.data_ptr(),
+                        (rope_rms::fp8e4m3fn *)v_cache.data_ptr(),
+                        kv_loc.data_ptr<int64_t>(),
+                        (float)k_scale,
+                        (float)v_scale,
+                        stream,
+                        k_out_fp8_ptr,
+                        v_out_fp8_ptr,
+                        return_kv);
+                } else {
+                    TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
+                }
         }
     });
 }
@@ -812,7 +934,8 @@ void fused_rope_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Tensor
 void fused_rope_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Tensor &positions,
                                int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
                                bool is_neox_style, double eps,
-                               Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &kv_loc, double k_scale, double v_scale) {
+                               Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &kv_loc, double k_scale, double v_scale,
+                               std::optional<Tensor> k_out, std::optional<Tensor> v_out, bool return_kv) {
     TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() && cos_sin.is_contiguous());
     TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && kv_loc.is_contiguous());
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(qkv));
@@ -828,6 +951,8 @@ void fused_rope_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin,
         "fused_rope_rms_set_kv", [&] {
             using T = KernelElementType<scalar_t>::type;
             if (kv_cache_dtype == qkv_dtype) {
+                T *k_out_ptr = (return_kv && k_out.has_value()) ? (T *)k_out.value().data_ptr<scalar_t>() : nullptr;
+                T *v_out_ptr = (return_kv && v_out.has_value()) ? (T *)v_out.value().data_ptr<scalar_t>() : nullptr;
                 rope_rms::fused_rope_rms_set_kv<T, T>(
                     (T *)qkv.data_ptr<scalar_t>(),
                     (T *)qw.data_ptr<scalar_t>(),
@@ -849,30 +974,71 @@ void fused_rope_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin,
                     kv_loc.data_ptr<int64_t>(),
                     (float)k_scale,
                     (float)v_scale,
-                    stream);
+                    stream,
+                    k_out_ptr,
+                    v_out_ptr,
+                    return_kv);
             } else {
-                rope_rms::fused_rope_rms_set_kv<T, rope_rms::fp8e4m3fn>(
-                    (T *)qkv.data_ptr<scalar_t>(),
-                    (T *)qw.data_ptr<scalar_t>(),
-                    (T *)kw.data_ptr<scalar_t>(),
-                    (T *)cos_sin.data_ptr<scalar_t>(),
-                    positions.data_ptr<int64_t>(),
-                    0,
-                    pos_strides[0],
-                    num_tokens,
-                    num_heads_q,
-                    num_heads_k,
-                    num_heads_v,
-                    head_size,
-                    is_neox_style,
-                    eps,
-                    (T *)q.data_ptr<scalar_t>(),
-                    (rope_rms::fp8e4m3fn *)k_cache.data_ptr(),
-                    (rope_rms::fp8e4m3fn *)v_cache.data_ptr(),
-                    kv_loc.data_ptr<int64_t>(),
-                    (float)k_scale,
-                    (float)v_scale,
-                    stream);
+                // Check if kv_cache_dtype is fp8e4m3fnuz or fp8e4m3fn
+                if (kv_cache_dtype == at::ScalarType::Float8_e4m3fnuz) {
+                    rope_rms::fp8e4m3fnuz *k_out_fp8_ptr = (return_kv && k_out.has_value()) ? (rope_rms::fp8e4m3fnuz *)k_out.value().data_ptr() : nullptr;
+                    rope_rms::fp8e4m3fnuz *v_out_fp8_ptr = (return_kv && v_out.has_value()) ? (rope_rms::fp8e4m3fnuz *)v_out.value().data_ptr() : nullptr;
+                    rope_rms::fused_rope_rms_set_kv<T, rope_rms::fp8e4m3fnuz>(
+                        (T *)qkv.data_ptr<scalar_t>(),
+                        (T *)qw.data_ptr<scalar_t>(),
+                        (T *)kw.data_ptr<scalar_t>(),
+                        (T *)cos_sin.data_ptr<scalar_t>(),
+                        positions.data_ptr<int64_t>(),
+                        0,
+                        pos_strides[0],
+                        num_tokens,
+                        num_heads_q,
+                        num_heads_k,
+                        num_heads_v,
+                        head_size,
+                        is_neox_style,
+                        eps,
+                        (T *)q.data_ptr<scalar_t>(),
+                        (rope_rms::fp8e4m3fnuz *)k_cache.data_ptr(),
+                        (rope_rms::fp8e4m3fnuz *)v_cache.data_ptr(),
+                        kv_loc.data_ptr<int64_t>(),
+                        (float)k_scale,
+                        (float)v_scale,
+                        stream,
+                        k_out_fp8_ptr,
+                        v_out_fp8_ptr,
+                        return_kv);
+                } else if (kv_cache_dtype == at::ScalarType::Float8_e4m3fn) {
+                    rope_rms::fp8e4m3fn *k_out_fp8_ptr = (return_kv && k_out.has_value()) ? (rope_rms::fp8e4m3fn *)k_out.value().data_ptr() : nullptr;
+                    rope_rms::fp8e4m3fn *v_out_fp8_ptr = (return_kv && v_out.has_value()) ? (rope_rms::fp8e4m3fn *)v_out.value().data_ptr() : nullptr;
+                    rope_rms::fused_rope_rms_set_kv<T, rope_rms::fp8e4m3fn>(
+                        (T *)qkv.data_ptr<scalar_t>(),
+                        (T *)qw.data_ptr<scalar_t>(),
+                        (T *)kw.data_ptr<scalar_t>(),
+                        (T *)cos_sin.data_ptr<scalar_t>(),
+                        positions.data_ptr<int64_t>(),
+                        0,
+                        pos_strides[0],
+                        num_tokens,
+                        num_heads_q,
+                        num_heads_k,
+                        num_heads_v,
+                        head_size,
+                        is_neox_style,
+                        eps,
+                        (T *)q.data_ptr<scalar_t>(),
+                        (rope_rms::fp8e4m3fn *)k_cache.data_ptr(),
+                        (rope_rms::fp8e4m3fn *)v_cache.data_ptr(),
+                        kv_loc.data_ptr<int64_t>(),
+                        (float)k_scale,
+                        (float)v_scale,
+                        stream,
+                        k_out_fp8_ptr,
+                        v_out_fp8_ptr,
+                        return_kv);
+                } else {
+                    TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
+                }
         }
     });
 }

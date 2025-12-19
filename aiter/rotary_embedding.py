@@ -1158,6 +1158,7 @@ class AiterFusedSetKVBufferArg:
     cache_loc: torch.Tensor
     k_scale: float
     v_scale: float
+    return_kv: bool = False  # Whether to return k_out and v_out
 
 
 class RotaryEmbeddingFusedQKNorm(nn.Module):
@@ -1229,13 +1230,12 @@ class RotaryEmbeddingFusedQKNorm(nn.Module):
         num_heads_k = num_kv_heads
         num_heads_v = num_kv_heads
         if fused_set_kv_buffer_arg is not None:
-            q_out = torch.empty(
-                num_tokens,
-                num_heads_q,
-                self.head_size,
-                dtype=qkv.dtype,
-                device=qkv.device,
-            )
+            q_out = torch.empty(num_tokens, num_heads_q, self.head_size, dtype=qkv.dtype, device=qkv.device)
+            # Create k_out and v_out buffers for varlen format output
+            return_kv = fused_set_kv_buffer_arg.return_kv
+            kv_cache_dtype = fused_set_kv_buffer_arg.kv_cache[0].dtype
+            k_out = torch.empty(num_tokens, num_heads_k, self.head_size, dtype=kv_cache_dtype, device=qkv.device) if return_kv else None
+            v_out = torch.empty(num_tokens, num_heads_v, self.head_size, dtype=kv_cache_dtype, device=qkv.device) if return_kv else None
             fused_rope_rms_set_kv(
                 qkv,
                 q_weight,
@@ -1255,8 +1255,14 @@ class RotaryEmbeddingFusedQKNorm(nn.Module):
                 fused_set_kv_buffer_arg.cache_loc,
                 fused_set_kv_buffer_arg.k_scale,
                 fused_set_kv_buffer_arg.v_scale,
+                k_out,
+                v_out,
+                return_kv,
             )
-            return q_out, None, None
+            if return_kv:
+                return q_out, k_out, v_out
+            else:
+                return q_out, None, None
         else:
             fused_rope_rms(
                 qkv,
@@ -1355,13 +1361,12 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
         )
         assert is_interleaved == self.mrope_interleaved
         if fused_set_kv_buffer_arg is not None:
-            q_out = torch.empty(
-                num_tokens,
-                num_heads_q,
-                self.head_size,
-                dtype=qkv.dtype,
-                device=qkv.device,
-            )
+            q_out = torch.empty(num_tokens, num_heads_q, self.head_size, dtype=qkv.dtype, device=qkv.device)
+            # Create k_out and v_out buffers for varlen format output
+            return_kv = fused_set_kv_buffer_arg.return_kv
+            kv_cache_dtype = fused_set_kv_buffer_arg.kv_cache[0].dtype
+            k_out = torch.empty(num_tokens, num_heads_k, self.head_size, dtype=kv_cache_dtype, device=qkv.device) if return_kv else None
+            v_out = torch.empty(num_tokens, num_heads_v, self.head_size, dtype=kv_cache_dtype, device=qkv.device) if return_kv else None
             fused_mrope_3d_rms_set_kv(
                 qkv,
                 q_weight,
@@ -1383,8 +1388,14 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
                 fused_set_kv_buffer_arg.cache_loc,
                 fused_set_kv_buffer_arg.k_scale,
                 fused_set_kv_buffer_arg.v_scale,
+                k_out,
+                v_out,
+                return_kv,
             )
-            return q_out, None, None
+            if return_kv:
+                return q_out, k_out, v_out
+            else:
+                return q_out, None, None
         else:
             fused_mrope_3d_rms(
                 qkv,
