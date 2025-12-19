@@ -260,8 +260,8 @@ FMoeKernel* get_heuristic_kernel(
     uint32_t tg_num             = 0;
     uint32_t num_persistent_tgs = 0;
     uint32_t round              = 0xffffffff;
-    std::string arch_id = get_gpu_arch();
-    std::string selectedKl = kernel_name.empty() ? "" : arch_id + kernel_name;
+    std::string arch_id         = get_gpu_arch();
+    std::string selectedKl      = kernel_name.empty() ? "" : arch_id + kernel_name;
     int vskip                   = 1;
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
 
@@ -272,8 +272,8 @@ FMoeKernel* get_heuristic_kernel(
     {
         for(const auto& el : *cfgs)
         {
-            if (el.first.find(arch_id) != 0)
-                        continue;
+            if(el.first.find(arch_id) != 0)
+                continue;
             const auto& cfg = el.second;
             if(cfg.vskip == vskip && cfg.smf == smf)
             {
@@ -675,8 +675,8 @@ void fmoe_g1u1_tkw1(torch::Tensor& out,               // [token_cnt, dim]
     const int token_cnt = input.size(0);
     const int block_m   = 32; // fmoe sorting kernel and fmoe kernel only support 32 for now
     const int estimated_sub_X_cnt = (token_cnt * topk + block_m - 1) / block_m;
-    int model_dim        = down.size(1);
-    int inter_dim        = down.size(2);
+    int model_dim                 = down.size(1);
+    int inter_dim                 = down.size(2);
     inter_dim *= model_dim / gate.size(2);
 
     if(fc2_smooth_scale.has_value())
@@ -839,7 +839,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
     int sub_X_cnt            = sorted_expert_ids.size(0);
     const char* enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
 
-    if(out.dtype() == at::ScalarType::BFloat16 && inter_dim % 256 == 0 && fc_scale_blkn == 128 &&
+    if(out.dtype() == at::ScalarType::BFloat16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
     {
         if(activation == ActivationType::Silu)
@@ -850,8 +850,8 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
             TORCH_CHECK(
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
-        impl_ptr = get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 0, kernel_name);
-
+        impl_ptr =
+            get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 0, kernel_name);
         impl_ptr->launch_kernel<uint8_t, uint16_t, false>(out,
                                                           input,
                                                           gate,
