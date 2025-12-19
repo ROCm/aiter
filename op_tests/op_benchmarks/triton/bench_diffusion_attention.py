@@ -419,8 +419,10 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
 
 def bench_kernel(q, k, v, args, provider):
     # Default softmax scale
-    BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
-    _, N_CTX_K, HK, D_HEAD_V = v.shape
+    print("bench kernel assumes shape BSHD")
+    print(f"q.shape = {q.shape}. Should correspond to BSHD, make sure that this is right!")
+    BATCH, HQ, N_CTX_Q,  D_HEAD = q.shape
+    _, HK, N_CTX_K, D_HEAD_V = v.shape
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = not args.no_k_smooth
 
@@ -588,10 +590,11 @@ def run_benchmark_captured(args):
         # Get the input tensors for this configuration
         inp = inputs[INPUT_IDX]
 
-        # Load tensors to GPU - captured inputs are in BSHD format (batch, seq, heads, dim)
-        q = inp["q"].to(device)
-        k = inp["k"].to(device)
-        v = inp["v"].to(device)
+        # Load tensors to GPU - captured inputs are in BHSD format (batch, heads, seq, dim). Permute it to the BSHD which bench kernel expects.
+        # Permute shouldnt move data, so contiguousness of dimensions should stay intact.
+        q = inp["q"].permute(0,2,1,3).to(device)
+        k = inp["k"].permute(0,2,1,3).to(device)
+        v = inp["v"].permute(0,2,1,3).to(device)
         return bench_kernel(q, k, v, args, provider)
 
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
@@ -629,13 +632,18 @@ def run_benchmark(args):
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         assert causal == False, "Causal not supported in this benchmark."
 
-        # Generate base inputs
-        q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD_V), device=device, dtype=dtype)
+        # Generate base inputs in BHSD layout which is the layout used in wan model.
+        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
         q.requires_grad = False
         k.requires_grad = False
         v.requires_grad = False
+        # permute to the BSHD layout which is expected by the bench_kernel
+        # permute does not move data so this doesnt affect the performance
+        q = q.permute(0,2,1,3)
+        k = k.permute(0,2,1,3)
+        v = v.permute(0,2,1,3)
 
         return bench_kernel(q, k, v, args, provider)
 
