@@ -67,7 +67,7 @@ struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
                                   bias_type,
                                   has_lse,
                                   false, // do_fp8_static_quant
-                                  has_sink} 
+                                  has_sink}
     {
     }
 };

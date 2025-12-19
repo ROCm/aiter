@@ -580,7 +580,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    v3_atomic_fp32,
                                    v3_bf16_cvt,
                                    v3_api_check,
-               
+
                                    hdim_q,
                                    hdim_v,
                                    data_type,
@@ -591,7 +591,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    p_drop > 0,
                                    s_randval,
                                    deterministic,
-               
+
                                    q_buf.GetDeviceBuffer(),
                                    k_buf.GetDeviceBuffer(),
                                    v_buf.GetDeviceBuffer(),

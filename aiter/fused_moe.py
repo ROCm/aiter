@@ -471,6 +471,30 @@ def get_block_size_M(token, topk, expert, inter_dim):
         tmp.append((rnd, empty, el))
     return sorted(tmp, key=lambda x: x[:2])[0][-1]
 
+@functools.lru_cache(maxsize=2048)
+def get_ksplit(token, topk, expert, inter_dim, model_dim):
+    aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
+    if aiter_ksplit != 0:
+        return aiter_ksplit
+    # only for moe_blk gemm1 a8w8 decode scenario
+    cu_num = get_cu_num() * 2 # a4w4 blkperCU = 2
+    tileN = 128
+
+    tgM = token * topk  # decode tile num
+    tgN = (inter_dim * 2 + tileN - 1) // tileN
+
+    tg_num = tgN * tgM
+    # if all cu already active
+    if tg_num >= cu_num:
+        return 1
+    tilek = 256
+    split_max = (cu_num + tg_num - 1) // tg_num
+    # at least split = 2
+    for i in reversed(range(2, split_max + 1)):
+        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
+            return i
+    return 1
+
 
 cfg_2stages = None
 # fmt: off
@@ -504,16 +528,14 @@ quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
 
 
 def nextPow2(n):
-    if n <= 0:
+    if n <= 1:
         return 1
     return 1 << (n - 1).bit_length()
 
 
 def get_padded_M(M):
     padded_m = M
-    if M >= 1 and M <= 16:
-        padded_m = 16
-    elif M < 1024:
+    if M < 1024:
         padded_m = nextPow2(padded_m)
     elif M < 2048:
         padded_m = 1024
@@ -662,6 +684,15 @@ def get_2stage_cfgs(
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
         )
+        ksplit = (
+            ksplit
+            if (run_1stage)
+            else (
+                get_ksplit(token, topk, expert, inter_dim, model_dim)
+                if q_type in [QuantType.per_1x128, QuantType.per_1x32]
+                else ksplit
+            )
+        )
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
@@ -696,17 +727,45 @@ def get_2stage_cfgs(
                 cktile_moe_stage1,
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
                 bias1=bias1,
             ),
             functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
                 bias2=bias2,
             ),
             16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
             False,
+        )
+    elif (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and q_dtype_w in [dtypes.fp4x2]
+        and ksplit > 1
+    ):
+        return MOEMetadata(
+            functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
+                bias1=bias1,
+                split_k=ksplit * 2, # multiple with blkperCU.
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+                bias2=bias2,
+            ),
+            16 if token < 2048 else 32 if token < 16384 else 64,
+            ksplit,
+            run_1stage,
         )
     if (
         "ck2stages" in kernelName1
@@ -819,7 +878,7 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
-        and activation == ActivationType.Swiglu
+        and (activation == ActivationType.Swiglu or metadata.ksplit > 1)
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
@@ -889,12 +948,11 @@ def fused_moe_2stages(
         w1_scale=w1_scale,
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
-
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
-        and activation == ActivationType.Swiglu
+        and (activation == ActivationType.Swiglu or metadata.ksplit > 1)
     ):
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
@@ -1199,7 +1257,7 @@ def torch_moe_stage1(
             if w1_bias is not None:
                 out[mask] = out[mask] + w1_bias[E_id].view(1, -1)
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
-    use_swiglu = (a1_scale is None) and (quant_type == QuantType.per_1x32)
+    use_swiglu = activation == aiter.ActivationType.Swiglu
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
@@ -1309,6 +1367,8 @@ def cktile_moe_stage1(
     n_pad_zeros=0,
     k_pad_zeros=0,
     bias1=None,
+    activation=ActivationType.Silu,
+    split_k=1,
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -1321,11 +1381,20 @@ def cktile_moe_stage1(
     out = torch.empty(
         (token_num, topk, D), dtype=hidden_states.dtype, device=hidden_states.device
     )
+
+    tmp_out = (
+        torch.zeros(
+            (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
+        )
+        if split_k > 1
+        else out
+    )
+
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
-        out,
+        tmp_out,
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
@@ -1336,8 +1405,16 @@ def cktile_moe_stage1(
         a1_scale,
         w1_scale,
         bias1,
+        activation,
         block_m,
+        split_k,
     )
+
+    if split_k > 1:
+        if activation == ActivationType.Silu:
+            aiter.silu_and_mul(out, tmp_out.to(out.dtype))
+        else:
+            aiter.gelu_and_mul(out, tmp_out.to(out.dtype))
     return out
 
 
@@ -1353,6 +1430,7 @@ def cktile_moe_stage2(
     w2_scale,
     a2_scale,
     block_m,
+    activation=ActivationType.Swiglu,
     sorted_weights=None,
     zeros_out=False,
     n_pad_zeros=0,
@@ -1385,6 +1463,7 @@ def cktile_moe_stage2(
         a2_scale,
         w2_scale,
         bias2,
+        activation,
         block_m,
     )
     return out
