@@ -268,4 +268,3 @@ def compile_kernel(args: CompileArgs):
 
 if __name__ == "__main__":
     main()
-

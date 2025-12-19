@@ -1937,9 +1937,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
 
-    K_HEAD_SIZE_SPLITS: gl.constexpr = (
-        HEAD_SIZE_POW2 // KV_16B_ELEMENT_COUNT
-    )
+    K_HEAD_SIZE_SPLITS: gl.constexpr = HEAD_SIZE_POW2 // KV_16B_ELEMENT_COUNT
     MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
 
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
@@ -2299,8 +2297,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             kv_block_numbers[:, None, None, None] * stride_key_block
             + kv_head_idx * stride_key_head
             + head_size_split_offsets[None, :, None, None] * stride_key_head_split
-            + block_element_offsets[None, None, :, None]
-            * KV_16B_ELEMENT_COUNT
+            + block_element_offsets[None, None, :, None] * KV_16B_ELEMENT_COUNT
             + contiguous_kv_element_offsets[None, None, None, :]
         )
         key_tensor = gl.load(key_cache_ptr + key_block_offsets)
@@ -2378,8 +2375,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
                 + kv_head_idx * stride_value_head
                 + value_dim1_offsets[None, :, None, None] * stride_value_head_size
-                + value_dim2_offsets[None, None, :, None]
-                * KV_16B_ELEMENT_COUNT
+                + value_dim2_offsets[None, None, :, None] * KV_16B_ELEMENT_COUNT
                 + value_dim3_offsets[None, None, None, :]
             )
             value_tensor = gl.load(value_cache_ptr + value_block_offsets)
