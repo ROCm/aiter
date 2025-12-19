@@ -445,7 +445,7 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [16, 128]:
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [16, 64, 128]:
         err, us_asm_decode = test_absorb_decode_bf16()
 
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
@@ -475,7 +475,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)]
+list_nhead = [(16, 1), (16, 2), (16, 4), (64, 1), (128, 1), (128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -555,7 +555,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[1, 3, 5, 16, 32, 64, 128, 256],
+    default=[4, 6, 8, 12, 12, 18, 16, 24],
     help="""Batch size.
     e.g.: -b 16""",
 )
