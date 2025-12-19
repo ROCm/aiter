@@ -251,10 +251,6 @@ __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     const int N = WQ.size(0);
     const int K = XQ.size(1);
 
-    TORCH_CHECK(K % AQuantGroupSize::kK == 0, "K must be aligned with AQuantGroupSize::kK");
-    TORCH_CHECK(K % BQuantGroupSize::kK == 0, "K must be aligned with BQuantGroupSize::kK");
-    TORCH_CHECK(N % BQuantGroupSize::kN == 0, "N must be aligned with BQuantGroupSize::kN");
-
     // prepare args
     ck_tile::QuantGemmHostArgs args;
     args.a_ptr  = XQ.data_ptr();

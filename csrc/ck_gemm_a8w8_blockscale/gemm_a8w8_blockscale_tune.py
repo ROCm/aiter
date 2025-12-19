@@ -168,9 +168,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     M,
                     N,
                     K,
-                    kernel.MPerBLOCK,
-                    kernel.NPerBLOCK,
-                    kernel.KPerBLOCK,
+                    kernel.M_Tile,
+                    kernel.N_Tile,
+                    kernel.K_Tile,
                 )
                 if useSplitK
                 else 0
