@@ -212,20 +212,79 @@ __device__ __forceinline__ void get_offset(int32_t* p_offset_0,
 
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
-        *p_offset_0 = offset_h + did * stride_d;
-        *p_offset_1 = *p_offset_0 + size_half_r * stride_d;
+        if constexpr(StrideDEq1)
+        {
+            *p_offset_0 = offset_h + did;
+            *p_offset_1 = *p_offset_0 + size_half_r;
+        }
+        else
+        {
+            *p_offset_0 = offset_h + did * stride_d;
+            *p_offset_1 = *p_offset_0 + size_half_r * stride_d;
+        }
     }
     else if constexpr(RotateStyle == ROTATE_STYLE_GPTJ)
     {
-        *p_offset_0 = offset_h + 2 * did * stride_d;
         if constexpr(StrideDEq1)
         {
+            *p_offset_0 = offset_h + 2 * did;
             // Asking compiler to merge memory ops when accessing adjacent elements.
             *p_offset_1 = *p_offset_0 + 1;
         }
         else
         {
+            *p_offset_0 = offset_h + 2 * did * stride_d;
             *p_offset_1 = *p_offset_0 + stride_d;
+        }
+    }
+}
+
+template <int32_t RotateStyle, bool StrideDEq1>
+__device__ __forceinline__ void get_offset_2(int32_t* p_offset_00,
+                                             int32_t* p_offset_01,
+                                             int32_t* p_offset_10,
+                                             int32_t* p_offset_11,
+                                             const int32_t did,
+                                             const int32_t hid,
+                                             const int32_t stride_d,
+                                             const int32_t stride_h,
+                                             const int32_t size_half_r)
+{
+    const int32_t offset_h = hid * stride_h;
+
+    if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
+    {
+        if constexpr(StrideDEq1)
+        {
+            *p_offset_00 = offset_h + did;
+            *p_offset_01 = *p_offset_00 + size_half_r;
+            *p_offset_10 = *p_offset_00 + 1;
+            *p_offset_11 = *p_offset_10 + size_half_r;
+        }
+        else
+        {
+            *p_offset_00 = offset_h + did * stride_d;
+            *p_offset_01 = *p_offset_00 + size_half_r * stride_d;
+            *p_offset_10 = *p_offset_00 + stride_d;
+            *p_offset_11 = *p_offset_10 + size_half_r * stride_d;
+        }
+    }
+    else if constexpr(RotateStyle == ROTATE_STYLE_GPTJ)
+    {
+        if constexpr(StrideDEq1)
+        {
+            *p_offset_00 = offset_h + 2 * did;
+            // Asking compiler to merge memory ops when accessing adjacent elements.
+            *p_offset_01 = *p_offset_00 + 1;
+            *p_offset_10 = *p_offset_00 + 2;
+            *p_offset_11 = *p_offset_00 + 3;
+        }
+        else
+        {
+            *p_offset_00 = offset_h + 2 * did * stride_d;
+            *p_offset_01 = *p_offset_00 + stride_d;
+            *p_offset_10 = *p_offset_01 + stride_d;
+            *p_offset_11 = *p_offset_10 + stride_d;
         }
     }
 }
@@ -249,6 +308,28 @@ __device__ __forceinline__ void load_payload(o_scalar_t* p_data_0,
 }
 
 template <int32_t RotateStyle, bool StrideDEq1, typename o_scalar_t, typename i_scalar_t>
+__device__ __forceinline__ void load_payload_2(o_scalar_t* p_data_00,
+                                               o_scalar_t* p_data_01,
+                                               o_scalar_t* p_data_10,
+                                               o_scalar_t* p_data_11,
+                                               const i_scalar_t* p_buffer,
+                                               const int32_t did,
+                                               const int32_t hid,
+                                               const int32_t stride_d,
+                                               const int32_t stride_h,
+                                               const int32_t size_half_r)
+{
+    int32_t offset_00, offset_01, offset_10, offset_11;
+    get_offset_2<RotateStyle, StrideDEq1>(
+        &offset_00, &offset_01, &offset_10, &offset_11, did, hid, stride_d, stride_h, size_half_r);
+
+    *p_data_00 = o_scalar_t(p_buffer[offset_00]);
+    *p_data_01 = o_scalar_t(p_buffer[offset_01]);
+    *p_data_10 = o_scalar_t(p_buffer[offset_10]);
+    *p_data_11 = o_scalar_t(p_buffer[offset_11]);
+}
+
+template <int32_t RotateStyle, bool StrideDEq1, typename o_scalar_t, typename i_scalar_t>
 __device__ __forceinline__ void store_payload(o_scalar_t* p_buffer,
                                               const i_scalar_t data_0,
                                               const i_scalar_t data_1,
@@ -264,6 +345,28 @@ __device__ __forceinline__ void store_payload(o_scalar_t* p_buffer,
 
     p_buffer[offset_0] = o_scalar_t(data_0);
     p_buffer[offset_1] = o_scalar_t(data_1);
+}
+
+template <int32_t RotateStyle, bool StrideDEq1, typename o_scalar_t, typename i_scalar_t>
+__device__ __forceinline__ void store_payload_2(o_scalar_t* p_buffer,
+                                                const i_scalar_t data_00,
+                                                const i_scalar_t data_01,
+                                                const i_scalar_t data_10,
+                                                const i_scalar_t data_11,
+                                                const int32_t did,
+                                                const int32_t hid,
+                                                const int32_t stride_d,
+                                                const int32_t stride_h,
+                                                const int32_t size_half_r)
+{
+    int32_t offset_00, offset_01, offset_10, offset_11;
+    get_offset_2<RotateStyle, StrideDEq1>(
+        &offset_00, &offset_01, &offset_10, &offset_11, did, hid, stride_d, stride_h, size_half_r);
+
+    p_buffer[offset_00] = o_scalar_t(data_00);
+    p_buffer[offset_01] = o_scalar_t(data_01);
+    p_buffer[offset_10] = o_scalar_t(data_10);
+    p_buffer[offset_11] = o_scalar_t(data_11);
 }
 
 template <typename scalar_t>
@@ -386,7 +489,49 @@ struct OpUncachedFwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        int32_t did = threadIdx.x * 2 + did_start;
+        for(; (did + 1) < size_half_r; did += blockDim.x * 2)
+        {
+            float cos_00, sin_00, cos_01, sin_01;
+            load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_00, &sin_00, &cos_01, &sin_01, p_freqs, did - did_start, size_half_r);
+            float cos_10, sin_10, cos_11, sin_11;
+            load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_10, &sin_10, &cos_11, &sin_11, p_freqs, did + 1 - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            {
+                float input_00, input_01, input_10, input_11;
+                load_payload_2<RotateStyle, StrideDInEq1>(&input_00,
+                                                          &input_01,
+                                                          &input_10,
+                                                          &input_11,
+                                                          p_input,
+                                                          did,
+                                                          hid,
+                                                          stride_i_d,
+                                                          stride_i_h,
+                                                          size_half_r);
+
+                const float output_00 = input_00 * cos_00 - input_01 * sin_00;
+                const float output_01 = input_01 * cos_01 + input_00 * sin_01;
+                const float output_10 = input_10 * cos_10 - input_11 * sin_10;
+                const float output_11 = input_11 * cos_11 + input_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDOutEq1>(p_output,
+                                                            output_00,
+                                                            output_01,
+                                                            output_10,
+                                                            output_11,
+                                                            did,
+                                                            hid,
+                                                            stride_o_d,
+                                                            stride_o_h,
+                                                            size_half_r);
+            }
+        }
+
+        if(did < size_half_r)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
@@ -456,7 +601,136 @@ struct OpUncachedFwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        int32_t did = threadIdx.x * 2 + did_start;
+        for(; (did + 1) < size_half_r; did += blockDim.x * 2)
+        {
+            float cos_00, sin_00, cos_01, sin_01;
+            load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_00, &sin_00, &cos_01, &sin_01, p_freqs, did - did_start, size_half_r);
+            float cos_10, sin_10, cos_11, sin_11;
+            load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_10, &sin_10, &cos_11, &sin_11, p_freqs, did + 1 - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
+            {
+                float input_x_00, input_x_01, input_y_00, input_y_01;
+                float input_x_10, input_x_11, input_y_10, input_y_11;
+                load_payload_2<RotateStyle, StrideDInXEq1>(&input_x_00,
+                                                           &input_x_01,
+                                                           &input_x_10,
+                                                           &input_x_11,
+                                                           p_input_x,
+                                                           did,
+                                                           hid,
+                                                           stride_ix_d,
+                                                           stride_ix_h,
+                                                           size_half_r);
+                load_payload_2<RotateStyle, StrideDInYEq1>(&input_y_00,
+                                                           &input_y_01,
+                                                           &input_y_10,
+                                                           &input_y_11,
+                                                           p_input_y,
+                                                           did,
+                                                           hid,
+                                                           stride_iy_d,
+                                                           stride_iy_h,
+                                                           size_half_r);
+
+                const float output_x_00 = input_x_00 * cos_00 - input_x_01 * sin_00;
+                const float output_x_01 = input_x_01 * cos_01 + input_x_00 * sin_01;
+                const float output_y_00 = input_y_00 * cos_00 - input_y_01 * sin_00;
+                const float output_y_01 = input_y_01 * cos_01 + input_y_00 * sin_01;
+                const float output_x_10 = input_x_10 * cos_10 - input_x_11 * sin_10;
+                const float output_x_11 = input_x_11 * cos_11 + input_x_10 * sin_11;
+                const float output_y_10 = input_y_10 * cos_10 - input_y_11 * sin_10;
+                const float output_y_11 = input_y_11 * cos_11 + input_y_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDOutXEq1>(p_output_x,
+                                                             output_x_00,
+                                                             output_x_01,
+                                                             output_x_10,
+                                                             output_x_11,
+                                                             did,
+                                                             hid,
+                                                             stride_ox_d,
+                                                             stride_ox_h,
+                                                             size_half_r);
+                store_payload_2<RotateStyle, StrideDOutYEq1>(p_output_y,
+                                                             output_y_00,
+                                                             output_y_01,
+                                                             output_y_10,
+                                                             output_y_11,
+                                                             did,
+                                                             hid,
+                                                             stride_oy_d,
+                                                             stride_oy_h,
+                                                             size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
+            {
+                float input_x_00, input_x_01, input_x_10, input_x_11;
+                load_payload_2<RotateStyle, StrideDInXEq1>(&input_x_00,
+                                                           &input_x_01,
+                                                           &input_x_10,
+                                                           &input_x_11,
+                                                           p_input_x,
+                                                           did,
+                                                           hid,
+                                                           stride_ix_d,
+                                                           stride_ix_h,
+                                                           size_half_r);
+
+                const float output_x_00 = input_x_00 * cos_00 - input_x_01 * sin_00;
+                const float output_x_01 = input_x_01 * cos_01 + input_x_00 * sin_01;
+                const float output_x_10 = input_x_10 * cos_10 - input_x_11 * sin_10;
+                const float output_x_11 = input_x_11 * cos_11 + input_x_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDOutXEq1>(p_output_x,
+                                                             output_x_00,
+                                                             output_x_01,
+                                                             output_x_10,
+                                                             output_x_11,
+                                                             did,
+                                                             hid,
+                                                             stride_ox_d,
+                                                             stride_ox_h,
+                                                             size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
+            {
+                float input_y_00, input_y_01, input_y_10, input_y_11;
+                load_payload_2<RotateStyle, StrideDInYEq1>(&input_y_00,
+                                                           &input_y_01,
+                                                           &input_y_10,
+                                                           &input_y_11,
+                                                           p_input_y,
+                                                           did,
+                                                           hid,
+                                                           stride_iy_d,
+                                                           stride_iy_h,
+                                                           size_half_r);
+
+                const float output_y_00 = input_y_00 * cos_00 - input_y_01 * sin_00;
+                const float output_y_01 = input_y_01 * cos_01 + input_y_00 * sin_01;
+                const float output_y_10 = input_y_10 * cos_10 - input_y_11 * sin_10;
+                const float output_y_11 = input_y_11 * cos_11 + input_y_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDOutYEq1>(p_output_y,
+                                                             output_y_00,
+                                                             output_y_01,
+                                                             output_y_10,
+                                                             output_y_11,
+                                                             did,
+                                                             hid,
+                                                             stride_oy_d,
+                                                             stride_oy_h,
+                                                             size_half_r);
+            }
+        }
+
+        if(did < size_half_r)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
@@ -604,7 +878,49 @@ struct OpUncachedBwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        int32_t did = threadIdx.x * 2 + did_start;
+        for(; (did + 1) < size_half_r; did += blockDim.x * 2)
+        {
+            float cos_00, sin_00, cos_01, sin_01;
+            load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_00, &sin_00, &cos_01, &sin_01, p_freqs, did - did_start, size_half_r);
+            float cos_10, sin_10, cos_11, sin_11;
+            load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_10, &sin_10, &cos_11, &sin_11, p_freqs, did + 1 - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            {
+                float output_grad_00, output_grad_01, output_grad_10, output_grad_11;
+                load_payload_2<RotateStyle, StrideDOutGradsEq1>(&output_grad_00,
+                                                                &output_grad_01,
+                                                                &output_grad_10,
+                                                                &output_grad_11,
+                                                                p_output_grads,
+                                                                did,
+                                                                hid,
+                                                                stride_o_d,
+                                                                stride_o_h,
+                                                                size_half_r);
+
+                const float input_grad_00 = output_grad_00 * cos_00 + output_grad_01 * sin_00;
+                const float input_grad_01 = output_grad_01 * cos_01 - output_grad_00 * sin_01;
+                const float input_grad_10 = output_grad_10 * cos_10 + output_grad_11 * sin_10;
+                const float input_grad_11 = output_grad_11 * cos_11 - output_grad_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDInGradsEq1>(p_input_grads,
+                                                                input_grad_00,
+                                                                input_grad_01,
+                                                                input_grad_10,
+                                                                input_grad_11,
+                                                                did,
+                                                                hid,
+                                                                stride_i_d,
+                                                                stride_i_h,
+                                                                size_half_r);
+            }
+        }
+
+        if(did < size_half_r)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
@@ -686,7 +1002,136 @@ struct OpUncachedBwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        int32_t did = threadIdx.x * 2 + did_start;
+        for(; (did + 1) < size_half_r; did += blockDim.x * 2)
+        {
+            float cos_00, sin_00, cos_01, sin_01;
+            load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_00, &sin_00, &cos_01, &sin_01, p_freqs, did - did_start, size_half_r);
+            float cos_10, sin_10, cos_11, sin_11;
+            load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_10, &sin_10, &cos_11, &sin_11, p_freqs, did + 1 - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
+            {
+                float output_grad_x_00, output_grad_x_01, output_grad_y_00, output_grad_y_01;
+                float output_grad_x_10, output_grad_x_11, output_grad_y_10, output_grad_y_11;
+                load_payload_2<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_00,
+                                                                 &output_grad_x_01,
+                                                                 &output_grad_x_10,
+                                                                 &output_grad_x_11,
+                                                                 p_output_grads_x,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_ox_d,
+                                                                 stride_ox_h,
+                                                                 size_half_r);
+                load_payload_2<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_00,
+                                                                 &output_grad_y_01,
+                                                                 &output_grad_y_10,
+                                                                 &output_grad_y_11,
+                                                                 p_output_grads_y,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_oy_d,
+                                                                 stride_oy_h,
+                                                                 size_half_r);
+
+                const float input_grad_x_00 = output_grad_x_00 * cos_00 + output_grad_x_01 * sin_00;
+                const float input_grad_x_01 = output_grad_x_01 * cos_01 - output_grad_x_00 * sin_01;
+                const float input_grad_y_00 = output_grad_y_00 * cos_00 + output_grad_y_01 * sin_00;
+                const float input_grad_y_01 = output_grad_y_01 * cos_01 - output_grad_y_00 * sin_01;
+                const float input_grad_x_10 = output_grad_x_10 * cos_10 + output_grad_x_11 * sin_10;
+                const float input_grad_x_11 = output_grad_x_11 * cos_11 - output_grad_x_10 * sin_11;
+                const float input_grad_y_10 = output_grad_y_10 * cos_10 + output_grad_y_11 * sin_10;
+                const float input_grad_y_11 = output_grad_y_11 * cos_11 - output_grad_y_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
+                                                                 input_grad_x_00,
+                                                                 input_grad_x_01,
+                                                                 input_grad_x_10,
+                                                                 input_grad_x_11,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_ix_d,
+                                                                 stride_ix_h,
+                                                                 size_half_r);
+                store_payload_2<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
+                                                                 input_grad_y_00,
+                                                                 input_grad_y_01,
+                                                                 input_grad_y_10,
+                                                                 input_grad_y_11,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_iy_d,
+                                                                 stride_iy_h,
+                                                                 size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
+            {
+                float output_grad_x_00, output_grad_x_01, output_grad_x_10, output_grad_x_11;
+                load_payload_2<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_00,
+                                                                 &output_grad_x_01,
+                                                                 &output_grad_x_10,
+                                                                 &output_grad_x_11,
+                                                                 p_output_grads_x,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_ox_d,
+                                                                 stride_ox_h,
+                                                                 size_half_r);
+
+                const float input_grad_x_00 = output_grad_x_00 * cos_00 + output_grad_x_01 * sin_00;
+                const float input_grad_x_01 = output_grad_x_01 * cos_01 - output_grad_x_00 * sin_01;
+                const float input_grad_x_10 = output_grad_x_10 * cos_10 + output_grad_x_11 * sin_10;
+                const float input_grad_x_11 = output_grad_x_11 * cos_11 - output_grad_x_10 * sin_11;
+
+                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
+                                                               input_grad_x_00,
+                                                               input_grad_x_01,
+                                                               input_grad_x_10,
+                                                               input_grad_x_11,
+                                                               did,
+                                                               hid,
+                                                               stride_ix_d,
+                                                               stride_ix_h,
+                                                               size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
+            {
+                float output_grad_y_00, output_grad_y_01, output_grad_y_10, output_grad_y_11;
+                load_payload_2<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_00,
+                                                                 &output_grad_y_01,
+                                                                 &output_grad_y_10,
+                                                                 &output_grad_y_11,
+                                                                 p_output_grads_y,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_oy_d,
+                                                                 stride_oy_h,
+                                                                 size_half_r);
+
+                const float input_grad_y_00 = output_grad_y_00 * cos_00 + output_grad_y_01 * sin_00;
+                const float input_grad_y_01 = output_grad_y_01 * cos_01 - output_grad_y_00 * sin_01;
+                const float input_grad_y_10 = output_grad_y_10 * cos_10 + output_grad_y_11 * sin_10;
+                const float input_grad_y_11 = output_grad_y_11 * cos_11 - output_grad_y_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
+                                                                 input_grad_y_00,
+                                                                 input_grad_y_01,
+                                                                 input_grad_y_10,
+                                                                 input_grad_y_11,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_iy_d,
+                                                                 stride_iy_h,
+                                                                 size_half_r);
+            }
+        }
+
+        if(did < size_half_r)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
@@ -835,7 +1280,49 @@ struct OpCachedFwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        int32_t did = threadIdx.x * 2 + did_start;
+        for(; (did + 1) < size_half_r; did += blockDim.x * 2)
+        {
+            float cos_00, sin_00, cos_01, sin_01;
+            load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_00, &sin_00, &cos_01, &sin_01, p_cos, p_sin, did - did_start, size_half_r);
+            float cos_10, sin_10, cos_11, sin_11;
+            load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_10, &sin_10, &cos_11, &sin_11, p_cos, p_sin, did + 1 - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            {
+                float input_00, input_01, input_10, input_11;
+                load_payload_2<RotateStyle, StrideDInEq1>(&input_00,
+                                                          &input_01,
+                                                          &input_10,
+                                                          &input_11,
+                                                          p_input,
+                                                          did,
+                                                          hid,
+                                                          stride_i_d,
+                                                          stride_i_h,
+                                                          size_half_r);
+
+                const float output_00 = input_00 * cos_00 - input_01 * sin_00;
+                const float output_01 = input_01 * cos_01 + input_00 * sin_01;
+                const float output_10 = input_10 * cos_10 - input_11 * sin_10;
+                const float output_11 = input_11 * cos_11 + input_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDOutEq1>(p_output,
+                                                            output_00,
+                                                            output_01,
+                                                            output_10,
+                                                            output_11,
+                                                            did,
+                                                            hid,
+                                                            stride_o_d,
+                                                            stride_o_h,
+                                                            size_half_r);
+            }
+        }
+
+        if(did < size_half_r)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
@@ -906,7 +1393,136 @@ struct OpCachedFwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        int32_t did = threadIdx.x * 2 + did_start;
+        for(; (did + 1) < size_half_r; did += blockDim.x * 2)
+        {
+            float cos_00, sin_00, cos_01, sin_01;
+            load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_00, &sin_00, &cos_01, &sin_01, p_cos, p_sin, did - did_start, size_half_r);
+            float cos_10, sin_10, cos_11, sin_11;
+            load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_10, &sin_10, &cos_11, &sin_11, p_cos, p_sin, did + 1 - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
+            {
+                float input_x_00, input_x_01, input_y_00, input_y_01;
+                float input_x_10, input_x_11, input_y_10, input_y_11;
+                load_payload_2<RotateStyle, StrideDInXEq1>(&input_x_00,
+                                                           &input_x_01,
+                                                           &input_x_10,
+                                                           &input_x_11,
+                                                           p_input_x,
+                                                           did,
+                                                           hid,
+                                                           stride_ix_d,
+                                                           stride_ix_h,
+                                                           size_half_r);
+                load_payload_2<RotateStyle, StrideDInYEq1>(&input_y_00,
+                                                           &input_y_01,
+                                                           &input_y_10,
+                                                           &input_y_11,
+                                                           p_input_y,
+                                                           did,
+                                                           hid,
+                                                           stride_iy_d,
+                                                           stride_iy_h,
+                                                           size_half_r);
+
+                const float output_x_00 = input_x_00 * cos_00 - input_x_01 * sin_00;
+                const float output_x_01 = input_x_01 * cos_01 + input_x_00 * sin_01;
+                const float output_y_00 = input_y_00 * cos_00 - input_y_01 * sin_00;
+                const float output_y_01 = input_y_01 * cos_01 + input_y_00 * sin_01;
+                const float output_x_10 = input_x_10 * cos_10 - input_x_11 * sin_10;
+                const float output_x_11 = input_x_11 * cos_11 + input_x_10 * sin_11;
+                const float output_y_10 = input_y_10 * cos_10 - input_y_11 * sin_10;
+                const float output_y_11 = input_y_11 * cos_11 + input_y_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDOutXEq1>(p_output_x,
+                                                             output_x_00,
+                                                             output_x_01,
+                                                             output_x_10,
+                                                             output_x_11,
+                                                             did,
+                                                             hid,
+                                                             stride_ox_d,
+                                                             stride_ox_h,
+                                                             size_half_r);
+                store_payload_2<RotateStyle, StrideDOutYEq1>(p_output_y,
+                                                             output_y_00,
+                                                             output_y_01,
+                                                             output_y_10,
+                                                             output_y_11,
+                                                             did,
+                                                             hid,
+                                                             stride_oy_d,
+                                                             stride_oy_h,
+                                                             size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
+            {
+                float input_x_00, input_x_01, input_x_10, input_x_11;
+                load_payload_2<RotateStyle, StrideDInXEq1>(&input_x_00,
+                                                           &input_x_01,
+                                                           &input_x_10,
+                                                           &input_x_11,
+                                                           p_input_x,
+                                                           did,
+                                                           hid,
+                                                           stride_ix_d,
+                                                           stride_ix_h,
+                                                           size_half_r);
+
+                const float output_x_00 = input_x_00 * cos_00 - input_x_01 * sin_00;
+                const float output_x_01 = input_x_01 * cos_01 + input_x_00 * sin_01;
+                const float output_x_10 = input_x_10 * cos_10 - input_x_11 * sin_10;
+                const float output_x_11 = input_x_11 * cos_11 + input_x_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDOutXEq1>(p_output_x,
+                                                             output_x_00,
+                                                             output_x_01,
+                                                             output_x_10,
+                                                             output_x_11,
+                                                             did,
+                                                             hid,
+                                                             stride_ox_d,
+                                                             stride_ox_h,
+                                                             size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
+            {
+                float input_y_00, input_y_01, input_y_10, input_y_11;
+                load_payload_2<RotateStyle, StrideDInYEq1>(&input_y_00,
+                                                           &input_y_01,
+                                                           &input_y_10,
+                                                           &input_y_11,
+                                                           p_input_y,
+                                                           did,
+                                                           hid,
+                                                           stride_iy_d,
+                                                           stride_iy_h,
+                                                           size_half_r);
+
+                const float output_y_00 = input_y_00 * cos_00 - input_y_01 * sin_00;
+                const float output_y_01 = input_y_01 * cos_01 + input_y_00 * sin_01;
+                const float output_y_10 = input_y_10 * cos_10 - input_y_11 * sin_10;
+                const float output_y_11 = input_y_11 * cos_11 + input_y_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDOutYEq1>(p_output_y,
+                                                             output_y_00,
+                                                             output_y_01,
+                                                             output_y_10,
+                                                             output_y_11,
+                                                             did,
+                                                             hid,
+                                                             stride_oy_d,
+                                                             stride_oy_h,
+                                                             size_half_r);
+            }
+        }
+
+        if(did < size_half_r)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
@@ -1055,7 +1671,49 @@ struct OpCachedBwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        int32_t did = threadIdx.x * 2 + did_start;
+        for(; (did + 1) < size_half_r; did += blockDim.x * 2)
+        {
+            float cos_00, sin_00, cos_01, sin_01;
+            load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_00, &sin_00, &cos_01, &sin_01, p_cos, p_sin, did - did_start, size_half_r);
+            float cos_10, sin_10, cos_11, sin_11;
+            load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_10, &sin_10, &cos_11, &sin_11, p_cos, p_sin, did + 1 - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            {
+                float output_grad_00, output_grad_01, output_grad_10, output_grad_11;
+                load_payload_2<RotateStyle, StrideDOutGradsEq1>(&output_grad_00,
+                                                                &output_grad_01,
+                                                                &output_grad_10,
+                                                                &output_grad_11,
+                                                                p_output_grads,
+                                                                did,
+                                                                hid,
+                                                                stride_o_d,
+                                                                stride_o_h,
+                                                                size_half_r);
+
+                const float input_grad_00 = output_grad_00 * cos_00 + output_grad_01 * sin_00;
+                const float input_grad_01 = output_grad_01 * cos_01 - output_grad_00 * sin_01;
+                const float input_grad_10 = output_grad_10 * cos_10 + output_grad_11 * sin_10;
+                const float input_grad_11 = output_grad_11 * cos_11 - output_grad_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDInGradsEq1>(p_input_grads,
+                                                                input_grad_00,
+                                                                input_grad_01,
+                                                                input_grad_10,
+                                                                input_grad_11,
+                                                                did,
+                                                                hid,
+                                                                stride_i_d,
+                                                                stride_i_h,
+                                                                size_half_r);
+            }
+        }
+
+        if(did < size_half_r)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
@@ -1138,7 +1796,136 @@ struct OpCachedBwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        int32_t did = threadIdx.x * 2 + did_start;
+        for(; (did + 1) < size_half_r; did += blockDim.x * 2)
+        {
+            float cos_00, sin_00, cos_01, sin_01;
+            load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_00, &sin_00, &cos_01, &sin_01, p_cos, p_sin, did - did_start, size_half_r);
+            float cos_10, sin_10, cos_11, sin_11;
+            load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_10, &sin_10, &cos_11, &sin_11, p_cos, p_sin, did + 1 - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
+            {
+                float output_grad_x_00, output_grad_x_01, output_grad_y_00, output_grad_y_01;
+                float output_grad_x_10, output_grad_x_11, output_grad_y_10, output_grad_y_11;
+                load_payload_2<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_00,
+                                                                 &output_grad_x_01,
+                                                                 &output_grad_x_10,
+                                                                 &output_grad_x_11,
+                                                                 p_output_grads_x,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_ox_d,
+                                                                 stride_ox_h,
+                                                                 size_half_r);
+                load_payload_2<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_00,
+                                                                 &output_grad_y_01,
+                                                                 &output_grad_y_10,
+                                                                 &output_grad_y_11,
+                                                                 p_output_grads_y,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_oy_d,
+                                                                 stride_oy_h,
+                                                                 size_half_r);
+
+                const float input_grad_x_00 = output_grad_x_00 * cos_00 + output_grad_x_01 * sin_00;
+                const float input_grad_x_01 = output_grad_x_01 * cos_01 - output_grad_x_00 * sin_01;
+                const float input_grad_y_00 = output_grad_y_00 * cos_00 + output_grad_y_01 * sin_00;
+                const float input_grad_y_01 = output_grad_y_01 * cos_01 - output_grad_y_00 * sin_01;
+                const float input_grad_x_10 = output_grad_x_10 * cos_10 + output_grad_x_11 * sin_10;
+                const float input_grad_x_11 = output_grad_x_11 * cos_11 - output_grad_x_10 * sin_11;
+                const float input_grad_y_10 = output_grad_y_10 * cos_10 + output_grad_y_11 * sin_10;
+                const float input_grad_y_11 = output_grad_y_11 * cos_11 - output_grad_y_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
+                                                                 input_grad_x_00,
+                                                                 input_grad_x_01,
+                                                                 input_grad_x_10,
+                                                                 input_grad_x_11,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_ix_d,
+                                                                 stride_ix_h,
+                                                                 size_half_r);
+                store_payload_2<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
+                                                                 input_grad_y_00,
+                                                                 input_grad_y_01,
+                                                                 input_grad_y_10,
+                                                                 input_grad_y_11,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_iy_d,
+                                                                 stride_iy_h,
+                                                                 size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
+            {
+                float output_grad_x_00, output_grad_x_01, output_grad_x_10, output_grad_x_11;
+                load_payload_2<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_00,
+                                                                 &output_grad_x_01,
+                                                                 &output_grad_x_10,
+                                                                 &output_grad_x_11,
+                                                                 p_output_grads_x,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_ox_d,
+                                                                 stride_ox_h,
+                                                                 size_half_r);
+
+                const float input_grad_x_00 = output_grad_x_00 * cos_00 + output_grad_x_01 * sin_00;
+                const float input_grad_x_01 = output_grad_x_01 * cos_01 - output_grad_x_00 * sin_01;
+                const float input_grad_x_10 = output_grad_x_10 * cos_10 + output_grad_x_11 * sin_10;
+                const float input_grad_x_11 = output_grad_x_11 * cos_11 - output_grad_x_10 * sin_11;
+
+                store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
+                                                               input_grad_x_00,
+                                                               input_grad_x_01,
+                                                               input_grad_x_10,
+                                                               input_grad_x_11,
+                                                               did,
+                                                               hid,
+                                                               stride_ix_d,
+                                                               stride_ix_h,
+                                                               size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
+            {
+                float output_grad_y_00, output_grad_y_01, output_grad_y_10, output_grad_y_11;
+                load_payload_2<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_00,
+                                                                 &output_grad_y_01,
+                                                                 &output_grad_y_10,
+                                                                 &output_grad_y_11,
+                                                                 p_output_grads_y,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_oy_d,
+                                                                 stride_oy_h,
+                                                                 size_half_r);
+
+                const float input_grad_y_00 = output_grad_y_00 * cos_00 + output_grad_y_01 * sin_00;
+                const float input_grad_y_01 = output_grad_y_01 * cos_01 - output_grad_y_00 * sin_01;
+                const float input_grad_y_10 = output_grad_y_10 * cos_10 + output_grad_y_11 * sin_10;
+                const float input_grad_y_11 = output_grad_y_11 * cos_11 - output_grad_y_10 * sin_11;
+
+                store_payload_2<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
+                                                                 input_grad_y_00,
+                                                                 input_grad_y_01,
+                                                                 input_grad_y_10,
+                                                                 input_grad_y_11,
+                                                                 did,
+                                                                 hid,
+                                                                 stride_iy_d,
+                                                                 stride_iy_h,
+                                                                 size_half_r);
+            }
+        }
+
+        if(did < size_half_r)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
@@ -1168,6 +1955,7 @@ struct OpCachedBwd
                 const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
                 const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
                 const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
+
                 store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
                                                                input_grad_x_0,
                                                                input_grad_x_1,
@@ -2667,7 +3455,7 @@ std::tuple<dim3, dim3> get_grid_config(const int32_t size_s_h,
 
     const int32_t size_r              = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
     const int32_t size_half_r         = size_r >> 1;
-    const int32_t aligned_size_half_r = ck_tile::next_power_of_two(size_half_r);
+    const int32_t aligned_size_half_r = ck_tile::next_power_of_two(size_half_r >> 1);
 
     const int32_t block_dim_x = min(aligned_size_half_r, ck_tile::get_warp_size());
     const int32_t block_dim_y = max(kNumThreads / block_dim_x, 1);
