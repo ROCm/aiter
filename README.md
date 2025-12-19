@@ -74,10 +74,10 @@ This Branch contains GEAK optimized Triton kernels. These kernels are named with
 
 | Kernel Name | 12/2 | 12/19 |
 |-------------|------|-------|
-| geak_oh_topk | 1.12X | |
-| geak_oh_fused_fp8_quant | 1.31X| |
-| geak_oh_fused_qkv_split_qk_rope | 1X | |
-| geak_oh_moe_mxfp4 | 1.02X | |
-| geak_oh_mxfp4_quant | | 1.33X |
-| geak_oe_gemm_a16w16 | 2.44X | |
-| geak_oe_unified_attention | 1.64X | |
+| [geak_oh_topk](aiter/ops/triton/_triton_kernels/geak_oh_topk.py) | 1.12X | |
+| [geak_oh_fused_fp8_quant](aiter/ops/triton/_triton_kernels/geak_oh_fused_fp8_quant.py) | 1.31X| |
+| [geak_oh_fused_qkv_split_qk_rope](aiter/ops/triton/_triton_kernels/geak_oh_fused_qkv_split_qk_rope.py) | 1X | |
+| [geak_oh_moe_mxfp4](aiter/ops/triton/_triton_kernels/geak_oh_moe_mxfp4.py) | 1.02X | |
+| [geak_oh_mxfp4_quant](aiter/ops/triton/_triton_kernels/geak_oh_mxfp4_quant.py) | | 1.33X |
+| [geak_oe_gemm_a16w16](aiter/ops/triton/geak_oe_gemm_a16w16.py) | 2.44X | |
+| [geak_oe_unified_attention](aiter/ops/triton/geak_oe_unified_attention.py) | 1.64X | |
