@@ -427,7 +427,8 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps,
     T *q = nullptr, KVT *k_cache = nullptr, KVT *v_cache = nullptr, int64_t *kv_loc = nullptr, float k_scale = 1.0, float v_scale = 1.0,
-    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false) {
+    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false,
+    bool use_shuffle_layout = false, int64_t block_size = 0, int64_t x = 0) {
     constexpr int VEC_SIZE = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     const auto warp_id = threadIdx.x / WARP_SIZE;
@@ -482,21 +483,57 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
             auto q_ = q + (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
             out_vec.store(q_ + access_id_in_head);
         } else {
-            auto offset = (kv_loc[token_id] * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
-            if constexpr (std::is_same_v<T, KVT>) {
-                out_vec.store(k_cache + offset);
-                if (return_kv && k_out != nullptr) {
-                    // Write to varlen output buffer: (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head
-                    auto k_out_offset = (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
-                    out_vec.store(k_out + k_out_offset);
+            int64_t slot_id = kv_loc[token_id];
+            if (slot_id < 0) {
+                return;
+            }
+            int64_t head_id_kv = head_id_in_token - num_heads_q;
+            if (use_shuffle_layout) {
+                // Shuffle layout: [num_blocks, num_kv_heads, head_size // x, block_size, x]
+                int64_t block_id = slot_id / block_size;
+                int64_t block_offset = slot_id % block_size;
+                int64_t dst_offset = block_id * num_heads_k * (HEAD_SIZE / x) * block_size * x + head_id_kv * (HEAD_SIZE / x) * block_size * x;
+                // For key: shuffle within each head_size chunk
+                if constexpr (std::is_same_v<T, KVT>) {
+                    for (int i = 0; i < VEC_SIZE; ++i) {
+                        int64_t offset_in_head = access_id_in_head + i;
+                        int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
+                        k_cache[dst_k_shuffle_offset] = out_vec[i];
+                    }
+                    if (return_kv && k_out != nullptr) {
+                        auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                        out_vec.store(k_out + k_out_offset);
+                    }
+                } else {
+                    auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
+                    for (int i = 0; i < VEC_SIZE; ++i) {
+                        int64_t offset_in_head = access_id_in_head + i;
+                        int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
+                        k_cache[dst_k_shuffle_offset] = out_vec_fp8[i];
+                    }
+                    if (return_kv && k_out != nullptr) {
+                        auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                        out_vec_fp8.store(k_out + k_out_offset);
+                    }
                 }
             } else {
-                auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
-                out_vec_fp8.store(k_cache + offset);
-                if (return_kv && k_out != nullptr) {
-                    // Write to varlen output buffer
-                    auto k_out_offset = (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
-                    out_vec_fp8.store(k_out + k_out_offset);
+                // Normal layout: [num_slots, num_kv_heads, head_size]
+                auto offset = (slot_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                if constexpr (std::is_same_v<T, KVT>) {
+                    out_vec.store(k_cache + offset);
+                    if (return_kv && k_out != nullptr) {
+                        // Write to varlen output buffer: (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head
+                        auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                        out_vec.store(k_out + k_out_offset);
+                    }
+                } else {
+                    auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
+                    out_vec_fp8.store(k_cache + offset);
+                    if (return_kv && k_out != nullptr) {
+                        // Write to varlen output buffer
+                        auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                        out_vec_fp8.store(k_out + k_out_offset);
+                    }
                 }
             }
         }
@@ -504,21 +541,57 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
     } else {
         vec_t<T, VEC_SIZE> v_vec;
         v_vec.load(qkv_ + access_id_in_head);
-        auto offset = (kv_loc[token_id] * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
-        if constexpr (std::is_same_v<T, KVT>) {
-            v_vec.store(v_cache + offset);
-            if (return_kv && v_out != nullptr) {
-                // Write to varlen output buffer: (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head
-                auto v_out_offset = (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
-                v_vec.store(v_out + v_out_offset);
+        int64_t slot_id = kv_loc[token_id];
+        if (slot_id < 0) {
+            return;
+        }
+        int64_t head_id_kv = head_id_in_token - num_heads_qk;
+        if (use_shuffle_layout) {
+            // Shuffle layout: [num_blocks, num_kv_heads, block_size // x, head_size, x]
+            int64_t block_id = slot_id / block_size;
+            int64_t block_offset = slot_id % block_size;
+            int64_t dst_offset = block_id * num_heads_v * (block_size / x) * HEAD_SIZE * x + head_id_kv * (block_size / x) * HEAD_SIZE * x;
+            // For value: shuffle within each block_size chunk
+            if constexpr (std::is_same_v<T, KVT>) {
+                for (int i = 0; i < VEC_SIZE; ++i) {
+                    int64_t offset_in_head = access_id_in_head + i;
+                    int64_t dst_v_shuffle_offset = dst_offset + (block_offset / x) * HEAD_SIZE * x + offset_in_head * x + (block_offset % x);
+                    v_cache[dst_v_shuffle_offset] = v_vec[i];
+                }
+                if (return_kv && v_out != nullptr) {
+                    auto v_out_offset = (token_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                    v_vec.store(v_out + v_out_offset);
+                }
+            } else {
+                auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
+                for (int i = 0; i < VEC_SIZE; ++i) {
+                    int64_t offset_in_head = access_id_in_head + i;
+                    int64_t dst_v_shuffle_offset = dst_offset + (block_offset / x) * HEAD_SIZE * x + offset_in_head * x + (block_offset % x);
+                    v_cache[dst_v_shuffle_offset] = v_vec_fp8[i];
+                }
+                if (return_kv && v_out != nullptr) {
+                    auto v_out_offset = (token_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                    v_vec_fp8.store(v_out + v_out_offset);
+                }
             }
         } else {
-            auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
-            v_vec_fp8.store(v_cache + offset);
-            if (return_kv && v_out != nullptr) {
-                // Write to varlen output buffer
-                auto v_out_offset = (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
-                v_vec_fp8.store(v_out + v_out_offset);
+            // Normal layout: [num_slots, num_kv_heads, head_size]
+            auto offset = (slot_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+            if constexpr (std::is_same_v<T, KVT>) {
+                v_vec.store(v_cache + offset);
+                if (return_kv && v_out != nullptr) {
+                    // Write to varlen output buffer: (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head
+                    auto v_out_offset = (token_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                    v_vec.store(v_out + v_out_offset);
+                }
+            } else {
+                auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
+                v_vec_fp8.store(v_cache + offset);
+                if (return_kv && v_out != nullptr) {
+                    // Write to varlen output buffer
+                    auto v_out_offset = (token_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                    v_vec_fp8.store(v_out + v_out_offset);
+                }
             }
         }
     }
@@ -530,7 +603,8 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps,
     T *q = nullptr, KVT *k_cache = nullptr, KVT *v_cache = nullptr, int64_t *kv_loc = nullptr, float k_scale = 1.0, float v_scale = 1.0,
-    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false) {
+    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false,
+    bool use_shuffle_layout = false, int64_t block_size = 0, int64_t x = 0) {
     constexpr int VEC_SIZE = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     const auto warp_id = threadIdx.x / WARP_SIZE;
@@ -579,42 +653,114 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
             auto q_ = q + (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
             out_vec.store(q_ + access_id_in_head);
         } else {
-            auto offset = (kv_loc[token_id] * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
-            if constexpr (std::is_same_v<T, KVT>) {
-                out_vec.store(k_cache + offset);
-                if (return_kv && k_out != nullptr) {
-                    // Write to varlen output buffer: (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head
-                    auto k_out_offset = (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
-                    out_vec.store(k_out + k_out_offset);
+            int64_t slot_id = kv_loc[token_id];
+            if (slot_id < 0) {
+                return;
+            }
+            int64_t head_id_kv = head_id_in_token - num_heads_q;
+            if (use_shuffle_layout) {
+                // Shuffle layout: [num_blocks, num_kv_heads, head_size // x, block_size, x]
+                int64_t block_id = slot_id / block_size;
+                int64_t block_offset = slot_id % block_size;
+                int64_t dst_offset = block_id * num_heads_k * (HEAD_SIZE / x) * block_size * x + head_id_kv * (HEAD_SIZE / x) * block_size * x;
+                // For key: shuffle within each head_size chunk
+                if constexpr (std::is_same_v<T, KVT>) {
+                    for (int i = 0; i < VEC_SIZE; ++i) {
+                        int64_t offset_in_head = access_id_in_head + i;
+                        int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
+                        k_cache[dst_k_shuffle_offset] = out_vec[i];
+                    }
+                    if (return_kv && k_out != nullptr) {
+                        auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                        out_vec.store(k_out + k_out_offset);
+                    }
+                } else {
+                    auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
+                    for (int i = 0; i < VEC_SIZE; ++i) {
+                        int64_t offset_in_head = access_id_in_head + i;
+                        int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
+                        k_cache[dst_k_shuffle_offset] = out_vec_fp8[i];
+                    }
+                    if (return_kv && k_out != nullptr) {
+                        auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                        out_vec_fp8.store(k_out + k_out_offset);
+                    }
                 }
             } else {
-                auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
-                out_vec_fp8.store(k_cache + offset);
-                if (return_kv && k_out != nullptr) {
-                    // Write to varlen output buffer
-                    auto k_out_offset = (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head;
-                    out_vec_fp8.store(k_out + k_out_offset);
+                // Normal layout: [num_slots, num_kv_heads, head_size]
+                auto offset = (slot_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                if constexpr (std::is_same_v<T, KVT>) {
+                    out_vec.store(k_cache + offset);
+                    if (return_kv && k_out != nullptr) {
+                        // Write to varlen output buffer: (token_id * num_heads_k + head_id_in_token - num_heads_q) * HEAD_SIZE + access_id_in_head
+                        auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                        out_vec.store(k_out + k_out_offset);
+                    }
+                } else {
+                    auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
+                    out_vec_fp8.store(k_cache + offset);
+                    if (return_kv && k_out != nullptr) {
+                        // Write to varlen output buffer
+                        auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                        out_vec_fp8.store(k_out + k_out_offset);
+                    }
                 }
             }
         }
     } else {
         vec_t<T, VEC_SIZE> v_vec;
         v_vec.load(qkv_ + access_id_in_head);
-        auto offset = (kv_loc[token_id] * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
-        if constexpr (std::is_same_v<T, KVT>) {
-            v_vec.store(v_cache + offset);
-            if (return_kv && v_out != nullptr) {
-                // Write to varlen output buffer: (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head
-                auto v_out_offset = (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
-                v_vec.store(v_out + v_out_offset);
+        int64_t slot_id = kv_loc[token_id];
+        if (slot_id < 0) {
+            return;
+        }
+        int64_t head_id_kv = head_id_in_token - num_heads_qk;
+        if (use_shuffle_layout) {
+            // Shuffle layout: [num_blocks, num_kv_heads, block_size // x, head_size, x]
+            int64_t block_id = slot_id / block_size;
+            int64_t block_offset = slot_id % block_size;
+            int64_t dst_offset = block_id * num_heads_v * (block_size / x) * HEAD_SIZE * x + head_id_kv * (block_size / x) * HEAD_SIZE * x;
+            // For value: shuffle within each block_size chunk
+            if constexpr (std::is_same_v<T, KVT>) {
+                for (int i = 0; i < VEC_SIZE; ++i) {
+                    int64_t offset_in_head = access_id_in_head + i;
+                    int64_t dst_v_shuffle_offset = dst_offset + (block_offset / x) * HEAD_SIZE * x + offset_in_head * x + (block_offset % x);
+                    v_cache[dst_v_shuffle_offset] = v_vec[i];
+                }
+                if (return_kv && v_out != nullptr) {
+                    auto v_out_offset = (token_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                    v_vec.store(v_out + v_out_offset);
+                }
+            } else {
+                auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
+                for (int i = 0; i < VEC_SIZE; ++i) {
+                    int64_t offset_in_head = access_id_in_head + i;
+                    int64_t dst_v_shuffle_offset = dst_offset + (block_offset / x) * HEAD_SIZE * x + offset_in_head * x + (block_offset % x);
+                    v_cache[dst_v_shuffle_offset] = v_vec_fp8[i];
+                }
+                if (return_kv && v_out != nullptr) {
+                    auto v_out_offset = (token_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                    v_vec_fp8.store(v_out + v_out_offset);
+                }
             }
         } else {
-            auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
-            v_vec_fp8.store(v_cache + offset);
-            if (return_kv && v_out != nullptr) {
-                // Write to varlen output buffer
-                auto v_out_offset = (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head;
-                v_vec_fp8.store(v_out + v_out_offset);
+            // Normal layout: [num_slots, num_kv_heads, head_size]
+            auto offset = (slot_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+            if constexpr (std::is_same_v<T, KVT>) {
+                v_vec.store(v_cache + offset);
+                if (return_kv && v_out != nullptr) {
+                    // Write to varlen output buffer: (token_id * num_heads_v + head_id_in_token - num_heads_qk) * HEAD_SIZE + access_id_in_head
+                    auto v_out_offset = (token_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                    v_vec.store(v_out + v_out_offset);
+                }
+            } else {
+                auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
+                v_vec_fp8.store(v_cache + offset);
+                if (return_kv && v_out != nullptr) {
+                    // Write to varlen output buffer
+                    auto v_out_offset = (token_id * num_heads_v + head_id_kv) * HEAD_SIZE + access_id_in_head;
+                    v_vec_fp8.store(v_out + v_out_offset);
+                }
             }
         }
     }
@@ -626,7 +772,8 @@ void fused_mrope_rms_set_kv(
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
     bool is_neox_style, double eps, std::array<int64_t, M> mrope_section, bool is_interleaved,
     T *q, KVT *k_cache, KVT *v_cache, int64_t *kv_loc, float k_scale, float v_scale, hipStream_t stream,
-    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false) {
+    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false,
+    bool use_shuffle_layout = false, int64_t block_size = 0, int64_t x = 0) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     TORCH_CHECK(dim == head_size / 2);
@@ -640,11 +787,11 @@ void fused_mrope_rms_set_kv(
     if (is_neox_style) {                                                                                                                     \
         fused_mrope_rms_neox_kv_kernel<T, HEAD_SIZE, true, IS_INTERLEAVED, M, KVT><<<numBlocks, threadsPerBlock, 0, stream>>>(              \
             qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps, \
-            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv);                                                                                  \
+            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv, use_shuffle_layout, block_size, x);                                                                                  \
     } else {                                                                                                                                 \
         fused_mrope_rms_noneox_kv_kernel<T, HEAD_SIZE, true, IS_INTERLEAVED, M, KVT><<<numBlocks, threadsPerBlock, 0, stream>>>(            \
             qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps, \
-            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv);                                                                                  \
+            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv, use_shuffle_layout, block_size, x);                                                                                  \
     }
 
     if (is_interleaved) {
@@ -682,7 +829,8 @@ void fused_rope_rms_set_kv(
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
     bool is_neox_style, double eps, 
     T *q, KVT *k_cache, KVT *v_cache, int64_t *kv_loc, float k_scale, float v_scale, hipStream_t stream,
-    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false) {
+    KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false,
+    bool use_shuffle_layout = false, int64_t block_size = 0, int64_t x = 0) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int block_size = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
@@ -695,11 +843,11 @@ void fused_rope_rms_set_kv(
     if (is_neox_style) {                                                                                                                     \
         fused_mrope_rms_neox_kv_kernel<T, HEAD_SIZE, false, false, 1, KVT><<<numBlocks, threadsPerBlock, 0, stream>>>(              \
             qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps, \
-            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv);                                                                                  \
+            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv, use_shuffle_layout, block_size, x);                                                                                  \
     } else {                                                                                                                                 \
         fused_mrope_rms_noneox_kv_kernel<T, HEAD_SIZE, false, false, 1, KVT><<<numBlocks, threadsPerBlock, 0, stream>>>(            \
             qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps, \
-            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv);                                                                                  \
+            q, k_cache, v_cache, kv_loc, k_scale, v_scale, k_out, v_out, return_kv, use_shuffle_layout, block_size, x);                                                                                  \
     }
 
         switch (head_size) {
@@ -778,7 +926,8 @@ void fused_mrope_3d_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_
                                int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
                                bool is_neox_style, std::vector<int64_t> mrope_section_, bool is_interleaved, double eps,
                                Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &kv_loc, double k_scale, double v_scale,
-                               std::optional<Tensor> k_out, std::optional<Tensor> v_out, bool return_kv) {
+                               std::optional<Tensor> k_out, std::optional<Tensor> v_out, bool return_kv,
+                               bool use_shuffle_layout, int64_t block_size, int64_t x) {
     TORCH_CHECK(mrope_section_.size() == 3);
     TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() && cos_sin.is_contiguous());
     TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && kv_loc.is_contiguous());
@@ -828,7 +977,10 @@ void fused_mrope_3d_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_
                     stream,
                     k_out_ptr,
                     v_out_ptr,
-                    return_kv);
+                    return_kv,
+                    use_shuffle_layout,
+                    block_size,
+                    x);
             } else {
                 // Check if kv_cache_dtype is fp8e4m3fnuz or fp8e4m3fn
                 if (kv_cache_dtype == at::ScalarType::Float8_e4m3fnuz) {
@@ -860,7 +1012,10 @@ void fused_mrope_3d_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_
                         stream,
                         k_out_fp8_ptr,
                         v_out_fp8_ptr,
-                        return_kv);
+                        return_kv,
+                        use_shuffle_layout,
+                        block_size,
+                        x);
                 } else if (kv_cache_dtype == at::ScalarType::Float8_e4m3fn) {
                     rope_rms::fp8e4m3fn *k_out_fp8_ptr = (return_kv && k_out.has_value()) ? (rope_rms::fp8e4m3fn *)k_out.value().data_ptr() : nullptr;
                     rope_rms::fp8e4m3fn *v_out_fp8_ptr = (return_kv && v_out.has_value()) ? (rope_rms::fp8e4m3fn *)v_out.value().data_ptr() : nullptr;
@@ -890,7 +1045,10 @@ void fused_mrope_3d_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_
                         stream,
                         k_out_fp8_ptr,
                         v_out_fp8_ptr,
-                        return_kv);
+                        return_kv,
+                        use_shuffle_layout,
+                        block_size,
+                        x);
                 } else {
                     TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
                 }
@@ -935,7 +1093,8 @@ void fused_rope_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin,
                                int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
                                bool is_neox_style, double eps,
                                Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &kv_loc, double k_scale, double v_scale,
-                               std::optional<Tensor> k_out, std::optional<Tensor> v_out, bool return_kv) {
+                               std::optional<Tensor> k_out, std::optional<Tensor> v_out, bool return_kv,
+                               bool use_shuffle_layout, int64_t block_size, int64_t x) {
     TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() && cos_sin.is_contiguous());
     TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && kv_loc.is_contiguous());
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(qkv));
@@ -977,7 +1136,10 @@ void fused_rope_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin,
                     stream,
                     k_out_ptr,
                     v_out_ptr,
-                    return_kv);
+                    return_kv,
+                    use_shuffle_layout,
+                    block_size,
+                    x);
             } else {
                 // Check if kv_cache_dtype is fp8e4m3fnuz or fp8e4m3fn
                 if (kv_cache_dtype == at::ScalarType::Float8_e4m3fnuz) {
@@ -1007,7 +1169,10 @@ void fused_rope_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin,
                         stream,
                         k_out_fp8_ptr,
                         v_out_fp8_ptr,
-                        return_kv);
+                        return_kv,
+                        use_shuffle_layout,
+                        block_size,
+                        x);
                 } else if (kv_cache_dtype == at::ScalarType::Float8_e4m3fn) {
                     rope_rms::fp8e4m3fn *k_out_fp8_ptr = (return_kv && k_out.has_value()) ? (rope_rms::fp8e4m3fn *)k_out.value().data_ptr() : nullptr;
                     rope_rms::fp8e4m3fn *v_out_fp8_ptr = (return_kv && v_out.has_value()) ? (rope_rms::fp8e4m3fn *)v_out.value().data_ptr() : nullptr;
@@ -1035,7 +1200,10 @@ void fused_rope_rms_set_kv(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin,
                         stream,
                         k_out_fp8_ptr,
                         v_out_fp8_ptr,
-                        return_kv);
+                        return_kv,
+                        use_shuffle_layout,
+                        block_size,
+                        x);
                 } else {
                     TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
                 }
