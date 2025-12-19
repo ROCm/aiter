@@ -3,7 +3,7 @@
 
 from torch import Tensor
 from ..jit.core import compile_ops
-from typing import List
+from typing import List, Optional
 
 
 @compile_ops("module_fused_mrope_rms")
@@ -47,6 +47,9 @@ def fused_mrope_3d_rms_set_kv(
     kv_loc: Tensor,
     k_scale: float,
     v_scale: float,
+    k_out: Optional[Tensor],
+    v_out: Optional[Tensor],
+    return_kv: bool,
 ) -> None: ...
 
 
@@ -87,4 +90,7 @@ def fused_rope_rms_set_kv(
     kv_loc: Tensor,
     k_scale: float,
     v_scale: float,
+    k_out: Optional[Tensor],
+    v_out: Optional[Tensor],
+    return_kv: bool,
 ) -> None: ...

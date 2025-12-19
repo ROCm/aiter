@@ -4,6 +4,7 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <optional>
 
 using namespace at;
 
@@ -41,7 +42,10 @@ void fused_mrope_3d_rms_set_kv(Tensor& qkv,
                                Tensor& v_cache,
                                Tensor& kv_loc,
                                double k_scale,
-                               double v_scale);
+                               double v_scale,
+                               std::optional<Tensor> k_out,
+                               std::optional<Tensor> v_out,
+                               bool return_kv);
 
 void fused_rope_rms(Tensor& qkv,
                     Tensor& qw,
@@ -73,4 +77,7 @@ void fused_rope_rms_set_kv(Tensor& qkv,
                            Tensor& v_cache,
                            Tensor& kv_loc,
                            double k_scale,
-                           double v_scale);
+                           double v_scale,
+                           std::optional<Tensor> k_out,
+                           std::optional<Tensor> v_out,
+                           bool return_kv);
