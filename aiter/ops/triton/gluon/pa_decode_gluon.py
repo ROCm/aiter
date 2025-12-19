@@ -1258,8 +1258,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(
         KV_16B_ELEMENT_COUNT, 1, 16, order=[1, 0]
     )
-    # shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
-    # shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(16, 1, 16, order=[1, 0])
 
     # Key cache layout - optimized for block-wise access patterns
     blocked_key_layout_fp8: gl.constexpr = gl.BlockedLayout(
@@ -1268,7 +1266,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         warps_per_cta=[4, 1, 1, 1],
         order=[3, 2, 1, 0],
     )
-    # key_warps_per_cta_f16: gl.constexpr = [4, 1, 1, 1]
     key_warps_per_cta_f16: gl.constexpr = (
         [4, 1, 1, 1] if KV_BLOCK_SIZE == 16 else [1, 1, 4, 1]
     )
@@ -1283,8 +1280,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     )
 
     DOT_QK_K_WIDTH: gl.constexpr = KV_16B_ELEMENT_COUNT
-    # DOT_QK_K_WIDTH: gl.constexpr = 8
-    # DOT_QK_K_WIDTH: gl.constexpr = 16
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
@@ -1332,7 +1327,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     # Value cache layout configuration based on transpose flag
     if VALUE_TRANSPOSED:
         # Transposed value layout for better memory access patterns
-        # value_threads_per_warp : gl.constexpr = [4, 1, 16, 1]
         value_threads_per_warp: gl.constexpr = (
             [4, 1, 16, 1] if KV_BLOCK_SIZE == 16 else [1, 4, 16, 1]
         )
@@ -1638,48 +1632,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         # Reshape key tensor for matrix multiplication
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
         key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
-
-        # # ==================== VALUE LOADING AND PROCESSING ====================
-        # if VALUE_TRANSPOSED:
-        #     # Load values from transposed cache layout
-        #     kv_block_numbers_reshaped = gl.convert_layout(
-        #         kv_block_numbers,
-        #         layout=gl.SliceLayout(
-        #             1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
-        #         ),
-        #     )
-        #     value_block_offsets = (
-        #         kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
-        #         + kv_head_idx * stride_value_head
-        #         + value_dim1_offsets[None, :, None, None] * stride_value_head_size
-        #         + value_dim2_offsets[None, None, :, None]
-        #         * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
-        #         + value_dim3_offsets[None, None, None, :]
-        #     )
-        #     value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-        #     # Permute and reshape for matrix multiplication
-        #     value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
-        #     value_tensor = gl.reshape(
-        #         value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
-        #     )
-        # else:
-        #     # Load values from standard cache layout
-        #     kv_block_numbers_reshaped = gl.convert_layout(
-        #         kv_block_numbers,
-        #         layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
-        #     )
-        #     value_block_offsets = (
-        #         kv_block_numbers_reshaped[:, None, None] * stride_value_block
-        #         + kv_head_idx * stride_value_head
-        #         + value_dim1_offsets[None, :, None] * stride_value_head_size
-        #         + value_dim2_offsets[None, None, :]
-        #     )
-        #     value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-        #     # Permute and reshape for matrix multiplication
-        #     value_tensor = gl.permute(value_tensor, [0, 2, 1])
-        #     value_tensor = gl.reshape(
-        #         value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
-        #     )
 
         # ==================== ATTENTION SCORE COMPUTATION ====================
         # Initialize QK accumulator

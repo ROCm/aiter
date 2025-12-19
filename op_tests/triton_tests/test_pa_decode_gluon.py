@@ -1915,13 +1915,6 @@ def run_multi_pa_gluon_test(
                                                         for (
                                                             use_aot_impl
                                                         ) in use_aot_impl_options:
-                                                            # if (
-                                                            #     ct != aiter.dtypes.fp8
-                                                            #     and bs == 64
-                                                            # ):
-                                                            #     context_partition_size = (
-                                                            #         128
-                                                            #     )
                                                             test_config = {
                                                                 "use_torch_flash_ref": use_torch_flash_ref,
                                                                 "compute_type": ct,
@@ -2107,7 +2100,6 @@ def simple_test():
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    # CONTEXT_PARTITION_SIZE_OPTIONS = [128]
     COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
     # COMPUTE_TYPE_OPTIONS = ["fp8"]
     QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
@@ -2137,8 +2129,8 @@ def simple_test():
     USE_AOT_IMPL_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
-    # BLOCK_SIZE_OPTIONS = [64]
-    # parse_arg_and_run_test()
+    BLOCK_SIZE_OPTIONS = [64]
+    parse_arg_and_run_test()
     # HEAD_CONFIGURATIONS = [(10, 1)]
     # BLOCK_SIZE_OPTIONS = [1024]
     # parse_arg_and_run_test()
