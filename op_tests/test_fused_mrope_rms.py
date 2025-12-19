@@ -892,6 +892,10 @@ if __name__ == "__main__":
                                         use_shuffle_layout=use_shuffle_layout,
                                         page_size=page_size,
                                     )
+<<<<<<< HEAD
+=======
+
+>>>>>>> 73efcd965 (support shuffle)
     print("\n\n================== test_mrope_3d_rms_set_kv ==================\n\n")
     is_neox_styles = [True, False]
     num_tokens = [513, 1257, 127, 778, 10024, 3]
@@ -903,6 +907,7 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     kv_cache_dtypes = [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz]
     test_return_kv_flags = [True, False]
+<<<<<<< HEAD
     use_shuffle_layouts = [True, False]  # Test both normal and shuffle layouts
     page_sizes = [16, 1024]  # Test two page sizes for shuffle layout
     head_sizes = [64]
@@ -913,6 +918,10 @@ if __name__ == "__main__":
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
     page_sizes = [16]
 
+=======
+    use_shuffle_layouts = [False, True]  # Test both normal and shuffle layouts
+    page_sizes = [16, 1024]  # Test two page sizes for shuffle layout
+>>>>>>> 73efcd965 (support shuffle)
 
     for kv_cache_dtype in kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
@@ -930,8 +939,13 @@ if __name__ == "__main__":
                                             dtype,
                                             num_token,
                                             num_head,
+<<<<<<< HEAD
                                             1,
                                             1,
+=======
+                                            num_head,
+                                            num_head,
+>>>>>>> 73efcd965 (support shuffle)
                                             head_size,
                                             is_neox_style,
                                             ms,
