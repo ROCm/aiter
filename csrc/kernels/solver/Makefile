@@ -5,7 +5,7 @@ CXX = hipcc
 ROCBLAS_DIR = /opt/rocm
 ROCSOLVER_DIR = /opt/rocm
 
-CFLAGS = -O3 -Wall -Wno-unused-result -I${ROCSOLVER_DIR}/include -I${ROCBLAS_DIR}/include --offload-arch=gfx942
+CFLAGS = -O3 -Wall -Wno-unused-result -Wno-deprecated-attributes -I${ROCSOLVER_DIR}/include -I${ROCBLAS_DIR}/include --offload-arch=gfx942
 LDFLAGS = -L${ROCSOLVER_DIR}/lib -lrocsolver -L${ROCBLAS_DIR}/lib -lrocblas
 
 # Targets
