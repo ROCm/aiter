@@ -20,14 +20,13 @@ except ImportError:
     )
     GLUON_AOT_COMPILE_ENABLED = False
 
-try:
-    from triton.tools.compile import compile_kernel, CompileArgs
-except ImportError:
-    print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
-
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     compile_gluon_kernel,
     CompileGluonArgs,
+)
+from csrc.cpp_itfs.gluon_aot_tools.compile import (
+    compile_kernel,
+    CompileArgs,
 )
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
 from csrc.cpp_itfs.utils import (
@@ -150,8 +149,8 @@ def compile(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
 
-        kv_compute_block_size = 256
         waves_per_eu = 1
+        kv_compute_block_size = context_partition_size
         # Select kernel implementation based on block size
         if kv_block_size > context_partition_size:
             # Use big block kernel for large block sizes
