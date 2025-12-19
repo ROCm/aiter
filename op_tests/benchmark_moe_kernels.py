@@ -1,7 +1,38 @@
-#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
 """
-Test all MOE kernel combinations for a given configuration.
-Reads config from input_config_to_test.csv and outputs all kernel results.
+MOE Kernel Benchmarking Tool
+
+Purpose:
+    Comprehensively benchmark all available MOE (Mixture of Experts) kernel implementations
+    for given configurations. Tests ASM kernels, CK 2-stage kernels, and 1-stage kernels,
+    then identifies the fastest option for each configuration.
+
+Input:
+    CSV file with MOE configurations (one config per row)
+    Required columns: token, model_dim, inter_dim, expert, topk, act_type, dtype, 
+                     q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1
+    
+    Each row is analyzed independently - configurations can differ in any parameter
+    (token count, dimensions, quantization, activation, etc.)
+
+Output:
+    CSV file with all kernel benchmark results including:
+    - Individual kernel timings for each configuration
+    - Error rates (verification accuracy)
+    - TFLOPS and bandwidth metrics
+    - Best kernel recommendation per row/configuration
+
+Usage:
+    python benchmark_moe_kernels.py -i configs/trace_moe_config.csv -o results.csv
+
+Key Features:
+    - Uses tune.py's kernel generation functions
+    - Matches tune.py's 50% error threshold (ERR_RATIO=0.5)
+    - Each CSV row analyzed independently
+    - Includes inter-stage quantization overhead for 2-stage kernels
+    - Compares 1-stage vs 2-stage approaches per configuration
 """
 
 import sys
@@ -76,7 +107,10 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
     
     tuner = FmoeTuner("fmoeTuner", key, resultList, "MOE kernel test")
     
-    # Process each configuration
+    # ============================================================================
+    # MAIN BENCHMARKING LOOP
+    # Each row in the CSV is processed independently
+    # ============================================================================
     all_results = []
     
     for idx, row in config_df.iterrows():
@@ -85,45 +119,62 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
         print(f"Token={row['token']}, Model={row['model_dim']}, Inter={row['inter_dim']}, "
               f"Expert={row['expert']}, TopK={row['topk']}")
         
-        # Prepare configuration
-        dtype = eval(row['dtype'])
-        q_dtype_a = eval(row['q_dtype_a'])
-        q_dtype_w = eval(row['q_dtype_w'])
-        q_type = eval(row['q_type'])
-        act_type = eval(row['act_type'])
+        # Parse string representations to Python objects
+        # CSV stores enums as strings like "ActivationType.Silu"
+        dtype = eval(row['dtype'])          # torch.bfloat16, torch.float16, etc.
+        q_dtype_a = eval(row['q_dtype_a'])  # Activation quant dtype
+        q_dtype_w = eval(row['q_dtype_w'])  # Weight quant dtype
+        q_type = eval(row['q_type'])        # QuantType.No, per_Token, per_1x128, etc.
+        act_type = eval(row['act_type'])    # ActivationType.Silu, Gelu, etc.
         
-        cu_num = tuner.get_cu_num()
+        cu_num = tuner.get_cu_num()  # Get GPU compute unit count
         
+        # Package configuration into tuple format expected by tune.py functions
         info = (
-            cu_num,
-            row['token'],
-            row['model_dim'],
-            row['inter_dim'],
-            row['expert'],
-            row['topk'],
-            act_type,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            q_type,
-            row['use_g1u1'],
-            row['doweight_stage1'],
+            cu_num,                    # GPU CU count
+            row['token'],              # Token count
+            row['model_dim'],          # Model dimension (hidden size)
+            row['inter_dim'],          # Intermediate dimension (FFN size)
+            row['expert'],             # Number of experts
+            row['topk'],               # Top-K experts to route to
+            act_type,                  # Activation function
+            dtype,                     # Output dtype
+            q_dtype_a,                 # Activation quantization dtype
+            q_dtype_w,                 # Weight quantization dtype
+            q_type,                    # Quantization type
+            row['use_g1u1'],           # Gate+Up in one weight (g1u1)
+            row['doweight_stage1'],    # Apply routing weights in stage1
         )
         
-        # Generate all tasks (ASM stage1, CK stages, 1-stage)
-        # Use same block_m values as tune.py
+        # ========================================================================
+        # KERNEL GENERATION
+        # Generate all possible kernel tasks using tune.py's functions
+        # ========================================================================
+        
+        # Block sizes to test (tile sizes for GEMM operations)
+        # These values match tune.py and cover common padding scenarios  
         blockMs = [16, 32, 64, 128]
         
         print("\nGenerating kernel tasks...")
+        
+        # 1. ASM kernels for 2-stage (assembly-based implementations)
+        #    Only available for certain quantization types (FP8, INT8)
         tasks_asm = tuner.gen_2stages_asm1_task(info, blockMs)
+        
+        # 2. CK kernels for 2-stage (Composable Kernel library)
+        #    More widely available across configurations
+        #    Separate stage1 and stage2 kernels
         tasks_ck = tuner.gen_2stages_task(info, blockMs)
+        
+        # 3. 1-stage kernels (fused approach combining both GEMMs)
+        #    Typically assembly-based fused implementations
         tasks_1stage = tuner.gen_1stage_asm_task(info)
         
         total_tasks = len(tasks_asm) + len(tasks_ck) + len(tasks_1stage)
         print(f"Total kernels to test: {total_tasks}")
-        print(f"  - ASM stage1: {len(tasks_asm)}")
-        print(f"  - CK 2-stage: {len(tasks_ck)}")
-        print(f"  - 1-stage: {len(tasks_1stage)}")
+        print(f"  - ASM stage1: {len(tasks_asm)} (assembly)")
+        print(f"  - CK 2-stage: {len(tasks_ck)} (Composable Kernel)")
+        print(f"  - 1-stage: {len(tasks_1stage)} (fused)")
         
         if total_tasks == 0:
             print("No kernels available for this configuration!")
@@ -136,10 +187,15 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
         all_tasks = tasks_asm + tasks_ck + tasks_1stage
         in_data = [(len(all_tasks), ())]
         
-        # Run benchmarks (mp_num=1 means sequential, shape_grouped=False for individual results)
+        # Execute all kernel tasks using mp_tuner utility from tune.py
+        # mp_num=1: Parameter for execution mode
+        # shape_grouped=False: Returns individual results per kernel
         results = mp_tuner(all_tasks, in_data, mp_num=1, shape_grouped=False)
         
-        # Benchmark quantization between stages
+        # ========================================================================
+        # QUANTIZATION OVERHEAD MEASUREMENT
+        # For 2-stage approaches, measure the quantization cost between stages
+        # ========================================================================
         print("\nBenchmarking inter-stage quantization...")
         quant_time_us = 0.0
         
@@ -181,14 +237,17 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
         else:
             print(f"  Quantization time: 0.00 us (No quantization)")
         
-        # Process results
+        # ========================================================================
+        # RESULTS PROCESSING
+        # Convert raw benchmark results into structured data
+        # ========================================================================
         print(f"\nProcessing {len(results)} results...")
         
         for (key_info, stage, kernel_name, block_m), us, err in results:
-            # Calculate TFLOPS and bandwidth
+            # Calculate performance metrics from timing
             tflops, bw = tuner.calculate((key_info, stage, kernel_name, block_m, us, err))
             
-            # Determine kernel type
+            # Categorize kernel implementation type from stage name
             if "asm" in stage:
                 kernel_type = "asm"
             elif stage in ["stage1", "stage2"]:
@@ -196,7 +255,7 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
             else:
                 kernel_type = "1stage"
             
-            # Store result
+            # Build result record containing all information
             result_dict = {
                 'config_idx': idx,
                 'token': row['token'],
@@ -224,9 +283,9 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
             
             all_results.append(result_dict)
             
-            # Print result
-            status = "✓" if err < 0.01 else "⚠" if err < 1.0 else "✗"
-            print(f"{status} {kernel_type:6} {stage:12} block_m={block_m:3} "
+            # Print result with status (PASS/WARN/FAIL based on error)
+            status = "PASS" if err < 0.01 else "WARN" if err < 1.0 else "FAIL"
+            print(f"[{status}] {kernel_type:6} {stage:12} block_m={block_m:3} "
                   f"time={us:8.2f}us err={err:6.2%} "
                   f"TFLOPS={tflops:7.2f} BW={bw:7.2f}GB/s "
                   f"{kernel_name[:50]}")
@@ -270,40 +329,48 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
         valid_results = valid_results[valid_results['error_pct'] < (ERR_RATIO * 100)]
         
         if len(valid_results) == 0:
-            print(f"⚠️  No valid kernels found (all have >{ERR_RATIO*100}% error or failed)")
+            print(f"WARNING: No valid kernels found (all have >{ERR_RATIO*100}% error or failed)")
             return results_df
         
-        # Analyze each token value separately
+        # ========================================================================
+        # ANALYSIS: Best Kernel Selection Per Configuration
+        # Each configuration (row) analyzed independently
+        # ========================================================================
+        
+        # Process each unique configuration separately
         for token_val in sorted(valid_results['token'].unique()):
             print(f"\n{'='*80}")
             print(f"Token = {token_val}")
             print(f"{'='*80}\n")
             
+            # Filter results for this specific token count
             token_results = valid_results[valid_results['token'] == token_val]
             stage1_results = token_results[token_results['stage'] == 'stage1']
             stage2_results = token_results[token_results['stage'] == 'stage2']
             onestage_results = token_results[token_results['stage'] == 'asm_1stage']
             
-            # Get quant_time for this token
+            # Get quantization overhead for this configuration
             quant_time = token_results['quant_time_us'].iloc[0] if len(token_results) > 0 else 0
             
+            # --- 2-Stage Kernel Analysis ---
             best_2stage_combo = None
             if len(stage1_results) > 0 and len(stage2_results) > 0:
-                # Group by block_m and find best combination for each block_m
                 print("2-Stage Combinations (by block_m with quantization overhead):")
                 print(f"{'-'*80}")
                 
                 block_m_combos = []
+                # For 2-stage kernels, stage1 and stage2 must use same block_m
+                # This is a hardware/algorithmic requirement
                 for block_m in sorted(token_results['block_m'].unique()):
                     s1_for_blockm = stage1_results[stage1_results['block_m'] == block_m]
                     s2_for_blockm = stage2_results[stage2_results['block_m'] == block_m]
                 
                     if len(s1_for_blockm) > 0 and len(s2_for_blockm) > 0:
-                        # Find best stage1 and stage2 for this block_m
+                        # Find fastest stage1 and stage2 kernels for this block_m
                         best_s1 = s1_for_blockm.loc[s1_for_blockm['time_us'].idxmin()]
                         best_s2 = s2_for_blockm.loc[s2_for_blockm['time_us'].idxmin()]
                         
-                        # Include quantization time between stages
+                        # Calculate total 2-stage time: stage1 + quantization + stage2
                         combo_time = best_s1['time_us'] + quant_time + best_s2['time_us']
                         combo_tflops = best_s1['tflops'] + best_s2['tflops']
                         
@@ -325,7 +392,7 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
                         print(f"    Quant:  {quant_time:.2f} us")
                         print(f"    Stage2: {best_s2['time_us']:.2f} us (err={best_s2['error']})")
                 
-                # Select best block_m combination for this token
+                # Select the block_m with minimum total time
                 if block_m_combos:
                     best_2stage_combo = min(block_m_combos, key=lambda x: x['total_time_us'])
                     
@@ -339,9 +406,10 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
                     print(f"    Time: {best_2stage_combo['stage2_time_us']:.2f} us (err={best_2stage_combo['stage2_error']})")
                     print(f"  Combined Total: {best_2stage_combo['total_time_us']:.2f} us")
             
-            # Analyze 1-stage kernels for this token
+            # --- 1-Stage Kernel Analysis ---
             best_1stage = None
             if len(onestage_results) > 0:
+                # Find fastest 1-stage kernel (fused approach)
                 best_1stage = onestage_results.loc[onestage_results['time_us'].idxmin()]
                 print(f"\n{'-'*80}")
                 print("Best 1-Stage Kernel:")
@@ -350,7 +418,8 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
                 print(f"  Time: {best_1stage['time_us']:.2f} us (err={best_1stage['error']})")
                 print(f"  TFLOPS: {best_1stage['tflops']:.2f}")
             
-            # Final recommendation for this token
+            # --- Final Recommendation ---
+            # Compare 2-stage vs 1-stage and recommend fastest
             print(f"\n{'-'*80}")
             print(f"RECOMMENDATION for Token={token_val}:")
             
@@ -362,7 +431,7 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
             
             if candidates:
                 fastest = min(candidates, key=lambda x: x[1])
-                print(f"  {fastest[0]}: {fastest[1]:.2f} us")
+                print(f"  BEST: {fastest[0]}: {fastest[1]:.2f} us")
                 
                 if len(candidates) > 1:
                     slower = max(candidates, key=lambda x: x[1])
