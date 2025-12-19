@@ -974,6 +974,7 @@ def fused_moe_2stages(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
+        dtype=dtype,
     )
 
     if (
@@ -1460,6 +1461,7 @@ def cktile_moe_stage1(
     n_pad_zeros=0,
     k_pad_zeros=0,
     bias1=None,
+    dtype=torch.bfloat16,
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -1470,7 +1472,7 @@ def cktile_moe_stage1(
     if w1.dtype is torch.uint32:
         D = D * 8
     out = torch.empty(
-        (token_num, topk, D), dtype=dtypes.bf16, device=hidden_states.device
+        (token_num, topk, D), dtype=dtype, device=hidden_states.device
     )
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
