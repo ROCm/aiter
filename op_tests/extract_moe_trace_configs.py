@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analyze PyTorch trace file to extract MOE configurations and benchmark alternatives.
+Extract MOE configuration from trace files.
 """
 
 import json
@@ -22,7 +22,6 @@ def extract_moe_configs_from_trace(trace_file):
         trace_data = json.load(f)
     
     events = trace_data.get('traceEvents', [])
-    print(f"Total events in trace: {len(events)}")
     
     # Find aiter::fused_moe_ events to extract configurations
     moe_configs = []
@@ -30,7 +29,7 @@ def extract_moe_configs_from_trace(trace_file):
     for event in events:
         name = event.get('name', '')
         
-        # Only look for aiter::fused_moe_ (not wrappers)
+        # Look only for aiter::fused_moe_
         if name != 'aiter::fused_moe_':
             continue
             
@@ -46,6 +45,7 @@ def extract_moe_configs_from_trace(trace_file):
         try:
             # First dimension: [token, model_dim]
             if len(input_dims[0]) >= 2:
+                # We don't extract token for now as trace files may have varying token counts across calls and across prefill and decode phases
                 model_dim = input_dims[0][1]
             else:
                 continue
@@ -66,9 +66,9 @@ def extract_moe_configs_from_trace(trace_file):
             # Check if g1u1 (w1 has 2*inter_dim)
             use_g1u1 = (w1_dim == inter_dim * 2)
             
-            # Get topk from args (look at 4th dimension)
+            # Get topk from args
             topk = 8  # Default
-            for dim in input_dims[3:6]:
+            for dim in input_dims[3:5]:
                 if len(dim) == 2:
                     topk = dim[1]
                     break
@@ -88,7 +88,7 @@ def extract_moe_configs_from_trace(trace_file):
                 }
                 return type_map.get(cpp_type, 'torch.bfloat16')
             
-            # Extract parameters from Concrete Inputs (matches fused_moe_ signature)
+            # Extract parameters from Concrete Inputs
             concrete_inputs = args.get('Concrete Inputs', [])
             
             # Position 6: activation (0=Silu, 1=Gelu, 2=Swiglu)
@@ -154,7 +154,6 @@ def extract_moe_configs_from_trace(trace_file):
 
 
 def main():
-    """Main entry point."""
     import argparse
     
     parser = argparse.ArgumentParser(description="Analyze trace file for MOE configurations")
@@ -169,9 +168,6 @@ def main():
     )
     
     args = parser.parse_args()
-    
-    print("MOE Trace Analyzer")
-    print("=" * 80)
     
     # Extract configurations
     configs = extract_moe_configs_from_trace(args.trace_file)
@@ -229,7 +225,7 @@ def main():
     ]
     
     print(f"\n{'='*80}")
-    print(f"Generating {len(token_values)} token configurations based on get_padded_M logic")
+    print(f"{len(token_values)} token configuration")
     
     # Replicate config for each token value
     if len(grouped) > 0:
