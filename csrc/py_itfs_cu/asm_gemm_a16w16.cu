@@ -189,10 +189,10 @@ AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
     return result.first->second.get();
 }
 
-
 torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
                               torch::Tensor& B,
                               torch::Tensor& out,
+                              torch::Tensor& semaphore,
                               std::optional<torch::Tensor> bias,
                               std::optional<int> splitK,
                               std::optional<std::string> kernelName,
@@ -232,13 +232,21 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
     int selectedksplit             = splitK.value_or(0) ?: 1;
     if(!kernelName.has_value() || kernelName.value_or("").empty() || !splitK.has_value())
     {
-        auto [name, split] = get_heuristic_kernel(
-            Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, 1, splitK, kernelName);
+        auto [name, split] = get_heuristic_kernel(Mdim,
+                                                  Ndim,
+                                                  Kdim,
+                                                  config_map,
+                                                  arch_id,
+                                                  bpreshuffle,
+                                                  args.add_bias,
+                                                  1,
+                                                  splitK,
+                                                  kernelName);
         selectedKernelName = name;
         selectedksplit     = split;
     }
-    args.splitk              = selectedksplit;
-    //printf("splitk: %u\n", args.splitk);
+    args.splitk = selectedksplit;
+    // printf("splitk: %u\n", args.splitk);
     AiterAsmKernel* impl_ptr = get_or_load_kernel(selectedKernelName, config_map, SUBM, SUBN);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -247,16 +255,10 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
     int gdy = (Mdim + SUBM - 1) / SUBM;
     int gdz = selectedksplit;
 
-    uint32_t* semaphore = new uint32_t[gdx * gdy];
-    for(int i = 0; i < gdx * gdy; i++)
-    {
-        semaphore[i] = selectedksplit;
-    }
-    uint32_t *SemaphoreBuffer;
-    HIP_CALL(hipMalloc(&SemaphoreBuffer, sizeof(uint32_t) * gdx * gdy));
-    HIP_CALL(
-        hipMemcpy(SemaphoreBuffer, semaphore, sizeof(uint32_t) * gdx * gdy, hipMemcpyHostToDevice));
-    args.ptr_semaphore = (void*)SemaphoreBuffer;
+    TORCH_CHECK(gdx <= 16, __func__, " gdx (", gdx, ") must be <= 16"); // 16 = 512/32
+
+    semaphore.fill_(selectedksplit);
+    args.ptr_semaphore = (void*)semaphore.data_ptr<uint32_t>();
 
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});

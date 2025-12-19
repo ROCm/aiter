@@ -59,8 +59,9 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 def run_bf16gemm_asm(
     x, weight, out_asm, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
+    sema = aiter.get_semaphore_workspace()
     return aiter.gemm_a16w16_asm(
-        x, weight, out_asm, bias, splitK, kernelName, bpreshuffle
+        x, weight, out_asm, sema, bias, splitK, kernelName, bpreshuffle
     )
 
 
@@ -454,7 +455,7 @@ parser.add_argument(
     "--dtype",
     type=dtypes.str2Dtype,
     # choices=["bf16", "fp16", "fp8"],
-    default=[torch.bfloat16, torch.float16],
+    default=[torch.bfloat16],
     help="""Data type. Support "bf16", "fp16", "fp8".
     e.g.: -d bf16
           or -d bf16,fp16    # Multiple comma-separated argus supported.""",
@@ -479,7 +480,7 @@ parser.add_argument(
     "-o",
     "--otype",
     type=dtypes.str2Dtype,
-    default=[None, torch.float16, torch.bfloat16, torch.float32],
+    default=[torch.bfloat16, torch.float32],
     help="""Data type of output.
     e.g.: -d bf16""",
 )
