@@ -1759,8 +1759,10 @@ def _write_ninja_file(
 #                       'Please set it to your CUDA install root.')
 #     return os.path.join(CUDA_HOME, *paths)
 
+
 def _is_cuda_file(path: str) -> bool:
-    valid_ext = [".cu", ".cuh", ".hip"]
-    if "composable_kernel" in path and path.endswith(".cpp"):
-        return True
+    return True
+    valid_ext = [".cu", ".cuh"]
+    if IS_HIP_EXTENSION:
+        valid_ext.append(".hip")
     return os.path.splitext(path)[1] in valid_ext
