@@ -166,21 +166,12 @@ def fav3_fp8_forward_func(
     )
 
 
-def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
-    # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
-    # tensor_layout = args.sagev1_layout
+def sagev1_forward_func(q, k, v, sm_scale, k_smooth=True):
     config = _get_config()
-    # Original tensors are in NHD format (batch, seq, heads, dim)
-    if tensor_layout == "HND":
-        # Convert from NHD to HND for better memory access
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous().to(torch.float16)
-    else:  # NHD
-        # Keep original layout
-        v = v.to(torch.float16)
-    # k_mean = k.mean(dim=1, keepdim=True) if k_smooth else None # provide km as None and it gets computed inside per_block_int8
-    # sm_scale = D_HEAD**-0.5
+    # permute back to BHSD which is the underlying tensor format
+    q = q.permute(0,2,1,3)
+    k = k.permute(0,2,1,3)
+    v = v.permute(0,2,1,3).to(torch.float16)
     q, q_scale, k, k_scale, _ = per_block_int8(
         q,
         k,
@@ -188,7 +179,7 @@ def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
         BLKQ=config["BLOCK_SIZE_M"],
         BLKK=config["BLOCK_SIZE_N"],
         sm_scale=sm_scale,
-        tensor_layout=tensor_layout,
+        tensor_layout="HND",
         smooth_k=k_smooth,
     )
     q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
@@ -199,7 +190,7 @@ def sagev1_forward_func(q, k, v, tensor_layout, sm_scale, k_smooth=True):
         v,
         q_scale,
         k_scale,
-        tensor_layout=tensor_layout,
+        tensor_layout="HND",
         output_dtype=torch.bfloat16,
         config=config,
     )
@@ -421,8 +412,8 @@ def bench_kernel(q, k, v, args, provider):
     # Default softmax scale
     print("bench kernel assumes shape BSHD")
     print(f"q.shape = {q.shape}. Should correspond to BSHD, make sure that this is right!")
-    BATCH, HQ, N_CTX_Q,  D_HEAD = q.shape
-    _, HK, N_CTX_K, D_HEAD_V = v.shape
+    BATCH, N_CTX_Q, HQ,  D_HEAD = q.shape
+    _, N_CTX_K, HK, D_HEAD_V = v.shape
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = not args.no_k_smooth
 
@@ -447,7 +438,6 @@ def bench_kernel(q, k, v, args, provider):
             q,
             k,
             v,
-            tensor_layout=args.sagev1_layout,
             sm_scale=softmax_scale,
             k_smooth=k_smooth,
         )
@@ -477,6 +467,9 @@ def bench_kernel(q, k, v, args, provider):
         current_output = fn()
         assert current_output is not None
         current_primary = primary_output(current_output)
+        if args.sagev1:
+            current_primary = current_primary.permute(0,2,1,3) # sagev1 output is BHSD
+
 
         def reference_output():
             if args.ref == "fav3_fp8":  #  fav3 fp8
@@ -519,6 +512,8 @@ def bench_kernel(q, k, v, args, provider):
             return fn()
 
         reference_primary = primary_output(reference_output())
+        if args.ref == "sagev1":
+            reference_primary = reference_primary.permute(0,2,1,3) # sagev1 output is BHSD
         check_attention_outputs(current_primary, reference_primary, fp8=False)
         if args.print_compare_stats:
             print_output_comparison_stats(current_primary, reference_primary)
@@ -713,13 +708,6 @@ def parse_args():
         help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.",
     )
     parser.add_argument("-no_k_smooth", action="store_true", default=False)
-    parser.add_argument(
-        "-sagev1_layout",
-        type=str,
-        default="NHD",
-        choices=["HND", "NHD"],
-        help="Tensor layout for sagev1: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: NHD.",
-    )
     parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)
