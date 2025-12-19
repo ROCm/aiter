@@ -27,6 +27,7 @@ def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
 
+
 def batched_gemm_a16wfp4_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -43,6 +44,7 @@ def batched_gemm_a16wfp4_fake_tensor(
         _, N, _ = w.shape
         return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
     return y
+
 
 @torch_compile_guard(gen_fake=batched_gemm_a16wfp4_fake_tensor)
 def batched_gemm_a16wfp4(

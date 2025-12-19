@@ -7,6 +7,7 @@ import torch
 import triton
 import json
 
+
 def prev_power_of_2(x: int) -> int:
     out = triton.next_power_of_2(x)
     return out // 2 if out > x else out
@@ -35,8 +36,10 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
         return x
     return x.contiguous()
 
+
 def serialize_dict(d: dict) -> str:
     return json.dumps(d)
+
 
 def deserialize_str(s: str) -> dict:
     return json.loads(s)

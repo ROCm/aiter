@@ -30,6 +30,7 @@ def gemm_a16w16_atomic_fake_tensor(
         return torch.zeros((M, N), dtype=dtype, device=x.device)
     return y
 
+
 @torch_compile_guard(gen_fake=gemm_a16w16_atomic_fake_tensor)
 def gemm_a16w16_atomic_(
     x: torch.Tensor,
@@ -91,6 +92,7 @@ def gemm_a16w16_atomic_(
     )
 
     return y
+
 
 def gemm_a16w16_atomic(
     x: torch.Tensor,

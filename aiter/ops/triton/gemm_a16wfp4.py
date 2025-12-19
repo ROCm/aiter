@@ -24,6 +24,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
+
 def gemm_a16wfp4_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -38,6 +39,7 @@ def gemm_a16wfp4_fake_tensor(
         N, _ = w.shape
         return torch.zeros((M, N), dtype=dtype, device=x.device)
     return y
+
 
 @torch_compile_guard(gen_fake=gemm_a16wfp4_fake_tensor)
 def gemm_a16wfp4(

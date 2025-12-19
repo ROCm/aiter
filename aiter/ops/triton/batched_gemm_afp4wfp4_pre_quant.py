@@ -21,6 +21,7 @@ def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
 
+
 def batched_gemm_afp4wfp4_pre_quant(
     x,
     w,

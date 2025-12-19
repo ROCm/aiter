@@ -64,6 +64,7 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
+
 def gemm_afp4wfp4_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -79,6 +80,7 @@ def gemm_afp4wfp4_fake_tensor(
         N, _ = w.shape
         return torch.empty((M, N), dtype=dtype, device=x.device)
     return y
+
 
 @torch_compile_guard(gen_fake=gemm_afp4wfp4_fake_tensor)
 def gemm_afp4wfp4_(
@@ -531,6 +533,7 @@ def gemm_afp4wfp4_preshuffle(
 
     return y
 
+
 def gemm_afp4wfp4_preshuffled_weight_scales(
     x,
     w,
@@ -545,6 +548,7 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
         "gemm_afp4wfp4_preshuffled_weight_scales will be deprecated in future AITER release, please switch to gemm_afp4wfp4_preshuffle"
     )
     return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config, use_aot)
+
 
 def gemm_afp4wfp4(
     x: torch.Tensor,

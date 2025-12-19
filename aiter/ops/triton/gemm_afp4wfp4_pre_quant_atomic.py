@@ -14,6 +14,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
+
 def gemm_afp4wfp4_pre_quant(
     x: torch.Tensor,
     w: torch.Tensor,
