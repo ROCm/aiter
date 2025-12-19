@@ -145,11 +145,10 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
 
-    const ck_tile::amd_buffer_coherence_enum b_mem_nt_type =
-        BaseGemmPipeline::GetBMemNTType(
+    const int32_t b_mem_nt_type = static_cast<int32_t>(BaseGemmPipeline::GetBMemNTType(
             args.NumTokens,
             args.N,
-            args.K);
+            args.K));
 
     float ave_time{0};
 
@@ -161,7 +160,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         constexpr auto tail_number_v    = tail_number_.value;
         constexpr auto scheduler        = FlatmmConfig::Scheduler;
         constexpr auto memory_operation = memory_operation_.value;
-        constexpr auto b_mem_nt_type_v  = b_mem_nt_type_.value;
+        constexpr auto b_mem_nt_type_v  = static_cast<ck_tile::amd_buffer_coherence_enum>(b_mem_nt_type_.value);
 
         using CodegenPipelineProblem =
             std::conditional_t<BMXFP4_Pipeline,
@@ -322,21 +321,25 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     const auto RunBMem = [&](const auto has_hot_loop_,
                          const auto tail_number_,
                          const auto memory_operation_) {
-        if(b_mem_nt_type == ck_tile::amd_buffer_coherence_enum::WAVE_NT1)
+
+        switch (b_mem_nt_type)
         {
-            Run(has_hot_loop_,
-                tail_number_,
-                memory_operation_,
-                ck_tile::integral_constant<ck_tile::amd_buffer_coherence_enum,
-                                           ck_tile::amd_buffer_coherence_enum::WAVE_NT1>{});
-        }
-        else
-        {
-            Run(has_hot_loop_,
-                tail_number_,
-                memory_operation_,
-                ck_tile::integral_constant<ck_tile::amd_buffer_coherence_enum,
-                                           ck_tile::amd_buffer_coherence_enum::coherence_default>{});
+            case 2:
+            {
+                Run(has_hot_loop_,
+                    tail_number_,
+                    memory_operation_,
+                    ck_tile::integral_constant<int32_t, 2>{});
+            }
+            break;
+            default:
+            {
+                Run(has_hot_loop_,
+                    tail_number_,
+                    memory_operation_,
+                    ck_tile::integral_constant<int32_t, 0>{});
+            }
+
         }
     };
 
