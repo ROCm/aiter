@@ -20,6 +20,22 @@ struct PaMetadataV12Traits
     static constexpr int32_t kFixedOverheadNumBlocks = 0;
     static constexpr int32_t kIsSparse               = kIsSparse_;
     static constexpr int32_t kLdsBatchInfo           = kLdsBatchInfo_;
+
+    // DEBUG
+    static __device__ void print()
+    {
+        printf("PaMetadataV12Traits {\n");
+
+        printf("  kPackedQoLenPerWg = %d\n", kPackedQoLenPerWg);
+        printf("  kPackedQoLenPerWg_log2 = %d\n", kPackedQoLenPerWg_log2);
+        printf("  kQoSplits = %s\n", kQoSplits ? "true" : "false");
+        printf("  kUniSeqlenQo = %d\n", kUniSeqlenQo);
+        printf("  kFixedOverheadNumBlocks = %d\n", kFixedOverheadNumBlocks);
+        printf("  kIsSparse = %d\n", kIsSparse);
+        printf("  kLdsBatchInfo = %d\n", kLdsBatchInfo);
+
+        printf("}\n");
+    }
 };
 
 template <typename Traits>
@@ -30,9 +46,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     extern __shared__ uint8_t p_smem[];
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
-    int32_t* p_lds_pages_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : params.num_batches);
-    int32_t* p_lds_partial_info =
-        p_lds_pages_kv + (Traits::kLdsBatchInfo ? params.num_batches : 0);
+    int32_t* p_lds_units_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : params.num_batches);
+    int32_t* p_lds_partial_info = p_lds_units_kv + (Traits::kLdsBatchInfo ? params.num_batches : 0);
 
     QoState qo_state(
         params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
@@ -41,7 +56,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     PaWorkInfo* p_work_info_set = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
 
-    int32_t sum_blocks = 0;
+    int32_t total_units = 0;
     for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
         const int32_t bid_ori = Traits::kIsSparse
@@ -49,38 +64,38 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                     : (bid / params.qk_batch_ratio);
         const int32_t qo_length = params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
         const int32_t kv_length = params.p_context_lens[bid_ori];
-
-        int32_t num_blocks = 0;
+        int total_batch_units = 0;
+        // Split query sequence into tiles
         for (int32_t qo_offset = 0; qo_offset < qo_length; qo_offset += params.qlen_granularity) {
             const int32_t local_qo_start = qo_offset;
             const int32_t local_qo_end = min(local_qo_start + params.qlen_granularity, qo_length);
             const int32_t effective_kv_length =
                     params.is_causal ? std::min(kv_length - qo_length + local_qo_end, kv_length) : kv_length;
-            num_blocks = integer_divide_ceil_power2(effective_kv_length,
+            int num_units = integer_divide_ceil_power2(effective_kv_length,
                                                     params.kv_granularity,
                                                     params.kv_granularity_log2);
             if (Traits::kIsSparse)
-                num_blocks = min(num_blocks, params.topk);
+                num_units = min(num_units, params.topk);  // TODO: check sparse
+            printf("==>q_tile:batch_idx,%d,qo_start,%d,qo_end,%d,num_units,%d,effective_kv_length,%d\n", bid, local_qo_start, local_qo_end, num_units, effective_kv_length);
+            total_batch_units += num_units;
         }
 
         if constexpr(Traits::kLdsBatchInfo)
         {
-            p_lds_pages_kv[bid] = num_blocks;
+            p_lds_units_kv[bid] = total_batch_units;
         }
-
-        sum_blocks += num_blocks;
 
         if constexpr(QoState::is_unique() == false)
         {
             p_lds_seqlens_qo[bid] =
                 params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
         }
+        total_units += total_batch_units;
     }
 
-    sum_blocks =
-        aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), ck_tile::get_warp_size()>(
-            sum_blocks);
-    sum_blocks += params.num_batches * Traits::kFixedOverheadNumBlocks;
+    total_units =
+        aiter::warpReduce<aiter::AddFunctor, decltype(total_units), ck_tile::get_warp_size()>(
+            total_units);
 
     if(lane_idx == 0)
     {
@@ -93,12 +108,13 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     // expected payload handled by each cu part.
-    const int32_t average = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
-                        Traits::kFixedOverheadNumBlocks;
-    const int32_t reminder = std::max(sum_blocks - params.num_splits * average, 0);
+    const int32_t average = total_units / params.num_cu;
+    const int32_t reminder = total_units % params.num_cu;
+    // DEBUG
     if(lane_idx == 0) {
-        printf("==>PaMetadataV12Traits:%d,%d,%d,%d,%d,%d\n", Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2, Traits::kQoSplits, Traits::kUniSeqlenQo, Traits::kFixedOverheadNumBlocks, Traits::kIsSparse, Traits::kLdsBatchInfo);
-        printf("==>sum_blocks,%d,average,%d,reminder,%d\n", sum_blocks, average, reminder);
+        Traits::print();
+        params.print();
+        printf("==>total_units,%d,average,%d,reminder,%d\n", total_units, average, reminder);
     }
 
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
@@ -108,7 +124,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     int32_t curr_kv_begin = 0;
     // The size of 1st element equals to the end loc of the 1st element.
-    int32_t curr_kv_end    = Traits::kLdsBatchInfo ? p_lds_pages_kv[0]
+    int32_t curr_kv_end    = Traits::kLdsBatchInfo ? p_lds_units_kv[0]
                              : Traits::kIsSparse   ? min(params.p_pages_kv_indptr[1], params.topk)
                                                    : params.p_pages_kv_indptr[1];
     int32_t curr_kv_pages = curr_kv_end - curr_kv_begin;
@@ -135,6 +151,28 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t num_kv_blocks = curr_kv_pages;
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
 
+            if(lane_idx == 0) {
+                printf("---------- split status ----------\n");
+                printf("==>curr_batch,%d\n", curr_batch);
+                printf("==>curr_kv_block,%d\n", curr_kv_block);
+                printf("==>curr_n_split_idx,%d\n", curr_n_split_idx);
+                printf("==>curr_sub_head_idx,%d\n", curr_sub_head_idx);
+                printf("==>curr_kv_begin,%d\n", curr_kv_begin);
+                printf("==>curr_kv_end,%d\n", curr_kv_end);
+                printf("==>curr_kv_pages,%d\n", curr_kv_pages);
+                printf("==>num_works,%d\n", num_works);
+                printf("==>partial_idx,%d\n", partial_idx);
+                printf("==>tot_qo_tiles,%d\n", tot_qo_tiles);
+                printf("==>last_reduce_indptr,%d\n", last_reduce_indptr);
+                printf("==>global_reduce_tile_idx,%d\n", global_reduce_tile_idx);
+                printf("==>remain_payload,%d\n", remain_payload);
+                printf("==>packed_qo_len,%d\n", packed_qo_len);
+                printf("==>num_qo_tiles,%d\n", num_qo_tiles);
+                printf("==>qo_tile_size,%d\n", qo_tile_size);
+                printf("==>num_kv_blocks,%d\n", num_kv_blocks);
+                printf("==>remain_kv_blocks,%d\n", remain_kv_blocks);
+                printf("--------------------\n");
+            }
             // If current cu part is able to handle this batch of seqences
             if(remain_payload >= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks))
             {
@@ -258,7 +296,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     {
                         if constexpr(Traits::kLdsBatchInfo)
                         {
-                            curr_kv_pages = p_lds_pages_kv[curr_batch];
+                            curr_kv_pages = p_lds_units_kv[curr_batch];
                         }
                         else
                         {
@@ -384,15 +422,15 @@ void dispatch_pa_metadata_v1_2_device(const PaMetadataV1KernelParameter& params,
 void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
                                  const torch::Tensor& pages_kv_indptr,   // [batch size + 1]
                                  const torch::Tensor& context_lens,      // [batch size]
-                                 const int32_t num_heads_per_head_k,  // qhead_granularity
+                                 const int32_t num_heads_per_head_k,  // qhead_granularity(gqa)
                                  const int32_t num_heads_k,
                                  const bool is_causal,
-                                 const int32_t kv_granularity,
+                                 const int32_t kv_granularity,  // kvlen_granularity
                                  const int32_t block_size,
                                  const int32_t max_seqlen_qo,
                                  const int32_t ori_uni_seqlen_qo,  // qlen_granularity
-                                 const int32_t topk,
-                                 const int32_t max_split_per_batch,
+                                 const int32_t topk,  // for sparse
+                                 const int32_t max_split_per_batch,  // TOOD: remove not use, DEBUG reused as available_tgs
                                  torch::Tensor& work_metadata_ptrs,
                                  torch::Tensor& work_info_set,
                                  torch::Tensor& work_indptr,
@@ -400,7 +438,7 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
                                  torch::Tensor& reduce_final_map,
                                  torch::Tensor& reduce_partial_map)
 {
-    constexpr int32_t kPackedQoLenPerWg = 256;
+    constexpr int32_t kPackedQoLenPerWg = 256; // TODO: remove HACK
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -409,18 +447,17 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
     hipGetDevice(&dev);
     hipGetDeviceProperties(&dev_prop, dev);
 
-    // const int32_t num_clusters = dev_prop.multiProcessorCount;
-    const int32_t num_clusters = 2;
+    // const int32_t available_tgs = dev_prop.multiProcessorCount;
+    const int32_t available_tgs = max_split_per_batch;
+
+    const int32_t num_clusters       = std::gcd(num_heads_k, available_tgs);
+    const int32_t tgs_per_cluster    = available_tgs / num_clusters;
+    const int32_t kheads_per_cluster = num_heads_k / num_clusters;
 
     int32_t num_batches    = context_lens.size(0);
     int32_t num_heads      = num_heads_k * num_heads_per_head_k;
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
-
-    // TODO: check num_splits
-    int32_t num_splits = max_split_per_batch < 0
-                             ? num_clusters
-                             : min(num_clusters, max_split_per_batch * num_batches);
 
     PaMetadataV1KernelParameter params = {};
     params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
@@ -434,17 +471,17 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
     params.p_context_lens               = context_lens.data_ptr<int32_t>();
     params.num_batches                  = num_batches;
     params.num_heads                    = num_heads_k * num_heads_per_head_k;
-    params.num_cu                       = num_clusters;
-    params.num_splits                   = num_splits;
+    params.num_cu                       = tgs_per_cluster;
+    params.num_splits                   = tgs_per_cluster;  // TODO: check use
     params.reduce_indptr_size           = reduce_indptr.size(0);
-    params.qhead_granularity            = num_heads_per_head_k;  // prefill-1, decode-gqa
-    params.qlen_granularity             = ori_uni_seqlen_qo;     // prefill-tile_q, decode-max_qlen  // TODO: check
+    params.qhead_granularity            = num_heads_per_head_k;  // gqa
+    params.qlen_granularity             = ori_uni_seqlen_qo;     // min(max_qlen, tile_q)
     params.kv_granularity               = kv_granularity;        // max(block_size, tile_kv)
     params.kv_granularity_log2          = __builtin_ctz(kv_granularity);
     params.block_size                   = block_size;
     params.blocks_per_unit              = kv_granularity / block_size;
     params.uni_seqlen_qo                = uni_seqlen_qo;
-    params.ori_seqlen_qo                = ori_uni_seqlen_qo;     // duplicate w/ qlen_granularity
+    params.ori_seqlen_qo                = ori_uni_seqlen_qo;     // TODO: remove duplicate w/ qlen_granularity
     params.is_causal                    = is_causal;
     params.topk                         = topk;
     params.qk_batch_ratio               = qk_batch_ratio;
@@ -453,12 +490,12 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
     MLA_METADATA_DISPATCHER(
         max_seqlen_qo * params.qhead_granularity,  // MAX_PACKED_SEQLEN_QO
         kPackedQoLenPerWg,                         // PACKED_QO_LEN_PER_WG
-        params.uni_seqlen_qo,                      
+        params.uni_seqlen_qo,
         topk,
         dispatch_pa_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
             params,
             stream,
             max_seqlen_qo,
-            dev_prop.warpSize,
-            dev_prop.maxSharedMemoryPerMultiProcessor));
+            dev_prop.warpSize,  // 64
+            dev_prop.maxSharedMemoryPerMultiProcessor));  // 65536
 }

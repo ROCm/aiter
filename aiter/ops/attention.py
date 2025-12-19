@@ -485,6 +485,44 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
+def get_asm_metadata_info_v1(
+    batch_size: int,
+    max_qlen: int,
+    qlen_granularity: int = 256,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+
+    max_qo_tiles_per_batch = int(math.ceil(max_qlen / qlen_granularity))
+    qo_tile_cnt = batch_size * max_qo_tiles_per_batch
+
+    # TODO: check calc of max allocation
+    max_work = qo_tile_cnt + cu_num - 1
+    max_partial_tiles = (
+        min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+    )
+
+    return (
+        (2, torch.uint64),  # work_metadata_ptrs
+        (cu_num + 1, torch.int32),  # work_indptr
+        ((max_work, 8), torch.int32),  # work_info
+        (qo_tile_cnt + 1, torch.int32),  # reduce_indptr
+        ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_partial_tiles, torch.int32),  # reduce_partial_map
+    )
+
+
 def get_pa_metadata_info_v1(
     batch_size: int,
     max_seqlen_qo: int,
@@ -597,6 +635,8 @@ def get_pa_metadata_v1(
                                                     reduced.
     """
     ...
+
+
 @compile_ops(MD_NAME)
 def mla_ps_prefill_asm_fwd(
     Q: torch.Tensor,
@@ -640,7 +680,7 @@ def get_mla_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
-    assert num_head_qo % 16 == 0
+    # assert num_head_qo % 16 == 0
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count

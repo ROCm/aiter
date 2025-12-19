@@ -188,9 +188,15 @@ def test_mla_prefill(
     K_bf16 = torch.randn((num_blocks, num_head_kv, qk_head_dim), dtype=torch.bfloat16)
     V_bf16 = K_bf16[:, :, :v_head_dim].contiguous()
 
-    q_quant, q_scale = per_tensor_quant(Q_bf16, scale=torch.tensor(1), quant_dtype=dtype)
-    k_quant, k_scale = per_tensor_quant(K_bf16, scale=torch.tensor(1), quant_dtype=kv_dtype)
-    v_quant, v_scale = per_tensor_quant(V_bf16, scale=torch.tensor(1), quant_dtype=kv_dtype)
+    q_quant, q_scale = per_tensor_quant(
+        Q_bf16, scale=torch.tensor(1), quant_dtype=dtype
+    )
+    k_quant, k_scale = per_tensor_quant(
+        K_bf16, scale=torch.tensor(1), quant_dtype=kv_dtype
+    )
+    v_quant, v_scale = per_tensor_quant(
+        V_bf16, scale=torch.tensor(1), quant_dtype=kv_dtype
+    )
 
     kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
 
@@ -218,29 +224,25 @@ def test_mla_prefill(
         (reduce_final_map_size, reduce_final_map_type),
         (reduce_partial_map_size, reduce_partial_map_type),
     ) = aiter.get_pa_metadata_info_v1(
-        batch_size = batch_size,
-        max_seqlen_qo = tile_q,
-        num_head_qo = num_head_q,
-        is_sparse = False,
-        fast_mode = True,
+        batch_size=batch_size,
+        max_seqlen_qo=tile_q,
+        num_head_qo=num_head_q,
+        is_sparse=False,
+        fast_mode=True,
     )
     work_metadata_ptrs = torch.zeros(
-        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
+        work_meta_data_size, dtype=work_meta_data_type, device=device
     )
-    work_indptr = torch.zeros(
-        work_indptr_size, dtype=work_indptr_type, device="cuda"
-    )
-    work_info = torch.zeros(
-        work_info_size, dtype=work_info_type, device="cuda"
-    )
+    work_indptr = torch.zeros(work_indptr_size, dtype=work_indptr_type, device=device)
+    work_info = torch.zeros(work_info_size, dtype=work_info_type, device=device)
     reduce_indptr = torch.zeros(
-        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
+        reduce_indptr_size, dtype=reduce_indptr_type, device=device
     )
     reduce_final_map = torch.zeros(
-        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
+        reduce_final_map_size, dtype=reduce_final_map_type, device=device
     )
     reduce_partial_map = torch.zeros(
-        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
     )
 
     metadata_map = {
@@ -293,7 +295,9 @@ def test_mla_prefill(
 
     output = torch.zeros_like(Q_bf16)
 
-    import os; os._exit(-1)
+    import os
+
+    os._exit(-1)
     _, us_aiter_asm = run_perftest(
         aiter.mla.mla_ps_prefill_fwd,
         q_quant,
@@ -319,13 +323,15 @@ def test_mla_prefill(
     err = checkAllclose(
         out_ref,
         output,
-        rtol=5e-2, atol=5e-2,
-        msg="mla_ps_prefill-absorb    [torch vs aiter_asm]: us......",
+        rtol=5e-2,
+        atol=5e-2,
+        msg="mla_ps_prefill    [torch vs aiter_asm]: us......",
     )
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
 
     return ret
+
 
 l_dtype = ["fp8"]
 l_kv_dtype = ["fp8"]

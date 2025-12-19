@@ -82,6 +82,49 @@ struct PaMetadataV1KernelParameter: MlaMetadataV1KernelParameter
     int32_t        gqa_ratio;
     int32_t        qhead_granularity;
     int32_t        qlen_granularity;
+
+    // DEBUG
+    __device__ void print() const
+    {
+        // ???????
+        printf("PaMetadataV1KernelParameter {\n");
+        printf("  // MlaMetadataV1KernelParameter members:\n");
+        printf("  p_work_metadata_ptrs = %p\n", p_work_metadata_ptrs);
+        printf("  p_work_indptr = %p\n", p_work_indptr);
+        printf("  p_work_info_set_raw = %p\n", p_work_info_set_raw);
+        printf("  p_reduce_indptr = %p\n", p_reduce_indptr);
+        printf("  p_reduce_final_map = %p\n", p_reduce_final_map);
+        printf("  p_reduce_partial_map = %p\n", p_reduce_partial_map);
+
+        printf("  p_seqlens_qo_indptr = %p\n", p_seqlens_qo_indptr);
+        printf("  p_seqlens_kv_indptr = %p\n", p_seqlens_kv_indptr);
+        printf("  num_batches = %d\n", num_batches);
+        printf("  fixed_num_batches = %d\n", fixed_num_batches);
+        printf("  num_heads = %d\n", num_heads);
+        printf("  num_cu = %d\n", num_cu);
+        printf("  reduce_indptr_size = %d\n", reduce_indptr_size);
+        printf("  kv_granularity = %d\n", kv_granularity);
+        printf("  kv_granularity_log2 = %d\n", kv_granularity_log2);
+        printf("  uni_seqlen_qo = %d\n", uni_seqlen_qo);
+        printf("  ori_seqlen_qo = %d\n", ori_seqlen_qo);
+        printf("  topk = %d\n", topk);
+        printf("  qk_batch_ratio = %d\n", qk_batch_ratio);
+        printf("  num_splits = %d\n", num_splits);
+        printf("  is_causal = %s\n", is_causal ? "true" : "false");
+
+        // ????????
+        printf("  // PaMetadataV1KernelParameter members:\n");
+        printf("  p_pages_kv_indptr = %p\n", p_pages_kv_indptr);
+        printf("  p_context_lens = %p\n", p_context_lens);
+        printf("  block_size = %d\n", block_size);
+        printf("  blocks_per_unit = %d\n", blocks_per_unit);
+        printf("  num_heads_k = %d\n", num_heads_k);
+        printf("  gqa_ratio = %d\n", gqa_ratio);
+        printf("  qhead_granularity = %d\n", qhead_granularity);
+        printf("  qlen_granularity = %d\n", qlen_granularity);
+
+        printf("}\n");
+    }
 };
 
 template <typename T>
