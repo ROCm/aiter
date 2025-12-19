@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
-import json
-import os
-import warnings
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from .activation import _get_activation_from_str
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 @triton.heuristics(
@@ -161,36 +155,10 @@ def _ff_a16w16_fused_ungated(
             y_ptrs += BLOCK_SIZE_K * stride_yk
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-FF-A16W16-fused.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
 
-    key = f"{N}_{K}"
-    if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_arch()
-        fpath = (
-            f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-FF-A16W16-fused-N={N}-K={K}.json"
-        )
-        if os.path.exists(fpath):
-            with open(fpath, "r") as file:
-                config = json.load(file)
-                _get_config._config_dict[key] = config
-        else:
-            key = "default"  # fall back to default config
-
-    bounds = [4, 8, 64]
-    for bound in bounds:
-        if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"M_LEQ_{bound}"]
-    else:
-        return _get_config._config_dict[key]["M_GEQ_4096"]
+    return get_gemm_config("FF-A16W16-fused", M, N, K, bounds=(4, 8, 64, 4096))

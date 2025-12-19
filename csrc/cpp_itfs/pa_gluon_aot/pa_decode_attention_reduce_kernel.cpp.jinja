@@ -13,6 +13,7 @@ void {{func_name}} (
     void* value_cache_ptr,        // [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     void* block_tables_ptr,       // [num_seqs, max_num_blocks_per_seq]
     void* sequence_lengths_ptr,   // [num_seqs]
+    void* sinks_ptr,              // [num_query_heads]
     double softmax_scale,
     void* query_scale,            // [num_seqs, num_kv_heads * q_group_size, 1]
     void* key_scale,              // [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -61,6 +62,7 @@ void {{func_name}} (
     void* value_cache_ptr,        // [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     void* block_tables_ptr,       // [num_seqs, max_num_blocks_per_seq]
     void* sequence_lengths_ptr,   // [num_seqs]
+    void* sinks_ptr,              // [num_query_heads]
     double softmax_scale,
     void* query_scale,            // [num_seqs, num_kv_heads * q_group_size, 1]
     void* key_scale,              // [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -104,7 +106,7 @@ void {{func_name}} (
                       stride_key_block_elem, stride_value_block, stride_value_head, stride_value_head_size,
                       stride_block_table_seq, query_scale_stride_0, kv_scale_stride_0, kv_scale_stride_1, query_seq_len, query_group_size, head_size,
                       num_seqs, num_kv_heads, max_context_partition_num);
-    {{triton_kernel2}}(reinterpret_cast<hipStream_t>(stream), output_ptr, exp_sums_ptr, max_logits_ptr, logits_ptr, sequence_lengths_ptr,
+    {{triton_kernel2}}(reinterpret_cast<hipStream_t>(stream), output_ptr, exp_sums_ptr, max_logits_ptr, logits_ptr, sequence_lengths_ptr, sinks_ptr,
                       stride_output_seq, stride_output_head, stride_exp_sums_seq, stride_exp_sums_head,
                       stride_exp_sums_part, stride_logits_seq, stride_logits_head, stride_logits_part,
                       stride_logits_group, equivalent_query_group_size, head_size, num_seqs, num_kv_heads);
