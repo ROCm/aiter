@@ -2385,7 +2385,10 @@ def sage_quant_kernel(
 def _general_quant_kernel(
     input_ptrs, output_ptrs, scale_ptrs, DTYPE_MAX, mask, sm_scale=None
 ):
-    x = tl.load(input_ptrs, mask=mask, other=0.0)
+    if mask is not None:
+        x = tl.load(input_ptrs, mask=mask, other=0.0)
+    else:
+        x = tl.load(input_ptrs)
     x = x.to(tl.float32)
     if sm_scale is not None:
         x *= sm_scale
