@@ -236,145 +236,138 @@ def run_all_kernel_tests(config_file="configs/input_config_to_test.csv",
         results_df = pd.DataFrame(all_results)
         
         # Sort by configuration and performance
-        results_df = results_df.sort_values(['config_idx', 'time_us'])
+        results_df = results_df.sort_values(['config_idx', 'token', 'time_us'])
         
         # Save to file
         results_df.to_csv(output_file, index=False)
         print(f"\n{'='*80}")
         print(f"Saved {len(results_df)} kernel results to {output_file}")
         
-        # Print summary statistics
-        print("\nSummary by kernel type:")
-        summary = results_df.groupby('kernel_type').agg({
-            'time_us': ['count', 'min', 'mean', 'max'],
-            'tflops': ['max'],
-            'bandwidth_gb': ['max']
-        }).round(2)
-        print(summary)
+        # Print summary statistics per token value
+        print("\nSummary by token and kernel type:")
+        for token_val in sorted(results_df['token'].unique()):
+            token_data = results_df[results_df['token'] == token_val]
+            print(f"\nToken={token_val}:")
+            summary = token_data.groupby('kernel_type').agg({
+                'time_us': ['count', 'min', 'mean', 'max'],
+                'tflops': ['max'],
+                'bandwidth_gb': ['max']
+            }).round(2)
+            print(summary)
         
         print(f"\n{'='*80}")
-        print("BEST KERNEL SELECTION ANALYSIS")
+        print("BEST KERNEL SELECTION PER TOKEN VALUE")
         print(f"{'='*80}\n")
         
-        # Filter to successful results (error < 5%)
+        # Filter to successful results (error < 50%, matching tune.py's errRatio=0.5)
         valid_results = results_df[results_df['error'] != 'failed'].copy()
         
         # Extract error percentage as float
+        # tune.py uses errRatio=0.5 (decimal), which equals 50% (percentage)
+        # Relationship: err_ratio = 0.5 ←→ err_perc = 50.0
         valid_results['error_pct'] = valid_results['error'].str.rstrip('%').astype(float)
-        valid_results = valid_results[valid_results['error_pct'] < 5.0]
+        ERR_RATIO = 0.5  # Same as tune.py default
+        valid_results = valid_results[valid_results['error_pct'] < (ERR_RATIO * 100)]
         
         if len(valid_results) == 0:
-            print("⚠️  No valid kernels found (all have >5% error or failed)")
+            print(f"⚠️  No valid kernels found (all have >{ERR_RATIO*100}% error or failed)")
             return results_df
         
-        # Analyze 2-stage kernels (SAME block_m requirement, like tune.py)
-        stage1_results = valid_results[valid_results['stage'] == 'stage1']
-        stage2_results = valid_results[valid_results['stage'] == 'stage2']
-        
-        # Get quant_time from first result (same for all)
-        quant_time = valid_results['quant_time_us'].iloc[0] if len(valid_results) > 0 else 0
-        
-        best_2stage_combo = None
-        if len(stage1_results) > 0 and len(stage2_results) > 0:
-            # Group by block_m and find best combination for each block_m
-            print("2-Stage Combinations (by block_m with quantization overhead):")
-            print(f"{'-'*80}")
+        # Analyze each token value separately
+        for token_val in sorted(valid_results['token'].unique()):
+            print(f"\n{'='*80}")
+            print(f"Token = {token_val}")
+            print(f"{'='*80}\n")
             
-            block_m_combos = []
-            for block_m in sorted(valid_results['block_m'].unique()):
-                s1_for_blockm = stage1_results[stage1_results['block_m'] == block_m]
-                s2_for_blockm = stage2_results[stage2_results['block_m'] == block_m]
-                
-                if len(s1_for_blockm) > 0 and len(s2_for_blockm) > 0:
-                    # Find best stage1 and stage2 for this block_m
-                    best_s1 = s1_for_blockm.loc[s1_for_blockm['time_us'].idxmin()]
-                    best_s2 = s2_for_blockm.loc[s2_for_blockm['time_us'].idxmin()]
-                    
-                    # Include quantization time between stages
-                    combo_time = best_s1['time_us'] + quant_time + best_s2['time_us']
-                    combo_tflops = best_s1['tflops'] + best_s2['tflops']
-                    
-                    block_m_combos.append({
-                        'block_m': block_m,
-                        'total_time_us': combo_time,
-                        'stage1_time_us': best_s1['time_us'],
-                        'quant_time_us': quant_time,
-                        'stage2_time_us': best_s2['time_us'],
-                        'stage1_kernel': best_s1['kernel_name'],
-                        'stage2_kernel': best_s2['kernel_name'],
-                        'stage1_error': best_s1['error'],
-                        'stage2_error': best_s2['error'],
-                        'combined_tflops': combo_tflops,
-                    })
-                    
-                    print(f"  block_m={block_m}: {combo_time:.2f} us")
-                    print(f"    Stage1: {best_s1['time_us']:.2f} us (err={best_s1['error']})")
-                    print(f"    Quant:  {quant_time:.2f} us")
-                    print(f"    Stage2: {best_s2['time_us']:.2f} us (err={best_s2['error']})")
+            token_results = valid_results[valid_results['token'] == token_val]
+            stage1_results = token_results[token_results['stage'] == 'stage1']
+            stage2_results = token_results[token_results['stage'] == 'stage2']
+            onestage_results = token_results[token_results['stage'] == 'asm_1stage']
             
-            # Select best block_m combination
-            if block_m_combos:
-                best_2stage_combo = min(block_m_combos, key=lambda x: x['total_time_us'])
+            # Get quant_time for this token
+            quant_time = token_results['quant_time_us'].iloc[0] if len(token_results) > 0 else 0
+            
+            best_2stage_combo = None
+            if len(stage1_results) > 0 and len(stage2_results) > 0:
+                # Group by block_m and find best combination for each block_m
+                print("2-Stage Combinations (by block_m with quantization overhead):")
+                print(f"{'-'*80}")
                 
+                block_m_combos = []
+                for block_m in sorted(token_results['block_m'].unique()):
+                    s1_for_blockm = stage1_results[stage1_results['block_m'] == block_m]
+                    s2_for_blockm = stage2_results[stage2_results['block_m'] == block_m]
+                
+                    if len(s1_for_blockm) > 0 and len(s2_for_blockm) > 0:
+                        # Find best stage1 and stage2 for this block_m
+                        best_s1 = s1_for_blockm.loc[s1_for_blockm['time_us'].idxmin()]
+                        best_s2 = s2_for_blockm.loc[s2_for_blockm['time_us'].idxmin()]
+                        
+                        # Include quantization time between stages
+                        combo_time = best_s1['time_us'] + quant_time + best_s2['time_us']
+                        combo_tflops = best_s1['tflops'] + best_s2['tflops']
+                        
+                        block_m_combos.append({
+                            'block_m': block_m,
+                            'total_time_us': combo_time,
+                            'stage1_time_us': best_s1['time_us'],
+                            'quant_time_us': quant_time,
+                            'stage2_time_us': best_s2['time_us'],
+                            'stage1_kernel': best_s1['kernel_name'],
+                            'stage2_kernel': best_s2['kernel_name'],
+                            'stage1_error': best_s1['error'],
+                            'stage2_error': best_s2['error'],
+                            'combined_tflops': combo_tflops,
+                        })
+                        
+                        print(f"  block_m={block_m}: {combo_time:.2f} us")
+                        print(f"    Stage1: {best_s1['time_us']:.2f} us (err={best_s1['error']})")
+                        print(f"    Quant:  {quant_time:.2f} us")
+                        print(f"    Stage2: {best_s2['time_us']:.2f} us (err={best_s2['error']})")
+                
+                # Select best block_m combination for this token
+                if block_m_combos:
+                    best_2stage_combo = min(block_m_combos, key=lambda x: x['total_time_us'])
+                    
+                    print(f"\n{'-'*80}")
+                    print("Best 2-Stage Combination:")
+                    print(f"  block_m: {best_2stage_combo['block_m']}")
+                    print(f"  Stage1: {best_2stage_combo['stage1_kernel'][:60]}")
+                    print(f"    Time: {best_2stage_combo['stage1_time_us']:.2f} us (err={best_2stage_combo['stage1_error']})")
+                    print(f"  Quantization: {best_2stage_combo['quant_time_us']:.2f} us")
+                    print(f"  Stage2: {best_2stage_combo['stage2_kernel'][:60]}")
+                    print(f"    Time: {best_2stage_combo['stage2_time_us']:.2f} us (err={best_2stage_combo['stage2_error']})")
+                    print(f"  Combined Total: {best_2stage_combo['total_time_us']:.2f} us")
+            
+            # Analyze 1-stage kernels for this token
+            best_1stage = None
+            if len(onestage_results) > 0:
+                best_1stage = onestage_results.loc[onestage_results['time_us'].idxmin()]
                 print(f"\n{'-'*80}")
-                print("Best 2-Stage Combination (with quantization):")
-                print(f"  block_m: {best_2stage_combo['block_m']} (same for both stages)")
-                print(f"  Stage1: {best_2stage_combo['stage1_kernel'][:60]}")
-                print(f"    - Time: {best_2stage_combo['stage1_time_us']:.2f} us")
-                print(f"    - Error: {best_2stage_combo['stage1_error']}")
-                print(f"\n  Quantization: {best_2stage_combo['quant_time_us']:.2f} us")
-                print(f"\n  Stage2: {best_2stage_combo['stage2_kernel'][:60]}")
-                print(f"    - Time: {best_2stage_combo['stage2_time_us']:.2f} us")
-                print(f"    - Error: {best_2stage_combo['stage2_error']}")
-                print(f"\n  Combined Total: {best_2stage_combo['total_time_us']:.2f} us ({best_2stage_combo['combined_tflops']:.2f} TFLOPS)")
-        
-        # Analyze 1-stage kernels
-        onestage_results = valid_results[valid_results['stage'] == 'asm_1stage']
-        best_1stage = None
-        if len(onestage_results) > 0:
-            best_1stage = onestage_results.loc[onestage_results['time_us'].idxmin()]
-            print(f"\n{'-'*80}")
-            print("Best 1-Stage Kernel:")
-            print(f"  Kernel: {best_1stage['kernel_name'][:60]}")
-            print(f"  block_m: {best_1stage['block_m']}")
-            print(f"  Time: {best_1stage['time_us']:.2f} us")
-            print(f"  Error: {best_1stage['error']}")
-            print(f"  TFLOPS: {best_1stage['tflops']:.2f}")
-            print(f"  Bandwidth: {best_1stage['bandwidth_gb']:.2f} GB/s")
-        
-        # Final comparison
-        print(f"\n{'='*80}")
-        print("FINAL RECOMMENDATION")
-        print(f"{'='*80}\n")
-        
-        candidates = []
-        if best_2stage_combo:
-            candidates.append(('2-Stage', best_2stage_combo['total_time_us']))
-        if best_1stage is not None:
-            candidates.append(('1-Stage', best_1stage['time_us']))
-        
-        if candidates:
-            fastest = min(candidates, key=lambda x: x[1])
+                print("Best 1-Stage Kernel:")
+                print(f"  Kernel: {best_1stage['kernel_name'][:60]}")
+                print(f"  block_m: {best_1stage['block_m']}")
+                print(f"  Time: {best_1stage['time_us']:.2f} us (err={best_1stage['error']})")
+                print(f"  TFLOPS: {best_1stage['tflops']:.2f}")
             
-            if fastest[0] == '2-Stage':
-                print(f"🏆 WINNER: 2-Stage Combination")
-                print(f"   Total Time: {best_2stage_combo['total_time_us']:.2f} us")
-                print(f"   block_m: {best_2stage_combo['block_m']} (same for both stages)")
-                print(f"   Breakdown:")
-                print(f"     Stage1:       {best_2stage_combo['stage1_time_us']:.2f} us (err={best_2stage_combo['stage1_error']})")
-                print(f"     Quantization: {best_2stage_combo['quant_time_us']:.2f} us")
-                print(f"     Stage2:       {best_2stage_combo['stage2_time_us']:.2f} us (err={best_2stage_combo['stage2_error']})")
-                print(f"   Combined TFLOPS: {best_2stage_combo['combined_tflops']:.2f}")
-                if best_1stage is not None:
-                    speedup = best_1stage['time_us'] / best_2stage_combo['total_time_us']
-                    print(f"   Speedup vs 1-Stage: {speedup:.2f}x faster")
-            else:
-                print(f"   1-Stage Kernel")
-                print(f"   Time: {best_1stage['time_us']:.2f} us")
-                print(f"   TFLOPS: {best_1stage['tflops']:.2f}")
-                if best_2stage_combo:
-                    speedup = best_2stage_combo['total_time_us'] / best_1stage['time_us']
-                    print(f"   Speedup vs 2-Stage: {speedup:.2f}x faster")
+            # Final recommendation for this token
+            print(f"\n{'-'*80}")
+            print(f"RECOMMENDATION for Token={token_val}:")
+            
+            candidates = []
+            if best_2stage_combo:
+                candidates.append(('2-Stage', best_2stage_combo['total_time_us']))
+            if best_1stage is not None:
+                candidates.append(('1-Stage', best_1stage['time_us']))
+            
+            if candidates:
+                fastest = min(candidates, key=lambda x: x[1])
+                print(f"  {fastest[0]}: {fastest[1]:.2f} us")
+                
+                if len(candidates) > 1:
+                    slower = max(candidates, key=lambda x: x[1])
+                    speedup = slower[1] / fastest[1]
+                    print(f"  Speedup vs {slower[0]}: {speedup:.2f}x faster")
         
     else:
         print("No results collected!")
