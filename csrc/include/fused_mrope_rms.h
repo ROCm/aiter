@@ -46,9 +46,9 @@ void fused_mrope_3d_rms_set_kv(Tensor& qkv,
                                std::optional<Tensor> k_out,
                                std::optional<Tensor> v_out,
                                bool return_kv,
-                               bool use_shuffle_layout = false,
-                               int64_t block_size = 0,
-                               int64_t x = 0);
+                               bool use_shuffle_layout,
+                               int64_t block_size,
+                               int64_t x);
 
 void fused_rope_rms(Tensor& qkv,
                     Tensor& qw,
@@ -84,6 +84,6 @@ void fused_rope_rms_set_kv(Tensor& qkv,
                            std::optional<Tensor> k_out,
                            std::optional<Tensor> v_out,
                            bool return_kv,
-                           bool use_shuffle_layout = false,
-                           int64_t block_size = 0,
-                           int64_t x = 0);
+                           bool use_shuffle_layout,
+                           int64_t block_size,
+                           int64_t x);

@@ -607,7 +607,7 @@ def test_mrope_3d_rms_set_kv(
     use_shuffle_layout=False,  # Whether to test shuffle layout
     page_size=0,  # Page size (block_size) for shuffle layout
 ):
-    max_positions = 10000  # Define max_positions for cache size
+    max_positions = 20000  # Define max_positions for cache size
     qkv = torch.randn(
         (num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size),
         dtype=dtype,
@@ -799,7 +799,7 @@ def test_mrope_3d_rms_set_kv(
 
 
 if __name__ == "__main__":
-    """
+
     print("\n\n================== test_rope_rms ==================\n\n")
     is_neox_styles = [True, False]
     num_tokens = [513, 1257, 127, 778, 10024, 3]
@@ -853,7 +853,7 @@ if __name__ == "__main__":
                             eps=1e-6,
                             is_mrope=True,
                         )
-    """
+
     print("\n\n================== test_rope_rms_set_kv ==================\n\n")
     is_neox_styles = [True, False]
     num_tokens = [513, 1257, 127, 778, 10024, 3]
@@ -863,7 +863,7 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     kv_cache_dtypes = [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz]
     test_return_kv_flags = [True, False]
-    use_shuffle_layouts = [True, False]  # Test both normal and shuffle layouts
+    use_shuffle_layouts = [False, True]  # Test both normal and shuffle layouts
     page_sizes = [16, 1024]  # Test two page sizes for shuffle layout
     
     for kv_cache_dtype in kv_cache_dtypes:

@@ -777,10 +777,10 @@ void fused_mrope_rms_set_kv(
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     TORCH_CHECK(dim == head_size / 2);
-    constexpr int block_size = 256;
+    constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
-    auto num_warps_per_block = block_size / WARP_SIZE;
-    dim3 threadsPerBlock(block_size);
+    auto num_warps_per_block = THREAD_BLOCK_SIZE / WARP_SIZE;
+    dim3 threadsPerBlock(THREAD_BLOCK_SIZE);
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
 
 #define DISPATCH_NEOX(HEAD_SIZE, IS_INTERLEAVED)                                                                                             \
@@ -832,10 +832,10 @@ void fused_rope_rms_set_kv(
     KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false,
     bool use_shuffle_layout = false, int64_t block_size = 0, int64_t x = 0) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
-    constexpr int block_size = 256;
+    constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
-    auto num_warps_per_block = block_size / WARP_SIZE;
-    dim3 threadsPerBlock(block_size);
+    auto num_warps_per_block = THREAD_BLOCK_SIZE / WARP_SIZE;
+    dim3 threadsPerBlock(THREAD_BLOCK_SIZE);
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
     std::array<int64_t, 1> mrope_section = {0};
 
