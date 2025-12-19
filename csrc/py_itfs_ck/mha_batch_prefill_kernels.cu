@@ -41,8 +41,6 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                std::optional<const at::Tensor>& kv_last_page_lens_)
 {
     // q: (total_q, nheads, d)
-    // k: (total_k, nheads_k, d)
-    // v: (total_k, nheads_k, d_v)
     // o: (total_q, nheads, d_v)
 
     // bias:(total_q, max_seqlen_k)
@@ -54,14 +52,34 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     ck_tile::index_t total_k = k.size(0) * page_block_size;
 
     ck_tile::index_t stride_q       = q.stride(-3);
-    ck_tile::index_t stride_k       = k.stride(-3);
-    ck_tile::index_t stride_v       = v.stride(-3);
+    ck_tile::index_t stride_k;
+    ck_tile::index_t stride_v;
+    
+    // Strictly enforce 5D swizzled layout
+    TORCH_CHECK(k.dim() == 5, "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/8, PageSize, 8]");
+    TORCH_CHECK(v.dim() == 5, "V tensor must be 5D [NumBlocks, NumHeads, PageSize/8, HeadDim, 8]");
+    TORCH_CHECK(k.is_contiguous(), "K tensor must be contiguous for swizzled layout");
+    TORCH_CHECK(v.is_contiguous(), "V tensor must be contiguous for swizzled layout");
+
+    // Swizzled Layout Strides
+    // K: [NumBlocks, NumHeads, HeadDim/8, PageSize, 8] -> stride(-2) corresponds to PageSize dim stride
+    // V: [NumBlocks, NumHeads, PageSize/8, HeadDim, 8] -> stride(-2) corresponds to HeadDim dim stride
+    stride_k = k.stride(-2); 
+    stride_v = v.stride(-2); 
+    
+    TORCH_CHECK(stride_k == 8, "stride_k (PageSize stride) must be 8 in 5D swizzled layout");
+    TORCH_CHECK(stride_v == 8, "stride_v (HeadDim stride) must be 8 in 5D swizzled layout");
+    TORCH_CHECK(k.stride(-1) == 1 && k.size(-1) == 8, "K last dim must be 8 and contiguous");
+    TORCH_CHECK(v.stride(-1) == 1 && v.size(-1) == 8, "V last dim must be 8 and contiguous");
+
     ck_tile::index_t stride_o       = out.stride(-3);
     ck_tile::index_t stride_randval = has_dropout_randval ? dropout_randval.stride(1) : 0;
 
     ck_tile::index_t nhead_stride_q       = q.stride(-2);
-    ck_tile::index_t nhead_stride_k       = k.stride(-2);
-    ck_tile::index_t nhead_stride_v       = v.stride(-2);
+    // For 5D, Head dim is at index 1
+    ck_tile::index_t nhead_stride_k       = k.stride(1);
+    ck_tile::index_t nhead_stride_v       = v.stride(1);
+    
     ck_tile::index_t nhead_stride_o       = out.stride(-2);
     ck_tile::index_t nhead_stride_lse     = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t nhead_stride_randval = has_dropout_randval ? dropout_randval.stride(0) : 0;
@@ -169,9 +187,9 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
 }
 
 std::vector<at::Tensor>
-mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d] or [page_num, page_size, hq, d]
-                  const at::Tensor& k, // [total_k, hk, d] or [page_num, page_size, hk, d]
-                  const at::Tensor& v, // [total_k, hk, d] or [page_num, page_size, hk, d]
+mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
+                  const at::Tensor& k, // [num_blocks, hk, d/8, block_size, 8]
+                  const at::Tensor& v, // [num_blocks, hk, block_size/8, d, 8]
                   const at::Tensor& cu_seqlens_q, // [b+1]
                   const at::Tensor& kv_indptr,    // [b+1]
                   const at::Tensor& kv_page_indices,
@@ -218,6 +236,8 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d] or [page_num, page_si
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    CHECK_CONTIGUOUS(k);
+    CHECK_CONTIGUOUS(v);
     CHECK_CONTIGUOUS(cu_seqlens_q);
     CHECK_CONTIGUOUS(kv_indptr);
 
@@ -226,11 +246,19 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d] or [page_num, page_si
     const int batch_size  = cu_seqlens_q.numel() - 1;
     int num_heads         = sizes[1];
     const int head_size_q = sizes[2];
-    const int head_size_v = v.size(-1);
-    const int num_heads_k = k.size(-2);
+    
+    TORCH_CHECK(k.dim() == 5, "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/8, PageSize, 8]");
+    TORCH_CHECK(v.dim() == 5, "V tensor must be 5D [NumBlocks, NumHeads, PageSize/8, HeadDim, 8]");
+
+    // K: [NumBlocks, NumHeads, HeadDim/8, PageSize, 8]
+    const int num_heads_k = k.size(1);
+    const int page_block_size = k.size(3);
+    TORCH_CHECK(page_block_size % 8 == 0, "Swizzled KV requires page size divisible by 8");
+    
+    // V: [NumBlocks, NumHeads, PageSize/8, HeadDim, 8]
+    const int head_size_v = v.size(3);
 
     const int num_blocks      = k.size(0);
-    const int page_block_size = k.dim() == 3 ? 1 : k.size(1);
 
     if(max_seqlen_q == 1 && !alibi_slopes_.has_value())
     {
@@ -290,20 +318,11 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d] or [page_num, page_si
     }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
-    if(k.dim() == 3)
-    {
-        CHECK_SHAPE(k, num_blocks, num_heads_k, head_size_q);
-        CHECK_SHAPE(v, num_blocks, num_heads_k, head_size_v);
-    }
-    else if(k.dim() == 4)
-    {
-        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size_q);
-        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size_v);
-    }
-    else
-    {
-        TORCH_CHECK(false, "Currently only supports dim equal to 3 or dim equal to 4");
-    }
+    
+    // K: [NumBlocks, NumHeads, HeadDim/8, PageSize, 8]
+    CHECK_SHAPE(k, num_blocks, num_heads_k, head_size_q / 8, page_block_size, 8);
+    // V: [NumBlocks, NumHeads, PageSize/8, HeadDim, 8]
+    CHECK_SHAPE(v, num_blocks, num_heads_k, page_block_size / 8, head_size_v, 8);
 
     if(page_block_size > 1)
     {

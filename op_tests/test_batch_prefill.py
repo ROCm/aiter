@@ -106,13 +106,12 @@ def ref_masked_attention(
         (2048, 2048),
     ],
 )
-@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("page_size", [1, 1024])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (3, 1)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["NHD"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("contiguous_kv", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("q_init_min,q_init_max", [(-10, 10)])
 @pytest.mark.parametrize("kv_init_min,kv_init_max", [(-5, 5)])
@@ -128,7 +127,6 @@ def test_batch_prefill_with_paged_kv_cache(
     causal,
     kv_layout,
     logits_soft_cap,
-    contiguous_kv,
     dtype,
     q_init_min,
     q_init_max,
@@ -144,6 +142,8 @@ def test_batch_prefill_with_paged_kv_cache(
 
     if head_dim == 64 and qo_len <= 64:
         pytest.skip("Unsupported configuration")
+    if page_size % 8 != 0:
+        pytest.skip("Swizzled V layout requires page size divisible by 8")
 
     def create_tensor(min, max, *args, **kwargs):
         x = torch.randn(*args, **kwargs)
@@ -164,28 +164,10 @@ def test_batch_prefill_with_paged_kv_cache(
     max_num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = max_num_pages_per_seq * batch_size
     kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]
-    if not contiguous_kv:
-        tmp = [kv_shape[0]]
-        for v in kv_shape[1:]:
-            tmp.append(2)
-            tmp.append(v)
-        kv_shape = tmp
-        kv_data_fp32 = create_tensor(
-            kv_init_min, kv_init_max, *kv_shape, dtype=torch.float32
-        ).to(0)
-        kv_data = kv_data_fp32.to(dtype)
-        kv_data = kv_data[:, 1, :, 1, :, 1, :, 1, :]
-        kv_data_fp32 = kv_data_fp32[:, 1, :, 1, :, 1, :, 1, :]
-        # actual data is stored in non-contiguous memory
-        assert (
-            kv_data.stride(-4)
-            != kv_data.shape[-3] * kv_data.shape[-2] * kv_data.shape[-1]
-        )
-    else:
-        kv_data_fp32 = create_tensor(
-            kv_init_min, kv_init_max, *kv_shape, dtype=torch.float32
-        ).to(0)
-        kv_data = kv_data_fp32.to(dtype)
+    kv_data_fp32 = create_tensor(
+        kv_init_min, kv_init_max, *kv_shape, dtype=torch.float32
+    ).to(0)
+    kv_data = kv_data_fp32.to(dtype)
     if 1 < batch_size:
         kv_lens = torch.maximum(
             qo_lens, torch.randint(1, kv_len + 1, (batch_size,))
@@ -205,8 +187,20 @@ def test_batch_prefill_with_paged_kv_cache(
     kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
 
     chunks = torch.chunk(kv_data, 2, dim=1)
-    k_cache = chunks[0].squeeze(1).squeeze(1)
-    v_cache = chunks[1].squeeze(1).squeeze(1)
+    k_cache_ref = chunks[0].squeeze(1).squeeze(1)
+    v_cache_ref = chunks[1].squeeze(1).squeeze(1)
+
+    # Swizzle K and V for the kernel
+    # K: [NumPages, PageSize, NumHeads, HeadDim] -> [NumPages, NumHeads, HeadDim/8, PageSize, 8]
+    assert head_dim % 8 == 0, "Head dim must be divisible by 8 for swizzled K layout"
+    k_cache = k_cache_ref.view(total_num_pages, page_size, num_kv_heads, head_dim // 8, 8) \
+                         .permute(0, 2, 3, 1, 4).contiguous()
+
+    # V: [NumPages, PageSize, NumHeads, HeadDim] -> [NumPages, NumHeads, PageSize/8, HeadDim, 8]
+    # Note: PageSize must be divisible by 8 for this layout
+    assert page_size % 8 == 0, "Page size must be divisible by 8 for swizzled V layout"
+    v_cache = v_cache_ref.view(total_num_pages, page_size // 8, 8, num_kv_heads, head_dim) \
+                         .permute(0, 3, 1, 4, 2).contiguous()
 
     o_ck_flash_attn = aiter.mha_batch_prefill_func(
         q,
@@ -326,9 +320,9 @@ parser.add_argument(
     "--pagesize",
     type=int,
     const=None,
-    default=16,
+    default=1024,
     help="""page size.
-    e.g.: -p 16""",
+    e.g.: -p 1024""",
 )
 parser.add_argument(
     "-q",
@@ -376,7 +370,6 @@ if __name__ == "__main__":
             causal=causal,
             kv_layout="NHD",
             logits_soft_cap=logits_soft_cap,
-            contiguous_kv=True,
             dtype=dtype,
             q_init_min=-10,
             q_init_max=10,

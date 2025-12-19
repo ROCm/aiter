@@ -2595,8 +2595,10 @@ def mha_batch_prefill_fake_tensors(
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if k.dim() != 5 or v.dim() != 5:
+        raise ValueError("Batch prefill requires 5D swizzled K/V tensors")
     num_heads = q.size(1)  # num_heads = q.sizes()[1]
-    head_size_v = v.size(2)  # head_size_v = v.size(2)
+    head_size_v = v.size(-2)  # head_size_v = v.size(-2)
     total_q = q.size(0)  # total_q = q.size(0)
 
     if out is None:
@@ -2739,12 +2741,17 @@ def mha_batch_prefill_func(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(-1)
-    head_size_v_og = v.size(-1)
-    if head_size_q_og % 8 != 0:
-        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
-        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
-    if head_size_v_og % 8 != 0:
-        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    if k.dim() != 5 or v.dim() != 5:
+        raise ValueError("Batch prefill requires 5D swizzled K/V tensors")
+    head_size_v_og = v.size(-2)
+    if head_size_q_og % 8 != 0 or head_size_v_og % 8 != 0:
+        raise ValueError("Swizzled KV requires head size divisible by 8")
+    if k.size(-3) * 8 != head_size_q_og:
+        raise ValueError("K swizzled layout does not match Q head size")
+    if k.size(-2) % 8 != 0:
+        raise ValueError("Swizzled KV requires page size divisible by 8")
+    if not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("Swizzled KV requires contiguous K/V")
     out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
         q,
         k,
