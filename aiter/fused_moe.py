@@ -1471,9 +1471,8 @@ def cktile_moe_stage1(
 
     if w1.dtype is torch.uint32:
         D = D * 8
-    out = torch.empty(
-        (token_num, topk, D), dtype=dtype, device=hidden_states.device
-    )
+    out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
+
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
