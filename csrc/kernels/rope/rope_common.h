@@ -2662,15 +2662,15 @@ std::tuple<dim3, dim3> get_grid_config(const int32_t size_s_h,
                                        const int32_t size_b,
                                        const int32_t size_f)
 {
-    constexpr int32_t kNumWarps   = 4;
-    constexpr int32_t kNumThreads = kNumWarps * ck_tile::get_warp_size();
+    constexpr int32_t num_warps   = 4;
+    constexpr int32_t num_threads = num_warps * ck_tile::get_warp_size();
 
     const int32_t size_r              = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
     const int32_t size_half_r         = size_r >> 1;
     const int32_t aligned_size_half_r = ck_tile::next_power_of_two(size_half_r);
 
-    const int32_t block_dim_x = min(aligned_size_half_r, ck_tile::get_warp_size());
-    const int32_t block_dim_y = max(kNumThreads / block_dim_x, 1);
+    const int32_t block_dim_x = std::min(aligned_size_half_r, ck_tile::get_warp_size());
+    const int32_t block_dim_y = std::max(num_threads / block_dim_x, 1);
 
     if constexpr(Is2D)
     {
