@@ -2001,6 +2001,7 @@ def fav3_sage_triton_impl(
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     config = get_fwd_configs(False)
+
     attn_fwd[grid](
         q,
         k,

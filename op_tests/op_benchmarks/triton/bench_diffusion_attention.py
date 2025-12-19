@@ -502,7 +502,7 @@ def bench_kernel(q, k, v, args, provider):
                     q,
                     k,
                     v,
-                    tensor_layout=args.sagev1_layout,
+                    tensor_layout="NHD",
                     sm_scale=softmax_scale,
                     k_smooth=k_smooth,
                 )
@@ -634,7 +634,6 @@ def run_benchmark(args):
         """
         Benchmark function for attention kernels with generated random inputs.
         """
-        assert args.sagev1_layout == "NHD"
         assert args.layout == "bshd"
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         assert causal == False, "Causal not supported in this benchmark."
