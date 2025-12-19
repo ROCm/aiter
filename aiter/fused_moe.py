@@ -221,7 +221,7 @@ def fused_moe_(
     bf16_fp8_bound = 512
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
-            if M < bf16_fp8_bound:
+            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             elif M >= bf16_fp8_bound:
                 q_dtype_a = dtypes.fp8
