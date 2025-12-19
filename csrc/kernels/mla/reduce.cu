@@ -609,6 +609,8 @@ __global__ void kn_mla_reduce_v1(
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD, 128, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  64, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD, 128, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     else MLA_REDUCE_ERROR(NUM_HEAD, HEAD_DIM, NAME);
 

@@ -356,8 +356,14 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         (q_dtype == at::ScalarType::Float8_e4m3fnuz || q_dtype == at::ScalarType::Float8_e4m3fn);
     const bool kv_is_fp8 =
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
-    const bool natively_supported =
-        (num_heads == 16) || ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
+
+    const bool q_is_bf16  = q_dtype == at::ScalarType::BFloat16;
+    const bool kv_is_bf16 = kv_dtype == at::ScalarType::BFloat16;
+
+    const bool natively_supported = (num_heads == 16) ||
+                                    ((num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
+                                    ((num_heads == 64) && q_is_bf16 && kv_is_bf16);
+
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
         qk_batch_ratio = num_heads / 16;
@@ -371,7 +377,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         uni_seqlen_qo = 1;
     }
 
-    TORCH_CHECK((num_heads == 16) || (num_heads == 128),
+    TORCH_CHECK((num_heads == 16) || (num_heads == 128) || ((num_heads == 64) && q_is_bf16 && kv_is_bf16),
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).")
