@@ -788,7 +788,6 @@ def fused_quant_fp8_sort(
     ), f"N ({N}) must be multiple of quant_block_size ({quant_block_size})"
     assert block_size % 32 == 0, "block_size must be multiple of 32"
 
-    M_sorted = sorted_ids.shape[0]
     N_blocks = triton.cdiv(N, block_size)
 
     if quant_dtype == dtypes.fp8:

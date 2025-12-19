@@ -265,7 +265,7 @@ template torch::Tensor
             if missing:
                 for mis in missing:
                     placeholders.remove(mis)
-            result = template
+            # result = template
             # for placeholder in placeholders:
             #     result = result.replace(placeholder, str_mapping[placeholder])
             # return result

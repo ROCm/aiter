@@ -106,7 +106,6 @@ def per_1x32_f8_scale_f8_quant(
 ):
     assert quant_dtype == dtypes.fp8
     block_size = 32
-    F8E8M0_EXP_BIAS = 127
     dtypeMax = 448.0
     MAX_POW2 = int(torch.log2(torch.tensor(dtypeMax, dtype=torch.float32)).item())
     dtypeMax = 2.0**MAX_POW2
