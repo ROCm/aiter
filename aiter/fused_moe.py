@@ -1409,6 +1409,7 @@ def ck_moe_stage1(
     quant_type=aiter.QuantType.No,
     activation=ActivationType.Gelu,
     splitk=1,
+    dtype=None,
 ):
     token_num = hidden_states.shape[0]
     tmp_out = (
