@@ -337,9 +337,9 @@ struct tuple_base<seq<I...>, T...> : tuple_object<I, T>... {
 };
 } // namespace impl
 template <class... T>
-struct tuple : impl::tuple_base<make_index_seq<sizeof...(T)>, T...> {
+struct tuple : impl::tuple_base<make_index_seq<sizeof...(T)>, remove_cvref_t<T>...> {
     OPUS_H_D static constexpr index_t size() { return sizeof...(T); }
-    using base = impl::tuple_base<make_index_seq<sizeof...(T)>, T...>;
+    using base = impl::tuple_base<make_index_seq<sizeof...(T)>, remove_cvref_t<T>...>;
     OPUS_H_D constexpr tuple() = default;
 
     template <typename U, typename std::enable_if<sizeof...(T) == 1 && !std::is_same<remove_cvref_t<U>, tuple>::value, bool>::type = false>
@@ -349,9 +349,23 @@ struct tuple : impl::tuple_base<make_index_seq<sizeof...(T)>, T...> {
     OPUS_H_D constexpr tuple(U&&... u) : base(std::forward<U>(u)...) {}
 };
 
-template <index_t I, class... T> OPUS_H_D constexpr decltype(auto) get(tuple<T...> const& t) { static_assert(I < sizeof...(T)); return impl::getv<I>(t); }
-template <index_t I, class... T> OPUS_H_D constexpr decltype(auto) get(tuple<T...>& t)       { static_assert(I < sizeof...(T)); return impl::getv<I>(t); }
-template <index_t I, class... T> OPUS_H_D constexpr decltype(auto) get(tuple<T...>&& t)      { static_assert(I < sizeof...(T)); return impl::getv<I>(std::move(t)); }
+template <index_t I, class... T> OPUS_H_D constexpr decltype(auto) get(tuple<T...> const& t) { 
+    static_assert(I < sizeof...(T)); 
+    using stored_type = remove_cvref_t<std::tuple_element_t<I, std::tuple<T...>>>;
+    return impl::getv<I, stored_type>(t); 
+}
+
+template <index_t I, class... T> OPUS_H_D constexpr decltype(auto) get(tuple<T...>& t) { 
+    static_assert(I < sizeof...(T)); 
+    using stored_type = remove_cvref_t<std::tuple_element_t<I, std::tuple<T...>>>;
+    return impl::getv<I, stored_type>(t); 
+}
+
+template <index_t I, class... T> OPUS_H_D constexpr decltype(auto) get(tuple<T...>&& t) { 
+    static_assert(I < sizeof...(T)); 
+    using stored_type = remove_cvref_t<std::tuple_element_t<I, std::tuple<T...>>>;
+    return impl::getv<I, stored_type>(std::move(t)); 
+}
 
 template <index_t I0, index_t I1, index_t... Is, class T>  /*recursive get*/
 OPUS_H_D constexpr decltype(auto) get(T&& t) { return get<I1, Is...>(get<I0>(std::move(t))); }
@@ -627,25 +641,65 @@ template<index_t cached_vec, typename Layout> struct is_layout<layout_cached<cac
 template<typename Layout> struct is_layout<layout_linear<Layout>> : true_type {};
 template<typename T> constexpr bool is_layout_v = is_layout<remove_cvref_t<T>>::value;
 
+namespace impl {
+template<typename Shape, typename Coord, index_t... Is>
+OPUS_H_D constexpr auto get_non_underscore_dims_impl(const Shape&, const Coord&, seq<Is...>) {
+    return opus::concat_tuple(
+        std::conditional_t<
+            !is_underscore_v<remove_cvref_t<decltype(get<Is>(Coord{}))>>,
+            opus::tuple<decltype(get<Is>(Shape{}))>,
+            opus::tuple<>
+        >{}...
+    );
+}
+}
+
 template <typename Layout>
 OPUS_H_D constexpr auto layout_to_issue_space() {
-    using maybe_coord = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, typename Layout::Coord>;
-    using issue_space_y = remove_cvref_t<decltype(pickup_shape(typename Layout::Shape{}, maybe_coord{}, underscore{}))>;
-    using single_issue_space = remove_cvref_t<decltype(make_repeated_tuple(number<1>{}, number<size<typename Layout::Shape>()>{}))>;
-    using fallback_issue_space_y = std::conditional_t<std::is_same_v<issue_space_y, opus::tuple<>>, single_issue_space, issue_space_y>;
-    using issue_space = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, single_issue_space, fallback_issue_space_y>;
-    return issue_space{};
+    if constexpr (std::is_same_v<typename Layout::Coord, false_type>) {
+        // no coord (non layout_cached)
+        return make_repeated_tuple(number<1>{}, number<Layout::rank>{});
+    } else {
+        // coord passed through
+        constexpr auto non_underscore_dims = impl::get_non_underscore_dims_impl(
+            typename Layout::Shape{}, 
+            typename Layout::Coord{}, 
+            make_index_seq<Layout::rank>{}
+        );
+        
+        // check non_underscore dims with coord_rank, should be same
+        static_assert(size<decltype(non_underscore_dims)>() == Layout::coord_rank,
+                     "Non-underscore dimensions count must equal coord_rank");
+        
+        return non_underscore_dims;
+    }
 }
 
 template<typename issue_space, int vec = 1>
 OPUS_H_D constexpr auto vectorize_issue_space(issue_space, number<vec> = {}) {
-    constexpr index_t vec_from_issue_space = get<size<issue_space>() - 1>(issue_space{}).value;     // here we get the original last dim length(which should be y dim)
-    static_assert(vec_from_issue_space % vec == 0, "please make sure requested vec size can be dividable of vec from issue space");
+    constexpr auto N = size<issue_space>();
+    constexpr auto last_elem = get<N - 1>(issue_space{});
+    
+    static_assert(is_constant_v<decltype(last_elem)>, 
+                  "issue_space elements must be number<> types");
+    
+    constexpr index_t vec_from_issue_space = last_elem.value;
+    static_assert(vec_from_issue_space % vec == 0, 
+                  "please make sure requested vec size can be dividable of vec from issue space");
 
-    constexpr auto issue_space_vec = transform_tuple_with_idx([&](auto item, auto index){           // modify the last dim, divide it by vec. Result is still a tuple
-        if constexpr (index.value == size<issue_space>() - 1) return number<item.value / vec_from_issue_space>{};
-        else                                                  return item;    }, issue_space{});
-    return issue_space_vec;
+    return []<index_t... Is>(seq<Is...>) -> decltype(auto) {
+        return opus::make_tuple(
+            [&]<index_t I>() -> decltype(auto) {
+                constexpr auto elem = get<I>(issue_space{});
+                if constexpr (I == N - 1) {
+                    constexpr index_t new_val = elem.value / vec;
+                    return number<new_val>{};
+                } else {
+                    return elem;
+                }
+            }.template operator()<Is>()...
+        );
+    }(make_index_seq<N>{});
 }
 
 template <index_t vec, typename Layout>
@@ -804,7 +858,7 @@ OPUS_H_D constexpr auto set_slice(C&& dst_c, V&& src_c, S&&...ss) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // BELOW IS AMDGPU SPECIFIC TYPES/ARCH/INTRINSICS
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// dtype, suffix is "_t", and register corresponding ext_vector_type, and a specialization of is_dtype
+// dtype, sufix is "_t", and register corresponding ext_vector_type, and a specialization of is_dtype
 #define REGISTER_DTYPE(dtype_base_, dtype_impl_)        \
     using dtype_base_ ## _t    = dtype_impl_;           \
     using dtype_base_ ## x1_t  = dtype_base_ ## _t __attribute__((ext_vector_type(1 )));    \
@@ -907,7 +961,6 @@ template<> OPUS_D float       min<float>(const float&a, const float&b) { return 
 
 template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = max(a, b); return max(max_0, max(min_0, c)); }
 template<> OPUS_D float       med3<float>(const float&a, const float&b, const float&c) { return __builtin_amdgcn_fmed3f(a, b, c); }
-template<> OPUS_D __fp16      med3<__fp16>(const __fp16&a, const __fp16&b, const __fp16&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // buffer load/store related
 OPUS_D constexpr auto buffer_default_config() {
@@ -1109,6 +1162,7 @@ template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_wa
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // mfma
+
 #define DISPATCH_MFMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) {  return inst_(a, b, c, cbsz, abid, blgp); }
 
@@ -1177,7 +1231,10 @@ namespace impl{ // utlity function to play with shape
 template<typename Shape, typename FDim, typename Target, index_t... Is>
 OPUS_D static constexpr auto pickup_shape_impl(const Shape&, const FDim&, Target, seq<Is...>) {
     static_assert(size<Shape>() == size<FDim>());
-    return concat_tuple(std::conditional_t< std::is_same_v<decltype(get<Is>(FDim{})), remove_cvref_t<Target>>,  tuple<decltype(get<Is>(Shape{}))>,  tuple<> >{}...);
+    // Use remove_cvref_t to ensure we store values, not references
+    return concat_tuple(std::conditional_t< std::is_same_v<remove_cvref_t<decltype(get<Is>(FDim{}))>, remove_cvref_t<Target>>,  
+                                            tuple<remove_cvref_t<decltype(get<Is>(Shape{}))>>,  
+                                            tuple<> >{}...);
 }
 
 template<typename Shape, typename Dim, index_t SStart, index_t DIdx, index_t... Ss /* index for Dim not Shape */>
@@ -1349,7 +1406,9 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 }
+
 // helper class to create adaptor instance for mfma, need be paired with make_mfma(). don't directly use it
+
 struct mfma_adaptor         { template<typename M> OPUS_D decltype(auto) operator()(M&&) { return impl::mfma_adaptor<remove_cvref_t<M>>{};} };
 struct mfma_adaptor_swap_ab { template<typename M> OPUS_D decltype(auto) operator()(M&&) { return impl::mfma_adaptor_swap_ab<remove_cvref_t<M>>{};} };
 
@@ -1468,7 +1527,7 @@ OPUS_D decltype(auto) make_tiled_mma(ES, TS, WS, WA&& = {}, TA&& = {}) {
             number<get<0>(ES{})>{}, number<get<1>(ES{})>{}, number<get<2>(ES{})>{}, number<get<0>(TS{})>{}, number<get<1>(TS{})>{}, number<get<2>(TS{})>{});
 }
 
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////
 // partition, use cached_vec to dispatch which layout implementation. cached_vec < 0 : "layout", cached_vec == 0 : "layout_linear", cached_vec > 0 : "layout_cached"
 template<index_t cached_vec = 0, typename M> OPUS_D constexpr auto partition_layout_a(M&& mma) { return mma.template layout_a<cached_vec>(); }
 template<index_t cached_vec = 0, typename M> OPUS_D constexpr auto partition_layout_b(M&& mma) { return mma.template layout_b<cached_vec>(); }
