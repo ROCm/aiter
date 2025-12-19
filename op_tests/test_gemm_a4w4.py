@@ -100,7 +100,6 @@ def test_gemm(dtype, M, N, K):
     x, x_scales_shuffle = quant_func(x, shuffle=True)
     w, w_scales_shuffle = quant_func(w, shuffle=True)
     wshuffle = shuffle_weight(w, layout=(16, 16))
-    bias_f32 = None
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
     a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
@@ -117,13 +116,13 @@ def test_gemm(dtype, M, N, K):
         w_scales_shuffle,
         bpreshuffle=True,
     )
-    err = checkAllclose(a, c[:M], msg="unified api")
+    err = checkAllclose(a, c, msg="unified api")
     ret["us"] = us
     ret["TFLOPS"] = M * N * K * 2 / us / 1e6
     ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
     ret["err"] = err
 
-    # kernelName = "" #"_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
+    # kernelName = "" # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
     # log2_k_split = 1
     # out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     # d, us = run_gemm_asm(

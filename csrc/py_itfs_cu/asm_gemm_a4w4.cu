@@ -113,7 +113,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
         if(cfg.bpreshuffle == bpreshuffle_en &&
            (cfg.splitK >= log2_k_split_en))
         {
-            // tile128x512 may mot support N % cfg.tile_N != 0
+            // tile128x512 may not support N % cfg.tile_N != 0
             if(cfg.tile_M != 128 || cfg.tile_N != 512 || (N % cfg.tile_N) == 0)
             {
                 std::vector<int> splitK_list =
