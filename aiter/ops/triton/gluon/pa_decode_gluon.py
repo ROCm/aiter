@@ -620,7 +620,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
-    shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
 
     # Key cache layout - optimized for CDNA3 architecture
     blocked_key_layout: gl.constexpr = gl.BlockedLayout(
@@ -798,9 +797,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     query_tensor = gl.amd.cdna3.buffer_load(
         ptr=query_ptr, offsets=query_offsets_base, mask=query_mask
     )
-    query_shared = gl.allocate_shared_memory(
-        query_tensor.dtype, query_tensor.shape, shared_query_layout, query_tensor
-    )
 
     # ==================== Query Quantization Scale Handling ====================
     if QUERY_QUANT_MODE == 0:
@@ -969,7 +965,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
         # Convert layouts for MFMA operation
         query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_layout)
-        # query_converted = query_shared.load(qk_lhs_layout)
         key_converted = gl.convert_layout(key_block, layout=qk_rhs_layout)
         query_converted = query_converted.to(COMPUTE_TYPE)
         key_converted = key_converted.to(COMPUTE_TYPE)
@@ -2066,49 +2061,12 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         value_threads_per_warp: gl.constexpr = (
             [4, 16, 1] if KV_BLOCK_SIZE == 16 else [1, 16, 4]
         )
-        v_blK_layout: gl.constexpr = gl.BlockedLayout(
+        blocked_value_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 1, 16],
             threads_per_warp=value_threads_per_warp,
             warps_per_cta=[1, 4, 1],
             order=[2, 1, 0],
         )
-
-        if MAX_NUM_KV_BLOCKS_PER_COMPUTE == 4:
-            v_bkl_64_reg_base: gl.constexpr = (
-                (0, 0, 1),
-                (0, 0, 2),
-                (0, 0, 4),
-                (0, 0, 8),
-                (0, 64, 0),
-                (1, 0, 0),
-                (2, 0, 0),
-            )
-        else:
-            v_bkl_64_reg_base: gl.constexpr = (
-                (0, 0, 1),
-                (0, 0, 2),
-                (0, 0, 4),
-                (0, 0, 8),
-                (0, 64, 0),
-                (1, 0, 0),
-            )
-        v_blK_64_layout: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=v_bkl_64_reg_base,
-            lane_bases=(
-                (0, 1, 0),
-                (0, 2, 0),
-                (0, 4, 0),
-                (0, 8, 0),
-                (0, 0, 16),
-                (0, 0, 32),
-            ),
-            warp_bases=((0, 16, 0), (0, 32, 0)),
-            block_bases=[],
-            shape=[MAX_NUM_KV_BLOCKS_PER_COMPUTE, 128, 64],
-        )
-
-        # blocked_value_layout: gl.constexpr = v_blK_layout if KV_BLOCK_SIZE == 16 else v_blK_64_layout
-        blocked_value_layout: gl.constexpr = v_blK_layout
 
         value_dim1_offsets = gl.arange(
             0,
@@ -2347,7 +2305,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         #     print("QKV_per_token")
 
         # Convert layouts for MFMA operation
-        # query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
         query_converted = query_shared.load(qk_lhs_operand_layout)
         key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
 
@@ -2590,8 +2547,6 @@ def paged_attention_decode_v2_reduce_kernel(
         Various stride parameters for tensor access
         Compile-time constants for kernel configuration (no MAX_CONTEXT_PARTITION_NUM needed)
     """
-    # Mathematical constant for exponential calculations
-    LOG2_E: tl.constexpr = 1.4426950408889634
     MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
 
     # ==================== INITIALIZATION ====================
