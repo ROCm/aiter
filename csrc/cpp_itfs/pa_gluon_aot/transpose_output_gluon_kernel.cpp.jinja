@@ -1,0 +1,49 @@
+#include "{{triton_header}}"
+
+
+extern "C" {
+void {{func_name}}(void* input_ptr,              // Input tensor pointer
+                    void* output_ptr,             // Output tensor pointer
+                    int batch_size,
+                    int seq_len,
+                    int num_kv_heads,
+                    int query_group_size,
+                    int last_dim,                 // head_size or 1 for scale
+                    int stride_input_batch,
+                    int stride_input_kv_head,
+                    int stride_input_seq,
+                    int stride_input_group,
+                    int stride_output_batch_seq,
+                    int stride_output_merged,
+                    int grid_dim_0,               // Grid dimension 0
+                    int grid_dim_1,               // Grid dimension 1
+                    int grid_dim_2,               // Grid dimension 2
+                    void* stream
+                    );
+}
+
+
+void {{func_name}}(void* input_ptr,              // Input tensor pointer
+                    void* output_ptr,             // Output tensor pointer
+                    int batch_size,
+                    int seq_len,
+                    int num_kv_heads,
+                    int query_group_size,
+                    int last_dim,                 // head_size or 1 for scale
+                    int stride_input_batch,
+                    int stride_input_kv_head,
+                    int stride_input_seq,
+                    int stride_input_group,
+                    int stride_output_batch_seq,
+                    int stride_output_merged,
+                    int grid_dim_0,               // Grid dimension 0
+                    int grid_dim_1,               // Grid dimension 1
+                    int grid_dim_2,               // Grid dimension 2
+                    void* stream
+                    ){
+    {{triton_kernel}}(reinterpret_cast<hipStream_t>(stream), input_ptr, output_ptr, 
+                      batch_size, seq_len, num_kv_heads, query_group_size, last_dim,
+                      stride_input_batch, stride_input_kv_head, stride_input_seq, 
+                      stride_input_group, stride_output_batch_seq, stride_output_merged,
+                      grid_dim_0, grid_dim_1, grid_dim_2);
+}

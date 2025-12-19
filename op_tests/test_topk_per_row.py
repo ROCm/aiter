@@ -157,19 +157,31 @@ def run_top_k_per_row_decode(
     numRows: int,
     stride0: int,
     stride1: int,
+    fast: bool,
 ) -> None:
     """
     Run the top_k_per_row kernel.
     """
-    return aiter.top_k_per_row_decode(
-        logits,
-        next_n,
-        seqLens,
-        indices,
-        numRows,
-        stride0,
-        stride1,
-    )
+    if fast:
+        return aiter.top_k_per_row_decode_fast(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+        )
+    else:
+        return aiter.top_k_per_row_decode(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+        )
 
 
 @benchmark()
@@ -231,7 +243,8 @@ def test_top_k_per_row_decode(
     top_k: int,
     next_n: int,
     data_generation: str = "random",
-) -> None:
+    fast: bool = False,
+) -> dict:
     """
     Test top_k_per_row_decode with seq_lens tensor.
     """
@@ -246,7 +259,9 @@ def test_top_k_per_row_decode(
     row_indices = torch.arange(num_rows, device="cuda") // next_n
     next_n_offset = torch.arange(num_rows, device="cuda") % next_n
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
-    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    logits = create_random_logits(
+        row_starts, row_ends, torch.float32, 42, data_generation
+    )
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
@@ -260,6 +275,7 @@ def test_top_k_per_row_decode(
         num_rows,
         logits.stride(0),
         logits.stride(1),
+        fast,
     )
 
     torch.cuda.synchronize()
@@ -277,9 +293,10 @@ def test_top_k_per_row_decode(
     )
 
     # measure performance
-    # ret["context_len"] = logits.shape[1]
+    ret["context_len"] = logits.shape[1]
     ret["all_close"] = all_close
     ret["us"] = us
+    ret["fast"] = fast
     return ret
 
 
@@ -362,13 +379,18 @@ df = pd.DataFrame(df)
 aiter.logger.info(f"summary for top_k_per_row_prefill kernel:\n{df}")
 
 
-# df = []
-# for m in args.decode_batch_size:
-#     for ctx in args.context_len:
-#         for k in args.top_k:
-#             for n in args.next_n:
-#                 ret = test_top_k_per_row_decode(m, ctx, k, n)
-#                 df.append(ret)
+df = []
+for data_generation in args.data_generation:
+    for m in args.decode_batch_size:
+        for ctx in args.context_len:
+            for k in args.top_k:
+                for n in args.next_n:
+                    ret = test_top_k_per_row_decode(
+                        m, ctx, k, n, data_generation, False
+                    )
+                    df.append(ret)
+                    ret = test_top_k_per_row_decode(m, ctx, k, n, data_generation, True)
+                    df.append(ret)
 
-# df = pd.DataFrame(df)
-# aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")
