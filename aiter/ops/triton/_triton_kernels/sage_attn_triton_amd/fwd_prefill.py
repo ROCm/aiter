@@ -2399,3 +2399,237 @@ def _general_quant_kernel(
     x_quant = x_quant.to(output_ptrs.dtype.element_ty)
     tl.store(output_ptrs, x_quant, mask=mask)
     tl.store(scale_ptrs, scale)
+
+
+
+def quantize_v_fp8(
+    v: torch.Tensor, FP8_MAX: float, BLKK: int, tensor_layout: str = "NHD"
+):
+    # call the corresponding quantization function with the V_QUANT_SCHEME
+
+    if V_QUANT_SCHEME == 0:
+        return _v_per_block_fp8(v, FP8_MAX, BLKK, tensor_layout=tensor_layout)
+    elif V_QUANT_SCHEME == 1:
+        return _v_per_channel_fp8(v, FP8_MAX, tensor_layout=tensor_layout)
+
+
+def _v_per_block_fp8(v, FP8_MAX, BLKK=64, tensor_layout="NHD"):
+    """
+    Quantize V tensor to FP8 per-block scales.
+
+    Args:
+        v: Input V tensor of shape (B, N, H_kv, D_head
+              or (B, H_kv, N, D_head) depending on tensor_layout.
+        FP8_MAX: Maximum representable value in FP8 format.
+        BLKK: Block size for quantization.
+        tensor_layout: Layout of the tensor, either "HND" or "NHD".
+
+    Returns:
+        v_fp8: Quantized V tensor in FP8 format.
+        v_scale: Scale factors for each block.
+    """
+    v_fp8 = torch.empty(v.shape, dtype=torch.torch.float8_e4m3fnuz, device=v.device)
+
+    # Apply K tensor smoothing following SageAttention approach
+
+    if tensor_layout == "HND":
+        b, h_kv, kv_len, head_dim = v.shape
+
+        stride_bz_k, stride_h_k, stride_seq_k = v.stride(0), v.stride(1), v.stride(2)
+        stride_bz_ko, stride_h_ko, stride_seq_ko = (
+            v_fp8.stride(0),
+            v_fp8.stride(1),
+            v_fp8.stride(2),
+        )
+    elif tensor_layout == "NHD":
+        b, kv_len, h_kv, head_dim = v.shape
+
+        stride_bz_k, stride_h_k, stride_seq_k = v.stride(0), v.stride(2), v.stride(1)
+        stride_bz_ko, stride_h_ko, stride_seq_ko = (
+            v_fp8.stride(0),
+            v_fp8.stride(2),
+            v_fp8.stride(1),
+        )
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+
+    v_scale = torch.empty(
+        (b, h_kv, (kv_len + BLKK - 1) // BLKK), device=v.device, dtype=torch.float32
+    )
+
+    grid = ((kv_len + BLKK - 1) // BLKK, h_kv, b)
+    quant_per_block_fp8_kernel[grid](
+        v,
+        v_fp8,
+        v_scale,
+        kv_len,
+        stride_bz_k,
+        stride_h_k,
+        stride_seq_k,
+        stride_bz_ko,
+        stride_h_ko,
+        stride_seq_ko,
+        v_scale.stride(0),
+        v_scale.stride(1),
+        FP8_MAX=FP8_MAX,
+        C=head_dim,
+        BLK=BLKK,
+    )
+
+    return v_fp8, v_scale
+
+
+@triton.jit
+def quant_per_block_fp8_kernel(
+    Input,
+    Output,
+    Scale,
+    L,
+    stride_iz,
+    stride_ih,
+    stride_in,
+    stride_oz,
+    stride_oh,
+    stride_on,
+    stride_sz,
+    stride_sh,
+    FP8_MAX: tl.constexpr,
+    C: tl.constexpr,
+    BLK: tl.constexpr,
+):
+    off_blk = tl.program_id(0)
+    off_h = tl.program_id(1)
+    off_b = tl.program_id(2)
+
+    offs_n = off_blk * BLK + tl.arange(0, BLK)
+    offs_k = tl.arange(0, C)
+
+    input_ptrs = (
+        Input
+        + off_b * stride_iz
+        + off_h * stride_ih
+        + offs_n[:, None] * stride_in
+        + offs_k[None, :]
+    )
+    output_ptrs = (
+        Output
+        + off_b * stride_oz
+        + off_h * stride_oh
+        + offs_n[:, None] * stride_on
+        + offs_k[None, :]
+    )
+    scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk
+
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
+    x = x.to(tl.float32)
+    scale = tl.max(tl.abs(x)) / FP8_MAX
+    x_fp8 = x / scale
+    # x_fp8 += 0.5 * tl.where(x_fp8 >= 0, 1, -1)
+    x_fp8 = x_fp8.to(Scale.type.element_ty)
+    tl.store(output_ptrs, x_fp8, mask=offs_n[:, None] < L)
+    tl.store(scale_ptrs, scale)
+
+
+def _v_per_channel_fp8(v, FP8_MAX, tensor_layout="NHD"):
+    """
+    Quantize V tensor to FP8 per-channel scales.
+
+    Args:
+        v: Input V tensor of shape (B, N, H_kv, D_head
+                or (B, H_kv, N, D_head) depending on tensor_layout.
+        FP8_MAX: Maximum representable value in FP8 format.
+        BLKK: Block size for quantization.
+        tensor_layout: Layout of the tensor, either "HND" or "NHD".
+
+    Returns:
+        v_fp8: Quantized V tensor in FP8 format.
+        v_scale: Scale factors for each channel.
+    """
+    v_fp8 = torch.empty(v.shape, dtype=torch.torch.float8_e4m3fnuz, device=v.device)
+
+    # Apply K tensor smoothing following SageAttention approach
+
+    if tensor_layout == "HND":
+        b, h_kv, kv_len, head_dim = v.shape
+
+        stride_bz_k, stride_h_k, stride_seq_k = v.stride(0), v.stride(1), v.stride(2)
+        stride_bz_ko, stride_h_ko, stride_seq_ko = (
+            v_fp8.stride(0),
+            v_fp8.stride(1),
+            v_fp8.stride(2),
+        )
+    elif tensor_layout == "NHD":
+        b, kv_len, h_kv, head_dim = v.shape
+
+        stride_bz_k, stride_h_k, stride_seq_k = v.stride(0), v.stride(2), v.stride(1)
+        stride_bz_ko, stride_h_ko, stride_seq_ko = (
+            v_fp8.stride(0),
+            v_fp8.stride(2),
+            v_fp8.stride(1),
+        )
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+
+    v_scale = torch.empty((b, h_kv, head_dim), device=v.device, dtype=torch.float32)
+
+    grid = (head_dim, h_kv, b)
+    quant_per_channel_fp8_kernel[grid](
+        v,
+        v_fp8,
+        v_scale,
+        kv_len,
+        triton.next_power_of_2(kv_len),
+        stride_bz_k,
+        stride_h_k,
+        stride_seq_k,
+        stride_bz_ko,
+        stride_h_ko,
+        stride_seq_ko,
+        v_scale.stride(0),
+        v_scale.stride(1),
+        FP8_MAX=FP8_MAX,
+    )
+
+    return v_fp8, v_scale
+
+
+@triton.jit
+def quant_per_channel_fp8_kernel(
+    Input,
+    Output,
+    Scale,
+    L,
+    L_PADDED: tl.constexpr,
+    stride_iz,
+    stride_ih,
+    stride_in,
+    stride_oz,
+    stride_oh,
+    stride_on,
+    stride_sz,
+    stride_sh,
+    FP8_MAX: tl.constexpr,
+):
+
+    off_d = tl.program_id(0)
+    off_h = tl.program_id(1)
+    off_b = tl.program_id(2)
+
+    offs_l = tl.arange(0, L_PADDED)
+
+    input_ptrs = (
+        Input + off_b * stride_iz + off_h * stride_ih + offs_l * stride_in + off_d
+    )
+    output_ptrs = (
+        Output + off_b * stride_oz + off_h * stride_oh + offs_l * stride_on + off_d
+    )
+    scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_d
+
+    x = tl.load(input_ptrs, mask=offs_l < L)
+    x = x.to(tl.float32)
+    scale = tl.max(tl.abs(x)) / FP8_MAX
+    x_fp8 = x / scale
+    # x_fp8 += 0.5 * tl.where(x_fp8 >= 0, 1, -1)
+    x_fp8 = x_fp8.to(Scale.type.element_ty)
+    tl.store(output_ptrs, x_fp8, mask=offs_l < L)
+    tl.store(scale_ptrs, scale)
