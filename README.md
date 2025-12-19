@@ -39,7 +39,7 @@ pip install -e ".[triton_comms]"
 
 # Option 2: Install all optional dependencies
 pip install -e ".[all]"
-```
+ ```
 
 For more details, see [docs/triton_comms.md](docs/triton_comms.md).
 
@@ -68,11 +68,16 @@ This Branch contains GEAK optimized Triton kernels. These kernels are named with
 - `oh` = OpenHands agent
 - `oe` = OpenEvolve agent
 
-| Kernel Name | 12/2 |
-|-------------|------|
-| geak_oh_topk | 1.12X |
-| geak_oh_fused_fp8_quant | 1.31X|
-| geak_oh_fused_qkv_split_qk_rope | 1X |
-| geak_oh_moe_mxfp4 | 1.02X |
-| geak_oe_gemm_a16w16 | 2.44X |
-| geak_oe_unified_attention | 1.64X |
+**Location:** GEAK kernels can be found at:
+- Kernel implementations: `aiter/ops/triton/_triton_kernels/geak_*.py`
+- Wrapper APIs: `aiter/ops/triton/geak_*.py`
+
+| Kernel Name | 12/2 | 12/19 |
+|-------------|------|-------|
+| geak_oh_topk | 1.12X | |
+| geak_oh_fused_fp8_quant | 1.31X| |
+| geak_oh_fused_qkv_split_qk_rope | 1X | |
+| geak_oh_moe_mxfp4 | 1.02X | |
+| geak_oh_mxfp4_quant | | 1.33X |
+| geak_oe_gemm_a16w16 | 2.44X | |
+| geak_oe_unified_attention | 1.64X | |
