@@ -463,9 +463,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     if(a.mask_type == 3)
     {
+        // Note: sink_size=0 is passed as the 3rd parameter (attention sink not supported in bwd yet)
+        auto sink_size = 0;
         auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
             a.window_size_left,
             a.window_size_right,
+            sink_size,
             a.seqlen_q,
             a.seqlen_k,
             (a.ck_mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
