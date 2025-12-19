@@ -14,6 +14,10 @@ from aiter import (
     silu_and_mul,
 )
 
+from aiter.test_common import (
+    checkAllclose,
+)
+
 from aiter.ops.quant import per_tensor_quant_hip
 import aiter
 import torch.nn.functional as F
@@ -110,25 +114,31 @@ def test_fused_rms_fp8_per_tensor_static_quant(M: int, N1: int, N2: int, dtype):
     scale = torch.randn(1, dtype=torch.float32, device="cuda")
     x1, w1, x2, w2, res1 = generate_fused_rms_quant_data(M, N1, N2, dtype)
 
-    y1_q_torch, y1_torch, y2_torch, y1_res_torch = (
-        run_torch_rms_fp8_per_tensor_static_quant(
-            x1, w1, 1e-6, x2, w2, 1e-6, res1, dtype_quant, scale
-        )
+    (
+        y1_q_torch,
+        y1_torch,
+        y2_torch,
+        y1_res_torch,
+    ) = run_torch_rms_fp8_per_tensor_static_quant(
+        x1, w1, 1e-6, x2, w2, 1e-6, res1, dtype_quant, scale
     )
 
-    y1_q_triton, y1_triton, y2_triton, y1_res_triton = (
-        fused_rms_fp8_per_tensor_static_quant(
-            x1,
-            w1,
-            1e-6,
-            scale,
-            inp2=x2,
-            inp2_weight=w2,
-            inp2_epsilon=1e-6,
-            dtype_quant=dtype_quant,
-            res1=res1,
-            output_unquantized_inp1=True,
-        )
+    (
+        y1_q_triton,
+        y1_triton,
+        y2_triton,
+        y1_res_triton,
+    ) = fused_rms_fp8_per_tensor_static_quant(
+        x1,
+        w1,
+        1e-6,
+        scale,
+        inp2=x2,
+        inp2_weight=w2,
+        inp2_epsilon=1e-6,
+        dtype_quant=dtype_quant,
+        res1=res1,
+        output_unquantized_inp1=True,
     )
 
     torch.testing.assert_close(y1_torch, y1_triton, atol=0.1, rtol=0.1)
@@ -148,25 +158,31 @@ def test_fused_rms_fp8_group_quant(M: int, N1: int, N2: int, dtype):
     dtype_quant = aiter.dtypes.fp8
     x1, w1, x2, w2, res1 = generate_fused_rms_quant_data(M, N1, N2, dtype)
 
-    (y1_q_torch, y1_s_torch), y1_torch, y2_torch, y1_res_torch = (
-        run_torch_rms_fp8_group_quant(
-            x1, w1, 1e-6, x2, w2, 1e-6, res1, dtype_quant, group_size
-        )
+    (
+        (y1_q_torch, y1_s_torch),
+        y1_torch,
+        y2_torch,
+        y1_res_torch,
+    ) = run_torch_rms_fp8_group_quant(
+        x1, w1, 1e-6, x2, w2, 1e-6, res1, dtype_quant, group_size
     )
 
-    (y1_q_triton, y1_s_triton), y1_triton, y2_triton, y1_res_triton = (
-        fused_rms_fp8_group_quant(
-            x1,
-            w1,
-            1e-6,
-            inp2=x2,
-            inp2_weight=w2,
-            inp2_epsilon=1e-6,
-            group_size=group_size,
-            dtype_quant=dtype_quant,
-            res1=res1,
-            output_unquantized_inp1=True,
-        )
+    (
+        (y1_q_triton, y1_s_triton),
+        y1_triton,
+        y2_triton,
+        y1_res_triton,
+    ) = fused_rms_fp8_group_quant(
+        x1,
+        w1,
+        1e-6,
+        inp2=x2,
+        inp2_weight=w2,
+        inp2_epsilon=1e-6,
+        group_size=group_size,
+        dtype_quant=dtype_quant,
+        res1=res1,
+        output_unquantized_inp1=True,
     )
 
     torch.testing.assert_close(y1_torch, y1_triton, atol=0.1, rtol=0.1)
@@ -245,8 +261,8 @@ def test_rmsnorm_quant_fuse(m, n):
         x, w, x_scale, eps, rocm_fp8_dtype
     )
 
-    torch.testing.assert_close(rms_out, rms_out_ref)
-    torch.testing.assert_close(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
+    checkAllclose(rms_out, rms_out_ref)
+    checkAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
 
 
 @pytest.mark.parametrize("M", [1, 32, 256])
@@ -492,27 +508,35 @@ def test_fused_reduce_rms_fp8_group_quant(
     x1, w1, x2, w2, res1, x3 = generate_fused_reduce_rms_quant_data(
         M, N1, N2, N3, SPK, dtype
     )
-    (y1_q_torch, y1_s_torch), y1_torch, y2_torch, y1_res_torch, y3_torch = (
-        run_torch_reduce_rms_fp8_group_quant(
-            x1, w1, 1e-6, x2, w2, 1e-6, res1, x3, dtype_quant, dtype, group_size
-        )
+    (
+        (y1_q_torch, y1_s_torch),
+        y1_torch,
+        y2_torch,
+        y1_res_torch,
+        y3_torch,
+    ) = run_torch_reduce_rms_fp8_group_quant(
+        x1, w1, 1e-6, x2, w2, 1e-6, res1, x3, dtype_quant, dtype, group_size
     )
 
-    (y1_q_triton, y1_s_triton), y1_triton, y2_triton, y1_res_triton, y3_triton = (
-        fused_reduce_rms_fp8_group_quant(
-            x1,
-            w1,
-            1e-6,
-            inp2=x2,
-            inp2_weight=w2,
-            inp2_epsilon=1e-6,
-            inp3=x3,
-            group_size=group_size,
-            dtype_quant=dtype_quant,
-            dtype=dtype,
-            res1=res1,
-            output_unquantized_inp1=True,
-        )
+    (
+        (y1_q_triton, y1_s_triton),
+        y1_triton,
+        y2_triton,
+        y1_res_triton,
+        y3_triton,
+    ) = fused_reduce_rms_fp8_group_quant(
+        x1,
+        w1,
+        1e-6,
+        inp2=x2,
+        inp2_weight=w2,
+        inp2_epsilon=1e-6,
+        inp3=x3,
+        group_size=group_size,
+        dtype_quant=dtype_quant,
+        dtype=dtype,
+        res1=res1,
+        output_unquantized_inp1=True,
     )
 
     torch.testing.assert_close(y1_torch, y1_triton, atol=0.1, rtol=0.1)
@@ -577,4 +601,4 @@ def test_silu_mul_quant_fuse(m, n):
     fp8_x_ref = silu_mul_fp8_quantization_ref(x, x_scale, rocm_fp8_dtype)
     fp8_x = triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype)
 
-    torch.testing.assert_close(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
+    checkAllclose(fp8_x.to(torch.float32), fp8_x_ref.to(torch.float32))
