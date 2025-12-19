@@ -1473,6 +1473,15 @@ namespace py = pybind11;
           py::arg("indices"),      \
           py::arg("numRows"),      \
           py::arg("stride0"),      \
+          py::arg("stride1"));     \
+    m.def("top_k_per_row_decode_fast",  \
+          &top_k_per_row_decode_fast,   \
+          py::arg("logits"),       \
+          py::arg("next_n"),       \
+          py::arg("seqLens"),      \
+          py::arg("indices"),      \
+          py::arg("numRows"),      \
+          py::arg("stride0"),      \
           py::arg("stride1"));
 
 #define MLA_METADATA_PYBIND                              \
