@@ -456,6 +456,7 @@ namespace py = pybind11;
           py::arg("A"),                          \
           py::arg("B"),                          \
           py::arg("out"),                        \
+          py::arg("semaphore"),                  \
           py::arg("bias")        = std::nullopt, \
           py::arg("splitK")      = std::nullopt, \
           py::arg("kernelName")  = std::nullopt, \
@@ -1537,34 +1538,34 @@ namespace py = pybind11;
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
-#define TOP_K_PER_ROW_PYBIND       \
-    m.def("top_k_per_row_prefill", \
-          &top_k_per_row_prefill,  \
-          py::arg("logits"),       \
-          py::arg("rowStarts"),    \
-          py::arg("rowEnds"),      \
-          py::arg("indices"),      \
-          py::arg("values"),       \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
-          py::arg("stride1"));     \
-    m.def("top_k_per_row_decode",  \
-          &top_k_per_row_decode,   \
-          py::arg("logits"),       \
-          py::arg("next_n"),       \
-          py::arg("seqLens"),      \
-          py::arg("indices"),      \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
-          py::arg("stride1"));     \
-    m.def("top_k_per_row_decode_fast",  \
-          &top_k_per_row_decode_fast,   \
-          py::arg("logits"),       \
-          py::arg("next_n"),       \
-          py::arg("seqLens"),      \
-          py::arg("indices"),      \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
+#define TOP_K_PER_ROW_PYBIND           \
+    m.def("top_k_per_row_prefill",     \
+          &top_k_per_row_prefill,      \
+          py::arg("logits"),           \
+          py::arg("rowStarts"),        \
+          py::arg("rowEnds"),          \
+          py::arg("indices"),          \
+          py::arg("values"),           \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+    m.def("top_k_per_row_decode",      \
+          &top_k_per_row_decode,       \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+    m.def("top_k_per_row_decode_fast", \
+          &top_k_per_row_decode_fast,  \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
           py::arg("stride1"));
 
 #define MLA_METADATA_PYBIND                              \

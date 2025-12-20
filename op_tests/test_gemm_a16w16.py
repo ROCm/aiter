@@ -59,8 +59,9 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 def run_bf16gemm_asm(
     x, weight, out_asm, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
+    sema = aiter.get_semaphore_workspace()
     return aiter.gemm_a16w16_asm(
-        x, weight, out_asm, bias, splitK, kernelName, bpreshuffle
+        x, weight, out_asm, sema, bias, splitK, kernelName, bpreshuffle
     )
 
 
