@@ -12,6 +12,7 @@ from moe_cktile2stages_common import (
     get_heuristic_dispatch_template,
 )
 import sys
+from chip_info import get_gfx
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -265,7 +266,7 @@ template torch::Tensor
             if missing:
                 for mis in missing:
                     placeholders.remove(mis)
-            result = template
+            # result = template
             # for placeholder in placeholders:
             #     result = result.replace(placeholder, str_mapping[placeholder])
             # return result
@@ -600,7 +601,9 @@ if __name__ == "__main__":
     # b_type = "fp8"
     # quant_type = "per_token"
 
-    a_types = ["bf16", "fp8"]
+    a_types = ["bf16"]
+    if get_gfx() == "gfx950":
+        a_types.append("fp8")
     b_type = "fp4"
     quant_type = "1x32"
 

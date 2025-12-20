@@ -756,32 +756,32 @@ namespace py = pybind11;
           py::arg("v_descale")     = std::nullopt, \
           py::arg("gen")           = std::nullopt);
 
-#define MHA_VARLEN_FWD_ASM_PYBIND                 \
-    m.def("fmha_v3_varlen_fwd",                   \
-          &aiter::torch_itfs::fmha_v3_varlen_fwd, \
-          py::arg("q"),                           \
-          py::arg("k"),                           \
-          py::arg("v"),                           \
-          py::arg("cu_seqlens_q"),                \
-          py::arg("cu_seqlens_k"),                \
-          py::arg("max_seqlen_q"),                \
-          py::arg("max_seqlen_k"),                \
-          py::arg("min_seqlen_q"),                \
-          py::arg("dropout_p"),                   \
-          py::arg("softmax_scale"),               \
-          py::arg("logits_soft_cap"),             \
-          py::arg("zero_tensors"),                \
-          py::arg("is_causal"),                   \
-          py::arg("window_size_left"),            \
-          py::arg("window_size_right"),           \
-          py::arg("return_softmax_lse"),          \
-          py::arg("return_dropout_randval"),      \
-          py::arg("how_v3_bf16_cvt"),             \
-          py::arg("out")          = std::nullopt, \
-          py::arg("block_table")  = std::nullopt, \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alibi_slopes") = std::nullopt, \
-          py::arg("gen")          = std::nullopt, \
+#define MHA_VARLEN_FWD_ASM_PYBIND                        \
+    m.def("fmha_v3_varlen_fwd",                          \
+          &aiter::torch_itfs::fmha_v3_varlen_fwd,        \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("v"),                                  \
+          py::arg("cu_seqlens_q"),                       \
+          py::arg("cu_seqlens_k"),                       \
+          py::arg("max_seqlen_q"),                       \
+          py::arg("max_seqlen_k"),                       \
+          py::arg("min_seqlen_q"),                       \
+          py::arg("dropout_p"),                          \
+          py::arg("softmax_scale"),                      \
+          py::arg("logits_soft_cap"),                    \
+          py::arg("zero_tensors"),                       \
+          py::arg("is_causal"),                          \
+          py::arg("window_size_left"),                   \
+          py::arg("window_size_right"),                  \
+          py::arg("return_softmax_lse"),                 \
+          py::arg("return_dropout_randval"),             \
+          py::arg("how_v3_bf16_cvt"),                    \
+          py::arg("out")                 = std::nullopt, \
+          py::arg("block_table")         = std::nullopt, \
+          py::arg("bias")                = std::nullopt, \
+          py::arg("alibi_slopes")        = std::nullopt, \
+          py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
 
@@ -833,7 +833,7 @@ namespace py = pybind11;
           py::arg("quant_type")     = 0,            \
           py::arg("activation")     = 0,            \
           py::arg("splitk")         = 1,            \
-          py::arg("dst_type")       = std::nullopt);\
+          py::arg("dst_type")       = std::nullopt);      \
                                                     \
     m.def("ck_moe_stage2",                          \
           &ck_moe_stage2,                           \
@@ -1458,25 +1458,34 @@ namespace py = pybind11;
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
-#define TOP_K_PER_ROW_PYBIND       \
-    m.def("top_k_per_row_prefill", \
-          &top_k_per_row_prefill,  \
-          py::arg("logits"),       \
-          py::arg("rowStarts"),    \
-          py::arg("rowEnds"),      \
-          py::arg("indices"),      \
-          py::arg("values"),       \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
-          py::arg("stride1"));     \
-    m.def("top_k_per_row_decode",  \
-          &top_k_per_row_decode,   \
-          py::arg("logits"),       \
-          py::arg("next_n"),       \
-          py::arg("seqLens"),      \
-          py::arg("indices"),      \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
+#define TOP_K_PER_ROW_PYBIND           \
+    m.def("top_k_per_row_prefill",     \
+          &top_k_per_row_prefill,      \
+          py::arg("logits"),           \
+          py::arg("rowStarts"),        \
+          py::arg("rowEnds"),          \
+          py::arg("indices"),          \
+          py::arg("values"),           \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+    m.def("top_k_per_row_decode",      \
+          &top_k_per_row_decode,       \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+    m.def("top_k_per_row_decode_fast", \
+          &top_k_per_row_decode_fast,  \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
           py::arg("stride1"));
 
 #define MLA_METADATA_PYBIND                              \
