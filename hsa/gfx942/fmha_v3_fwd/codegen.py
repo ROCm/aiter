@@ -862,7 +862,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                 }
                             }
                         }
-                    }    
+                    }
                 }
             }
         }
