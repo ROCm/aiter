@@ -649,7 +649,8 @@ def get_mla_metadata_info_v1(
 
     max_qo_tiles_per_batch = (
         int(math.ceil(max_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
+        if num_head_qo == 16
+        or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
