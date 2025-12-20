@@ -43,8 +43,7 @@ def gemm_a16w16_asm(
     splitK: Optional[int] = None,
     kernelName: Optional[str] = None,
     bpreshuffle: bool = False,
-) -> Tensor:
-    ...
+) -> Tensor: ...
 
 
 @functools.lru_cache(maxsize=1)
