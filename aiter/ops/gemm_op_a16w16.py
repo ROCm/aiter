@@ -46,7 +46,7 @@ def gemm_a16w16_asm(
 ) -> Tensor: ...
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=1)
 def get_semaphore_workspace(device: torch.device) -> Tensor:
     return torch.zeros((16, 64), dtype=torch.uint32, device=device)
 
