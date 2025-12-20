@@ -605,7 +605,7 @@ class GemmCommonTuner(TunerCommon):
         cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
         bpe = self.get_bpe(inputdtype)
-        if flops < 128 * 5120 * 256:
+        if flops < 128 * 5120 * 256 * 2:
             self.num_warmup = 30
-        elif flops < 256 * 5120 * 256:
+        elif flops < 256 * 5120 * 256 * 2:
             self.num_warmup = 15

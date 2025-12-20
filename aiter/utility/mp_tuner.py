@@ -3,14 +3,12 @@
 import torch
 import multiprocessing as mp
 import time
-import logging
 import sys
 import os
 from multiprocessing import TimeoutError as MPTimeoutError
 from aiter.test_common import checkAllclose
 from aiter import dtypes
-
-logger = logging.getLogger(__name__)
+from aiter import logger
 
 
 def worker(
@@ -29,7 +27,9 @@ def worker(
 
     pid = mp.current_process().pid
     device = torch.device(f"cuda:{gpu_id}")
-
+    torch.cuda.set_device(device)
+    args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
+    torch.cuda.synchronize()
     max_err_ratio = 0.0
     try:
         torch.cuda.set_device(device)
@@ -38,10 +38,9 @@ def worker(
         res = None
         us = float("inf")
         try:
-            print(f"gpu id : {gpu_id} run_perftest: info:{info}, func:{func}", flush=True)
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
-            print(f"run_perftest: info:{info}, func:{func} us:{us}", flush=True)
+
         except RuntimeError as e:
             print(f"run gpu func error: info:{info}\t {e}")
             us = -1 # not support or error
@@ -128,68 +127,53 @@ def worker(
     return info, us, round(max_err_ratio, 4)
 
 
-def work_group(gpu_id, fast_mode, err_ratio, in_data, tasks):
-    """Work group that processes a batch of related tasks.
+def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks):
+    """Work group that processes a batch of related tasks."""
+    group_task = [tasks] if not isinstance(tasks, list) else tasks
+    kernels_num, (input_data) = in_data
+    (
+        info,
+        gen_data,
+        gen_args,
+        func,
+        args,
+        kwargs,
+        ref_func,
+        ref_args,
+        ref_kwargs,
+        ref,
+        *rest,
+    ) = group_task[0]
 
-    Each work_group runs in a separate process (controlled by maxtasksperchild=1).
-    If this process crashes due to GPU memory fault, it won't affect other task groups.
-    GPU ID is explicitly passed as a parameter.
+    pid = mp.current_process().pid
+    gpuID = GPUIDMap[pid]
+    device = torch.device(f"cuda:{gpuID}")
+    torch.cuda.set_device(device)
+    data = (
+        gen_data(*gen_args, device=device)
+        if not input_data and gen_data is not None
+        else input_data
+    )
 
-    Args:
-        gpu_id: GPU device ID to use for this work group
-        fast_mode: Whether to skip result comparison
-        err_ratio: Error tolerance ratio
-        in_data: Input data for tasks
-        tasks: Task or list of tasks to execute
-    """
+    assert ref_func is not None or ref is not None or fast_mode != 0
+    # ref=None & ref_func=None & fast_mode=1: fast tune, not compare results, do not postprocess,return all results
+    # ref=None & fast_mode=0: ref_func should be given and return best result
+    # (ref!=None | ref_func!=None) & fast_mode=1: compare results and return all results, but do not postprocess
+    # (ref!=None | ref_func!=None) & fast_mode=0: return best result, postprocess
+    if ref is None and not fast_mode or (ref_func is not None and fast_mode):
+        ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
+        updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
+        ref = ref_func(*updated_ref_args, **ref_kwargs)
+        torch.cuda.synchronize()
+
     try:
-        group_task = [tasks] if not isinstance(tasks, list) else tasks
-        kernels_num, (input_data) = in_data
-        (
-            info,
-            gen_data,
-            gen_args,
-            func,
-            args,
-            kwargs,
-            ref_func,
-            ref_args,
-            ref_kwargs,
-            ref,
-            *rest,
-        ) = group_task[0]
-
+        # Retrieve GPU ID from the map
         pid = mp.current_process().pid
-        device = torch.device(f"cuda:{gpu_id}")
-        torch.cuda.set_device(device)
-        #print(f"Process {pid} using GPU {gpu_id} for task group")
-    except Exception as e:
-        print(f"Error initializing work_group: {e}")
-        # Return dummy failed results for all tasks
-        if isinstance(tasks, list):
-            return [
-                (task[0] if task else "unknown", float("inf"), 1.0) for task in tasks
-            ]
-        else:
-            return [(tasks[0] if tasks else "unknown", float("inf"), 1.0)]
-
-    try:
-        data = (
-            gen_data(*gen_args, device=device)
-            if not input_data and gen_data is not None
-            else input_data
-        )
-
-        assert ref_func is not None or ref is not None or fast_mode != 0
-        # ref=None & ref_func=None & fast_mode=1: fast tune, not compare results, do not postprocess,return all results
-        # ref=None & fast_mode=0: ref_func should be given and return best result
-        # (ref!=None | ref_func!=None) & fast_mode=1: compare results and return all results, but do not postprocess
-        # (ref!=None | ref_func!=None) & fast_mode=0: return best result, postprocess
-        if ref is None and not fast_mode or (ref_func is not None and fast_mode):
-            ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
-            updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
-            ref = ref_func(*updated_ref_args, **ref_kwargs)
-            torch.cuda.synchronize()
+        if pid not in GPUIDMap:
+            raise KeyError(
+                f"Process {pid} not found in GPUIDMap. Available PIDs: {list(GPUIDMap.keys())}"
+            )
+        gpu_id = GPUIDMap[pid]
 
         rets = []
         shape_grouped = isinstance(tasks, list)
@@ -218,7 +202,7 @@ def work_group(gpu_id, fast_mode, err_ratio, in_data, tasks):
 
             ref = ref if ref_noused is None else ref_noused
             work_args = (
-                gpu_id,  # Pass GPU ID as first argument
+                gpu_id,  # Pass GPU ID as first argument (already retrieved from GPUIDMap)
                 info,
                 func,
                 new_args,
@@ -244,6 +228,11 @@ def work_group(gpu_id, fast_mode, err_ratio, in_data, tasks):
             ]
         else:
             return [(tasks[0] if tasks else "unknown", float("inf"), 1.0)]
+
+
+def get_pid():
+    time.sleep(3)
+    return mp.current_process().pid
 
 
 def mp_tuner(
@@ -280,11 +269,9 @@ def mp_tuner(
     start_idx = 0
     if not tasks:
         return []
-    if mp_num == 1 & fast_mode == 0:
-        shape_grouped = True
-
-    print(f"mp_num: {mp_num}, fast_mode: {fast_mode}, shape_grouped: {shape_grouped}")
-
+    # if mp_num == 1 & fast_mode == 0:
+    #    shape_grouped = True
+    # time.sleep(2)
     task_group = []
     # dispatch per shape to one pid
     if shape_grouped:
@@ -309,13 +296,13 @@ def mp_tuner(
     print(f"Distributing {len(task_group)} task groups across {mp_num} GPUs")
 
     # Helper function to submit tasks to pool
-    def submit_tasks(pool, task_indices):
+    def submit_tasks(pool, gpu_map, task_indices):
         """Submit tasks to the pool and return async results as a dict"""
         return {
             k: pool.apply_async(
                 work_group,
                 args=(
-                    k % mp_num + start_idx,  # GPU ID (round-robin assignment)
+                    gpu_map,  # GPU ID (round-robin assignment)
                     fast_mode,
                     err_ratio,
                     in_datas[ref_data_index[k]],
@@ -327,15 +314,12 @@ def mp_tuner(
 
     # Create initial pool and submit all tasks
     pool = mp.Pool(processes=parallel_num)
-    rets_dict = submit_tasks(pool, range(len(task_group)))
+    pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
+    gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
+    rets_dict = submit_tasks(pool, gpu_map, range(len(task_group)))
     # Convert to list for compatibility with existing code
     rets = [rets_dict[k] for k in range(len(task_group))]
     pool.close()
-
-    # Collect results with timeout and error handling
-    # Use "first-done-first-processed" strategy for better performance
-    import itertools
-    import time
 
     result_dict = {}  # Store results by task index
     failed_tasks = []
@@ -345,15 +329,15 @@ def mp_tuner(
     task_start_times = {k: time.time() for k, _ in remaining_tasks}
     check_interval = 30  # Check every 0.1 seconds
 
-    print(f"Waiting for {len(remaining_tasks)} tasks to complete (timeout={timeout}s each)...")
+    print(
+        f"Waiting for {len(remaining_tasks)} tasks to complete (timeout={timeout}s each)..."
+    )
 
     def add_dummy_result(k, results_list):
         """Helper function to add dummy failed result"""
         if shape_grouped:
             task_info = (
-                task_group[k]
-                if isinstance(task_group[k], list)
-                else [task_group[k]]
+                task_group[k] if isinstance(task_group[k], list) else [task_group[k]]
             )
             for task in task_info:
                 info = task[0] if len(task) > 0 else f"task_{k}"
@@ -379,7 +363,9 @@ def mp_tuner(
                 result_dict[k] = task_result
                 completed_this_round.append((k, async_result))
                 elapsed = time.time() - task_start_times[k]
-                #print(f"[Done] Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)")
+                #print(
+                #    f"[Done] Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
+                #)
 
             except MPTimeoutError:
                 # Check if this specific task has exceeded its timeout
@@ -393,7 +379,9 @@ def mp_tuner(
                     # Add dummy result
                     dummy_results = []
                     add_dummy_result(k, dummy_results)
-                    result_dict[k] = dummy_results if shape_grouped else [dummy_results[0]]
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
                     completed_this_round.append((k, async_result))
                 # else: still within timeout, continue waiting
 
@@ -447,9 +435,13 @@ def mp_tuner(
             # Create new pool
             pool = mp.Pool(processes=parallel_num)
 
+            # Recreate gpu_map for new processes (new PIDs)
+            pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
+            gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
+
             # Resubmit remaining tasks
             remaining_task_indices = [k for k, _ in remaining_tasks]
-            new_rets_dict = submit_tasks(pool, remaining_task_indices)
+            new_rets_dict = submit_tasks(pool, gpu_map, remaining_task_indices)
             pool.close()
 
             # Update remaining_tasks with new async results
@@ -461,7 +453,9 @@ def mp_tuner(
 
             # Reset pool restart flag
             pool_restart_needed = False
-            print(f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n")
+            print(
+                f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n"
+            )
 
         # Small sleep to avoid busy waiting
         if remaining_tasks:
@@ -499,8 +493,6 @@ def mp_tuner(
             f"{'='*60}"
         )
         print(summary)
-        logger.warning(f"Failed task indices: {[k for k, _ in failed_tasks]}, config is {task_group[k]}")
-    else:
-        print(f"[Done] All {len(rets)} tasks completed successfully")
+        logger.warning(summary)
 
     return result
