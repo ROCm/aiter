@@ -372,6 +372,7 @@ def get_gemm1_kernels_list(
     ActOP: str,
     MulRoutedWeight: bool,
     preshuffle: bool = False,
+    splitk: bool = False,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -417,7 +418,10 @@ def get_gemm1_kernels_list(
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleWint4"
         elif tag == "a8w8blkscale":
-            kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
+            if splitk:
+                kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscaleSplitk"
+            else:
+                kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
         elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScale"
         elif tag == "a16w16":
