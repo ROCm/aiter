@@ -456,6 +456,7 @@ namespace py = pybind11;
           py::arg("A"),                          \
           py::arg("B"),                          \
           py::arg("out"),                        \
+          py::arg("semaphore"),                  \
           py::arg("bias")        = std::nullopt, \
           py::arg("splitK")      = std::nullopt, \
           py::arg("kernelName")  = std::nullopt, \
