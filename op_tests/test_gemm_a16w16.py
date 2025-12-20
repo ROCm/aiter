@@ -2,9 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import os
 import random
-import sys
 from functools import lru_cache
 
 import pandas as pd
