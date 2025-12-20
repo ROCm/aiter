@@ -111,6 +111,7 @@ get_heuristic_kernel(int M,
         if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
            (add_bias == 0 || cfg.bias == 1) && clean == cfg.clean)
         {
+            //printf("hahahahahah");
             int split_K = 1;
             if(splitk.has_value())
                 split_K = splitk.value();
@@ -257,7 +258,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
 
     TORCH_CHECK(gdx <= 16, __func__, " gdx (", gdx, ") must be <= 16"); // 16 = 512/32
 
-    semaphore.fill_(selectedksplit);
+    // semaphore.fill_(selectedksplit);
     args.ptr_semaphore = (void*)semaphore.data_ptr<uint32_t>();
 
     size_t arg_size = sizeof(args);
