@@ -243,8 +243,6 @@ def fused_moe_(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
-        bias1,
-        bias2,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -567,6 +565,7 @@ class MOEMetadata:
     block_m: int
     ksplit: int
     run_1stage: bool = False
+    has_bias: bool = False
 
 
 @functools.lru_cache(maxsize=2048)
@@ -585,8 +584,6 @@ def get_2stage_cfgs(
     doweight_stage1,
     hidden_pad,
     intermediate_pad,
-    bias1,
-    bias2,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -765,17 +762,16 @@ def get_2stage_cfgs(
                 cktile_moe_stage1,
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
-                bias1=bias1,
             ),
             functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
-                bias2=bias2,
             ),
             get_block_m(),
             ksplit,
             False,
+            True,
         )
     if (
         "ck2stages" in kernelName1
@@ -883,8 +879,6 @@ def fused_moe_2stages(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
-        bias1,
-        bias2,
     )
     if (
         quant_type == QuantType.per_1x32
@@ -957,7 +951,17 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
-
+    extra_stage1_args = {}
+    extra_stage2_args = {}
+    if (
+        not metadata.run_1stage
+        and metadata.has_bias
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and quant_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+    ):
+        extra_stage1_args["bias1"] = bias1
+        extra_stage2_args["bias2"] = bias2
     a2 = metadata.stage1(
         a1,
         w1,
@@ -973,6 +977,7 @@ def fused_moe_2stages(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
+        **extra_stage1_args,
     )
 
     if (
@@ -1053,6 +1058,7 @@ def fused_moe_2stages(
         a2_scale=a2_scale,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
+        **extra_stage2_args,
     )
 
     return moe_out
