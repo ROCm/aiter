@@ -113,7 +113,7 @@ get_heuristic_kernel(int M,
         {
             int split_K = 1;
             if(splitk.has_value())
-                split_K = splitk.value();
+                split_K = std::min(splitk.value(), 16);
             else if(cfg.splitK == 1)
             {
                 pure_tg_num = ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN);

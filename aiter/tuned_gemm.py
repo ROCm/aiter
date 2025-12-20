@@ -399,7 +399,7 @@ def asm_gemm(
     out_asm = torch.empty(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
-    sema = get_semaphore_workspace()
+    sema = get_semaphore_workspace(out_asm.device)
     return gemm_a16w16_asm(
         inp, weights, out_asm, sema, bias, splitK, KernelName, bpreshuffle
     )

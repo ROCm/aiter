@@ -46,9 +46,9 @@ def gemm_a16w16_asm(
 ) -> Tensor: ...
 
 
-@functools.lru_cache(maxsize=1)
-def get_semaphore_workspace() -> Tensor:
-    return torch.zeros((16, 64), dtype=torch.uint32, device="cuda")
+@functools.lru_cache(maxsize=None)
+def get_semaphore_workspace(device: torch.device) -> Tensor:
+    return torch.zeros((16, 64), dtype=torch.uint32, device=device)
 
 
 def gemm_a16w16(
@@ -59,5 +59,5 @@ def gemm_a16w16(
     splitK: Optional[int] = None,
     kernelName: Optional[str] = None,
 ):
-    sema = get_semaphore_workspace()
+    sema = get_semaphore_workspace(out.device)
     return gemm_a16w16_asm(A, B, out, bias, sema, splitK, kernelName)
