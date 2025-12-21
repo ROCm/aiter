@@ -296,7 +296,7 @@ def mla_decode_fwd(
         final_lse = torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
 
 
-        import pdb;pdb.set_trace()
+        # import pdb;pdb.set_trace()
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
@@ -317,7 +317,7 @@ def mla_decode_fwd(
             kv_scale,
         )
 
-        import pdb;pdb.set_trace()
+        # import pdb;pdb.set_trace()
         aiter.mla_reduce_v1(
             logits,
             attn_lse,
@@ -328,7 +328,7 @@ def mla_decode_fwd(
             o,
             final_lse,
         )
-        import pdb;pdb.set_trace()
+        # import pdb;pdb.set_trace()
 
     if io_transformed:
         if persistent_mode:
