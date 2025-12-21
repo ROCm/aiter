@@ -17,7 +17,7 @@ USE_LRU_CACHE = True
 Cold start: 290.8928 ms
 LRU Cache: ENABLED
 Avg per call: 0.110 us
-vs 
+vs
 LRU Cache: DISABLED
 Avg per call: 2.503 us
 """

@@ -2,9 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import os
 import random
-import sys
 from functools import lru_cache
 
 import pandas as pd
@@ -59,8 +57,9 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 def run_bf16gemm_asm(
     x, weight, out_asm, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
+    sema = aiter.get_semaphore_workspace(out_asm.device)
     return aiter.gemm_a16w16_asm(
-        x, weight, out_asm, bias, splitK, kernelName, bpreshuffle
+        x, weight, out_asm, sema, bias, splitK, kernelName, bpreshuffle
     )
 
 
@@ -96,7 +95,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     ret = {}
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
-    weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
+    weight = torch.randn(n, k, dtype=otype, device="cuda").to(dtype)
     if otype is None:
         otype = dtype
     if bias:
@@ -471,7 +470,7 @@ parser.add_argument(
     "-o",
     "--otype",
     type=dtypes.str2Dtype,
-    default=[None, torch.float16, torch.bfloat16, torch.float32],
+    default=[torch.float16, torch.bfloat16, torch.float32],
     help="""Data type of output.
     e.g.: -d bf16""",
 )

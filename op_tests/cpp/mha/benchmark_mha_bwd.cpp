@@ -156,7 +156,9 @@ auto create_args(int argc, char* argv[])
         .insert("v3_bf16_cvt",
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
-        .insert("v3_api_check", "0", "if set to 1, check whether the input scenario is supported by the asm kernel.");
+        .insert("v3_api_check",
+                "0",
+                "if set to 1, check whether the input scenario is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -263,7 +265,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     bool bwd_v3         = arg_parser.get_bool("bwd_v3");
     bool v3_atomic_fp32 = arg_parser.get_bool("v3_atomic_fp32");
     int v3_bf16_cvt     = arg_parser.get_int("v3_bf16_cvt");
-    bool v3_api_check    = arg_parser.get_bool("v3_api_check");
+    bool v3_api_check   = arg_parser.get_bool("v3_api_check");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -353,9 +355,11 @@ bool run(const ck_tile::ArgParser& arg_parser)
     const ck_tile::index_t nsplits =
         deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
     const ck_tile::index_t a16_dq_acc_seq =
-        v3_atomic_fp32 ? shape_seqlen_q : (mode == mode_enum::batch ? (seqlen_q + 15) / 16 * 16 : (max_seqlen_q + 15) / 16 * 16);
+        v3_atomic_fp32 ? shape_seqlen_q
+                       : (mode == mode_enum::batch ? (seqlen_q + 15) / 16 * 16
+                                                   : (max_seqlen_q + 15) / 16 * 16);
     // hdim_q = 192 pipline currently don't support hdim padding
-    const ck_tile::index_t a16_dq_acc_hdim = v3_atomic_fp32 ? hdim_q : hdim_q == 192? 192: 128;
+    const ck_tile::index_t a16_dq_acc_hdim = v3_atomic_fp32 ? hdim_q : hdim_q == 192 ? 192 : 128;
 
     ck_tile::HostTensor<QDataType> q_host(
         get_lengths(i_perm, shape_batch, nhead, shape_seqlen_q, hdim_q));
@@ -490,7 +494,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
               << ", h:" << nhead << "/" << nhead_k << ", s:" << seqlen_q << "/" << seqlen_k
               << ", d:" << hdim_q << "/" << hdim_v << ", scale:" << scale << ", bias:" << bias
               << ", dbias:" << use_dbias << ", p_drop:" << p_drop << ", s_randval:" << s_randval
-              << ", deterministic:" << deterministic << ", mask:" << mask << std::flush << std::endl;
+              << ", deterministic:" << deterministic << ", mask:" << mask << std::flush
+              << std::endl;
 
     std::size_t workspace_size =
         dq_acc_host.get_element_space_size_in_bytes() * sizeof(AccDataType) / (1024 * 1024);
@@ -502,16 +507,25 @@ bool run(const ck_tile::ArgParser& arg_parser)
     }
 
     auto get_mask_type = [&]() {
-        if (mask.type == mask_enum::no_mask) {
+        if(mask.type == mask_enum::no_mask)
+        {
             return 0;
-        } else {
-            if (mask.type == mask_enum::window_generic) {
+        }
+        else
+        {
+            if(mask.type == mask_enum::window_generic)
+            {
                 assert(false);
                 return 0;
-            } else {
-                if ((mask.left == -1) && (mask.right == 0)) {
+            }
+            else
+            {
+                if((mask.left == -1) && (mask.right == 0))
+                {
                     return (mask.type == mask_enum::mask_top_left) ? 1 : 2;
-                } else {
+                }
+                else
+                {
                     return 3;
                 }
             }
@@ -580,7 +594,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    v3_atomic_fp32,
                                    v3_bf16_cvt,
                                    v3_api_check,
-               
+
                                    hdim_q,
                                    hdim_v,
                                    data_type,
@@ -591,7 +605,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    p_drop > 0,
                                    s_randval,
                                    deterministic,
-               
+
                                    q_buf.GetDeviceBuffer(),
                                    k_buf.GetDeviceBuffer(),
                                    v_buf.GetDeviceBuffer(),
@@ -953,17 +967,24 @@ bool run(const ck_tile::ArgParser& arg_parser)
         }
 
         // dS_i_j = P_i_j .* (dP_i_j - dO_i dot O_i)
-        ds_hp_host_ref.ForEach([&](auto& self, auto idx_gmn) {
-            AccDataType do_dot_o = 0;
+        // Precompute dO_i dot O_i for each (head, seq_q) to avoid redundant computation
+        // This reduces complexity from O(nhead * seqlen_q * seqlen_k * hdim_v) to
+        // O(nhead * seqlen_q * hdim_v) + O(nhead * seqlen_q * seqlen_k)
+        ck_tile::HostTensor<AccDataType> do_dot_o_ref({nhead, real_seqlen_q});
+        do_dot_o_ref.ForEach([&](auto& self, auto idx_gm) {
+            AccDataType sum = 0;
             for(int o = 0; o < hdim_v; o++)
             {
-                auto idx_gmo = idx_gmn;
-                idx_gmo[2]   = o;
-                do_dot_o += ck_tile::type_convert<AccDataType>(do_host_ref(idx_gmo)) *
-                            ck_tile::type_convert<AccDataType>(o_host_refs[wb](idx_gmo));
+                sum += ck_tile::type_convert<AccDataType>(do_host_ref(idx_gm[0], idx_gm[1], o)) *
+                       ck_tile::type_convert<AccDataType>(o_host_refs[wb](idx_gm[0], idx_gm[1], o));
             }
+            self(idx_gm) = sum;
+        });
+
+        ds_hp_host_ref.ForEach([&](auto& self, auto idx_gmn) {
             self(idx_gmn) = ck_tile::type_convert<AccDataType>(
-                p_hp_host_refs[wb](idx_gmn) * (dp_hp_host_ref(idx_gmn) - do_dot_o));
+                p_hp_host_refs[wb](idx_gmn) *
+                (dp_hp_host_ref(idx_gmn) - do_dot_o_ref(idx_gmn[0], idx_gmn[1])));
         });
 
         if(use_dbias)
