@@ -254,7 +254,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
     int gdy = (Mdim + SUBM - 1) / SUBM;
     int gdz = selectedksplit;
 
-    TORCH_CHECK(gdx <= 16, __func__, " gdx (", gdx, ") must be <= 16"); // 16 = 512/32
+    TORCH_CHECK(gdy <= 16, __func__, " gdy (", gdy, ") must be <= 16"); // 16 = 512/32
 
     // semaphore.fill_(selectedksplit);
     args.ptr_semaphore = (void*)semaphore.data_ptr<uint32_t>();
