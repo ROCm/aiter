@@ -351,6 +351,8 @@ def _attn_fwd(
         0
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
+    # reverse the order of the workgroups to process the longer tasks first to reduce the tail effect
+    wid = tl.num_programs(0) - wid - 1
 
     off_q_head = wid % NUM_Q_HEADS
     off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
