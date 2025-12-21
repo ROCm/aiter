@@ -1538,15 +1538,20 @@ def paged_attention_decode_sliding_window(
     # ==================== SEQUENCE PROCESSING ====================
     query_converted = query_shared.load(qk_lhs_operand_layout)
     if SLIDING_WINDOW > 0:
-        sequence_partition_start_idx = context_length - SLIDING_WINDOW
-        sequence_partition_end_idx = context_length
+        sequence_partition_start_idx = (
+            context_length - SLIDING_WINDOW
+        ) // CONTEXT_PARTITION_SIZE
+        sequence_partition_end_idx = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
     else:
-        sub_context_length = gl.load(page_size_ptr)
-        # sub_context_length = gl.cdiv(context_length, gl.num_programs(2))
-        sequence_partition_start_idx = sub_context_length * sequence_split_idx
-        if sequence_partition_start_idx >= context_length:
+        page_size = gl.load(page_size_ptr)
+        sequence_start_idx = page_size * sequence_split_idx
+        if sequence_start_idx >= context_length:
             return  # No computation needed for this partition
-        sequence_partition_end_idx = sub_context_length * (sequence_split_idx + 1)
+        sequence_end_idx = gl.minimum(
+            context_length, page_size * (sequence_split_idx + 1)
+        )
+        sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
+        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
 
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
         # Quantize bf16 query to fp8
@@ -1563,14 +1568,12 @@ def paged_attention_decode_sliding_window(
     else:
         query_converted = query_converted.to(COMPUTE_TYPE)
 
-    for kv_sequence_start_idx in range(
-        sequence_partition_start_idx, sequence_partition_end_idx, CONTEXT_PARTITION_SIZE
+    for sequence_partition_idx in range(
+        sequence_partition_start_idx, sequence_partition_end_idx
     ):
         # Process KV sequence in compute blocks
-        kv_sequence_end_idx = gl.minimum(
-            kv_sequence_start_idx + CONTEXT_PARTITION_SIZE, context_length
-        )
-
+        kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
+        kv_sequence_end_idx = kv_sequence_start_idx + CONTEXT_PARTITION_SIZE
         num_kv_blocks = gl.cdiv(
             kv_sequence_end_idx - kv_sequence_start_idx, KV_BLOCK_SIZE
         )
@@ -2999,6 +3002,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         All parameters from the pa_decode_gluon function, plus kernel configuration
         parameters for Triton compilation and execution.
     """
+    num_sequences, num_kv_heads, num_splits = grid
     HEAD_SIZE_POW2 = triton.next_power_of_2(HEAD_SIZE)
     # Production path - select and launch appropriate kernel
     QUERY_GROUP_SIZE = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
@@ -3023,10 +3027,12 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             waves_per_eu = 4
 
         if PS:
+
             if SLIDING_WINDOW == 0:
                 page_size = get_recommended_page_size(
-                    context_lengths_ptr, grid[2], CONTEXT_PARTITION_SIZE
+                    context_lengths_ptr, num_splits, CONTEXT_PARTITION_SIZE
                 )
+                # grid = (num_sequences * num_splits, num_kv_heads, 1)
             else:
                 page_size = 1
             paged_attention_decode_sliding_window[grid](
@@ -3419,8 +3425,9 @@ def pa_decode_gluon(
             query_group_size=query_group_size,
             head_size=head_size,
         )
-
-    if ps:
+    if sliding_window > 0:
+        max_context_partition_num = 1
+    elif ps:
         max_context_partition_num = get_recommended_splits(num_sequences, num_kv_heads)
     else:
         max_context_partition_num = triton.cdiv(
@@ -3466,11 +3473,7 @@ def pa_decode_gluon(
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
 
-    # Configure execution grid
-    if sliding_window > 0:
-        grid = (num_sequences, num_kv_heads, 1)
-    else:
-        grid = (num_sequences, num_kv_heads, max_context_partition_num)
+    grid = (num_sequences, num_kv_heads, max_context_partition_num)
 
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
     # Validate input params constraint
@@ -3585,7 +3588,7 @@ def pa_decode_gluon(
 
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
 
-    ps = sliding_window > 0 or ps
+    ps = ps or max_context_partition_num <= 1
     _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         grid,
         exp_sums,
