@@ -396,8 +396,8 @@ def check_LLVM_MAIN_REVISION():
     #define CK_TILE_HOST_DEVICE_EXTERN"""
     import subprocess
 
-    cmd = f"""echo "#include <tuple>
-__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -"""
+    cmd = """echo "#include <tuple>
+__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -"""
     try:
         subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError:
