@@ -1553,6 +1553,7 @@ def paged_attention_decode_sliding_window(
         sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
         sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
 
+    max_num_kv_blocks = gl.cdiv(context_length, KV_BLOCK_SIZE)
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
         # Quantize bf16 query to fp8
         # Convert query to float32 for computation
@@ -1571,13 +1572,8 @@ def paged_attention_decode_sliding_window(
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
-        # Process KV sequence in compute blocks
-        kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
-        kv_sequence_end_idx = kv_sequence_start_idx + CONTEXT_PARTITION_SIZE
-        num_kv_blocks = gl.cdiv(
-            kv_sequence_end_idx - kv_sequence_start_idx, KV_BLOCK_SIZE
-        )
-        kv_block_start_idx = kv_sequence_start_idx // KV_BLOCK_SIZE
+        kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+        num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
         qk_column_offsets = kv_block_start_idx * KV_BLOCK_SIZE + gl.arange(
             0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
@@ -3184,10 +3180,6 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     Args:
         All parameters from the reduction kernel plus execution grid configuration
     """
-    # Configuration flag for kernel selection
-    # if QUERY_GROUP_SIZE < 16:
-    #     QUERY_GROUP_SIZE_POW2 = 16
-    # else:
     QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(QUERY_GROUP_SIZE)
     if PS:
         paged_attention_decode_ps_reduce_kernel[grid](
