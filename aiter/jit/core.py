@@ -377,11 +377,15 @@ def validate_and_update_archs():
 def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
-    cmd = ["hipcc", flag_hip, "-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    cmd = (
+        ["hipcc"]
+        + flag_hip.split()
+        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    )
     try:
-        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
-        logger.warning(f"Current hipcc not support: {flag_hip}")
+        logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
     return True
 
