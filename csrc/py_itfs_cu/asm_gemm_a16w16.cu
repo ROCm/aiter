@@ -68,6 +68,7 @@ get_heuristic_kernel(int M,
                      std::optional<int> splitk             = std::nullopt,
                      std::optional<std::string> kernelName = std::nullopt)
 {
+    TORCH_CHECK(K % 64 == 0, __func__, " Kdim must be divisible by 64 !"); // load min size is 128b
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
@@ -132,7 +133,6 @@ get_heuristic_kernel(int M,
             pure_tg_num = ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN);
             if(cfg.splitK == 1 && K / cfg.subK >= 2) // kernel and Kdim support splitk
             {
-                TORCH_CHECK(K % 64 == 0, __func__, " Kdim must be divisible by 64 !!!");
                 TORCH_CHECK(cfg.subK > 0,
                             __func__,
                             " cfg.subK must be greater than 0 to avoid division by zero.");
