@@ -265,23 +265,25 @@ def test_qk_norm_rope_cache_quant(
     checkAllclose(v_ref, v, msg="v", rtol=1e-2, atol=0.05)
     checkAllclose(k_cache_ref, k_cache, msg="k_cache", rtol=1e-2, atol=0.05)
     checkAllclose(v_cache_ref, v_cache, msg="v_cache", rtol=1e-2, atol=0.05)
-
+    # diff = torch.abs(v_cache_ref - v_cache) > 1
+    # print("positions: ", torch.nonzero(diff)[:20])
+    # print("values: ", (v_cache_ref - v_cache)[diff])
 
 if __name__ == "__main__":
     # rope
     is_neox_styles = [False, True]
     num_tokens = [513, 1257, 127, 778, 10024, 3]
-    # num_tokens = [1]
+    # num_tokens = [1257]
     num_heads = [(32, 4), (64, 8)]
-    # num_heads = [(1, 1)]
+    # num_heads = [(32,/ 4)]
     head_sizes = [64, 128, 256]
-    # head_sizes = [64]
+    # head_sizes = [128]
     max_positions = 10000
-    num_blocks = 10000
+    num_blocks = 1000
     page_size = 16
     k_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
     v_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
-    kv_cache_dtypes = ["fp8_e4m3", "auto"]
+    # kv_cache_dtypes = ["fp8_e4m3", "auto"]
     kv_cache_dtypes = ["auto"]
     dtype = torch.bfloat16
     for is_neox_style in is_neox_styles:
@@ -295,7 +297,7 @@ if __name__ == "__main__":
                             cache_dtype = dtype
                         k_cache = torch.randn([num_blocks, page_size, num_kv_head, head_size], dtype=dtype, device='cuda').to(cache_dtype)
                         v_cache = torch.randn([num_blocks, page_size, num_kv_head, head_size], dtype=dtype, device='cuda').to(cache_dtype)
-                        slot_mapping = torch.randint(0, num_blocks * page_size, (num_token,),  dtype=torch.int64, device='cuda')
+                        slot_mapping = torch.randperm(num_token,  dtype=torch.int64, device='cuda')
                         x = 16 // k_cache.element_size()
                         k_cache = k_cache.view([num_blocks, page_size, num_kv_head, head_size // x, x]).permute(0, 2, 3, 1, 4).contiguous()
                         v_cache = v_cache.permute(0, 2, 3, 1).contiguous()

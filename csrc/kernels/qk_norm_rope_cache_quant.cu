@@ -226,16 +226,16 @@ __global__ void fusedQKNormRopeKernel(
         int const idx0 = 2 * i;
         int const idx1 = 2 * i + 1;
 
-        scalar_t const val0 = elements[idx0];
-        scalar_t const val1 = elements[idx1];
+        float const val0 = static_cast<float>(elements[idx0]);
+        float const val1 = static_cast<float>(elements[idx1]);
 
         int const dim_idx = laneId * numElemsPerThread + idx0;
         int const half_dim = dim_idx / 2;
-        scalar_t cos_val = cos_ptr[half_dim];
-        scalar_t sin_val = sin_ptr[half_dim];
+        float cos_val = static_cast<float>(cos_ptr[half_dim]);
+        float sin_val = static_cast<float>(sin_ptr[half_dim]);
 
-        elements[idx0] = val0 * cos_val - val1 * sin_val;
-        elements[idx1] = val0 * sin_val + val1 * cos_val;
+        elements[idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
+        elements[idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
       }
     } else {
       scalar_t elements2[numElemsPerThread];  // Additional buffer required for RoPE.
@@ -245,7 +245,7 @@ __global__ void fusedQKNormRopeKernel(
       // values.
 #pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
-        elements2[i] = __shfl_xor(float(elements[i]), 16, 32);
+        elements2[i] = static_cast<scalar_t>(__shfl_xor(float(elements[i]), 16, 32));
         if (laneId < 16) {
           elements2[i] = -elements2[i];
         }
@@ -254,10 +254,10 @@ __global__ void fusedQKNormRopeKernel(
         dim_idx = (dim_idx * 2) % head_dim;
         int half_dim = dim_idx / 2;
         // Use pre-computed cos/sin from cache
-        scalar_t cos_val = cos_ptr[half_dim];
-        scalar_t sin_val = sin_ptr[half_dim];
+        float cos_val = static_cast<float>(cos_ptr[half_dim]);
+        float sin_val = static_cast<float>(sin_ptr[half_dim]);
 
-        elements[i] = elements[i] * cos_val + elements2[i] * sin_val;
+        elements[i] = static_cast<scalar_t>(elements[i] * cos_val + elements2[i] * sin_val);
       }
       __syncwarp();
     }
@@ -284,16 +284,17 @@ __global__ void fusedQKNormRopeKernel(
   int64_t block_idx = slot_id / page_size;
   int64_t block_offset = slot_id % page_size;
   if (isK) {
-    float k_scale_val = *k_scale;
+    float k_scale_val = 1.0f;
+    if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
+      k_scale_val = *k_scale;
+    }
     int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
                            headIdx * head_dim * page_size +
-                           laneId * numElemsPerThread / x * page_size * x +
-                           block_offset * x + 
-                           laneId * numElemsPerThread % x;
+                           block_offset * x ;
 
 #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
-      int64_t offset = cache_offset + (i / x) * page_size * x + (i % x);
+      int64_t offset = cache_offset + (laneId * numElemsPerThread + i) / x * page_size * x + (laneId * numElemsPerThread + i) % x;
       if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
         k_cache[offset] = elements[i];
       } else {
