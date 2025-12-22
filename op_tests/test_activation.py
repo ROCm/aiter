@@ -71,7 +71,7 @@ def test_silu_and_mul(m, n, dtype):
     return ret
 
 
-l_dtype = ["fp16", "bf16"]
+l_dtype = ["fp16", "bf16", "fp32"]
 l_m = [1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840]
 l_n = [1024, 4096, 6400, 8192]
 

@@ -21,18 +21,30 @@ using fp8_type = ck_tile::fp8_t;
 static constexpr int32_t max_vec_size = 8;
 static constexpr int32_t max_wave_num = 8;
 
+// Type trait: fp32 inputs compute in bf16, others use their native type
+template <typename T>
+using compute_type_t = std::conditional_t<std::is_same_v<T, float>, ck_tile::bfloat16_t, T>;
+
 namespace aiter {
 
-// Activation and gating kernel template.
+// Activation and gating kernel template with fp32 auto-conversion support.
+// If DTYPE_I is float, it will be converted to bf16 for computation using ck_tile::type_convert.
 template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d]
                                    const DTYPE_I* __restrict__ input, // [..., 2, d]
                                    const int d)
 {
+    using DTYPE_COMPUTE = compute_type_t<DTYPE_I>;
+
+    // CK Tile buffer addressing constraint: float supports VEC_SIZE <= 16
+    static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
+                  "float type only supports VEC_SIZE up to 16");
+
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
     using vec_i                     = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
+    using vec_c                     = ck_tile::vec_t<DTYPE_COMPUTE, VEC_SIZE_I>;
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (d + ooba_i - 1) / ooba_i * ooba_i;
     auto buffer_x = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_x, oob_i);
@@ -116,23 +128,42 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
-        vec_i x{};
-        vec_i y{};
+        vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
+        vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        x = buffer_x.template get<vec_i>(idx, 0, true);
-        y = buffer_y.template get<vec_i>(idx, 0, true);
+        // Convert fp32→bf16 if needed, otherwise use directly
+        vec_c x_compute{};
+        vec_c y_compute{};
+
+        if constexpr(std::is_same_v<DTYPE_I, float>)
+        {
+#pragma unroll
+            for(size_t j = 0; j < VEC_SIZE_I; j++)
+            {
+                x_compute[j] = ck_tile::type_convert<DTYPE_COMPUTE>(x[j]); // fp32→bf16
+                y_compute[j] = ck_tile::type_convert<DTYPE_COMPUTE>(y[j]);
+            }
+        }
+        else
+        {
+            x_compute = x; // bf16/fp16: zero-copy
+            y_compute = y;
+        }
 
         vec_i r{};
 
 #pragma unroll
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
-            float ax0 = ACT_FN(x[j]);
-            float y0  = ck_tile::type_convert<float>(y[j]);
+            // Call ACT_FN with appropriate type conversion
+            DTYPE_I x_val0 = ck_tile::type_convert<DTYPE_I>(x_compute[j]);
+            float ax0      = ACT_FN(x_val0);
+            float y0       = ck_tile::type_convert<float>(y_compute[j]);
             if(j + 1 < VEC_SIZE_I)
             {
-                float ax1           = ACT_FN(x[j + 1]);
-                float y1            = ck_tile::type_convert<float>(y[j + 1]);
+                DTYPE_I x_val1      = ck_tile::type_convert<DTYPE_I>(x_compute[j + 1]);
+                float ax1           = ACT_FN(x_val1);
+                float y1            = ck_tile::type_convert<float>(y_compute[j + 1]);
                 ck_tile::fp32x2_t a = {ax0, ax1};
                 ck_tile::fp32x2_t b = {y0, y1};
                 ck_tile::fp32x2_t c;
@@ -158,17 +189,24 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
     }
 }
 
-// Scaled activation and gating kernel template.
+// Scaled activation and gating kernel template with fp32 auto-conversion support.
 template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void scaled_act_and_mul_kernel(fp8_type* __restrict__ out,        // [..., d]
                                           const DTYPE_I* __restrict__ input, // [..., 2, d]
                                           const int d,
                                           const float scale)
 {
+    using DTYPE_COMPUTE = compute_type_t<DTYPE_I>;
+
+    // CK Tile buffer addressing constraint: float supports VEC_SIZE <= 16
+    static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
+                  "float type only supports VEC_SIZE up to 16");
+
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
     using vec_i                     = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
+    using vec_c                     = ck_tile::vec_t<DTYPE_COMPUTE, VEC_SIZE_I>;
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (d + ooba_i - 1) / ooba_i * ooba_i;
 
@@ -179,17 +217,38 @@ __global__ void scaled_act_and_mul_kernel(fp8_type* __restrict__ out,        // 
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
-        auto x = buffer_x.template get<vec_i>(idx, 0, true);
-        auto y = buffer_y.template get<vec_i>(idx, 0, true);
+        vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
+        vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
+
+        // Convert fp32→bf16 if needed, otherwise use directly
+        vec_c x_compute{};
+        vec_c y_compute{};
+
+        if constexpr(std::is_same_v<DTYPE_I, float>)
+        {
+#pragma unroll
+            for(size_t j = 0; j < VEC_SIZE_I; j++)
+            {
+                x_compute[j] = ck_tile::type_convert<DTYPE_COMPUTE>(x[j]); // fp32→bf16
+                y_compute[j] = ck_tile::type_convert<DTYPE_COMPUTE>(y[j]);
+            }
+        }
+        else
+        {
+            x_compute = x; // bf16/fp16: zero-copy
+            y_compute = y;
+        }
 
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
             if(j + 1 < VEC_SIZE_I)
             {
-                float act_x0 = ACT_FN(x[j]);
-                float act_x1 = ACT_FN(x[j + 1]);
-                float y0     = ck_tile::type_convert<float>(y[j]);
-                float y1     = ck_tile::type_convert<float>(y[j + 1]);
+                DTYPE_I x_val0 = ck_tile::type_convert<DTYPE_I>(x_compute[j]);
+                DTYPE_I x_val1 = ck_tile::type_convert<DTYPE_I>(x_compute[j + 1]);
+                float act_x0   = ACT_FN(x_val0);
+                float act_x1   = ACT_FN(x_val1);
+                float y0       = ck_tile::type_convert<float>(y_compute[j]);
+                float y1       = ck_tile::type_convert<float>(y_compute[j + 1]);
 
                 float2 act_vals   = {act_x0, act_x1};
                 float2 y_vals     = {y0, y1};
@@ -206,7 +265,8 @@ __global__ void scaled_act_and_mul_kernel(fp8_type* __restrict__ out,        // 
             }
             else
             {
-                float r = ACT_FN(x[j]) * ck_tile::type_convert<float>(y[j]) * scale;
+                DTYPE_I x_val = ck_tile::type_convert<DTYPE_I>(x_compute[j]);
+                float r       = ACT_FN(x_val) * ck_tile::type_convert<float>(y_compute[j]) * scale;
                 out[token_idx * d + idx + j] = ck_tile::type_convert<fp8_type>(r);
             }
         }
@@ -257,50 +317,94 @@ static constexpr int nextPow2(unsigned int num)
     return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
 }
 
-// Launch activation and gating kernel.
-#define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL)                                              \
-    int d              = input.size(-1) / 2;                                               \
-    int64_t num_tokens = input.numel() / input.size(-1);                                   \
-    int vec_size       = nextPow2(d / 64);                                                 \
-    vec_size           = vec_size < 2 ? 2 : vec_size;                                      \
-    vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;                \
-    int num_wave       = nextPow2(d / 64 / vec_size);                                      \
-    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                \
-    dim3 grid(num_tokens);                                                                 \
-    dim3 block(num_wave * 64);                                                             \
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));      \
-    const hipStream_t stream = at::hip::getCurrentHIPStream();                             \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "act_and_mul_kernel", [&] {       \
-        using input_dtype = typename t2ck<scalar_t>::type;                                 \
-        AITER_DISPATCH_CASE_VEC_SIZE(                                                      \
-            vec_size,                                                                      \
-            aiter::act_and_mul_kernel<input_dtype, KERNEL<input_dtype>, VEC_SIZE>          \
-            <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),   \
-                                         reinterpret_cast<input_dtype*>(input.data_ptr()), \
-                                         d);)                                              \
-    });
-#define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                                        \
-    int d              = input.size(-1) / 2;                                                \
-    int64_t num_tokens = input.numel() / input.size(-1);                                    \
-    int vec_size       = nextPow2(d / 64);                                                  \
-    vec_size           = vec_size < 2 ? 2 : vec_size;                                       \
-    vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;                 \
-    int num_wave       = nextPow2(d / 64 / vec_size);                                       \
-    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                 \
-    dim3 grid(num_tokens);                                                                  \
-    dim3 block(num_wave * 64);                                                              \
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));       \
-    const hipStream_t stream = at::hip::getCurrentHIPStream();                              \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_act_and_mul_kernel", [&] { \
-        using input_dtype = typename t2ck<scalar_t>::type;                                  \
-        AITER_DISPATCH_CASE_VEC_SIZE(                                                       \
-            vec_size,                                                                       \
-            aiter::scaled_act_and_mul_kernel<input_dtype, KERNEL<input_dtype>, VEC_SIZE>    \
-            <<<grid, block, 0, stream>>>(reinterpret_cast<fp8_type*>(out.data_ptr()),       \
-                                         reinterpret_cast<input_dtype*>(input.data_ptr()),  \
-                                         d,                                                 \
-                                         1.0f / (*scale.data_ptr<float>()));)               \
-    });
+// Common kernel launch parameters computation
+#define COMPUTE_ACTIVATION_KERNEL_PARAMS                                              \
+    int d              = input.size(-1) / 2;                                          \
+    int64_t num_tokens = input.numel() / input.size(-1);                              \
+    int vec_size       = nextPow2(d / 64);                                            \
+    vec_size           = vec_size < 2 ? 2 : vec_size;                                 \
+    vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;           \
+    int num_wave       = nextPow2(d / 64 / vec_size);                                 \
+    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;           \
+    dim3 grid(num_tokens);                                                            \
+    dim3 block(num_wave * 64);                                                        \
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input)); \
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+// Helper macro for fp32 vec_size dispatch (CK Tile only supports VEC_SIZE <= 16 for fp32)
+#define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...) \
+    case VS:                                                      \
+        aiter::KERNEL_NAME<input_dtype, KERNEL<input_dtype>, VS>  \
+            <<<grid, block, 0, stream>>>(__VA_ARGS__);            \
+        break;
+
+#define DISPATCH_FP32_KERNEL(KERNEL_NAME, KERNEL, ...)                    \
+    switch(vec_size)                                                      \
+    {                                                                     \
+        DISPATCH_FP32_VEC_SIZE_CASE(16, KERNEL_NAME, KERNEL, __VA_ARGS__) \
+        DISPATCH_FP32_VEC_SIZE_CASE(8, KERNEL_NAME, KERNEL, __VA_ARGS__)  \
+        DISPATCH_FP32_VEC_SIZE_CASE(4, KERNEL_NAME, KERNEL, __VA_ARGS__)  \
+        DISPATCH_FP32_VEC_SIZE_CASE(2, KERNEL_NAME, KERNEL, __VA_ARGS__)  \
+        DISPATCH_FP32_VEC_SIZE_CASE(1, KERNEL_NAME, KERNEL, __VA_ARGS__)  \
+    }
+
+#define DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr) \
+    DISPATCH_FP32_KERNEL(act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d)
+
+#define DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale) \
+    DISPATCH_FP32_KERNEL(scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, inv_scale)
+
+// Launch activation and gating kernel (fp32/bf16/fp16 unified, fp32→bf16 auto-convert)
+#define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL)                                                  \
+    COMPUTE_ACTIVATION_KERNEL_PARAMS                                                           \
+    if(input.scalar_type() == at::ScalarType::Float)                                           \
+    {                                                                                          \
+        /* fp32: limited VEC_SIZE due to CK Tile constraint */                                 \
+        using input_dtype = ck_tile::fp32_t;                                                   \
+        auto* out_ptr     = reinterpret_cast<input_dtype*>(out.data_ptr());                    \
+        auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                  \
+        DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                      \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        /* bf16/fp16: full VEC_SIZE support */                                                 \
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "act_and_mul_kernel", [&] {       \
+            using input_dtype = typename t2ck<scalar_t>::type;                                 \
+            AITER_DISPATCH_CASE_VEC_SIZE(                                                      \
+                vec_size,                                                                      \
+                aiter::act_and_mul_kernel<input_dtype, KERNEL<input_dtype>, VEC_SIZE>          \
+                <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),   \
+                                             reinterpret_cast<input_dtype*>(input.data_ptr()), \
+                                             d);)                                              \
+        });                                                                                    \
+    }
+
+// Launch scaled activation and gating kernel (fp32/bf16/fp16 unified, fp32→bf16 auto-convert)
+#define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                                            \
+    COMPUTE_ACTIVATION_KERNEL_PARAMS                                                            \
+    if(input.scalar_type() == at::ScalarType::Float)                                            \
+    {                                                                                           \
+        /* fp32: limited VEC_SIZE due to CK Tile constraint */                                  \
+        using input_dtype = ck_tile::fp32_t;                                                    \
+        auto* out_ptr     = reinterpret_cast<fp8_type*>(out.data_ptr());                        \
+        auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                   \
+        float inv_scale   = 1.0f / (*scale.data_ptr<float>());                                  \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)                     \
+    }                                                                                           \
+    else                                                                                        \
+    {                                                                                           \
+        /* bf16/fp16: full VEC_SIZE support */                                                  \
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_act_and_mul_kernel", [&] { \
+            using input_dtype = typename t2ck<scalar_t>::type;                                  \
+            AITER_DISPATCH_CASE_VEC_SIZE(                                                       \
+                vec_size,                                                                       \
+                aiter::scaled_act_and_mul_kernel<input_dtype, KERNEL<input_dtype>, VEC_SIZE>    \
+                <<<grid, block, 0, stream>>>(reinterpret_cast<fp8_type*>(out.data_ptr()),       \
+                                             reinterpret_cast<input_dtype*>(input.data_ptr()),  \
+                                             d,                                                 \
+                                             1.0f / (*scale.data_ptr<float>()));)               \
+        });                                                                                     \
+    }
 
 namespace aiter {
 
