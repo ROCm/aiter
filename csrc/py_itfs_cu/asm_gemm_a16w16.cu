@@ -111,16 +111,15 @@ get_heuristic_kernel(int M,
             if(splitk.has_value())
             {
                 selectedsplitK = splitk.value();
+                selectedsplitK = std::min({selectedsplitK, 16, static_cast<int>(K / cfg.subK)});
                 TORCH_CHECK((selectedsplitK > 1 && cfg.splitK == 1) ||
                                 (selectedsplitK <= 1 && cfg.splitK == 0),
                             __func__,
                             " The specified splitK ",
                             selectedsplitK,
-                            " cannot be supported by the specified kernel ",
+                            " cannot be supported by the specified kernel or Kdim",
                             el.first,
                             ".");
-                selectedsplitK =
-                    std::min(std::min(selectedsplitK, 16), static_cast<int>(K / cfg.subK));
                 break;
             }
         }
