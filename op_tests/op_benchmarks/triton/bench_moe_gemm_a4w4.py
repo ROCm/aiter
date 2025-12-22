@@ -3,8 +3,6 @@
 
 from itertools import chain
 from pathlib import Path
-from copy import deepcopy
-import csv
 import triton.profiler as proton
 import torch
 import argparse
@@ -206,7 +204,7 @@ def roofline_mlp(
 ):
     out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
     out_path.mkdir(parents=True, exist_ok=True)
-    csv_path = compute_roofline(
+    compute_roofline(
         dim1,
         dim2,
         n_expts_tot,

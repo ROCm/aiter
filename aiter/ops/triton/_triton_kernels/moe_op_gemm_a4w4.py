@@ -21,7 +21,10 @@ def matmul_launch_metadata(grid, kernel, args):
     else:
         n_tokens = None
         n_w_bytes = W.numel() * W.element_size()
-    repr = lambda s, x: f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
+
+    def repr(s, x):
+        return f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
+
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
     if args["B"] is not None:
@@ -532,7 +535,7 @@ def _moe_gemm_a4w4(
     if X_static_scale is not None:
         # should not go in here since static scale fp4 is disabled
         tl.static_assert(
-            X_static_scale == None,
+            X_static_scale is None,
             f"Static scale is disabled for fp4 precision. got {X_static_scale}",
         )
 

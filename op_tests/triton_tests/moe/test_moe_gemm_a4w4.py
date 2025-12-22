@@ -2,11 +2,8 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
 from dataclasses import dataclass, fields
-import itertools
 import pytest
 import torch
-from typing import Union
-import triton
 
 # routing utilities
 from aiter.ops.triton.moe_routing.routing import routing
@@ -21,7 +18,6 @@ from aiter.ops.triton.moe_op_gemm_a4w4 import (
 
 # numerics utilities
 from aiter.ops.triton.quant_moe import (
-    downcast_to_static_fp8,
     downcast_to_mxfp,
     upcast_from_mxfp,
 )
@@ -242,19 +238,11 @@ def test_op(
 
     torch.manual_seed(0)
 
+    act_mxfp4 = "mxfloat4_e2m1"
     weight_mxfp4 = "mxfloat4_e2m1"
     weight_dtype_str = weight_mxfp4[2:]
-
-    act_mxfp4 = "mxfloat4_e2m1"
-    act_dtype_str = act_mxfp4[2:]
-    weight_mxfp4 = "mxfloat4_e2m1"
-    weight_dtype_str = weight_mxfp4[2:]
-
-    act_mxfp4 = "mxfloat4_e2m1"
-    act_dtype_str = act_mxfp4[2:]
 
     weight_dtype = dtype_str_to_torch(weight_dtype_str)
-    act_dtype = dtype_str_to_torch(act_dtype_str)
     m, rdata, gindx, sindx = init_routing_data(
         m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device
     )
