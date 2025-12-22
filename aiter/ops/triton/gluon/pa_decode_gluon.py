@@ -48,16 +48,85 @@ def get_recommended_splits(num_sequences, num_kv_heads):
     return max_context_partition_num
 
 
-def get_recommended_page_size(
+@triton.jit
+def find_max_kernel(
+    input_ptr,  # Pointer to input tensor
+    output_ptr,  # Pointer to output (single value)
+    n_elements,  # Number of elements
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Triton kernel to find maximum value in a 1D tensor using reduction.
+    """
+    # Each program handles one block
+    pid = tl.program_id(0)
+
+    # Calculate offsets for this block
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    # Create mask for valid elements
+    mask = offsets < n_elements
+
+    # Load data with masking (use -inf for invalid elements)
+    data = tl.load(input_ptr + offsets, mask=mask, other=float("-inf"))
+
+    # Find max within this block
+    block_max = tl.max(data, axis=0)
+
+    # Store the block max (will be reduced later)
+    tl.store(output_ptr + pid, block_max)
+
+
+def get_recommended_page_size_triton(
     context_lengths, max_context_partition_num, context_partition_size
 ):
-    max_context_length = context_lengths.max()
-    return torch.maximum(
-        triton.next_power_of_2(
-            triton.cdiv(max_context_length, max_context_partition_num)
-        ),
-        torch.tensor(context_partition_size, device=context_lengths.device),
+    """
+    Triton version: Calculate recommended page size for paged attention.
+
+    Args:
+        context_lengths: Tensor of context lengths
+        max_context_partition_num: Maximum number of context partitions
+        context_partition_size: Minimum partition size
+
+    Returns:
+        Recommended page size (scalar tensor)
+    """
+    # Flatten input if needed
+    context_lengths_flat = context_lengths.flatten()
+    n_elements = context_lengths_flat.numel()
+
+    # Choose block size (power of 2)
+    BLOCK_SIZE = triton.next_power_of_2(min(n_elements, 1024))
+
+    # Calculate number of blocks needed
+    n_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
+
+    # Allocate output for block-level maxes
+    block_maxes = torch.empty(
+        n_blocks, dtype=context_lengths.dtype, device=context_lengths.device
     )
+
+    # Launch kernel to find max in each block
+    grid = (n_blocks,)
+    find_max_kernel[grid](
+        context_lengths_flat,
+        block_maxes,
+        n_elements,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    # Final reduction on CPU/GPU (small array)
+    max_context_length = block_maxes.max()
+
+    # Calculate recommended page size
+    page_size_candidate = triton.next_power_of_2(
+        triton.cdiv(max_context_length.item(), max_context_partition_num)
+    )
+
+    recommended_size = max(page_size_candidate, context_partition_size)
+
+    return torch.tensor(recommended_size, device=context_lengths.device)
 
 
 @gluon.jit
@@ -3026,7 +3095,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         if PS:
 
             if SLIDING_WINDOW == 0:
-                page_size = get_recommended_page_size(
+                page_size = get_recommended_page_size_triton(
                     context_lengths_ptr, num_splits, CONTEXT_PARTITION_SIZE
                 )
                 # grid = (num_sequences * num_splits, num_kv_heads, 1)
