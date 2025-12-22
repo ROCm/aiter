@@ -61,7 +61,7 @@ def top_p_sampling_from_probs(
     samples = torch.empty(batch_size, dtype=torch.int32, device=probs.device)
     func = compile(vec_size, deterministic)
     func(
-        torch_to_c_types(
+        *torch_to_c_types(
             probs,
             samples,
             indices,
