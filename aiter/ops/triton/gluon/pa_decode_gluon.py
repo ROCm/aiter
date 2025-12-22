@@ -49,84 +49,32 @@ def get_recommended_splits(num_sequences, num_kv_heads):
 
 
 @triton.jit
-def find_max_kernel(
-    input_ptr,  # Pointer to input tensor
-    output_ptr,  # Pointer to output (single value)
-    n_elements,  # Number of elements
-    BLOCK_SIZE: tl.constexpr,
+def get_recommended_page_size_kernel(
+    max_context_length_ptr, max_context_partition_num: int, context_partition_size: int
 ):
-    """
-    Triton kernel to find maximum value in a 1D tensor using reduction.
-    """
-    # Each program handles one block
-    pid = tl.program_id(0)
-
-    # Calculate offsets for this block
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-
-    # Create mask for valid elements
-    mask = offsets < n_elements
-
-    # Load data with masking (use -inf for invalid elements)
-    data = tl.load(input_ptr + offsets, mask=mask, other=float("-inf"))
-
-    # Find max within this block
-    block_max = tl.max(data, axis=0)
-
-    # Store the block max (will be reduced later)
-    tl.store(output_ptr + pid, block_max)
+    """Return the smallest power of 2 greater than or equal to n"""
+    max_context_length = tl.load(max_context_length_ptr)
+    n = tl.cdiv(max_context_length, max_context_partition_num).to(tl.int64)
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    n += 1
+    n = tl.maximum(n, context_partition_size)
+    tl.store(max_context_length_ptr, n.to(tl.int32))
 
 
-def get_recommended_page_size_triton(
+def get_recommended_page_size(
     context_lengths, max_context_partition_num, context_partition_size
 ):
-    """
-    Triton version: Calculate recommended page size for paged attention.
-
-    Args:
-        context_lengths: Tensor of context lengths
-        max_context_partition_num: Maximum number of context partitions
-        context_partition_size: Minimum partition size
-
-    Returns:
-        Recommended page size (scalar tensor)
-    """
-    # Flatten input if needed
-    context_lengths_flat = context_lengths.flatten()
-    n_elements = context_lengths_flat.numel()
-
-    # Choose block size (power of 2)
-    BLOCK_SIZE = triton.next_power_of_2(min(n_elements, 1024))
-
-    # Calculate number of blocks needed
-    n_blocks = triton.cdiv(n_elements, BLOCK_SIZE)
-
-    # Allocate output for block-level maxes
-    block_maxes = torch.empty(
-        n_blocks, dtype=context_lengths.dtype, device=context_lengths.device
+    max_context_length = context_lengths.max()
+    get_recommended_page_size_kernel[(1,)](
+        max_context_length, max_context_partition_num, context_partition_size
     )
-
-    # Launch kernel to find max in each block
-    grid = (n_blocks,)
-    find_max_kernel[grid](
-        context_lengths_flat,
-        block_maxes,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-    # Final reduction on CPU/GPU (small array)
-    max_context_length = block_maxes.max()
-
-    # Calculate recommended page size
-    page_size_candidate = triton.next_power_of_2(
-        triton.cdiv(max_context_length.item(), max_context_partition_num)
-    )
-
-    recommended_size = max(page_size_candidate, context_partition_size)
-
-    return torch.tensor(recommended_size, device=context_lengths.device)
+    return max_context_length
 
 
 @gluon.jit
@@ -3057,6 +3005,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     sinks_ptr,
     PS,
     CDNA_VERSION,
+    page_size,
 ):
     """
     Wrapper function for paged attention decode kernel with dynamic kernel selection.
@@ -3093,14 +3042,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             waves_per_eu = 4
 
         if PS:
-
-            if SLIDING_WINDOW == 0:
-                page_size = get_recommended_page_size_triton(
-                    context_lengths_ptr, num_splits, CONTEXT_PARTITION_SIZE
-                )
-                # grid = (num_sequences * num_splits, num_kv_heads, 1)
-            else:
-                page_size = 1
             paged_attention_decode_sliding_window[grid](
                 exp_sums_ptr,
                 max_logits_ptr,
@@ -3330,6 +3271,7 @@ def pa_decode_gluon(
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     ps: bool = False,
+    page_size: torch.Tensor = None,
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -3465,7 +3407,8 @@ def pa_decode_gluon(
         3,
         4,
     ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
-
+    if page_size is None:
+        page_size = 1
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
@@ -3705,6 +3648,7 @@ def pa_decode_gluon(
         sinks_ptr=sinks,
         PS=ps,
         CDNA_VERSION=cdna_version,
+        page_size=page_size,
     )
     if max_context_partition_num > 1:
         # ==================== REDUCTION KERNEL EXECUTION ====================

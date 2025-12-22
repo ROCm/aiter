@@ -19,7 +19,7 @@ from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.ops.attention import pa_decode_gluon
 from aiter.ops.triton.gluon.pa_decode_gluon import (
-    # pa_decode_gluon,
+    get_recommended_page_size,
     get_recommended_splits,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
@@ -1141,7 +1141,7 @@ def prepare_gluon_query_and_scale(
     return quantized_query_gluon, query_scale_gluon, output_gluon
 
 
-@perftest()
+@perftest(testGraph=True)
 def run_gluon_kernel(
     output: torch.Tensor,
     output_transposed: torch.Tensor,
@@ -1168,6 +1168,7 @@ def run_gluon_kernel(
     sinks: Optional[torch.Tensor] = None,
     sliding_window: int = 0,
     ps=False,
+    page_size=None,
 ) -> None:
     """Run Gluon FP8/BF16/FP16 kernel for paged attention using Triton transpose kernel.
 
@@ -1245,6 +1246,7 @@ def run_gluon_kernel(
                 sinks=sinks,
                 sliding_window=sliding_window,
                 ps=ps,
+                page_size=page_size,
             )
         else:
             raise RuntimeError(
@@ -1523,12 +1525,18 @@ def run_pa_gluon_test(
         context_partition_size = 128
     else:
         context_partition_size = 256
+    page_size = torch.tensor(1, dtype=torch.int32, device=context_lengths.device)
     if ps:
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        if sliding_window == 0:
+            page_size = get_recommended_page_size(
+                context_lengths, max_context_partition_num, context_partition_size
+            )
     else:
         max_context_partition_num = triton.cdiv(
             max_context_length, context_partition_size
         )
+
     equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
     intermediate_shape = (
         num_seqs,
@@ -1605,6 +1613,7 @@ def run_pa_gluon_test(
         sinks=sinks,
         sliding_window=sliding_window,
         ps=ps,
+        page_size=page_size,
     )
 
     # Compare with original reference
