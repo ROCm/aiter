@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 import aiter
-from aiter import dtypes, gemm_a16w16_asm, get_semaphore_workspace, logger
+from aiter import dtypes, get_semaphore_workspace, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.shuffle import shuffle_weight
