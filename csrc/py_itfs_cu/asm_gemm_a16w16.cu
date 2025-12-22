@@ -131,14 +131,12 @@ get_heuristic_kernel(int M,
             // 1. select splitk
             int split_K = 1;
             pure_tg_num = ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN);
-            if(cfg.splitK == 1) // kernel support splitk
+            if(cfg.splitK == 1 && K / cfg.subK >= 2) // kernel and Kdim support splitk
             {
-
                 TORCH_CHECK(K % 64 == 0, __func__, " Kdim must be divisible by 64 !!!");
                 TORCH_CHECK(cfg.subK > 0,
                             __func__,
                             " cfg.subK must be greater than 0 to avoid division by zero.");
-                TORCH_CHECK(K / cfg.subK >= 2, __func__, "the Kim cannot splitk");
                 int max_splitk = std::min(std::min(static_cast<int>(num_cu / pure_tg_num), 16),
                                           static_cast<int>(K / cfg.subK));
                 split_K =
