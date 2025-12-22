@@ -172,7 +172,7 @@ def main():
     )
     parser.add_argument(
         "-o", "--output",
-        default="configs/trace_moe_config.csv",
+        default="trace_moe_config.csv",
         help="Output configuration CSV file"
     )
     
