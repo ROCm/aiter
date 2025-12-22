@@ -65,7 +65,6 @@ get_heuristic_kernel(int M,
                      std::string arch_id,
                      bool bpreshuffle,
                      int add_bias,
-                     int clean                             = 1,
                      std::optional<int> splitk             = std::nullopt,
                      std::optional<std::string> kernelName = std::nullopt)
 {
@@ -91,12 +90,13 @@ get_heuristic_kernel(int M,
         const auto& cfg = el.second;
         if(kernelName.has_value() && el.first != (arch_id + kernelName.value()))
             continue;
+        // check specified kernel name
         if(kernelName.has_value())
         {
             TORCH_CHECK(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
                             (add_bias == 0 || cfg.bias == 1),
                         __func__,
-                        " the specified kernel name ",
+                        " The specified kernel name ",
                         el.first,
                         " cannot support the input shape (N=",
                         N,
@@ -107,36 +107,44 @@ get_heuristic_kernel(int M,
                         ", bias=",
                         add_bias,
                         ").");
-        }
-        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
-           (add_bias == 0 || cfg.bias == 1) && clean == cfg.clean)
-        {
-            int split_K = 1;
+            selectedKernelName = el.first;
             if(splitk.has_value())
-                split_K = std::min(splitk.value(), 16);
-            else if(cfg.splitK == 1)
             {
-                pure_tg_num = ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN);
-                if(pure_tg_num < num_cu)
-                {
-                    TORCH_CHECK(cfg.subK > 0,
-                                __func__,
-                                " cfg.subK must be greater than 0 to avoid division by zero.");
-                    int max_split = std::min(std::min(static_cast<int>(num_cu / pure_tg_num), 16),
-                                             static_cast<int>(K / cfg.subK));
-                    for(int i = max_split; i >= 1; i--)
-                    {
-                        if(K % 64 == 0)
-                        {
-                            split_K = i;
-                            break;
-                        }
-                        else
-                            TORCH_CHECK(false, __func__, " Kdim must be divisible by 64 !!!");
-                    }
-                }
+                selectedsplitK = splitk.value();
+                TORCH_CHECK((selectedsplitK > 1 && cfg.splitK == 1) ||
+                                (selectedsplitK <= 1 && cfg.splitK == 0),
+                            __func__,
+                            " The specified splitK ",
+                            selectedsplitK,
+                            " cannot be supported by the specified kernel ",
+                            el.first,
+                            ".");
+                selectedsplitK =
+                    std::min(std::min(selectedsplitK, 16), static_cast<int>(K / cfg.subK));
+                break;
             }
+        }
+        // auto select splitk or kernel
+        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
+           (add_bias == 0 || cfg.bias == 1))
+        {
+            // 1. select splitk
+            int split_K = 1;
+            pure_tg_num = ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN);
+            if(cfg.splitK == 1) // kernel support splitk
+            {
 
+                TORCH_CHECK(K % 64 == 0, __func__, " Kdim must be divisible by 64 !!!");
+                TORCH_CHECK(cfg.subK > 0,
+                            __func__,
+                            " cfg.subK must be greater than 0 to avoid division by zero.");
+                TORCH_CHECK(K / cfg.subK >= 2, __func__, "the Kim cannot splitk");
+                int max_splitk = std::min(std::min(static_cast<int>(num_cu / pure_tg_num), 16),
+                                          static_cast<int>(K / cfg.subK));
+                split_K =
+                    std::max(2, max_splitk); // if kernel support splitk, set splitk to 2 at least.
+            }
+            // 2. better or not
             uint32_t tg_num      = pure_tg_num * split_K;
             uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
             float local_compute2mem_effi =
@@ -227,37 +235,50 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
     args.is_out_b16                 = (out.dtype() == torch::ScalarType::BFloat16) ? 1 : 0;
     args.add_bias                   = bias.has_value() ? 1 : 0;
 
-    CFG* config_map                = &cfg_bf16gemm_fp32bf16;
-    std::string selectedKernelName = kernelName.has_value() ? arch_id + kernelName.value() : "";
-    int selectedksplit             = splitK.value_or(0) ?: 1;
-    if(!kernelName.has_value() || kernelName.value_or("").empty() || !splitK.has_value())
-    {
-        auto [name, split] = get_heuristic_kernel(Mdim,
-                                                  Ndim,
-                                                  Kdim,
-                                                  config_map,
-                                                  arch_id,
-                                                  bpreshuffle,
-                                                  args.add_bias,
-                                                  1,
-                                                  splitK,
-                                                  kernelName);
-        selectedKernelName = name;
-        selectedksplit     = split;
-    }
-    args.splitk              = selectedksplit;
-    AiterAsmKernel* impl_ptr = get_or_load_kernel(selectedKernelName, config_map, SUBM, SUBN);
+    CFG* config_map = &cfg_bf16gemm_fp32bf16;
+
+    auto [name, split] = get_heuristic_kernel(
+        Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, splitK, kernelName);
+    args.splitk              = split;
+    AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
-    int gdz = selectedksplit;
+    int gdz = split;
 
     TORCH_CHECK(gdy <= 16, __func__, " gdy (", gdy, ") must be <= 16"); // 16 = 512/32
 
     // semaphore.fill_(selectedksplit);
     args.ptr_semaphore = (void*)semaphore.data_ptr<uint32_t>();
+    // printf("KernelArgs Debug Info:\n");
+    // printf("  ptr_D: %p\n", args.ptr_D);
+    // printf("  ptr_C: %p\n", args.ptr_C);
+    // printf("  ptr_A: %p\n", args.ptr_A);
+    // printf("  ptr_B: %p\n", args.ptr_B);
+    // printf("  ptr_Bias: %p\n", args.ptr_Bias);
+    // printf("  ptr_semaphore: %p\n", args.ptr_semaphore);
+    // printf("  alpha: %f\n", args.alpha);
+    // printf("  beta: %f\n", args.beta);
+    // printf("  stride_D0: %u\n", args.stride_D0);
+    // printf("  stride_D1: %u\n", args.stride_D1);
+    // printf("  stride_C0: %u\n", args.stride_C0);
+    // printf("  stride_C1: %u\n", args.stride_C1);
+    // printf("  stride_A0: %u\n", args.stride_A0);
+    // printf("  stride_A1: %u\n", args.stride_A1);
+    // printf("  stride_B0: %u\n", args.stride_B0);
+    // printf("  stride_B1: %u\n", args.stride_B1);
+    // printf("  M: %u\n", args.M);
+    // printf("  N: %u\n", args.N);
+    // printf("  K: %u\n", args.K);
+    // printf("  splitk: %u\n", args.splitk);
+    // printf("  is_out_b16: %u\n", args.is_out_b16);
+    // printf("  add_bias: %u\n", args.add_bias);
+    // printf("  Grid: [%d, %d, %d]\n", gdx, gdy, gdz);
+    // printf("  Block: [256, 1, 1]\n");
+    // printf("  SUBM: %u, SUBN: %u\n", SUBM, SUBN);
+    // printf("  Selected Kernel: %s\n", name.c_str());
 
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
