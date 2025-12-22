@@ -280,6 +280,10 @@ __global__ void fusedQKNormRopeKernel(
 
   // cache the kv into kv cache and quant if required
   int64_t slot_id = slot_mapping[tokenIdx];
+  if (slot_id < 0) {
+    // invalid slot, skip
+    return;
+  }
   int64_t block_idx = slot_id / page_size;
   int64_t block_offset = slot_id % page_size;
   if (isK) {
