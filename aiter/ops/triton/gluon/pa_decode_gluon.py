@@ -1970,7 +1970,10 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     DOT_QK_K_WIDTH: gl.constexpr = KV_16B_ELEMENT_COUNT
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=CDNA_VERSION,
+        instr_shape=[16, 16],
+        transposed=True,
+        warps_per_cta=[1, 4],
     )
     qk_lhs_operand_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=DOT_QK_K_WIDTH
@@ -2032,7 +2035,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         )
         blocked_value_layout: gl.constexpr = (
             blocked_value_layout_fp8
-            if COMPUTE_TYPE == gl.float8e4b8
+            if KV_16B_ELEMENT_COUNT == 16
             else blocked_value_layout_f16
         )
         value_dim1_offsets = gl.arange(
