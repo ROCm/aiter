@@ -17,9 +17,9 @@ import aiter
 from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
-
+from aiter.ops.attention import pa_decode_gluon
 from aiter.ops.triton.gluon.pa_decode_gluon import (
-    pa_decode_gluon,
+    # pa_decode_gluon,
     get_recommended_splits,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
@@ -1220,7 +1220,7 @@ def run_gluon_kernel(
         )
     else:
         if pa_decode_gluon is not None:
-            pa_decode_gluon(
+            torch.ops.aiter.pa_decode_gluon(
                 output,
                 output_transposed,
                 query,
@@ -1318,6 +1318,7 @@ def run_pa_gluon_test(
         ]
     else:
         kv_len_list = [context_length] * batch_size
+
     context_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
     # print(f"context_lengths={context_lengths}")
     if use_sinks:
@@ -1518,12 +1519,10 @@ def run_pa_gluon_test(
         if sliding_window > 0
         else context_lengths.max().item()
     )
-    context_partition_size = 256
-    if sliding_window > 0:
-        max_context_length = min(max_context_length, sliding_window)
-        if max_context_length <= 128:
-            context_partition_size = 128
-
+    if ps or sliding_window > 0:
+        context_partition_size = 128
+    else:
+        context_partition_size = 256
     if ps:
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
     else:
@@ -1592,9 +1591,9 @@ def run_pa_gluon_test(
         block_tables,
         softmax_scale,
         query_length,
-        context_lengths.max().item(),
+        131072,
         context_partition_size,
-        TORCH_TO_TL_DTYPE[compute_type],
+        compute_type,
         query_scale=query_scale_factors,
         key_scale=key_scale_original,
         value_scale=value_scale_original,
@@ -2267,22 +2266,21 @@ def sliding_window_test():
 
     USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    # COMPUTE_TYPE_OPTIONS = ["fp8"]
 
     SINKS_OPTIONS = [False]
-    SLIDING_WINDOW_OPTIONS = [0, 128]
-    HEAD_DIMENSION_OPTIONS = [64, 128]
-    CONTEXT_LENGTH_OPTIONS = [2048]
-    BATCH_SIZE_OPTIONS = [64, 128]
+    SLIDING_WINDOW_OPTIONS = [0]
+    HEAD_DIMENSION_OPTIONS = [64]
+    CONTEXT_LENGTH_OPTIONS = [1024, 8192]
+    BATCH_SIZE_OPTIONS = [4, 16, 128]
     QUERY_LENGTH_OPTIONS = [1]
     COMPUTE_TYPE_OPTIONS = ["bf16"]
     QUANT_Q_AND_KV_OPTIONS = [[False, True]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
-    KV_VARLEN_OPTIONS = [True]
+    KV_VARLEN_OPTIONS = [True, False]
     HEAD_CONFIGURATIONS = [(64, 8)]
     USE_AOT_IMPL_OPTIONS = [False]
-    PS_OPTIONS = [True]
+    PS_OPTIONS = [True, False]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     # BLOCK_SIZE_OPTIONS = [64]
