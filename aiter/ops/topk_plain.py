@@ -13,7 +13,12 @@ from ..jit.core import (
 def topk_plain(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
+    topk_out: torch.Tensor,
     topk: int,
-    largest: bool,
+    largest: bool = True,
+    rowStarts: torch.Tensor = None,
+    rowEnds: torch.Tensor = None,
+    stride0: int = -1,
+    stride1: int = 1,
 ) -> None:
     pass

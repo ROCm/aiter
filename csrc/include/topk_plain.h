@@ -6,5 +6,10 @@
 
 void topk_plain(torch::Tensor& values,
                 torch::Tensor& topk_ids,
-                int topk_num,
-                bool largest);
+                torch::Tensor& topk_out,
+                int topk,
+                bool largest = true,
+                torch::Tensor rowStarts = torch::Tensor(),
+                torch::Tensor rowEnds = torch::Tensor(),
+                int64_t stride0 = -1,
+                int64_t stride1 = 1);

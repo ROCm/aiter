@@ -171,6 +171,7 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                         batch_stride_o,
                         mask.left,
                         mask.right,
+                        mask.sink,
                         static_cast<ck_tile::index_t>(mask.type),
                         min_seqlen_q,
                         p_dropout,
@@ -344,6 +345,7 @@ mha_varlen_fwd(
     bool is_causal,
     int window_size_left,
     int window_size_right,
+    int sink_size,
     bool return_softmax_lse,
     bool return_dropout_randval,
     std::optional<at::Tensor> out_,                // [total_q, hq, d]
@@ -456,7 +458,7 @@ mha_varlen_fwd(
     if (is_causal) {
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
         window_size_right = 0;
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0" + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // casual
     }
     else if (window_size_left == -1 && window_size_right == -1) {
@@ -464,10 +466,10 @@ mha_varlen_fwd(
     }
     else {
         // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
-
+    bool has_sink = mask.sink > 0;
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
     if (!paged_KV) {
         const int total_k = k.size(0);
@@ -594,7 +596,8 @@ mha_varlen_fwd(
                                              true, //is_group_mode
                                              mask.type,
                                              bias_type,
-                                             has_lse);
+                                             has_lse,
+                                             has_sink);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
         }
         else
@@ -633,7 +636,6 @@ mha_varlen_fwd(
                     drop_seed_offset,
                     const_cast<std::optional<const at::Tensor>&>(cu_seqlens_q_padded_),
                     const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_));
-
             float t = aiter::mha_fwd(args,
                                      stream_config,
                                      dtype_str,
@@ -643,6 +645,7 @@ mha_varlen_fwd(
                                      has_lse,
                                      qscale_type,
                                      false, // use_ext_asm
+                                     has_sink,
                                      1);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }

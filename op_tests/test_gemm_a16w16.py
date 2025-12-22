@@ -2,9 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import os
 import random
-import sys
 from functools import lru_cache
 
 import pandas as pd
@@ -59,8 +57,9 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 def run_bf16gemm_asm(
     x, weight, out_asm, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
+    sema = aiter.get_semaphore_workspace(out_asm.device)
     return aiter.gemm_a16w16_asm(
-        x, weight, out_asm, bias, splitK, kernelName, bpreshuffle
+        x, weight, out_asm, sema, bias, splitK, kernelName, bpreshuffle
     )
 
 
@@ -93,9 +92,10 @@ def init_hipblas():
 
 @benchmark()
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
+    ret = {}
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
-    weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
+    weight = torch.randn(n, k, dtype=otype, device="cuda").to(dtype)
     if otype is None:
         otype = dtype
     if bias:
@@ -108,6 +108,23 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
     a, avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
     b, avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
+    assert (
+        a.dtype == b.dtype
+    ), f"Expected a.dtype == b.dtype, but a={a.dtype}, b={b.dtype}, input dtype={dtype}"
+    if otype is not None:
+        assert (
+            a.dtype == otype
+        ), f"a={a.dtype}, expected output dtype={otype}, input dtype={dtype}"
+        assert (
+            b.dtype == otype
+        ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
+
+    msg_b = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
+    err_tgemm = checkAllclose(a, b, msg=msg_b)
+    ret["torch us"] = avg_a
+    ret["tgemm us"] = avg_b
+    ret["tgemm err"] = err_tgemm
+
     if (
         n % 16 == 0
         and k % 32 == 0
@@ -123,25 +140,14 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     else:
         c = None
         avg_c = None
-    assert (
-        a.dtype == b.dtype
-    ), f"Expected a.dtype == b.dtype, but a={a.dtype}, b={b.dtype}, input dtype={dtype}"
-    if otype is not None:
+    if c is not None and avg_c is not None:
         assert (
-            a.dtype == otype
-        ), f"a={a.dtype}, expected output dtype={otype}, input dtype={dtype}"
-        assert (
-            b.dtype == otype
-        ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
-        if c is not None:
-            assert (
-                c.dtype == otype
-            ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
-    msg_b = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
-    if avg_c is not None:
+            c.dtype == otype
+        ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
         msg_c = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
-    err_tgemm = checkAllclose(a, b, msg=msg_b)
-    err_hipb = checkAllclose(a, c, msg=msg_c) if c is not None else None
+        err_hipb = checkAllclose(a, c, msg=msg_c) if c is not None else None
+        ret["hipb us"] = avg_c
+        ret["hipb err"] = err_hipb
 
     #### asm a16w16 gemm -- huan
     ### run bf16gemm_f32 asm
@@ -158,23 +164,15 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
             x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
         )
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
-        err_asm = checkAllclose(b, d, msg=msg)
+        err_asm = checkAllclose(a, d, msg=msg)
         ### no shuffle
         e, avg_e = run_bf16gemm_asm(x, weight, out_asm, bias)
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
-        err_asm_noshuffle = checkAllclose(b, e, msg=msg)
-
-    ret = {
-        "torch us": avg_a,
-        "tgemm us": avg_b,
-        "tgemm err (vs torch)": err_tgemm,
-        "hipb us": locals().get("avg_c", ""),
-        "hipb err (vs torch)": locals().get("err_hipb", ""),
-        "asm-bpshuff us": locals().get("avg_d", ""),
-        "asm-bpshuff err (vs tgemm)": locals().get("err_asm", ""),
-        "asm-nshuff us": locals().get("avg_e", ""),
-        "asm-nshuff err (vs tgemm)": locals().get("err_asm_noshuffle", ""),
-    }
+        err_asm_noshuffle = checkAllclose(a, e, msg=msg)
+        ret["asm-bpshuff us"] = avg_d
+        ret["asm-bpshuff err"] = err_asm
+        ret["asm-nshuff us"] = avg_e
+        ret["asm-nshuff err"] = err_asm_noshuffle
 
     a, us = run_gemm_triton(x, weight, bias, otype, scaleA, scaleB)
     err = checkAllclose(b, a)
@@ -472,7 +470,7 @@ parser.add_argument(
     "-o",
     "--otype",
     type=dtypes.str2Dtype,
-    default=[None, torch.float16, torch.bfloat16, torch.float32],
+    default=[torch.float16, torch.bfloat16, torch.float32],
     help="""Data type of output.
     e.g.: -d bf16""",
 )
