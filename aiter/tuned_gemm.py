@@ -24,7 +24,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
+from aiter import (
+    dtypes,
+    gemm_a16w16_asm,
+    get_semaphore_workspace,
+    hipb_create_extension,
+    hipb_mm,
+    logger,
+)
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -127,7 +134,6 @@ def get_GEMM_A16W16_config(
                 eval(dtype) == dtypes.bf16
                 and N % 64 == 0
                 and K % 64 == 0
-                and not bias
                 and (eval(otype) == dtypes.bf16 or eval(otype) == dtypes.fp32)
             ):
                 default_config["libtype"] = "asm"
@@ -393,7 +399,10 @@ def asm_gemm(
     out_asm = torch.empty(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
-    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
+    sema = get_semaphore_workspace(out_asm.device)
+    return gemm_a16w16_asm(
+        inp, weights, out_asm, sema, bias, splitK, KernelName, bpreshuffle
+    )
 
 
 def triton_gemm(
