@@ -25,21 +25,17 @@ static constexpr int32_t max_wave_num = 8;
 template <typename T>
 using compute_type_t = T;
 
-// Type trait for output type (fp32 outputs as bf16, others keep native type)
-template <typename T>
-using output_type_t = std::conditional_t<std::is_same_v<T, float>, ck_tile::bfloat16_t, T>;
-
 namespace aiter {
 
-// Activation and gating kernel template supporting fp32/bf16/fp16.
-// fp32 inputs compute in fp32 but output as bf16; bf16/fp16 keep native type.
-template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
-__global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d]
+// Activation and gating kernel template with flexible input/output types.
+// DTYPE_I: input type (fp32/bf16/fp16), DTYPE_O: output type (fp32/bf16/fp16)
+// Computes in DTYPE_I native precision, converts to DTYPE_O on output.
+template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
+__global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d]
                                    const DTYPE_I* __restrict__ input, // [..., 2, d]
                                    const int d)
 {
     using DTYPE_COMPUTE = compute_type_t<DTYPE_I>;
-    using DTYPE_O       = output_type_t<DTYPE_I>;
 
     // CK Tile buffer addressing constraint: float supports VEC_SIZE <= 16
     static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
@@ -58,8 +54,8 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
     buffer_x.init_raw();
     buffer_y.init_raw();
 
-    // Output buffer view (may have different type than input for fp32→bf16)
-    DTYPE_O* __restrict__ out_base  = reinterpret_cast<DTYPE_O*>(out) + token_idx * d;
+    // Output buffer view (independent type from input)
+    DTYPE_O* __restrict__ out_base  = out + token_idx * d;
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     const int32_t oob_o             = (d + ooba_o - 1) / ooba_o * ooba_o;
     auto buffer_out =
@@ -182,9 +178,10 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
     }
 }
 
-// Scaled activation and gating kernel template supporting fp32/bf16/fp16.
-template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
-__global__ void scaled_act_and_mul_kernel(fp8_type* __restrict__ out,        // [..., d]
+// Scaled activation and gating kernel template with flexible output type.
+// DTYPE_I: input type, DTYPE_O: output type (typically fp8 for quantization)
+template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
+__global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d]
                                           const DTYPE_I* __restrict__ input, // [..., 2, d]
                                           const int d,
                                           const float scale)
@@ -238,14 +235,14 @@ __global__ void scaled_act_and_mul_kernel(fp8_type* __restrict__ out,        // 
                              : "=v"(result)
                              : "v"(act_vals), "v"(y_vals), "v"(scale_vals));
 
-                out[token_idx * d + idx + j]     = ck_tile::type_convert<fp8_type>(result.x);
-                out[token_idx * d + idx + j + 1] = ck_tile::type_convert<fp8_type>(result.y);
+                out[token_idx * d + idx + j]     = ck_tile::type_convert<DTYPE_O>(result.x);
+                out[token_idx * d + idx + j + 1] = ck_tile::type_convert<DTYPE_O>(result.y);
             }
             else
             {
                 DTYPE_I x_val = ck_tile::type_convert<DTYPE_I>(x_compute[j]);
                 float r       = ACT_FN(x_val) * ck_tile::type_convert<float>(y_compute[j]) * scale;
-                out[token_idx * d + idx + j] = ck_tile::type_convert<fp8_type>(r);
+                out[token_idx * d + idx + j] = ck_tile::type_convert<DTYPE_O>(r);
             }
         }
     }
@@ -310,10 +307,10 @@ static constexpr int nextPow2(unsigned int num)
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
 // Helper macro for fp32 vec_size dispatch (CK Tile only supports VEC_SIZE <= 16 for fp32)
-#define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...) \
-    case VS:                                                      \
-        aiter::KERNEL_NAME<input_dtype, KERNEL<input_dtype>, VS>  \
-            <<<grid, block, 0, stream>>>(__VA_ARGS__);            \
+#define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...)              \
+    case VS:                                                                   \
+        aiter::KERNEL_NAME<input_dtype, output_dtype, KERNEL<input_dtype>, VS> \
+            <<<grid, block, 0, stream>>>(__VA_ARGS__);                         \
         break;
 
 #define DISPATCH_FP32_KERNEL(KERNEL_NAME, KERNEL, ...)                    \
@@ -332,52 +329,108 @@ static constexpr int nextPow2(unsigned int num)
 #define DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale) \
     DISPATCH_FP32_KERNEL(scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, inv_scale)
 
-// Launch activation and gating kernel (fp32/bf16/fp16 unified, fp32→bf16 auto-convert)
-#define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL)                                                  \
-    COMPUTE_ACTIVATION_KERNEL_PARAMS                                                           \
-    if(input.scalar_type() == at::ScalarType::Float)                                           \
-    {                                                                                          \
-        /* fp32: limited VEC_SIZE due to CK Tile constraint */                                 \
-        using input_dtype = ck_tile::fp32_t;                                                   \
-        auto* out_ptr     = reinterpret_cast<input_dtype*>(out.data_ptr());                    \
-        auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                  \
-        DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                      \
-    }                                                                                          \
-    else                                                                                       \
-    {                                                                                          \
-        /* bf16/fp16: full VEC_SIZE support */                                                 \
-        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "act_and_mul_kernel", [&] {       \
-            using input_dtype = typename t2ck<scalar_t>::type;                                 \
-            AITER_DISPATCH_CASE_VEC_SIZE(                                                      \
-                vec_size,                                                                      \
-                aiter::act_and_mul_kernel<input_dtype, KERNEL<input_dtype>, VEC_SIZE>          \
-                <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),   \
-                                             reinterpret_cast<input_dtype*>(input.data_ptr()), \
-                                             d);)                                              \
-        });                                                                                    \
+// Helper macro to dispatch scaled kernel based on output type
+#define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                \
+    if(out.scalar_type() == at::ScalarType::BFloat16)                         \
+    {                                                                         \
+        using output_dtype = ck_tile::bf16_t;                                 \
+        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr()); \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)   \
+    }                                                                         \
+    else if(out.scalar_type() == at::ScalarType::Half)                        \
+    {                                                                         \
+        using output_dtype = ck_tile::fp16_t;                                 \
+        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr()); \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)   \
+    }                                                                         \
+    else if(out.scalar_type() == at::ScalarType::Float)                       \
+    {                                                                         \
+        using output_dtype = ck_tile::fp32_t;                                 \
+        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr()); \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)   \
+    }                                                                         \
+    else                                                                      \
+    {                                                                         \
+        /* fp8 output */                                                      \
+        using output_dtype = fp8_type;                                        \
+        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr()); \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)   \
     }
 
-// Launch scaled activation and gating kernel (fp32/bf16/fp16 unified, fp32→bf16 auto-convert)
+// Launch activation and gating kernel with flexible input/output types
+// Input and output types are determined by the tensor dtypes passed from Python
+#define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL)                                                    \
+    COMPUTE_ACTIVATION_KERNEL_PARAMS                                                             \
+    if(input.scalar_type() == at::ScalarType::Float)                                             \
+    {                                                                                            \
+        /* fp32 input: dispatch based on output type */                                          \
+        using input_dtype = ck_tile::fp32_t;                                                     \
+        auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                    \
+        if(out.scalar_type() == at::ScalarType::BFloat16)                                        \
+        {                                                                                        \
+            using output_dtype = ck_tile::bf16_t;                                                \
+            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
+            DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
+        }                                                                                        \
+        else if(out.scalar_type() == at::ScalarType::Half)                                       \
+        {                                                                                        \
+            using output_dtype = ck_tile::fp16_t;                                                \
+            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
+            DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
+        }                                                                                        \
+        else if(out.scalar_type() == at::ScalarType::Float)                                      \
+        {                                                                                        \
+            using output_dtype = ck_tile::fp32_t;                                                \
+            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
+            DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
+        }                                                                                        \
+        else                                                                                     \
+        {                                                                                        \
+            TORCH_CHECK(false, "Unsupported output type for fp32 input");                        \
+        }                                                                                        \
+    }                                                                                            \
+    else                                                                                         \
+    {                                                                                            \
+        /* bf16/fp16 input: output must match input type */                                      \
+        TORCH_CHECK(input.scalar_type() == out.scalar_type(),                                    \
+                    "For bf16/fp16 input, output type must match input type");                   \
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "act_and_mul_kernel", [&] {         \
+            using input_dtype  = typename t2ck<scalar_t>::type;                                  \
+            using output_dtype = input_dtype;                                                    \
+            AITER_DISPATCH_CASE_VEC_SIZE(                                                        \
+                vec_size,                                                                        \
+                aiter::                                                                          \
+                    act_and_mul_kernel<input_dtype, output_dtype, KERNEL<input_dtype>, VEC_SIZE> \
+                <<<grid, block, 0, stream>>>(reinterpret_cast<output_dtype*>(out.data_ptr()),    \
+                                             reinterpret_cast<input_dtype*>(input.data_ptr()),   \
+                                             d);)                                                \
+        });                                                                                      \
+    }
+
+// Launch scaled activation and gating kernel with flexible input/output types
 #define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                                            \
     COMPUTE_ACTIVATION_KERNEL_PARAMS                                                            \
     if(input.scalar_type() == at::ScalarType::Float)                                            \
     {                                                                                           \
-        /* fp32: limited VEC_SIZE due to CK Tile constraint */                                  \
+        /* fp32 input: dispatch based on output type (fp8/bf16/fp16/fp32) */                    \
         using input_dtype = ck_tile::fp32_t;                                                    \
-        auto* out_ptr     = reinterpret_cast<fp8_type*>(out.data_ptr());                        \
         auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                   \
         float inv_scale   = 1.0f / (*scale.data_ptr<float>());                                  \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)                     \
+        DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                                  \
     }                                                                                           \
     else                                                                                        \
     {                                                                                           \
-        /* bf16/fp16: full VEC_SIZE support */                                                  \
+        /* bf16/fp16 input: output typically fp8 for quantization */                            \
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_act_and_mul_kernel", [&] { \
-            using input_dtype = typename t2ck<scalar_t>::type;                                  \
+            using input_dtype  = typename t2ck<scalar_t>::type;                                 \
+            using output_dtype = fp8_type;                                                      \
             AITER_DISPATCH_CASE_VEC_SIZE(                                                       \
                 vec_size,                                                                       \
-                aiter::scaled_act_and_mul_kernel<input_dtype, KERNEL<input_dtype>, VEC_SIZE>    \
-                <<<grid, block, 0, stream>>>(reinterpret_cast<fp8_type*>(out.data_ptr()),       \
+                aiter::scaled_act_and_mul_kernel<input_dtype,                                   \
+                                                 output_dtype,                                  \
+                                                 KERNEL<input_dtype>,                           \
+                                                 VEC_SIZE>                                      \
+                <<<grid, block, 0, stream>>>(reinterpret_cast<output_dtype*>(out.data_ptr()),   \
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),  \
                                              d,                                                 \
                                              1.0f / (*scale.data_ptr<float>()));)               \
@@ -386,6 +439,10 @@ static constexpr int nextPow2(unsigned int num)
 
 namespace aiter {
 
+// Flexible type conversion:
+// - fp32 input can output as fp32/bf16/fp16 (determined by out.dtype)
+// - bf16 input must output as bf16
+// - fp16 input must output as fp16
 void silu_and_mul(torch::Tensor& out,   // [..., d]
                   torch::Tensor& input) // [..., 2 * d]
 {
