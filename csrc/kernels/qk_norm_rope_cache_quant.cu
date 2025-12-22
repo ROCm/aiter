@@ -104,7 +104,7 @@ template <typename T>
 __inline__ __device__ T warpReduceSum(T val) {
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1)
-    val += __shfl_xor_sync(FINAL_MASK, val, mask, 32);
+    val += __shfl_xor(val, mask, 32);
   return val;
 }
 
@@ -146,9 +146,6 @@ __global__ void fusedQKNormRopeKernel(
     int const page_size,             // Page size for kv cache
     int x                           // kv cache tiling size
 ) {
-  constexpr int vec_size = sizeof(float2) / sizeof(scalar_t);
-  using ltype = aiter::common::vec_t<scalar_t, vec_size>;
-  using stype = aiter::common::vec_t<kv_cache_scalar_t, vec_size>;
 
   int const warpsPerBlock = blockDim.x / 32;
   int const warpId = threadIdx.x / 32;
@@ -168,7 +165,11 @@ __global__ void fusedQKNormRopeKernel(
                                     : localHeadIdx;
   constexpr int  numElemsPerThread = head_dim / 32;
   scalar_t elements[numElemsPerThread];
+  constexpr int best_vec_size = sizeof(float2) / sizeof(scalar_t);
+  constexpr int vec_size = std::min(best_vec_size, numElemsPerThread);
   constexpr int load_loop_cnt = numElemsPerThread / vec_size;
+  using ltype = aiter::common::vec_t<scalar_t, vec_size>;
+  using stype = aiter::common::vec_t<kv_cache_scalar_t, vec_size>;
   constexpr int tail_elems = numElemsPerThread % vec_size;
   const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
   const float inverted_vscale = v_scale == nullptr ? 1.0f : 1 / (*v_scale);
@@ -176,12 +177,12 @@ __global__ void fusedQKNormRopeKernel(
 #pragma unroll
   // Load data first
   for (int i = 0; i < load_loop_cnt; i += 1) {
-    int offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim + laneId * numElemsPerThread) / vec_size;
+    int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim + laneId * numElemsPerThread) / vec_size;
     reinterpret_cast<ltype*>(elements)[i]  = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
   }
 #pragma unroll
   for (int i = 0; i < tail_elems; i++) {
-    int offset = tokenIdx * num_heads * head_dim + localHeadIdx * head_dim
+    int64_t offset = tokenIdx * num_heads * head_dim + localHeadIdx * head_dim
                   + laneId * numElemsPerThread + load_loop_cnt * vec_size + i;
     elements[load_loop_cnt * vec_size + i] = qkv_void[offset];
   }
@@ -244,7 +245,7 @@ __global__ void fusedQKNormRopeKernel(
       // values.
 #pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
-        elements2[i] = __shfl_xor_sync(FINAL_MASK, float(elements[i]), 16);
+        elements2[i] = __shfl_xor(float(elements[i]), 16, 32);
         if (laneId < 16) {
           elements2[i] = -elements2[i];
         }
@@ -258,20 +259,19 @@ __global__ void fusedQKNormRopeKernel(
 
         elements[i] = elements[i] * cos_val + elements2[i] * sin_val;
       }
-      // __shfl_xor_sync does not provide memfence. Need to sync again.
       __syncwarp();
     }
 #pragma unroll
     for (int i = 0; i < load_loop_cnt; i += 1) {
-      int offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim + laneId * numElemsPerThread) / vec_size;
+      int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim + laneId * numElemsPerThread) / vec_size;
       reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] = reinterpret_cast<ltype*>(elements)[i];
     }
 #pragma unroll
-  for (int i = 0; i < tail_elems; i++) {
-    int offset = tokenIdx * num_heads * head_dim + localHeadIdx * head_dim
-                  + laneId * numElemsPerThread + load_loop_cnt * vec_size + i;
-    qkv_void[offset] = elements[load_loop_cnt * vec_size + i];
-  }
+    for (int i = 0; i < tail_elems; i++) {
+      int64_t offset = tokenIdx * num_heads * head_dim + localHeadIdx * head_dim
+                    + laneId * numElemsPerThread + load_loop_cnt * vec_size + i;
+      qkv_void[offset] = elements[load_loop_cnt * vec_size + i];
+    }
   }
 
   if (isQ) {
@@ -285,41 +285,40 @@ __global__ void fusedQKNormRopeKernel(
   int64_t block_offset = slot_id % page_size;
   if (isK) {
     float k_scale_val = *k_scale;
-    int64_t cache_offset = (block_idx * page_size * num_heads_k * head_dim +
-                          headIdx * head_dim * page_size +
-                          block_offset * x + laneId * numElemsPerThread) / vec_size;
+    int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
+                           headIdx * head_dim * page_size +
+                           laneId * numElemsPerThread / x * page_size * x +
+                           block_offset * x + 
+                           laneId * numElemsPerThread % x;
+
 #pragma unroll
-    for (int i = 0; i < load_loop_cnt; i += 1) {
-      cache_offset = cache_offset + i;
-      stype store_val;
-#pragma unroll
-      for (int j = 0; j < vec_size; ++j) {
-        if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-          store_val.data[j] = static_cast<kv_cache_scalar_t>(float(elements[i * vec_size + j]));
-        } else {
-          store_val.data[j] = static_cast<kv_cache_scalar_t>(float(elements[i * vec_size + j]) / k_scale_val);
-        }
+    for (int i = 0; i < numElemsPerThread; i++) {
+      int64_t offset = cache_offset + (i / x) * page_size * x + (i % x);
+      if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
+        k_cache[offset] = elements[i];
+      } else {
+        k_cache[offset] = static_cast<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
       }
-      reinterpret_cast<stype*>(k_cache)[cache_offset] = store_val;
     }
   } else {
-      float v_scale_val = *v_scale;
-      int64_t cache_offset = (block_idx * page_size * num_heads_v * head_dim +
+      float v_scale_val = 1.0f;
+      if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
+        v_scale_val = *v_scale;
+      }
+      int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
                           headIdx * head_dim * page_size +
-                          block_offset + laneId * numElemsPerThread) / vec_size;
+                          laneId * numElemsPerThread * page_size +
+                          block_offset;
+
+      // no vectorized store for v cache since its not contiguous on head_dim
 #pragma unroll
-      for (int i = 0; i < load_loop_cnt; i += 1) {
-        cache_offset = cache_offset + i;
-        stype store_val;
-#pragma unroll
-        for (int j = 0; j < vec_size; ++j) {
-          if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-            store_val.data[j] = static_cast<kv_cache_scalar_t>(float(elements[i * vec_size + j]));
-          } else {
-            store_val.data[j] = static_cast<kv_cache_scalar_t>(float(elements[i * vec_size + j]) / v_scale_val);
-          }
+      for (int i = 0; i < numElemsPerThread; i++) {
+        int64_t offset = cache_offset + i * page_size;
+        if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
+          v_cache[offset] = elements[i];
+        } else {
+          v_cache[offset] = static_cast<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
         }
-        reinterpret_cast<stype*>(v_cache)[cache_offset] = store_val;
       }
   }
 }

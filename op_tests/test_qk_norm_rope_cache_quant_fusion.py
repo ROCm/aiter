@@ -113,12 +113,16 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     k = k.reshape(k_shape)
     n_blocks, _, head_size_tiled, page_size, x = k_cache.shape
 
-    k_cache = k_cache.permute(0, 3, 1, 2, 4).view([n_blocks * page_size, num_heads_k, head_size])
-    v_cache = v_cache.permute(0, 3, 1, 2).view([n_blocks * page_size, num_heads_v, head_size])
-    k_cache[slot_mapping] = (k.view(num_tokens, num_heads_k, head_size) / k_scale).to(k_cache.dtype)
-    v_cache[slot_mapping] = (v.view(num_tokens, num_heads_v, head_size) / v_scale).to(v_cache.dtype)
-    k_cache = k_cache.view([n_blocks, page_size, num_heads_k, head_size // x, x]).permute(0, 2, 3, 1, 4)
-    v_cache = v_cache.view([n_blocks, page_size, num_heads_v, head_size]).permute(0, 2, 3, 1)
+    k_cache = k_cache.permute(0, 3, 1, 2, 4).reshape([n_blocks * page_size, num_heads_k, head_size])
+    v_cache = v_cache.permute(0, 3, 1, 2).reshape([n_blocks * page_size, num_heads_v, head_size])
+    if kv_cache_dtype == "auto":
+        k_cache[slot_mapping] = (k.view(num_tokens, num_heads_k, head_size)).to(k_cache.dtype)
+        v_cache[slot_mapping] = (v.view(num_tokens, num_heads_v, head_size)).to(v_cache.dtype)
+    else:
+        k_cache[slot_mapping] = (k.view(num_tokens, num_heads_k, head_size) / k_scale).to(k_cache.dtype)
+        v_cache[slot_mapping] = (v.view(num_tokens, num_heads_v, head_size) / v_scale).to(v_cache.dtype)
+    k_cache = k_cache.view([n_blocks, page_size, num_heads_k, head_size // x, x]).permute(0, 2, 3, 1, 4).contiguous()
+    v_cache = v_cache.view([n_blocks, page_size, num_heads_v, head_size]).permute(0, 2, 3, 1).contiguous()
 
 
     return q, k, v, k_cache, v_cache
@@ -205,8 +209,13 @@ def test_qk_norm_rope_cache_quant(
     positions = torch.randint(
         0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
     )
+    # print("slot: ", slot_mapping)
+    # print("original v: ", v_cache)
+    # original_v_cache = v_cache.clone()
+    # print("v cache shape: ", v_cache.shape)
+    # print("v cache stride: ", v_cache.stride())
 
-    (q_ref, k_ref, v_ref, k_cache, v_cache) = run_torch_qk_norm_rope_cache_quant_shuffle(
+    (q_ref, k_ref, v_ref, k_cache_ref, v_cache_ref), avg_torch = run_torch_qk_norm_rope_cache_quant_shuffle(
         qkv,
         qw,
         kw,
@@ -226,7 +235,7 @@ def test_qk_norm_rope_cache_quant(
         slot_mapping,
         kv_cache_dtype,
     )
-    (q, k, v, k_cache, v_cache) = run_aiter_qk_norm_rope_cache_quant_shuffle(
+    (q, k, v, k_cache, v_cache), avg_cu = run_aiter_qk_norm_rope_cache_quant_shuffle(
         qkv,
         qw,
         kw,
@@ -254,8 +263,8 @@ def test_qk_norm_rope_cache_quant(
     checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
     checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
     checkAllclose(v_ref, v, msg="v", rtol=1e-2, atol=0.05)
-    checkAllclose(k_cache, k_cache, msg="k_cache", rtol=1e-2, atol=0.05)
-    checkAllclose(v_cache, v_cache, msg="v_cache", rtol=1e-2, atol=0.05)
+    checkAllclose(k_cache_ref, k_cache, msg="k_cache", rtol=1e-2, atol=0.05)
+    checkAllclose(v_cache_ref, v_cache, msg="v_cache", rtol=1e-2, atol=0.05)
 
 
 if __name__ == "__main__":
@@ -288,8 +297,8 @@ if __name__ == "__main__":
                         v_cache = torch.randn([num_blocks, page_size, num_kv_head, head_size], dtype=dtype, device='cuda').to(cache_dtype)
                         slot_mapping = torch.randint(0, num_blocks * page_size, (num_token,),  dtype=torch.int64, device='cuda')
                         x = 16 // k_cache.element_size()
-                        k_cache = k_cache.view([num_blocks, page_size, num_kv_head, head_size // x, x]).permute(0, 2, 3, 1, 4)
-                        v_cache = v_cache.permute(0, 2, 3, 1)
+                        k_cache = k_cache.view([num_blocks, page_size, num_kv_head, head_size // x, x]).permute(0, 2, 3, 1, 4).contiguous()
+                        v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
 
                         test_qk_norm_rope_cache_quant(
                             dtype,
