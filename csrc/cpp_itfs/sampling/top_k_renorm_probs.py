@@ -50,16 +50,31 @@ def top_k_renorm_probs(
     renorm_probs = torch.empty_like(probs)
 
     func = compile(vec_size)
+    (
+        probs_ptr,
+        renorm_probs_ptr,
+        top_k_arr_ptr,
+        top_k_val,
+        batch_size,
+        vocab_size,
+        stream,
+    ) = torch_to_c_types(
+        probs,
+        renorm_probs,
+        maybe_top_k_arr,
+        top_k_val,
+        batch_size,
+        vocab_size,
+        torch.cuda.current_stream(),
+    )
     func(
-        *torch_to_c_types(
-            probs,
-            renorm_probs,
-            maybe_top_k_arr,
-            top_k_val,
-            batch_size,
-            vocab_size,
-            torch.cuda.current_stream(),
-        )
+        probs_ptr,
+        renorm_probs_ptr,
+        top_k_arr_ptr,
+        batch_size,
+        top_k_val,
+        vocab_size,
+        stream,
     )
     return renorm_probs
 

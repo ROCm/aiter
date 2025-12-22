@@ -64,21 +64,46 @@ def top_k_top_p_sampling_from_probs(
     output = torch.empty(batch_size, dtype=torch.int32, device=probs.device)
     vec_size = math.gcd(16 // probs.element_size(), vocab_size)
     func = compile(vec_size, deterministic)
+    (
+        probs_ptr,
+        output_ptr,
+        indices_ptr,
+        top_k_arr_ptr,
+        top_p_arr_ptr,
+        top_k_val,
+        top_p_val,
+        batch_size,
+        philox_seed,
+        philox_offset,
+        vocab_size,
+        stream,
+    ) = torch_to_c_types(
+        probs,
+        output,
+        indices,
+        maybe_top_k_arr,
+        maybe_top_p_arr,
+        top_k_val,
+        top_p_val,
+        batch_size,
+        philox_seed,
+        philox_offset,
+        vocab_size,
+        torch.cuda.current_stream(),
+    )
     func(
-        *torch_to_c_types(
-            probs,
-            output,
-            indices,
-            maybe_top_k_arr,
-            maybe_top_p_arr,
-            top_k_val,
-            top_p_val,
-            batch_size,
-            philox_seed,
-            philox_offset,
-            vocab_size,
-            torch.cuda.current_stream(),
-        )
+        probs_ptr,
+        output_ptr,
+        indices_ptr,
+        top_k_arr_ptr,
+        top_p_arr_ptr,
+        batch_size,
+        top_k_val,
+        top_p_val,
+        philox_seed,
+        philox_offset,
+        vocab_size,
+        stream,
     )
     return output
 
