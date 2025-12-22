@@ -172,6 +172,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, printLog=False):
 
         rets = []
         shape_grouped = isinstance(tasks, list)
+        print(f"shape_grouped: {shape_grouped}")
+        print(f"kernels_num: {kernels_num}")
         solutions = 1 if not shape_grouped else kernels_num
         for i in range(solutions):
             (
@@ -273,24 +275,20 @@ def mp_tuner(
     if shape_grouped:
         # Group tasks by info_keys (info[0])
         from collections import OrderedDict
-
         info_key_groups = OrderedDict()
-
+        
         for task in tasks:
             # Extract info_keys from task (task[0] is info, task[0][0] is info_keys)
             info_keys = task[0][0] if task and len(task) > 0 else None
-
+            
             if info_keys not in info_key_groups:
                 info_key_groups[info_keys] = []
             info_key_groups[info_keys].append(task)
-
+        
         # Convert to list of groups
         task_group = list(info_key_groups.values())
-        if verbose:
-            print(
-                f"[Task Grouping] Grouped {len(tasks)} tasks into {len(task_group)} groups by info_keys"
-            )
-
+        print(f"[Task Grouping] Grouped {len(tasks)} tasks into {len(task_group)} groups by info_keys")
+        
         # Update in_datas to reflect the actual group sizes
         # Each group gets one entry with (group_size, original_data)
         new_in_datas = []
@@ -298,20 +296,13 @@ def mp_tuner(
             group_size = len(group)
             # Use the first task's data configuration, or keep original if within bounds
             if group_idx < len(in_datas):
-                original_data = (
-                    in_datas[group_idx][1] if len(in_datas[group_idx]) > 1 else None
-                )
+                original_data = in_datas[group_idx][1] if len(in_datas[group_idx]) > 1 else None
             else:
-                original_data = (
-                    in_datas[0][1] if in_datas and len(in_datas[0]) > 1 else None
-                )
+                original_data = in_datas[0][1] if in_datas and len(in_datas[0]) > 1 else None
             new_in_datas.append((group_size, original_data))
-
+        
         in_datas = new_in_datas
-        if verbose:
-            print(
-                f"[in_datas] Updated to {len(in_datas)} entries with group sizes: {[size for size, _ in in_datas]}"
-            )
+        print(f"[in_datas] Updated to {len(in_datas)} entries with group sizes: {[size for size, _ in in_datas]}")
     else:
         task_group = tasks
 
@@ -440,7 +431,6 @@ def mp_tuner(
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
                     pool_restart_needed = True
-                    failed_tasks.append((k, error_type))
 
                 if len(dummy_failed_tasks) > mp_num:
                     break
