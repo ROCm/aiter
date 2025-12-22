@@ -1743,10 +1743,15 @@ namespace py = pybind11;
     m.def("trtllm_open_ar_fusion_captured_handles", &trtllm::open_ar_fusion_captured_handles); \
     m.def("trtllm_allreduce_rms", &trtllm::allreduce_rms);
 
-#define TOPK_PLAIN_PYBIND      \
-    m.def("topk_plain",        \
-          &topk_plain,         \
-          py::arg("values"),   \
-          py::arg("topk_ids"), \
-          py::arg("topk"),     \
-          py::arg("largest"));
+#define TOPK_PLAIN_PYBIND           \
+    m.def("topk_plain",             \
+          &topk_plain,              \
+          py::arg("values"),        \
+          py::arg("topk_ids"),      \
+          py::arg("topk_out"),      \
+          py::arg("topk"),          \
+          py::arg("largest") = true, \
+          py::arg("rowStarts") = torch::Tensor(), \
+          py::arg("rowEnds") = torch::Tensor(), \
+          py::arg("stride0") = -1,  \
+          py::arg("stride1") = 1);
