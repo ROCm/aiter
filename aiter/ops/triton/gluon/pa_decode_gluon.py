@@ -38,7 +38,7 @@ def get_cdna_version():
 
 
 def get_occupancy():
-    return 4
+    return 2
 
 
 def get_recommended_splits(num_sequences, num_kv_heads):
