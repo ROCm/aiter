@@ -318,12 +318,12 @@ class Gemm:
                 f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}, splitK: {splitK}, subK: {subK}, bias:{bias}"
             )
             kernelName = asm_kernels[key][0]
-            start  = 1
+            start = 1
             if splitK:
                 maxSplitK = compute_gemm_SplitK(
                     self.m, self.n, self.k, tile_m, tile_n, 256
                 )  # if self.splitK else 1
-                start = 2 # clean kernel not support splitK=1
+                start = 2  # clean kernel not support splitK=1
             else:
                 maxSplitK = 1
             maxSplitK = min(maxSplitK, 16)
@@ -938,6 +938,7 @@ class GemmTuner(GemmCommonTuner):
 
             resultsdf = pd.concat([old_df, timedf], ignore_index=True)
             resultsdf.to_csv(profile_file, index=False)
+
     def set_run_iters(self, input, inputdtype):
         cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
