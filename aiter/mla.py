@@ -235,7 +235,8 @@ def mla_decode_fwd(
         )
 
         if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4) or (
+            q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16 and nhead in [32, 64])
         ):
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
@@ -270,7 +271,8 @@ def mla_decode_fwd(
             num_kv_splits = get_cu_num()
         if nhead == 16 or (
             nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8) or (
-            nhead == 64 and q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
+            nhead == 64 and q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16) or (
+            nhead == 32 and q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
         ):
             # Natively support cases
             pass
@@ -285,12 +287,12 @@ def mla_decode_fwd(
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
-        logits = torch.zeros(
+        logits = torch.empty(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
         )
-        attn_lse = torch.zeros(
+        attn_lse = torch.empty(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
             dtype=dtypes.fp32,
             device=device,
@@ -301,7 +303,6 @@ def mla_decode_fwd(
             else None
         )
 
-        # import pdb;pdb.set_trace()
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
@@ -322,7 +323,6 @@ def mla_decode_fwd(
             kv_scale,
         )
 
-        # import pdb;pdb.set_trace()
         aiter.mla_reduce_v1(
             logits,
             attn_lse,
@@ -333,7 +333,6 @@ def mla_decode_fwd(
             o,
             final_lse,
         )
-        # import pdb;pdb.set_trace()
 
     if io_transformed:
         if return_logits:
