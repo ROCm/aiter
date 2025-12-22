@@ -4,6 +4,7 @@
 
 from jinja2 import Template
 from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
+import math
 
 
 MD_NAME = "top_k_top_p_sampling_from_probs"
@@ -16,7 +17,7 @@ with open(
 
 
 def compile(
-    d: int,
+    vec_size: int,
     deterministic: bool,
     folder: str = None,
 ):
@@ -28,7 +29,7 @@ def compile(
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/sampling.cuh",
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/vec_dtypes.cuh",
         ],
-        d=d,
+        vec_size=vec_size,
         deterministic=deterministic,
         folder=folder,
     )
@@ -61,8 +62,8 @@ def top_k_top_p_sampling_from_probs(
     philox_seed = generator.seed()
 
     output = torch.empty(batch_size, dtype=torch.int32, device=probs.device)
-
-    func = compile(vocab_size, deterministic)
+    vec_size = math.gcd(16 // probs.element_size(), vocab_size)
+    func = compile(vec_size, deterministic)
     (
         probs_ptr,
         output_ptr,
