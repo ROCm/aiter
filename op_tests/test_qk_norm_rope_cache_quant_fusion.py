@@ -119,8 +119,8 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
         k_cache[slot_mapping] = (k.view(num_tokens, num_heads_k, head_size)).to(k_cache.dtype)
         v_cache[slot_mapping] = (v.view(num_tokens, num_heads_v, head_size)).to(v_cache.dtype)
     else:
-        k_cache[slot_mapping] = (k.view(num_tokens, num_heads_k, head_size) / k_scale).to(k_cache.dtype)
-        v_cache[slot_mapping] = (v.view(num_tokens, num_heads_v, head_size) / v_scale).to(v_cache.dtype)
+        k_cache[slot_mapping] = (k.view(num_tokens, num_heads_k, head_size).float() / k_scale).to(k_cache.dtype)
+        v_cache[slot_mapping] = (v.view(num_tokens, num_heads_v, head_size).float() / v_scale).to(v_cache.dtype)
     k_cache = k_cache.view([n_blocks, page_size, num_heads_k, head_size // x, x]).permute(0, 2, 3, 1, 4).contiguous()
     v_cache = v_cache.view([n_blocks, page_size, num_heads_v, head_size]).permute(0, 2, 3, 1).contiguous()
 
@@ -263,8 +263,8 @@ def test_qk_norm_rope_cache_quant(
     checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
     checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
     checkAllclose(v_ref, v, msg="v", rtol=1e-2, atol=0.05)
-    checkAllclose(k_cache_ref, k_cache, msg="k_cache", rtol=1e-2, atol=0.05)
-    checkAllclose(v_cache_ref, v_cache, msg="v_cache", rtol=1e-2, atol=0.05)
+    checkAllclose(k_cache_ref.float(), k_cache.float(), msg="k_cache", rtol=1e-2, atol=0.05)
+    checkAllclose(v_cache_ref.float(), v_cache.float(), msg="v_cache", rtol=1e-2, atol=0.05)
     # diff = torch.abs(v_cache_ref - v_cache) > 1
     # print("positions: ", torch.nonzero(diff)[:20])
     # print("values: ", (v_cache_ref - v_cache)[diff])
@@ -284,7 +284,7 @@ if __name__ == "__main__":
     k_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
     v_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
     # kv_cache_dtypes = ["fp8_e4m3", "auto"]
-    kv_cache_dtypes = ["auto"]
+    kv_cache_dtypes = ["fp8_e4m3"]
     dtype = torch.bfloat16
     for is_neox_style in is_neox_styles:
         for num_token in num_tokens:

@@ -298,7 +298,7 @@ __global__ void fusedQKNormRopeKernel(
       if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
         k_cache[offset] = elements[i];
       } else {
-        k_cache[offset] = static_cast<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
+        k_cache[offset] = ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
       }
     }
   } else {
@@ -318,7 +318,7 @@ __global__ void fusedQKNormRopeKernel(
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
           v_cache[offset] = elements[i];
         } else {
-          v_cache[offset] = static_cast<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
+          v_cache[offset] = ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
         }
       }
   }
