@@ -499,8 +499,8 @@ def get_module_custom_op(md_name: str) -> None:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
             logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
         except ImportError:
-            # If AITER_JIT_DIR was set but module wasn't found there OR in package,
-            # we likely need to build it. Raise error to trigger build.
+            # If the module cannot be imported from either AITER_JIT_DIR (if set)
+            # or from the package, we likely need to build it. Raise error to trigger build.
             raise
     return
 
