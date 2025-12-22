@@ -147,7 +147,10 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                                 i,
                                 splitK,
                             ),  # [0, 1, 2, 3, 4] is index of paramters for kernel_instance_test in generate_data
-                            {},
+                            {
+                                "num_warmup": args.warmup,
+                                "num_iters": args.iters,
+                            },
                             run_torch,
                             ([0, 1, 2, 3],),
                             {},
@@ -162,7 +165,16 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
         ret = []
         if task:
             shape_grouped = False
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
 
         return ret
 

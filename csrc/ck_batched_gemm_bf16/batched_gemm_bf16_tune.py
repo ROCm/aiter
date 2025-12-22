@@ -126,7 +126,10 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                                 i,
                                 splitK,
                             ),  # [0, 1, 2] is index of paramters for run_batched_gemm in generate_data
-                            {},
+                            {
+                                "num_warmup": args.warmup,
+                                "num_iters": args.iters,
+                            },
                             run_torch,
                             ([0, 1],),
                             {},
@@ -141,7 +144,16 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
 
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
 
         return ret
 

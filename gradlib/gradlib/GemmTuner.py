@@ -174,6 +174,8 @@ class Gemm:
         err_ratio=0.01,
         profile_file="",
         num_warms=5,
+        timeout=100,
+        verbose=False,
         # splitK=None,
     ):
         torch.cuda.empty_cache()
@@ -209,6 +211,8 @@ class Gemm:
         self.asm_map = {}
         self.has_bias = bias
         self.num_warm = num_warms
+        self.timeout = timeout
+        self.verbose = verbose
 
     def find_hipblas_sols(self):
         sols = aiter.hipb_findallsols(
@@ -402,7 +406,9 @@ class Gemm:
                 (),
             )
         ]
-        ret = mp_tuner(tasks, in_data, self.mp, False)
+        ret = mp_tuner(
+            tasks, in_data, self.mp, False, timeout=self.timeout, verbose=self.verbose
+        )
         return ret
 
     def triton_egmm_all_sols(self):
@@ -524,7 +530,14 @@ class Gemm:
                 (),
             )
         ]
-        ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
+        ret = mp_tuner(
+            task,
+            in_data,
+            self.mp,
+            fast_mode == 1,
+            timeout=self.timeout,
+            verbose=self.verbose,
+        )
         if fast_mode == 1:
             self.hipb_gtimedf = self.save_topn_result(ret, fast_mode, "hipblaslt")
             return []
@@ -744,6 +757,7 @@ class GemmTuner(GemmCommonTuner):
                         )
             self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
             self.untunedf["cu_num"] = self.get_cu_num()
+            self.untunedf = self.untunedf[self.keys]
             untunedf_cols = self.untunedf.columns
             if len(self.tunedf) != 0:
                 mask = self.untunedf.apply(tuple, axis=1).isin(
@@ -751,8 +765,9 @@ class GemmTuner(GemmCommonTuner):
                 )
                 if args.verbose:
                     logger.info("skiped tuned shapes:")
+                    print(self.untunedf[mask])
                 self.untunedf = self.untunedf[~mask]
-            self.untunedf.drop_duplicates().reset_index(drop=True)
+            self.untunedf = self.untunedf.drop_duplicates().reset_index(drop=True)
             print("untunedf is ", self.untunedf)
 
     def add_gemm(
@@ -824,6 +839,8 @@ class GemmTuner(GemmCommonTuner):
                 err_ratio=args.errRatio,
                 profile_file=args.profile_file,
                 num_warms=self.num_warmup,
+                timeout=args.timeout,
+                verbose=args.verbose,
             )
 
             ret.extend(gemmobj.run_solutions())

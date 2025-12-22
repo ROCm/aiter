@@ -44,6 +44,7 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 class FmoeTuner(TunerCommon):
 
     ARG_DEFAULTS = {
+        **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
         "untune_file": "aiter/configs/untuned_fmoe.csv",
@@ -1663,13 +1664,13 @@ class FmoeTuner(TunerCommon):
     ):
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
-        args = self.keys
-        print(untunedf[args])
+        keys = self.keys
+        print(untunedf[keys])
         tasks = []
         tasks_ck = []
         task_1stage = []
         in_data = []
-        for line in untunedf[args].values:
+        for line in untunedf[keys].values:
             (
                 cu_num,
                 token,
@@ -1728,7 +1729,13 @@ class FmoeTuner(TunerCommon):
         if len(tasks) + len(tasks_ck) + len(task_1stage) > 0:
             ### shape_grouped should be False as multiple stages
             rets = mp_tuner(
-                tasks + tasks_ck + task_1stage, in_data, mp_num, True, False
+                tasks + tasks_ck + task_1stage,
+                in_data,
+                mp_num,
+                True,
+                False,
+                timeout=args.timeout,
+                verbose=args.verbose,
             )
         if not rets:
             print("no shape to tune or no solution found")
@@ -1820,7 +1827,9 @@ class FmoeTuner(TunerCommon):
 
             ## remove invalid candidate
             profileDF = profileDF[
-                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf")) & (profileDF["us"] != -1)
+                (profileDF["err"] < args.errRatio)
+                & (profileDF["us"] != float("-inf"))
+                & (profileDF["us"] != -1)
             ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"

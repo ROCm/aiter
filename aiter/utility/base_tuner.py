@@ -24,6 +24,9 @@ class TunerCommon:
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",  # for all results
+        "timeout": None,  # 100s timeout for per test
+        "warmup": 5,  # 5 warmup iters for profiling
+        "iters": 101,  # 101 run iters for profiling
     }
     dtype2bpe_dict = {
         dtypes.fp16: 2,
@@ -42,10 +45,10 @@ class TunerCommon:
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
     }
-    INVALID_TIME = -1 # op not support or error
+    INVALID_TIME = -1  # op not support or error
 
-    INF_TIME = float("inf") # op time is too large
-    INVLAID_ERR_RATIO = 1.0 # err ratio is too large
+    INF_TIME = float("inf")  # op time is too large
+    INVLAID_ERR_RATIO = 1.0  # err ratio is too large
 
     def __init__(self, name, key, resultList, description=None):
         self.parser = argparse.ArgumentParser(description=description)
@@ -63,7 +66,7 @@ class TunerCommon:
         self.remain_untuned = pd.DataFrame(columns=self.keys)
         self.sort_keys = key
         self.start_time = 0
-        self.num_warmup = 5
+        self.num_warmup = 10
         self.num_iters = 101
 
     def get_arg_defaults(self):
@@ -143,6 +146,24 @@ class TunerCommon:
             default=defaults["profile_file"],
             required=False,
             help="output: all tuning results stored in this file",
+        )
+        self.parser.add_argument(
+            "--warmup",
+            type=int,
+            default=defaults["warmup"],
+            help="warmup iters for profiling",
+        )
+        self.parser.add_argument(
+            "--iters",
+            type=int,
+            default=defaults["iters"],
+            help="run iters for profiling",
+        )
+        self.parser.add_argument(
+            "--timeout",
+            type=int,
+            default=defaults["timeout"],
+            help="timeout for task group",
         )
 
     def parse_args(self):
@@ -562,14 +583,28 @@ class GemmCommonTuner(TunerCommon):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
         self.failed = pd.concat(
-            [self.failed, resultdf[(resultdf["us"] == self.INVALID_TIME) | (resultdf["us"] == self.INF_TIME)]],
+            [
+                self.failed,
+                resultdf[
+                    (resultdf["us"] == self.INVALID_TIME)
+                    | (resultdf["us"] == self.INF_TIME)
+                ],
+            ],
             ignore_index=True,
         )
         self.success = pd.concat(
-            [self.success, resultdf[(resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)]],
+            [
+                self.success,
+                resultdf[
+                    (resultdf["us"] != self.INVALID_TIME)
+                    & (resultdf["us"] != self.INF_TIME)
+                ],
+            ],
             ignore_index=True,
         )
-        update_tunedf = resultdf[(resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)]  # self.success
+        update_tunedf = resultdf[
+            (resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)
+        ]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:
@@ -608,4 +643,4 @@ class GemmCommonTuner(TunerCommon):
         if flops < 128 * 5120 * 256 * 2:
             self.num_warmup = 30
         elif flops < 256 * 5120 * 256 * 2:
-            self.num_warmup = 15
+            self.num_warmup = 20
