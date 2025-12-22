@@ -1655,10 +1655,15 @@ namespace py = pybind11;
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
-#define TOPK_PLAIN_PYBIND      \
-    m.def("topk_plain",        \
-          &topk_plain,         \
-          py::arg("values"),   \
-          py::arg("topk_ids"), \
-          py::arg("topk"),     \
-          py::arg("largest"));
+#define TOPK_PLAIN_PYBIND           \
+    m.def("topk_plain",             \
+          &topk_plain,              \
+          py::arg("values"),        \
+          py::arg("topk_ids"),      \
+          py::arg("topk_out"),      \
+          py::arg("topk"),          \
+          py::arg("largest") = true, \
+          py::arg("rowStarts") = torch::Tensor(), \
+          py::arg("rowEnds") = torch::Tensor(), \
+          py::arg("stride0") = -1,  \
+          py::arg("stride1") = 1);
