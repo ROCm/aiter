@@ -8,6 +8,7 @@ from functools import lru_cache
 import torch
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 import triton
 import triton.language as tl
@@ -3081,7 +3082,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 FP8_MAX_VALUE=FP8_MAX_VALUE,
                 SLIDING_WINDOW=SLIDING_WINDOW,
                 CDNA_VERSION=CDNA_VERSION,
-                ONE_SHOT=grid[2] <= 1,
+                ONE_SHOT=num_splits <= 1,
                 waves_per_eu=waves_per_eu,
                 num_stages=1,
             )
@@ -3249,7 +3250,7 @@ def pa_decode_gluon(
     query_length: int,
     max_context_length: int,
     context_partition_size: int,
-    compute_type: tl.dtype,
+    compute_type: torch.dtype,
     query_scale: torch.Tensor,  # [num_seqs * query_length, num_query_heads, 1] or [1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -3259,7 +3260,7 @@ def pa_decode_gluon(
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
-    ps=False,
+    ps: bool = False,
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -3619,7 +3620,7 @@ def pa_decode_gluon(
         query_scale_stride_0,
         key_scale_stride_0,
         key_scale_stride_1,
-        COMPUTE_TYPE=compute_type,
+        COMPUTE_TYPE=torch_to_triton_dtype[compute_type],
         QUERY_SEQ_LEN=query_length,
         HEAD_SIZE=head_size,
         QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
