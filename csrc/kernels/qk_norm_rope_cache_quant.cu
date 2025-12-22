@@ -138,7 +138,7 @@ __global__ void fusedQKNormRopeKernel(
     scalar_t const* cos_sin_cache,  // Pre-computed cos/sin cache
     int64_t const* position_ids,     // Position IDs for RoPE
     kv_cache_scalar_t* k_cache,      // Key cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
-    kv_cache_scalar_t* v_cache,      // Value cache [num_blocks, num_kv_heads, head_size, block_size]
+    kv_cache_scalar_t* v_cache,      // Value cache [num_blocks, num_heads, block_size/X, head_size, X]
     int64_t* slot_mapping,           // Slot mapping
     float* k_scale,                  // Key scale for quantized key cache
     float* v_scale,                  // Value scale for quantized value cache
@@ -203,9 +203,8 @@ __global__ void fusedQKNormRopeKernel(
 #pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
       int dim = laneId * numElemsPerThread + i;
-      float weight = isQ ? static_cast<float>(q_weight[dim])
-                        : static_cast<float>(k_weight[dim]);
-      elements[i] = static_cast<float>(elements[i]) * rms_rcp * weight;
+      float weight = isQ ? float(q_weight[dim]) : float(k_weight[dim]);
+      elements[i] = static_cast<scalar_t>(elements[i] * rms_rcp * weight);
     }
 
     // Apply RoPE to normalized elements
@@ -226,8 +225,8 @@ __global__ void fusedQKNormRopeKernel(
         int const idx0 = 2 * i;
         int const idx1 = 2 * i + 1;
 
-        float const val0 = static_cast<float>(elements[idx0]);
-        float const val1 = static_cast<float>(elements[idx1]);
+        float const val0 = elements[idx0];
+        float const val1 = elements[idx1];
 
         int const dim_idx = laneId * numElemsPerThread + idx0;
         int const half_dim = dim_idx / 2;
@@ -254,8 +253,8 @@ __global__ void fusedQKNormRopeKernel(
         dim_idx = (dim_idx * 2) % head_dim;
         int half_dim = dim_idx / 2;
         // Use pre-computed cos/sin from cache
-        float cos_val = static_cast<float>(cos_ptr[half_dim]);
-        float sin_val = static_cast<float>(sin_ptr[half_dim]);
+        float cos_val = cos_ptr[half_dim];
+        float sin_val = sin_ptr[half_dim];
 
         elements[i] = static_cast<scalar_t>(elements[i] * cos_val + elements2[i] * sin_val);
       }
@@ -308,13 +307,13 @@ __global__ void fusedQKNormRopeKernel(
       }
       int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
                           headIdx * head_dim * page_size +
-                          laneId * numElemsPerThread * page_size +
-                          block_offset;
+                          block_offset / x * head_dim * x +
+                          block_offset % x;
 
       // no vectorized store for v cache since its not contiguous on head_dim
 #pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
-        int64_t offset = cache_offset + i * page_size;
+        int64_t offset = cache_offset + (laneId * numElemsPerThread + i) * x;
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
           v_cache[offset] = elements[i];
         } else {
