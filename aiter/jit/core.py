@@ -384,7 +384,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
     )
     try:
         subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
         logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
     return True
