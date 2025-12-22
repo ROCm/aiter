@@ -128,7 +128,7 @@ def _routing_sigmoid_top1_kernel(
 @functools.lru_cache(maxsize=1024)
 def _get_config(M, N, K):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE_ROUTING_SIGMOID_TOPK1.json"
         with open(fpath, "r") as file:
