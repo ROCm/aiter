@@ -56,7 +56,7 @@ import tune
 from tune import FmoeTuner
 
 
-def run_all_kernel_tests(config_file="configs/input_config_to_test.csv", 
+def run_all_kernel_tests(config_file="trace_moe_config.csv", 
                          output_file="all_kernel_results.csv"):
     """
     Run all kernel combinations for configurations in the input file.
@@ -451,7 +451,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test all MOE kernel combinations")
     parser.add_argument(
         "-i", "--input",
-        default="configs/input_config_to_test.csv",
+        default="trace_moe_config.csv",
         help="Input configuration CSV file"
     )
     parser.add_argument(
