@@ -98,6 +98,48 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     ret["err"] = err
     return ret
 
+@benchmark()
+def test_gelu_tanh_and_mul(m, n, dtype):
+    ret = {}
+    input = torch.randn(m, n, dtype=dtype, device="cuda")
+    out = torch.empty((m, n // 2), dtype=dtype, device="cuda")
+    ref = torch_gelu_tanh_and_mul(input)
+    _, us_aiter = run_perftest(
+        aiter.gelu_tanh_and_mul,
+        out, input)
+    
+    # Check if the results are close
+    err = checkAllclose(ref, out)
+    ret["us"] = us_aiter
+    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["err"] = err
+    return ret
+
+from transformers.activations import ACT2FN
+def torch_gelu_ref(x: torch.Tensor) -> torch.Tensor:
+    out = ACT2FN["gelu_pytorch_tanh"](x)
+    return out
+
+def gelu_fast_vec_wrapper(input: torch.Tensor) -> torch.Tensor:
+    out = torch.randn_like(input)
+    aiter.gelu_fast_vec(out, input)
+    return out
+
+@benchmark()
+def test_gelu_fast(m, n, dtype):
+    ret = {}
+    input = torch.randn(m, 1, n, dtype=dtype, device="cuda")
+    ref = torch_gelu_ref(input)
+    out, us_aiter = run_perftest(
+        gelu_fast_vec_wrapper,
+        input)
+
+    # Check if the results are close
+    err = checkAllclose(ref, out)
+    ret["us"] = us_aiter
+    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["err"] = err
+    return ret
 
 @benchmark()
 def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
@@ -206,3 +248,17 @@ df = df[
 
 df_md = df.to_markdown(index=False)
 aiter.logger.info("silu_and_mul summary (markdown):\n%s", df_md)
+
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
+            ret = test_gelu_fast(m, n, dtype)
+            df.append(ret)
+df = pd.DataFrame(df)
+df = df[
+    ["M", "N", "input_dtype", "output_dtype", "us", "TB/s", "RD TB/s", "WR TB/s", "err"]
+]
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gelu_fast summary (markdown):\n%s", df_md)
+
