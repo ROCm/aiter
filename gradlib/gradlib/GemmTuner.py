@@ -942,7 +942,7 @@ class GemmTuner(GemmCommonTuner):
     def set_run_iters(self, input, inputdtype):
         cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
-        bpe = self.get_bpe(inputdtype)
+        # bpe = self.get_bpe(inputdtype)
         if flops < 128 * 5120 * 256 * 2:
             self.num_warmup = 30
         elif flops < 256 * 5120 * 256 * 2:
