@@ -21,20 +21,25 @@ using fp8_type = ck_tile::fp8_t;
 static constexpr int32_t max_vec_size = 8;
 static constexpr int32_t max_wave_num = 8;
 
-// Type trait: fp32 inputs compute in bf16, others use their native type
+// Type trait for computation type (all compute in native type)
 template <typename T>
-using compute_type_t = std::conditional_t<std::is_same_v<T, float>, ck_tile::bfloat16_t, T>;
+using compute_type_t = T;
+
+// Type trait for output type (fp32 outputs as bf16, others keep native type)
+template <typename T>
+using output_type_t = std::conditional_t<std::is_same_v<T, float>, ck_tile::bfloat16_t, T>;
 
 namespace aiter {
 
-// Activation and gating kernel template with fp32 auto-conversion support.
-// If DTYPE_I is float, it will be converted to bf16 for computation using ck_tile::type_convert.
+// Activation and gating kernel template supporting fp32/bf16/fp16.
+// fp32 inputs compute in fp32 but output as bf16; bf16/fp16 keep native type.
 template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d]
                                    const DTYPE_I* __restrict__ input, // [..., 2, d]
                                    const int d)
 {
     using DTYPE_COMPUTE = compute_type_t<DTYPE_I>;
+    using DTYPE_O       = output_type_t<DTYPE_I>;
 
     // CK Tile buffer addressing constraint: float supports VEC_SIZE <= 16
     static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
@@ -45,6 +50,7 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
     using vec_i                     = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
     using vec_c                     = ck_tile::vec_t<DTYPE_COMPUTE, VEC_SIZE_I>;
+    using vec_o                     = ck_tile::vec_t<DTYPE_O, VEC_SIZE_I>;
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (d + ooba_i - 1) / ooba_i * ooba_i;
     auto buffer_x = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_x, oob_i);
@@ -52,15 +58,17 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
     buffer_x.init_raw();
     buffer_y.init_raw();
 
-    // Output buffer view for wide stores (raw path)
-    DTYPE_I* __restrict__ out_base = out + token_idx * d;
+    // Output buffer view (may have different type than input for fp32→bf16)
+    DTYPE_O* __restrict__ out_base  = reinterpret_cast<DTYPE_O*>(out) + token_idx * d;
+    static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
+    const int32_t oob_o             = (d + ooba_o - 1) / ooba_o * ooba_o;
     auto buffer_out =
-        ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(out_base, oob_i);
+        ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(out_base, oob_o);
     buffer_out.init_raw();
 
-    constexpr int32_t allowed_max = std::is_same<DTYPE_I, double>::value ? 8 : 16;
+    constexpr int32_t allowed_max = std::is_same<DTYPE_O, double>::value ? 8 : 16;
 
-    auto store_vec_segmented = [&](int64_t base_idx, const vec_i& v) __device__ {
+    auto store_vec_segmented = [&](int64_t base_idx, const vec_o& v) __device__ {
         int64_t off = base_idx;
         int32_t rem = VEC_SIZE_I;
         int32_t pos = 0;
@@ -68,7 +76,7 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
         {
             if(allowed_max >= 16 && rem >= 16)
             {
-                using vec16 = ck_tile::vec_t<DTYPE_I, 16>;
+                using vec16 = ck_tile::vec_t<DTYPE_O, 16>;
                 vec16 t{};
 #pragma unroll
                 for(int i = 0; i < 16; ++i)
@@ -80,7 +88,7 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
             }
             else if(rem >= 8)
             {
-                using vec8 = ck_tile::vec_t<DTYPE_I, 8>;
+                using vec8 = ck_tile::vec_t<DTYPE_O, 8>;
                 vec8 t{};
 #pragma unroll
                 for(int i = 0; i < 8; ++i)
@@ -92,7 +100,7 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
             }
             else if(rem >= 4)
             {
-                using vec4 = ck_tile::vec_t<DTYPE_I, 4>;
+                using vec4 = ck_tile::vec_t<DTYPE_O, 4>;
                 vec4 t{};
 #pragma unroll
                 for(int i = 0; i < 4; ++i)
@@ -104,7 +112,7 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
             }
             else if(rem >= 2)
             {
-                using vec2 = ck_tile::vec_t<DTYPE_I, 2>;
+                using vec2 = ck_tile::vec_t<DTYPE_O, 2>;
                 vec2 t{};
                 t[0] = v[pos + 0];
                 t[1] = v[pos + 1];
@@ -115,7 +123,7 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
             }
             else
             {
-                using vec1 = ck_tile::vec_t<DTYPE_I, 1>;
+                using vec1 = ck_tile::vec_t<DTYPE_O, 1>;
                 vec1 t{};
                 t[0] = v[pos];
                 buffer_out.template set<vec1>(off, 0, true, t);
@@ -131,26 +139,11 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
         vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
         vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        // Convert fp32→bf16 if needed, otherwise use directly
-        vec_c x_compute{};
-        vec_c y_compute{};
+        // Compute directly in native type (DTYPE_I == DTYPE_COMPUTE)
+        const vec_c& x_compute = x;
+        const vec_c& y_compute = y;
 
-        if constexpr(std::is_same_v<DTYPE_I, float>)
-        {
-#pragma unroll
-            for(size_t j = 0; j < VEC_SIZE_I; j++)
-            {
-                x_compute[j] = ck_tile::type_convert<DTYPE_COMPUTE>(x[j]); // fp32→bf16
-                y_compute[j] = ck_tile::type_convert<DTYPE_COMPUTE>(y[j]);
-            }
-        }
-        else
-        {
-            x_compute = x; // bf16/fp16: zero-copy
-            y_compute = y;
-        }
-
-        vec_i r{};
+        vec_o r{};
 
 #pragma unroll
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
@@ -168,19 +161,19 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
                 ck_tile::fp32x2_t b = {y0, y1};
                 ck_tile::fp32x2_t c;
                 asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
-                r[j]     = ck_tile::type_convert<DTYPE_I>(c.x);
-                r[j + 1] = ck_tile::type_convert<DTYPE_I>(c.y);
+                r[j]     = ck_tile::type_convert<DTYPE_O>(c.x);
+                r[j + 1] = ck_tile::type_convert<DTYPE_O>(c.y);
             }
             else
             {
-                r[j] = ck_tile::type_convert<DTYPE_I>(ax0 * y0);
+                r[j] = ck_tile::type_convert<DTYPE_O>(ax0 * y0);
             }
         }
 
         if constexpr(VEC_SIZE_I == 1 || VEC_SIZE_I == 2 || VEC_SIZE_I == 4 || VEC_SIZE_I == 8 ||
                      VEC_SIZE_I == 16)
         {
-            buffer_out.template set<vec_i>(idx, 0, true, r);
+            buffer_out.template set<vec_o>(idx, 0, true, r);
         }
         else
         {
@@ -189,7 +182,7 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
     }
 }
 
-// Scaled activation and gating kernel template with fp32 auto-conversion support.
+// Scaled activation and gating kernel template supporting fp32/bf16/fp16.
 template <typename DTYPE_I, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void scaled_act_and_mul_kernel(fp8_type* __restrict__ out,        // [..., d]
                                           const DTYPE_I* __restrict__ input, // [..., 2, d]
@@ -220,24 +213,9 @@ __global__ void scaled_act_and_mul_kernel(fp8_type* __restrict__ out,        // 
         vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
         vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        // Convert fp32→bf16 if needed, otherwise use directly
-        vec_c x_compute{};
-        vec_c y_compute{};
-
-        if constexpr(std::is_same_v<DTYPE_I, float>)
-        {
-#pragma unroll
-            for(size_t j = 0; j < VEC_SIZE_I; j++)
-            {
-                x_compute[j] = ck_tile::type_convert<DTYPE_COMPUTE>(x[j]); // fp32→bf16
-                y_compute[j] = ck_tile::type_convert<DTYPE_COMPUTE>(y[j]);
-            }
-        }
-        else
-        {
-            x_compute = x; // bf16/fp16: zero-copy
-            y_compute = y;
-        }
+        // Compute directly in native type (DTYPE_I == DTYPE_COMPUTE)
+        const vec_c& x_compute = x;
+        const vec_c& y_compute = y;
 
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
