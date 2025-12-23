@@ -29,7 +29,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     using QoState = QoState<Traits>;
 
     const int32_t ori_seqlen_qo = [&]() {
-        if constexpr (Traits::kIsSparse)
+        if constexpr(Traits::kIsSparse)
         {
             return params.p_seqlens_qo_indptr[1] - params.p_seqlens_qo_indptr[0];
         }
@@ -40,7 +40,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }();
 
     const int32_t num_batches = [&]() {
-        if constexpr (Traits::kIsSparse)
+        if constexpr(Traits::kIsSparse)
         {
             return params.num_batches * ori_seqlen_qo;
         }
@@ -77,9 +77,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     int32_t sum_blocks = 0;
     for(int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
     {
-        const int32_t bid_ori = Traits::kIsSparse
-                                    ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
-                                    : (bid / params.qk_batch_ratio);
+        const int32_t bid_ori = Traits::kIsSparse ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
+                                                  : (bid / params.qk_batch_ratio);
         const int32_t kv_end  = params.p_seqlens_kv_indptr[bid_ori + 1];
         const int32_t seqlen_kv =
             Traits::kIsSparse ? min(kv_end - params.p_seqlens_kv_indptr[bid_ori], params.topk)
@@ -169,14 +168,16 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
                     if constexpr(!Traits::kIsSparse)
                     {
-                        if (params.qk_batch_ratio != 1)
+                        if(params.qk_batch_ratio != 1)
                         {
-                            batch_tail = num_qo_tiles - (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
+                            batch_tail =
+                                num_qo_tiles -
+                                (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
                         }
                     }
-                    work_info.kv_end   = ck_tile::min(
-                        work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
-                        curr_kv_end - batch_tail);
+                    work_info.kv_end    = ck_tile::min(work_info.kv_start +
+                                                        (remain_kv_blocks * params.kv_granularity),
+                                                    curr_kv_end - batch_tail);
                     work_info.kv_offset = curr_kv_end - work_info.kv_end;
 
                     // split related info
@@ -243,11 +244,11 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             }
                             else
                             {
-                                const int32_t bid_ori = Traits::kIsSparse
-                                                            ? (curr_batch / ori_seqlen_qo /
-                                                               params.qk_batch_ratio)
-                                                            : (curr_batch / params.qk_batch_ratio);
-                                curr_kv_seqlen        = params.p_seqlens_kv_indptr[bid_ori + 1] -
+                                const int32_t bid_ori =
+                                    Traits::kIsSparse
+                                        ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
+                                        : (curr_batch / params.qk_batch_ratio);
+                                curr_kv_seqlen = params.p_seqlens_kv_indptr[bid_ori + 1] -
                                                  params.p_seqlens_kv_indptr[bid_ori];
                                 curr_kv_seqlen = Traits::kIsSparse
                                                      ? min(curr_kv_seqlen, params.topk)
@@ -285,9 +286,12 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
                         if constexpr(!Traits::kIsSparse)
                         {
-                            if (params.qk_batch_ratio != 1)
+                            if(params.qk_batch_ratio != 1)
                             {
-                                batch_tail = num_qo_tiles - (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
+                                batch_tail =
+                                    num_qo_tiles -
+                                    (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo -
+                                    1;
                             }
                         }
                         work_info.kv_end = ck_tile::min(
