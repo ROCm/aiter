@@ -337,10 +337,8 @@ __global__ void fusedQKNormRopeKernel(
     float k_scale_val = 1.0f;
     if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
       k_scale_val = warp_max / dtype_max;
-      int64_t scale_offset = block_idx * page_size + block_offset;
-      if (warpId == 0 && laneId == 0) {
-        k_scale[scale_offset] = k_scale_val;
-      }
+      int64_t scale_offset = block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
+      k_scale[scale_offset] = k_scale_val;
     }
     int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
                            headIdx * head_dim * page_size +
@@ -359,10 +357,8 @@ __global__ void fusedQKNormRopeKernel(
       float v_scale_val = 1.0f;
       if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
         v_scale_val = warp_max / dtype_max;
-        int64_t scale_offset = block_idx * page_size + block_offset;
-        if (warpId == 0 && laneId == 0) {
-          v_scale[scale_offset] = v_scale_val;
-        }
+        int64_t scale_offset = block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
+        v_scale[scale_offset] = v_scale_val;
       }
       int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
                           headIdx * head_dim * page_size +

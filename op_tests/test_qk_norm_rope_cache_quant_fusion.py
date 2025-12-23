@@ -272,14 +272,14 @@ if __name__ == "__main__":
     max_positions = 10000
     num_blocks = 1000
     page_size = 16
-    k_scale = torch.zeros([num_blocks, page_size], dtype=torch.float32, device="cuda")
-    v_scale = torch.zeros([num_blocks, page_size], dtype=torch.float32, device="cuda")
     # kv_cache_dtypes = ["fp8_e4m3", "auto"]
     kv_cache_dtypes = ["fp8_e4m3", "auto"]
     dtype = torch.bfloat16
     for is_neox_style in is_neox_styles:
         for num_token in num_tokens:
             for num_head, num_kv_head in num_heads:
+                k_scale = torch.zeros([num_blocks, num_kv_head, page_size], dtype=torch.float32, device="cuda")
+                v_scale = torch.zeros([num_blocks, num_kv_head, page_size], dtype=torch.float32, device="cuda")
                 for i, head_size in enumerate(head_sizes):
                     for kv_cache_dtype in kv_cache_dtypes:
                         if kv_cache_dtype == "fp8_e4m3":
