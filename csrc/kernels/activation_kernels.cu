@@ -313,32 +313,25 @@ static constexpr int nextPow2(unsigned int num)
 #define DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale) \
     DISPATCH_FP32_KERNEL(scaled_act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d, inv_scale)
 
-// Helper macro to dispatch scaled kernel based on output type
-#define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                \
-    if(out.scalar_type() == at::ScalarType::BFloat16)                         \
-    {                                                                         \
-        using output_dtype = ck_tile::bf16_t;                                 \
-        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr()); \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)   \
-    }                                                                         \
-    else if(out.scalar_type() == at::ScalarType::Half)                        \
-    {                                                                         \
-        using output_dtype = ck_tile::fp16_t;                                 \
-        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr()); \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)   \
-    }                                                                         \
-    else if(out.scalar_type() == at::ScalarType::Float)                       \
-    {                                                                         \
-        using output_dtype = ck_tile::fp32_t;                                 \
-        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr()); \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)   \
-    }                                                                         \
-    else                                                                      \
-    {                                                                         \
-        /* fp8 output */                                                      \
-        using output_dtype = fp8_type;                                        \
-        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr()); \
-        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)   \
+// Helper macro to dispatch scaled kernel with restricted output types (fp8 or int8)
+#define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                      \
+    if(out.scalar_type() == at::ScalarType::Float8_e4m3fn ||                        \
+       out.scalar_type() == at::ScalarType::Float8_e4m3fnuz ||                      \
+       out.scalar_type() == at::ScalarType::Float8_e5m2)                            \
+    {                                                                               \
+        using output_dtype = fp8_type;                                              \
+        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)         \
+    }                                                                               \
+    else if(out.scalar_type() == at::ScalarType::Char)                              \
+    {                                                                               \
+        using output_dtype = ck_tile::int8_t;                                       \
+        auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
+        DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)         \
+    }                                                                               \
+    else                                                                            \
+    {                                                                               \
+        TORCH_CHECK(false, "scaled_act_and_mul only supports fp8 or int8 outputs"); \
     }
 
 // Launch activation and gating kernel with flexible input/output types
