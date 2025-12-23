@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Literal, Optional, Tuple, List, Dict, Any
 import torch
 import os
 import glob
@@ -224,6 +224,7 @@ def fav3_sage_forward_func(
     v: torch.Tensor,
     causal: bool,
     inference_mode: bool,  # not return softmax_lse
+    layout: Literal["bshd", "bhsd"],
 ):
     config = get_fwd_configs(False)
     # assert (
@@ -243,6 +244,10 @@ def fav3_sage_forward_func(
     FP8_MAX = torch.finfo(fp8_dtype).max
 
     # Method 2: Current sage_quant (unified quantization)
+    tensor_layout = {
+        "bshd": "NHD",
+        "bhsd": "HND",
+    }[layout]
     q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, _ = sage_quant(
         q,
         k,
@@ -253,7 +258,7 @@ def fav3_sage_forward_func(
         sm_scale=softmax_scale,
         BLKQ=BLKQ,
         BLKK=BLKK,
-        tensor_layout="NHD",
+        tensor_layout=tensor_layout,
     )
     return lambda: fav3_sage_func(
         q_int8,
@@ -265,6 +270,7 @@ def fav3_sage_forward_func(
         FP8_MAX,
         causal=causal,
         inference_mode=inference_mode,
+        layout=layout,
     )
 
 
@@ -408,8 +414,8 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
 
 def bench_kernel(q, k, v, args, provider):
     # Default softmax scale
-    print("bench kernel assumes shape BSHD")
-    print(f"q.shape = {q.shape}. Should correspond to BSHD, make sure that this is right!")
+    # print("bench kernel assumes shape BSHD")
+    # print(f"q.shape = {q.shape}. Should correspond to BSHD, make sure that this is right!")
     BATCH, N_CTX_Q, HQ,  D_HEAD = q.shape
     _, N_CTX_K, HK, D_HEAD_V = v.shape
     softmax_scale = 1.0 / (D_HEAD**0.5)
@@ -446,6 +452,7 @@ def bench_kernel(q, k, v, args, provider):
             v,
             causal=False,
             inference_mode=True,
+            layout="bshd",
         )
     else:  # fav2 (no quantization)
         fn = fav2_forward_func(
