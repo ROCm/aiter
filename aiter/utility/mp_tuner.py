@@ -267,7 +267,7 @@ def mp_tuner(
     start_idx = 0
     if not tasks:
         return []
-    if mp_num == 1 & fast_mode == 0:
+    if mp_num == 1 and fast_mode == 0:
         shape_grouped = True
     # time.sleep(2)
     task_group = []
