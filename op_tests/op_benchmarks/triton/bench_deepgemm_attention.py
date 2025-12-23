@@ -10,7 +10,10 @@ import os
 import triton
 
 from aiter.test_common import run_perftest
-from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.ops.triton.pa_mqa_logits import (
+    deepgemm_fp8_paged_mqa_logits,
+    deepgemm_fp8_paged_mqa_logits_schedule,
+)
 from aiter.ops.shuffle import shuffle_weight
 
 
@@ -198,7 +201,9 @@ def run_benchmark(args: argparse.Namespace):
 
         assert blocksize == 1 or args.kv_preshuffle and blocksize % 16 == 0
 
-        var_ratio = 0.0
+        var_ratio = 0.5
+        EnableVarCtxOpt = var_ratio > 0.0
+
         context_lens = (
             torch.randint(
                 int((1 - var_ratio) * avg_kv_length),
@@ -295,6 +300,16 @@ def run_benchmark(args: argparse.Namespace):
                     split_kv_cache_data.view(kv_num_block, kv_block_Size * index_dim)
                 )
 
+            if EnableVarCtxOpt:
+                safe_chunks_per_cta = deepgemm_fp8_paged_mqa_logits_schedule(
+                    batch_size,
+                    next_n,
+                    context_lens,
+                    max_model_len,
+                    ChunkK=ChunkK,
+                    WavePerEU=WavePerEU,
+                )
+
             _, elapsed_us = run_perftest(
                 deepgemm_fp8_paged_mqa_logits,
                 q_fp8,
@@ -308,6 +323,7 @@ def run_benchmark(args: argparse.Namespace):
                 Preshuffle=Preshuffle,
                 KVBlockSize=blocksize,
                 WavePerEU=WavePerEU,
+                VarCtxSchedule=safe_chunks_per_cta if EnableVarCtxOpt else None,
             )
             cache_key = deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
@@ -321,6 +337,7 @@ def run_benchmark(args: argparse.Namespace):
                 Preshuffle=Preshuffle,
                 KVBlockSize=blocksize,
                 WavePerEU=WavePerEU,
+                VarCtxSchedule=safe_chunks_per_cta if EnableVarCtxOpt else None,
             )
 
             print(">>> ", cache_key)
@@ -367,7 +384,7 @@ def run_benchmark(args: argparse.Namespace):
 
             padded_str = "T" if args.padding else "F"
             os.makedirs(aot_kernel_dir, exist_ok=True)
-            aot_name = f"paged_mqa_logits{"_preshuffle" if args.kv_preshuffle else ""}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            aot_name = f"paged_mqa_logits{"_preshuffle" if args.kv_preshuffle else ""}{"_varctx" if EnableVarCtxOpt else ""}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
