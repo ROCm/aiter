@@ -456,6 +456,7 @@ namespace py = pybind11;
           py::arg("A"),                          \
           py::arg("B"),                          \
           py::arg("out"),                        \
+          py::arg("semaphore"),                  \
           py::arg("bias")        = std::nullopt, \
           py::arg("splitK")      = std::nullopt, \
           py::arg("kernelName")  = std::nullopt, \
@@ -914,7 +915,9 @@ namespace py = pybind11;
           py::arg("block_m")        = 32,           \
           py::arg("sorted_weights") = std::nullopt, \
           py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0);               \
+          py::arg("activation")     = 0,            \
+          py::arg("splitk")         = 1,            \
+          py::arg("dst_type")       = std::nullopt);      \
                                                     \
     m.def("ck_moe_stage2",                          \
           &ck_moe_stage2,                           \
@@ -932,7 +935,9 @@ namespace py = pybind11;
           py::arg("block_m")        = 32,           \
           py::arg("sorted_weights") = std::nullopt, \
           py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0);
+          py::arg("activation")     = 0,            \
+          py::arg("splitk")         = 1,            \
+          py::arg("dst_type")       = std::nullopt);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \
@@ -1537,34 +1542,34 @@ namespace py = pybind11;
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
-#define TOP_K_PER_ROW_PYBIND       \
-    m.def("top_k_per_row_prefill", \
-          &top_k_per_row_prefill,  \
-          py::arg("logits"),       \
-          py::arg("rowStarts"),    \
-          py::arg("rowEnds"),      \
-          py::arg("indices"),      \
-          py::arg("values"),       \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
-          py::arg("stride1"));     \
-    m.def("top_k_per_row_decode",  \
-          &top_k_per_row_decode,   \
-          py::arg("logits"),       \
-          py::arg("next_n"),       \
-          py::arg("seqLens"),      \
-          py::arg("indices"),      \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
-          py::arg("stride1"));     \
-    m.def("top_k_per_row_decode_fast",  \
-          &top_k_per_row_decode_fast,   \
-          py::arg("logits"),       \
-          py::arg("next_n"),       \
-          py::arg("seqLens"),      \
-          py::arg("indices"),      \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
+#define TOP_K_PER_ROW_PYBIND           \
+    m.def("top_k_per_row_prefill",     \
+          &top_k_per_row_prefill,      \
+          py::arg("logits"),           \
+          py::arg("rowStarts"),        \
+          py::arg("rowEnds"),          \
+          py::arg("indices"),          \
+          py::arg("values"),           \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+    m.def("top_k_per_row_decode",      \
+          &top_k_per_row_decode,       \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+    m.def("top_k_per_row_decode_fast", \
+          &top_k_per_row_decode_fast,  \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
           py::arg("stride1"));
 
 #define MLA_METADATA_PYBIND                              \
@@ -1630,10 +1635,15 @@ namespace py = pybind11;
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
-#define TOPK_PLAIN_PYBIND      \
-    m.def("topk_plain",        \
-          &topk_plain,         \
-          py::arg("values"),   \
-          py::arg("topk_ids"), \
-          py::arg("topk"),     \
-          py::arg("largest"));
+#define TOPK_PLAIN_PYBIND           \
+    m.def("topk_plain",             \
+          &topk_plain,              \
+          py::arg("values"),        \
+          py::arg("topk_ids"),      \
+          py::arg("topk_out"),      \
+          py::arg("topk"),          \
+          py::arg("largest") = true, \
+          py::arg("rowStarts") = torch::Tensor(), \
+          py::arg("rowEnds") = torch::Tensor(), \
+          py::arg("stride0") = -1,  \
+          py::arg("stride1") = 1);

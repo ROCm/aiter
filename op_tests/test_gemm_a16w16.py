@@ -2,9 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import os
 import random
-import sys
 from functools import lru_cache
 
 import pandas as pd
@@ -59,8 +57,9 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 def run_bf16gemm_asm(
     x, weight, out_asm, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
+    sema = aiter.get_semaphore_workspace(out_asm.device)
     return aiter.gemm_a16w16_asm(
-        x, weight, out_asm, bias, splitK, kernelName, bpreshuffle
+        x, weight, out_asm, sema, bias, splitK, kernelName, bpreshuffle
     )
 
 

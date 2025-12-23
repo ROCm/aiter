@@ -5,7 +5,6 @@ import triton.language as tl
 from typing import Optional
 from aiter.utility import dtypes
 from aiter.ops.triton._triton_kernels.fused_mxfp4_quant import (
-    _rmsmorm_op,
     _fused_rms_mxfp4_quant_kernel,
     _fused_flatten_mxfp4_quant,
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
@@ -650,3 +649,196 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         x_fp4.view(dtypes.fp4x2),
         blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o),
     )
+
+
+@triton.jit
+def _fused_quant_fp8_sort_kernel(
+    # Pointers
+    input_ptr,
+    sorted_ids_ptr,
+    num_valid_ids_ptr,
+    x_fp8_ptr,
+    scale_sorted_ptr,
+    # Input/Output strides
+    stride_input_m: tl.constexpr,
+    stride_input_n: tl.constexpr,
+    stride_x_fp8_m: tl.constexpr,
+    stride_x_fp8_n: tl.constexpr,
+    stride_scale_o3: tl.constexpr,
+    stride_scale_o2: tl.constexpr,
+    stride_scale_o1: tl.constexpr,
+    stride_scale_o0: tl.constexpr,
+    # Problem size
+    M_input: tl.constexpr,
+    N_input: tl.constexpr,
+    N_scale_cols: tl.constexpr,
+    token_num: tl.constexpr,
+    # Block configuration
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,  # quant_block_size / 2
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    TOPK: tl.constexpr,
+    # Quantization parameters
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
+):
+    pid_m = tl.program_id(0) * 2
+    pid_n = tl.program_id(1) * 2
+
+    num_valid_ids = tl.load(num_valid_ids_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
+        return
+
+    out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
+
+    for i in range(4):
+        m = i % 2 * BLOCK_SIZE_M  # 0 or BLOCK_SIZE_M
+        n = i // 2 * BLOCK_SIZE_N  # 0 or BLOCK_SIZE_N
+
+        sorted_ids_offs_m = pid_m * BLOCK_SIZE_M + m + tl.arange(0, BLOCK_SIZE_M)
+        sorted_ids_mask = sorted_ids_offs_m < num_valid_ids
+        sorted_ids = tl.load(
+            sorted_ids_ptr + sorted_ids_offs_m,
+            mask=sorted_ids_mask,
+            other=0,
+        )
+        topk_ids = sorted_ids >> 24
+        token_ids = sorted_ids & 0xFFFFFF
+
+        if TOPK == 1:
+            original_m_idx = token_ids
+        else:
+            original_m_idx = token_ids * TOPK + topk_ids
+
+        input_offs_n = (pid_n * BLOCK_SIZE_N + n) * QUANT_BLOCK_SIZE + tl.arange(
+            0, BLOCK_SIZE_N * QUANT_BLOCK_SIZE
+        )
+        input_offs = (
+            original_m_idx[:, None] * stride_input_m
+            + input_offs_n[None, :] * stride_input_n
+        )
+        input_mask = (original_m_idx < M_input)[:, None] & (input_offs_n < N_input)[
+            None, :
+        ]
+
+        x = tl.load(input_ptr + input_offs, mask=input_mask, other=0.0).to(tl.float32)
+
+        x_reshaped = x.reshape(BLOCK_SIZE_M * BLOCK_SIZE_N, QUANT_BLOCK_SIZE)
+
+        amax = tl.max(tl.abs(x_reshaped), axis=-1, keep_dims=True)
+
+        amax = amax.to(tl.int32, bitcast=True)
+        amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+        amax = amax.to(tl.float32, bitcast=True)
+
+        scale_e8m0_unbiased = tl.log2(amax).floor() - tl.log2(DTYPE_MAX).floor()
+        scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+
+        quant_scale = tl.exp2(-scale_e8m0_unbiased)
+        x_fp8 = tl.clamp(x_reshaped * quant_scale, DTYPE_MIN, DTYPE_MAX)
+        x_fp8 = x_fp8.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N * QUANT_BLOCK_SIZE)
+
+        scale_e8m0 = (scale_e8m0_unbiased.to(tl.uint8) + 127).to(tl.uint8)
+        scale_e8m0 = scale_e8m0.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N)  # [BLOCK_SIZE_M]
+
+        out_offs_n = (pid_n * BLOCK_SIZE_N + n) * QUANT_BLOCK_SIZE + tl.arange(
+            0, BLOCK_SIZE_N * QUANT_BLOCK_SIZE
+        )
+        out_offs = (
+            original_m_idx[:, None] * stride_x_fp8_m
+            + out_offs_n[None, :] * stride_x_fp8_n
+        )
+        out_mask = (original_m_idx < M_input)[:, None] & (out_offs_n < N_input)[None, :]
+        tl.store(
+            x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.type.element_ty), mask=out_mask
+        )
+
+        out = out | (scale_e8m0.to(tl.uint32) << (i * 8))
+
+    offs_0 = tl.arange(0, BLOCK_SIZE_M)
+    offs_1 = tl.arange(0, BLOCK_SIZE_N)
+    offs_2 = pid_n // 2
+    offs_3 = pid_m // 2
+    offs = (
+        offs_0[:, None] * stride_scale_o0
+        + offs_1[None, :] * stride_scale_o1
+        + offs_2 * stride_scale_o2
+        + offs_3 * stride_scale_o3
+    )
+    tl.store(scale_sorted_ptr + offs, out)
+
+
+def fused_quant_fp8_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_size: int = 32,
+    quant_block_size: int = 8,
+    quant_dtype: torch.dtype = dtypes.fp8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    BLOCK_SIZE_M = block_size
+    BLOCK_SIZE_N = quant_block_size
+    BLOCK_SIZE_M_u32 = BLOCK_SIZE_M // 2
+    BLOCK_SIZE_N_u32 = BLOCK_SIZE_N // 2
+
+    M, N = input.shape
+    assert (
+        N % quant_block_size == 0
+    ), f"N ({N}) must be multiple of quant_block_size ({quant_block_size})"
+    assert block_size % 32 == 0, "block_size must be multiple of 32"
+
+    N_blocks = triton.cdiv(N, block_size)
+
+    if quant_dtype == dtypes.fp8:
+        DTYPE_MAX = 448.0
+        DTYPE_MIN = -448.0
+    elif quant_dtype == torch.float8_e4m3fn:
+        DTYPE_MAX = 448.0
+        DTYPE_MIN = -448.0
+    else:
+        DTYPE_MAX = 448.0
+        DTYPE_MIN = -448.0
+
+    x_fp8 = torch.empty_like(input, dtype=quant_dtype, device="cuda")
+    M_o, N_o = sorted_ids.shape[0], N_blocks
+
+    # [M_sorted_blocks/2, N_blocks/2, BLOCK_SIZE_N_u32, BLOCK_SIZE_M_u32]
+    scale_e8m0_packed = torch.empty(
+        (
+            triton.cdiv(M_o, BLOCK_SIZE_M),
+            triton.cdiv(N_o, BLOCK_SIZE_N),
+            BLOCK_SIZE_N_u32,
+            BLOCK_SIZE_M_u32,
+        ),
+        dtype=torch.uint32,
+        device=input.device,
+    )
+
+    grid = (
+        triton.cdiv(M_o, BLOCK_SIZE_M),  # 32
+        triton.cdiv(N_o, BLOCK_SIZE_N),  # 8
+    )
+
+    _fused_quant_fp8_sort_kernel[grid](
+        input,
+        sorted_ids,
+        num_valid_ids,
+        x_fp8,
+        scale_e8m0_packed,
+        *input.stride(),
+        *x_fp8.stride(),
+        *scale_e8m0_packed.stride(),
+        M_input=M,
+        N_input=N,
+        N_scale_cols=N_blocks,
+        token_num=token_num,
+        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
+        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
+        QUANT_BLOCK_SIZE=32,
+        TOPK=M // token_num,
+        DTYPE_MAX=DTYPE_MAX,
+        DTYPE_MIN=DTYPE_MIN,
+    )
+
+    return x_fp8, scale_e8m0_packed.view(dtypes.fp8_e8m0).view(-1, N_o)
