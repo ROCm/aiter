@@ -8,7 +8,6 @@ import pandas as pd
 
 from abc import abstractmethod
 from aiter import logger
-import traceback
 from operator import itemgetter
 import time
 from aiter import dtypes
@@ -79,7 +78,6 @@ class TunerCommon:
     def set_run_iters(self, input, indtype):
         """set warm iters and run iter for profiling"""
         """suggest warm iters * time1_per_iter > 100us"""
-        pass
 
     def _setup_common_arguments(self):
         """set common arguments"""
@@ -241,7 +239,7 @@ class TunerCommon:
     def get_out_file(self, tuned_file):
         """if there are multiple tuned file, then write tuning result to the first file"""
         path_list = tuned_file.split(os.pathsep) if tuned_file else []
-        assert path_list, f"output tuned file is empty"
+        assert path_list, "output tuned file is empty"
         return path_list[0]
 
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
@@ -349,7 +347,6 @@ class TunerCommon:
 
         if fast_mode or topk == -1:
             return rets
-        best_time = -1
         tol_err_ratio = args.errRatio
         from collections import defaultdict
 
@@ -639,7 +636,7 @@ class GemmCommonTuner(TunerCommon):
     def set_run_iters(self, input, inputdtype):
         cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
-        bpe = self.get_bpe(inputdtype)
+
         if flops < 128 * 5120 * 256 * 2:
             self.num_warmup = 30
         elif flops < 256 * 5120 * 256 * 2:

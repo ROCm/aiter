@@ -3,8 +3,6 @@
 import torch
 import multiprocessing as mp
 import time
-import sys
-import os
 from multiprocessing import TimeoutError as MPTimeoutError
 from aiter.test_common import checkAllclose
 from aiter import dtypes
@@ -85,12 +83,6 @@ def worker(
                         msg=f"info:{info} res[{i}] ",
                     )
                     max_err_ratio = max(max_err_ratio, err_ratio)
-
-    except torch.cuda.CudaError as e:
-        print(f"CUDA Error in process:{pid} info:{info}: {e}")
-        print(f"This might be a GPU hang or memory access fault")
-        us = float("inf")
-        max_err_ratio = 1.0
     except RuntimeError as e:
         if "CUDA" in str(e) or "HIP" in str(e) or "out of memory" in str(e).lower():
             print(f"GPU Runtime Error in process:{pid} info:{info}: {e}")
@@ -98,7 +90,8 @@ def worker(
             try:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            except:
+            except Exception as e:
+                print(f"Error in process:{pid} info:{info}: {e}")
                 pass
         else:
             print(f"Runtime Error in process:{pid} info:{info}: {e}")
@@ -115,14 +108,6 @@ def worker(
         # traceback.print_exc()
         us = -1  # float("inf")
         max_err_ratio = 1.0
-    finally:
-        # Ensure GPU state is cleaned up
-        # try:
-        #    torch.cuda.synchronize()
-        #    torch.cuda.empty_cache()
-        # except:
-        #    pass
-        pass
 
     return info, us, round(max_err_ratio, 4)
 
@@ -443,7 +428,6 @@ def mp_tuner(
             except Exception as e:
                 # Check if it's a process crash (segfault, memory fault, etc.)
                 error_type = type(e).__name__
-                error_str = str(e)
 
                 # Special handling for KeyError (PID mapping issue)
                 is_mapping_error = error_type == "KeyError"
@@ -471,7 +455,7 @@ def mp_tuner(
         if pool_restart_needed and remaining_tasks:
             if verbose:
                 print(f"\n{'='*60}")
-                print(f"? Pool restart needed due to crash. Restarting pool...")
+                print("? Pool restart needed due to crash. Restarting pool...")
                 print(f"Remaining tasks: {len(remaining_tasks)}")
                 print(f"{'='*60}\n")
 
