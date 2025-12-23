@@ -95,7 +95,6 @@ torch::Tensor
             {k.M_Tile}, {k.N_Tile}, {k.K_Tile},
             {k.M_Warp}, {k.N_Warp}, {k.K_Warp},
             {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
-            {str(k.kPadM).lower()}, {str(k.kPadN).lower()}, {str(k.kPadK).lower()},
             {str(k.TiledMMAPermuteN).lower()},
             {str(k.TransposeC).lower()},
             {str(k.DoubleSmemBuffer).lower()},

@@ -55,9 +55,6 @@ template <ck_tile::index_t M_Tile,
           ck_tile::index_t M_Warp_Tile,
           ck_tile::index_t N_Warp_Tile,
           ck_tile::index_t K_Warp_Tile,
-          bool kPadM,
-          bool kPadN,
-          bool kPadK,
           bool TiledMMAPermuteN                    = false,
           bool TransposeC                          = false,
           bool DoubleSmemBuffer                    = false,
@@ -75,9 +72,6 @@ struct CreateTileGemmConfig
     static constexpr ck_tile::index_t M_Warp_Tile_v             = M_Warp_Tile;
     static constexpr ck_tile::index_t N_Warp_Tile_v             = N_Warp_Tile;
     static constexpr ck_tile::index_t K_Warp_Tile_v             = K_Warp_Tile;
-    static constexpr bool kPadM_v                               = kPadM;
-    static constexpr bool kPadN_v                               = kPadN;
-    static constexpr bool kPadK_v                               = kPadK;
     static constexpr bool TiledMMAPermuteN_v                    = TiledMMAPermuteN;
     static constexpr bool TransposeC_v                          = TransposeC;
     static constexpr bool DoubleSmemBuffer_v                    = DoubleSmemBuffer;
@@ -95,9 +89,6 @@ template <ck_tile::index_t M_Tile,
           ck_tile::index_t M_Warp_Tile,
           ck_tile::index_t N_Warp_Tile,
           ck_tile::index_t K_Warp_Tile,
-          bool kPadM,
-          bool kPadN,
-          bool kPadK,
           bool TiledMMAPermuteN                    = false,
           bool TransposeC                          = false,
           bool DoubleSmemBuffer                    = false,
@@ -113,9 +104,6 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             M_Warp_Tile,
                                             N_Warp_Tile,
                                             K_Warp_Tile,
-                                            kPadM,
-                                            kPadN,
-                                            kPadK,
                                             TiledMMAPermuteN,
                                             TransposeC,
                                             DoubleSmemBuffer,
@@ -123,10 +111,9 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             Scheduler,
                                             BlockPerCu>;
 
-template <typename QDataType, typename OutDataType, typename GemmConfig>
-void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
+template <typename QDataType, typename OutDataType, typename GemmConfig, bool PadN, bool PadK>
+void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 {
-
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<GemmConfig::M_Tile_v, GemmConfig::N_Tile_v, GemmConfig::K_Tile_v>,
         ck_tile::sequence<GemmConfig::M_Warp_v, GemmConfig::N_Warp_v, GemmConfig::K_Warp_v>,
@@ -134,9 +121,9 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
                           GemmConfig::N_Warp_Tile_v,
                           GemmConfig::K_Warp_Tile_v>>;
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
-    using GemmTraits      = ck_tile::TileGemmQuantTraits<GemmConfig::kPadM_v,
-                                                         GemmConfig::kPadN_v,
-                                                         GemmConfig::kPadK_v,
+    using GemmTraits      = ck_tile::TileGemmQuantTraits<false, // kPadM_v,
+                                                         PadN,
+                                                         PadK,
                                                          false, // PreshuffleQuant, not support yet
                                                          false, // PreshuffleB, not support yet
                                                          ALayout,
@@ -233,7 +220,31 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
     };
 
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
-};
+}
+
+template <typename QDataType, typename OutDataType, typename GemmConfig>
+void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
+{
+    const bool pad_n = (args.N % BQuantGroupSize::kN != 0);
+    const bool pad_k = (args.K % AQuantGroupSize::kK != 0);
+
+    if(pad_n && pad_k)
+    {
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, true>(args);
+    }
+    else if(pad_n && !pad_k)
+    {
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, false>(args);
+    }
+    else if(!pad_n && pad_k)
+    {
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, true>(args);
+    }
+    else
+    {
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, false>(args);
+    }
+}
 
 template <typename QDataType, typename OutDataType, typename GemmInstance>
 __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
