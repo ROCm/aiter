@@ -1599,6 +1599,12 @@ def paged_attention_decode_sliding_window(
                     offsets=max_logits_offsets,
                     mask=max_logits_group_mask,
                 )
+                gl.amd.cdna3.buffer_store(
+                    stored_value=attention_accumulator.to(OUTPUT_DTYPE),
+                    ptr=output_ptr,
+                    offsets=output_offsets,
+                    mask=output_mask,
+                )
             return  # No computation needed for this partition
         sequence_end_idx = gl.minimum(
             context_length, page_size * (sequence_split_idx + 1)
