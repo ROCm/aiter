@@ -24,6 +24,7 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+
 setup_seed(23333)
 
 
@@ -319,6 +320,7 @@ def test_mla(
     )
     valid_reduce_partial_cnt = reduce_indptr[valid_batch_size].item()
 
+    torch.set_printoptions(threshold=99999)
     # print(f"seq_lens_kv({seq_lens_kv.shape}):")
     # print(seq_lens_kv)
     # print(f"kv_indptr({kv_indptr.shape}):")
@@ -335,6 +337,7 @@ def test_mla(
     print(reduce_final_map[:valid_batch_size])
     print(f"reduce_partial_map({reduce_partial_map.shape}.{valid_reduce_partial_cnt}):")
     print(reduce_partial_map[:valid_reduce_partial_cnt])
+    torch.set_printoptions(threshold=1000)
 
     num_dbg_tr_rows = max(total_q * nhead, kv_indptr[-1].item())
     dbg_tr = torch.empty((num_dbg_tr_rows, qk_head_dim), dtype=torch.float32).fill_(
