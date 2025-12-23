@@ -20,6 +20,7 @@ from aiter import ActivationType
 from aiter import pertoken_quant
 from aiter import dtypes
 import argparse
+import pandas as pd
 
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
@@ -105,6 +106,7 @@ def test_fmoe_ep(
     shared_E=2,
     ep=8,
 ):
+    ret = {}
     # This gpu id in EP, this example use the last id
     ep_id = ep - 1
     # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask)
@@ -123,7 +125,7 @@ def test_fmoe_ep(
     expert_mask[E:-1] = 1
 
     quantAlgoId = quant_algo.index(quant)
-    if quantAlgoId not in [0, 3] and not use_g1u1:
+    if quantAlgoId not in [0] and not use_g1u1:
         print("g1u0 only could test no quant and int8smoothquant")
         return
 
@@ -301,9 +303,9 @@ def test_fmoe_ep(
             fc1_smooth_scale,
             fc2_smooth_scale,
         ) / (1024 * 1024 * 1024 * 1024.0)
-        bw = num_tb * 1e6 / avg_b
+        bw = num_tb * 1e9 / avg_b
         print(
-            f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}TB/s"
+            f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}GB/s"
         )
 
         if use_smooth and (
@@ -339,6 +341,22 @@ def test_fmoe_ep(
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
+        ret = {
+            "token": token,
+            "quant": quantstr,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "E": E,
+            "shared_E": shared_E,
+            "topk": topk,
+            "ep": ep,
+            "dtype": dtype,
+            "torch_avg_us": float(avg_c),
+            "asm_avg_us": float(avg_b),
+            "uplift": float(avg_c / avg_b - 1.0),
+            "asm_bandwidth": float(bw),
+        }
+    return ret
 
 
 parser = argparse.ArgumentParser(
@@ -359,7 +377,7 @@ parser.add_argument(
     "--test",
     type=str,
     choices=l_test,
-    default=None,
+    default="g1u1_int8quant",
     help="""Select test to run.
     e.g.: -t g1u1_int8quant
           or -t test_fmoe_16_bit
@@ -485,22 +503,21 @@ for test in l_test:
                                 ep=ep,
                             )
     elif test == "g1u1_int8quant":
+        results = []
         for dtype in (
             [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
         ):
-            for m in [128, 256] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
-                        expert = 32 if args.expert is None else args.expert
-                        topk = 5 if args.topk is None else args.topk
+            for m in [16, 32, 64, 128, 256, 512, 1024, 4096,8192,10240,12288,16384,20480,24576,30720,32768,40960] if args.token is None else args.token:
+                for hdim in [5120] if args.hidden_dim is None else args.hidden_dim:
+                    for idim in [1536] if args.inter_dim is None else args.inter_dim:
+                        expert = 128 if args.expert is None else args.expert
+                        topk = 6 if args.topk is None else args.topk
                         for ep in (
-                            [4, 8]
+                            [8]
                             if args.expert_parallelism is None
                             else args.expert_parallelism
                         ):
-                            test_fmoe_ep(
+                            ret = test_fmoe_ep(
                                 dtype,
                                 m,
                                 hdim,
@@ -512,6 +529,9 @@ for test in l_test:
                                 shared_E=2,
                                 ep=ep,
                             )
+                            results.append(ret)
+        df = pd.DataFrame(results)
+        print(f"summary:\n{df}")
     elif test == "g1u1_fp8quant":
         for dtype in (
             [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]

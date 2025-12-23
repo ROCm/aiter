@@ -450,6 +450,15 @@ def test_pa_mtp(
     ret["us_hip_bf16"] = us_hip
     ret["err_hip_bf16"] = err_noquant
 
+    element_size = dtype.itemsize
+    total_kv_tokens = batch_size * ctx_lens
+    total_q_tokens = batch_size * qlen
+    mem_bytes_bf16 = (
+        int(total_kv_tokens) * int(num_kv_heads) * int(head_size) * int(element_size) * 2
+        + int(total_q_tokens) * int(num_query_heads) * int(head_size) * int(element_size) * 2
+    )
+    ret["bw_hip_bf16"] = mem_bytes_bf16 / (us_hip * 1e-6) / 1e9
+
     # ################## quant start ######################
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
@@ -479,6 +488,13 @@ def test_pa_mtp(
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
 
+    mem_bytes_fp8 = (
+        int(total_kv_tokens) * int(num_kv_heads) * int(head_size) * 1 * 2
+        + int(total_q_tokens) * int(num_query_heads) * int(head_size) * 1
+        + int(total_q_tokens) * int(num_query_heads) * int(head_size) * int(element_size)
+    )
+    ret["bw_asm_fp8"] = mem_bytes_fp8 / (us_aiter_asm * 1e-6) / 1e9
+
     q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
     q_scale = q_scale.squeeze(-1)
 
@@ -505,17 +521,18 @@ def test_pa_mtp(
     )
     ret["us_hip_fp8"] = us_hip
     ret["err_hip_fp8"] = err
+    ret["bw_hip_fp8"] = mem_bytes_fp8 / (us_hip * 1e-6) / 1e9
 
     return ret
 
 
 head_dim = 128
-l_block_size = [16]
+l_block_size = [1024]
 l_dtype = ["bf16"]
-l_num_heads = [(5, 1), (8, 1), (10, 1)]
-l_qlen = [1, 2, 3, 4]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
-l_batch_size = [128]
+l_num_heads = [(10, 1)]
+l_qlen = [4]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 8192,10240,16384]
+l_batch_size = [64,128,256]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
