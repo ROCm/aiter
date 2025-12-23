@@ -46,33 +46,6 @@ except ImportError:
     )
     GLUON_AOT_COMPILE_ENABLED = False
 
-try:
-    from triton.tools.compile import compile_kernel, CompileArgs
-except ImportError:
-    print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
-
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
-    compile_gluon_kernel,
-    CompileGluonArgs,
-)
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
-from csrc.cpp_itfs.utils import (
-    BUILD_DIR,
-    AITER_CORE_DIR,
-    get_default_func_name,
-    compile_template_op,
-    mp_lock,
-    not_built,
-    run_lib,
-    logger,
-)
-from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
-    transpose_query_gluon_aot,
-    transpose_output_gluon_aot,
-)
-from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
-
 MD_NAME = "pa_decode_attention_reduce_kernel"
 
 
