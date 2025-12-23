@@ -114,6 +114,9 @@ def perftest(
                 logger.info(f"avg: {avg} us/iter with hipgraph")
 
             avg = get_trace_perf(prof, num_iters)
+            print(
+                prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
+            )  # new line
             return data, avg
 
         return wrapper
