@@ -1194,7 +1194,7 @@ def run_gluon_kernel(
     This function can run in aot or jit mode based on use_aot_impl flag.
     """
     # Run kernel
-    if use_aot_impl and sliding_window == 0:
+    if use_aot_impl and sliding_window == 0 and not ps:
         pa_decode_gluon_aot(
             output,
             output_transposed,
@@ -1524,7 +1524,7 @@ def run_pa_gluon_test(
     if ps or sliding_window > 0:
         context_partition_size = 128
     else:
-        context_partition_size = 256
+        context_partition_size = context_partition_size
     page_size = torch.tensor(1, dtype=torch.int32, device=context_lengths.device)
     if ps:
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
@@ -2227,6 +2227,7 @@ def simple_test():
     global USE_TORCH_FLASH_REF_OPTIONS
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
+    global PS_OPTIONS
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
@@ -2244,6 +2245,7 @@ def simple_test():
     KV_VARLEN_OPTIONS = [False]
     HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
     USE_AOT_IMPL_OPTIONS = [True]
+    PS_OPTIONS = [False]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     BLOCK_SIZE_OPTIONS = [64]
@@ -2277,7 +2279,7 @@ def sliding_window_test():
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
     SINKS_OPTIONS = [False]
-    SLIDING_WINDOW_OPTIONS = [0]
+    SLIDING_WINDOW_OPTIONS = [0, 128]
     HEAD_DIMENSION_OPTIONS = [64]
     CONTEXT_LENGTH_OPTIONS = [1024, 8192]
     BATCH_SIZE_OPTIONS = [4, 16, 128]
@@ -2344,5 +2346,5 @@ def multi_compute_quant_type_test():
 
 
 if __name__ == "__main__":
-    sliding_window_test()
+    simple_test()
     # multi_compute_quant_type_test()

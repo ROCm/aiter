@@ -45,6 +45,7 @@ from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
     transpose_output_gluon_aot,
 )
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 MD_NAME = "pa_decode_attention_reduce_kernel"
 
@@ -405,7 +406,7 @@ def pa_decode_gluon_aot(
     query_length: int,
     max_context_length: int,
     context_partition_size: int,
-    compute_type: tl.dtype,
+    compute_type: torch.dtype,
     query_scale: torch.Tensor,  # [num_seqs * query_length, num_query_heads, 1] or [1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -541,12 +542,13 @@ def pa_decode_gluon_aot(
     - For FP8 computation, query_scale and key_scale/value_scale are required
     - For BF16/FP16 computation, scales can be None
     """
+
     cdna_version = get_cdna_version()
     assert cdna_version in [
         3,
         4,
     ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
-
+    compute_type = torch_to_triton_dtype[compute_type]
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
