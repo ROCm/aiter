@@ -2536,7 +2536,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
 
         # ==================== VALUE ACCUMULATION ====================
         # Handle value quantization scaling for FP8
-        if value_tensor.dtype.is_fp8():
+        if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 1:
                 # Per-token quantization scaling
                 # Create mask for valid tokens
@@ -3609,7 +3609,7 @@ def pa_decode_gluon(
             query_scale_stride_0 = query_scale.stride(0)
 
     # Configure KV quantization
-    if key_scale is not None and value_scale is not None:
+    if key_scale is not None and value_scale is not None and key_cache.dtype == aiter.dtypes.fp8:
         assert (
             isinstance(key_scale, torch.Tensor) and key_scale.dtype == aiter.dtypes.fp32
         ), f"key_scale tensor only support dtype == {aiter.dtypes.fp32}, but got key_scale.dtype == {key_scale.dtype}"
