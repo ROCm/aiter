@@ -5,6 +5,7 @@ import torch
 import aiter
 from torch.profiler import profile, ProfilerActivity
 from aiter import dtypes
+import time
 
 input_shapes = [
     (512,),
