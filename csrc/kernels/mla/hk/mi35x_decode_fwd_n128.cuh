@@ -612,9 +612,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
     constexpr uint32_t k_o_end        = 255;
     constexpr uint32_t k_o_begin      = k_o_end - k_o_sz + 1;
-    constexpr uint32_t k_p_mfma_end   = k_o_begin - 1;
+    constexpr uint32_t k_p_mfma_end   = k_o_begin - 1; // reuse p_mfma and p_comp
     constexpr uint32_t k_p_mfma_begin = k_p_mfma_end - k_p_mfma_sz + 1;
-    constexpr uint32_t k_p_comp_end   = k_p_mfma_begin - 1;
+    constexpr uint32_t k_p_comp_end   = k_o_begin - 1; // reuse p_mfma and p_comp
     constexpr uint32_t k_p_comp_begin = k_p_comp_end - k_p_comp_sz + 1;
     constexpr uint32_t k_kv_1_end     = k_p_comp_begin - 1;
     constexpr uint32_t k_kv_1_begin   = k_kv_1_end - k_kv_size + 1;
@@ -659,7 +659,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_ranges> kv_1;
     hk::art<comp_t, T::kBlockN, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_ranges> p_comp;
-    // hk::art<kv_t, T::kBlockN, T::kTileM, hk::row_l, hk::rt_16x16_s, p_mfma_ranges> p_mfma;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges> p_mfma;
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
     // Runtime constants
@@ -759,9 +759,102 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             softmax<kIsFirstIter, kIsTail, k_p_comp_begin, comp_t>(
                 &row_max, &row_sum_e, &rescale, kv_tile_start, kv_end, params.softmax_scale);
 
-            ///
-            /// KV GEMM
-            ///
+            // Convert p from comp_t to kv_t
+            ckt::static_for<k_p_comp_begin, k_p_comp_end + 1, 4>{}([&](auto idx) {
+                constexpr uint32_t dst_idx = k_p_mfma_begin + (idx.value - k_p_comp_begin) / 4;
+                constexpr uint32_t src_idx = idx.value;
+                asm volatile("v_cvt_pk_fp8_f32 v[%0], v[%1], v[%2]\n\t"
+                             "v_cvt_pk_fp8_f32 v[%0], v[%3], v[%4] op_sel:[0, 0, 1]"
+                             :
+                             : "n"(dst_idx),
+                               "n"(src_idx),
+                               "n"(src_idx + 1),
+                               "n"(src_idx + 2),
+                               "n"(src_idx + 3));
+            });
+
+            // GEMM on PV
+            const uint32_t row_idx         = lane_idx % 16;
+            const uint32_t col_idx         = 4 * (lane_idx / 16);
+            constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2);
+            ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
+                constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
+                using oaccu_range_0           = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base, oaccu_base + 8 - 1>>,
+                    4>;
+                using oaccu_range_1 = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base + 8, oaccu_base + 16 - 1>>,
+                    4>;
+                hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_range_0>
+                    oaccu_0;
+                hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_range_1>
+                    oaccu_1;
+
+                // Load V from LDS directly
+                /// TODO: This shouldn't be efficient!!!!
+                const ckt::fp8_t* p_kv =
+                    reinterpret_cast<ckt::fp8_t*>(p_lds_k_nope) + idx.value * (T::kBlockK * 2);
+                FUI temp0, temp1, temp2, temp3;
+                temp0.x = p_kv[row_idx + (col_idx + 0) * 512];
+                temp0.y = p_kv[row_idx + (col_idx + 1) * 512];
+                temp0.z = p_kv[row_idx + (col_idx + 2) * 512];
+                temp0.w = p_kv[row_idx + (col_idx + 3) * 512];
+                temp1.x = p_kv[row_idx + (col_idx + 16 + 0) * 512];
+                temp1.y = p_kv[row_idx + (col_idx + 16 + 1) * 512];
+                temp1.z = p_kv[row_idx + (col_idx + 16 + 2) * 512];
+                temp1.w = p_kv[row_idx + (col_idx + 16 + 3) * 512];
+                temp2.x = p_kv[row_idx + 16 + (col_idx + 0) * 512];
+                temp2.y = p_kv[row_idx + 16 + (col_idx + 1) * 512];
+                temp2.z = p_kv[row_idx + 16 + (col_idx + 2) * 512];
+                temp2.w = p_kv[row_idx + 16 + (col_idx + 3) * 512];
+                temp3.x = p_kv[row_idx + 16 + (col_idx + 16 + 0) * 512];
+                temp3.y = p_kv[row_idx + 16 + (col_idx + 16 + 1) * 512];
+                temp3.z = p_kv[row_idx + 16 + (col_idx + 16 + 2) * 512];
+                temp3.w = p_kv[row_idx + 16 + (col_idx + 16 + 3) * 512];
+                hkm::v_mov_b32_up2p<k_kv_0_begin + 0>(temp0.ui);
+                hkm::v_mov_b32_up2p<k_kv_0_begin + 1>(temp1.ui);
+                hkm::v_mov_b32_up2p<k_kv_0_begin + 2>(temp2.ui);
+                hkm::v_mov_b32_up2p<k_kv_0_begin + 3>(temp3.ui);
+
+                if constexpr(kIsFirstIter)
+                {
+                    hk::mma_ABt(oaccu_0, kv_0, p_mfma);
+                }
+                else
+                {
+                    hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
+                }
+
+                temp0.x = p_kv[row_idx + 32 + (col_idx + 0) * 512];
+                temp0.y = p_kv[row_idx + 32 + (col_idx + 1) * 512];
+                temp0.z = p_kv[row_idx + 32 + (col_idx + 2) * 512];
+                temp0.w = p_kv[row_idx + 32 + (col_idx + 3) * 512];
+                temp1.x = p_kv[row_idx + 32 + (col_idx + 16 + 0) * 512];
+                temp1.y = p_kv[row_idx + 32 + (col_idx + 16 + 1) * 512];
+                temp1.z = p_kv[row_idx + 32 + (col_idx + 16 + 2) * 512];
+                temp1.w = p_kv[row_idx + 32 + (col_idx + 16 + 3) * 512];
+                temp2.x = p_kv[row_idx + 32 + 16 + (col_idx + 0) * 512];
+                temp2.y = p_kv[row_idx + 32 + 16 + (col_idx + 1) * 512];
+                temp2.z = p_kv[row_idx + 32 + 16 + (col_idx + 2) * 512];
+                temp2.w = p_kv[row_idx + 32 + 16 + (col_idx + 3) * 512];
+                temp3.x = p_kv[row_idx + 32 + 16 + (col_idx + 16 + 0) * 512];
+                temp3.y = p_kv[row_idx + 32 + 16 + (col_idx + 16 + 1) * 512];
+                temp3.z = p_kv[row_idx + 32 + 16 + (col_idx + 16 + 2) * 512];
+                temp3.w = p_kv[row_idx + 32 + 16 + (col_idx + 16 + 3) * 512];
+                hkm::v_mov_b32_up2p<k_kv_1_begin + 0>(temp0.ui);
+                hkm::v_mov_b32_up2p<k_kv_1_begin + 1>(temp1.ui);
+                hkm::v_mov_b32_up2p<k_kv_1_begin + 2>(temp2.ui);
+                hkm::v_mov_b32_up2p<k_kv_1_begin + 3>(temp3.ui);
+
+                if constexpr(kIsFirstIter)
+                {
+                    hk::mma_ABt(oaccu_1, kv_1, p_mfma);
+                }
+                else
+                {
+                    hk::mma_ABt(oaccu_1, kv_1, p_mfma, oaccu_1);
+                }
+            });
 
             // Debug code
             float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
