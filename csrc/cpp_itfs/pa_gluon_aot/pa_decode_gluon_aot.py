@@ -12,6 +12,7 @@ import triton.language as tl
 from jinja2 import Template
 
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
     compile_kernel,
