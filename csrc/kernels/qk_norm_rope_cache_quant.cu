@@ -100,11 +100,11 @@ struct alignas(sizeof(T) * vec_size) vec_t {
     }
 };
 
-template <typename T>
-__inline__ __device__ T warpReduceSum(T val) {
+template <typename Func, typename T>
+__inline__ __device__ T warpReduceSum(Func func, T val) {
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1)
-    val += __shfl_xor(val, mask, 32);
+    val = func(val, __shfl_xor(val, mask, 32));
   return val;
 }
 
@@ -113,7 +113,19 @@ inline __device__ __host__ T divUp(T m, T n) {
   return (m + n - 1) / n;
 }
 
-}  // namespace tensorrt_llm::common
+__device__ float abs(float x)
+{
+    union
+    {
+        float f32;
+        uint32_t u32;
+    } y;
+    y.f32 = x;
+    y.u32 = y.u32 & 0x7fffffff;
+    return y.f32;
+};
+
+}  // namespace aiter::common
 
 namespace aiter_kernels {
 // NOTE(zhuhaoran): This kernel is adapted from TensorRT-LLM implementation,
@@ -126,7 +138,7 @@ namespace aiter_kernels {
 // head_dim: the dimension of each head
 // interleave: interleave=!is_neox.
 template <typename scalar_t, typename kv_cache_scalar_t,
-          int head_dim, bool interleave, vllm::Fp8KVCacheDataType kv_dt>
+          int head_dim, bool interleave, int num_kv_heads, vllm::Fp8KVCacheDataType kv_dt>
 __global__ void fusedQKNormRopeKernel(
     scalar_t* qkv_void,                  // Combined QKV tensor
     int const num_heads_q,           // Number of query heads
@@ -138,13 +150,13 @@ __global__ void fusedQKNormRopeKernel(
     scalar_t const* cos_sin_cache,  // Pre-computed cos/sin cache
     int64_t const* position_ids,     // Position IDs for RoPE
     kv_cache_scalar_t* k_cache,      // Key cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
-    kv_cache_scalar_t* v_cache,      // Value cache [num_blocks, num_heads, block_size/X, head_size, X]
+    kv_cache_scalar_t* v_cache,      // Value cache [num_blocks, num_kv_heads, block_size/X, head_size, X]
     int64_t* slot_mapping,           // Slot mapping
-    float* k_scale,                  // Key scale for quantized key cache
-    float* v_scale,                  // Value scale for quantized value cache
+    float* k_scale,                  // Key scale for quantized key cache [num_blocks, block_size]
+    float* v_scale,                  // Value scale for quantized value cache [num_blocks, block_size]
     int const num_tokens,            // Number of tokens
     int const page_size,             // Page size for kv cache
-    int x                           // kv cache tiling size
+    int x                            // kv cache tiling size
 ) {
 
   int const warpsPerBlock = blockDim.x / 32;
@@ -196,7 +208,10 @@ __global__ void fusedQKNormRopeKernel(
     for (int i = 0; i < numElemsPerThread; i++) {
       sumOfSquares += static_cast<float>(elements[i]) * static_cast<float>(elements[i]);
     }
-    sumOfSquares = aiter::common::warpReduceSum(sumOfSquares);
+    auto sum_func = [](float a, float b) {
+        return a + b;
+    };
+    sumOfSquares = aiter::common::warpReduceSum(sum_func, sumOfSquares);
     float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
 
     // Normalize elements
@@ -286,10 +301,46 @@ __global__ void fusedQKNormRopeKernel(
   }
   int64_t block_idx = slot_id / page_size;
   int64_t block_offset = slot_id % page_size;
+  __shared__ float shared_max[num_kv_heads];
+  float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
+  float warp_max = elements[0];
+
+
+  if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
+    auto f_absmax_f32 = [](float v_0_, float v_1_) {
+        return __builtin_fmaxf(aiter::common::abs(v_0_), aiter::common::abs(v_1_));
+    };
+#pragma unroll
+    for (int i = 1; i < numElemsPerThread; i++) {
+      warp_max = f_absmax_f32(warp_max, elements[i]);
+    }
+    warp_max = aiter::common::warpReduceSum(f_absmax_f32, warp_max);
+    if constexpr (num_kv_heads > 1) {
+      // multiple kv heads, need to reduce across warps in a block, otherwise not necessary
+      if (laneId == 0) {
+        shared_max[warpId] = warp_max;
+        __syncthreads();
+        // since the num_kv_heads is normally small value like 1 or 2, we just iterate on lane 0 for simplicity
+        if (warpId == 0) {
+  #pragma unroll
+          for (int i = 1; i < num_kv_heads; ++i) {
+            warp_max = f_absmax_f32(warp_max, shared_max[i]);
+          }
+          shared_max[0] = warp_max;
+        }
+      }
+      __syncthreads();
+      warp_max = shared_max[0];
+    }
+  }
   if (isK) {
     float k_scale_val = 1.0f;
     if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
-      k_scale_val = *k_scale;
+      k_scale_val = warp_max / dtype_max;
+      int64_t scale_offset = block_idx * page_size + block_offset;
+      if (warpId == 0 && laneId == 0) {
+        k_scale[scale_offset] = k_scale_val;
+      }
     }
     int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
                            headIdx * head_dim * page_size +
@@ -307,7 +358,11 @@ __global__ void fusedQKNormRopeKernel(
   } else {
       float v_scale_val = 1.0f;
       if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
-        v_scale_val = *v_scale;
+        v_scale_val = warp_max / dtype_max;
+        int64_t scale_offset = block_idx * page_size + block_offset;
+        if (warpId == 0 && laneId == 0) {
+          v_scale[scale_offset] = v_scale_val;
+        }
       }
       int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
                           headIdx * head_dim * page_size +
@@ -327,43 +382,64 @@ __global__ void fusedQKNormRopeKernel(
   }
 }
 
+#define DISPATCH_KV_HEAD(num_kv_heads, ...) \
+  if (num_kv_heads == 1) {                  \
+    constexpr int NUM_KV_HEADS = 1;          \
+    __VA_ARGS__                              \
+  } else if (num_kv_heads == 2) {           \
+    constexpr int NUM_KV_HEADS = 2;          \
+    __VA_ARGS__                              \
+  } else if (num_kv_heads == 4) {           \
+    constexpr int NUM_KV_HEADS = 4;          \
+    __VA_ARGS__                              \
+  } else if (num_kv_heads == 8) {           \
+    constexpr int NUM_KV_HEADS = 8;          \
+    __VA_ARGS__                              \
+  } else if (num_kv_heads == 16) {          \
+    constexpr int NUM_KV_HEADS = 16;         \
+    __VA_ARGS__                              \
+  } else if (num_kv_heads == 32) {          \
+    constexpr int NUM_KV_HEADS = 32;         \
+    __VA_ARGS__                              \
+  } else {                                   \
+    TORCH_CHECK(false, "Unsupported num_kv_heads: ", num_kv_heads); \
+  }
 
 // Borrowed from
 // https://github.com/flashinfer-ai/flashinfer/blob/8125d079a43e9a0ba463a4ed1b639cefd084cec9/include/flashinfer/pos_enc.cuh#L568
 #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
   if (interleave) {                                      \
     const bool INTERLEAVE = true;                        \
-    __VA_ARGS__                                          \
+    DISPATCH_KV_HEAD(num_heads_k, __VA_ARGS__)          \
   } else {                                               \
     const bool INTERLEAVE = false;                       \
-    __VA_ARGS__                                          \
+    DISPATCH_KV_HEAD(num_heads_k, __VA_ARGS__)          \
   }
 
 template <typename scalar_t, typename kv_cache_scalar_t, vllm::Fp8KVCacheDataType kv_dt>
-void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens,
-                           int const num_heads_q, int const num_heads_k,
-                           int const num_heads_v, int const head_dim,
-                           float const eps, scalar_t const* q_weight,
+void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens, int const num_heads_q, 
+                           int const num_heads_k, int const num_heads_v, 
+                           int const head_dim, float const eps, scalar_t const* q_weight,
                            scalar_t const* k_weight, scalar_t const* cos_sin_cache,
                            bool const interleave, int64_t const* position_ids,
                            kv_cache_scalar_t* k_cache, kv_cache_scalar_t* v_cache,
                            int64_t* slot_mapping, float* k_scale, float* v_scale,
                            int page_size, int x,
                            hipStream_t stream) {
-  constexpr int blockSize = 256;
+  // each warp process head_dimo, and each block process (num_kv_heads * head_dim)
+  // we need make sure the num_heads_k is no greater than 32
+  int blockSize = num_heads_k * 32;
+  // make sure no thread is wasted, adopt 64 here
+  blockSize = std::max(blockSize, 64);
+  int const gridSize = num_tokens * (num_heads_q / num_heads_k + 2);
 
-  int const warpsPerBlock = blockSize / 32;
-  int const totalQKVHeads = num_heads_q + num_heads_k + num_heads_v;
-  int const totalWarps = num_tokens * totalQKVHeads;
-
-  int const gridSize = aiter::common::divUp(totalWarps, warpsPerBlock);
   dim3 gridDim(gridSize);
   dim3 blockDim(blockSize);
 
   switch (head_dim) {
     case 64:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 64, INTERLEAVE, kv_dt>
+        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 64, INTERLEAVE, NUM_KV_HEADS, kv_dt>
             <<<gridDim, blockDim, 0, stream>>>(
                 qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
                 k_weight, cos_sin_cache, position_ids, k_cache, v_cache, slot_mapping, k_scale, v_scale, num_tokens, page_size, x);
@@ -371,7 +447,7 @@ void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens,
       break;
     case 128:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 128, INTERLEAVE, kv_dt>
+        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 128, INTERLEAVE, NUM_KV_HEADS, kv_dt>
             <<<gridDim, blockDim, 0, stream>>>(
                 qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
                 k_weight, cos_sin_cache, position_ids, k_cache, v_cache, slot_mapping, k_scale, v_scale, num_tokens, page_size, x);
@@ -379,7 +455,7 @@ void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens,
       break;
     case 256:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 256, INTERLEAVE, kv_dt>
+        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 256, INTERLEAVE, NUM_KV_HEADS, kv_dt>
             <<<gridDim, blockDim, 0, stream>>>(
                 qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
                 k_weight, cos_sin_cache, position_ids, k_cache, v_cache, slot_mapping, k_scale, v_scale, num_tokens, page_size, x);
@@ -392,10 +468,10 @@ void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens,
 }
 }  // namespace tensorrt_llm::kernels
 
-#define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE) \
-  aiter_kernels::launchFusedQKNormRope<SRC_T, CACHE_T, KV_DTYPE> (             \
-      reinterpret_cast<SRC_T*>(qkv.data_ptr()), num_tokens, num_heads_q, num_heads_k, \
-      num_heads_v, head_dim, eps, reinterpret_cast<SRC_T*>(q_weight.data_ptr()), reinterpret_cast<SRC_T*>(k_weight.data_ptr()), \
+#define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)                 \
+  aiter_kernels::launchFusedQKNormRope<SRC_T, CACHE_T, KV_DTYPE> (              \
+      reinterpret_cast<SRC_T*>(qkv.data_ptr()), num_tokens, num_heads_q, num_heads_k, num_heads_v, \
+      head_dim, eps, reinterpret_cast<SRC_T*>(q_weight.data_ptr()), reinterpret_cast<SRC_T*>(k_weight.data_ptr()), \
       reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()), !is_neox, position_ids.data_ptr<int64_t>(), \
       reinterpret_cast<CACHE_T*>(k_cache.data_ptr()), reinterpret_cast<CACHE_T*>(v_cache.data_ptr()), \
       slot_mapping.data_ptr<int64_t>(), \
@@ -450,6 +526,10 @@ void fused_qk_norm_rope_cache_quant_shuffle(
   TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
                   qkv.scalar_type() == k_weight.scalar_type(),
               "qkv, q_weight and k_weight must have the same dtype");
+  TORCH_CHECK(head_dim % 32 == 0,
+              "Head dimension must be multiple of 32 for fused QK Norm RoPE kernel");
+  TORCH_CHECK(num_heads_k <= 32,
+              "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
 
   int64_t num_tokens = qkv.size(0);
   int64_t page_size = v_cache.size(-1);

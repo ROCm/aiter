@@ -78,8 +78,8 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     eps: float,
     k_cache: Tensor,    # [num_blocks, num_heads_k, head_size // x, page_size, x]
     v_cache: Tensor,    # [num_blocks, num_heads_v, head_size, page_size]
-    k_scale: Tensor,
-    v_scale: Tensor,
+    k_scale: Tensor,    # [num_blocks, page_size]
+    v_scale: Tensor,    # [num_blocks, page_size]
     slot_mapping: Tensor,
     kv_cache_dtype: str,
 ):
@@ -115,18 +115,11 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
 
     v = v.view(num_tokens, -1, head_size)
 
-    # k_cache = k_cache.permute(0, 3, 1, 2, 4).reshape([n_blocks * page_size, num_heads_k, head_size])
-    # v_cache = v_cache.permute(0, 3, 1, 2).reshape([n_blocks * page_size, num_heads_v, head_size])
-    # if kv_cache_dtype == "auto":
-    #     k_cache[slot_mapping] = (k.view(num_tokens, num_heads_k, head_size)).to(k_cache.dtype)
-    #     v_cache[slot_mapping] = (v.view(num_tokens, num_heads_v, head_size)).to(v_cache.dtype)
-    # else:
-    #     k_cache[slot_mapping] = (k.view(num_tokens, num_heads_k, head_size).float() / k_scale).to(k_cache.dtype)
-    #     v_cache[slot_mapping] = (v.view(num_tokens, num_heads_v, head_size).float() / v_scale).to(v_cache.dtype)
-    from aiter import reshape_and_cache
-    reshape_and_cache(k, v, k_cache, v_cache, slot_mapping, kv_cache_dtype, None, None, asm_layout=True)
-    # k_cache = k_cache.view([n_blocks, page_size, num_heads_k, head_size // x, x]).permute(0, 2, 3, 1, 4).contiguous()
-    # v_cache = v_cache.view([n_blocks, page_size, num_heads_v, head_size]).permute(0, 2, 3, 1).contiguous()
+    from aiter import reshape_and_cache_with_pertoken_quant, reshape_and_cache
+    if kv_cache_dtype == "auto":
+        reshape_and_cache(k, v, k_cache, v_cache, slot_mapping, kv_cache_dtype, None, None, asm_layout=True)
+    else:
+        reshape_and_cache_with_pertoken_quant(k, v, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout=True)
 
     k = k.reshape(k_shape)
     v = v.reshape(k_shape)
@@ -214,11 +207,8 @@ def test_qk_norm_rope_cache_quant(
     positions = torch.randint(
         0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
     )
-    # print("slot: ", slot_mapping)
-    # print("original v: ", v_cache)
-    # original_v_cache = v_cache.clone()
-    # print("v cache shape: ", v_cache.shape)
-    # print("v cache stride: ", v_cache.stride())
+    k_scale_ref = k_scale.clone()
+    v_scale_ref = v_scale.clone()
 
     (q_ref, k_ref, v_ref, k_cache_ref, v_cache_ref), avg_torch = run_torch_qk_norm_rope_cache_quant_shuffle(
         qkv,
@@ -235,8 +225,8 @@ def test_qk_norm_rope_cache_quant(
         eps,
         k_cache,
         v_cache,
-        k_scale,
-        v_scale,
+        k_scale_ref,
+        v_scale_ref,
         slot_mapping,
         kv_cache_dtype,
     )
@@ -270,28 +260,22 @@ def test_qk_norm_rope_cache_quant(
     checkAllclose(v_ref, v, msg="v", rtol=1e-2, atol=0.05)
     checkAllclose(k_cache_ref.float(), k_cache.float(), msg="k_cache", rtol=1e-2, atol=0.05)
     checkAllclose(v_cache_ref.float(), v_cache.float(), msg="v_cache", rtol=1e-2, atol=0.05)
-    k_cache_ref = k_cache_ref.float()
-    k_cache = k_cache.float()
-    diff = torch.abs(k_cache_ref - k_cache) > 1e-1
-    print("positions: ", torch.nonzero(diff)[:20])
-    print("values: ", (k_cache_ref - k_cache)[diff])
+    checkAllclose(k_scale_ref, k_scale, msg="k_scale", rtol=1e-2, atol=0.05)
+    checkAllclose(v_scale_ref, v_scale, msg="v_scale", rtol=1e-2, atol=0.05)
 
 if __name__ == "__main__":
     # rope
     is_neox_styles = [False, True]
-    num_tokens = [513, 1257, 127, 778, 10024, 3, 1]
-    # num_tokens = [1]
+    num_tokens = [513, 1257, 127, 778, 1024, 3, 1]
     num_heads = [(32, 4), (64, 8), (4, 1)]
-    # num_heads = [(4, 1)]
     head_sizes = [64, 128, 256]
-    # head_sizes = [128]
     max_positions = 10000
-    num_blocks = 100000
+    num_blocks = 1000
     page_size = 16
-    k_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
-    v_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    k_scale = torch.zeros([num_blocks, page_size], dtype=torch.float32, device="cuda")
+    v_scale = torch.zeros([num_blocks, page_size], dtype=torch.float32, device="cuda")
     # kv_cache_dtypes = ["fp8_e4m3", "auto"]
-    kv_cache_dtypes = ["auto"]
+    kv_cache_dtypes = ["fp8_e4m3", "auto"]
     dtype = torch.bfloat16
     for is_neox_style in is_neox_styles:
         for num_token in num_tokens:
