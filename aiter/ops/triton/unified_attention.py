@@ -28,9 +28,9 @@ def select_2d_config(
     TILE_SIZE = 64
     # in case head_size is large
     max_num_stages_2d = 4
-    dev = arch_info.get_device()
+    dev = arch_info.get_arch()
     if head_size > 128:
-        if block_size >=64 and dev == "R9700":
+        if block_size >= 64 and dev == "gfx1201":
             max_num_stages_2d = 1
         else:
             max_num_stages_2d = 2
