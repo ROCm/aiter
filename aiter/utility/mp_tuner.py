@@ -154,20 +154,20 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, printLog=False):
     try:
         # Retrieve GPU ID from the map
         pid = mp.current_process().pid
-        if pid not in GPUIDMap:
-            # Fallback: Use round-robin GPU assignment based on PID
-            gpu_num = torch.cuda.device_count()
-            gpu_id = pid % gpu_num
-            warning_msg = (
-                f"[Warning] Process {pid} not found in GPUIDMap. "
-                f"Available PIDs: {list(GPUIDMap.keys())}. "
-                f"Using fallback GPU assignment: GPU {gpu_id}"
-            )
-            print(warning_msg)
-            # Still raise KeyError to trigger pool restart in parent process
-            raise KeyError(
-                f"Process {pid} not found in GPUIDMap. Available PIDs: {list(GPUIDMap.keys())}"
-            )
+        #if pid not in GPUIDMap:
+        #    # Fallback: Use round-robin GPU assignment based on PID
+        #    gpu_num = torch.cuda.device_count()
+        #    gpu_id = pid % gpu_num
+        #    warning_msg = (
+        #        f"[Warning] Process {pid} not found in GPUIDMap. "
+        #        f"Available PIDs: {list(GPUIDMap.keys())}. "
+        #        f"Using fallback GPU assignment: GPU {gpu_id}"
+        #    )
+        #    print(warning_msg)
+        #    # Still raise KeyError to trigger pool restart in parent process
+        #    raise KeyError(
+        #        f"Process {pid} not found in GPUIDMap. Available PIDs: {list(GPUIDMap.keys())}"
+        #    )
         gpu_id = GPUIDMap[pid]
 
         rets = []
@@ -352,7 +352,7 @@ def mp_tuner(
 
     # Track start time for each task
     task_start_times = {k: time.time() for k, _ in remaining_tasks}
-    check_interval = 10  # Check every 30 seconds
+    check_interval = 10  # Check every 10 seconds for responsive polling 
 
     timeout_msg = (
         f"timeout={timeout}s each" if timeout is not None else "no timeout limit"
@@ -375,15 +375,27 @@ def mp_tuner(
 
     # Process tasks as they complete
     pool_restart_needed = False
+    logged_error_types = set()  # Track error types that already logged to avoid duplicates
 
     while remaining_tasks:
         completed_this_round = []
         dummy_failed_tasks = []
-
+        timeout_count_this_round = 0  # Track timeouts in this round
+        
         for k, async_result in remaining_tasks:
             try:
-                # Non-blocking check with short timeout
-                task_result = async_result.get(timeout=check_interval)
+                # Calculate appropriate timeout based on task's remaining time
+                if timeout is not None:
+                    elapsed = time.time() - task_start_times[k]
+                    remaining_time = timeout - elapsed
+                    # Use the smaller of check_interval and remaining_time, but at least 1 second
+                    actual_timeout = max(1, min(check_interval, remaining_time))
+                else:
+                    # No timeout set, use default check_interval
+                    actual_timeout = check_interval
+                
+                # Non-blocking check with dynamic timeout
+                task_result = async_result.get(timeout=actual_timeout)
 
                 # Task completed successfully
                 result_dict[k] = task_result
@@ -398,12 +410,13 @@ def mp_tuner(
                 # Check if this specific task has exceeded its timeout (only if timeout is set)
                 if timeout is not None:
                     elapsed = time.time() - task_start_times[k]
+                    
                     if elapsed > timeout:
+                        timeout_count_this_round += 1
+                        
                         error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
                         print(error_msg)
-                        logger.error(error_msg)
                         failed_tasks.append((k, "timeout"))
-                        print(f"task: {task_group[k]}", flush=True)
 
                         # Add dummy result
                         dummy_results = []
@@ -412,6 +425,15 @@ def mp_tuner(
                             dummy_results if shape_grouped else [dummy_results[0]]
                         )
                         completed_this_round.append((k, async_result))
+                        
+                        # Trigger pool restart for timeout (similar to crash)
+                        pool_restart_needed = True
+                        
+                        # If mp_num tasks timed out, all GPUs are likely stuck - restart immediately
+                        if timeout_count_this_round >= mp_num:
+                            print(f"\n[!] {timeout_count_this_round} tasks timed out (all {mp_num} GPUs likely stuck)")
+                            print("[!] Triggering immediate pool restart...\n")
+                            break
                 # else: still within timeout (or no timeout set), continue waiting
 
             except Exception as e:
@@ -423,18 +445,18 @@ def mp_tuner(
 
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
-
                     dummy_failed_tasks.append((k, "mapping error"))
-                    pool_restart_needed = True
+                    #pool_restart_needed = True
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
-                    pool_restart_needed = True
+                    #pool_restart_needed = True
 
-                if len(dummy_failed_tasks) > mp_num:
-                    break
-                logger.error(error_msg)
-                # failed_tasks.append((k, error_type))
-
+                # Only log error once per error type
+                if error_type not in logged_error_types:
+                    logger.error(error_msg)
+                    logged_error_types.add(error_type)
+                
+#
         # Remove completed tasks from remaining list
         for item in completed_this_round:
             remaining_tasks.remove(item)
@@ -453,7 +475,6 @@ def mp_tuner(
                 pool.join()
             except Exception as e:
                 print(f"Warning: Error during pool termination: {e}")
-
             # Create new pool
             pool = mp.Pool(processes=parallel_num)
 
@@ -468,7 +489,6 @@ def mp_tuner(
 
             # Update remaining_tasks with new async results
             remaining_tasks = [(k, new_rets_dict[k]) for k in remaining_task_indices]
-
             # Reset start times for resubmitted tasks
             for k in remaining_task_indices:
                 task_start_times[k] = time.time()
