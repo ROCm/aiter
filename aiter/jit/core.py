@@ -39,7 +39,9 @@ def mp_lock(
     """
     Using FileBaton for multiprocessing.
     """
-    os.makedirs(os.path.dirname(lockPath), exist_ok=True)
+    dir_name = os.path.dirname(lockPath)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     baton = FileBaton(lockPath)
     if baton.try_acquire():
         try:
