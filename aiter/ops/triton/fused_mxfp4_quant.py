@@ -195,11 +195,13 @@ def fused_flatten_mxfp4_quant(
 def fused_reduce_act_mul_and_mxfp4_quant(
     x: torch.Tensor,
     activation: Literal["silu", "gelu", "gelu_tanh"],
+    quant_type=dtypes.fp4x2,
     x2: Optional[torch.Tensor] = None,
     scaling_mode: str = "even",
     shuffle: bool = False,
     scale_shuffle_padding: bool = False,
     dtype: Optional[float] = torch.bfloat16,
+
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply reduction along the first dimension and apply the activation function + per-token group quantization to MX FP4 format.
@@ -275,7 +277,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
 
     MXFP4_QUANT_BLOCK_SIZE = 32
     N_half = N1 // 2
-    y = torch.empty((M, N_half // 2), dtype=torch.uint8, device=x.device)
+    y = torch.empty((M, N_half // 2), dtype=quant_type, device=x.device)
     scaleN_valid = triton.cdiv(N_half, MXFP4_QUANT_BLOCK_SIZE)
     # Setting scale M to be multiple of 256 and scale N to be multiple of 8
     use_scale_shuffle_padding = shuffle or scale_shuffle_padding
@@ -287,7 +289,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         scaleN = scaleN_valid
     y_scale = torch.empty(
         (scaleM, scaleN),
-        dtype=torch.uint8,
+        dtype=torch.float8_e8m0fnu,
         device=x.device,
     )
 

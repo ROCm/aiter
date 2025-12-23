@@ -616,3 +616,79 @@ def test_fused_dynamic_mxfp4_quant_moe_sort(
         x_fp4_triton.view(torch.uint8), x_scales_ref_triton_not_sorted.view(torch.uint8)
     )
     torch.testing.assert_close(x_ref, x_triton, atol=tol, rtol=tol)
+
+
+def silu_mul_mxfp4_quant_ref():
+    
+
+
+@pytest.mark.parametrize(
+    "M, N1, N2",
+    [
+        (1, 256, 256),
+        (2, 256, 256),
+        (4, 256, 256),
+        (32, 256, 256),
+        (1, 4, 256),
+        (1, 28, 256),
+        (1, 32, 256),
+        (1, 64, 256),
+        (1, 68, 256),
+        (128, 28, 256),
+        (128, 32, 256),
+        (128, 64, 256),
+        (128, 68, 256),
+        (256, 32, 256),
+    ],
+)
+@pytest.mark.parametrize("SPK", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("activation", ["silu", "gelu"])
+@pytest.mark.parametrize("shuffle", [False, True])
+@pytest.mark.parametrize("scale_shuffle_padding", [False, True])
+
+def test_fused_reduce_act_mul_mxfp4_group_quant(
+    M: int,
+    N1: int,
+    N2: int,
+    SPK: int,
+    dtype,
+    activation: str,
+    shuffle: bool,
+    scale_shuffle_padding: bool,
+):
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    if shuffle and (N1 * 2) % 512 != 0:
+        pytest.skip()
+
+    x, x2 = generate_fused_reduce_act_mul_mxfp4_group_quant(
+        M, N1, dtype=dtype, SPK=SPK, N2=N2
+    )
+
+    (y_q_torch, y_s_torch), y2_torch = run_torch_reduce_act_mul_mxfp4_group_quant(
+        x, x2, activation, dtype=dtype, shuffle=shuffle
+    )
+
+    (y_q_triton, y_s_triton), y2_triton = fused_reduce_act_mul_and_mxfp4_quant(
+        x,
+        activation=activation,
+        x2=x2,
+        shuffle=shuffle,
+        scale_shuffle_padding=scale_shuffle_padding,
+        dtype=dtype,
+    )
+
+    if shuffle:
+        y_s_triton = un_shuffle_scales(y_s_triton.view(y_s_triton.shape[0] // 32, -1))
+        y_s_torch = un_shuffle_scales(y_s_torch.view(y_s_torch.shape[0] // 32, -1))
+
+    torch.testing.assert_close(y2_torch, y2_triton, atol=0.1, rtol=0.1)
+
+    scaleN_valid = (N1 // 2 + 31) // 32
+    y_s_triton = y_s_triton[:M, :scaleN_valid]
+    y_s_torch = y_s_torch[:M, :scaleN_valid]
+
+    torch.testing.assert_close(y_q_triton, y_q_torch)
+    torch.testing.assert_close(y_s_triton, y_s_torch)
