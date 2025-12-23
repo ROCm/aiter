@@ -172,8 +172,6 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, printLog=False):
 
         rets = []
         shape_grouped = isinstance(tasks, list)
-        print(f"shape_grouped: {shape_grouped}")
-        print(f"kernels_num: {kernels_num}")
         solutions = 1 if not shape_grouped else kernels_num
         for i in range(solutions):
             (
@@ -354,7 +352,7 @@ def mp_tuner(
 
     # Track start time for each task
     task_start_times = {k: time.time() for k, _ in remaining_tasks}
-    check_interval = 30  # Check every 30 seconds
+    check_interval = 10  # Check every 30 seconds
 
     timeout_msg = (
         f"timeout={timeout}s each" if timeout is not None else "no timeout limit"
