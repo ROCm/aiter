@@ -1420,10 +1420,10 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             shape=[MAX_NUM_KV_BLOCKS_PER_COMPUTE, 128, 64],
         )
 
-        blocked_value_layout: gl.constexpr = (
-            v_blK_layout if KV_BLOCK_SIZE == 16 else v_blK_64_layout
-        )
-        # blocked_value_layout: gl.constexpr = v_blK_layout
+        # blocked_value_layout: gl.constexpr = (
+        #     v_blK_layout if KV_BLOCK_SIZE == 16 else v_blK_64_layout
+        # )
+        blocked_value_layout: gl.constexpr = v_blK_layout
 
         value_dim1_offsets = gl.arange(
             0,
@@ -1641,6 +1641,9 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
         key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
 
+        query_converted = query_shared.load(qk_lhs_operand_layout)
+        query_converted = query_converted.to(COMPUTE_TYPE)
+
         LOAD_V_BEFORE_QK: gl.constexpr = True
         # LOAD_V_BEFORE_QK: gl.constexpr = False
 
@@ -1707,10 +1710,9 @@ def paged_attention_decode_v2_gluon_dot_kernel(
 
         # Convert layouts for MFMA operation
         # query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
-        query_converted = query_shared.load(qk_lhs_operand_layout)
+        # query_converted = query_shared.load(qk_lhs_operand_layout)
+        # query_converted = query_converted.to(COMPUTE_TYPE)
         key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
-
-        query_converted = query_converted.to(COMPUTE_TYPE)
         key_converted = key_converted.to(COMPUTE_TYPE)
 
         # Compute QK attention scores using MFMA
