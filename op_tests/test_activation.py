@@ -7,13 +7,6 @@ import pandas as pd
 import argparse
 
 
-def torch_scaled_silu_and_mul(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    d = input.shape[-1] // 2
-    x, y = input.split([d, d], dim=-1)
-    out = F.silu(x) * y / scale
-    return out.to(dtypes.fp8)
-
-
 def torch_silu_and_mul(input: torch.Tensor) -> torch.Tensor:
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
@@ -57,6 +50,8 @@ def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
     }
     ret["input_dtype"] = dtype_map.get(dtype, str(dtype))
     ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
+    ret["M"] = m
+    ret["N"] = n
     ret["us"] = us_aiter
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
     ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
@@ -71,7 +66,6 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     Test silu_and_mul with flexible input/output types.
     If output_dtype is None, output matches input dtype.
     """
-    ret = {}
     input = torch.randn(m, n, dtype=dtype, device="cuda")
     out_dtype = output_dtype if output_dtype is not None else dtype
     out = torch.empty((m, n // 2), dtype=out_dtype, device="cuda")
@@ -92,8 +86,11 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
 
     # Record input/output types for clarity
     dtype_map = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}
+    ret = {}
     ret["input_dtype"] = dtype_map.get(dtype, str(dtype))
     ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
+    ret["M"] = m
+    ret["N"] = n
     ret["us"] = us_aiter
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
     ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
@@ -105,7 +102,6 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
 @benchmark()
 def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
     """Test fp32 input with fp16/bf16 output for scaled activation"""
-    ret = {}
     input = torch.randn(m, n, dtype=input_dtype, device="cuda")
     scale = torch.max(input).to(torch.float32)
     out = torch.empty((m, n // 2), dtype=output_dtype, device="cuda")
@@ -122,8 +118,18 @@ def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
         scale,
     )
 
-    # Check if the results are close
-    err = checkAllclose(ref, out)
+    err = checkAllclose(ref.to(torch.float), out.to(torch.float))
+    dtype_map = {
+        torch.float32: "fp32",
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+        dtypes.fp8: "fp8",
+    }
+    ret = {}
+    ret["input_dtype"] = dtype_map.get(input_dtype, str(input_dtype))
+    ret["output_dtype"] = dtype_map.get(output_dtype, str(output_dtype))
+    ret["M"] = m
+    ret["N"] = n
     ret["us"] = us_aiter
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
     ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
@@ -187,20 +193,17 @@ for dtype in l_dtype:
         for n in l_n:
             ret = test_scaled_silu_and_mul(m, n, dtype)
             df.append(ret)
-# Add fp32 input with fp16/bf16 output (bandwidth optimization)
-for output_dtype in [torch.float16, torch.bfloat16]:
-    for m in l_m:
-        for n in l_n:
-            ret = test_scaled_silu_and_mul(
-                m, n, torch.float32, output_dtype=output_dtype
-            )
-            df.append(ret)
 df = pd.DataFrame(df)
+df = df[
+    ["M", "N", "input_dtype", "output_dtype", "us", "TB/s", "RD TB/s", "WR TB/s", "err"]
+]
 aiter.logger.info(f"scaled_silu_and_mul summary:\n{df}")
 
 df = []
 # Standard same-dtype tests
 for dtype in l_dtype:
+    if dtype == torch.float32:
+        continue
     for m in l_m:
         for n in l_n:
             ret = test_silu_and_mul(m, n, dtype)
@@ -212,4 +215,7 @@ for output_dtype in [torch.float16, torch.bfloat16]:
             ret = test_silu_and_mul(m, n, torch.float32, output_dtype=output_dtype)
             df.append(ret)
 df = pd.DataFrame(df)
+df = df[
+    ["M", "N", "input_dtype", "output_dtype", "us", "TB/s", "RD TB/s", "WR TB/s", "err"]
+]
 aiter.logger.info(f"silu_and_mul summary:\n{df}")

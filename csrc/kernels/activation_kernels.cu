@@ -22,21 +22,17 @@ static constexpr int32_t max_vec_size = 8;
 static constexpr int32_t max_wave_num = 8;
 
 // Type trait for computation type (all compute in native type)
-template <typename T>
-using compute_type_t = T;
 
 namespace aiter {
 
 // Activation and gating kernel template with flexible input/output types.
 // DTYPE_I: input type (fp32/bf16/fp16), DTYPE_O: output type (fp32/bf16/fp16)
-// Computes in DTYPE_I native precision, converts to DTYPE_O on output.
+// Computes in float, converts to DTYPE_O on output.
 template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d]
                                    const DTYPE_I* __restrict__ input, // [..., 2, d]
                                    const int d)
 {
-    using DTYPE_COMPUTE = compute_type_t<DTYPE_I>;
-
     // CK Tile buffer addressing constraint: float supports VEC_SIZE <= 16
     static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
                   "float type only supports VEC_SIZE up to 16");
@@ -45,7 +41,6 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
     using vec_i                     = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
-    using vec_c                     = ck_tile::vec_t<DTYPE_COMPUTE, VEC_SIZE_I>;
     using vec_o                     = ck_tile::vec_t<DTYPE_O, VEC_SIZE_I>;
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (d + ooba_i - 1) / ooba_i * ooba_i;
@@ -135,24 +130,20 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
         vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
         vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        // Compute directly in native type (DTYPE_I == DTYPE_COMPUTE)
-        const vec_c& x_compute = x;
-        const vec_c& y_compute = y;
-
         vec_o r{};
 
 #pragma unroll
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
             // Call ACT_FN with appropriate type conversion
-            DTYPE_I x_val0 = ck_tile::type_convert<DTYPE_I>(x_compute[j]);
+            DTYPE_I x_val0 = x[j];
             float ax0      = ACT_FN(x_val0);
-            float y0       = ck_tile::type_convert<float>(y_compute[j]);
+            float y0       = ck_tile::type_convert<float>(y[j]);
             if(j + 1 < VEC_SIZE_I)
             {
-                DTYPE_I x_val1      = ck_tile::type_convert<DTYPE_I>(x_compute[j + 1]);
+                DTYPE_I x_val1      = x[j + 1];
                 float ax1           = ACT_FN(x_val1);
-                float y1            = ck_tile::type_convert<float>(y_compute[j + 1]);
+                float y1            = ck_tile::type_convert<float>(y[j + 1]);
                 ck_tile::fp32x2_t a = {ax0, ax1};
                 ck_tile::fp32x2_t b = {y0, y1};
                 ck_tile::fp32x2_t c;
@@ -186,8 +177,6 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                                           const int d,
                                           const float scale)
 {
-    using DTYPE_COMPUTE = compute_type_t<DTYPE_I>;
-
     // CK Tile buffer addressing constraint: float supports VEC_SIZE <= 16
     static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
                   "float type only supports VEC_SIZE up to 16");
@@ -196,7 +185,6 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
     using vec_i                     = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
-    using vec_c                     = ck_tile::vec_t<DTYPE_COMPUTE, VEC_SIZE_I>;
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (d + ooba_i - 1) / ooba_i * ooba_i;
 
@@ -210,20 +198,16 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
         vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
         vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        // Compute directly in native type (DTYPE_I == DTYPE_COMPUTE)
-        const vec_c& x_compute = x;
-        const vec_c& y_compute = y;
-
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
             if(j + 1 < VEC_SIZE_I)
             {
-                DTYPE_I x_val0 = ck_tile::type_convert<DTYPE_I>(x_compute[j]);
-                DTYPE_I x_val1 = ck_tile::type_convert<DTYPE_I>(x_compute[j + 1]);
+                DTYPE_I x_val0 = x[j];
+                DTYPE_I x_val1 = x[j + 1];
                 float act_x0   = ACT_FN(x_val0);
                 float act_x1   = ACT_FN(x_val1);
-                float y0       = ck_tile::type_convert<float>(y_compute[j]);
-                float y1       = ck_tile::type_convert<float>(y_compute[j + 1]);
+                float y0       = ck_tile::type_convert<float>(y[j]);
+                float y1       = ck_tile::type_convert<float>(y[j + 1]);
 
                 float2 act_vals   = {act_x0, act_x1};
                 float2 y_vals     = {y0, y1};
@@ -240,8 +224,8 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
             }
             else
             {
-                DTYPE_I x_val = ck_tile::type_convert<DTYPE_I>(x_compute[j]);
-                float r       = ACT_FN(x_val) * ck_tile::type_convert<float>(y_compute[j]) * scale;
+                DTYPE_I x_val = x[j];
+                float r       = ACT_FN(x_val) * ck_tile::type_convert<float>(y[j]) * scale;
                 out[token_idx * d + idx + j] = ck_tile::type_convert<DTYPE_O>(r);
             }
         }
@@ -420,20 +404,12 @@ static constexpr int nextPow2(unsigned int num)
     }                                                                                           \
     else                                                                                        \
     {                                                                                           \
-        /* bf16/fp16 input: output typically fp8 for quantization */                            \
+        /* bf16/fp16 input: dispatch based on output type (fp8/bf16/fp16/fp32) */               \
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_act_and_mul_kernel", [&] { \
-            using input_dtype  = typename t2ck<scalar_t>::type;                                 \
-            using output_dtype = fp8_type;                                                      \
-            AITER_DISPATCH_CASE_VEC_SIZE(                                                       \
-                vec_size,                                                                       \
-                aiter::scaled_act_and_mul_kernel<input_dtype,                                   \
-                                                 output_dtype,                                  \
-                                                 KERNEL<input_dtype>,                           \
-                                                 VEC_SIZE>                                      \
-                <<<grid, block, 0, stream>>>(reinterpret_cast<output_dtype*>(out.data_ptr()),   \
-                                             reinterpret_cast<input_dtype*>(input.data_ptr()),  \
-                                             d,                                                 \
-                                             1.0f / (*scale.data_ptr<float>()));)               \
+            using input_dtype = typename t2ck<scalar_t>::type;                                  \
+            auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());               \
+            float inv_scale   = 1.0f / (*scale.data_ptr<float>());                              \
+            DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                              \
         });                                                                                     \
     }
 
