@@ -1132,9 +1132,9 @@ def asm_stage1(
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32).to(dtype))
+            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
         else:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32).to(dtype))
+            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
     return out
 
 
@@ -1446,9 +1446,9 @@ def ck_moe_stage1(
     )
     if splitk > 1:
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32).to(out.dtype))
+            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
         else:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32).to(out.dtype))
+            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
     return out
 
 
