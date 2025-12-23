@@ -43,16 +43,16 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "It's main branch, running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-1gpu-runner", "aiter-mi325-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner", "aiter-mi325-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-1gpu-runner", "aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner", "aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           elif echo "${PR_TITLE}" | grep -qi "mi35x"; then
             echo "PR title contains 'MI35X', running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-1gpu-runner", "aiter-mi325-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner", "aiter-mi325-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-1gpu-runner", "aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner", "aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           else
             echo "Not main branch and PR title does not contain mi35x, only running on MI325..."
-            echo 'standard_runners=["aiter-1gpu-runner", "aiter-mi325-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner", "aiter-mi325-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-1gpu-runner", "aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner", "aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           fi
           echo "$GITHUB_OUTPUT"
     
