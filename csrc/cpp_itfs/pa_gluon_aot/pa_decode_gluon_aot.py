@@ -1,50 +1,50 @@
 import os
-import time
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from jinja2 import Template
-import torch
+
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+import torch
 import triton
 import triton.language as tl
+from jinja2 import Template
+
+from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from csrc.cpp_itfs.gluon_aot_tools.compile import (
+    CompileArgs,
+    compile_kernel,
+)
+from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
+    CompileGluonArgs,
+    compile_gluon_kernel,
+)
+from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
+    transpose_output_gluon_aot,
+    transpose_query_gluon_aot,
+)
+from csrc.cpp_itfs.torch_utils import torch_to_c_types
+from csrc.cpp_itfs.utils import (
+    AITER_CORE_DIR,
+    BUILD_DIR,
+    compile_template_op,
+    get_default_func_name,
+    logger,
+    mp_lock,
+    not_built,
+    run_lib,
+)
 
 GLUON_AOT_COMPILE_ENABLED = True
 try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
+    from triton.experimental import gluon  # noqa: F401
+    from triton.experimental.gluon import language as gl  # noqa: F401
 except ImportError:
     print(
         "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, pa_decode_gluon_aot cannot use compile mode!"
     )
     GLUON_AOT_COMPILE_ENABLED = False
-
-try:
-    from triton.tools.compile import compile_kernel, CompileArgs
-except ImportError:
-    print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
-
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
-    compile_gluon_kernel,
-    CompileGluonArgs,
-)
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
-from csrc.cpp_itfs.utils import (
-    BUILD_DIR,
-    AITER_CORE_DIR,
-    get_default_func_name,
-    compile_template_op,
-    mp_lock,
-    not_built,
-    run_lib,
-    logger,
-)
-from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
-    transpose_query_gluon_aot,
-    transpose_output_gluon_aot,
-)
-from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 
 MD_NAME = "pa_decode_attention_reduce_kernel"
 
@@ -150,8 +150,8 @@ def compile(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
 
-        kv_compute_block_size = 256
         waves_per_eu = 1
+        kv_compute_block_size = context_partition_size
         # Select kernel implementation based on block size
         if kv_block_size > context_partition_size:
             # Use big block kernel for large block sizes
