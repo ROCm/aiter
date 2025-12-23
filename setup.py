@@ -4,6 +4,7 @@
 import os
 import shutil
 import sys
+import json
 
 from setuptools import Distribution, setup
 
@@ -17,7 +18,7 @@ from jit import core
 from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
-PACKAGE_NAME = "aiter"
+PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
 if BUILD_TARGET == "auto":
@@ -81,131 +82,55 @@ if IS_ROCM:
     shutil.copytree("gradlib", "aiter_meta/gradlib")
     shutil.copytree("csrc", "aiter_meta/csrc")
 
+    def _load_modules_from_config():
+        cfg_path = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return []
+        if isinstance(data, dict):
+            return list(data.keys())
+        return []
+
     def get_exclude_ops():
-        if PREBUILD_KERNELS == 1:
-            return [
-                "libmha_fwd",
-                "libmha_bwd",
-                "module_fmha_v3_fwd",
-                "module_mha_fwd",
-                "module_mha_varlen_fwd",
-                "module_mha_batch_prefill",
-                "module_fmha_v3_bwd",
-                "module_fmha_v3_varlen_bwd",
-                "module_fmha_v3_varlen_fwd",
-                "module_mha_bwd",
-                "module_mha_varlen_bwd",
-                "module_batched_gemm_bf16_tune",
-                "module_batched_gemm_a8w8_tune",
-                "module_gemm_a8w8_tune",
-                "module_gemm_a8w8_blockscale_tune",
-                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
-                "module_gemm_a4w4_blockscale_tune",
-                "module_gemm_a8w8_bpreshuffle_tune",
-                "module_gemm_a8w8_bpreshuffle_cktile_tune",
-                "module_gemm_mi350_a8w8_blockscale_asm",
-            ]
-        elif PREBUILD_KERNELS == 2:
-            return [
-                "libmha_bwd",
-                "module_mha_batch_prefill",
-                "module_fmha_v3_bwd",
-                "module_fmha_v3_varlen_bwd",
-                "module_mha_bwd",
-                "module_mha_varlen_bwd",
-                "module_batched_gemm_bf16_tune",
-                "module_batched_gemm_a8w8_tune",
-                "module_gemm_a8w8_tune",
-                "module_gemm_a8w8_blockscale_tune",
-                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
-                "module_gemm_a4w4_blockscale_tune",
-                "module_gemm_a8w8_bpreshuffle_tune",
-                "module_gemm_a8w8_bpreshuffle_cktile_tune",
-                "module_gemm_mi350_a8w8_blockscale_asm",
-            ]
-        elif PREBUILD_KERNELS == 3:
-            return [
-                "module_activation",
-                "module_attention",
-                "module_pa_ragged",
-                "module_pa_v1",
-                "module_attention_asm",
-                "module_pa",
-                "module_mla_asm",
-                "module_cache",
-                "module_custom_all_reduce",
-                "module_quick_all_reduce",
-                "module_custom",
-                "module_gemm_common",
-                "module_batched_gemm_bf16",
-                "module_batched_gemm_a8w8",
-                "module_gemm_a8w8",
-                "module_gemm_a8w8_blockscale",
-                "module_gemm_a8w8_blockscale_bpreshuffle",
-                "module_gemm_a4w4_blockscale",
-                "module_gemm_a8w8_bpreshuffle",
-                "module_deepgemm",
-                "module_gemm_a8w8_bpreshuffle_cktile",
-                "module_gemm_a8w8_asm",
-                "module_gemm_a16w16_asm",
-                "module_gemm_a4w4_asm",
-                "module_gemm_a8w8_blockscale_asm",
-                "module_gemm_a8w8_blockscale_bpreshuffle_asm",
-                "module_gemm_mi350_a8w8_blockscale_asm",
-                "module_moe_asm",
-                "module_moe_ck2stages",
-                "module_moe_cktile2stages",
-                "module_moe_sorting",
-                "module_moe_topk",
-                "module_norm",
-                "module_pos_encoding",
-                "module_rmsnorm",
-                "module_smoothquant",
-                "module_batched_gemm_bf16_tune",
-                "module_batched_gemm_a8w8_tune",
-                "module_gemm_a8w8_tune",
-                "module_gemm_a8w8_blockscale_tune",
-                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
-                "module_gemm_a4w4_blockscale_tune",
-                "module_gemm_a8w8_bpreshuffle_tune",
-                "module_gemm_a8w8_bpreshuffle_cktile_tune",
-                "module_aiter_operator",
-                "module_aiter_unary",
-                "module_quant",
-                "module_sample",
-                "module_rope_general_fwd",
-                "module_rope_general_bwd",
-                "module_rope_pos_fwd",
-                "module_fused_mrope_rms",
-                # "module_fmha_v3_fwd",
-                "module_mha_fwd",
-                "module_mha_varlen_fwd",
-                # "module_fmha_v3_bwd",
-                "module_fmha_v3_varlen_bwd",
-                "module_fmha_v3_varlen_fwd",
-                "module_mha_bwd",
-                "module_mha_varlen_bwd",
-                "libmha_fwd",
-                "libmha_bwd",
-                "module_rocsolgemm",
-                "module_hipbsolgemm",
-                "module_top_k_per_row",
-                "module_mla_metadata",
-                "module_mla_reduce",
-                "module_topk_plain",
-            ]
-        else:
-            return [
-                "module_gemm_mi350_a8w8_blockscale_asm",
-                "module_batched_gemm_bf16_tune",
-                "module_batched_gemm_a8w8_tune",
-                "module_gemm_a8w8_tune",
-                "module_gemm_a8w8_blockscale_tune",
-                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
-                "module_gemm_a4w4_blockscale_tune",
-                "module_gemm_a8w8_bpreshuffle_tune",
-                "module_gemm_a8w8_bpreshuffle_cktile_tune",
-            ]
+        all_modules = _load_modules_from_config()
+        exclude_ops = []
+
+        for module in all_modules:
+            if PREBUILD_KERNELS == 1:
+                # Exclude mha, _tune, and specific module
+                if (
+                    "mha" in module
+                    or "_tune" in module
+                    or module == "module_gemm_mi350_a8w8_blockscale_asm"
+                ):
+                    exclude_ops.append(module)
+            elif PREBUILD_KERNELS == 2:
+                # Exclude _bwd, _tune, and specific module
+                if (
+                    "_bwd" in module
+                    or "_tune" in module
+                    or module == "module_gemm_mi350_a8w8_blockscale_asm"
+                ):
+                    exclude_ops.append(module)
+            elif PREBUILD_KERNELS == 3:
+                # Keep only module_fmha_v3* and module_aiter_enum
+                if not (
+                    module.startswith("module_fmha_v3")
+                    or module == "module_aiter_enum"
+                    or module == "module_gemm_mi350_a8w8_blockscale_asm"
+                ):
+                    exclude_ops.append(module)
+            else:
+                # Default behavior: exclude tunes and specific mi350 module
+                if (
+                    "_tune" in module
+                    or module == "module_gemm_mi350_a8w8_blockscale_asm"
+                ):
+                    exclude_ops.append(module)
+
+        return exclude_ops
 
     exclude_ops = get_exclude_ops()
 
@@ -307,9 +232,6 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-# Define Iris dependency once to avoid duplication
-IRIS_DEP = "iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429"
-
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -334,14 +256,12 @@ setup(
     ],
     extras_require={
         # Triton-based communication using Iris
-        # Pinned to commit 905ec1c (Nov 18, 2024) for reproducibility and API stability
-        "triton_comms": [
-            IRIS_DEP,
-        ],
+        # Note: Iris is not available on PyPI and must be installed separately
+        # Install with: pip install -r requirements-triton-comms.txt
+        # (See requirements-triton-comms.txt for pinned Iris version)
+        "triton_comms": [],
         # Install all optional dependencies
-        "all": [
-            IRIS_DEP,
-        ],
+        "all": [],
     },
     setup_requires=setup_requires,
     distclass=ForcePlatlibDistribution,

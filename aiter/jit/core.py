@@ -363,6 +363,8 @@ def validate_and_update_archs():
         "gfx1151",
         "gfx1152",
         "gfx1153",
+        "gfx1200",
+        "gfx1201",
         "gfx950",
     ]
 
@@ -375,12 +377,38 @@ def validate_and_update_archs():
 
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str) -> bool:
-    ret = os.system(f"hipcc {flag_hip} -x hip -E -P /dev/null -o /dev/null")
-    if ret == 0:
-        return True
-    else:
-        logger.warning(f"{flag_hip} is not supported by hipcc.")
+    import subprocess
+
+    cmd = (
+        ["hipcc"]
+        + flag_hip.split()
+        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    )
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
+    return True
+
+
+@functools.lru_cache()
+def check_LLVM_MAIN_REVISION():
+    # for https://github.com/ROCm/ROCm/issues/5646 and https://github.com/ROCm/composable_kernel/pull/3469
+    # ck using following logic...
+    """#if LLVM_MAIN_REVISION < 554785
+    #define CK_TILE_HOST_DEVICE_EXTERN __host__ __device__
+    #else
+    #define CK_TILE_HOST_DEVICE_EXTERN"""
+    import subprocess
+
+    cmd = """echo "#include <tuple>
+__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -"""
+    try:
+        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError:
+        return 554785
+    return 554785 - 1
 
 
 def check_and_set_ninja_worker():
@@ -541,6 +569,7 @@ def build_module(
             "-Wno-macro-redefined",
             "-Wno-missing-template-arg-list-after-template-kw",
             "-fgpu-flush-denormals-to-zero",
+            f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
         ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
