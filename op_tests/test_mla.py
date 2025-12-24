@@ -4,7 +4,7 @@
 import argparse
 import itertools
 import random
-
+import pandas as pd
 import torch
 
 import aiter
@@ -575,7 +575,6 @@ parser.add_argument(
     --varlen # True""",
 )
 
-import pandas as pd
 
 args = parser.parse_args()
 
