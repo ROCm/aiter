@@ -450,12 +450,11 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
                                             int x,
                                             hipStream_t stream)
 {
-    // each warp process head_dimo, and each block process (num_kv_heads * head_dim)
-    // we need make sure the num_heads_k is no greater than 32
-    int blockSize = num_heads_k * 32;
     // make sure no thread is wasted, adopt 64 here
-    blockSize          = std::max(blockSize, 64);
-    int const gridSize = num_tokens * (num_heads_q / num_heads_k + 2);
+    constexpr int blockSize      = 64;
+    constexpr int warp_per_block = blockSize / 32;
+    int const gridSize =
+        (num_tokens * (num_heads_q + num_heads_k + num_heads_v) + 1) / warp_per_block;
 
     dim3 gridDim(gridSize);
     dim3 blockDim(blockSize);
