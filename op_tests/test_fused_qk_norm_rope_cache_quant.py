@@ -5,7 +5,6 @@ import torch
 from torch import Tensor
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
-from typing import List
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
