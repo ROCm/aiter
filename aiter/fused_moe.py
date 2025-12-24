@@ -1441,7 +1441,7 @@ def ck_moe_stage1(
         sorted_weights,
         quant_type,
         activation,
-        int(splitk),
+        splitk,
         out.dtype,
     )
     if splitk > 1:

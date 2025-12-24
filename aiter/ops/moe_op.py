@@ -530,7 +530,7 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
-        splitk,
+        int(splitk),
         dtype2str_dict[dst_type],
     )
     return out
