@@ -566,6 +566,38 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
     *p_row_sum_e = kIsFirstIter ? local_sum_e : ((*p_rescale) * (*p_row_sum_e) + local_sum_e);
 }
 
+__device__ __forceinline__ void float_2_bf16_pair(uint32_t dst, uint32_t src_0, uint32_t src_1)
+{
+#if defined(__gfx950__)
+    asm volatile("v_cvt_pk_bf16_f32 v[%0], v[%1], v[%2]" : : "i"(dst), "i"(src_0), "i"(src_1));
+#elif defined(__gfx94__)
+    static constexpr uint32_t FP32_NAN            = 0x7fff0000;
+    static constexpr uint32_t ROUND_BIAS_FOR_BF16 = 0x7fff;
+    static constexpr uint32_t MERGE_MASK          = 0xffff0000;
+
+    using uint32x2_t = uint32_t __attribute__((ext_vector_type(2)));
+    uint32x2_t check_nan;
+    uint32_t tmp;
+    asm volatile("v_cmp_u_f32 %0, v[%3], v[%3]\n\t"
+                 "v_bfe_u32 %1, v[%3], 16, 1\n\t"
+                 "v_add3_u32 %1, v[%3], %1, %5\n\t"
+                 "v_cndmask_b32 v[%2], %1, %6, %0\n\t"
+                 "v_lshrrev_b32 v[%2], 16, v[%2]\n\t"
+                 "v_cmp_u_f32 %0, v[%4], v[%4]\n\t"
+                 "v_bfe_u32 %1, v[%4], 16, 1\n\t"
+                 "v_add3_u32 %1, v[%4], %1, %5\n\t"
+                 "v_cndmask_b32 %1, %1, %6, %0\n\t"
+                 "v_and_or_b32 v[%2], %1, %7, v[%2]"
+                 : "=s"(check_nan), "+v"(tmp)
+                 : "i"(dst),
+                   "i"(src_0),
+                   "i"(src_1),
+                   "v"(ROUND_BIAS_FOR_BF16),
+                   "v"(FP32_NAN),
+                   "v"(MERGE_MASK));
+#endif
+}
+
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(72))) void kn_mla_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
@@ -666,6 +698,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     const uint32_t warp_idx = ckt::get_warp_id();
     const uint32_t lane_idx = __lane_id();
 
+    std::uintptr_t out_as_int  = reinterpret_cast<std::uintptr_t>(params.final_output.raw_ptr);
+    std::uint64_t out_as_u64   = static_cast<std::uint64_t>(out_as_int);
+    hk::buffer_resource out_br = hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
         const int32_t partial_qo_loc = __builtin_amdgcn_readfirstlane(
@@ -759,6 +795,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             softmax<kIsFirstIter, kIsTail, k_p_comp_begin, comp_t>(
                 &row_max, &row_sum_e, &rescale, kv_tile_start, kv_end, params.softmax_scale);
 
+            if constexpr(kIsFirstIter == false)
+            {
+                hk::mul_vgpr(oaccu, oaccu, rescale);
+            }
+
             // Convert p from comp_t to kv_t
             ckt::static_for<k_p_comp_begin, k_p_comp_end + 1, 4>{}([&](auto idx) {
                 constexpr uint32_t dst_idx = k_p_mfma_begin + (idx.value - k_p_comp_begin) / 4;
@@ -780,7 +821,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
                 constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
                 using oaccu_range_0           = hkdart::split_many_t<
-                    hkdart::type_list<hkdart::range<oaccu_base, oaccu_base + 8 - 1>>,
+                    hkdart::type_list<hkdart::range<oaccu_base + 0, oaccu_base + 8 - 1>>,
                     4>;
                 using oaccu_range_1 = hkdart::split_many_t<
                     hkdart::type_list<hkdart::range<oaccu_base + 8, oaccu_base + 16 - 1>>,
@@ -855,38 +896,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     hk::mma_ABt(oaccu_1, kv_1, p_mfma, oaccu_1);
                 }
             });
-
-            // Debug code
-            float r00 = FUI(hkm::v_get_gpr<k_p_comp_begin>()).f32;
-            float r01 = FUI(hkm::v_get_gpr<k_p_comp_begin + 1>()).f32;
-            float r02 = FUI(hkm::v_get_gpr<k_p_comp_begin + 2>()).f32;
-            float r03 = FUI(hkm::v_get_gpr<k_p_comp_begin + 3>()).f32;
-            float r10 = FUI(hkm::v_get_gpr<k_p_comp_begin + 4>()).f32;
-            float r11 = FUI(hkm::v_get_gpr<k_p_comp_begin + 5>()).f32;
-            float r12 = FUI(hkm::v_get_gpr<k_p_comp_begin + 6>()).f32;
-            float r13 = FUI(hkm::v_get_gpr<k_p_comp_begin + 7>()).f32;
-
-            int row0 = qo_start * T::kQoNumHead + warp_idx * 16 + (lane_idx & 0xf);
-            int col0 = (kv_tile_start - kv_start) + (lane_idx / 16) * 4;
-            int col1 = col0 + 16;
-
-            int off00 = row0 * 576 + col0;
-            int off01 = row0 * 576 + col0 + 1;
-            int off02 = row0 * 576 + col0 + 2;
-            int off03 = row0 * 576 + col0 + 3;
-            int off10 = row0 * 576 + col1;
-            int off11 = row0 * 576 + col1 + 1;
-            int off12 = row0 * 576 + col1 + 2;
-            int off13 = row0 * 576 + col1 + 3;
-
-            params.p_dbg[off00] = r00;
-            params.p_dbg[off01] = r01;
-            params.p_dbg[off02] = r02;
-            params.p_dbg[off03] = r03;
-            params.p_dbg[off10] = r10;
-            params.p_dbg[off11] = r11;
-            params.p_dbg[off12] = r12;
-            params.p_dbg[off13] = r13;
         };
 
         const int32_t kv_len = kv_end - kv_start;
@@ -914,7 +923,30 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         ///
         /// Outputs
         ///
-        if(partial_qo_loc < 0) {}
+        if(partial_qo_loc < 0)
+        {
+            const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16;
+            const uint32_t col_idx_base = (lane_idx / 16) * 4;
+            const uint32_t offset       = (row_idx * T::kVoHeadDim + col_idx_base) * sizeof(out_t);
+            constexpr uint32_t gemm_tile_size = 16;
+
+#pragma unroll
+            for(uint32_t idx = 0; idx < T::kVoHeadDim / gemm_tile_size; ++idx)
+            {
+                const uint32_t i_offset = idx * gemm_tile_size * sizeof(out_t);
+                const uint32_t src_idx  = idx * 4 + k_o_begin;
+                float_2_bf16_pair(k_o_begin, src_idx, src_idx + 1);
+                float_2_bf16_pair(k_o_begin + 1, src_idx + 2, src_idx + 3);
+                asm volatile("buffer_store_dwordx2 v[%0:%1], %2, %3, 0 offen offset:%4"
+                             :
+                             : "i"(k_o_begin), // reuse these vgprs
+                               "i"(k_o_begin + 1),
+                               "v"(offset),
+                               "s"(*(hk::i32x4*)&out_br),
+                               "i"(i_offset)
+                             : "memory");
+            }
+        }
         else {}
     }
 }
