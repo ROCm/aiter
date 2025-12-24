@@ -44,7 +44,7 @@ def ensure_spawn_method():
 
 
 def perftest(
-    num_iters=801, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+    num_iters=301, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):

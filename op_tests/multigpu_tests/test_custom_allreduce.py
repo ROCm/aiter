@@ -9,6 +9,7 @@ from typing_extensions import Optional
 
 import torch
 import torch.distributed as dist
+import pandas as pd
 
 from aiter import dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -114,6 +115,9 @@ def test_allreduce_custom(
     for out, us in rets:
         msg = f"test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         checkAllclose(ref, out.to(ref), msg=msg)
+    M, N = shape
+    avg_us = sum(us for _, us in rets) / len(rets)
+    return {"M": M, "N": N, "time_us": avg_us}
 
 
 # l_dtype = ["fp16", "bf16"]
@@ -167,16 +171,36 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    rows = []
     for dtype in l_dtype:
         for shape in l_shape:
-            test_allreduce_custom(
-                8,
-                1,
-                shape,
-                dtype,
-                withGraph=True,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
+            rows.append(
+                test_allreduce_custom(
+                    8,
+                    1,
+                    shape,
+                    dtype,
+                    withGraph=True,
+                    distributed_init_method=get_distributed_init_method(
+                        get_ip(), get_open_port()
+                    ),
+                )
             )
             # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)
+    df = pd.DataFrame(rows)
+
+    def _dtype2str(x):
+        try:
+            return next((k for k, v in dtypes.d_dtypes.items() if v == x))
+        except Exception:
+            return str(x).split(".")[-1]
+
+    if "dtype" in df.columns:
+        df["dtype"] = df["dtype"].map(_dtype2str)
+    df["tp"] = df.get("tp_size", None)
+    df["pp"] = df.get("pp_size", None)
+    df["graph"] = df.get("withGraph", None)
+    cols = ["M", "N", "dtype", "tp", "pp", "graph", "time_us"]
+    cols = [c for c in cols if c in df.columns]
+    df = df[cols]
+    print(df.to_string(index=False))
