@@ -318,28 +318,6 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
             warp_max = f_absmax_f32(warp_max, elements[i]);
         }
         warp_max = warpReduceSum(f_absmax_f32, warp_max);
-        if constexpr(num_kv_heads > 1)
-        {
-            // multiple kv heads, need to reduce across warps in a block, otherwise not necessary
-            if(laneId == 0)
-            {
-                shared_max[warpId] = warp_max;
-                __syncthreads();
-                // since the num_kv_heads is normally small value like 1 or 2, we just iterate on
-                // lane 0 for simplicity
-                if(warpId == 0)
-                {
-#pragma unroll
-                    for(int i = 1; i < num_kv_heads; ++i)
-                    {
-                        warp_max = f_absmax_f32(warp_max, shared_max[i]);
-                    }
-                    shared_max[0] = warp_max;
-                }
-            }
-            __syncthreads();
-            warp_max = shared_max[0];
-        }
     }
     if(isK)
     {
