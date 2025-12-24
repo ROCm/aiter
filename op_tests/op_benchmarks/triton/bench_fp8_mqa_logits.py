@@ -3,7 +3,7 @@ import triton
 import argparse
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.utils.types import e4m3_dtype
-from op_tests.triton_tests.test_fp8_mqa_logits import (
+from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
     per_custom_dims_cast_to_fp8,
     generate_cp_test_data,
 )

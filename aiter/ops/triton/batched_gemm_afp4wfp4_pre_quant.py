@@ -3,9 +3,8 @@
 
 from typing import Optional
 import torch
-import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.common_utils import serialize_dict
 from aiter.ops.triton.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
@@ -32,6 +31,8 @@ def batched_gemm_afp4wfp4_pre_quant(
     _LOGGER.info(
         "batched_gemm_afp4wfp4_pre_quant will be deprecated in future AITER release, please switch to batched_gemm_a16wfp4"
     )
+
+    config_hashable = serialize_dict(config) if config else None
     return batched_gemm_a16wfp4(
-        x, w, w_scales, dtype, y, config, transpose_bm=False, prequant=True
+        x, w, w_scales, dtype, y, config_hashable, transpose_bm=False, prequant=True
     )

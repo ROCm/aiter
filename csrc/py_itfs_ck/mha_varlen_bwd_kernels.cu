@@ -10,203 +10,6 @@
 
 namespace aiter {
 namespace torch_itfs {
-fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
-                                          // sizes
-                                          const int b,
-                                          const int max_seqlen_q,
-                                          const int max_seqlen_k,
-                                          const int h,
-                                          const int h_k,
-                                          const int hdim_q,
-                                          const int hdim_v,
-                                          // device pointers
-                                          const at::Tensor q,
-                                          const at::Tensor k,
-                                          const at::Tensor v,
-                                          const at::Tensor cu_seqlens_q,
-                                          const at::Tensor cu_seqlens_k,
-                                          std::optional<const at::Tensor> &cu_seqlens_q_padded,
-                                          std::optional<const at::Tensor> &cu_seqlens_k_padded,
-                                          std::optional<const at::Tensor> &alibi_slopes_,
-                                          const at::Tensor out,
-                                          const at::Tensor softmax_lse,
-                                          const at::Tensor dout,
-                                          at::Tensor dq_acc,
-                                          at::Tensor d,
-                                          at::Tensor dq,
-                                          at::Tensor dk,
-                                          at::Tensor dv,
-                                          float softmax_scale,
-                                          float p_dropout,
-                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
-{
-    ck_tile::index_t total_q = q.size(0);
-    ck_tile::index_t total_k = k.size(0);
-
-    // q: (total_q, nheads, hdim_q)
-    ck_tile::index_t batch_stride_q = 0;
-    ck_tile::index_t stride_q = q.stride(0);
-    ck_tile::index_t nhead_stride_q = q.stride(1);
-
-    // k: (total_k, nheads_k, hdim_q)
-    ck_tile::index_t batch_stride_k = 0;
-    ck_tile::index_t stride_k = k.stride(0);
-    ck_tile::index_t nhead_stride_k = k.stride(1);
-
-    // v: (total_k, nheads_k, hdim_v)
-    ck_tile::index_t batch_stride_v = 0;
-    ck_tile::index_t stride_v = v.stride(0);
-    ck_tile::index_t nhead_stride_v = v.stride(1);
-
-    // o: (total_q, nheads, hdim_v)
-    ck_tile::index_t batch_stride_o = 0;
-    ck_tile::index_t stride_o = out.stride(0);
-    ck_tile::index_t nhead_stride_o = out.stride(1);
-
-    // lse: (nheads, total_q)
-    ck_tile::index_t batch_stride_lse = 0;
-    ck_tile::index_t nhead_stride_lse = softmax_lse.stride(0);
-
-    // do: (total_q, nheads, hdim)
-    ck_tile::index_t batch_stride_do = 0;
-    ck_tile::index_t stride_do = dout.stride(0);
-    ck_tile::index_t nhead_stride_do = dout.stride(1);
-
-    // d: (batch_size, nheads, max_seqlen_q)
-    // CK assume d share the same stride with lse
-
-    // dq: (total_q, nheads, hdim_q)
-    ck_tile::index_t batch_stride_dq = 0;
-    ck_tile::index_t stride_dq = dq.stride(0);
-    ck_tile::index_t nhead_stride_dq = dq.stride(1);
-
-
-    // dk_expanded: (total_k, nheads, hdim_q)
-    ck_tile::index_t batch_stride_dk = 0;
-    ck_tile::index_t stride_dk = dk.stride(0);
-    ck_tile::index_t nhead_stride_dk = dk.stride(1);
-
-    // dv_expanded: (total_k, nheads, hdim_v)
-    ck_tile::index_t batch_stride_dv = 0;
-    ck_tile::index_t stride_dv = dv.stride(0);
-    ck_tile::index_t nhead_stride_dv = dv.stride(1);
-
-    // dq_acc: (split, total_q, nheads, hdim_v)
-    ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
-    ck_tile::index_t batch_stride_dq_acc = 0;
-    ck_tile::index_t stride_dq_acc = dq_acc.stride(1);
-    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(2);
-
-    float p_undrop = 1.0 - p_dropout;
-
-    void *alibi_slopes_ptr = nullptr;
-    ck_tile::index_t stride_alibi_slopes = 0;
-
-    if (alibi_slopes_.has_value()) {
-        auto alibi_slopes = alibi_slopes_.value();
-        CHECK_DEVICE(alibi_slopes);
-        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
-        TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({h}) || alibi_slopes.sizes() == torch::IntArrayRef({b, h}));
-        alibi_slopes_ptr = alibi_slopes.data_ptr();
-        // alibi_slopes:(batch_size, nheads) or (nhead)
-        stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
-    }
-
-    const void* seqstart_k_ptr = nullptr;
-    const void* seqstart_q_ptr = nullptr;
-    const void* cu_seqlen_k_ptr = nullptr;
-    const void* cu_seqlen_q_ptr = nullptr;
-
-    if (cu_seqlens_k_padded.has_value()) {
-        seqstart_k_ptr = cu_seqlens_k_padded.value().data_ptr();
-        cu_seqlen_k_ptr = cu_seqlens_k.data_ptr();
-    } else {
-        seqstart_k_ptr = cu_seqlens_k.data_ptr();
-    }
-
-    if (cu_seqlens_q_padded.has_value()) {
-        seqstart_q_ptr = cu_seqlens_q_padded.value().data_ptr();
-        cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
-    } else {
-        seqstart_q_ptr = cu_seqlens_q.data_ptr();
-    }
-
-    return fmha_bwd_args{q.data_ptr(),
-                         k.data_ptr(),
-                         v.data_ptr(),
-                         alibi_slopes_ptr, // bias
-                         out.data_ptr(),
-                         softmax_lse.data_ptr(),
-                         dout.data_ptr(),
-                         d.data_ptr(),
-                         nullptr, // rand_val
-                         dq.data_ptr(),
-                         dk.data_ptr(),
-                         dv.data_ptr(),
-                         nullptr, // dbias
-                         dq_acc.data_ptr(), // dq_acc
-                         seqstart_q_ptr, // seqstart_q_ptr (physical cumulative)
-                         seqstart_k_ptr, // seqstart_k_ptr (physical cumulative)
-                         nullptr, // seqlen_q_ptr (per-sequence logical)
-                         nullptr, // seqlen_k_ptr (per-sequence logical)
-                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr (cumulative logical, not used in CK backend for now)
-                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr (cumulative logical, not used in CK backend for now)
-                         total_q,
-                         total_k,
-                         b,
-                         max_seqlen_q, // max_seqlen_q
-                         max_seqlen_k, // max_seqlen_k
-                         hdim_q, // hdim_q
-                         hdim_v, // hdim_v
-                         h, // nhead_q
-                         h_k, // nhead_k
-                         softmax_scale,
-                         stride_q,
-                         stride_k,
-                         stride_v,
-                         stride_alibi_slopes,
-                         stride_o,
-                         0, // stride_randval
-                         stride_do,
-                         stride_dq_acc,
-                         stride_dq,
-                         stride_dk,
-                         stride_dv,
-                         0, // stride_dbias
-                         nhead_stride_q,
-                         nhead_stride_k,
-                         nhead_stride_v,
-                         0, // nhead_stride_bias
-                         nhead_stride_o,
-                         0, // nhead_stride_randval
-                         nhead_stride_do,
-                         nhead_stride_lse,
-                         nhead_stride_dq_acc,
-                         nhead_stride_dq,
-                         nhead_stride_dk,
-                         nhead_stride_dv,
-                         0, // nhead_stride_dbias
-                         batch_stride_q,
-                         batch_stride_k,
-                         batch_stride_v,
-                         0  , // batch_stride_bias
-                         batch_stride_o,
-                         0, // batch_stride_randval
-                         batch_stride_do,
-                         batch_stride_lse,
-                         batch_stride_dq_acc,
-                         batch_stride_dq,
-                         batch_stride_dk,
-                         batch_stride_dv,
-                         0  , // batch_stride_dbias, FA without dbias
-                         split_stride_dq_acc,
-                         mask.left,
-                         mask.right,
-                         static_cast<ck_tile::index_t>(mask.type),
-                         p_dropout,
-                         p_undrop,
-                         drop_seed_offset};
-}
 
 std::vector<at::Tensor>
 mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
@@ -306,6 +109,23 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
 
+    auto get_mask_type = [&]() {
+        if (mask.type == mask_enum::no_mask) {
+            return 0;
+        } else {
+            if (mask.type == mask_enum::window_generic) {
+                assert(false);
+                return 0;
+            } else {
+                if ((mask.left == -1) && (mask.right == 0)) {
+                    return (mask.type == mask_enum::mask_top_left) ? 1 : 2;
+                } else {
+                    return 3;
+                }
+            }
+        }
+    };
+
     // q, k, v, out had been padded in mha_fwd
     // dq_, dk_, dv_ are also padded tensor
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
@@ -402,49 +222,188 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
 
-        auto args =
-            get_ck_fmha_varlen_bwd_args(
-                mask,
-                batch_size,
-                max_seqlen_q,
-                max_seqlen_k,
-                num_heads,
-                num_heads_k,
-                head_size_q,
-                head_size_v,
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                cu_seqlens_q_padded,
-                cu_seqlens_k_padded,
-                alibi_slopes_,
-                out,
-                softmax_lse,
-                dout,
-                dq_accum,
-                softmax_d,
-                dq,
-                dk_expanded,
-                dv_expanded,
-                softmax_scale,
-                p_dropout,
-                drop_seed_offset);
+        auto args = [=]() {
+            // q: (total_q, nheads, hdim_q)
+            ck_tile::index_t batch_stride_q = 0;
+            ck_tile::index_t stride_q = q.stride(0);
+            ck_tile::index_t nhead_stride_q = q.stride(1);
 
-        float t = aiter::mha_bwd(args,
-                                 stream_config,
-                                 q_dtype_str,
-                                 true,  //is_group_mode
-                                 mask.type,
-                                 bias_type,
-                                 false,  // has_dbias
-                                 false,  // is_store_randval
-                                 deterministic,
-                                 false,  // use_ext_asm
-                                 false,  // is_v3_atomic_fp32
-                                 0);     // how_v3_bf16_cvt
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
+            // k: (total_k, nheads_k, hdim_q)
+            ck_tile::index_t batch_stride_k = 0;
+            ck_tile::index_t stride_k = k.stride(0);
+            ck_tile::index_t nhead_stride_k = k.stride(1);
+
+            // v: (total_k, nheads_k, hdim_v)
+            ck_tile::index_t batch_stride_v = 0;
+            ck_tile::index_t stride_v = v.stride(0);
+            ck_tile::index_t nhead_stride_v = v.stride(1);
+
+            // o: (total_q, nheads, hdim_v)
+            ck_tile::index_t batch_stride_o = 0;
+            ck_tile::index_t stride_o = out.stride(0);
+            ck_tile::index_t nhead_stride_o = out.stride(1);
+
+            // lse: (nheads, total_q)
+            ck_tile::index_t batch_stride_lse = 0;
+            ck_tile::index_t nhead_stride_lse = softmax_lse.stride(0);
+
+            // do: (total_q, nheads, hdim)
+            ck_tile::index_t batch_stride_do = 0;
+            ck_tile::index_t stride_do = dout.stride(0);
+            ck_tile::index_t nhead_stride_do = dout.stride(1);
+
+            // d: (batch_size, nheads, max_seqlen_q)
+            // CK assume d share the same stride with lse
+
+            // dq: (total_q, nheads, hdim_q)
+            ck_tile::index_t batch_stride_dq = 0;
+            ck_tile::index_t stride_dq = dq.stride(0);
+            ck_tile::index_t nhead_stride_dq = dq.stride(1);
+
+
+            // dk_expanded: (total_k, nheads, hdim_q)
+            ck_tile::index_t batch_stride_dk = 0;
+            ck_tile::index_t stride_dk = dk_expanded.stride(0);
+            ck_tile::index_t nhead_stride_dk = dk_expanded.stride(1);
+
+            // dv_expanded: (total_k, nheads, hdim_v)
+            ck_tile::index_t batch_stride_dv = 0;
+            ck_tile::index_t stride_dv = dv_expanded.stride(0);
+            ck_tile::index_t nhead_stride_dv = dv_expanded.stride(1);
+
+            // dq_acc: (split, total_q, nheads, hdim_v)
+            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(0);
+            ck_tile::index_t batch_stride_dq_acc = 0;
+            ck_tile::index_t stride_dq_acc = dq_accum.stride(1);
+            ck_tile::index_t nhead_stride_dq_acc = dq_accum.stride(2);
+
+            float p_undrop = 1.0 - p_dropout;
+
+            void *alibi_slopes_ptr = nullptr;
+            ck_tile::index_t stride_alibi_slopes = 0;
+
+            if (alibi_slopes_.has_value()) {
+                auto alibi_slopes = alibi_slopes_.value();
+                CHECK_DEVICE(alibi_slopes);
+                TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+                TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({num_heads}) || alibi_slopes.sizes() == torch::IntArrayRef({batch_size, num_heads}));
+                alibi_slopes_ptr = alibi_slopes.data_ptr();
+                // alibi_slopes:(batch_size, nheads) or (nhead)
+                stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
+            }
+
+            const void* seqstart_k_ptr = nullptr;
+            const void* seqstart_q_ptr = nullptr;
+            const void* cu_seqlen_k_ptr = nullptr;
+            const void* cu_seqlen_q_ptr = nullptr;
+
+            if (cu_seqlens_k_padded.has_value()) {
+                seqstart_k_ptr = cu_seqlens_k_padded.value().data_ptr();
+                cu_seqlen_k_ptr = cu_seqlens_k.data_ptr();
+            } else {
+                seqstart_k_ptr = cu_seqlens_k.data_ptr();
+            }
+
+            if (cu_seqlens_q_padded.has_value()) {
+                seqstart_q_ptr = cu_seqlens_q_padded.value().data_ptr();
+                cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
+            } else {
+                seqstart_q_ptr = cu_seqlens_q.data_ptr();
+            }
+
+            return mha_bwd_args{get_mask_type(),
+                                false, // use_v3
+                                false, // is_v3_atomic_fp32
+                                false, // how_v3_bf16_cvt
+                                false, // v3_api_check
+
+                                head_size_q,
+                                head_size_v,
+                                q_dtype_str,
+                                true, // mode
+                                static_cast<int>(mask.type),
+                                static_cast<int>(bias_type),
+                                false, // has_dbias
+                                p_dropout > 0,
+                                false,  // store_randval
+                                deterministic,
+
+                                q.data_ptr(),
+                                k.data_ptr(),
+                                v.data_ptr(),
+                                alibi_slopes_ptr, // bias
+                                out.data_ptr(),
+                                softmax_lse.data_ptr(),
+                                dout.data_ptr(),
+                                softmax_d.data_ptr(),
+                                nullptr, // rand_val
+                                dq.data_ptr(),
+                                dk_expanded.data_ptr(),
+                                dv_expanded.data_ptr(),
+                                nullptr, // dbias
+                                dq_accum.data_ptr(), // dq_acc
+                                seqstart_q_ptr, // seqstart_q_ptr (physical cumulative)
+                                seqstart_k_ptr, // seqstart_k_ptr (physical cumulative)
+                                nullptr, // seqlen_q_ptr (per-sequence logical)
+                                nullptr, // seqlen_k_ptr (per-sequence logical)
+                                cu_seqlen_q_ptr, // cu_seqlen_q_ptr (cumulative logical, not used in CK backend for now)
+                                cu_seqlen_k_ptr, // cu_seqlen_k_ptr (cumulative logical, not used in CK backend for now)
+                                total_q,
+                                total_k,
+                                batch_size,
+                                max_seqlen_q, // max_seqlen_q
+                                max_seqlen_k, // max_seqlen_k
+                                num_heads, // nhead_q
+                                num_heads_k, // nhead_k
+                                softmax_scale,
+                                stride_q,
+                                stride_k,
+                                stride_v,
+                                stride_alibi_slopes,
+                                stride_o,
+                                0, // stride_randval
+                                stride_do,
+                                stride_dq_acc,
+                                stride_dq,
+                                stride_dk,
+                                stride_dv,
+                                0, // stride_dbias
+                                nhead_stride_q,
+                                nhead_stride_k,
+                                nhead_stride_v,
+                                0, // nhead_stride_bias
+                                nhead_stride_o,
+                                0, // nhead_stride_randval
+                                nhead_stride_do,
+                                nhead_stride_lse,
+                                nhead_stride_dq_acc,
+                                nhead_stride_dq,
+                                nhead_stride_dk,
+                                nhead_stride_dv,
+                                0, // nhead_stride_dbias
+                                batch_stride_q,
+                                batch_stride_k,
+                                batch_stride_v,
+                                0  , // batch_stride_bias
+                                batch_stride_o,
+                                0, // batch_stride_randval
+                                batch_stride_do,
+                                batch_stride_lse,
+                                batch_stride_dq_acc,
+                                batch_stride_dq,
+                                batch_stride_dk,
+                                batch_stride_dv,
+                                0  , // batch_stride_dbias, FA without dbias
+                                split_stride_dq_acc,
+                                mask.left,
+                                mask.right,
+                                p_dropout,
+                                p_undrop,
+                                drop_seed_offset};
+        }();
+
+        float t = aiter::mha_bwd(args, stream_config);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_varlen_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
         dk_expanded.zero_();
