@@ -8,7 +8,7 @@ import argparse
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/../../../aiter/")
-from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR
+from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR  # noqa: E402
 
 FWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}"]
 BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"]
