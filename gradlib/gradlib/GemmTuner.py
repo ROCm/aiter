@@ -113,7 +113,7 @@ def generate_data(
     # blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device=device)
     bias = torch.randn(n, device=device).to(outdtype) if bias else None
     scale_half = torch.tensor(0.5, dtype=dtypes.fp32, device=device)
-    scale_one = torch.tensor(1, dtype=dtypes.fp32, device=device)
+    # scale_one = torch.tensor(1, dtype=dtypes.fp32, device=device)
     scale = scale_half if scaleAB else None
     # if scaleAB:
     #    scaleB = scaleB.t()
@@ -389,12 +389,6 @@ class Gemm:
                 )
 
                 solutions = solutions + 1
-        in_data = [
-            (
-                solutions,
-                (),
-            )
-        ]
         # ret = mp_tuner(task_asm, in_data, self.mp, False)
         return task_asm
 
@@ -478,9 +472,9 @@ class Gemm:
         if top_sols:
             solutions = self.hipb_top_sols
         task = []
-        scaleA = HALF if self.scaleAB else None
-        scaleB = HALF if self.scaleAB else None
-        gtimes = {}
+        # scaleA = HALF if self.scaleAB else None
+        # scaleB = HALF if self.scaleAB else None
+        # gtimes = {}
         for solidx in solutions:
             info = (
                 (
@@ -584,7 +578,7 @@ class Gemm:
     def run_fast_solutions(self):
         self.find_hipblas_sols()
         self.warmup()
-        rets_hipb_fast = self.hipb_time_all_sols(fast_mode=1)
+        self.hipb_time_all_sols(fast_mode=1)
 
     def run_best_solutions(self):
         rets_hipb = []
