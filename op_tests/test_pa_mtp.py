@@ -454,10 +454,26 @@ def test_pa_mtp(
     total_kv_tokens = batch_size * ctx_lens
     total_q_tokens = batch_size * qlen
     mem_bytes_bf16 = (
-        int(total_kv_tokens) * int(num_kv_heads) * int(head_size) * int(element_size) * 2
-        + int(total_q_tokens) * int(num_query_heads) * int(head_size) * int(element_size) * 2
+        int(total_kv_tokens)
+        * int(num_kv_heads)
+        * int(head_size)
+        * int(element_size)
+        * 2
+        + int(total_q_tokens)
+        * int(num_query_heads)
+        * int(head_size)
+        * int(element_size)
+        * 2
     )
     ret["bw_hip_bf16"] = mem_bytes_bf16 / (us_hip * 1e-6) / 1e9
+    ret["token"] = int(total_kv_tokens)
+    ret["bs"] = int(batch_size)
+    ret["ctx_len"] = int(ctx_lens)
+    ret["q_len"] = int(qlen)
+    ret["token_kv"] = int(total_kv_tokens)
+    ret["token_q"] = int(total_q_tokens)
+    ret["token_total"] = int(total_kv_tokens + total_q_tokens)
+    ret["num_heads"] = f"({num_query_heads},{num_kv_heads})"
 
     # ################## quant start ######################
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
@@ -491,7 +507,10 @@ def test_pa_mtp(
     mem_bytes_fp8 = (
         int(total_kv_tokens) * int(num_kv_heads) * int(head_size) * 1 * 2
         + int(total_q_tokens) * int(num_query_heads) * int(head_size) * 1
-        + int(total_q_tokens) * int(num_query_heads) * int(head_size) * int(element_size)
+        + int(total_q_tokens)
+        * int(num_query_heads)
+        * int(head_size)
+        * int(element_size)
     )
     ret["bw_asm_fp8"] = mem_bytes_fp8 / (us_aiter_asm * 1e-6) / 1e9
 
@@ -530,9 +549,9 @@ head_dim = 128
 l_block_size = [1024]
 l_dtype = ["bf16"]
 l_num_heads = [(10, 1)]
-l_qlen = [4]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 8192,10240,16384]
-l_batch_size = [64,128,256]
+l_qlen = [1, 4]
+l_ctx_len = [4096, 8192, 10240]
+l_batch_size = [64, 128, 256, 512]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -607,19 +626,28 @@ l_block_size = args.block_size
 
 for dtype in l_dtype:
     df = []
-    for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
-        l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
-    ):
-        ret = test_pa_mtp(
-            ctx_len,
-            batch_size,
-            num_heads,
-            head_dim,
-            block_size,
-            dtype,
-            qlen,
-        )
-        df.append(ret)
+    for qlen in l_qlen:
+        for batch_size in l_batch_size:
+            for ctx_len in l_ctx_len:
+                for block_size in l_block_size:
+                    for num_heads in l_num_heads:
+                        ret = test_pa_mtp(
+                            ctx_len,
+                            batch_size,
+                            num_heads,
+                            head_dim,
+                            block_size,
+                            dtype,
+                            qlen,
+                        )
+                        df.append(ret)
     df = pd.DataFrame(df)
+    for dup_col, keep_col in [("batch_size", "bs"), ("ctx_lens", "ctx_len")]:
+        if dup_col in df.columns and keep_col in df.columns:
+            df = df.drop(columns=[dup_col])
+    front_cols = ["token", "bs", "ctx_len", "q_len", "num_heads"]
+    other_cols = [c for c in df.columns if c not in front_cols]
+    df = df[front_cols + other_cols]
+    df = df.sort_values(by=["bs", "ctx_len", "q_len"]).reset_index(drop=True)
     aiter.logger.info(f"summary:\n{df}")
     # df.to_csv("mla_prefill.csv")

@@ -383,7 +383,13 @@ def test_fmoe_ep(
         checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
         allowed_bs = {1, 2, 3, 4, 64, 128, 256, 512}
-        ctx_candidates = [(10240, "10K"), (8192, "8K"), (4096, "4K"), (1, "1")]
+        ctx_candidates = [
+            (10240, "10K"),
+            (8192, "8K"),
+            (4096, "4K"),
+            (1024, "1K"),
+            (1, "1"),
+        ]
         bs_val = None
         ctx_str = None
         for ctx_val, ctx_label in ctx_candidates:
@@ -521,13 +527,27 @@ if len(sys.argv) == 1:
     args.asm_only = True
     l_test = ["g1u1_int8quant"]
     if args.token is None:
-        prefill_bs = [1, 2, 3, 4]
-        prefill_ctx = [4096, 8192, 10240]
-        decode_bs = [64, 128, 256, 512]
-        decode_ctx = [1]
-        prefill_tokens = [b * c for b in prefill_bs for c in prefill_ctx]
-        decode_tokens = [b * c for b in decode_bs for c in decode_ctx]
-        args.token = sorted(list(set(prefill_tokens + decode_tokens)))
+        # Exactly 15 tests:
+        # - Prefill: bs in {1,2,3,4}, ctx in {4K,8K,10K} (unique products)
+        # - + one extra prefill: bs=1, ctx=1K
+        # - Decode: bs in {64,128,256,512}, ctx=1
+        args.token = [
+            1024,  # prefill bs=1, ctx=1K
+            4096,  # prefill bs=1, ctx=4K
+            8192,  # prefill bs=1, ctx=8K  (also bs=2, ctx=4K)
+            10240,  # prefill bs=1, ctx=10K
+            12288,  # prefill bs=3, ctx=4K
+            16384,  # prefill bs=2, ctx=8K  (also bs=4, ctx=4K)
+            20480,  # prefill bs=2, ctx=10K
+            24576,  # prefill bs=3, ctx=8K
+            30720,  # prefill bs=3, ctx=10K
+            32768,  # prefill bs=4, ctx=8K
+            40960,  # prefill bs=4, ctx=10K
+            64,  # decode bs=64, ctx=1
+            128,  # decode bs=128, ctx=1
+            256,  # decode bs=256, ctx=1
+            512,  # decode bs=512, ctx=1
+        ]
     if args.hidden_dim is None:
         args.hidden_dim = [5120]
     if args.inter_dim is None:
@@ -640,7 +660,7 @@ for test in l_test:
                             if ret:
                                 results.append(ret)
         if results:
-            df = pd.DataFrame(results)
+            df = pd.DataFrame(results).sort_values(by=["token"]).reset_index(drop=True)
             print(f"summary:\n{df}")
     elif test == "g1u1_fp8quant":
         for dtype in (
