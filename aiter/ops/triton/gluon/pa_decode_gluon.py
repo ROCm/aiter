@@ -2289,38 +2289,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
         key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
 
-        # ==================== ATTENTION SCORE COMPUTATION ====================
-        # Initialize QK accumulator
-        qk_accumulator = gl.zeros(
-            (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
-            dtype=gl.float32,
-            layout=qk_mfma_layout,
-        )
-
-        # if sequence_idx == 0 \
-        #     and kv_head_idx == 0 \
-        #     and sequence_partition_idx == 0:
-        #     print("query_tensor=", query_tensor.to(tl.float32))
-        #     print("key_tensor=", key_tensor.to(tl.float32))
-        # if QUERY_QUANT_MODE == 0 and KV_QUANT_MODE == 0:
-        #     print("QKV_per_tensor")
-        # else:
-        #     print("QKV_per_token")
-
-        # Convert layouts for MFMA operation
         query_converted = query_shared.load(qk_lhs_operand_layout)
-        key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
-
         query_converted = query_converted.to(COMPUTE_TYPE)
-        key_converted = key_converted.to(COMPUTE_TYPE)
-
-        # Compute QK attention scores using MFMA
-        attention_scores = gl.amd.cdna3.mfma(
-            query_converted, key_converted, qk_accumulator
-        )
-        attention_scores = gl.reshape(
-            attention_scores, [QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
-        )
 
         # ==================== VALUE LOADING AND PROCESSING ====================
         if VALUE_TRANSPOSED:
@@ -2362,6 +2332,36 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             value_tensor = gl.reshape(
                 value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             )
+
+        # ==================== ATTENTION SCORE COMPUTATION ====================
+        # Initialize QK accumulator
+        qk_accumulator = gl.zeros(
+            (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
+            dtype=gl.float32,
+            layout=qk_mfma_layout,
+        )
+
+        # if sequence_idx == 0 \
+        #     and kv_head_idx == 0 \
+        #     and sequence_partition_idx == 0:
+        #     print("query_tensor=", query_tensor.to(tl.float32))
+        #     print("key_tensor=", key_tensor.to(tl.float32))
+        # if QUERY_QUANT_MODE == 0 and KV_QUANT_MODE == 0:
+        #     print("QKV_per_tensor")
+        # else:
+        #     print("QKV_per_token")
+
+        # Convert layouts for MFMA operation
+        key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
+        key_converted = key_converted.to(COMPUTE_TYPE)
+
+        # Compute QK attention scores using MFMA
+        attention_scores = gl.amd.cdna3.mfma(
+            query_converted, key_converted, qk_accumulator
+        )
+        attention_scores = gl.reshape(
+            attention_scores, [QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
+        )
 
         # Apply quantization scaling to attention scores
         if KV_QUANT_MODE >= 0:
@@ -3375,3 +3375,4 @@ def pa_decode_gluon(
             query_group_size=query_group_size,
             head_size=head_size,
         )
+    # end
