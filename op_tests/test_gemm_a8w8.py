@@ -87,13 +87,16 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
     weightshuffle = shuffle_weight(weight, layout=(16, 16))
     bias = torch.rand([1, n], dtype=dtype, device="cuda") * 10
-
+    TFLOPS = None
+    GBS = None
     # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
     err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
+    TFLOPS = m * n * k * 2 / avg_b / 1e6
+    GBS = (x.nbytes + weight.nbytes) / avg_b / 1e3
     if quantDtype != dtypes.i8:
         c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         c = c + bias
@@ -132,13 +135,10 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         err_e = None
     return {
         "ck us": avg_b,
-        "ck err": err_b,
         "ck bpreshuffle us": avg_c,
-        "ck bpreshuffle err": err_c,
         "asm us": avg_d,
-        "asm err": err_d,
-        "hipmm bpreshuffle us": avg_e,
-        "hipmm bpreshuffle err": err_e,
+        "CK TFLOPS": TFLOPS,
+        "CK GBS": GBS,
     }
 
 
@@ -275,6 +275,7 @@ def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk):
                 ret = test_gemm(dtype, m, n, k, quantDtype)
                 df.append(ret)
     df = pd.DataFrame(df)
+    df.to_csv("data_a8w8.csv")
     aiter.logger.info(f"summary:\n{df}")
 
 
@@ -336,45 +337,39 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
 
-l_dtype = ["bf16", "fp16"]
-l_quantDtype = ["i8", "fp8"]
+l_dtype = ["bf16"]
+l_quantDtype = ["i8"]
 l_mnk_nm = [
-    # qkv_proj
-    (1, 1280, 8192),
-    (32, 1280, 8192),
-    (64, 1280, 8192),
-    (128, 1280, 8192),
-    (192, 1280, 8192),
-    (256, 1280, 8192),
-    (320, 1280, 8192),
-    (512, 1280, 8192),
-    (1024, 1280, 8192),
-    (2048, 1280, 8192),
-    (4096, 1280, 8192),
-    (8192, 1280, 8192),
-    (16384, 1280, 8192),
-    # attn_out
-    (1, 8192, 1024),
-    (32, 8192, 1024),
-    (64, 8192, 1024),
-    (128, 8192, 1024),
-    (192, 8192, 1024),
-    (256, 8192, 1024),
-    (320, 8192, 1024),
-    (512, 8192, 1024),
-    (1024, 8192, 1024),
-    (2048, 8192, 1024),
-    (4096, 8192, 1024),
-    (8192, 8192, 1024),
-    (16384, 8192, 1024),
-    # hipmm preshuffle
-    (16, 7424, 8192),
-    (32, 7424, 8192),
-    (48, 7424, 8192),
-    (64, 7424, 8192),
-    (4096, 7424, 8192),
-    (5120, 7424, 8192),
-    (8192, 7424, 8192),
+    (64, 1536, 5120),
+    (128, 1536, 5120),
+    (256, 1536, 5120),
+    (512, 1536, 5120),
+    (1024, 1536, 5120),
+    (4096, 1536, 5120),
+    (8192, 1536, 5120),
+    (10240, 1536, 5120),
+    (12288, 1536, 5120),
+    (16384, 1536, 5120),
+    (20480, 1536, 5120),
+    (24576, 1536, 5120),
+    (30720, 1536, 5120),
+    (32768, 1536, 5120),
+    (40960, 1536, 5120),
+    (64, 5120, 1280),
+    (128, 5120, 1280),
+    (256, 5120, 1280),
+    (512, 5120, 1280),
+    (1024, 5120, 1280),
+    (4096, 5120, 1280),
+    (8192, 5120, 1280),
+    (10240, 5120, 1280),
+    (12288, 5120, 1280),
+    (16384, 5120, 1280),
+    (20480, 5120, 1280),
+    (24576, 5120, 1280),
+    (30720, 5120, 1280),
+    (32768, 5120, 1280),
+    (40960, 5120, 1280),
 ]
 
 parser = argparse.ArgumentParser(
@@ -426,4 +421,4 @@ if args.mnk is not None:
     l_mnk_nm = [args.mnk]
 
 test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
-test_skinny_gemm_a8w8_pertoken_quant()
+# test_skinny_gemm_a8w8_pertoken_quant()
