@@ -404,7 +404,7 @@ def pa_decode_gluon_aot(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_length: int,
-    max_context_length: int,
+    max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
     query_scale: torch.Tensor,  # [num_seqs * query_length, num_query_heads, 1] or [1]
@@ -481,8 +481,8 @@ def pa_decode_gluon_aot(
     query_length : int
         Length of query sequences. Must be <= 4.
 
-    max_context_length : int
-        Maximum sequence length supported in the KV cache.
+    max_context_partition_num : int
+        Maximum number of context partitions.
 
     context_partition_size : int
         Size of each context partition for partitioned attention computation.
@@ -582,9 +582,7 @@ def pa_decode_gluon_aot(
 
     num_sequences = batch_size
     num_query_heads_total = num_query_heads
-    max_context_partition_num = int(
-        (max_context_length + context_partition_size - 1) // context_partition_size
-    )
+
     head_size = query.shape[-1]
     kv_block_size = key_cache.shape[-2]
     query_group_size = num_query_heads_total // num_kv_heads

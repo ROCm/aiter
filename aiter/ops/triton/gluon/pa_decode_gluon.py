@@ -3325,7 +3325,7 @@ def pa_decode_gluon(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_length: int,
-    max_context_length: int,
+    max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
     query_scale: torch.Tensor,  # [num_seqs * query_length, num_query_heads, 1] or [1]
@@ -3404,8 +3404,8 @@ def pa_decode_gluon(
     query_length : int
         Length of query sequences. Must be <= 4.
 
-    max_context_length : int
-        Maximum sequence length supported in the KV cache.
+    max_context_partition_num : int
+        Maximum number of context partitions.
 
     context_partition_size : int
         Size of each context partition for partitioned attention computation.
@@ -3496,14 +3496,6 @@ def pa_decode_gluon(
             num_kv_heads=num_kv_heads,
             query_group_size=query_group_size,
             head_size=head_size,
-        )
-    if sliding_window > 0:
-        max_context_partition_num = 1
-    elif ps:
-        max_context_partition_num = get_recommended_splits(num_sequences, num_kv_heads)
-    else:
-        max_context_partition_num = triton.cdiv(
-            max_context_length, context_partition_size
         )
 
     if exp_sums is None:
