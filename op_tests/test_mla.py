@@ -521,8 +521,8 @@ parser.add_argument(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=dtypes.str2Dtype,
-    default=dtypes.str2Dtype("bf16"),
+    type=str,
+    default="bf16",
     choices=["bf16", "fp8"],
     help="""Data type of Q.
     e.g.: -d bf16""",
@@ -530,8 +530,8 @@ parser.add_argument(
 parser.add_argument(
     "-kvd",
     "--kv_dtype",
-    type=dtypes.str2Dtype,
-    default=dtypes.str2Dtype("bf16"),
+    type=str,
+    default="bf16",
     choices=["bf16", "fp8"],
     help="""Data type of KV.
     e.g.: -kvd bf16""",
@@ -583,6 +583,8 @@ parser.add_argument(
 
 
 args = parser.parse_args()
+args.dtype = [dtypes.str2Dtype(args.dtype)]
+args.kv_dtype = [dtypes.str2Dtype(args.kv_dtype)]
 
 for nhead, decode_qlen in args.nhead:
     df = []
