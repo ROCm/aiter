@@ -759,7 +759,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_qk_norm_rope_cache_quant_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/qk_norm_rope_cache_quant.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/fused_qk_norm_rope_cache_quant.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
