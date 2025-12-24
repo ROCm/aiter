@@ -1,6 +1,14 @@
 import triton
 import triton.language as tl
 
+try:
+    from triton.language.extra.libdevice import fast_dividef, fast_expf
+except ImportError:
+    try:
+        from triton.language.extra.cuda.libdevice import fast_dividef, fast_expf
+    except ImportError:
+        from triton.language.math import fast_dividef, fast_expf
+
 
 @triton.jit
 def _rmsmorm_op(row, weight, n_cols, epsilon):
@@ -68,6 +76,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
     HAVE_SECOND_INPUT: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
     FIRST_INPUT_OUT: tl.constexpr,
+    RMSNORM_CONVERT_TO_INP1_TYPE: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
@@ -100,11 +109,13 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
             mask=mask1,
         )
 
+    if RMSNORM_CONVERT_TO_INP1_TYPE:
+        norm1 = norm1.to(inp1_ptr.dtype.element_ty)
+        norm1 = norm1.to(tl.float32)
     # apply quantization
     scale = tl.load(scale_ptr).to(tl.float32)
     scale_recip = 1.0 / scale
     out1_fp8 = tl.clamp(norm1 * scale_recip, DTYPE_MIN, DTYPE_MAX)
-
     # store the results
     tl.store(
         out1_fp8_ptr + m_pid * out1_fp8_row_stride + n_offs * out1_fp8_col_stride,
@@ -697,3 +708,61 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                 inp3,
                 mask=mask3,
             )
+
+
+@triton.jit
+def _fused_silu_mul_fp8_per_tensor_static_quant_kernel(
+    inp_ptr,
+    out_fp8_ptr,
+    scale_ptr,
+    n_rows,
+    n_cols,
+    row_stride,
+    col_stride,
+    out_fp8_row_stride,
+    out_fp8_col_stride,
+    BLOCK_SIZE_N: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
+    SILU_CONVERT_TO_INP_TYPE: tl.constexpr,
+):
+    m_pid = tl.program_id(0)
+    n_offs = tl.arange(0, BLOCK_SIZE_N)
+    first_half_ptrs = inp_ptr + m_pid * row_stride + n_offs * col_stride
+    second_half_ptrs = inp_ptr + m_pid * row_stride + (n_cols + n_offs) * col_stride
+
+    mask = n_offs < n_cols
+
+    # a for first half
+    a = tl.load(
+        first_half_ptrs,
+        mask=mask,
+        other=0.0,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+
+    # b for second half
+    b = tl.load(
+        second_half_ptrs,
+        mask=mask,
+        other=0.0,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+
+    silu_a = fast_dividef(a, (1 + fast_expf(-a)))
+    silu_o = silu_a * b
+
+    if SILU_CONVERT_TO_INP_TYPE:
+        silu_o = silu_o.to(inp_ptr.dtype.element_ty)
+        silu_o = silu_o.to(tl.float32)
+
+    # apply quantization
+    scale = tl.load(scale_ptr).to(tl.float32)
+    scale_recip = 1.0 / scale
+    quant_fp8_out = tl.clamp(silu_o * scale_recip, DTYPE_MIN, DTYPE_MAX)
+    # store the results
+    tl.store(
+        out_fp8_ptr + m_pid * out_fp8_row_stride + n_offs * out_fp8_col_stride,
+        quant_fp8_out.to(out_fp8_ptr.dtype.element_ty),
+        mask=mask,
+    )
