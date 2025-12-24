@@ -309,13 +309,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         const auto& cfg     = it_pre->second;
         const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
+        std::string co_name = cfg.path + cfg.co_name;
         ts_odo              = cfg.ts;
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
         }
 
         impl_ptr_pre = result.first->second.get();
@@ -330,13 +330,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         const auto& cfg     = it_dqdkdv->second;
         const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
+        std::string co_name = cfg.path + cfg.co_name;
         ts_kv               = cfg.ts;
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
         }
 
         impl_ptr_dqdkdv = result.first->second.get();
@@ -353,13 +353,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         {
             const auto& cfg     = it_post->second;
             const char* name    = cfg.knl_name.c_str();
-            const char* co_name = cfg.co_name.c_str();
+            std::string co_name = cfg.path + cfg.co_name;
             ts_dq               = cfg.ts;
 
             auto result = impl_ptr_map.emplace(name, nullptr);
             if(result.second)
             {
-                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
             }
 
             impl_ptr_post = result.first->second.get();

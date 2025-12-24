@@ -3,42 +3,40 @@
 import sys
 import os
 import argparse
+from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR
+
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/../../../aiter/")
-from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR
-from jit.utils.chip_info import get_gfx_list
 
-
-FWD_CODEGEN_CMD = []
+FWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}"]
 BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"]
-
-
-def get_asm_dir():
-    for gfx in get_gfx_list():
-        FWD_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/fmha_v3_fwd"
-        if os.path.exists(FWD_ASM_DIR):
-            FWD_CODEGEN_CMD.append(f"{FWD_ASM_DIR}/codegen.py --output_dir {{}}")
 
 
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
     if ck_exclude:
-        blob_gen_cmd = [
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}",
-        ]
+        srcs = [f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp"]
+        blob_gen_cmd = []
     else:
+        srcs = [
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp",
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cpp",
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cpp",
+        ]
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}",
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}",
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}",
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}",
         ]
     blob_gen_cmd.extend(FWD_CODEGEN_CMD)
+    flag_use_v3 = "-DFAV3_ON=1" if ck_exclude else "-DFAV3_ON=1 -DFAV2_ON=1"
     return {
+        "srcs": srcs,
         "md_name": "libmha_fwd",
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": [flag_use_v3],
     }
 
 
@@ -88,7 +86,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    get_asm_dir()
     if args.api == "fwd":
         compile_mha_fwd(False)
     elif args.api == "bwd":

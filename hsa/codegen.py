@@ -37,8 +37,8 @@ if __name__ == "__main__":
         "--module",
         required=True,
         help="""module of ASM kernel,
-    e.g.: -m bf16gemm
-""",
+            e.g.: -m bf16gemm
+        """,
     )
     parser.add_argument(
         "-o",
@@ -102,12 +102,13 @@ if __name__ == "__main__":
                 content += f"""
 #define ADD_CFG({other_columns_comma}, arch, path, knl_name, co_name)         \\
     {{                                         \\
-        arch knl_name, {{ knl_name, path co_name, arch, {other_columns_comma} }}         \\
+        arch knl_name, {{ knl_name, path, co_name, arch, {other_columns_comma} }}         \\
     }}
 
 struct {args.module}Config
 {{
     std::string knl_name;
+    std::string path;
     std::string co_name;
     std::string arch;
 {other_columns_cpp_def}
