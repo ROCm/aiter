@@ -11,7 +11,7 @@ from op_tests.test_rope import (
     RotateStyle,
     ref_rope_2d_fwd,
 )
-from aiter.ops.triton.rope import (
+from aiter.ops.triton.rope.rope import (
     rope_fwd,
     rope_fwd_inplace,
     rope_bwd,

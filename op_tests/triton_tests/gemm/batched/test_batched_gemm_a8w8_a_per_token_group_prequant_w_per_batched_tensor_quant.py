@@ -4,7 +4,7 @@
 import torch
 import triton
 import pytest
-from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes

@@ -1,6 +1,6 @@
 import torch
 import pytest
-from aiter.ops.triton.gemm_a16wfp4 import gemm_a16wfp4
+from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 # Note this is specified by the HW and cannot be changed.
