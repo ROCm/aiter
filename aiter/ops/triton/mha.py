@@ -58,6 +58,7 @@ def _flash_attn_forward(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
     config: Optional[dict[str, any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int]:
 
@@ -116,6 +117,10 @@ def _flash_attn_forward(
     assert (not IS_FP8) or (
         IS_FP8 and pe_head_dim == 0
     ), "Positional encoding doesn't support FP8."
+
+    assert (sink is None) or (
+        sink is not None and sink.dim() == 1 and sink.shape[0] == num_q_heads
+    ), "Sink must be 1D and have one element per query head."
 
     # softmax_lse [batch, num_q_heads, seqlen_q]
     if is_varlen:
@@ -201,6 +206,7 @@ def _flash_attn_forward(
         s_dmask,
         dropout_mask,
         softmax_lse,
+        sink,
         *q_strides,
         *k_strides,
         *v_strides,
@@ -239,6 +245,7 @@ def _flash_attn_forward(
         BATCH=batch,
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
+        ENABLE_SINK=sink is not None,
         **config,
     )
 
@@ -261,10 +268,13 @@ class _FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_lse,
         return_softmax,
+        sink,
         is_grad_enabled,
         config=None,
     ):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        is_grad = is_grad_enabled and any(
+            x is not None and x.requires_grad for x in [q, k, v, sink]
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(3)
@@ -288,12 +298,13 @@ class _FlashAttnFunc(torch.autograd.Function):
                 return_softmax=return_softmax and dropout_p > 0,
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
+                sink=sink,
                 config=config,
             )
         )
 
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, sink)
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
             ctx.dropout_p = dropout_p
@@ -315,16 +326,22 @@ class _FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, sink = ctx.saved_tensors
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
+        dsink = (
+            torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
+        )
         head_size_v_og = do.size(3)
         do_padded = do
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
         if _USE_FUSED_BWD_KERNEL:
+            assert (
+                sink is None and dsink is None
+            ), "Fused backward doesn't support sinks."
             flash_attn_fused_backward(
                 do_padded,
                 q,
@@ -371,6 +388,8 @@ class _FlashAttnFunc(torch.autograd.Function):
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                sink=sink,
+                dsink=dsink,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -380,17 +399,18 @@ class _FlashAttnFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
-            None,
-            None,
-            None,
-            None,
+            None,  # dropout_p
+            None,  # softmax_scale
+            None,  # causal
+            None,  # window_size
             dbias,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # alibi_slopes
+            None,  # deterministic
+            None,  # return_lse
+            None,  # return_softmax
+            dsink,
+            None,  # is_grad_enabled
+            None,  # config
         )
 
 
@@ -407,6 +427,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    sink=None,
     config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -449,6 +470,7 @@ def flash_attn_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        sink: (nheads,), attention sink scores (one per Q head), or None
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -474,6 +496,7 @@ def flash_attn_func(
         deterministic,
         return_lse,
         return_attn_probs,
+        sink,
         torch.is_grad_enabled(),
         config,
     )
@@ -501,10 +524,13 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         out,
+        sink,
         is_grad_enabled,
         config=None,
     ):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        is_grad = is_grad_enabled and any(
+            x is not None and x.requires_grad for x in [q, k, v, sink]
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(2)
@@ -530,12 +556,13 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 max_seqlen_k=max_seqlen_k,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                sink=sink,
                 config=config,
             )
         )
         if is_grad:
             ctx.save_for_backward(
-                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k
+                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, sink
             )
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
@@ -559,16 +586,22 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, sink = ctx.saved_tensors
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
+        dsink = (
+            torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
+        )
         head_size_og = do.size(2)
         do_padded = do
         if head_size_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
 
         if _USE_FUSED_BWD_KERNEL:
+            assert (
+                sink is None and dsink is None
+            ), "Fused backward doesn't support sinks."
             flash_attn_fused_backward(
                 do_padded,
                 q,
@@ -615,6 +648,8 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                sink=sink,
+                dsink=dsink,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -624,24 +659,24 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # cu_seqlens_q,
+            None,  # cu_seqlens_k
+            None,  # max_seqlen_q
+            None,  # max_seqlen_k
+            None,  # dropout_p
+            None,  # softmax_scale
+            None,  # causal
+            None,  # window_size
             dbias,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # alibi_slopes
+            None,  # deterministic
+            None,  # return_lse
+            None,  # return_softmax
+            None,  # block_table
+            None,  # out
+            dsink,
+            None,  # is_grad_enabled
+            None,  # config
         )
 
 
@@ -664,6 +699,7 @@ def flash_attn_varlen_func(
     return_attn_probs=False,
     block_table=None,
     out=None,
+    sink=None,
     config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -712,6 +748,7 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        sink: (nheads,), attention sink scores (one per Q head), or None
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -744,6 +781,7 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         out,
+        sink,
         torch.is_grad_enabled(),
         config,
     )

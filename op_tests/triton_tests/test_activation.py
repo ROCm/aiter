@@ -1,8 +1,11 @@
 import torch
 import torch.nn.functional as F
 import pytest
-from .test_quant_mxfp4 import torch_dynamic_mxfp4_quant
-from .test_gemm_afp4wfp4 import shuffle_scales, un_shuffle_scales
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    shuffle_scales,
+    un_shuffle_scales,
+)
 from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 

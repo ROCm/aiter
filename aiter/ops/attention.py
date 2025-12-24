@@ -629,14 +629,15 @@ def get_mla_metadata_info_v1(
 
     max_qo_tiles_per_batch = (
         int(math.ceil(max_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
+        if num_head_qo == 16
+        or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
     if fast_mode:
-        max_work = tile_cnt + cu_num - 1
+        max_work = (batch_size + cu_num - 1) * max_qo_tiles_per_batch
         max_split_tiles = (
             min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
         )
