@@ -133,12 +133,15 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     else:
         avg_e = None
         err_e = None
+    if avg_d is not None:
+        TFLOPS = m * n * k * 2 / avg_d / 1e6
+        GBS = (x.nbytes + weight.nbytes) / avg_d / 1e3
     return {
-        "ck us": avg_b,
-        "ck bpreshuffle us": avg_c,
-        "asm us": avg_d,
-        "CK TFLOPS": TFLOPS,
-        "CK GBS": GBS,
+        "ck-us": avg_b,
+        "ck-bpreshuffle us": avg_c,
+        "asm-us": avg_d,
+        "ASM-TFLOPS": TFLOPS,
+        "ASM-GBS": GBS,
     }
 
 
