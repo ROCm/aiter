@@ -327,6 +327,7 @@ def mla_decode_fwd(
         )
 
         if nhead == 128:
+            # if False:
             aiter.hk_mla_decode_fwd(
                 q,
                 kv_buffer,
