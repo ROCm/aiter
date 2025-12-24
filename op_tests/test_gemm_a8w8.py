@@ -138,7 +138,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         GBS = (x.nbytes + weight.nbytes) / avg_d / 1e3
     return {
         "ck-us": avg_b,
-        "ck-bpreshuffle us": avg_c,
+        "ck-bpreshuffle-us": avg_c,
         "asm-us": avg_d,
         "ASM-TFLOPS": TFLOPS,
         "ASM-GBS": GBS,
