@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (C) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,21 +34,6 @@
   CHECK_TH_CUDA(x);    \
   CHECK_CONTIGUOUS(x)
 
-#ifdef USE_ROCM
-  #define FINAL_MASK 0xffffffffffffffffULL
-
-  #if defined(HIP_VERSION) && HIP_VERSION < 70000000
-// On ROCm versions before 7.0, __syncwarp isn't defined. The below
-// implementation is copy/pasted from the implementation in ROCm 7.0
-__device__ inline void __syncwarp() {
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-  __builtin_amdgcn_wave_barrier();
-  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-}
-  #endif
-#else
-  #define FINAL_MASK 0xffffffff
-#endif
 
 namespace aiter::common {
 template <typename T, int vec_size>
@@ -192,12 +177,6 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
   for (int i = 0; i < load_loop_cnt; i += 1) {
     int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim + laneId * numElemsPerThread) / vec_size;
     reinterpret_cast<ltype*>(elements)[i]  = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
-  }
-#pragma unroll
-  for (int i = 0; i < tail_elems; i++) {
-    int64_t offset = tokenIdx * num_heads * head_dim + localHeadIdx * head_dim
-                  + laneId * numElemsPerThread + load_loop_cnt * vec_size + i;
-    elements[load_loop_cnt * vec_size + i] = qkv_void[offset];
   }
 
   // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
