@@ -37,7 +37,10 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    float p_dropout,
                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset,
                                    const std::optional<at::Tensor> &cu_seqlens_q_,
-                                   const std::optional<at::Tensor> &cu_seqlens_kv_)
+                                   const std::optional<at::Tensor> &cu_seqlens_kv_,
+                                   const std::string& data_type,
+                                   bias_enum bias_type,
+                                   quant_scale_enum qscale_type)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -97,7 +100,16 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
     const ck_tile::index_t *cu_seqlen_q_ptr = cu_seqlens_q_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_q_.value().data_ptr<int32_t>()) : nullptr;
     const ck_tile::index_t *cu_seqlen_kv_ptr = cu_seqlens_kv_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_kv_.value().data_ptr<int32_t>()) : nullptr;
 
-    return mha_fwd_args{q.data_ptr(),
+    return mha_fwd_args{false, // use_asm_v3
+                        false, // v3_api_check
+                        1, // how_v3_bf16_cvt
+                        data_type,
+                        false, // is_group_mode
+                        static_cast<int>(bias_type),
+                        has_lse,
+                        static_cast<int>(qscale_type),
+                        mask.sink > 0, // hsa_sink
+                        q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
                         bias_ptr,
@@ -246,7 +258,6 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
-    bool has_sink = mask.sink > 0;
 
     TORCH_CHECK(!(bias_.has_value() && alibi_slopes_.has_value()), "cannot apply bias and alibi at the same time");
     bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
@@ -355,18 +366,12 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p_dropout,
                 drop_seed_offset,
                 cu_seqlens_q_,
-                cu_seqlens_kv_);
+                cu_seqlens_kv_,
+                dtype_str,
+                bias_type,
+                qscale_type);
 
-        float t = aiter::mha_fwd(args,
-                                 stream_config,
-                                 dtype_str,
-                                 false, // is_group_mode
-                                 mask.type,
-                                 bias_type,
-                                 has_lse,
-                                 qscale_type,
-                                 false,
-                                 has_sink);
+        float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {
