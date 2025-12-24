@@ -29,7 +29,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_out: torch.Tensor = None,
     decode_q_pe_out: torch.Tensor = None,
     k_pe_out: torch.Tensor = None,
-    q_out_dtype: torch.dtype=None,
+    q_out_dtype: torch.dtype = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -79,7 +79,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out: torch.Tensor = None,
     decode_q_pe_out: torch.Tensor = None,
     k_pe_out: torch.Tensor = None,
-    q_out_dtype: torch.dtype=None,
+    q_out_dtype: torch.dtype = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -127,7 +127,9 @@ def fused_qk_rope_cat_and_cache_mla(
     assert (d_freq == d_pe // 2) or (
         d_freq == d_pe
     ), "cos/sin last dim should be the same or half of the qk last dim"
-    assert num_decode_toks_for_zeros >= 0, "in case tensor creation failure"
+    assert (
+        num_decode_toks_for_zeros >= 0
+    ), "num_decode_toks_for_zeros must be non-negative to avoid invalid tensor creation"
     if isinstance(k_scale, torch.Tensor):
         assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
     reuse_freqs_front_part = d_freq == d_pe // 2
@@ -223,7 +225,7 @@ def fused_qk_rope_cat_and_cache_mla(
         num_warps=1,
     )
 
-    if q_nope_zeros_out == None:
+    if q_nope_zeros_out is None:
         # change q_nope_zeros_out from None to a tensor for torch compile
         q_nope_zeros_out = torch.empty(
             (num_decode_toks_for_zeros, qh, dk_nope),
