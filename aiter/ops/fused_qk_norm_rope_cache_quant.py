@@ -3,7 +3,6 @@
 
 from torch import Tensor
 from ..jit.core import compile_ops
-from typing import List
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
