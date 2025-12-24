@@ -40,7 +40,7 @@ try:
         tiles_per_warp=[1, 1],
     )
     _Use_2d_instr_shape_mfma_layout = tl.constexpr(True)
-except:
+except Exception:
     _Use_2d_instr_shape_mfma_layout = tl.constexpr(False)
 
 
@@ -381,11 +381,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
     LoadBlockIndiceForEachStage: gl.constexpr = ChunkKPerStage % KVBlockSize == 0
 
-    DS_WRITE: gl.constexpr = 0x200
+    # DS_WRITE: gl.constexpr = 0x200
     DS_READ: gl.constexpr = 0x100
     BUFFER_LOAD: gl.constexpr = 0x020
     MFMA: gl.constexpr = 0x008
-    VALU: gl.constexpr = 0x002
+    # VALU: gl.constexpr = 0x002
 
     # ===---------------------------------------------------
     # Mapping WorkTile
@@ -1175,11 +1175,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
 
     LoadBlockIndiceForEachStage: gl.constexpr = ChunkKPerStage % KVBlockSize == 0
 
-    DS_WRITE: gl.constexpr = 0x200
+    # DS_WRITE: gl.constexpr = 0x200
     DS_READ: gl.constexpr = 0x100
     BUFFER_LOAD: gl.constexpr = 0x020
     MFMA: gl.constexpr = 0x008
-    VALU: gl.constexpr = 0x002
+    # VALU: gl.constexpr = 0x002
 
     # ===---------------------------------------------------
     # Mapping WorkTile
