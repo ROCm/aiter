@@ -75,10 +75,10 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     head_size: int,
     is_neox_style: bool,
     eps: float,
-    k_cache: Tensor,    # [num_blocks, num_heads_k, head_size // x, page_size, x]
-    v_cache: Tensor,    # [num_blocks, num_heads_v, head_size, page_size]
-    k_scale: Tensor,    # [num_blocks, page_size]
-    v_scale: Tensor,    # [num_blocks, page_size]
+    k_cache: Tensor,  # [num_blocks, num_heads_k, head_size // x, page_size, x]
+    v_cache: Tensor,  # [num_blocks, num_heads_v, head_size, page_size]
+    k_scale: Tensor,  # [num_blocks, page_size]
+    v_scale: Tensor,  # [num_blocks, page_size]
     slot_mapping: Tensor,
     kv_cache_dtype: str,
 ):
@@ -100,7 +100,6 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     cos_sin = cos_sin[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
 
-
     q_shape = q.shape
     q = q.view(num_tokens, -1, head_size)
     q = apply_rotary_emb_dispatch(q, cos, sin, is_neox_style)
@@ -113,10 +112,23 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     v = v.view(num_tokens, -1, head_size)
 
     from aiter import reshape_and_cache_with_pertoken_quant, reshape_and_cache
+
     if kv_cache_dtype == "auto":
-        reshape_and_cache(k, v, k_cache, v_cache, slot_mapping, kv_cache_dtype, None, None, asm_layout=True)
+        reshape_and_cache(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            None,
+            None,
+            asm_layout=True,
+        )
     else:
-        reshape_and_cache_with_pertoken_quant(k, v, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout=True)
+        reshape_and_cache_with_pertoken_quant(
+            k, v, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout=True
+        )
 
     k = k.reshape(k_shape)
     v = v.reshape(k_shape)
@@ -207,25 +219,27 @@ def test_qk_norm_rope_cache_quant(
     k_scale_ref = k_scale.clone()
     v_scale_ref = v_scale.clone()
 
-    (q_ref, k_ref, v_ref, k_cache_ref, v_cache_ref), avg_torch = run_torch_qk_norm_rope_cache_quant_shuffle(
-        qkv,
-        qw,
-        kw,
-        cos_sin,
-        positions,
-        num_tokens,
-        num_heads_q,
-        num_heads_k,
-        num_heads_v,
-        head_size,
-        is_neox_style,
-        eps,
-        k_cache,
-        v_cache,
-        k_scale_ref,
-        v_scale_ref,
-        slot_mapping,
-        kv_cache_dtype,
+    (q_ref, k_ref, v_ref, k_cache_ref, v_cache_ref), avg_torch = (
+        run_torch_qk_norm_rope_cache_quant_shuffle(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            k_cache,
+            v_cache,
+            k_scale_ref,
+            v_scale_ref,
+            slot_mapping,
+            kv_cache_dtype,
+        )
     )
     (q, k, v, k_cache, v_cache), avg_cu = run_aiter_qk_norm_rope_cache_quant_shuffle(
         qkv,
@@ -246,19 +260,22 @@ def test_qk_norm_rope_cache_quant(
         kv_cache_dtype,
         k_scale,
         v_scale,
-
     )
 
-
     info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
-    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
+    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch / avg_cu - 1:<5.1%}"
     checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
     checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
     checkAllclose(v_ref, v, msg=msg, rtol=1e-2, atol=0.05)
-    checkAllclose(k_cache_ref.float(), k_cache.float(), msg="k_cache", rtol=1e-2, atol=0.05)
-    checkAllclose(v_cache_ref.float(), v_cache.float(), msg="v_cache", rtol=1e-2, atol=0.05)
+    checkAllclose(
+        k_cache_ref.float(), k_cache.float(), msg="k_cache", rtol=1e-2, atol=0.05
+    )
+    checkAllclose(
+        v_cache_ref.float(), v_cache.float(), msg="v_cache", rtol=1e-2, atol=0.05
+    )
     checkAllclose(k_scale_ref, k_scale, msg="k_scale", rtol=1e-2, atol=0.05)
     checkAllclose(v_scale_ref, v_scale, msg="v_scale", rtol=1e-2, atol=0.05)
+
 
 if __name__ == "__main__":
     # rope
@@ -274,19 +291,43 @@ if __name__ == "__main__":
     for is_neox_style in is_neox_styles:
         for num_token in num_tokens:
             for num_head, num_kv_head in num_heads:
-                k_scale = torch.zeros([num_blocks, num_kv_head, page_size], dtype=torch.float32, device="cuda")
-                v_scale = torch.zeros([num_blocks, num_kv_head, page_size], dtype=torch.float32, device="cuda")
+                k_scale = torch.zeros(
+                    [num_blocks, num_kv_head, page_size],
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                v_scale = torch.zeros(
+                    [num_blocks, num_kv_head, page_size],
+                    dtype=torch.float32,
+                    device="cuda",
+                )
                 for i, head_size in enumerate(head_sizes):
                     for kv_cache_dtype in kv_cache_dtypes:
                         if kv_cache_dtype == "fp8_e4m3":
                             cache_dtype = torch.float8_e4m3fnuz
                         else:
                             cache_dtype = dtype
-                        k_cache = torch.randn([num_blocks, page_size, num_kv_head, head_size], dtype=dtype, device='cuda').to(cache_dtype)
-                        v_cache = torch.randn([num_blocks, page_size, num_kv_head, head_size], dtype=dtype, device='cuda').to(cache_dtype)
-                        slot_mapping = torch.randperm(num_token,  dtype=torch.int64, device='cuda')
+                        k_cache = torch.randn(
+                            [num_blocks, page_size, num_kv_head, head_size],
+                            dtype=dtype,
+                            device="cuda",
+                        ).to(cache_dtype)
+                        v_cache = torch.randn(
+                            [num_blocks, page_size, num_kv_head, head_size],
+                            dtype=dtype,
+                            device="cuda",
+                        ).to(cache_dtype)
+                        slot_mapping = torch.randperm(
+                            num_token, dtype=torch.int64, device="cuda"
+                        )
                         x = 16 // k_cache.element_size()
-                        k_cache = k_cache.view([num_blocks, page_size, num_kv_head, head_size // x, x]).permute(0, 2, 3, 1, 4).contiguous()
+                        k_cache = (
+                            k_cache.view(
+                                [num_blocks, page_size, num_kv_head, head_size // x, x]
+                            )
+                            .permute(0, 2, 3, 1, 4)
+                            .contiguous()
+                        )
                         v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
 
                         test_qk_norm_rope_cache_quant(
