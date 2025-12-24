@@ -622,7 +622,7 @@ def test_mla(
 
     num_dbg_tr_rows = max(total_q * nhead, kv_indptr[-1].item())
     dbg_tr = torch.empty((num_dbg_tr_rows, qk_head_dim), dtype=torch.float32).fill_(
-        -233.0
+        -0.233
     )
 
     def test_absorb_decode_bf16():

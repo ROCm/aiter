@@ -328,6 +328,7 @@ def mla_decode_fwd(
 
         if nhead == 128:
             # if False:
+            o.fill_(234.5)
             aiter.hk_mla_decode_fwd(
                 q,
                 kv_buffer,
@@ -349,55 +350,68 @@ def mla_decode_fwd(
             kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
             for i in range(bs):
                 key = kvs[i]
+                value, _ = torch.split(key, [512, 64], dim=-1)
                 query = qs[i]
                 qk = (
                     torch.einsum("qhd,khd->hqk", query.float(), key.float()).squeeze(1)
                     * sm_scale
                 )
-                qk_exp = torch.empty_like(qk)
-                for kv_start in range(0, qk.shape[1], 32):
-                    kv_end = min(kv_start + 32, qk.shape[1])
-                    max_tile = qk[:, :kv_end]
-                    m = max_tile.max(-1).values
-                    p_tile = torch.exp(qk[:, kv_start:kv_end] - m.unsqueeze(-1))
-                    qk_exp[:, kv_start:kv_end] = p_tile
-                dbg_qk = dbg_tr[i * nhead : (i + 1) * nhead, : qk.shape[1]]
-                checkAllclose(dbg_qk, qk_exp, msg=f"dbg[{i}] vs. qk[{i}]")
+                lse = qk.logsumexp(dim=-1)
+                m = qk.max(-1).values
+                qk_exp = torch.exp(qk - m.unsqueeze(-1)).unsqueeze(1)
+                l = qk_exp.sum(-1)
+                out = torch.einsum(
+                    "hqk,khd->qhd", qk_exp.to(value.dtype).float(), value.float()
+                )
+                out = out / l.transpose(0, 1).unsqueeze(-1)
+                # checkAllclose(o[i], out[0].to(o.dtype), msg=f"o[{i}] vs. out[{i}]")
+                print(f"{dbg_tr.shape=}, {dbg_tr[: bs * nhead, :512].shape=}")
+                print(dbg_tr[: bs * nhead, :512])
 
+                pp = qk_exp[0][0].to(value.dtype)
+                vv = value[:, :, 0].squeeze(-1)
+                rr = pp.to(torch.float32) @ vv.to(torch.float32)
+                # torch.set_printoptions(threshold=99999)
+                print(f"{pp=}\n{vv=}")
+
+                checkAllclose(
+                    dbg_tr[: bs * nhead, :512], out[0], msg=f"dbg_tr[{i}] vs. out[{i}]"
+                )
             exit()
 
-        aiter.mla_decode_stage1_asm_fwd(
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            num_kv_splits_indptr,
-            work_meta_data,
-            work_indptr,
-            work_info_set,
-            max_seqlen_q,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            logits,
-            attn_lse,
-            o,
-            q_scale,
-            kv_scale,
-        )
+        else:
+            aiter.mla_decode_stage1_asm_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                work_meta_data,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                page_size,
+                nhead_kv,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+                q_scale,
+                kv_scale,
+            )
 
-        aiter.mla_reduce_v1(
-            logits,
-            attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            max_seqlen_q,
-            o,
-            final_lse,
-        )
+            aiter.mla_reduce_v1(
+                logits,
+                attn_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                o,
+                final_lse,
+            )
 
     if io_transformed:
         if return_logits:
