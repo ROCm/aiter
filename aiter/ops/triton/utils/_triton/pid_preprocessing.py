@@ -42,14 +42,9 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     # Note that we need to consider the following two cases:
     # 1. the current pid is on a tall xcd
     # 2. the current pid is on a short xcd
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = (
-            tall_xcds * pids_per_xcd
-            + (xcd - tall_xcds) * (pids_per_xcd - 1)
-            + local_pid
-        )
+    # FIX compilation issue
+    u = min(xcd, tall_xcds)
+    pid = u * pids_per_xcd + (xcd - u) * (pids_per_xcd - 1) + local_pid
 
     return pid
 
