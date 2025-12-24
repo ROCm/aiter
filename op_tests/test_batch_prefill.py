@@ -10,7 +10,6 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter import per_tensor_quant
-from aiter.test_common import run_perftest
 from einops import rearrange, repeat
 import argparse
 
@@ -702,7 +701,7 @@ def test_batch_prefill_vs_varlen_fp8(
     )
 
     # Compare results (all tokens are valid, no padding)
-    print(f"\n=== FP8 Comparison: batch_prefill vs varlen ===")
+    print("\n=== FP8 Comparison: batch_prefill vs varlen ===")
     print(
         f"batch_size={batch_size}, heads={num_qo_heads}/{num_kv_heads}, "
         f"dim={head_dim}, qo_len={qo_len}, kv_len={kv_len}"
