@@ -106,7 +106,7 @@ def ref_masked_attention(
         (2048, 2048),
     ],
 )
-@pytest.mark.parametrize("page_size", [1, 1024])
+@pytest.mark.parametrize("page_size", [128, 256, 1024])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (3, 1)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
@@ -116,7 +116,7 @@ def ref_masked_attention(
 @pytest.mark.parametrize("q_init_min,q_init_max", [(-10, 10)])
 @pytest.mark.parametrize("kv_init_min,kv_init_max", [(-5, 5)])
 @pytest.mark.parametrize("seed", [19378])
-def test_batch_prefill_with_paged_kv_cache(
+def test_batch_prefill_sglang(
     batch_size,
     kv_len,
     qo_len,
@@ -142,8 +142,9 @@ def test_batch_prefill_with_paged_kv_cache(
 
     if head_dim == 64 and qo_len <= 64:
         pytest.skip("Unsupported configuration")
-    if page_size % 8 != 0:
-        pytest.skip("Swizzled V layout requires page size divisible by 8")
+    k_vector_size = 16 // torch.tensor([], dtype=dtype).element_size()
+    if page_size % k_vector_size != 0:
+        pytest.skip("Vectorized V layout requires page size divisible by vector size")
 
     def create_tensor(min, max, *args, **kwargs):
         x = torch.randn(*args, **kwargs)
@@ -191,15 +192,20 @@ def test_batch_prefill_with_paged_kv_cache(
     v_cache_ref = chunks[1].squeeze(1).squeeze(1)
 
     # Swizzle K and V for the kernel
-    # K: [NumPages, PageSize, NumHeads, HeadDim] -> [NumPages, NumHeads, HeadDim/8, PageSize, 8]
-    assert head_dim % 8 == 0, "Head dim must be divisible by 8 for swizzled K layout"
-    k_cache = k_cache_ref.view(total_num_pages, page_size, num_kv_heads, head_dim // 8, 8) \
+    # K: [NumPages, PageSize, NumHeads, HeadDim] ->
+    #    [NumPages, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]
+    assert head_dim % k_vector_size == 0, "Head dim must be divisible by vector size"
+    k_cache = k_cache_ref.view(
+        total_num_pages, page_size, num_kv_heads, head_dim // k_vector_size, k_vector_size
+    ) \
                          .permute(0, 2, 3, 1, 4).contiguous()
 
-    # V: [NumPages, PageSize, NumHeads, HeadDim] -> [NumPages, NumHeads, PageSize/8, HeadDim, 8]
-    # Note: PageSize must be divisible by 8 for this layout
-    assert page_size % 8 == 0, "Page size must be divisible by 8 for swizzled V layout"
-    v_cache = v_cache_ref.view(total_num_pages, page_size // 8, 8, num_kv_heads, head_dim) \
+    # V: [NumPages, PageSize, NumHeads, HeadDim] ->
+    #    [NumPages, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]
+    assert page_size % k_vector_size == 0, "Page size must be divisible by vector size"
+    v_cache = v_cache_ref.view(
+        total_num_pages, page_size // k_vector_size, k_vector_size, num_kv_heads, head_dim
+    ) \
                          .permute(0, 3, 1, 4, 2).contiguous()
 
     o_ck_flash_attn = aiter.mha_batch_prefill_func(
@@ -266,10 +272,162 @@ def test_batch_prefill_with_paged_kv_cache(
         o_i = o_ck_flash_attn[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         torch.testing.assert_close(o_i, o_ref_i, rtol=rtol, atol=atol)
 
+@pytest.mark.parametrize("batch_size", [1, 3, 7])
+@pytest.mark.parametrize(
+    "qo_len,kv_len",
+    [
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+    ],
+)
+@pytest.mark.parametrize("page_size", [128, 256, 1024])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (3, 1)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seed", [19378])
+def test_batch_prefill_vllm(
+    batch_size,
+    kv_len,
+    qo_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    causal,
+    logits_soft_cap,
+    dtype,
+    seed,
+):
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    if causal and kv_len < qo_len:
+        pytest.skip("kv_len < qo_len is not allowed if causal=True")
+
+    k_vector_size = 16 // torch.tensor([], dtype=dtype).element_size()
+    if page_size % k_vector_size != 0:
+        pytest.skip("Vectorized V layout requires page size divisible by vector size")
+
+    def create_tensor(min, max, *args, **kwargs):
+        x = torch.randn(*args, **kwargs)
+        x = (x - x.min()) / (x.max() - x.min())
+        return min + (max - min) * x
+
+    def convert_lens_to_indtpr(lens):
+        return torch.cumsum(torch.cat((torch.tensor([0]), lens)), dim=0).int()
+
+    q = create_tensor(
+        -10, 10, batch_size * qo_len, num_qo_heads, head_dim, dtype=dtype
+    ).to(0)
+    if 1 < batch_size:
+        qo_lens = torch.randint(1, qo_len + 1, (batch_size,)).int()
+    else:
+        qo_lens = torch.full((batch_size,), qo_len).int()
+    q_indptr_cpu = convert_lens_to_indtpr(qo_lens)
+    max_num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = max_num_pages_per_seq * batch_size
+    kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]
+    kv_data_fp32 = create_tensor(-5, 5, *kv_shape, dtype=torch.float32).to(0)
+    kv_data = kv_data_fp32.to(dtype)
+    if 1 < batch_size:
+        kv_lens = torch.maximum(
+            qo_lens, torch.randint(1, kv_len + 1, (batch_size,))
+        ).int()
+    else:
+        kv_lens = torch.full((batch_size,), kv_len).int()
+    kv_num_used_pages = (kv_lens + page_size - 1) // page_size
+    kv_indptr_cpu = convert_lens_to_indtpr(kv_num_used_pages)
+    kv_indices_cpu = torch.nn.functional.pad(
+        torch.randperm(total_num_pages).int(), (0, 128), value=0
+    )
+    kv_last_page_len_cpu = ((kv_lens - 1) % page_size + 1).int()
+
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_indptr_cpu.to(0)
+    kv_indices_gpu = kv_indices_cpu.to(0)
+    kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
+    seqlen_k_gpu = kv_lens.to(0).int()
+
+    block_table_cpu = torch.zeros(
+        (batch_size, max_num_pages_per_seq), dtype=torch.int32
+    )
+    for i in range(batch_size):
+        start = kv_indptr_cpu[i].item()
+        end = kv_indptr_cpu[i + 1].item()
+        block_table_cpu[i, : (end - start)] = kv_indices_cpu[start:end]
+    block_table_gpu = block_table_cpu.to(0)
+
+    chunks = torch.chunk(kv_data, 2, dim=1)
+    k_cache_ref = chunks[0].squeeze(1).squeeze(1)
+    v_cache_ref = chunks[1].squeeze(1).squeeze(1)
+
+    k_cache = k_cache_ref.view(
+        total_num_pages, page_size, num_kv_heads, head_dim // k_vector_size, k_vector_size
+    ).permute(0, 2, 3, 1, 4).contiguous()
+    v_cache = v_cache_ref.view(
+        total_num_pages, page_size // k_vector_size, k_vector_size, num_kv_heads, head_dim
+    ).permute(0, 3, 1, 4, 2).contiguous()
+
+    o_ck_flash_attn = aiter.mha_batch_prefill_func(
+        q,
+        k_cache,
+        v_cache,
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        torch.max(qo_lens).item(),
+        torch.max(kv_lens).item(),
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        kv_last_page_lens=kv_last_page_len_gpu,
+        block_table=block_table_gpu,
+        seqlen_k=seqlen_k_gpu,
+    )
+
+    for i in range(batch_size):
+        perm_dims = [0, 1, 2, 3]
+        perm_dims_last = [0, 1, 2]
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+        used_kv_indices = kv_indices_cpu[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+        ki = torch.cat(
+            [
+                kv_data_fp32[used_kv_indices[:-1], 0]
+                .permute(*perm_dims)
+                .reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_kv_indices[-1], 0, : kv_last_page_len_cpu[i], :]
+                .permute(*perm_dims_last)
+                .reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        ).to(dtype)
+        vi = torch.cat(
+            [
+                kv_data_fp32[used_kv_indices[:-1], 1]
+                .permute(*perm_dims)
+                .reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_kv_indices[-1], 1, : kv_last_page_len_cpu[i], :]
+                .permute(*perm_dims_last)
+                .reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        ).to(dtype)
+
+        rtol, atol = (2e-2, 1e-2)
+        o_ref_i = ref_masked_attention(
+            qi, ki, vi, causal=causal, logits_soft_cap=logits_soft_cap
+        )
+
+        o_i = o_ck_flash_attn[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+        torch.testing.assert_close(o_i, o_ref_i, rtol=rtol, atol=atol)
 
 l_causal = [False, True]
 l_logits_soft_cap = [0.0, 30.0]
 l_dtype = ["fp16", "bf16"]
+l_lookup_table = ["sglang", "vllm"]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -342,6 +500,18 @@ parser.add_argument(
     help="""number of kv head.
     e.g.: -h_k 8""",
 )
+parser.add_argument(
+    "-t",
+    "--lookup_table",
+    type=str,
+    const=None,
+    choices=l_lookup_table,
+    default="sglang",
+    nargs="?",
+    help="""lookup table.
+    e.g.: -t sglang""",
+)
+
 if __name__ == "__main__":
     args = parser.parse_args()
     if args.dtype is None:
@@ -352,28 +522,47 @@ if __name__ == "__main__":
         l_causal = [args.causal]
     if args.logits_soft_cap is not None:
         l_logits_soft_cap = [args.logits_soft_cap]
+    if args.lookup_table is not None:
+        l_lookup_table = [args.lookup_table]
 
     for (
         causal,
         logits_soft_cap,
         dtype,
-    ) in itertools.product(l_causal, l_logits_soft_cap, l_dtype):
-        print(f"causal={causal}, logits_soft_cap={logits_soft_cap}, dtype={dtype}")
-        test_batch_prefill_with_paged_kv_cache(
-            batch_size=1,
-            kv_len=args.seqlen,
-            qo_len=args.seqlen,
-            page_size=args.pagesize,
-            num_qo_heads=args.headq,
-            num_kv_heads=args.headk,
-            head_dim=128,
-            causal=causal,
-            kv_layout="NHD",
-            logits_soft_cap=logits_soft_cap,
-            dtype=dtype,
-            q_init_min=-10,
-            q_init_max=10,
-            kv_init_min=-5,
-            kv_init_max=5,
-            seed=19378,
-        )
+        lookup_table,
+    ) in itertools.product(l_causal, l_logits_soft_cap, l_dtype, l_lookup_table):
+        print(f"causal={causal}, logits_soft_cap={logits_soft_cap}, dtype={dtype}, lookup_table={lookup_table}")
+
+        if lookup_table == "vllm":
+            test_batch_prefill_vllm(
+                batch_size=1,
+                kv_len=args.seqlen,
+                qo_len=args.seqlen,
+                page_size=args.pagesize,
+                num_qo_heads=args.headq,
+                num_kv_heads=args.headk,
+                head_dim=128,
+                causal=causal,
+                logits_soft_cap=logits_soft_cap,
+                dtype=dtype,
+                seed=19378,
+            )
+        else:
+            test_batch_prefill_sglang(
+                batch_size=1,
+                kv_len=args.seqlen,
+                qo_len=args.seqlen,
+                page_size=args.pagesize,
+                num_qo_heads=args.headq,
+                num_kv_heads=args.headk,
+                head_dim=128,
+                causal=causal,
+                kv_layout="NHD",
+                logits_soft_cap=logits_soft_cap,
+                dtype=dtype,
+                q_init_min=-10,
+                q_init_max=10,
+                kv_init_min=-5,
+                kv_init_max=5,
+                seed=19378,
+            )
