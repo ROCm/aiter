@@ -22,7 +22,6 @@
 #include "vec_convert.h"
 #include <torch/cuda.h>
 
-
 #define CHECK_TYPE(x, st) \
     TORCH_CHECK(          \
         x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
@@ -176,17 +175,16 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
                                             : localHeadIdx;
     constexpr int numElemsPerThread = head_dim / 32;
     scalar_t elements[numElemsPerThread];
-    constexpr int best_vec_size = sizeof(float2) / sizeof(scalar_t);
+    constexpr int best_vec_size = sizeof(float4) / sizeof(scalar_t);
     constexpr int vec_size      = std::min(best_vec_size, numElemsPerThread);
     constexpr int load_loop_cnt = numElemsPerThread / vec_size;
     using ltype                 = ::vec_t<scalar_t, vec_size>;
-    using stype                 = ::vec_t<kv_cache_scalar_t, vec_size>;
-    constexpr int tail_elems    = numElemsPerThread % vec_size;
     const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
     const float inverted_vscale = v_scale == nullptr ? 1.0f : 1 / (*v_scale);
 
 #pragma unroll
-    // Load data first
+    // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
+    // kernel launch
     for(int i = 0; i < load_loop_cnt; i += 1)
     {
         int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
@@ -287,13 +285,6 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
             reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] =
                 reinterpret_cast<ltype*>(elements)[i];
         }
-#pragma unroll
-        for(int i = 0; i < tail_elems; i++)
-        {
-            int64_t offset = tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
-                             laneId * numElemsPerThread + load_loop_cnt * vec_size + i;
-            qkv_void[offset] = elements[load_loop_cnt * vec_size + i];
-        }
     }
 
     if(isQ)
@@ -315,6 +306,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
     float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
     float warp_max  = elements[0];
 
+    // If quantization is required, compute the max abs value across the head_dim * num_heads
     if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
     {
         auto f_absmax_f32 = [](float v_0_, float v_1_) {
