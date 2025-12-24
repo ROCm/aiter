@@ -49,10 +49,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 PyNcclCommunicator,
             )
 
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group,
-                device=self.device,
-            )
+            try:
+                self.pynccl_comm = PyNcclCommunicator(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize PyNcclCommunicator for group "
+                    f"{self.unique_name}. Exception: {e}"
+                )
             # if is_symmetric_memory_enabled():
             #     register_nccl_symmetric_ops(self.pynccl_comm)
 
@@ -149,6 +155,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             qr_comm is not None
             and not qr_comm.disabled
             and qr_comm.should_quick_allreduce(input_)
+            and (input_.nelement() * input_.element_size()) >= 4*1024*1024 # input shape should be such that quick reduce will show benefits.
+            # input shape estimated at 2 * max concurrency for now. if performance issues, subject to change
         ):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None

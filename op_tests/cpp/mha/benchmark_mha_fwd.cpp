@@ -1053,6 +1053,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                               lse,
                               quant_scale_enum::no_scale,
                               fwd_v3,
+                              false, /*has_sink*/
                               v3_bf16_cvt,
                               nullptr,
                               nullptr,
