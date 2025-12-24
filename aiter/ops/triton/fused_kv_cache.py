@@ -52,11 +52,19 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     if k_pe_out is None:
         k_pe_out = torch.empty((bk, kh, d_pe), dtype=k_pe.dtype, device=k_pe.device)
 
-    q_nope_zeros_out = torch.empty(
-        (num_decode_toks_for_zeros, qh, dk_nope),
-        dtype=q_nope.dtype,
-        device=q_nope.device,
-    )
+
+    if num_decode_toks_for_zeros > 0:
+        q_nope_zeros_out = torch.empty(
+            (num_decode_toks_for_zeros, qh, dk_nope),
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+    else:
+        q_nope_zeros_out = torch.empty(
+            (0, qh, dk_nope),
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
 
     return q_out, decode_q_pe_out, k_pe_out, kv_cache, q_nope_zeros_out
 
