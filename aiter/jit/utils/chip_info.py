@@ -55,6 +55,22 @@ def get_gfx_custom_op() -> int:
 
 
 @functools.lru_cache(maxsize=10)
+def get_native_gpu_arch() -> str:
+    try:
+        rocminfo = executable_path("rocminfo")
+        result = subprocess.run(
+            [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        output = result.stdout
+        for line in output.split("\n"):
+            if "gfx" in line.lower():
+                return line.split(":")[-1].strip()
+    except Exception as e:
+        raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
+    raise RuntimeError("No gfx arch found in rocminfo output.")
+
+
+@functools.lru_cache(maxsize=10)
 def get_gfx_custom_op_core() -> int:
     gfx = os.getenv("GPU_ARCHS", "native")
     gfx_mapping = {v: k for k, v in GFX_MAP.items()}

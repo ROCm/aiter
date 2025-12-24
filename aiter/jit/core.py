@@ -20,7 +20,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list
+from chip_info import get_gfx, get_gfx_list, get_native_gpu_arch
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from torch_guard import torch_compile_guard  # noqa: E402
@@ -487,11 +487,12 @@ __mds = {}
 @torch_compile_guard()
 def get_module_custom_op(md_name: str) -> None:
     global __mds
+    arch = get_native_gpu_arch()
     if md_name not in __mds:
         if "AITER_JIT_DIR" in os.environ:
-            __mds[md_name] = importlib.import_module(md_name)
+            __mds[md_name] = importlib.import_module(f"{arch}.{md_name}")
         else:
-            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+            __mds[md_name] = importlib.import_module(f"{__package__}.{arch}.{md_name}")
         logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
     return
 
@@ -545,8 +546,6 @@ def build_module(
         opbd_dir = f"{op_dir}/build"
         src_dir = f"{op_dir}/build/srcs"
         os.makedirs(src_dir, exist_ok=True)
-        if os.path.exists(f"{get_user_jit_dir()}/{target_name}"):
-            os.remove(f"{get_user_jit_dir()}/{target_name}")
 
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
@@ -598,8 +597,6 @@ def build_module(
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
-        archs = validate_and_update_archs()
-        flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
@@ -650,44 +647,57 @@ def build_module(
                     bd_include_dir,
                     hipify,
                 )
-
-        try:
-            _jit_compile(
-                md_name,
-                sorted(set(sources)),
-                extra_cflags=flags_cc,
-                extra_cuda_cflags=flags_hip,
-                extra_ldflags=extra_ldflags,
-                extra_include_paths=extra_include_paths,
-                build_directory=opbd_dir,
-                verbose=verbose or AITER_LOG_MORE > 0,
-                with_cuda=True,
-                is_python_module=is_python_module,
-                is_standalone=is_standalone,
-                torch_exclude=torch_exclude,
-                hipify=hipify,
+        archs = validate_and_update_archs()
+        for arch in archs:
+            if os.path.exists(os.path.join(get_user_jit_dir(), arch, target_name)):
+                os.remove(os.path.join(get_user_jit_dir(), arch, target_name))
+            if not os.path.exists(os.path.join(opbd_dir, arch)):
+                os.makedirs(os.path.join(opbd_dir, arch))
+            if not os.path.exists(os.path.join(get_user_jit_dir(), arch)):
+                os.makedirs(os.path.join(get_user_jit_dir(), arch))
+            logger.info(
+                f"build for md_name = {md_name}, arch = {arch}, sources = {sources}"
             )
-            if is_python_module and not is_standalone:
-                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
-            else:
-                shutil.copy(
-                    f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
+            try:
+                _jit_compile(
+                    md_name,
+                    sorted(set(sources)),
+                    extra_cflags=flags_cc,
+                    extra_cuda_cflags=flags_hip + [f"--offload-arch={arch}"],
+                    extra_ldflags=extra_ldflags,
+                    extra_include_paths=extra_include_paths,
+                    build_directory=opbd_dir,
+                    verbose=verbose or AITER_LOG_MORE > 0,
+                    with_cuda=True,
+                    is_python_module=is_python_module,
+                    is_standalone=is_standalone,
+                    torch_exclude=torch_exclude,
+                    hipify=hipify,
                 )
-        except Exception as e:
-            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
-            logger.error(
-                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
-                    re.sub(
-                        "error:",
-                        "\033[31merror:\033[0m",
-                        "-->".join(traceback.format_exception(*sys.exc_info())),
-                        flags=re.I,
-                    ),
+                if is_python_module and not is_standalone:
+                    shutil.copy(
+                        f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}/{arch}"
+                    )
+                else:
+                    shutil.copy(
+                        f"{opbd_dir}/{target_name}",
+                        f"{AITER_ROOT_DIR}/op_tests/cpp/mha",
+                    )
+            except Exception as e:
+                tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
+                logger.error(
+                    f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
+                        re.sub(
+                            "error:",
+                            "\033[31merror:\033[0m",
+                            "-->".join(traceback.format_exception(*sys.exc_info())),
+                            flags=re.I,
+                        ),
+                    )
                 )
-            )
-            raise SystemExit(
-                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
-            ) from e
+                raise SystemExit(
+                    f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+                ) from e
 
     def FinalFunc():
         logger.info(
@@ -812,7 +822,7 @@ def compile_ops(
                 if module is None:
                     try:
                         module = get_module(md_name)
-                    except Exception as e:
+                    except Exception:
                         md = custom_build_args.get("md_name", md_name)
                         module = get_module(md)
             except ModuleNotFoundError:
@@ -859,7 +869,8 @@ def compile_ops(
                         os.environ["HIP_CLANG_PATH"] = prev_hip_clang_path
                     else:
                         os.environ.pop("HIP_CLANG_PATH", None)
-
+                native_arch = get_gfx()
+                print(f"show native arch = {native_arch}")
                 if is_python_module:
                     module = get_module(md_name)
                 if md_name not in __mds:
