@@ -801,7 +801,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
             ),
             block_m,
-            ksplit,
+            int(ksplit),
             run_1stage,
         )
 
@@ -1441,7 +1441,7 @@ def ck_moe_stage1(
         sorted_weights,
         quant_type,
         activation,
-        splitk,
+        int(splitk),
         out.dtype,
     )
     if splitk > 1:
