@@ -516,7 +516,8 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=dtypes.str2Dtype,
-    default=dtypes.str2Dtype("bf16,fp8"),
+    default=dtypes.str2Dtype("bf16"),
+    choices=["bf16", "fp8"],
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
@@ -524,7 +525,8 @@ parser.add_argument(
     "-kvd",
     "--kv_dtype",
     type=dtypes.str2Dtype,
-    default=dtypes.str2Dtype("bf16,fp8"),
+    default=dtypes.str2Dtype("bf16"),
+    choices=["bf16", "fp8"],
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
