@@ -842,7 +842,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
             ),
             block_m,
-            ksplit,
+            int(ksplit),
             run_1stage,
         )
 
