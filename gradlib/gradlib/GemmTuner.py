@@ -22,6 +22,7 @@ from functools import lru_cache
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import argparse
 
 import aiter
 from aiter import dtypes, get_semaphore_workspace, logger
@@ -176,6 +177,7 @@ class Gemm:
         err_ratio=0.01,
         profile_file="",
         num_warmup=10,
+        libtype=["all"],
         # splitK=None,
     ):
         torch.cuda.empty_cache()
@@ -211,6 +213,7 @@ class Gemm:
         self.asm_map = {}
         self.has_bias = bias
         self.num_warmup = num_warmup
+        self.libtype = libtype
 
     def find_hipblas_sols(self):
         sols = aiter.hipb_findallsols(
@@ -397,8 +400,10 @@ class Gemm:
 
     def run_asm_triton_sols(self):
         tasks = []
-        tasks.extend(self.triton_egmm_all_sols())
-        tasks.extend(self.asm_gemm_all_solutions())
+        if "all" in self.libtype or "triton" in self.libtype:
+            tasks.extend(self.triton_gemm_all_sols())
+        if "all" in self.libtype or "asm" in self.libtype:
+            tasks.extend(self.asm_gemm_all_solutions())
         solutions = len(tasks)
         in_data = [
             (
@@ -409,7 +414,7 @@ class Gemm:
         ret = mp_tuner(tasks, in_data, self.mp, False)
         return ret
 
-    def triton_egmm_all_sols(self):
+    def triton_gemm_all_sols(self):
         if self.scaleAB or self.is_shuffle or self.outdtype == dtypes.fp32:
             print(
                 f"Triton gemm_a16w16 does not support scaling{self.scaleAB} or weight shuffle {self.is_shuffle}  or fp32 output {self.outdtype} yet"
@@ -582,14 +587,17 @@ class Gemm:
         rets_hipb_fast = self.hipb_time_all_sols(fast_mode=1)
 
     def run_best_solutions(self):
-        self.warmup()
-        rets_hipb = self.hipb_time_all_sols(fast_mode=0, top_sols=1)
+        rets_hipb = []
+        if "all" in self.libtype or "hipblaslt" in self.libtype:
+            self.warmup()
+            rets_hipb = self.hipb_time_all_sols(fast_mode=0, top_sols=1)
         rets_asm = self.run_asm_triton_sols()
         return rets_hipb + rets_asm
 
     def run_solutions(self):
-        self.run_fast_solutions()
-        self.functional_get_topn_fastest()
+        if "all" in self.libtype or "hipblaslt" in self.libtype:
+            self.run_fast_solutions()
+            self.functional_get_topn_fastest()
         rets = self.run_best_solutions()
         return rets
 
@@ -604,6 +612,12 @@ class Gemm:
             cpu_blob = self.blob.cpu()
             del cpu_blob
 
+def libtype_list(string):
+    values = string.split(",")
+    for value in values:
+        if value not in ["all", "asm", "hipblaslt", "triton"]:
+            raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
+    return values
 
 class GemmTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
@@ -650,6 +664,15 @@ class GemmTuner(GemmCommonTuner):
             help="Tune for both bias and non bias cases,"
             " regardless of what was used"
             " to collect the shapes",
+        )
+        self.parser.add_argument(
+            "--libtype",
+            # nargs='+',
+            # choices=['all', 'asm', 'hipblaslt', 'triton'],
+            type=libtype_list,
+            default=["all"],
+            required=False,
+            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton']",
         )
 
     def __init__(
@@ -829,6 +852,7 @@ class GemmTuner(GemmCommonTuner):
                 err_ratio=args.errRatio,
                 profile_file=args.profile_file,
                 num_warmup=self.num_warmup,
+                libtype=args.libtype,
             )
 
             ret.extend(gemmobj.run_solutions())
