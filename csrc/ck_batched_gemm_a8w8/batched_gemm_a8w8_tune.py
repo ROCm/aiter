@@ -58,7 +58,7 @@ def generate_data(b, m, n, k, device="cuda"):
 
 class BatchedGemma8W8Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
-        "verbose": False,
+        **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_A8W8_BATCHED_GEMM}",
         "untune_file": "aiter/configs/a8w8_untuned_batched_gemm.csv",
         "errRatio": 0.05,

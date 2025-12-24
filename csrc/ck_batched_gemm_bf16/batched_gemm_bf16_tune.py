@@ -40,7 +40,7 @@ def generate_data(b, m, n, k, device="cuda"):
 
 class BatchedGemmBf16Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
-        "verbose": False,
+        **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_BF16_BATCHED_GEMM}",
         "untune_file": "aiter/configs/bf16_untuned_batched_gemm.csv",
         "errRatio": 0.05,
