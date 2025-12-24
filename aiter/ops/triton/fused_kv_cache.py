@@ -175,7 +175,6 @@ def fused_qk_rope_cat_and_cache_mla(
             bk == b_k_pe_out and kh == hk_k_pe_out and d_pe == d_k_pe_out
         ), "k_pe_out shape mismatch, expected (bk, kh, d_pe)"
 
-
     q_nope_zeros_out = None
     if num_decode_toks_for_zeros > 0:
         q_nope_zeros_out = torch.empty(
