@@ -129,7 +129,7 @@ __device__ float abs(float x)
 
 namespace aiter_kernels {
 // Adopted and changed from vllm
-// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedQKNormRopeQuantCacheShuffleKernel.cu
+// https://github.com/vllm-project/vllm/blob/main/csrc/fused_qknorm_rope_kernel.cu
 
 // Perform per-head QK Norm,  RoPE in a single kernel.
 // scalar_t: data type of QKV and RMSNorm weights
@@ -461,7 +461,7 @@ void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv, int const num_tokens,
                   "Unsupported head dimension for fusedQKNormRope: ", head_dim);
   }
 }
-}  // namespace tensorrt_llm::kernels
+}  // namespace aiter_kernels
 
 #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)                 \
   aiter_kernels::launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE> (              \
