@@ -297,7 +297,7 @@ def ck_moe_stage1(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
-    splitk: int = 1,
+    splitk: Optional[int] = 1,
     dst_type: Optional[str] = None,
 ) -> None: ...
 
@@ -530,7 +530,7 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
-        splitk,
+        int(splitk) if splitk is not None else splitk,
         dtype2str_dict[dst_type],
     )
     return out

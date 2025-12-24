@@ -300,6 +300,52 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
 
 
 @triton.jit
+def _deepgemm_fp8_paged_mqa_logits_varctx_schedule(
+    batch_size,
+    context_len_ptr,
+    safe_chunks_per_cta_ptr,
+    parallel_unit_num,
+    ChunkK: tl.constexpr,
+    AlignedBatchSize: tl.constexpr,
+    TryCount: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    ctx_lens = tl.load(
+        context_len_ptr + tl.arange(0, AlignedBatchSize),
+        mask=tl.arange(0, AlignedBatchSize) < batch_size,
+        other=0,
+    )
+    ctx_blks = tl.cdiv(ctx_lens, ChunkK)
+
+    has_successed = False
+    safe_seg_lens = 0
+    for t in range(TryCount):
+        try_seg_per_pu = 1 + pid * TryCount + TryCount - t
+        ctx_segs = tl.cdiv(ctx_blks, try_seg_per_pu)
+        total_segs = tl.sum(ctx_segs)
+
+        if total_segs <= parallel_unit_num:
+            has_successed = True
+        elif has_successed:
+            safe_seg_lens = try_seg_per_pu + 1
+            has_successed = False
+
+    try_seg_per_pu = 1 + pid * TryCount
+    ctx_segs = tl.cdiv(ctx_blks, try_seg_per_pu)
+    total_segs = tl.sum(ctx_segs)
+
+    if has_successed:
+        if total_segs > parallel_unit_num:
+            safe_seg_lens = try_seg_per_pu + 1
+        elif try_seg_per_pu == 1:
+            safe_seg_lens = 1
+
+    if safe_seg_lens != 0:
+        tl.store(safe_chunks_per_cta_ptr, safe_seg_lens)
+
+
+@triton.jit
 def _deepgemm_fp8_paged_mqa_logits(
     batch_size,
     next_n,
@@ -449,6 +495,38 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     max_model_len,
     max_block_len,
     SplitKV,
+    dummyPointerArg,  # dummy pointer for compatibility with triton3.5 on lower version
+    ChunkQ: tl.constexpr,
+    ChunkK: tl.constexpr,
+    HiddenDim: tl.constexpr,
+    KVBlockSize: tl.constexpr = 16,
+):
+    # for AOT load use, only need kernel have the same signature as implementation side
+    pass
+
+
+@triton.jit
+def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
+    batch_size,
+    next_n,
+    heads_num,
+    Q_buffer,
+    stride_q_batch,
+    stride_q_next_n,
+    stride_q_heads,
+    KV_buffer,
+    stride_k_seq,
+    scale_buffer,
+    stride_scale_seq,
+    context_len_ptr,
+    kv_indices,
+    weights,
+    stride_w_batch,
+    OutLogits_buffer,
+    stride_out_batch,
+    max_model_len,
+    max_block_len,
+    safe_chunks_per_cta_ptr,
     dummyPointerArg,  # dummy pointer for compatibility with triton3.5 on lower version
     ChunkQ: tl.constexpr,
     ChunkK: tl.constexpr,
