@@ -58,22 +58,25 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                              bool has_lse,
                              bool has_dropout,
                              bool skip_min_seqlen_q,
-                             bool is_sglang_layout,
+                             ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
                              int page_size)
-        : fmha_batch_prefill_traits{head_size_q,
-                                    head_size_v,
-                                    dtype,
-                                    is_group_mode,
-                                    true, // is_v_rowmajor
-                                    has_logits_soft_cap,
-                                    mask_type,
-                                    bias_type,
-                                    has_lse,
-                                    has_dropout,
-                                    quant_scale_enum::no_scale, // qscale_type
-                                    skip_min_seqlen_q,
-                                    is_sglang_layout,
-                                    page_size}
+        : fmha_batch_prefill_traits{
+              head_size_q,
+              head_size_v,
+              dtype,
+              is_group_mode,
+              true, // is_v_rowmajor
+              has_logits_soft_cap,
+              mask_type,
+              bias_type,
+              has_lse,
+              has_dropout,
+              quant_scale_enum::no_scale, // qscale_type
+              skip_min_seqlen_q,
+              false,
+              ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT,
+              kv_lookup_table,
+              page_size}
     {
     }
 };
@@ -117,7 +120,7 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      bool has_lse,
                                                      quant_scale_enum qscale_type,
                                                      bool use_ext_asm,
-                                                     bool has_sink = false,
+                                                     bool has_sink                      = false,
                                                      int how_v3_bf16_cvt                = 1,
                                                      const void* seqstart_q_padding_ptr = nullptr,
                                                      const void* seqstart_k_padding_ptr = nullptr,

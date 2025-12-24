@@ -54,23 +54,39 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     ck_tile::index_t stride_q       = q.stride(-3);
     ck_tile::index_t stride_k;
     ck_tile::index_t stride_v;
-    
-    // Strictly enforce 5D swizzled layout
-    TORCH_CHECK(k.dim() == 5, "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/8, PageSize, 8]");
-    TORCH_CHECK(v.dim() == 5, "V tensor must be 5D [NumBlocks, NumHeads, PageSize/8, HeadDim, 8]");
-    TORCH_CHECK(k.is_contiguous(), "K tensor must be contiguous for swizzled layout");
-    TORCH_CHECK(v.is_contiguous(), "V tensor must be contiguous for swizzled layout");
 
-    // Swizzled Layout Strides
-    // K: [NumBlocks, NumHeads, HeadDim/8, PageSize, 8] -> stride(-2) corresponds to PageSize dim stride
-    // V: [NumBlocks, NumHeads, PageSize/8, HeadDim, 8] -> stride(-2) corresponds to HeadDim dim stride
+    const int k_vector_size = 16 / static_cast<int>(k.element_size());
+    
+    // Strictly enforce 5D vectorized layout
+    TORCH_CHECK(k.dim() == 5,
+                "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]");
+    TORCH_CHECK(v.dim() == 5,
+                "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
+    TORCH_CHECK(k.is_contiguous(), "K tensor must be contiguous for vectorized layout");
+    TORCH_CHECK(v.is_contiguous(), "V tensor must be contiguous for vectorized layout");
+
+    // Vectorized layout strides
+    // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize] -> stride(-2) is PageSize
+    // V: [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize] -> stride(-2) is HeadDim
     stride_k = k.stride(-2); 
     stride_v = v.stride(-2); 
     
-    TORCH_CHECK(stride_k == 8, "stride_k (PageSize stride) must be 8 in 5D swizzled layout");
-    TORCH_CHECK(stride_v == 8, "stride_v (HeadDim stride) must be 8 in 5D swizzled layout");
-    TORCH_CHECK(k.stride(-1) == 1 && k.size(-1) == 8, "K last dim must be 8 and contiguous");
-    TORCH_CHECK(v.stride(-1) == 1 && v.size(-1) == 8, "V last dim must be 8 and contiguous");
+    TORCH_CHECK(stride_k == k_vector_size,
+                "stride_k (PageSize stride) must be ",
+                k_vector_size,
+                " in 5D vectorized layout");
+    TORCH_CHECK(stride_v == k_vector_size,
+                "stride_v (HeadDim stride) must be ",
+                k_vector_size,
+                " in 5D vectorized layout");
+    TORCH_CHECK(k.stride(-1) == 1 && k.size(-1) == k_vector_size,
+                "K last dim must be ",
+                k_vector_size,
+                " and contiguous");
+    TORCH_CHECK(v.stride(-1) == 1 && v.size(-1) == k_vector_size,
+                "V last dim must be ",
+                k_vector_size,
+                " and contiguous");
 
     ck_tile::index_t stride_o       = out.stride(-3);
     ck_tile::index_t stride_randval = has_dropout_randval ? dropout_randval.stride(1) : 0;
@@ -150,6 +166,9 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.kv_indptr         = kv_indptr.data_ptr();
     args.kv_page_indices   = kv_page_indices.data_ptr();
     args.kv_last_page_lens = kv_last_page_lens_ptr;
+    args.seqlen_k_ptr      = nullptr;
+    args.block_table_ptr   = nullptr;
+    args.batch_stride_block_table = 0;
     args.scale_s           = softmax_scale;
     args.scale_p           = 1;
     args.scale_o           = 1;
@@ -188,8 +207,8 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
 
 std::vector<at::Tensor>
 mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
-                  const at::Tensor& k, // [num_blocks, hk, d/8, block_size, 8]
-                  const at::Tensor& v, // [num_blocks, hk, block_size/8, d, 8]
+                  const at::Tensor& k, // [num_blocks, hk, d/k_vector_size, block_size, k_vector_size]
+                  const at::Tensor& v, // [num_blocks, hk, block_size/k_vector_size, d, k_vector_size]
                   const at::Tensor& cu_seqlens_q, // [b+1]
                   const at::Tensor& kv_indptr,    // [b+1]
                   const at::Tensor& kv_page_indices,
@@ -208,7 +227,9 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                   std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
                   std::optional<at::Generator> gen_,
-                  std::optional<const at::Tensor> kv_last_page_lens_)
+                  std::optional<const at::Tensor> kv_last_page_lens_,
+                  std::optional<const at::Tensor> block_table_,
+                  std::optional<const at::Tensor> seqlen_k_)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -220,6 +241,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     TORCH_CHECK(kv_indptr.dtype() == torch::kInt32, "kv_indptr must have dtype int32");
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    const int k_vector_size = 16 / static_cast<int>(q.element_size());
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);
@@ -247,15 +269,19 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     int num_heads         = sizes[1];
     const int head_size_q = sizes[2];
     
-    TORCH_CHECK(k.dim() == 5, "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/8, PageSize, 8]");
-    TORCH_CHECK(v.dim() == 5, "V tensor must be 5D [NumBlocks, NumHeads, PageSize/8, HeadDim, 8]");
+    TORCH_CHECK(k.dim() == 5,
+                "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]");
+    TORCH_CHECK(v.dim() == 5,
+                "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
 
-    // K: [NumBlocks, NumHeads, HeadDim/8, PageSize, 8]
+    // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]
     const int num_heads_k = k.size(1);
     const int page_block_size = k.size(3);
-    TORCH_CHECK(page_block_size % 8 == 0, "Swizzled KV requires page size divisible by 8");
+    TORCH_CHECK(page_block_size % k_vector_size == 0,
+                "Vectorized KV requires page size divisible by ",
+                k_vector_size);
     
-    // V: [NumBlocks, NumHeads, PageSize/8, HeadDim, 8]
+    // V: [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]
     const int head_size_v = v.size(3);
 
     const int num_blocks      = k.size(0);
@@ -280,10 +306,12 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(head_size_q <= 256, "CK only supports head dimension at most 256");
     TORCH_CHECK(head_size_v <= 256, "CK only supports head dimension at most 256");
-    TORCH_CHECK(head_size_q % 8 == 0,
-                "query, key, value, and out_ must have a head_size that is a multiple of 8");
-    TORCH_CHECK(head_size_v % 8 == 0,
-                "query, key, value, and out_ must have a head_size that is a multiple of 8");
+    TORCH_CHECK(head_size_q % k_vector_size == 0,
+                "query, key, value, and out_ must have a head_size that is a multiple of ",
+                k_vector_size);
+    TORCH_CHECK(head_size_v % k_vector_size == 0,
+                "query, key, value, and out_ must have a head_size that is a multiple of ",
+                k_vector_size);
     TORCH_CHECK(num_heads % num_heads_k == 0,
                 "Number of heads in key/value must divide number of heads in query");
 
@@ -319,12 +347,12 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
 
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
     
-    // K: [NumBlocks, NumHeads, HeadDim/8, PageSize, 8]
-    CHECK_SHAPE(k, num_blocks, num_heads_k, head_size_q / 8, page_block_size, 8);
-    // V: [NumBlocks, NumHeads, PageSize/8, HeadDim, 8]
-    CHECK_SHAPE(v, num_blocks, num_heads_k, page_block_size / 8, head_size_v, 8);
+    // K: [NumBlocks, NumHeads, HeadDim/k_vector_size, PageSize, k_vector_size]
+    CHECK_SHAPE(k, num_blocks, num_heads_k, head_size_q / k_vector_size, page_block_size, k_vector_size);
+    // V: [NumBlocks, NumHeads, PageSize/k_vector_size, HeadDim, k_vector_size]
+    CHECK_SHAPE(v, num_blocks, num_heads_k, page_block_size / k_vector_size, head_size_v, k_vector_size);
 
-    if(page_block_size > 1)
+    if(page_block_size > 1 && !block_table_.has_value())
     {
         TORCH_CHECK(kv_last_page_lens_.has_value(),
                     "if page_block_size > 1, must pass kv_last_page_lens to kernel");
@@ -434,6 +462,33 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                                    p_dropout,
                                                    drop_seed_offset,
                                                    kv_last_page_lens_);
+
+        if(block_table_.has_value())
+        {
+            auto block_table = block_table_.value();
+            CHECK_DEVICE(block_table);
+            TORCH_CHECK(block_table.scalar_type() == at::kInt,
+                        "block_table must be int32");
+            TORCH_CHECK(block_table.dim() == 2, "block_table must be 2d");
+            TORCH_CHECK(block_table.size(0) == batch_size,
+                        "block_table first dim must match batch_size");
+            TORCH_CHECK(block_table.stride(-1) == 1,
+                        "block_table must have contiguous last dimension");
+            TORCH_CHECK(seqlen_k_.has_value(),
+                        "block_table requires seqlen_k for per-batch lengths");
+
+            auto seqlen_k = seqlen_k_.value();
+            CHECK_DEVICE(seqlen_k);
+            TORCH_CHECK(seqlen_k.scalar_type() == at::kInt,
+                        "seqlen_k must be int32");
+            TORCH_CHECK(seqlen_k.dim() == 1, "seqlen_k must be 1d");
+            TORCH_CHECK(seqlen_k.size(0) == batch_size,
+                        "seqlen_k must have shape [batch_size]");
+
+            args.block_table_ptr = block_table.data_ptr();
+            args.batch_stride_block_table = block_table.stride(0);
+            args.seqlen_k_ptr = seqlen_k.data_ptr();
+        }
 
         float t = aiter::mha_batch_prefill(args,
                                            stream_config,

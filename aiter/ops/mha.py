@@ -978,6 +978,8 @@ def cmdGenFunc_mha_batch_prefill(
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor] = None,
+    block_table: Optional[Tensor] = None,
+    seqlen_k: Optional[Tensor] = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -2591,12 +2593,16 @@ def mha_batch_prefill_fake_tensors(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
+    kv_last_page_lens: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    seqlen_k: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if k.dim() != 5 or v.dim() != 5:
-        raise ValueError("Batch prefill requires 5D swizzled K/V tensors")
+        raise ValueError("Batch prefill requires 5D vectorized K/V tensors")
     num_heads = q.size(1)  # num_heads = q.sizes()[1]
     head_size_v = v.size(-2)  # head_size_v = v.size(-2)
     total_q = q.size(0)  # total_q = q.size(0)
@@ -2662,6 +2668,8 @@ def mha_batch_prefill(
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor]=None,
+    block_table: Optional[Tensor] = None,
+    seqlen_k: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -2686,6 +2694,8 @@ def _mha_batch_prefill(
     zero_tensors: bool = False,
     out: torch.Tensor = None,
     kv_last_page_lens: torch.Tensor = None,
+    block_table: torch.Tensor = None,
+    seqlen_k: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2712,6 +2722,8 @@ def _mha_batch_prefill(
         alibi_slopes,
         None,
         kv_last_page_lens,
+        block_table,
+        seqlen_k,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
@@ -2737,21 +2749,23 @@ def mha_batch_prefill_func(
     return_attn_probs=False,
     out=None,
     kv_last_page_lens=None,
+    block_table=None,
+    seqlen_k=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(-1)
     if k.dim() != 5 or v.dim() != 5:
-        raise ValueError("Batch prefill requires 5D swizzled K/V tensors")
+        raise ValueError("Batch prefill requires 5D vectorized K/V tensors")
     head_size_v_og = v.size(-2)
     if head_size_q_og % 8 != 0 or head_size_v_og % 8 != 0:
-        raise ValueError("Swizzled KV requires head size divisible by 8")
+        raise ValueError("Vectorized KV requires head size divisible by 8")
     if k.size(-3) * 8 != head_size_q_og:
-        raise ValueError("K swizzled layout does not match Q head size")
+        raise ValueError("K vectorized layout does not match Q head size")
     if k.size(-2) % 8 != 0:
-        raise ValueError("Swizzled KV requires page size divisible by 8")
+        raise ValueError("Vectorized KV requires page size divisible by 8")
     if not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError("Swizzled KV requires contiguous K/V")
+        raise ValueError("Vectorized KV requires contiguous K/V")
     out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
         q,
         k,
@@ -2772,6 +2786,8 @@ def mha_batch_prefill_func(
         return_softmax=return_attn_probs and dropout_p > 0,
         out=out,
         kv_last_page_lens=kv_last_page_lens,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
     )
     out = out_padded[..., :head_size_v_og]
 
