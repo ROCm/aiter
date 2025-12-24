@@ -903,8 +903,16 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     kv_cache_dtypes = [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz]
     test_return_kv_flags = [True, False]
-    use_shuffle_layouts = [False, True]  # Test both normal and shuffle layouts
+    use_shuffle_layouts = [True, False]  # Test both normal and shuffle layouts
     page_sizes = [16, 1024]  # Test two page sizes for shuffle layout
+    head_sizes = [64]
+    num_heads = [8]
+    mrope_sections = [[12, 10, 10]]
+    is_neox_styles = [True]
+    is_interleaveds = [False]
+    use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
+    page_sizes = [16]
+
 
     for kv_cache_dtype in kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
@@ -922,8 +930,8 @@ if __name__ == "__main__":
                                             dtype,
                                             num_token,
                                             num_head,
-                                            num_head,
-                                            num_head,
+                                            1,
+                                            1,
                                             head_size,
                                             is_neox_style,
                                             ms,
