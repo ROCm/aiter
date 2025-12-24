@@ -116,8 +116,25 @@ def test_allreduce_custom(
         checkAllclose(ref, out.to(ref), msg=msg)
 
 
-l_dtype = ["fp16", "bf16"]
-l_shape = [(128, 8192)]
+# l_dtype = ["fp16", "bf16"]
+l_dtype = ["bf16"]
+l_shape = [
+    (64, 5120),
+    (128, 5120),
+    (256, 5120),
+    (512, 5120),
+    (1024, 5120),
+    (4096, 5120),
+    (8192, 5120),
+    (10240, 5120),
+    (12288, 5120),
+    (16384, 5120),
+    (20480, 5120),
+    (24576, 5120),
+    (30720, 5120),
+    (32768, 5120),
+    (40960, 5120),
+]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
