@@ -345,7 +345,7 @@ def ck_moe_stage1(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
-    splitk: int = 1,
+    splitk: Optional[int] = 1,
     dst_type: Optional[str] = None,
 ) -> None: ...
 
