@@ -111,8 +111,6 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     k = k.view(num_tokens, -1, head_size)
     k = apply_rotary_emb_dispatch(k, cos, sin, is_neox_style)
 
-    n_blocks, _, head_size_tiled, page_size, x = k_cache.shape
-
     v = v.view(num_tokens, -1, head_size)
 
     from aiter import reshape_and_cache_with_pertoken_quant, reshape_and_cache
@@ -272,7 +270,6 @@ if __name__ == "__main__":
     max_positions = 10000
     num_blocks = 1000
     page_size = 16
-    # kv_cache_dtypes = ["fp8_e4m3", "auto"]
     kv_cache_dtypes = ["fp8_e4m3", "auto"]
     dtype = torch.bfloat16
     for is_neox_style in is_neox_styles:

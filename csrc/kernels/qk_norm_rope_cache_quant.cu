@@ -128,35 +128,36 @@ __device__ float abs(float x)
 }  // namespace aiter::common
 
 namespace aiter_kernels {
-// NOTE(zhuhaoran): This kernel is adapted from TensorRT-LLM implementation,
-// with added support for passing the cos_sin_cache as an input.
-// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedQKNormRopeKernel.cu
+// Adopted and changed from vllm
+// https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/fusedQKNormRopeQuantCacheShuffleKernel.cu
 
-// Perform per-head QK Norm and RoPE in a single kernel.
-// scalar_t_in: data type of QKV and RMSNorm weights
-// scalar_t_cache: data type of kv cache
+// Perform per-head QK Norm,  RoPE in a single kernel.
+// scalar_t: data type of QKV and RMSNorm weights
+// kv_cache_scalar_t: data type of kv cache
 // head_dim: the dimension of each head
 // interleave: interleave=!is_neox.
+// num_kv_heads: number of kv heads for kv cache
+// kv_dt: data type of kv cache for quantization
 template <typename scalar_t, typename kv_cache_scalar_t,
           int head_dim, bool interleave, int num_kv_heads, vllm::Fp8KVCacheDataType kv_dt>
-__global__ void fusedQKNormRopeKernel(
+__global__ void fusedQKNormRopeQuantCacheShuffleKernel(
     scalar_t* qkv_void,                  // Combined QKV tensor
-    int const num_heads_q,           // Number of query heads
-    int const num_heads_k,           // Number of key heads
-    int const num_heads_v,           // Number of value heads
-    float const eps,                 // Epsilon for RMS normalization
-    scalar_t const* q_weight,       // RMSNorm weights for query
-    scalar_t const* k_weight,       // RMSNorm weights for key
-    scalar_t const* cos_sin_cache,  // Pre-computed cos/sin cache
-    int64_t const* position_ids,     // Position IDs for RoPE
-    kv_cache_scalar_t* k_cache,      // Key cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
-    kv_cache_scalar_t* v_cache,      // Value cache [num_blocks, num_kv_heads, block_size/X, head_size, X]
-    int64_t* slot_mapping,           // Slot mapping
-    float* k_scale,                  // Key scale for quantized key cache [num_blocks, block_size]
-    float* v_scale,                  // Value scale for quantized value cache [num_blocks, block_size]
-    int const num_tokens,            // Number of tokens
-    int const page_size,             // Page size for kv cache
-    int x                            // kv cache tiling size
+    int const num_heads_q,               // Number of query heads
+    int const num_heads_k,               // Number of key heads
+    int const num_heads_v,               // Number of value heads
+    float const eps,                     // Epsilon for RMS normalization
+    scalar_t const* q_weight,            // RMSNorm weights for query
+    scalar_t const* k_weight,            // RMSNorm weights for key
+    scalar_t const* cos_sin_cache,       // Pre-computed cos/sin cache
+    int64_t const* position_ids,         // Position IDs for RoPE
+    kv_cache_scalar_t* k_cache,          // Key cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
+    kv_cache_scalar_t* v_cache,          // Value cache [num_blocks, num_kv_heads, block_size/X, head_size, X]
+    int64_t* slot_mapping,               // Slot mapping
+    float* k_scale,                      // Key scale for quantized key cache [num_blocks, block_size]
+    float* v_scale,                      // Value scale for quantized value cache [num_blocks, block_size]
+    int const num_tokens,                // Number of tokens
+    int const page_size,                 // Page size for kv cache
+    int x                                // kv cache tiling size
 ) {
 
   int const warpsPerBlock = blockDim.x / 32;
@@ -401,8 +402,6 @@ __global__ void fusedQKNormRopeKernel(
     TORCH_CHECK(false, "Unsupported num_kv_heads: ", num_kv_heads); \
   }
 
-// Borrowed from
-// https://github.com/flashinfer-ai/flashinfer/blob/8125d079a43e9a0ba463a4ed1b639cefd084cec9/include/flashinfer/pos_enc.cuh#L568
 #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
   if (interleave) {                                      \
     const bool INTERLEAVE = true;                        \
@@ -413,7 +412,7 @@ __global__ void fusedQKNormRopeKernel(
   }
 
 template <typename scalar_t, typename kv_cache_scalar_t, vllm::Fp8KVCacheDataType kv_dt>
-void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens, int const num_heads_q, 
+void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv, int const num_tokens, int const num_heads_q, 
                            int const num_heads_k, int const num_heads_v, 
                            int const head_dim, float const eps, scalar_t const* q_weight,
                            scalar_t const* k_weight, scalar_t const* cos_sin_cache,
@@ -435,7 +434,7 @@ void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens, int const num_he
   switch (head_dim) {
     case 64:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 64, INTERLEAVE, NUM_KV_HEADS, kv_dt>
+        aiter_kernels::fusedQKNormRopeQuantCacheShuffleKernel<scalar_t, kv_cache_scalar_t, 64, INTERLEAVE, NUM_KV_HEADS, kv_dt>
             <<<gridDim, blockDim, 0, stream>>>(
                 qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
                 k_weight, cos_sin_cache, position_ids, k_cache, v_cache, slot_mapping, k_scale, v_scale, num_tokens, page_size, x);
@@ -443,7 +442,7 @@ void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens, int const num_he
       break;
     case 128:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 128, INTERLEAVE, NUM_KV_HEADS, kv_dt>
+        aiter_kernels::fusedQKNormRopeQuantCacheShuffleKernel<scalar_t, kv_cache_scalar_t, 128, INTERLEAVE, NUM_KV_HEADS, kv_dt>
             <<<gridDim, blockDim, 0, stream>>>(
                 qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
                 k_weight, cos_sin_cache, position_ids, k_cache, v_cache, slot_mapping, k_scale, v_scale, num_tokens, page_size, x);
@@ -451,7 +450,7 @@ void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens, int const num_he
       break;
     case 256:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        aiter_kernels::fusedQKNormRopeKernel<scalar_t, kv_cache_scalar_t, 256, INTERLEAVE, NUM_KV_HEADS, kv_dt>
+        aiter_kernels::fusedQKNormRopeQuantCacheShuffleKernel<scalar_t, kv_cache_scalar_t, 256, INTERLEAVE, NUM_KV_HEADS, kv_dt>
             <<<gridDim, blockDim, 0, stream>>>(
                 qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
                 k_weight, cos_sin_cache, position_ids, k_cache, v_cache, slot_mapping, k_scale, v_scale, num_tokens, page_size, x);
@@ -465,7 +464,7 @@ void launchFusedQKNormRope(scalar_t* qkv, int const num_tokens, int const num_he
 }  // namespace tensorrt_llm::kernels
 
 #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)                 \
-  aiter_kernels::launchFusedQKNormRope<SRC_T, CACHE_T, KV_DTYPE> (              \
+  aiter_kernels::launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE> (              \
       reinterpret_cast<SRC_T*>(qkv.data_ptr()), num_tokens, num_heads_q, num_heads_k, num_heads_v, \
       head_dim, eps, reinterpret_cast<SRC_T*>(q_weight.data_ptr()), reinterpret_cast<SRC_T*>(k_weight.data_ptr()), \
       reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()), !is_neox, position_ids.data_ptr<int64_t>(), \
