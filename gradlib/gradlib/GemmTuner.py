@@ -612,12 +612,14 @@ class Gemm:
             cpu_blob = self.blob.cpu()
             del cpu_blob
 
+
 def libtype_list(string):
     values = string.split(",")
     for value in values:
         if value not in ["all", "asm", "hipblaslt", "triton"]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
+
 
 class GemmTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
@@ -919,7 +921,6 @@ class GemmTuner(GemmCommonTuner):
         else:
             resultsdf = pd.DataFrame(self.columns)
         self.save_profile(resultsdf, args.profile_file)
-        import numpy as np
 
         best_gtimedfs = pd.DataFrame(columns=self.columns)
         for key, df in gtimedf_dic.items():
