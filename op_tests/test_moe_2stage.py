@@ -273,7 +273,7 @@ def test_fmoe(
 
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
-l_dim = [(7168,  256)]
+l_dim = [(7168, 256)]
 # l_dim = [(4096, 1536)]
 l_tokenNum = [
     # 1,

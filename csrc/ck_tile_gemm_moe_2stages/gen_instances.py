@@ -273,13 +273,13 @@ template torch::Tensor
         def validate_and_format(template: str, mapping: dict) -> str:
             # check all format element in dict.
             str_mapping = {
-                '(a_data_type)': dtype_dict[self.a_dtype],
-                '(b_data_type)': dtype_dict[self.b_dtype],
-                '(acc_data_type)': dtype_dict[self.acc_dtype],
-                '(c_data_type)': dtype_dict[self.c_dtype],
-                '(activation)': self.activation,
-                '(has_bias)': 'true' if self.activation == 2 else 'false',
-                '(split_k)': 'true' if self.is_split_k else 'false',
+                "(a_data_type)": dtype_dict[self.a_dtype],
+                "(b_data_type)": dtype_dict[self.b_dtype],
+                "(acc_data_type)": dtype_dict[self.acc_dtype],
+                "(c_data_type)": dtype_dict[self.c_dtype],
+                "(activation)": self.activation,
+                "(has_bias)": "true" if self.activation == 2 else "false",
+                "(split_k)": "true" if self.is_split_k else "false",
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
             str_mapping.update(format_args)
@@ -308,7 +308,6 @@ template torch::Tensor
             f.write(validate_and_format(HEURISTIC_template, dict))
 
         return f"./dispatchers/{k.dispatch_suffix}_heuristic_dispatch_{tag}.h"
-
 
     """generate lookup.h linking MNK/datatype to specific instance"""
 
@@ -393,7 +392,8 @@ torch::Tensor
 """
         _, k0 = next(iter(kernels_dict.items()))
         with open(
-            os.path.join(self.manifests_path, f"{k0.dispatch_suffix}_manifest_{tag}.h"), "w"
+            os.path.join(self.manifests_path, f"{k0.dispatch_suffix}_manifest_{tag}.h"),
+            "w",
         ) as f:
             f.write(MAINFEST_head)
             for k_name in self.kernel_name_list:
@@ -412,7 +412,9 @@ torch::Tensor
 
         self.gen_lookup_dict(kernels_dict)
         self.gen_heuristic_dispatch(tag, kernels_dict)
-        return self.gen_heuristic_dispatch(tag, kernels_dict), self.gen_manifest_head(tag, kernels_dict)
+        return self.gen_heuristic_dispatch(tag, kernels_dict), self.gen_manifest_head(
+            tag, kernels_dict
+        )
 
 
 # def get_tune_dict(tune_dict_csv):
@@ -432,6 +434,7 @@ torch::Tensor
 #             tune_dict[(M, N, K)] = kernels_list[kid]
 #     return tune_dict
 
+
 def generate_common_header(working_path, dispatch_files, manifest_files):
 
     common_header = """// SPDX-License-Identifier: MIT
@@ -446,7 +449,9 @@ def generate_common_header(working_path, dispatch_files, manifest_files):
         include_path = f'"{file_name}"'
         dispatch_header += f"#include {include_path}\n"
 
-    dispatch_common_header_path = os.path.join(working_path, "moe_cktile2stages_heuristic_dispatch_common.h")
+    dispatch_common_header_path = os.path.join(
+        working_path, "moe_cktile2stages_heuristic_dispatch_common.h"
+    )
     with open(dispatch_common_header_path, "w") as f:
         f.write(dispatch_header)
 
@@ -454,50 +459,13 @@ def generate_common_header(working_path, dispatch_files, manifest_files):
         include_path = f'"{file_name}"'
         manifest_header += f"#include {include_path}\n"
 
-    manifest_common_header_path = os.path.join(working_path, "moe_cktile2stages_manifest_common.h")
+    manifest_common_header_path = os.path.join(
+        working_path, "moe_cktile2stages_manifest_common.h"
+    )
     with open(manifest_common_header_path, "w") as f:
         f.write(manifest_header)
 
-
     """genarete heuristic dispatch header for multi dtype"""
-
-def gen_heuristic_dispatch_header(tags):
-    HEURISTIC_dispatch_header = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "moe_cktile2stages.h"
-
-"""
-    for tag in tags:
-        HEURISTIC_headers = f"""#include "./dispatchers/moe_cktile2stages_heuristic_dispatch_{tag}.h"
-"""
-        HEURISTIC_dispatch_header += HEURISTIC_headers
-
-    HEURISTIC_function = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
-#include "moe_cktile2stages.h"
-
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m);
-
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m);
-"""
-    # create heuristic heirarchy
-    with open(
-        os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"),
-        "w",
-    ) as f:
-        f.write(HEURISTIC_dispatch_header)
-    with open(
-        os.path.join(
-            self.dispatchers_path, "moe_cktile2stages_heuristic_dispatch_common.h"
-        ),
-        "w",
-    ) as f:
-        f.write(HEURISTIC_function)
 
 
 if __name__ == "__main__":
@@ -683,7 +651,15 @@ if __name__ == "__main__":
         if a_type in ["fp8", "bf8"] and is_split_k:
             continue
         codegen = cktile_moe_2stage_gemm_codegen(
-            args.working_path, a_type, acc_type, c_dtype, quant_type, act_type, 2, is_split_k, False
+            args.working_path,
+            a_type,
+            acc_type,
+            c_dtype,
+            quant_type,
+            act_type,
+            2,
+            is_split_k,
+            False,
         )
         # gen all instances for gemm1 and gemm2
         _, gemm1_kernel_list = get_gemm1_kernels_list(
