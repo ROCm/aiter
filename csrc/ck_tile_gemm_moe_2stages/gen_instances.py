@@ -128,11 +128,11 @@ torch::Tensor
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
         elif k.QuantType == "1x32":
             # scaleGranA = "-1"
-            scaleGranA = "1, 32"
-            scaleGranB = "1, 32"
+            scaleGranA = "1, 32, ck_tile::e8m0_t"
+            scaleGranB = "1, 32, ck_tile::e8m0_t"
             biasGran = "1"
-            xptr = "x_scale.has_value() ? static_cast<float*>(x_scale.value().data_ptr()) : nullptr"
-            wptr = "static_cast<float*>(w_scale.value().data_ptr())"
+            xptr = "x_scale.has_value() ? static_cast<ck_tile::e8m0_t*>(x_scale.value().data_ptr()) : nullptr"
+            wptr = "static_cast<ck_tile::e8m0_t*>(w_scale.value().data_ptr())"
             biasptr = "static_cast<float*>(exp_bias.has_value() ? exp_bias.value().data_ptr() : nullptr)"
 
         if act_dict[k.ActOP] != 2:
