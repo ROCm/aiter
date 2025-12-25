@@ -364,19 +364,7 @@ def mla_decode_fwd(
                     "hqk,khd->qhd", qk_exp.to(value.dtype).float(), value.float()
                 )
                 out = out / l.transpose(0, 1).unsqueeze(-1)
-                # checkAllclose(o[i], out[0].to(o.dtype), msg=f"o[{i}] vs. out[{i}]")
-                print(f"{dbg_tr.shape=}, {dbg_tr[: bs * nhead, :512].shape=}")
-                print(dbg_tr[: bs * nhead, :512])
-
-                pp = qk_exp[0][0].to(value.dtype)
-                vv = value[:, :, 0].squeeze(-1)
-                rr = pp.to(torch.float32) @ vv.to(torch.float32)
-                # torch.set_printoptions(threshold=99999)
-                print(f"{pp=}\n{vv=}")
-
-                checkAllclose(
-                    dbg_tr[: bs * nhead, :512], out[0], msg=f"dbg_tr[{i}] vs. out[{i}]"
-                )
+                checkAllclose(o[i], out[0].to(o.dtype), msg=f"o[{i}] vs. out[{i}]")
             exit()
 
         else:

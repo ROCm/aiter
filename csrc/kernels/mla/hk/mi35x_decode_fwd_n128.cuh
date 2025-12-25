@@ -872,58 +872,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
                 }
 
-                // if ((warp_idx == 0) && (idx.value == 0)) {
-                //     constexpr uint32_t gemm_a = 8;
-                //     constexpr uint32_t gemm_b = 16;
-                //     constexpr uint32_t gemm_d = 8;
-                //     constexpr uint32_t elem_per_thr = gemm_a + gemm_b + gemm_d;
-
-                //     FUI pp0{hkm::v_get_gpr<k_p_mfma_begin>()};
-                //     FUI pp1{hkm::v_get_gpr<k_p_mfma_begin+1>()};
-                //     float4 p0 = convert_fp8x4_to_float4(pp0);
-                //     float4 p1 = convert_fp8x4_to_float4(pp1);
-
-                //     float4 t0 = convert_fp8x4_to_float4(temp0);
-                //     float4 t1 = convert_fp8x4_to_float4(temp1);
-                //     float4 t2 = convert_fp8x4_to_float4(temp2);
-                //     float4 t3 = convert_fp8x4_to_float4(temp3);
-
-                //     params.p_dbg[lane_idx * 576 + 0 + 0]  = p0.x;
-                //     params.p_dbg[lane_idx * 576 + 0 + 1]  = p0.y;
-                //     params.p_dbg[lane_idx * 576 + 0 + 2]  = p0.z;
-                //     params.p_dbg[lane_idx * 576 + 0 + 3]  = p0.w;
-                //     params.p_dbg[lane_idx * 576 + 0 + 4]  = p1.x;
-                //     params.p_dbg[lane_idx * 576 + 0 + 5]  = p1.y;
-                //     params.p_dbg[lane_idx * 576 + 0 + 6]  = p1.z;
-                //     params.p_dbg[lane_idx * 576 + 0 + 7]  = p1.w;
-                //     params.p_dbg[lane_idx * 576 + 8 + 0]  = t0.x;
-                //     params.p_dbg[lane_idx * 576 + 8 + 1]  = t0.y;
-                //     params.p_dbg[lane_idx * 576 + 8 + 2]  = t0.z;
-                //     params.p_dbg[lane_idx * 576 + 8 + 3]  = t0.w;
-                //     params.p_dbg[lane_idx * 576 + 8 + 4]  = t1.x;
-                //     params.p_dbg[lane_idx * 576 + 8 + 5]  = t1.y;
-                //     params.p_dbg[lane_idx * 576 + 8 + 6]  = t1.z;
-                //     params.p_dbg[lane_idx * 576 + 8 + 7]  = t1.w;
-                //     params.p_dbg[lane_idx * 576 + 8 + 8]  = t2.x;
-                //     params.p_dbg[lane_idx * 576 + 8 + 9]  = t2.y;
-                //     params.p_dbg[lane_idx * 576 + 8 + 10] = t2.z;
-                //     params.p_dbg[lane_idx * 576 + 8 + 11] = t2.w;
-                //     params.p_dbg[lane_idx * 576 + 8 + 12] = t3.x;
-                //     params.p_dbg[lane_idx * 576 + 8 + 13] = t3.y;
-                //     params.p_dbg[lane_idx * 576 + 8 + 14] = t3.z;
-                //     params.p_dbg[lane_idx * 576 + 8 + 15] = t3.w;
-                //     params.p_dbg[lane_idx * 576 + 24 + 0] = hkm::v_get_gpr<oaccu_base + 0,
-                //     float>(); params.p_dbg[lane_idx * 576 + 24 + 1] = hkm::v_get_gpr<oaccu_base +
-                //     1, float>(); params.p_dbg[lane_idx * 576 + 24 + 2] =
-                //     hkm::v_get_gpr<oaccu_base + 2, float>(); params.p_dbg[lane_idx * 576 + 24 +
-                //     3] = hkm::v_get_gpr<oaccu_base + 3, float>(); params.p_dbg[lane_idx * 576 +
-                //     24 + 4] = hkm::v_get_gpr<oaccu_base + 4, float>(); params.p_dbg[lane_idx *
-                //     576 + 24 + 5] = hkm::v_get_gpr<oaccu_base + 5, float>();
-                //     params.p_dbg[lane_idx * 576 + 24 + 6] = hkm::v_get_gpr<oaccu_base + 6,
-                //     float>(); params.p_dbg[lane_idx * 576 + 24 + 7] = hkm::v_get_gpr<oaccu_base +
-                //     7, float>();
-                // }
-
                 temp0.x = p_kv[row_idx + 32 + (col_idx + 0) * 512];
                 temp0.y = p_kv[row_idx + 32 + (col_idx + 1) * 512];
                 temp0.z = p_kv[row_idx + 32 + (col_idx + 2) * 512];
@@ -992,39 +940,22 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             const uint32_t offset       = (row_idx * T::kVoHeadDim + col_idx_base) * sizeof(out_t);
             constexpr uint32_t gemm_tile_size = 16;
 
-            // #pragma unroll
-            //             for(uint32_t idx = 0; idx < T::kVoHeadDim / gemm_tile_size; ++idx)
-            //             {
-            //                 const uint32_t i_offset = idx * gemm_tile_size * sizeof(out_t);
-            //                 const uint32_t src_idx  = idx * 4 + k_o_begin;
-            //                 float_2_bf16_pair(k_o_begin, src_idx, src_idx + 1);
-            //                 float_2_bf16_pair(k_o_begin + 1, src_idx + 2, src_idx + 3);
-            //                 asm volatile("buffer_store_dwordx2 v[%0:%1], %2, %3, 0 offen
-            //                 offset:%4"
-            //                              :
-            //                              : "i"(k_o_begin), // reuse these vgprs
-            //                                "i"(k_o_begin + 1),
-            //                                "v"(offset),
-            //                                "s"(*(hk::i32x4*)&out_br),
-            //                                "i"(i_offset)
-            //                              : "memory");
-            //             }
-
-            ckt::static_for<0, T::kVoHeadDim / gemm_tile_size, 1>{}([&](auto idx) {
-                constexpr uint32_t src_idx = idx.value * 4 + k_o_begin;
-
-                float test_x = hkm::v_get_gpr<src_idx, float>();
-                float test_y = hkm::v_get_gpr<src_idx + 1, float>();
-                float test_z = hkm::v_get_gpr<src_idx + 2, float>();
-                float test_w = hkm::v_get_gpr<src_idx + 3, float>();
-
-                uint32_t col_idx         = idx.value * gemm_tile_size + col_idx_base;
-                uint32_t offset          = row_idx * 576 + col_idx;
-                params.p_dbg[offset + 0] = test_x;
-                params.p_dbg[offset + 1] = test_y;
-                params.p_dbg[offset + 2] = test_z;
-                params.p_dbg[offset + 3] = test_w;
-            });
+#pragma unroll
+            for(uint32_t idx = 0; idx < T::kVoHeadDim / gemm_tile_size; ++idx)
+            {
+                const uint32_t i_offset = idx * gemm_tile_size * sizeof(out_t);
+                const uint32_t src_idx  = idx * 4 + k_o_begin;
+                float_2_bf16_pair(k_o_begin, src_idx, src_idx + 1);
+                float_2_bf16_pair(k_o_begin + 1, src_idx + 2, src_idx + 3);
+                asm volatile("buffer_store_dwordx2 v[%0:%1], %2, %3, 0 offen offset:%4"
+                             :
+                             : "i"(k_o_begin), // reuse these vgprs
+                               "i"(k_o_begin + 1),
+                               "v"(offset),
+                               "s"(*(hk::i32x4*)&out_br),
+                               "i"(i_offset)
+                             : "memory");
+            }
         }
         else {}
     }
