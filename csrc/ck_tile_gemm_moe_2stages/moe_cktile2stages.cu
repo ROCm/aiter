@@ -345,7 +345,7 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         // }
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock, 0, has_bias, k_batch)(XQ,
+            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock, 0, has_bias, k_batch)(
                 XQ,
                 WQ,
                 Y,

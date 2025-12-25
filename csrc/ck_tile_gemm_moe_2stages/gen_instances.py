@@ -640,8 +640,7 @@ if __name__ == "__main__":
     # quant_type = "per_token"
 
     a_types = ["bf16"]
-    # if get_gfx() == "gfx950":
-    if True:
+    if get_gfx() == "gfx950":
         a_types.append("fp8")
     b_type = "fp4"
     quant_type = "1x32"

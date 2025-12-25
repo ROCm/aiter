@@ -510,8 +510,7 @@ def get_gemm1_kernels_list(
     HasBias: bool = False,
     IsSplitK: bool = False,
 ) -> list:
-    # arch = get_gfx()
-    arch = "gfx950"
+    arch = get_gfx()
     if Adtype.lower() in bit8_list and Bdtype.lower() in bit8_list and Adtype == Bdtype:
         if arch == "gfx950":
             tag = "a8w8_gfx950"
@@ -560,8 +559,7 @@ def get_gemm2_kernels_list(
     MulRoutedWeight: bool = True,
     HasBias: bool = False,
 ) -> list:
-    # arch = get_gfx()
-    arch = "gfx950"
+    arch = get_gfx()
     if Adtype in bit8_list and Bdtype in bit8_list and Adtype == Bdtype:
         if arch == "gfx950":
             tag = "a8w8_gfx950"
