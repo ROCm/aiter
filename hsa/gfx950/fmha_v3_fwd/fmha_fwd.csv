@@ -1,0 +1,9 @@
+dtype,hdim_q,hdim_v,mask,mode,bf16_cvt,ts_qo,ts_kv,knl_name,co_name
+bf16,128,128,0,0,0,256,32,_ZN5aiter19fmha_fwd_hd128_bf16E,fwd_hd128_bf16.co
+bf16,128,128,2,0,0,256,32,_ZN5aiter26fmha_fwd_hd128_bf16_causalE,fwd_hd128_bf16_causal.co
+bf16,128,128,0,1,0,256,32,_ZN5aiter25fmha_fwd_hd128_bf16_groupE,fwd_hd128_bf16_group.co
+bf16,128,128,2,1,0,256,32,_ZN5aiter32fmha_fwd_hd128_bf16_causal_groupE,fwd_hd128_bf16_causal_group.co
+bf16,192,128,0,0,0,128,32,_ZN5aiter25fmha_fwd_hd192_hd128_bf16E,fwd_hd192_hd128_bf16.co
+bf16,192,128,2,0,0,128,32,_ZN5aiter32fmha_fwd_hd192_hd128_bf16_causalE,fwd_hd192_hd128_bf16_causal.co
+bf16,192,128,0,1,0,128,32,_ZN5aiter31fmha_fwd_hd192_hd128_bf16_groupE,fwd_hd192_hd128_bf16_group.co
+bf16,192,128,2,1,0,128,32,_ZN5aiter38fmha_fwd_hd192_hd128_bf16_causal_groupE,fwd_hd192_hd128_bf16_causal_group.co
