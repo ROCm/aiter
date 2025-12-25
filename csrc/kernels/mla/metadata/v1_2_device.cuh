@@ -371,6 +371,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
+    constexpr int32_t kPackedQoLenPerWg = 128;                                              \
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
@@ -397,9 +398,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool kv_is_bf16 = kv_dtype == at::ScalarType::BFloat16;
 
     const bool natively_supported = (num_heads == 16) ||
-                                    ((num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
-                                    ((num_heads == 64) && q_is_bf16 && kv_is_bf16) ||
-                                    ((num_heads == 32) && q_is_bf16 && kv_is_bf16);
+                                    ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
@@ -408,9 +407,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         num_batches *= qk_batch_ratio;
     }
 
-    TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
-                ((num_heads == 64) && q_is_bf16 && kv_is_bf16) ||
-                ((num_heads == 32) && q_is_bf16 && kv_is_bf16),
+    TORCH_CHECK((num_heads == 16) || (num_heads == 128),
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).")
@@ -442,19 +439,17 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.qk_batch_ratio               = qk_batch_ratio;
 
     // launch kernel
-    MLA_NUM_HEADS_DISPATCHER(
-        num_heads,
-        MLA_METADATA_DISPATCHER(
-            max_seqlen_qo * num_heads_per_head_k,
-            kPackedQoLenPerWg,
-            params.uni_seqlen_qo,
-            topk,
-            dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
-                params,
-                stream,
-                max_seqlen_qo,
-                dev_prop.warpSize,
-                dev_prop.maxSharedMemoryPerMultiProcessor)));
+    MLA_METADATA_DISPATCHER(
+        max_seqlen_qo * num_heads_per_head_k,
+        kPackedQoLenPerWg,
+        params.uni_seqlen_qo,
+        topk,
+        dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
+            params,
+            stream,
+            max_seqlen_qo,
+            dev_prop.warpSize,
+            dev_prop.maxSharedMemoryPerMultiProcessor));
 
 
 }
