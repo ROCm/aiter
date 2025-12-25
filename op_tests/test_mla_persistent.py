@@ -213,7 +213,9 @@ def test_mla(
     max_seqlen_qo = seq_lens_qo.max().item()
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
-    q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
+    # q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
+    q = torch.randn((total_q + 1, nhead, qk_head_dim), dtype=torch.bfloat16)
+    q = q[:-1]
 
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
@@ -302,7 +304,6 @@ def test_mla(
     )
     q_scale = torch.ones([1], dtype=torch.float, device="cuda")
     kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
-    # import pdb;pdb.set_trace()
 
 
     def test_absorb_decode_bf16():
@@ -343,7 +344,6 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        # import pdb;pdb.set_trace()
 
         return err, us_asm_decode
 
