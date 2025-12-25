@@ -137,6 +137,7 @@ def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
     ret["err"] = err
     return ret
 
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
