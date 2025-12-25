@@ -55,10 +55,18 @@ def str2bool(v):
 
 
 def str2tuple(v):
+    """
+    Convert string to int or tuple of ints.
+    - "512" → 512 (single value without comma returns int)
+    - "512," → (512,) (trailing comma returns tuple)
+    - "512,1024" → (512, 1024) (multiple values return tuple)
+    """
     try:
-        parts = v.strip("()").split(",")
-
-        return tuple(int(p.strip()) for p in parts)
+        parts = [int(p.strip()) for p in v.strip("()").split(",") if p.strip()]
+        # Return single value if only one element and no comma; otherwise return tuple
+        if "," not in v and len(parts) == 1:
+            return parts[0]
+        return tuple(parts)
     except Exception as e:
         raise argparse.ArgumentTypeError(f"invalid format of input: {v}") from e
 
