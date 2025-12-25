@@ -65,7 +65,10 @@ def str2tuple(v):
 
 def str2Dtype(v):
     try:
-        parts = v.strip("()").split(",")
-        return list(d_dtypes[p.strip()] for p in parts)
+        parts = [p.strip() for p in v.strip("()").split(",") if p.strip()]
+        # Return single value if only one element and no comma; otherwise return list
+        if len(parts) == 1 and "," not in v:
+            return d_dtypes[parts[0]]
+        return [d_dtypes[p] for p in parts]
     except Exception as e:
         raise argparse.ArgumentTypeError(f"invalid format of data type: {v}") from e

@@ -71,10 +71,6 @@ def test_silu_and_mul(m, n, dtype):
     return ret
 
 
-l_dtype = ["fp16", "bf16"]
-l_m = [1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840]
-l_n = [1024, 4096, 6400, 8192]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -82,56 +78,48 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    metavar="{fp16, bf16}",
+    default="fp16, bf16",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    choices=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840],
+    default=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840],
     help="""M of mnk.
     e.g.: -m 32""",
 )
 parser.add_argument(
     "-n",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    choices=[1024, 4096, 6400, 8192],
+    default=[1024, 4096, 6400, 8192],
     help="""N of mnk.
     e.g.: -n 1024""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.n is not None:
-    l_n = [args.n]
 
 df = []
-for dtype in l_dtype:
-    for m in l_m:
-        for n in l_n:
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
             ret = test_scaled_silu_and_mul(m, n, dtype)
             df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"scaled_silu_and_mul summary:\n{df}")
 
 df = []
-for dtype in l_dtype:
-    for m in l_m:
-        for n in l_n:
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
             ret = test_silu_and_mul(m, n, dtype)
             df.append(ret)
 df = pd.DataFrame(df)
