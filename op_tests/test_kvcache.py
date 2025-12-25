@@ -361,4 +361,4 @@ for (
     df.append(ret)
 df = pd.DataFrame(df)
 # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"kvcache summary:\n{df}")

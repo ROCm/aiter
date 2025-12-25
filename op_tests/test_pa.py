@@ -876,4 +876,4 @@ for num_heads in l_num_heads:
             )
             df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"pa summary:\n{df}")

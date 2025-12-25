@@ -514,4 +514,4 @@ for test in args.test:
         ret = test_skinny_gemm()
         df += ret
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"gemm_a16w16 summary:\n{df}")

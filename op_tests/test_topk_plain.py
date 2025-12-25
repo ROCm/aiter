@@ -187,7 +187,4 @@ df = pd.DataFrame(df)
 df["speedup (aiter vs torch)"] = df["time_us (torch)"] / df["time_us (aiter)"]
 df["speedup (aiter vs triton)"] = df["time_us (triton)"] / df["time_us (aiter)"]
 
-print("\n" + "=" * 60)
-print("SUMMARY")
-print("=" * 60)
-logger.info(f"\n{df.to_string(index=False)}")
+aiter.logger.info(f"topk_plain summary:\n{df}")
