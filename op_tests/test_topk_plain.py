@@ -7,7 +7,8 @@ from aiter.test_common import (
     benchmark,
     run_perftest,
 )
-from aiter import dtypes, logger
+import aiter
+from aiter import dtypes
 from aiter.ops.triton.topk import topk as triton_topk
 from aiter.ops.topk_plain import topk_plain
 import pandas as pd
