@@ -208,4 +208,4 @@ for (
         )
         df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    aiter.logger.info(f"deepgemm summary:\n{df}")

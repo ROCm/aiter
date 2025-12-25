@@ -604,5 +604,5 @@ for dtype in l_dtype:
         )
         df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    aiter.logger.info(f"pa_mtp summary:\n{df}")
     # df.to_csv("mla_prefill.csv")

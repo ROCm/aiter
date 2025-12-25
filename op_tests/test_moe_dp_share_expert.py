@@ -180,4 +180,4 @@ for q_dtype in list_q_dtype:
                 )
                 df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    aiter.logger.info(f"moe_dp_share_expert summary:\n{df}")

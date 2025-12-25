@@ -531,4 +531,4 @@ for (
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"moe_2stage summary:\n{df}")

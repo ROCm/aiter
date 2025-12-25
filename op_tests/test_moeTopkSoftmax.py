@@ -496,7 +496,7 @@ for dtype in l_dtype:
             ret = test_topk_softmax(dtype, m, e, l_topk)
             df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"moeTopkSoftmax summary:\n{df}")
 
 df = []
 for token in l_token:
@@ -512,7 +512,7 @@ for token in l_token:
     )
     df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"moeTopkSoftmax_biased_grouped_topk summary:\n{df}")
 
 df = []
 for token in l_token:
@@ -537,4 +537,4 @@ for token in l_token:
         )
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"moeTopkSoftmax_grouped_topk summary:\n{df}")

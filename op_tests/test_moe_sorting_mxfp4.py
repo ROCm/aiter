@@ -164,7 +164,7 @@ for dtype in l_dtype:
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage1")
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"moe_sorting_mxfp4_stage1 summary:\n{df}")
 
 df = []
 for dtype in l_dtype:
@@ -177,4 +177,4 @@ for dtype in l_dtype:
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage2")
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"moe_sorting_mxfp4_stage2 summary:\n{df}")
