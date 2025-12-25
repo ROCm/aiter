@@ -88,7 +88,9 @@ def ref_masked_attention(
         attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
-    out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
+    out = torch.einsum(
+        "hqk,khd->qhd", attn_weights_exp.to(value.dtype).float(), value.float()
+    )
 
     out = out / l.transpose(0, 1).unsqueeze(-1)
 
