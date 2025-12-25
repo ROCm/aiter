@@ -190,6 +190,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
        (a.has_lse && a.batch_stride_lse < a.nhead_stride_lse) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
+        std::cout << "[Warning]unsupport condition!!!" << std::endl;
         return -1;
     }
 
@@ -206,6 +207,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     auto it                     = fwd_cfgs->find(kernel_name_key);
     if(it == fwd_cfgs->end())
     {
+        std::cout << "[Warning]error kernel name key!!!" << std::endl;
         return -1;
     };
 
