@@ -77,9 +77,6 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
             MOE_DISPATCH_BNT_TYPE(ADataType, BDataType, AccDataType, CDataType, stage, 0, false, false, b_nt_type);
         }
     }
-    
-    // Should never reach here if all cases are covered
-    TORCH_CHECK(false, "Unsupported combination of activation and has_bias");
 }
     
 

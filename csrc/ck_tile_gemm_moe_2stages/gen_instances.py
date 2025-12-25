@@ -199,7 +199,7 @@ torch::Tensor
                 "ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up" if k.stage == 1 else
                 "ck_tile::MoeFlatmmKind::kFFN_gemm2"},
                 ck_tile::element_wise::PassThrough,
-                {act_dict[k.ActOP]}
+                {act_dict[k.ActOP]},
                 {k.b_nt_type}
                 >(kernel_args, stream_config);
 """
