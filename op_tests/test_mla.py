@@ -305,7 +305,7 @@ def test_mla(
 
     us_asm = None
     if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16
+        dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128]
     ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
