@@ -494,10 +494,14 @@ def test_mla(
         is_causal=False,
         dtype=out_dtype,
     )
+    q_scale = torch.ones([1], dtype=torch.float, device="cuda")
+    kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
     def test_sparse_mla_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
+
+        kv_buffer_cal = kv_buffer.to(kvtype)
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
@@ -511,6 +515,7 @@ def test_mla(
             kv_last_page_lens,
             1,
             sm_scale,
+            kv_scale=kv_scale,
             num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
@@ -541,10 +546,7 @@ def test_mla(
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         q_fp8 = q.to(dtypes.fp8)
-        q_scale = torch.ones([1], dtype=torch.float, device="cuda")
-
         kv_buffer_fp8 = kv_buffer.to(kvtype)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
             q_fp8 if dtype == dtypes.fp8 else q,

@@ -300,15 +300,21 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
+    q_scale = torch.ones([1], dtype=torch.float, device="cuda")
+    kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+    # import pdb;pdb.set_trace()
+
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
+        kv_buffer_cal = kv_buffer.to(kvtype)
+
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
-            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+            kv_buffer_cal.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
             qo_indptr,
             kv_indptr,
@@ -316,6 +322,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
+            kv_scale=kv_scale,
             num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
@@ -336,6 +343,8 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+        # import pdb;pdb.set_trace()
+
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
@@ -343,10 +352,7 @@ def test_mla(
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         q_fp8 = q.to(dtypes.fp8)
-        q_scale = torch.ones([1], dtype=torch.float, device="cuda")
-
         kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
             q_fp8 if dtype == dtypes.fp8 else q,
