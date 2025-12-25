@@ -816,6 +816,7 @@ def get_2stage_cfgs(
             ksplit,
             False,
             True,
+            get_b_nt_type(token),
         )
     elif (
         dtype in [dtypes.bf16, dtypes.fp16]
