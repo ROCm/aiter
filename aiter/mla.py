@@ -365,6 +365,62 @@ def mla_decode_fwd(
                 )
                 out = out / l.transpose(0, 1).unsqueeze(-1)
                 checkAllclose(o[i], out[0].to(o.dtype), msg=f"o[{i}] vs. out[{i}]")
+
+                #
+                # Simulate Kernel
+                log2e = 1.4426950408889634
+                for kv_tile_start in range(0, key.shape[0], 32):
+                    kv_tile_end = min(kv_tile_start + 32, key.shape[0])
+                    k_tile = key[kv_tile_start:kv_tile_end, :, :]
+                    v_tile, _ = torch.split(k_tile, [512, 64], dim=-1)
+                    # QK GEMM
+                    qk_tile = (
+                        torch.einsum(
+                            "qhd,khd->hqk", query.float(), k_tile.float()
+                        ).squeeze(1)
+                        * sm_scale
+                    )
+                    # SOTFMAX
+                    local_m_tile = qk_tile.max(-1).values
+                    new_m_tile = (
+                        local_m_tile
+                        if kv_tile_start == 0
+                        else torch.max(m_tile, local_m_tile)
+                    )
+                    rescale_tile = (
+                        torch.full_like(new_m_tile, 1.0)
+                        if kv_tile_start == 0
+                        else torch.exp2((m_tile - new_m_tile) * log2e)
+                    )
+                    p_tile = torch.exp2(
+                        (qk_tile - new_m_tile.unsqueeze(-1)) * log2e
+                    ).unsqueeze(1)
+                    sum_e_tile = (
+                        p_tile.sum(-1)
+                        if kv_tile_start == 0
+                        else p_tile.sum(-1) + sum_e_tile * rescale_tile.unsqueeze(-1)
+                    )
+                    m_tile = new_m_tile
+                    # PV GEMM
+                    pv_tile = torch.einsum(
+                        "hqk,khd->qhd", p_tile.to(v_tile.dtype).float(), v_tile.float()
+                    )
+                    o_tile = (
+                        pv_tile
+                        if kv_tile_start == 0
+                        else o_tile * rescale_tile.unsqueeze(-1) + pv_tile
+                    )
+                o_tile = o_tile / sum_e_tile.transpose(0, 1).unsqueeze(-1)
+                checkAllclose(o[i], o_tile[0].to(o.dtype), msg=f"o[{i}] vs. o_tile[0]")
+                checkAllclose(
+                    out[0].to(o.dtype),
+                    o_tile[0].to(o.dtype),
+                    msg=f"out[{i}] vs. o_tile[0]",
+                )
+
+
+                # print(datetime.datetime.now())
+
             exit()
 
         else:

@@ -463,7 +463,8 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
                                         comp_t* p_rescale,
                                         uint32_t kv_tile_start,
                                         uint32_t kv_end,
-                                        float softmax_scale)
+                                        float softmax_scale,
+                                        float* p_dbg)
 {
     constexpr comp_t log2e = 1.4426950408889634;
 
@@ -497,7 +498,7 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
     }
 
     const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, *p_row_max);
-    *p_rescale = kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((local_max - new_row_max) * log2e);
+    *p_rescale = kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f(((*p_row_max) - new_row_max) * log2e);
 
     *p_row_max = new_row_max;
 
@@ -608,8 +609,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     using comp_t = float;
 
     using G = hk::group<T::kNumWarps>;
-
-    constexpr comp_t log2e = 1.4426950408889634;
 
     const int32_t worker_idx     = blockIdx.x;
     const int32_t work_start_idx = __builtin_amdgcn_readfirstlane(params.p_work_indptr[worker_idx]);
@@ -792,8 +791,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             });
 
             float rescale;
-            softmax<kIsFirstIter, kIsTail, k_p_comp_begin, comp_t>(
-                &row_max, &row_sum_e, &rescale, kv_tile_start, kv_end, params.softmax_scale);
+            softmax<kIsFirstIter, kIsTail, k_p_comp_begin, comp_t>(&row_max,
+                                                                   &row_sum_e,
+                                                                   &rescale,
+                                                                   kv_tile_start,
+                                                                   kv_end,
+                                                                   params.softmax_scale,
+                                                                   params.p_dbg);
 
             if constexpr(kIsFirstIter == false)
             {
@@ -859,13 +863,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 if constexpr(kIsFirstIter)
                 {
-                    // hk::mma_ABt(oaccu_0, kv_0, p_mfma);
-                    hkm::mfma_f32_16x16x32_fp8_fp8_zero_accum<k_kv_0_begin,
-                                                              k_p_mfma_begin,
-                                                              oaccu_base>();
-                    hkm::mfma_f32_16x16x32_fp8_fp8_zero_accum<k_kv_0_begin + 2,
-                                                              k_p_mfma_begin,
-                                                              oaccu_base + 4>();
+                    hk::mma_ABt(oaccu_0, kv_0, p_mfma);
                 }
                 else
                 {
