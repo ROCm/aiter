@@ -68,10 +68,10 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t CShuffleMXDLPerWave = std::min(MXDLPerWave, 2);
     static constexpr ck::index_t CShuffleNXDLPerWave = ck::is_same_v<B0DataType, I4> ? 1 : NXDLPerWave;
     // Note: some fp8 instances didn't compile with AK1/BK1=16
-    static constexpr ck::index_t K1 = (MPerBlock != 16 && NPerBlock == 64 && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1) ? 8 : 16;
+    static constexpr ck::index_t K1 = (BLOCKSIZE != 64 && MPerBlock != 16 && NPerBlock == 64 && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1) ? 8 : 16;
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 = ck::is_same_v<B0DataType, I4> ? 32 : K1 / sizeof(B0DataType);
-    static constexpr ck::index_t EVec = MPerBlock == 16 ? 4: 16 / sizeof(EDataType);
+    static constexpr ck::index_t EVec = (MPerBlock == 16 || BLOCKSIZE == 64) ? 4: 16 / sizeof(EDataType);
     static constexpr ck::index_t K0_A = KPerBlock / AK1;
     static constexpr ck::index_t K0_B = KPerBlock / BK1;
     static constexpr ck::index_t K0_M_A = BLOCKSIZE / K0_A;
@@ -79,8 +79,8 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t D0Vec = 1;
     static constexpr ck::index_t D1Vec = PerTensorQuant ? 1 : EVec;
     static constexpr ck::index_t D2Vec = 1;
-    static constexpr ck::index_t CShuffleNLane = MPerBlock == 16 ? K0_A : 8;
-    static constexpr ck::index_t CShuffleMLane = MPerBlock == 16 ? K0_M_A : 32;
+    static constexpr ck::index_t CShuffleNLane = (MPerBlock == 16 || BLOCKSIZE == 64) ? K0_A : 8;
+    static constexpr ck::index_t CShuffleMLane = (MPerBlock == 16 || BLOCKSIZE == 64) ? K0_M_A : 32;
 
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemm
         // clang-format off
