@@ -371,7 +371,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
-    constexpr int32_t kPackedQoLenPerWg = 128;                                              \
+    constexpr int32_t kPackedQoLenPerWg = 128;
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
@@ -393,9 +393,6 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         (q_dtype == at::ScalarType::Float8_e4m3fnuz || q_dtype == at::ScalarType::Float8_e4m3fn);
     const bool kv_is_fp8 =
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
-
-    const bool q_is_bf16  = q_dtype == at::ScalarType::BFloat16;
-    const bool kv_is_bf16 = kv_dtype == at::ScalarType::BFloat16;
 
     const bool natively_supported = (num_heads == 16) ||
                                     ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
@@ -450,6 +447,4 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
             max_seqlen_qo,
             dev_prop.warpSize,
             dev_prop.maxSharedMemoryPerMultiProcessor));
-
-
 }

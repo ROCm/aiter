@@ -384,24 +384,3 @@ private:
             MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                                    \
         }                                                                                               \
     }
-
-#define MLA_NUM_HEADS_CASE(C_NUM_HEADS, ...)                                                        \
-    case C_NUM_HEADS:                                                                               \
-    {                                                                                               \
-        constexpr int32_t kPackedQoLenPerWg = C_NUM_HEADS;                                          \
-        __VA_ARGS__;                                                                                \
-        break;                                                                                      \
-    }
-
-#define MLA_NUM_HEADS_DISPATCHER(NUM_HEADS, ...)                                                    \
-    switch (NUM_HEADS)                                                                              \
-    {                                                                                               \
-        MLA_NUM_HEADS_CASE(32, __VA_ARGS__);                                                        \
-        MLA_NUM_HEADS_CASE(64, __VA_ARGS__);                                                        \
-        default:                                                                                    \
-        {                                                                                           \
-            constexpr int32_t kPackedQoLenPerWg = 128;                                              \
-            __VA_ARGS__;                                                                            \
-            break;                                                                                  \
-        }                                                                                           \
-    }
