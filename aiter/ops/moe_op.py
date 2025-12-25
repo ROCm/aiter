@@ -340,6 +340,7 @@ def moe_cktile2stages_gemm1_ck(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    b_nt_type: Optional[int] = 0,
 ) -> Tensor: ...
 
 
@@ -359,6 +360,7 @@ def moe_cktile2stages_gemm1(
     exp_bias: Optional[Tensor] = None,
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    b_nt_type: Optional[int] = 0,
     split_k: Optional[int] = 1,
 ):
     return moe_cktile2stages_gemm1_ck(
@@ -378,6 +380,7 @@ def moe_cktile2stages_gemm1(
         activation,
         block_m,
         split_k,
+        b_nt_type,
     )
 
 
@@ -399,6 +402,7 @@ def moe_cktile2stages_gemm2_ck(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    b_nt_type: Optional[int] = 0,
 ) -> Tensor: ...
 
 
@@ -418,6 +422,7 @@ def moe_cktile2stages_gemm2(
     exp_bias: Optional[Tensor] = None,
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    b_nt_type: Optional[int] = 0,
     split_k: Optional[int] = 1,
 ):
     return moe_cktile2stages_gemm2_ck(
@@ -437,6 +442,7 @@ def moe_cktile2stages_gemm2(
         activation,
         block_m,
         split_k,
+        b_nt_type,
     )
 
 

@@ -20,6 +20,10 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.utility.amd_buffer_coherence import (
+    BufferCoherenceType,
+    BufferCoherenceMapper,
+)
 
 BLOCK_SIZE_M = 32
 
@@ -533,6 +537,14 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     return 0
 
 
+@functools.lru_cache(maxsize=2048)
+def get_b_nt_type(token):
+    b_nt = BufferCoherenceType.DEFAULT
+    if token <= 416:
+        b_nt = BufferCoherenceType.WAVE_NT
+    return BufferCoherenceMapper.map_to_arch_value(b_nt)
+
+
 cfg_2stages = None
 # fmt: off
 fused_moe_1stage_dict = {
@@ -594,6 +606,7 @@ class MOEMetadata:
     ksplit: int
     run_1stage: bool = False
     has_bias: bool = False
+    b_nt_type: BufferCoherenceType = BufferCoherenceType.DEFAULT
 
 
 @functools.lru_cache(maxsize=2048)
@@ -829,6 +842,7 @@ def get_2stage_cfgs(
             16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
             run_1stage,
+            get_b_nt_type(token),
         )
     if (
         "ck2stages" in kernelName1
@@ -1035,6 +1049,7 @@ def fused_moe_2stages(
         w1_scale=(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
+        b_nt_type=metadata.b_nt_type,
         sorted_weights=sorted_weights if doweight_stage1 else None,
         dtype=dtype,
         **extra_stage1_args,
@@ -1116,6 +1131,7 @@ def fused_moe_2stages(
         ),
         a2_scale=a2_scale,
         block_m=block_size_M,
+        b_nt_type=metadata.b_nt_type,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
@@ -1470,6 +1486,7 @@ def ck_moe_stage1(
     kernelName="",
     sorted_weights=None,
     quant_type=aiter.QuantType.No,
+    b_nt_type=0,
     activation=ActivationType.Gelu,
     splitk=1,
     dtype=None,
@@ -1525,6 +1542,7 @@ def cktile_moe_stage1(
     n_pad_zeros=0,
     k_pad_zeros=0,
     bias1=None,
+    b_nt_type=0,
     activation=ActivationType.Silu,
     split_k=1,
     dtype=torch.bfloat16,
@@ -1564,6 +1582,7 @@ def cktile_moe_stage1(
         bias1,
         activation,
         block_m,
+        b_nt_type,
         split_k,
     )
 
@@ -1593,6 +1612,7 @@ def cktile_moe_stage2(
     n_pad_zeros=0,
     k_pad_zeros=0,
     bias2=None,
+    b_nt_type=0,
 ):
     token_num = a2.shape[0]
     D = w2.shape[1]
@@ -1622,6 +1642,7 @@ def cktile_moe_stage2(
         bias2,
         activation,
         block_m,
+        b_nt_type,
     )
     return out
 

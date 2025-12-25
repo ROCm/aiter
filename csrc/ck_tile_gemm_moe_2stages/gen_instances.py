@@ -280,6 +280,7 @@ template torch::Tensor
                 "(activation)": self.activation,
                 "(has_bias)": "true" if self.activation == 2 else "false",
                 "(split_k)": "true" if self.is_split_k else "false",
+                "(b_nt_type)": str(self.b_nt_type),
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
             str_mapping.update(format_args)
