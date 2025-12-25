@@ -451,7 +451,12 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [16, 32, 64, 128]:
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+        16,
+        32,
+        64,
+        128,
+    ]:
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
