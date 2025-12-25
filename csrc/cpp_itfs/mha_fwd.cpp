@@ -187,7 +187,6 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     if((!a.use_asm_v3) || (a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
        (a.data_type != "bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
-       (a.has_lse && a.batch_stride_lse < a.nhead_stride_lse) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
         std::cout << "[Warning]unsupport condition!!!" << std::endl;
@@ -207,7 +206,6 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     auto it                     = fwd_cfgs->find(kernel_name_key);
     if(it == fwd_cfgs->end())
     {
-        std::cout << "[Warning]error kernel name key!!!" << std::endl;
         return -1;
     };
 
