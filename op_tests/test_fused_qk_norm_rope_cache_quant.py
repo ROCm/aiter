@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -304,7 +305,11 @@ if __name__ == "__main__":
                 for i, head_size in enumerate(head_sizes):
                     for kv_cache_dtype in kv_cache_dtypes:
                         if kv_cache_dtype == "fp8_e4m3":
-                            cache_dtype = torch.float8_e4m3fnuz
+                            cache_dtype = (
+                                torch.float8_e4m3fn
+                                if get_arch() != "gfx942"
+                                else torch.float8_e4m3fnuz
+                            )
                         else:
                             cache_dtype = dtype
                         k_cache = torch.randn(
