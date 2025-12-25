@@ -480,13 +480,14 @@ def get_block_size_M(token, topk, expert, inter_dim):
         tmp.append((rnd, empty, el))
     return sorted(tmp, key=lambda x: x[:2])[0][-1]
 
+
 @functools.lru_cache(maxsize=2048)
 def get_ksplit(token, topk, expert, inter_dim, model_dim):
     aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
     if aiter_ksplit != 0:
         return aiter_ksplit
     # only for moe_blk gemm1 a8w8 decode scenario
-    cu_num = get_cu_num() * 2 # a4w4 blkperCU = 2
+    cu_num = get_cu_num() * 2  # a4w4 blkperCU = 2
     tileN = 128
 
     tgM = token * topk  # decode tile num
@@ -816,7 +817,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
                 bias1=bias1,
-                split_k=ksplit * 2, # multiple with blkperCU.
+                split_k=ksplit * 2,  # multiple with blkperCU.
             ),
             functools.partial(
                 cktile_moe_stage2,
