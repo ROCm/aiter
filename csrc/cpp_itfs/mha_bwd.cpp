@@ -127,8 +127,9 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
 
 float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
+    float asm_ret = fmha_v3_bwd(a, s);
 #if ONLY_FAV3
-    return fmha_v3_bwd(a, s);
+    return asm_ret;
 #else
     fmha_bwd_traits traits{a.hdim_q,
                            a.hdim_v,
@@ -225,11 +226,11 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* drop_seed_offset   */ a.drop_seed_offset,
     };
 
-    float asm_ret = fmha_v3_bwd(a, s);
     if(asm_ret == -1)
     {
         return fmha_bwd(traits, ck_args, s);
     }
+    return asm_ret;
 #endif
 }
 
@@ -462,9 +463,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     if(a.mask_type == 3)
     {
+        // Note: sink_size=0 is passed as the 3rd parameter (attention sink not supported in bwd
+        // yet)
+        auto sink_size    = 0;
         auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
             a.window_size_left,
             a.window_size_right,
+            sink_size,
             a.seqlen_q,
             a.seqlen_k,
             (a.ck_mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||

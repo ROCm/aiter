@@ -223,17 +223,22 @@ def cmdGenFunc_ck_moe_stage(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    splitk: int = 1,
+    dst_type: Optional[str] = None,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
+    is_splitk = splitk > 1
+    outtype = str2dtype_dict[dst_type] if is_splitk else out.dtype
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
         w1.dtype,
-        out.dtype,
+        outtype,
         activation,
         quant_type,
         mul_routed_weight_stage,
         getattr(w1, "is_shuffled", False),
+        is_splitk,
     )
     return {
         "md_name": md_name,
@@ -292,6 +297,8 @@ def ck_moe_stage1(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    splitk: int = 1,
+    dst_type: Optional[str] = None,
 ) -> None: ...
 
 
@@ -443,6 +450,11 @@ dtype2str_dict = {
     torch.int4: "i4",
 }
 
+str2dtype_dict = {
+    "f16": dtypes.fp16,
+    "b16": dtypes.bf16,
+}
+
 
 @functools.lru_cache(maxsize=1024)
 def get_moe_stage_module(
@@ -453,6 +465,7 @@ def get_moe_stage_module(
     quant_type,
     mul_routed_weight_stage,
     preshuffle_mode=False,
+    is_splitk=False,
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -467,6 +480,7 @@ def get_moe_stage_module(
     if preshuffle_mode and weight_dtype == dtypes.fp4x2:
         preshuffle_str = "--preshuffle"
 
+    splitk_str = "--issplitk" if is_splitk else ""
     quant_type = (
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
@@ -483,10 +497,11 @@ def get_moe_stage_module(
             act,
             quant_type,
             f"mulWeightStage{mul_routed_weight_stage}",
+            "splitk" if is_splitk else "",
         ]
     )
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} -w {{}}"
     ]
 
     return md_name, blob_gen_cmd
@@ -508,6 +523,8 @@ def ck_moe_stage1_fwd(
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
+    splitk: Optional[int] = 1,
+    dst_type: Optional[torch.dtype] = None,
 ):
     ck_moe_stage1(
         hidden_states,
@@ -525,6 +542,8 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
+        splitk,
+        dtype2str_dict[dst_type],
     )
     return out
 
