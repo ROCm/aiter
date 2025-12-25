@@ -629,12 +629,12 @@ def test_pa_mtp(
         )
 
         # Store results
-        ret["us_asm_fp8"] = stats_ps["p99"]
-        ret["us_asm_fp8_mean"] = stats_ps["mean"]
-        ret["us_asm_fp8_p50"] = stats_ps["p50"]
-        ret["us_asm_fp8_p95"] = stats_ps["p95"]
-        ret["us_asm_noquant_p99"] = stats_no_ps["p99"]
-        ret["us_asm_noquant_mean"] = stats_no_ps["mean"]
+        ret["us_asm_fp8_p99"] = stats_ps["p99"]
+        # ret["us_asm_fp8_mean"] = stats_ps["mean"]
+        # ret["us_asm_fp8_p50"] = stats_ps["p50"]
+        # ret["us_asm_fp8_p95"] = stats_ps["p95"]
+        ret["us_asm_fp8_nops_99"] = stats_no_ps["p99"]
+        # ret["us_asm_fp8_nops_mean"] = stats_no_ps["mean"]
         ret["speedup_p99"] = (
             stats_no_ps["p99"] / stats_ps["p99"] if stats_ps["p99"] > 0 else 0
         )
@@ -707,7 +707,7 @@ l_num_heads = [
     # (16, 1),
 ]  # num_query_heads must be multiple of 16 for get_mla_metadata_info_v1
 l_qlen = [1, 2, 3, 4]
-# l_qlen = [4]
+l_qlen = [1, 4]
 # q_Tile is [max_qlen * num_query_heads // num_kv_heads]
 kv_lens_list0 = [i * 256 for i in range(1, 10)]
 kv_lens_list1 = [i - 1 for i in kv_lens_list0]
@@ -734,10 +734,12 @@ kv_lens_list = [
 ]
 # l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
 # l_ctx_len = kv_lens_list0 + kv_lens_list1 + kv_lens_list3 + kv_lens_list
+kv_lens_list = [4096, 8192, 10240]
 l_ctx_len = kv_lens_list
 # l_ctx_len = [3460, 16700, 7900, 2580, 4140, 6360, 2270]
 # l_ctx_len = [16000]
 l_batch_size = [32, 64, 80]
+l_batch_size = [64, 128, 256, 512]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -837,8 +839,8 @@ l_varlen = args.varlen
 
 for dtype in l_dtype:
     df = []
-    for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
-        l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
+    for num_heads, batch_size, block_size, ctx_len, qlen in itertools.product(
+        l_num_heads, l_batch_size, l_block_size, l_ctx_len, l_qlen
     ):
         ret = test_pa_mtp(
             ctx_len,
@@ -856,4 +858,4 @@ for dtype in l_dtype:
         df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
-    df.to_csv("pa_ps.csv")
+    df.to_csv("pa_nt.csv")
