@@ -186,10 +186,13 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     std::string arch_id = get_gpu_arch();
 
     if((!a.use_asm_v3) || (a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
-       (a.bias_type != 0) || (a.p_drop > 0.f) || ((arch_id != "gfx942") && (arch_id != "gfx950")))
+       (a.data_type != "bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
+       (a.has_lse && a.batch_stride_lse < a.nhead_stride_lse) ||
+       ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
         return -1;
     }
+
     auto fwd_cfgs               = &cfg_fmha_fwd;
     int cfg_mask_type           = get_cfg_mask_type(a);
     std::string kernel_name_key = get_kernel_name_key(arch_id,
@@ -213,17 +216,11 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     AiterAsmKernel* impl_ptr = nullptr;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    const auto& cfg = it->second;
-
+    const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
-
-    auto result = impl_ptr_map.emplace(name, nullptr);
-
-    if(result.second)
-    {
-        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
-    }
+    auto result =
+        impl_ptr_map.try_emplace(name, std::make_unique<AiterAsmKernel>(name, co_name.c_str()));
     impl_ptr = result.first->second.get();
     fmha_fwd_v3_args args;
     int arg_size = sizeof(args);
