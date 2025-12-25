@@ -162,6 +162,8 @@ def mla_decode_fwd(
     q_scale=None,
     kv_scale=None,
     intra_batch_mode=False,
+    return_logits=False,
+    return_lse=False,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -271,7 +273,7 @@ def mla_decode_fwd(
         ):
             # Natively support cases
             pass
-        elif nhead in range(32, 128 + 1, 16) and persistent_mode and max_seqlen_q == 1:
+        elif nhead in range(32, 128 + 1, 16) and persistent_mode:
             # we use nhead=16 to simulate such cases by customized metadata
             # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
             total_s = ori_total_s * (ori_nhead // 16)
@@ -292,7 +294,11 @@ def mla_decode_fwd(
             dtype=dtypes.fp32,
             device=device,
         )
-        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        final_lse = (
+            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            if return_lse
+            else None
+        )
 
         aiter.mla_decode_stage1_asm_fwd(
             q,
@@ -326,10 +332,9 @@ def mla_decode_fwd(
         )
 
     if io_transformed:
-        if persistent_mode:
+        if return_logits:
             logits = logits.view(-1, 1, ori_nhead, v_head_dim)
-        else:
-            logits = logits.view(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
+
         q = q.view(ori_total_s, ori_nhead, -1)
         o = o.view(ori_total_s, ori_nhead, -1)
 

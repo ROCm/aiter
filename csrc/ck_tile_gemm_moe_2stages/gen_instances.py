@@ -8,12 +8,14 @@ import shutil
 import re
 from moe_cktile2stages_common import (
     act_dict,
+    dtype_dict,
     kernelInstance,
     get_gemm1_kernels_list,
     get_gemm2_kernels_list,
     get_heuristic_dispatch_template,
 )
 import sys
+from chip_info import get_gfx
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -30,7 +32,7 @@ class cktile_moe_2stage_gemm_codegen:
     def __init__(
         self,
         working_path,
-        ab_dtype,
+        a_dtype,
         acc_dtype,
         c_dtype,
         quant_type,
@@ -42,8 +44,11 @@ class cktile_moe_2stage_gemm_codegen:
         self.working_path = working_path
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
+        self.dispatchers_path = os.path.join(working_path, "dispatchers")
         self.istune = istune
-        self.ab_dtype = ab_dtype.lower()
+        self.kernel_name_list = []
+        self.a_dtype = a_dtype
+        self.b_dtype = "fp4"
         self.acc_dtype = acc_dtype.lower()
         self.c_dtype = c_dtype.lower()
         self.quant_type = quant_type
@@ -121,10 +126,11 @@ torch::Tensor
             xptr = "static_cast<float*>(x_scale.value().data_ptr())"
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
         elif k.QuantType == "1x32":
-            scaleGranA = "-1"
+            # scaleGranA = "-1"
+            scaleGranA = "1, 32"
             scaleGranB = "1, 32"
             biasGran = "1"
-            xptr = "nullptr"
+            xptr = "x_scale.has_value() ? static_cast<float*>(x_scale.value().data_ptr()) : nullptr"
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
             biasptr = "static_cast<float*>(exp_bias.has_value() ? exp_bias.value().data_ptr() : nullptr)"
 
@@ -240,8 +246,8 @@ template torch::Tensor
                 )
             ).write_text(intsance)
 
-        if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
-            fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
+        if (k.QuantType == "1x32") and (a_type in ["bf16", "fp16", "fp8"]):
+            fill_template(k.name, self.a_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
         else:
             for CDtype in ["bf16", "fp16"]:
                 for ABDtype in ["fp8"]:  # "bf16", "fp16",
@@ -266,6 +272,10 @@ template torch::Tensor
         def validate_and_format(template: str, mapping: dict) -> str:
             # check all format element in dict.
             str_mapping = {
+                '(a_data_type)': dtype_dict[self.a_dtype],
+                '(b_data_type)': dtype_dict[self.b_dtype],
+                '(acc_data_type)': dtype_dict[self.acc_dtype],
+                '(c_data_type)': dtype_dict[self.c_dtype],
                 '(activation)': self.activation,
                 '(has_bias)': 'true' if self.activation == 2 else 'false',
                 '(split_k)': 'true' if self.is_split_k else 'false',
@@ -278,8 +288,9 @@ template torch::Tensor
             # print(placeholders)
             # print(str_mapping)
             if missing:
-                raise KeyError(f"Missing keys in mapping: {missing}")
-            result = template
+                for mis in missing:
+                    placeholders.remove(mis)
+            # result = template
             # for placeholder in placeholders:
             #     result = result.replace(placeholder, str_mapping[placeholder])
             # return result
@@ -288,7 +299,9 @@ template torch::Tensor
         _, k = next(iter(dict.items()))
         # create heuristic heirarchy
         with open(
-            os.path.join(self.working_path, f"{k.dispatch_suffix}_heuristic_dispatch.h"),
+            os.path.join(
+                self.dispatchers_path, f"moe_cktile2stages_heuristic_dispatch_{tag}.h"
+            ),
             "w",
         ) as f:
             f.write(validate_and_format(HEURISTIC_template, dict))
@@ -353,7 +366,8 @@ template torch::Tensor
 #include <torch/extension.h>
 """
         MAINFEST_template = """
-template <typename ADataType, typename BDataType, typename DDataType, typename EDataType>
+// template <typename ADataType, typename BDataType, typename DDataType, typename EDataType>
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
 torch::Tensor
 {kernel_name}(
     torch::Tensor& XQ,
@@ -381,8 +395,8 @@ torch::Tensor
             os.path.join(self.working_path, f"{k0.dispatch_suffix}_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            for k_name in self.kernel_name_list:
+                f.write(MAINFEST_template.format(kernel_name=k_name))
             f.write(MAINFEST_end)
 
         return f"{k0.dispatch_suffix}_manifest.h"
@@ -390,11 +404,13 @@ torch::Tensor
     """generate all instances and headers"""
 
     def gen_instances(self, tag, kernels_dict):
-
         for mnk, k in kernels_dict.items():
             self.gen_instance(k)
+            if k.name not in self.kernel_name_list:
+                self.kernel_name_list.append(k.name)
 
         self.gen_lookup_dict(kernels_dict)
+        self.gen_heuristic_dispatch(tag, kernels_dict)
         return self.gen_heuristic_dispatch(tag, kernels_dict), self.gen_manifest_head(kernels_dict)
 
 
@@ -441,6 +457,46 @@ def generate_common_header(working_path, dispatch_files, manifest_files):
     with open(manifest_common_header_path, "w") as f:
         f.write(manifest_header)
 
+
+    """genarete heuristic dispatch header for multi dtype"""
+
+def gen_heuristic_dispatch_header(tags):
+    HEURISTIC_dispatch_header = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
+
+"""
+    for tag in tags:
+        HEURISTIC_headers = f"""#include "./dispatchers/moe_cktile2stages_heuristic_dispatch_{tag}.h"
+"""
+        HEURISTIC_dispatch_header += HEURISTIC_headers
+
+    HEURISTIC_function = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "moe_cktile2stages.h"
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m);
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m);
+"""
+    # create heuristic heirarchy
+    with open(
+        os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"),
+        "w",
+    ) as f:
+        f.write(HEURISTIC_dispatch_header)
+    with open(
+        os.path.join(
+            self.dispatchers_path, "moe_cktile2stages_heuristic_dispatch_common.h"
+        ),
+        "w",
+    ) as f:
+        f.write(HEURISTIC_function)
 
 
 if __name__ == "__main__":
@@ -583,6 +639,8 @@ if __name__ == "__main__":
     # quant_type = "per_token"
 
     a_types = ["bf16"]
+    if get_gfx() == "gfx950":
+        a_types.append("fp8")
     b_type = "fp4"
     quant_type = "1x32"
 
@@ -593,6 +651,7 @@ if __name__ == "__main__":
 
     impl_path = os.path.join(args.working_path, "impl")
     instances_path = os.path.join(args.working_path, "instances")
+    dispatchers_path = os.path.join(args.working_path, "dispatchers")
 
     if os.path.exists(impl_path):
         shutil.rmtree(impl_path)
@@ -600,9 +659,15 @@ if __name__ == "__main__":
     if os.path.exists(instances_path):
         shutil.rmtree(instances_path)
     os.mkdir(instances_path)
+    if os.path.exists(dispatchers_path):
+        shutil.rmtree(dispatchers_path)
+    os.mkdir(dispatchers_path)
+
 
     gen_dispatch_files = []
     gen_manifest_files = []
+    tags = []
+    kernel_list = []
 
     for a_type, c_dtype, act_type, is_split_k in itertools.product(
         a_types, c_dtypes, act_types, is_split_k_l

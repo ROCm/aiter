@@ -24,13 +24,13 @@ import torch
 import torch.nn.functional as F
 
 import aiter
-from aiter import dtypes, logger
+from aiter import dtypes, get_semaphore_workspace, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 
 aiter.hipb_create_extension()
 
@@ -59,10 +59,12 @@ def call_hipb_mm(
 def run_gemm_bf16_asm(
     inp, w, out, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
+    sema = get_semaphore_workspace(inp.device)
     return aiter.gemm_a16w16_asm(
         inp,
         w,
         out,
+        sema,
         bias=bias,
         splitK=splitK,
         kernelName=kernelName,

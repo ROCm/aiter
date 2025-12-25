@@ -3,9 +3,8 @@
 
 from typing import Optional
 import torch
-import triton
-import triton.language as tl
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.common_utils import serialize_dict
 from aiter.ops.triton.gemm_a16wfp4 import (
     gemm_a16wfp4,
 )
@@ -14,9 +13,9 @@ _LOGGER = AiterTritonLogger()
 
 
 def gemm_afp4wfp4_pre_quant(
-    x,
-    w,
-    w_scales,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
@@ -24,4 +23,6 @@ def gemm_afp4wfp4_pre_quant(
     _LOGGER.info(
         "gemm_afp4wfp4_pre_quant will be deprecated in future AITER release, please switch to gemm_a16wfp4"
     )
-    return gemm_a16wfp4(x, w, w_scales, True, dtype, y, config)
+
+    config_hashable = serialize_dict(config) if config else None
+    return gemm_a16wfp4(x, w, w_scales, True, dtype, y, config_hashable)
