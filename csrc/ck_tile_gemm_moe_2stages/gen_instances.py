@@ -355,7 +355,7 @@ template torch::Tensor
 
     """generate manifest.h for instance header"""
 
-    def gen_manifest_head(self, kernels_dict):
+    def gen_manifest_head(self, tag, kernels_dict):
         MAINFEST_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -393,14 +393,14 @@ torch::Tensor
 """
         _, k0 = next(iter(kernels_dict.items()))
         with open(
-            os.path.join(self.manifests_path, f"{k0.dispatch_suffix}_manifest.h"), "w"
+            os.path.join(self.manifests_path, f"{k0.dispatch_suffix}_manifest_{tag}.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
             for k_name in self.kernel_name_list:
                 f.write(MAINFEST_template.format(kernel_name=k_name))
             f.write(MAINFEST_end)
 
-        return f"./manifests/{k0.dispatch_suffix}_manifest.h"
+        return f"./manifests/{k0.dispatch_suffix}_manifest_{tag}.h"
 
     """generate all instances and headers"""
 
@@ -412,7 +412,7 @@ torch::Tensor
 
         self.gen_lookup_dict(kernels_dict)
         self.gen_heuristic_dispatch(tag, kernels_dict)
-        return self.gen_heuristic_dispatch(tag, kernels_dict), self.gen_manifest_head(kernels_dict)
+        return self.gen_heuristic_dispatch(tag, kernels_dict), self.gen_manifest_head(tag, kernels_dict)
 
 
 # def get_tune_dict(tune_dict_csv):

@@ -243,6 +243,8 @@ def fused_moe_(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        bias1,
+        bias2,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -609,6 +611,8 @@ def get_2stage_cfgs(
     doweight_stage1,
     hidden_pad,
     intermediate_pad,
+    bias1,
+    bias2,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -931,6 +935,8 @@ def fused_moe_2stages(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        bias1,
+        bias2,
     )
     if (
         quant_type == QuantType.per_1x32
