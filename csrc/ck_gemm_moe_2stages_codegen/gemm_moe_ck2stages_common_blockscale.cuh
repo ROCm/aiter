@@ -262,7 +262,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
               MXDLPerWave, NXDLPerWave,
               S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
               S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
-              MXDLPerWave,    NXDLPerWave,   S<1, K0_M, 1, K0_A>, S<2, 1, 1, 1>,
+              MXDLPerWave,    NXDLPerWave,   S<1, 4, 1, 64>, S<2, 1, 1, 1>,
               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, false, false, false, MulRoutedWeight, int32_t, A0DataType>;
 
 
