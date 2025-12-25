@@ -60,21 +60,20 @@ std::string get_kernel_name_key(const std::string& arch_id,
     return kernel_name_key;
 }
 
-std::string get_kernel_co_name(const std::string& cfg_path,
-                               const std::string& cfg_co_name,
-                               const std::string& arch_id)
+std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string& arch_id)
 {
-    std::string co_name = cfg_path + cfg_co_name;
+    std::string co_name = cfg_co_name;
     if(arch_id == "gfx942")
     {
+        auto pos        = cfg_co_name.rfind('/');
         uint32_t cu_num = get_num_cu_func();
         if(cu_num == 304)
         {
-            co_name = cfg_path + "MI300/" + cfg_co_name;
+            co_name = cfg_co_name.substr(0, pos + 1) + "MI300/" + cfg_co_name.substr(pos + 1);
         }
         else if(cu_num == 80 || cu_num == 64)
         {
-            co_name = cfg_path + "MI308/" + cfg_co_name;
+            co_name = cfg_co_name.substr(0, pos + 1) + "MI308/" + cfg_co_name.substr(pos + 1);
         }
     }
     return co_name;
@@ -216,16 +215,14 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     const auto& cfg = it->second;
 
-    std::string kernel_func_name =
-        "_ZN5aiter" + std::to_string(cfg.knl_name.length()) + cfg.knl_name + "E";
-    std::string co_name = get_kernel_co_name(cfg.path, cfg.co_name, arch_id);
+    const char* name    = cfg.knl_name.c_str();
+    std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
 
-    auto result = impl_ptr_map.emplace(kernel_func_name.c_str(), nullptr);
+    auto result = impl_ptr_map.emplace(name, nullptr);
 
     if(result.second)
     {
-        result.first->second =
-            std::make_unique<AiterAsmKernel>(kernel_func_name.c_str(), co_name.c_str());
+        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
     }
     impl_ptr = result.first->second.get();
     fmha_fwd_v3_args args;
