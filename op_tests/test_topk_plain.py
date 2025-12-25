@@ -9,7 +9,6 @@ from aiter.test_common import (
 )
 import aiter
 from aiter import dtypes
-from aiter.ops.triton.topk import topk as triton_topk
 from aiter.ops.topk_plain import topk_plain
 import pandas as pd
 
