@@ -755,6 +755,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
         auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_tile_start,
                                                              const int32_t kv_tile_end) {
+            if constexpr(kIsFirstIter == false)
+            {
+                __builtin_amdgcn_s_barrier();
+            }
+
             // Async load K from VRAM to LDS
             /// TODO: Merge loading Q with K on first iter.
             async_load_k<T, kIsTail>(p_lds_k_nope,
