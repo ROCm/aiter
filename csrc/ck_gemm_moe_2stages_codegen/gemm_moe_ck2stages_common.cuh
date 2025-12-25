@@ -75,9 +75,12 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
         ck::is_same_v<B0DataType, I4> ? 1 : NXDLPerWave;
     // Note: some fp8 instances didn't compile with AK1/BK1=16
     static constexpr ck::index_t CShuffleMLane = MPerBlock == 16 ? 16 : NPerBlock / 2 / NXDLPerWave;
-    static constexpr ck::index_t CShuffleNLane = BLOCKSIZE / CShuffleNLane;
+    static constexpr ck::index_t CShuffleNLane = BLOCKSIZE / CShuffleMLane;
     static constexpr ck::index_t K1 =
-        (PipelineVer == ck::BlockGemmPipelineVersion::v3 && NPerBlock == 64 && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1) ? 8 : 16;
+        (PipelineVer == ck::BlockGemmPipelineVersion::v3 && NPerBlock == 64 &&
+         sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1)
+            ? 8
+            : 16;
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 = ck::is_same_v<B0DataType, I4> ? 32 : K1 / sizeof(B0DataType);
     static constexpr ck::index_t EVec   = MPerBlock == 16 ? 4 : 16 / sizeof(EDataType);
@@ -250,10 +253,10 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
 
     static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
     // static constexpr ck::index_t BLOCKSIZE = 256;
-    static constexpr ck::index_t WAVES       = BLOCKSIZE / 64;
-    static constexpr ck::index_t MNPerXDL    = 16;
-    static constexpr ck::index_t MXDLPerWave = MPerBlock / (MNPerXDL * MWaves);
-    static constexpr ck::index_t NXDLPerWave = NPerBlock / (MNPerXDL * NWaves);
+    static constexpr ck::index_t WAVES               = BLOCKSIZE / 64;
+    static constexpr ck::index_t MNPerXDL            = 16;
+    static constexpr ck::index_t MXDLPerWave         = MPerBlock / (MNPerXDL * MWaves);
+    static constexpr ck::index_t NXDLPerWave         = NPerBlock / (MNPerXDL * NWaves);
     static constexpr ck::index_t CShuffleMXDLPerWave = std::min(2, MXDLPerWave);
     static constexpr ck::index_t CShuffleNXDLPerWave =
         ck::is_same_v<B0DataType, I4> ? 2 : NXDLPerWave;
