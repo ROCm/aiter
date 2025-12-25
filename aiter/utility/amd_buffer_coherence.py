@@ -54,7 +54,7 @@ class Gfx942Coherence:
     SYSTEM_NT0 = NT0 | SYSTEM  # 17
     SYSTEM_NT1 = NT1 | SYSTEM  # 19
 
-    DEFAULT = GROUP_NT0
+    DEFAULT = WAVE_NT0
     WAVE_NT = WAVE_NT1
     GROUP_NT = GROUP_NT1
     DEVICE_NT = DEVICE_NT1
@@ -153,7 +153,6 @@ class BufferCoherenceMapper:
             return BufferCoherenceMapper.map_to_gfx90a(coherence_type)
         elif arch in ["gfx950", "gfx942"]:
             return BufferCoherenceMapper.map_to_gfx942(coherence_type)
-        elif arch in ["gfx1200", "gfx1201"]
+        elif arch in ["gfx1200", "gfx1201"]:
             return BufferCoherenceMapper.map_to_gfx12(coherence_type)
-        else:
-            assert (False, f"unsupported arch {arch}")
+        return BufferCoherenceType.DEFAULT
