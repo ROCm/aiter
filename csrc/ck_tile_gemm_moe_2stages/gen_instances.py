@@ -45,6 +45,7 @@ class cktile_moe_2stage_gemm_codegen:
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.dispatchers_path = os.path.join(working_path, "dispatchers")
+        self.manifests_path = os.path.join(working_path, "manifests")
         self.istune = istune
         self.kernel_name_list = []
         self.a_dtype = a_dtype
@@ -300,13 +301,13 @@ template torch::Tensor
         # create heuristic heirarchy
         with open(
             os.path.join(
-                self.dispatchers_path, f"moe_cktile2stages_heuristic_dispatch_{tag}.h"
+                self.dispatchers_path, f"{k.dispatch_suffix}_heuristic_dispatch_{tag}.h"
             ),
             "w",
         ) as f:
             f.write(validate_and_format(HEURISTIC_template, dict))
 
-        return f"{k.dispatch_suffix}_heuristic_dispatch.h"
+        return f"./dispatchers/{k.dispatch_suffix}_heuristic_dispatch_{tag}.h"
 
 
     """generate lookup.h linking MNK/datatype to specific instance"""
@@ -392,14 +393,14 @@ torch::Tensor
 """
         _, k0 = next(iter(kernels_dict.items()))
         with open(
-            os.path.join(self.working_path, f"{k0.dispatch_suffix}_manifest.h"), "w"
+            os.path.join(self.manifests_path, f"{k0.dispatch_suffix}_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
             for k_name in self.kernel_name_list:
                 f.write(MAINFEST_template.format(kernel_name=k_name))
             f.write(MAINFEST_end)
 
-        return f"{k0.dispatch_suffix}_manifest.h"
+        return f"./manifests/{k0.dispatch_suffix}_manifest.h"
 
     """generate all instances and headers"""
 
@@ -639,7 +640,8 @@ if __name__ == "__main__":
     # quant_type = "per_token"
 
     a_types = ["bf16"]
-    if get_gfx() == "gfx950":
+    # if get_gfx() == "gfx950":
+    if True:
         a_types.append("fp8")
     b_type = "fp4"
     quant_type = "1x32"
@@ -652,6 +654,7 @@ if __name__ == "__main__":
     impl_path = os.path.join(args.working_path, "impl")
     instances_path = os.path.join(args.working_path, "instances")
     dispatchers_path = os.path.join(args.working_path, "dispatchers")
+    manifests_path = os.path.join(args.working_path, "manifests")
 
     if os.path.exists(impl_path):
         shutil.rmtree(impl_path)
@@ -662,6 +665,9 @@ if __name__ == "__main__":
     if os.path.exists(dispatchers_path):
         shutil.rmtree(dispatchers_path)
     os.mkdir(dispatchers_path)
+    if os.path.exists(manifests_path):
+        shutil.rmtree(manifests_path)
+    os.mkdir(manifests_path)
 
 
     gen_dispatch_files = []
@@ -673,6 +679,10 @@ if __name__ == "__main__":
         a_types, c_dtypes, act_types, is_split_k_l
     ):
         has_bias = True if act_type == "swiglu" else False
+
+        # a8w8 do not support
+        if a_type in ["fp8", "bf8"] and is_split_k:
+            continue
         codegen = cktile_moe_2stage_gemm_codegen(
             args.working_path, a_type, acc_type, c_dtype, quant_type, act_type, 2, is_split_k, False
         )
