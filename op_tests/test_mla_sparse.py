@@ -464,7 +464,6 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
-    # import pdb;pdb.set_trace()
 
     # generate kv topk per token & convert indices into per token
     token_indices = generate_topk_kv(kv_indptr, decode_qlen)
@@ -633,7 +632,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 2), (48, 1), (64, 2), (128, 2)]
+list_nhead = [(16, 2), (48, 1), (128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

@@ -300,7 +300,6 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
-    import pdb;pdb.set_trace()
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
