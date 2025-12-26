@@ -771,7 +771,7 @@ for test in l_test:
                                 ep=ep,
                             )
                             if ret:
-                                ret["a16w4"] = True
+                                ret["a16w8"] = True
                                 results.append(ret)
         if results:
             df = pd.DataFrame(results).sort_values(by=["token"]).reset_index(drop=True)
