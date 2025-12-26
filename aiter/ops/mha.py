@@ -1276,7 +1276,6 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
     if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
-        print(f"TESTINGGG fmha_v3_fwd = {l_tpf}")
         out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,

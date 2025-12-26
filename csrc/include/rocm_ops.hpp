@@ -790,7 +790,9 @@ namespace py = pybind11;
           py::arg("out")          = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
-          py::arg("gen")          = std::nullopt);
+          py::arg("gen")          = std::nullopt, \
+          py::arg("tokens_per_frame")         = 0);
+
 
 #define MHA_FWD_PYBIND                             \
     m.def("mha_fwd",                               \

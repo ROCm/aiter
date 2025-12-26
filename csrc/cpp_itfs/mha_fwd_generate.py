@@ -99,7 +99,9 @@ float mha_fwd(mha_fwd_args args,
               int how_v3_bf16_cvt,
               const void* seqstart_q_padding_ptr,
               const void* seqstart_k_padding_ptr,
-              bool is_v3_api_check)
+              bool is_v3_api_check,
+              int magic_const,
+              int tokens_per_frame)
 {{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
@@ -178,7 +180,7 @@ V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
 
 def get_v3_api():
-    v3_call = "fmha_fwd_v3(traits, args, stream_config, is_v3_api_check)"
+    v3_call = "fmha_fwd_v3(traits, args, stream_config, is_v3_api_check, magic_const, tokens_per_frame)"
     gfx_list = get_gfx_list()
     v3_arch_list = [arch for arch in ["gfx942", "gfx950"] if arch in gfx_list]
 

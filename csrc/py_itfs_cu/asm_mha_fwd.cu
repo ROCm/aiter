@@ -312,6 +312,8 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                 softmax_scale,
                 p_dropout,
                 drop_seed_offset);
+        
+        int magic_const = (uint32_t)(((1ULL << 32) + tokens_per_frame - 1) / tokens_per_frame);
 
         float t = aiter::mha_fwd(args,
                                  stream_config,
@@ -323,7 +325,12 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  quant_scale_enum::no_scale,
                                  true,
                                  false,
-                                 how_v3_bf16_cvt);
+                                 how_v3_bf16_cvt,
+                                 nullptr,
+                                 nullptr,
+                                 false,
+                                 magic_const,
+                                 tokens_per_frame);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {
