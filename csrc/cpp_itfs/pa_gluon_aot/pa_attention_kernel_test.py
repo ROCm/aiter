@@ -1033,31 +1033,31 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     print("\n=== Test Results ===")
     if max_diff_exp_sums < tolerance:
         print(
-            f"? exp_sums TEST PASSED: Max difference ({max_diff_exp_sums:.6e}) < tolerance ({tolerance})"
+            f"✅ exp_sums TEST PASSED: Max difference ({max_diff_exp_sums:.6e}) < tolerance ({tolerance})"
         )
     else:
         print(
-            f"? exp_sums TEST FAILED: Max difference ({max_diff_exp_sums:.6e}) >= tolerance ({tolerance})"
+            f"❌ exp_sums TEST FAILED: Max difference ({max_diff_exp_sums:.6e}) >= tolerance ({tolerance})"
         )
         all_passed = False
 
     if max_diff_max_logits < tolerance:
         print(
-            f"? max_logits TEST PASSED: Max difference ({max_diff_max_logits:.6e}) < tolerance ({tolerance})"
+            f"✅ max_logits TEST PASSED: Max difference ({max_diff_max_logits:.6e}) < tolerance ({tolerance})"
         )
     else:
         print(
-            f"? max_logits TEST FAILED: Max difference ({max_diff_max_logits:.6e}) >= tolerance ({tolerance})"
+            f"❌ max_logits TEST FAILED: Max difference ({max_diff_max_logits:.6e}) >= tolerance ({tolerance})"
         )
         all_passed = False
 
     if max_diff_temporary_output < tolerance:
         print(
-            f"? temporary_output TEST PASSED: Max difference ({max_diff_temporary_output:.6e}) < tolerance ({tolerance})"
+            f"✅ temporary_output TEST PASSED: Max difference ({max_diff_temporary_output:.6e}) < tolerance ({tolerance})"
         )
     else:
         print(
-            f"? temporary_output TEST FAILED: Max difference ({max_diff_temporary_output:.6e}) >= tolerance ({tolerance})"
+            f"❌ temporary_output TEST FAILED: Max difference ({max_diff_temporary_output:.6e}) >= tolerance ({tolerance})"
         )
         all_passed = False
 
@@ -1080,12 +1080,12 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     # Test result
     if all_passed:
         print(
-            f"\n? OVERALL TEST PASSED: All comparisons within tolerance and no NaN values detected"
+            f"\n✅ OVERALL TEST PASSED: All comparisons within tolerance and no NaN values detected"
         )
         return True
     else:
         print(
-            f"\n? OVERALL TEST FAILED: Some comparisons failed or NaN values detected"
+            f"\n❌ OVERALL TEST FAILED: Some comparisons failed or NaN values detected"
         )
         return False
 

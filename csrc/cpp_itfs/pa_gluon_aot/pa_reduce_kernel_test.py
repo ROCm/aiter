@@ -469,11 +469,11 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     tolerance = 5e-3
     if max_diff < tolerance:
         print(
-            f"\n? TEST PASSED: Max difference ({max_diff:.6e}) < tolerance ({tolerance})"
+            f"\n✅ TEST PASSED: Max difference ({max_diff:.6e}) < tolerance ({tolerance})"
         )
     else:
         print(
-            f"\n? TEST FAILED: Max difference ({max_diff:.6e}) >= tolerance ({tolerance})"
+            f"\n❌ TEST FAILED: Max difference ({max_diff:.6e}) >= tolerance ({tolerance})"
         )
 
     return {
