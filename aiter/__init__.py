@@ -75,6 +75,7 @@ from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
 from .ops.fused_mrope_rms import *
+from .ops.groupnorm import *
 from . import mla
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
