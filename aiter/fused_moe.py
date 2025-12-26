@@ -774,18 +774,19 @@ def get_2stage_cfgs(
             False,
             True,
         )
-    if (
-        (kernelName1 is not None and "ck2stages" in kernelName1)
-        or (kernelName1 is None
-        and ((q_type == QuantType.per_1x128 and doweight_stage1)
-        or q_dtype_w
-        in [
-            dtypes.bf16,
-            dtypes.fp16,
-            torch.uint32,
-            dtypes.fp4x2,
-            dtypes.fp8,
-        ]))
+    if (kernelName1 is not None and "ck2stages" in kernelName1) or (
+        kernelName1 is None
+        and (
+            (q_type == QuantType.per_1x128 and doweight_stage1)
+            or q_dtype_w
+            in [
+                dtypes.bf16,
+                dtypes.fp16,
+                torch.uint32,
+                dtypes.fp4x2,
+                dtypes.fp8,
+            ]
+        )
     ):
         return MOEMetadata(
             functools.partial(
