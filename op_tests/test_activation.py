@@ -194,8 +194,8 @@ for dtype in args.dtype:
             df.append(ret)
 # Add fp32 input with fp16/bf16 output (bandwidth optimization)
 for output_dtype in [torch.float16, torch.bfloat16]:
-    for m in l_m:
-        for n in l_n:
+    for m in args.m:
+        for n in args.n:
             ret = test_silu_and_mul(m, n, torch.float32, output_dtype=output_dtype)
             df.append(ret)
 df = pd.DataFrame(df)
