@@ -487,31 +487,6 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     if aiter_ksplit != 0:
         return aiter_ksplit
     # only for moe_blk gemm1 a8w8 decode scenario
-    cu_num = get_cu_num() * 2  # a4w4 blkperCU = 2
-    tileN = 128
-
-    tgM = token * topk  # decode tile num
-    tgN = (inter_dim * 2 + tileN - 1) // tileN
-
-    tg_num = tgN * tgM
-    # if all cu already active
-    if tg_num >= cu_num:
-        return 1
-    tilek = 256
-    split_max = (cu_num + tg_num - 1) // tg_num
-    # at least split = 2
-    for i in reversed(range(2, split_max + 1)):
-        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
-            return i
-    return 1
-
-
-@functools.lru_cache(maxsize=2048)
-def get_ksplit(token, topk, expert, inter_dim, model_dim):
-    aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
-    if aiter_ksplit != 0:
-        return aiter_ksplit
-    # only for moe_blk gemm1 a8w8 decode scenario
     if token * topk > expert:
         return 0
     cu_num = get_cu_num()
@@ -1569,9 +1544,9 @@ def cktile_moe_stage1(
 
     if split_k > 1:
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.to(out.dtype))
+            aiter.silu_and_mul(out, tmp_out) #TODO: support fp32 splitk
         else:
-            aiter.gelu_and_mul(out, tmp_out.to(out.dtype))
+            aiter.gelu_and_mul(out, tmp_out)
     return out
 
 
