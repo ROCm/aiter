@@ -1544,7 +1544,7 @@ def cktile_moe_stage1(
 
     if split_k > 1:
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out) #TODO: support fp32 splitk
+            aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
         else:
             aiter.gelu_and_mul(out, tmp_out)
     return out
