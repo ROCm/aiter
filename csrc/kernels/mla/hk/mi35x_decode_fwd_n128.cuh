@@ -126,7 +126,7 @@ struct HkMlaDecodeFwdParams
     const float softmax_scale;
 
     // debug
-    float* p_dbg;
+    void* p_dbg;
 };
 
 template <typename T, bool kCheckBoundary = true>
@@ -467,7 +467,7 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
                                         uint32_t kv_tile_start,
                                         uint32_t kv_end,
                                         float softmax_scale,
-                                        float* p_dbg)
+                                        void* p_dbg)
 {
     constexpr comp_t log2e = 1.4426950408889634;
 
@@ -634,10 +634,11 @@ template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(72))) void kn_mla_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
 {
-    using q_t    = T::q_t;
-    using kv_t   = T::kv_t;
-    using out_t  = T::out_t;
-    using comp_t = float;
+    using q_t     = T::q_t;
+    using kv_t    = T::kv_t;
+    using out_t   = T::out_t;
+    using comp_t  = float;
+    using split_t = float; // format of temp split output and lse.
 
     using G = hk::group<T::kNumWarps>;
 
@@ -728,9 +729,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     const uint32_t warp_idx = ckt::get_warp_id();
     const uint32_t lane_idx = __lane_id();
 
-    std::uintptr_t out_as_int  = reinterpret_cast<std::uintptr_t>(params.final_output.raw_ptr);
-    std::uint64_t out_as_u64   = static_cast<std::uint64_t>(out_as_int);
-    hk::buffer_resource out_br = hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+    std::uintptr_t out_as_int       = reinterpret_cast<std::uintptr_t>(params.final_output.raw_ptr);
+    std::uint64_t out_as_u64        = static_cast<std::uint64_t>(out_as_int);
+    hk::buffer_resource out_br      = hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+    std::uintptr_t split_out_as_int = reinterpret_cast<std::uintptr_t>(params.split_output.raw_ptr);
+    std::uint64_t split_out_as_u64  = static_cast<std::uint64_t>(split_out_as_int);
+    hk::buffer_resource split_out_br =
+        hk::make_buffer_resource(split_out_as_u64, 0xFFFFFFFF, 0x00020000);
 
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
@@ -967,12 +972,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         ///
         /// Outputs
         ///
+
+        constexpr uint32_t gemm_tile_size =
+            16; // output tile size of mfma_f32_16x16x32_fp8_fp8 is 16x16
+
         if(partial_qo_loc < 0)
         {
             const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16 + qo_start * T::kQoNumHead;
             const uint32_t col_idx_base = (lane_idx / 16) * 4;
             const uint32_t offset       = (row_idx * T::kVoHeadDim + col_idx_base) * sizeof(out_t);
-            constexpr uint32_t gemm_tile_size = 16;
 
 #pragma unroll
             for(uint32_t idx = 0; idx < T::kVoHeadDim / gemm_tile_size; ++idx)
@@ -991,7 +999,36 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                              : "memory");
             }
         }
-        else {}
+        else
+        {
+            static_assert(std::is_same_v<split_t, comp_t> && std::is_same_v<float, comp_t>);
+
+            const uint32_t row_idx = lane_idx % 16 + warp_idx * 16 + partial_qo_loc * T::kQoNumHead;
+            const uint32_t col_idx_base = (lane_idx / 16) * 4;
+            const uint32_t out_offset = (row_idx * T::kVoHeadDim + col_idx_base) * sizeof(split_t);
+
+#pragma unroll
+            for(uint32_t idx = 0; idx < T::kVoHeadDim / gemm_tile_size; ++idx)
+            {
+                const uint32_t i_offset = idx * gemm_tile_size * sizeof(split_t);
+                const uint32_t src_idx  = idx * 4 + k_o_begin;
+                asm volatile("buffer_store_dwordx4 v[%0:%1], %2, %3, 0 offen offset:%4"
+                             :
+                             : "i"(src_idx),
+                               "i"(src_idx + 3),
+                               "v"(out_offset),
+                               "s"(*(hk::i32x4*)&split_out_br),
+                               "i"(i_offset)
+                             : "memory");
+            }
+
+            if(lane_idx < gemm_tile_size)
+            {
+                constexpr comp_t inv_log2e = 1.0 / 1.4426950408889634;
+                const comp_t lse           = row_max + __builtin_amdgcn_logf(row_sum_e) * inv_log2e;
+                params.split_lse.raw_ptr[row_idx] = lse;
+            }
+        }
     }
 }
 
@@ -1057,7 +1094,7 @@ void dispatch_mla_decode_fwd_n128(torch::Tensor& query,
         // parameters
         softmax_scale,
         // debug
-        dbg_tr.has_value() ? dbg_tr.value().data_ptr<float>() : nullptr};
+        dbg_tr.has_value() ? dbg_tr.value().data_ptr() : nullptr};
 
     const dim3 grid        = dim3(dev_prop.multiProcessorCount);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
