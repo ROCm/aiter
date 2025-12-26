@@ -254,6 +254,7 @@ def fmha_v3_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    l_tpf: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1234,6 +1235,7 @@ def _flash_attn_forward(
     how_v3_bf16_cvt: Optional[int] = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
+    l_tpf: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
@@ -1274,6 +1276,7 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
     if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
+        print(f"TESTINGGG fmha_v3_fwd = {l_tpf}")
         out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
@@ -1290,6 +1293,7 @@ def _flash_attn_forward(
             bias,
             alibi_slopes,
             None,
+            l_tpf,
         )
     else:
         out, softmax_lse, S_dmask, rng_state = mha_fwd(
@@ -1700,6 +1704,7 @@ class FlashAttnFunc(torch.autograd.Function):
         how_v3_bf16_cvt: Optional[int] = 1,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_kv: Optional[torch.Tensor] = None,
+        l_tpf: int = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -1731,6 +1736,7 @@ class FlashAttnFunc(torch.autograd.Function):
             how_v3_bf16_cvt=how_v3_bf16_cvt,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
+            l_tpf=l_tpf,
         )
         if is_grad:
             assert return_lse
@@ -1829,6 +1835,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # how_v3_bf16_cvt
             None,  # cu_seqlens_q
             None,  # cu_seqlens_kv
+            None,  # l_tpf
         )
 
 
@@ -1848,6 +1855,7 @@ def flash_attn_func(
     how_v3_bf16_cvt=1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
+    l_tpf: int = 0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1918,6 +1926,7 @@ def flash_attn_func(
         how_v3_bf16_cvt,
         cu_seqlens_q,
         cu_seqlens_kv,
+        l_tpf
     )
 
 
