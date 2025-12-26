@@ -65,7 +65,7 @@ jobs:
           echo "Multiple: ${{ steps.machines.outputs.multigpu_runners }}"
 
   build_aiter_image:
-    runs-on: aiter-k8s-build
+    runs-on: aiter-1gpu-runner
     needs: [define-runners]
     steps:
       - name: Checkout code
@@ -76,7 +76,7 @@ jobs:
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.DOCKER_IMAGE }}
 
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
           RUN pip uninstall -y aiter
           RUN pip install --upgrade pandas zmq einops numpy==1.26.2
           RUN pip install --upgrade "pybind11>=3.0.1"
@@ -97,7 +97,9 @@ jobs:
                 git submodule update --init --recursive --depth 1 --jobs 4; \
               fi \
            && pip install -r requirements.txt \
-           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py develop
+           && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py develop \
+           && echo "Prebuilding kernels completed"
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
