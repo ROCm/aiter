@@ -39,6 +39,9 @@ def mp_lock(
     """
     Using FileBaton for multiprocessing.
     """
+    dir_name = os.path.dirname(lockPath)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     baton = FileBaton(lockPath)
     if baton.try_acquire():
         try:
@@ -488,11 +491,23 @@ __mds = {}
 def get_module_custom_op(md_name: str) -> None:
     global __mds
     if md_name not in __mds:
+        # Try importing from AITER_JIT_DIR first if set
         if "AITER_JIT_DIR" in os.environ:
-            __mds[md_name] = importlib.import_module(md_name)
-        else:
+            try:
+                __mds[md_name] = importlib.import_module(md_name)
+                logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+                return
+            except ImportError:
+                pass
+
+        # Fallback to package import
+        try:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
-        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+            logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+        except ImportError:
+            # If the module cannot be imported from either AITER_JIT_DIR (if set)
+            # or from the package, we likely need to build it. Raise error to trigger build.
+            raise
     return
 
 
