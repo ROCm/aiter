@@ -198,15 +198,12 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(kv_indptr.dtype() == torch::kInt32, "kv_indptr must have dtype int32");
 
-    std::string dtype_str;
-    if(q_dtype == at::ScalarType::Half)
-        dtype_str = "fp16";
-    else if(q_dtype == at::ScalarType::BFloat16)
-        dtype_str = "bf16";
-    else if(is_qkv_fp8)
+    std::string dtype_str = torchDTypeToStr(c10::scalarTypeToTypeMeta(q_dtype));
+    if(is_qkv_fp8)
     {
         if(!out_.has_value() || out_.value().dtype() == at::ScalarType::BFloat16)
-            dtype_str = "fp8bf16"; // BF16 output is required for FP8 input due to current kernel implementation constraints
+            dtype_str = "fp8bf16"; // BF16 output is required for FP8 input due to current kernel
+                                   // implementation constraints
         else
             TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
     }
