@@ -9,6 +9,7 @@ from typing_extensions import Optional
 
 import torch
 import torch.distributed as dist
+import pandas as pd
 
 from aiter import dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -100,7 +101,8 @@ def test_allreduce_custom(
     ref = torch.zeros(shape, dtype=dtype)
     rets = []
     for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
+        # x = torch.randn(shape, dtype=dtype)
+        x = torch.randint(1, 16, shape, dtype=dtype)
         ref += x
         rets.append(
             pool.apply_async(
@@ -114,10 +116,31 @@ def test_allreduce_custom(
     for out, us in rets:
         msg = f"test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         checkAllclose(ref, out.to(ref), msg=msg)
+    M, N = shape
+    avg_us = sum(us for _, us in rets) / len(rets)
+    return {"M": M, "N": N, "time_us": avg_us}
 
 
-l_dtype = ["fp16", "bf16"]
-l_shape = [(128, 8192)]
+# l_dtype = ["fp16", "bf16"]
+l_dtype = ["bf16"]
+l_shape = [
+        (4, 7168)
+    # (64, 5120),
+    # (128, 5120),
+    # (256, 5120),
+    # (512, 5120),
+    # (1024, 5120),
+    # (4096, 5120),
+    # (8192, 5120),
+    # (10240, 5120),
+    # (12288, 5120),
+    # (16384, 5120),
+    # (20480, 5120),
+    # (24576, 5120),
+    # (30720, 5120),
+    # (32768, 5120),
+    # (40960, 5120),
+]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
@@ -150,16 +173,36 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    rows = []
     for dtype in l_dtype:
         for shape in l_shape:
-            test_allreduce_custom(
-                8,
-                1,
-                shape,
-                dtype,
-                withGraph=True,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
+            rows.append(
+                test_allreduce_custom(
+                    8,
+                    1,
+                    shape,
+                    dtype,
+                    withGraph=True,
+                    distributed_init_method=get_distributed_init_method(
+                        get_ip(), get_open_port()
+                    ),
+                )
             )
             # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)
+    df = pd.DataFrame(rows)
+
+    def _dtype2str(x):
+        try:
+            return next((k for k, v in dtypes.d_dtypes.items() if v == x))
+        except Exception:
+            return str(x).split(".")[-1]
+
+    if "dtype" in df.columns:
+        df["dtype"] = df["dtype"].map(_dtype2str)
+    df["tp"] = df.get("tp_size", None)
+    df["pp"] = df.get("pp_size", None)
+    df["graph"] = df.get("withGraph", None)
+    cols = ["M", "N", "dtype", "tp", "pp", "graph", "time_us"]
+    cols = [c for c in cols if c in df.columns]
+    df = df[cols]
+    print(df.to_string(index=False))

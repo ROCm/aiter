@@ -388,6 +388,7 @@ namespace aiter
 
 #define THREAD_NUM 512
 
+  /*
   template <typename T, int ngpus>
   __global__ void __launch_bounds__(512, 1)
       cross_device_reduce_1stage(RankData *_dp, RankSignals sg,
@@ -446,6 +447,68 @@ namespace aiter
     }
     // maybe do not need device sync
     // end_sync<ngpus, true>(sg, self_sg, rank);
+  }
+  */
+
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1)
+      cross_device_reduce_1stage(RankData *_dp, RankSignals sg,
+#ifndef USE_ROCM
+                                 volatile
+#endif
+                                 Signal *self_sg,
+                                 T *__restrict__ result, int rank, int size)
+  {
+    using P = typename packed_t<T>::P;
+    using A = typename packed_t<T>::A;
+    constexpr int pack_size = packed_t<T>::P::size;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const P *ptrs[ngpus];
+    P *tmps[ngpus];
+#pragma unroll
+    for (int i = 0; i < ngpus; i++)
+    {
+      // int target = (rank + i) % ngpus;
+      ptrs[i] = (const P *)_dp->ptrs[i];
+      tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+    // do the actual reduction
+    for (int idx = index; idx < size; idx += gridDim.x * blockDim.x)
+    {
+#pragma unroll
+      for (int i = 0; i < ngpus; ++i)
+      {
+        tmps[i][rank * size + idx] = ptrs[rank][idx];
+      }
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+    for (int idx = index; idx < size; idx += gridDim.x * blockDim.x)
+    {
+      A add_tmp;
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        add_tmp.data[i] = 0.0f;
+      }
+#pragma unroll
+      for (int i = 0; i < ngpus; ++i)
+      {
+        P inp_reg;
+        inp_reg = tmps[rank][i * size + idx];
+#pragma unroll
+        for (int j = 0; j < pack_size; ++j)
+        {
+          add_tmp.data[j] += ck_tile::type_convert<float>(inp_reg.data[j]);
+        }
+      }
+      P rslt;
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        rslt.data[i] = ck_tile::type_convert<T>(add_tmp.data[i]);
+      }
+      *(reinterpret_cast<P*>(result) + idx) = rslt;
+    }
   }
 
   template <typename T, int ngpus>
@@ -1512,7 +1575,8 @@ namespace aiter
       }
       if (call_1stage)
       {
-        blocks = std::min(kMaxBlocks, (size + (threads / world_size_) - 1) / (threads / world_size_));
+        // blocks = std::min(kMaxBlocks, (size + (threads / world_size_) - 1) / (threads / world_size_));
+        blocks = std::min(kMaxBlocks, (size + threads - 1) / threads );
       }
       else if (call_2stage)
       {
