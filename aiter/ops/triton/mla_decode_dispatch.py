@@ -50,7 +50,12 @@ if triton.__version__ >= "3.5.0" and not enable_aot_gluon_mla:
     enable_gluon_mla = True
     enable_jit_gluon_mla = True
     # from aiter.ops.triton.gluon.mla_decode_mi355 import _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
-    from aiter.ops.triton.gluon.mla_decode_mi355 import _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+    # from aiter.ops.triton.gluon.mla_decode_mi355 import (
+    #     _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64,
+    #     _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async,
+    # )
+    from aiter.ops.triton.gluon.mla_decode_mi355 import _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async as _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+
     from aiter.ops.triton.gluon.mla_decode import (
         _fwd_grouped_kernel_stage1_n16x2_prefetch_k_paged_64
     )
@@ -171,12 +176,12 @@ def _compile_mla(
         },
         attrs={
             (0,): [["tt.divisibility", 16], ["tt.pointer_range", 32]],  # Q
-            (1,): [["tt.divisibility", 16]],  # k_buffer 
+            (1,): [["tt.divisibility", 16]],  # k_buffer
             (2,): [["tt.divisibility", 16]],  # v_buffer
             (3,): [["tt.divisibility", 16]],  # sm_scale
-            (1,): [["tt.divisibility", 16]],  # kv_indptr 
+            (1,): [["tt.divisibility", 16]],  # kv_indptr
             (2,): [["tt.divisibility", 16]],  # kv_indices
-            (1,): [["tt.divisibility", 16]],  # Att_Out 
+            (1,): [["tt.divisibility", 16]],  # Att_Out
             (2,): [["tt.divisibility", 16]],  # Att_Lse
             (4,): [["tt.divisibility", 16]],  # stride_qb
             (5,): [["tt.divisibility", 16]],  # stride_qh
