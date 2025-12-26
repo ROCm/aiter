@@ -91,6 +91,7 @@ def run_ck(
     return_attn_probs=False,
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
+    l_tpf=0,
 ):
     (out, softmax_lse, S_dmask), us_fwd = run_perftest(
         aiter.flash_attn_func,
@@ -110,6 +111,7 @@ def run_ck(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
         num_rotate_args=1,
+        l_tpf=l_tpf,
     )
 
     if dropout_p > 0.0:
@@ -213,6 +215,7 @@ def test_flash_attn_output(
     mha_type,
     dtype,
     input_layout,
+    l_tpf,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -302,6 +305,7 @@ def test_flash_attn_output(
         deterministic,
         return_lse,
         return_attn_probs,
+        l_tpf=l_tpf,
     )
 
     out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
@@ -414,6 +418,7 @@ def flash_attn_output_benchmark(
     mha_type,
     dtype,
     input_layout,
+    l_tpf,
 ):
     return test_flash_attn_output(
         batch_size,
@@ -430,6 +435,7 @@ def flash_attn_output_benchmark(
         mha_type,
         dtype,
         input_layout,
+        l_tpf,
     )
 
 
@@ -493,6 +499,7 @@ def test_flash_attn_seq_padding(
     deterministic,
     mha_type,
     dtype,
+    l_tpf,
 ):
 
     torch.random.manual_seed(0)
@@ -591,6 +598,7 @@ def test_flash_attn_seq_padding(
         return_attn_probs,
         cu_seqlens_q,
         cu_seqlens_kv,
+        l_tpf=l_tpf,
     )
 
     # 3. Run Torch with padding_mask (forward pass only)
@@ -681,6 +689,7 @@ def test_flash_attn_seq_padding(
 l_causal = [False, True]
 l_local = [False, True]
 l_deterministic = [False, True]
+l_tpf = 0
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -806,6 +815,13 @@ parser.add_argument(
     help="""input_layout.
     e.g.: -i BSHD""",
 )
+parser.add_argument(
+    "-tpf",
+    "--token_per_frame",
+    type=int,
+    default=0,
+    help="""Tokens per frame for causal attention. Default is 0.""",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
 
@@ -817,6 +833,9 @@ if __name__ == "__main__":
 
     if args.deterministic is not None:
         l_deterministic = [args.deterministic]
+
+    if args.token_per_frame > 0:
+        l_tpf = args.token_per_frame
 
     collected = []
     for (
@@ -844,6 +863,7 @@ if __name__ == "__main__":
             mha_type,
             dtypes.d_dtypes[dtype],
             args.input_layout,
+            l_tpf,
         )
         collected.append(ret)
         test_flash_attn_seq_padding(
@@ -861,6 +881,7 @@ if __name__ == "__main__":
             deterministic,
             mha_type,
             dtypes.d_dtypes[dtype],
+            l_tpf,
         )
 
     df = pd.DataFrame(collected)

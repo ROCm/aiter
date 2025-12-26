@@ -155,7 +155,8 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     std::optional<at::Tensor> out_,          // [b, sq, hq, d_v]
                                     std::optional<const at::Tensor> bias_,   // [sq, sk]
                                     std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-                                    std::optional<at::Generator> gen_)
+                                    std::optional<at::Generator> gen_,
+                                    int tokens_per_frame)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -311,6 +312,8 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                 softmax_scale,
                 p_dropout,
                 drop_seed_offset);
+        
+        int magic_const = (uint32_t)(((1ULL << 32) + tokens_per_frame - 1) / tokens_per_frame);
 
         float t = aiter::mha_fwd(args,
                                  stream_config,
@@ -322,7 +325,12 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  quant_scale_enum::no_scale,
                                  true,
                                  false,
-                                 how_v3_bf16_cvt);
+                                 how_v3_bf16_cvt,
+                                 nullptr,
+                                 nullptr,
+                                 false,
+                                 magic_const,
+                                 tokens_per_frame);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

@@ -102,6 +102,8 @@ class fmha_fwd_v3_kernel
     {
         int length = strlen(name);
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
+        std::cout << "Loading kernel: " << kernel_func_name << std::endl;
+        std::cout << "HSACO ptr: " << hsaco << std::endl;
         HIP_CALL(hipModuleLoadData(&module, hsaco));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }
@@ -172,7 +174,7 @@ class fmha_fwd_v3_kernel
 };
 
 template <typename fmha_fwd_kernel_selector>
-float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a)
+float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a, int magic_const, int tokens_per_frame)
 {
     if(s.log_level_ > 0)
         std::cout << ", " << FmhaFwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
@@ -182,6 +184,7 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a)
     {
         tune_opt -= 2;
     }
+    tune_opt = 0; // disable tune for fmha v3 for now
 
     fmha_fwd_v3_args args;
     args.ptr_o   = a.o_ptr;
@@ -219,6 +222,8 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a)
     args.ptr_kseq = nullptr;
     args.ptr_qseq_padding = nullptr;
     args.ptr_kseq_padding = nullptr;
+    args.tokens_per_frame_magic_const = magic_const;
+    args.tokens_per_frame = tokens_per_frame;
 
     auto traits = fmha_fwd_v3_traits{a.batch,
                                      a.nhead_q,
@@ -303,7 +308,7 @@ float fmha_fwd_v3_group_dispatcher(const ck_tile::stream_config& s, mha_fwd_args
     );
 }
 
-float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config& s, bool is_v3_api_check) {
+float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config& s, bool is_v3_api_check, int magic_const, int tokens_per_frame) {
     float r = -1;
     if (t.use_ext_asm == true) {
         if (t.data_type.compare("bf16") == 0) {
@@ -317,7 +322,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, magic_const, tokens_per_frame);
                             }
                             else {
                                 if (a.batch_stride_lse >= a.nhead_stride_lse) {
@@ -325,7 +330,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, magic_const, tokens_per_frame);
                                 }
                             }
                         }
@@ -335,7 +340,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, magic_const, tokens_per_frame);
                             }
                             else {
                                 if (a.batch_stride_lse >= a.nhead_stride_lse) {
@@ -343,7 +348,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, magic_const, tokens_per_frame);
                                 }
                             }
                         }
@@ -392,7 +397,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, magic_const, tokens_per_frame);
                             }
                             else {
                                 if (a.batch_stride_lse >= a.nhead_stride_lse) {
@@ -400,7 +405,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, magic_const, tokens_per_frame);
                                 }
                             }
                         }
@@ -410,7 +415,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                 if (is_v3_api_check) {
                                     return 1;
                                 }
-                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, magic_const, tokens_per_frame);
                             }
                             else {
                                 if (a.batch_stride_lse >= a.nhead_stride_lse) {
@@ -418,7 +423,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                                     if (is_v3_api_check) {
                                         return 1;
                                     }
-                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, magic_const, tokens_per_frame);
                                 }
                             }
                         }
