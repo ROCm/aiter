@@ -155,6 +155,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
+              quant_scale_enum qscale_type,
               bool use_ext_asm)
 {
     int head_size_q = args.hdim_q;
@@ -169,7 +170,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
-                                     quant_scale_enum::no_scale,
+                                     qscale_type,
                                      use_ext_asm);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
