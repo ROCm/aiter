@@ -596,6 +596,45 @@ namespace aiter
     }
   }
 
+  /*
+   * reduce_scatter, at first dim
+   * range = size / (pack_size * ngpu)
+   * for case:
+   *  input:(ngpus * n) -> output:(n)
+   *  input:(ngpus * m, n, ...) -> output(m, n, ...)
+   * cond: size % (pack_size * ngpus) == 0
+   * */
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) reduce_scatter_first_dim(
+      RankData *_dp,
+      RankSignals sg,
+      Signal *self_sg,
+      T *__restrict__ result,
+      int rank,
+      int range
+  )
+  {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    using P = typename packed_t<T>::P;
+    using A = typename packed_t<T>::A;
+    const P *ptrs[ngpus];
+#pragma unroll
+    for (int i = 0; i < ngpus; i++)
+    {
+      int target = (rank + i) % ngpus;
+      ptrs[i] = (const P *)_dp->ptrs[target];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = tid; idx < range; idx += stride)
+    {
+      int load_index = rank * range + idx;
+      int store_index = idx;
+      *(reinterpret_cast<P*>(result) + store_index) = packed_reduce<P, ngpus, A>(ptrs, load_index);
+    }
+  }
+
   // fp8 quant all-reduce code start
   template <typename T>
   struct Fp16Filter
@@ -1603,6 +1642,31 @@ namespace aiter
     }
 #undef REDUCE_CASE
 #undef KL
+  }
+
+  template <typename T>
+  void dispatchReduceScatter(hipStream_t stream, T* input, T* output, int size)
+  {
+    RankData* ptrs = get_buffer_RD(stream, input);
+    auto d = packed_t<T>::P::size;
+    int range = size / (world_size_ * d);
+    dim3 block(512);
+    int block_num = (range + 511) / 512;
+    dim3 grid(std::min(16, block_num));
+    switch (world_size_)
+    {
+      case 8:
+        reduce_scatter_first_dim<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+        break;
+      case 4:
+        reduce_scatter_first_dim<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+        break;
+      case 2:
+        reduce_scatter_first_dim<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+        break;
+      default:
+        printf("reduce_scatter world_size error!\n");
+    }
   }
 
   template <typename T>

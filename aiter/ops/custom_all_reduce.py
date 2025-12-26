@@ -33,6 +33,15 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce")
+def reduce_scatter(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
 def all_gather_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor) -> None: ...
 
 
