@@ -270,9 +270,6 @@ def test_batch_prefill_with_paged_kv_cache(
         torch.testing.assert_close(o_i, o_ref_i, rtol=rtol, atol=atol)
 
 
-l_causal = [False, True]
-l_logits_soft_cap = [0.0, 30.0]
-l_dtype = ["fp16", "bf16"]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -281,9 +278,8 @@ parser.add_argument(
     "-c",
     "--causal",
     type=dtypes.str2bool,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[False, True],
     help="""Causal mask mode (False or True).
     e.g.: -c false""",
 )
@@ -291,41 +287,32 @@ parser.add_argument(
     "-l",
     "--logits_soft_cap",
     type=float,
-    choices=l_logits_soft_cap,
-    nargs="?",
-    const=None,
-    default=None,
+    choices=[0.0, 30.0],
+    nargs="*",
+    default=[0.0, 30.0],
     help="""Logits soft cap.
     e.g.: -l 30.0""",
 )
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default="fp16, bf16",
+    metavar="{fp16, bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    if args.dtype is None:
-        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-    else:
-        l_dtype = [dtypes.d_dtypes[args.dtype]]
-    if args.causal is not None:
-        l_causal = [args.causal]
-    if args.logits_soft_cap is not None:
-        l_logits_soft_cap = [args.logits_soft_cap]
 
     for (
         causal,
         logits_soft_cap,
         dtype,
-    ) in itertools.product(l_causal, l_logits_soft_cap, l_dtype):
+    ) in itertools.product(args.causal, args.logits_soft_cap, args.dtype):
         test_batch_prefill_with_paged_kv_cache(
             batch_size=1,
             kv_len=8192,
