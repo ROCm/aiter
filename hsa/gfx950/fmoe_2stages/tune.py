@@ -139,7 +139,13 @@ class FmoeTuner950(FmoeTuner):
         if len(tasks) + len(tasks_ck) + len(task_1stage) > 0:
             ### shape_grouped should be False as multiple stages
             rets = mp_tuner(
-                tasks + tasks_ck + task_1stage, in_data, mp_num, True, False
+                tasks + tasks_ck + task_1stage,
+                in_data,
+                mp_num,
+                True,
+                False,
+                timeout=args.timeout,
+                verbose=args.verbose,
             )
         if not rets:
             print("no shape to tune or no solution found")
