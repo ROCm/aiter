@@ -7,6 +7,7 @@
 #include "aiter_hip_common.h"
 #include "fmha_fwd.hpp"
 #include "mask.hpp"
+#include <iostream>
 
 namespace aiter {
 struct mha_fwd_traits : public fmha_fwd_traits

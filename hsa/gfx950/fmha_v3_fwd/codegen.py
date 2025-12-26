@@ -102,6 +102,8 @@ class fmha_fwd_v3_kernel
     {
         int length = strlen(name);
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
+        std::cout << "Loading kernel: " << kernel_func_name << std::endl;
+        std::cout << "HSACO ptr: " << hsaco << std::endl;
         HIP_CALL(hipModuleLoadData(&module, hsaco));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }
