@@ -364,7 +364,8 @@ using MoeKernel = std::function<void(const hipStream_t& stream,
                                      void*&,
                                      std::optional<void*>,
                                      std::optional<void*>,
-                                     std::optional<int>)>;
+                                     std::optional<int>,
+                                     std::optional<bool>)>;
 
 template <typename A0DataType,
           typename B0DataType,
@@ -398,7 +399,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         void*& out,               // [max_num_tokens_padded, inter_dim]
                         std::optional<void*> w1_scale = std::nullopt, // [e, 1, n], gate(up) scale
                         std::optional<void*> a1_scale = std::nullopt, // [m, 1], token scale
-                        std::optional<int>   splitk   = 1 // splitk
+                        std::optional<int>   splitk   = 1, // splitk
+                        std::optional<bool>  nt = false
 );
 
 template <typename A0DataType,
@@ -434,5 +436,6 @@ void ck_moe_stage2_gemm(
     void*& out,               // [m, out_dim]
     std::optional<void*> w2_scale = std::nullopt, // [e, 1, n], gate(up) scale
     std::optional<void*> a2_scale = std::nullopt, // [max_num_tokens_padded, 1], token scale
-    std::optional<int>   splitk   = 1 // splitk
+    std::optional<int>   splitk   = 1, // splitk
+    std::optional<bool>  bt = false
 );

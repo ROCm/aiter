@@ -21,7 +21,8 @@ template <
     bool Nswizzle,
     bool PerTensorQuant,
     bool MulRoutedWeight,
-    int ActOP>
+    int ActOP,
+    bool NT>
 void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
                         void *&hidden_states,     // [m, k], input token
@@ -35,7 +36,6 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         std::optional<void *> w1_scale, // [e, 1, n], gate(up) scale
                         std::optional<void *> a1_scale, // [m, 1], token scale
                         std::optional<int>    splitk     // splitk
-
 )
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -105,7 +105,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                 S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                 S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                 MXDLPerWave,    NXDLPerWave,   S<1, K0_M_A, 1, K0_A>, S<2, 1, 1, 1>,
-                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, IsSplitK, MulRoutedWeight, int32_t, A0DataType>;
+                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, IsSplitK, MulRoutedWeight, int32_t, A0DataType, A0DataType, A0DataType, A0DataType, NT>;
 
     // clang-format on
 
@@ -152,22 +152,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     invoker.Run(argument, StreamConfig{stream});
 }
 
-#define CK_MOE_STAGE1_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                                                     \
-    template void ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
-        const hipStream_t &stream,                                                                                                                                                                                              \
-        int tokens, int sorted_size, int N, int K,                                                                                                                                                                              \
-        int topk,                                                                                                                                                                                                               \
-        void *&hidden_states,                                                                                                                                                                                                   \
-        void *&w1,                                                                                                                                                                                                              \
-        void *&w2,                                                                                                                                                                                                              \
-        void *&sorted_token_ids,                                                                                                                                                                                                \
-        void *&sorted_expert_ids,                                                                                                                                                                                               \
-        void *&sorted_weights,                                                                                                                                                                                                  \
-        void *&num_valid_ids,                                                                                                                                                                                                   \
-        void *&out,                                                                                                                                                                                                             \
-        std::optional<void *> w1_scale,                                                                                                                                                                                         \
-        std::optional<void *> a1_scale,                                                                                                                                                                                         \
-        std::optional<int>   splitk);
+
 
 template <
     typename A0DataType,
@@ -185,7 +170,100 @@ template <
     bool Nswizzle,
     bool PerTensorQuant,
     bool MulRoutedWeight,
-    int ActOP = 0>
+    int ActOP>
+void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
+                        int topk,
+                        void *&hidden_states,     // [m, k], input token
+                        void *&w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                        void *&w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                        void *&sorted_token_ids,  // [max_num_tokens_padded]
+                        void *&sorted_expert_ids, // [max_num_m_blocks]
+                        void *&sorted_weights,
+                        void *&num_valid_ids,           // [1]
+                        void *&out,                     // [max_num_tokens_padded, inter_dim]
+                        std::optional<void *> w1_scale, // [e, 1, n], gate(up) scale
+                        std::optional<void *> a1_scale, // [m, 1], token scale
+                        std::optional<int>    splitk,     // splitk
+                        std::optional<bool>   nt)
+{
+    // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() << std::endl;
+    if (nt.has_value() && nt.value()) {
+        ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, true>(
+            stream,
+            tokens,
+            sorted_size,
+            N,
+            K,
+            topk,
+            hidden_states,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            num_valid_ids,
+            out,
+            w1_scale,
+            a1_scale,
+            splitk);
+    } else {
+        ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, false>(
+            stream,
+            tokens,
+            sorted_size,
+            N,
+            K,
+            topk,
+            hidden_states,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            num_valid_ids,
+            out,
+            w1_scale,
+            a1_scale,
+            splitk);
+    }
+}
+
+#define CK_MOE_STAGE1_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                                                     \
+    template void ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
+        const hipStream_t &stream,                                                                                                                                                                                              \
+        int tokens, int sorted_size, int N, int K,                                                                                                                                                                              \
+        int topk,                                                                                                                                                                                                               \
+        void *&hidden_states,                                                                                                                                                                                                   \
+        void *&w1,                                                                                                                                                                                                              \
+        void *&w2,                                                                                                                                                                                                              \
+        void *&sorted_token_ids,                                                                                                                                                                                                \
+        void *&sorted_expert_ids,                                                                                                                                                                                               \
+        void *&sorted_weights,                                                                                                                                                                                                  \
+        void *&num_valid_ids,                                                                                                                                                                                                   \
+        void *&out,                                                                                                                                                                                                             \
+        std::optional<void *> w1_scale,                                                                                                                                                                                         \
+        std::optional<void *> a1_scale,                                                                                                                                                                                         \
+        std::optional<int>   splitk,                                                                                                                                                                                            \
+        std::optional<bool>   nt);
+
+template <
+    typename A0DataType,
+    typename B0DataType,
+    typename AccDataType,
+    typename EDataType,
+    typename CDEElementOp,
+    PipelineVersion PipelineVer,
+    int BLOCKSIZE,
+    int MPerBlock,
+    int NPerBlock,
+    int KPerBlock,
+    int MWaves,
+    int NWaves,
+    bool Nswizzle,
+    bool PerTensorQuant,
+    bool MulRoutedWeight,
+    int ActOP = 0,
+    bool NT = false>
 void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
                         void *&inter_states,            // [max_num_tokens_padded, k], input token
@@ -198,7 +276,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         void *&out,                     // [m, out_dim]
                         std::optional<void *> w2_scale, // [e, 1, n], gate(up) scale
                         std::optional<void *> a2_scale, // [max_num_tokens_padded, 1], token scale
-                        std::optional<int>   splitk     // splitk
+                        std::optional<int>   splitk    // splitk
 )
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -250,7 +328,8 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t Scale_Block_M = 1;
     static constexpr ck::index_t Scale_Block_N = 128;
     static constexpr ck::index_t Scale_Block_K = 128;
-    using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmBlockScale
+
+    using DeviceOpInstanceNormal = ck::tensor_operation::device::DeviceMoeGemmBlockScale
         // clang-format off
             < Row, Col, DsLayout, ELayout,
               A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
@@ -263,16 +342,14 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
               S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
               S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
               MXDLPerWave,    NXDLPerWave,   S<1, 4, 1, 64>, S<2, 1, 1, 1>,
-              ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, false, false, false, MulRoutedWeight, int32_t, A0DataType>;
-
-
+              ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, false, false, false, MulRoutedWeight, int32_t, A0DataType, A0DataType, A0DataType, A0DataType, NT>;
 
     auto a_element_op = AElementOp{};
     auto b_element_op = BElementOp{};
     auto cde_element_op = CDEElementOp{};
 
     // do GEMM
-    auto device_op = DeviceOpInstance{};
+    auto device_op = DeviceOpInstanceNormal{};
     const void* a2_scale_ptr = *a2_scale;
     const void* w2_scale_ptr = *w2_scale;
 
@@ -310,6 +387,83 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     invoker.Run(argument, StreamConfig{stream});
 }
 
+
+
+template <
+    typename A0DataType,
+    typename B0DataType,
+    typename AccDataType,
+    typename EDataType,
+    typename CDEElementOp,
+    PipelineVersion PipelineVer,
+    int BLOCKSIZE,
+    int MPerBlock,
+    int NPerBlock,
+    int KPerBlock,
+    int MWaves,
+    int NWaves,
+    bool Nswizzle,
+    bool PerTensorQuant,
+    bool MulRoutedWeight,
+    int ActOP = 0>
+void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
+                        int topk,
+                        void *&inter_states,            // [max_num_tokens_padded, k], input token
+                        void *&w1,                      // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                        void *&w2,                      // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                        void *&sorted_token_ids,        // [max_num_tokens_padded]
+                        void *&sorted_expert_ids,       // [max_num_m_blocks]
+                        void *&sorted_weights,          // [max_num_tokens_padded]
+                        void *&num_valid_ids,           //[1]
+                        void *&out,                     // [m, out_dim]
+                        std::optional<void *> w2_scale, // [e, 1, n], gate(up) scale
+                        std::optional<void *> a2_scale, // [max_num_tokens_padded, 1], token scale
+                        std::optional<int>   splitk,    // splitk
+                        std::optional<bool>   nt)
+{
+    // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() << std::endl;
+    if (nt.has_value() && nt.value()) {
+        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, true>(
+            stream,
+            tokens,
+            sorted_size,
+            N,
+            K,
+            topk,
+            inter_states,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            num_valid_ids,
+            out,
+            w2_scale,
+            a2_scale,
+            splitk);
+    } else {
+        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, false>(
+            stream,
+            tokens,
+            sorted_size,
+            N,
+            K,
+            topk,
+            inter_states,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            num_valid_ids,
+            out,
+            w2_scale,
+            a2_scale,
+            splitk);
+    }
+}
+
+
 #define CK_MOE_STAGE2_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                    \
     template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
         const hipStream_t &stream,                                                                                                                                   \
@@ -325,4 +479,5 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
         void *&out,                                                                                                                                                  \
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
-        std::optional<int>   splitk);
+        std::optional<int>   splitk,                                                                                                                                 \
+        std::optional<bool>   nt);

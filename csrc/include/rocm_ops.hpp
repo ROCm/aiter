@@ -917,6 +917,7 @@ namespace py = pybind11;
           py::arg("quant_type")     = 0,            \
           py::arg("activation")     = 0,            \
           py::arg("splitk")         = 1,            \
+          py::arg("non_temporal_load") = false,     \
           py::arg("dst_type")       = std::nullopt);      \
                                                     \
     m.def("ck_moe_stage2",                          \
@@ -937,6 +938,7 @@ namespace py = pybind11;
           py::arg("quant_type")     = 0,            \
           py::arg("activation")     = 0,            \
           py::arg("splitk")         = 1,            \
+          py::arg("non_temporal_load") = false,     \
           py::arg("dst_type")       = std::nullopt);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
