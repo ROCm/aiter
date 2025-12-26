@@ -1540,6 +1540,9 @@ namespace py = pybind11;
           py::arg("block_size"),                                     \
           py::arg("x"));
 
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
@@ -1752,6 +1755,6 @@ namespace py = pybind11;
           py::arg("topk"),          \
           py::arg("largest") = true, \
           py::arg("rowStarts") = torch::Tensor(), \
-          py::arg("rowEnds") = torch::Tensor(), \
-          py::arg("stride0") = -1,  \
-          py::arg("stride1") = 1);
+          py::arg("rowEnds")   = torch::Tensor(), \
+          py::arg("stride0")   = -1,              \
+          py::arg("stride1")   = 1);
