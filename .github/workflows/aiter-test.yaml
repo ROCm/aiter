@@ -46,16 +46,16 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "It's main branch, running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-mi355-1gpu","aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-mi355-8gpu","aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           elif echo "${PR_TITLE}" | grep -qi "mi35x"; then
             echo "PR title contains 'MI35X', running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-mi355-1gpu","aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-mi355-8gpu","aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           else
             echo "Not main branch and PR title does not contain mi35x, only running on MI325..."
-            echo 'standard_runners=["aiter-mi355-1gpu","aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-mi355-8gpu","aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           fi
           echo "$GITHUB_OUTPUT"
     
@@ -112,11 +112,16 @@ jobs:
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
-      - name: Push Docker image
+      - name: Save Docker image as tarball
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
-          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
-          docker push $IMAGE_TAG
+          docker save $IMAGE_TAG -o aiter_image.tar
+
+      - name: Upload Docker image tar to GitHub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter_image_tar_${{ env.GITHUB_COMMIT_SHA }}
+          path: aiter_image.tar
 
       - name: Success message
         run: |
@@ -151,10 +156,20 @@ jobs:
         run: |
           ./.github/scripts/clean_up_rocm.sh
 
+      - name: Download Docker image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: aiter_image_tar_${{ env.GITHUB_COMMIT_SHA }}
+          path: aiter_image.tar
+
+      - name: Load Docker image from tarball
+        run: |
+          docker load -i aiter_image.tar
+          docker images
+          
       - name: Run the container
         run: |
           set -ex
-          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           echo "Starting container: aiter_test"
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
@@ -210,7 +225,7 @@ jobs:
   multi-gpu:
     needs: [build_aiter_image, define-runners]
     # only run multi-gpu tests on main branch due to limited multi-gpu resources
-    if: github.ref == 'refs/heads/main' 
+    # if: github.ref == 'refs/heads/main' 
     strategy:
       fail-fast: false
       matrix:
@@ -224,10 +239,20 @@ jobs:
       - name: Clean up Rocm processes
         run: ./.github/scripts/clean_up_rocm.sh
 
+      - name: Download Docker image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: aiter_image_tar_${{ env.GITHUB_COMMIT_SHA }}
+          path: aiter_image.tar
+
+      - name: Load Docker image from tarball
+        run: |
+          docker load -i aiter_image.tar
+          docker images
+
       - name: Run the container
         run: |
           set -ex
-          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           echo "Starting container: aiter_test"
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
@@ -253,7 +278,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          bash -c "pip show aiter || true"
+          bash -c "pip show amd-aiter || true"
 
       - name: Tests
         run: |
