@@ -636,7 +636,6 @@ class GemmCommonTuner(TunerCommon):
     def set_run_iters(self, input, inputdtype):
         cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
-        print(f"flops: {flops}")
         if flops < 256 * 5120 * 256 * 2:
             self.num_warmup = 50
         elif flops <= 1024 * 5120 * 256 * 2:

@@ -178,7 +178,7 @@ class Gemm:
         profile_file="",
         num_warmup=10,
         libtype=["all"],
-        timeout=100,
+        timeout=None,
         verbose=False,
         # splitK=None,
     ):

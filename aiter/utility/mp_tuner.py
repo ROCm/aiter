@@ -25,9 +25,6 @@ def worker(
 
     pid = mp.current_process().pid
     device = torch.device(f"cuda:{gpu_id}")
-    torch.cuda.set_device(device)
-    args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
-    torch.cuda.synchronize()
     max_err_ratio = 0.0
     try:
         torch.cuda.set_device(device)
@@ -197,7 +194,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, printLog=False):
 
             ref = ref if ref_noused is None else ref_noused
             work_args = (
-                gpu_id,  # Pass GPU ID as first argument (already retrieved from GPUIDMap)
+                gpu_id,
                 info,
                 func,
                 new_args,
@@ -213,9 +210,9 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, printLog=False):
 
     except Exception as e:
         print(f"Critical error in work_group: {e}")
-        import traceback
+        #import traceback
 
-        traceback.print_exc()
+        #traceback.print_exc()
         # Return dummy failed results for all tasks in the group
         if isinstance(tasks, list):
             return [
@@ -535,8 +532,6 @@ def mp_tuner(
     if failed_tasks:
         timeout_count = sum(1 for _, reason in failed_tasks if reason == "timeout")
         crash_count = len(failed_tasks) - timeout_count
-        # for task in failed_tasks:
-        #    print(f"task: {task_group[task[0]]}", flush=True)
         summary = (
             f"\n{'='*60}\n"
             f"Tuning Summary:\n"
