@@ -103,6 +103,7 @@ jobs:
           ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
 
       - name: Upload tuned CSVs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tuned-csvs
