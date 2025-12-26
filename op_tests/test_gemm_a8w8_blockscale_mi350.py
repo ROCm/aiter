@@ -92,7 +92,7 @@ def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_gemm_asm_mi350(dtype, m, n, k):
+def test_gemm_asm_gfx950(dtype, m, n, k):
     from aiter.jit.utils.chip_info import get_gfx
 
     if get_gfx() not in ["gfx950"]:
@@ -210,5 +210,5 @@ for dtype in [dtypes.bf16]:
             (4096, 512),
         ][1:2]:
             continue  # Disabled now due to coredump issue
-            test_gemm_asm_mi350(dtype, m, n, k)
+            test_gemm_asm_gfx950(dtype, m, n, k)
             break

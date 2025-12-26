@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from aiter.jit.utils.torch_guard import torch_compile_guard
 import torch
 from torch import Tensor
-from typing import Optional
+from typing import Optional, Tuple
 from ..jit.core import compile_ops
 import torch.nn.functional as F
 import functools
@@ -100,6 +101,42 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     return y, scale.view(dtypes.fp8_e8m0)
 
 
+def per_1x32_f8_scale_f8_quant(
+    x, scale=None, quant_dtype=dtypes.fp8, scale_type=dtypes.fp32, shuffle=False
+):
+    assert quant_dtype == dtypes.fp8
+    block_size = 32
+    dtypeMax = 448.0
+    MAX_POW2 = int(torch.log2(torch.tensor(dtypeMax, dtype=torch.float32)).item())
+    dtypeMax = 2.0**MAX_POW2
+
+    shape_original = x.shape
+    x = x.view(-1, shape_original[-1])
+
+    m, n = x.shape
+    x = x.view(-1, block_size)
+    max_abs = torch.amax(torch.abs(x.float()), 1)
+
+    # fp8e8m0fnu_from_fp32_value
+    if scale_type == dtypes.fp32:
+        scale_f32 = max_abs / dtypeMax
+        scale_e8m0_biased = None
+    else:
+        scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+        scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
+        # scale_f32 = max_abs / dtypeMax
+
+    y = x.float() / scale_f32.view(-1, 1)
+    y = y.view(*shape_original[:-1], -1)
+    if scale_type == dtypes.fp32:
+        scale = scale_f32.view(m, -1)
+    else:
+        scale = scale_e8m0_biased.view(m, -1)  # .view(torch.uint8)
+        if shuffle:
+            scale = fp4_utils.e8m0_shuffle(scale)
+    return y.to(quant_dtype), scale
+
+
 def per_tensor_quant(
     x, scale=None, scale_dtype=dtypes.fp32, quant_dtype=dtypes.i8, dtypeMax=None
 ):
@@ -181,13 +218,14 @@ def get_triton_quant(qType):
     return tmp.get(qType, raise_NotImplementedError)
 
 
+@torch_compile_guard()
 def per_token_quant_hip(
-    x,
-    scale=None,
-    quant_dtype=dtypes.i8,
-    num_rows: Optional[torch.tensor] = None,
-    num_rows_factor=1,
-):
+    x: Tensor,
+    scale: Optional[Tensor] = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    num_rows: Optional[Tensor] = None,
+    num_rows_factor: int = 1,
+) -> Tuple[Tensor, Tensor]:
     shape = x.shape
     device = x.device
     if scale is None:
@@ -213,15 +251,16 @@ def per_token_quant_hip(
     return y, scale
 
 
+@torch_compile_guard()
 def per_group_quant_hip(
-    x,
-    scale=None,
-    quant_dtype=dtypes.i8,
-    group_size=128,
-    transpose_scale=False,
-    num_rows: Optional[torch.tensor] = None,
-    num_rows_factor=1,
-):
+    x: Tensor,
+    scale: Optional[Tensor] = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    group_size: int = 128,
+    transpose_scale: bool = False,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor: int = 1,
+) -> Tuple[Tensor, Tensor]:
     shape = x.shape
     device = x.device
     if scale is None:
@@ -252,7 +291,7 @@ def per_1x32_f4_quant_hip(
     scale=None,
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
-    num_rows: Optional[torch.tensor] = None,
+    num_rows: Optional[torch.Tensor] = None,
     num_rows_factor=1,
 ):
     m, n = x.shape
@@ -302,7 +341,7 @@ def per_tensor_quant_hip(
     x,
     scale=None,
     quant_dtype=dtypes.i8,
-    num_rows: Optional[torch.tensor] = None,
+    num_rows: Optional[torch.Tensor] = None,
     num_rows_factor=1,
 ):
     assert num_rows is None, "num_rows is not supported for per_tensor_quant_hip"

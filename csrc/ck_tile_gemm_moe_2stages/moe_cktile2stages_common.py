@@ -158,12 +158,36 @@ a16w4_gemm2_kernels_list_gfx950= {
     # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
 }
 
+# gemm1 out:bf16/fp16 AB:fp8/fp4
+a8w4_gemm1_kernels_list_gfx950= {
+    #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
+    # 0: kernelInstance(       1,        256,       16,        128,       256,           16,         16,          128,          1,        4,            2,),
+    # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            4,),
+    1: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          128,          1,        4,            2,),
+    3: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          128,          1,        4,            1,),
+    # 4: kernelInstance(       2,        256,      128,        256,       128,           16,         16,          32,          1,        4,            1,),
+    # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
+    # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
+}
+# gemm2 out:bf16/fp16 AB:fp8/fp4
+a8w4_gemm2_kernels_list_gfx950= {
+    #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
+    # 0: kernelInstance(       2,        256,       16,        128,       256,           16,         16,          128,          1,        4,            2,),
+    # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            4,),
+    1: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          128,          1,        4,            2,),
+    3: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          128,          1,        4,            1,),
+    # 4: kernelInstance(       2,        256,      128,        256,       128,           16,         16,          32,          1,        4,            1,),
+    # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
+    # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
+}
+
 # fmt: on
 gemm1_kernels_dict = {
     "a8w8_gfx950": a8w8_gemm1_kernels_list_gfx950,
     "a8w8": a8w8_gemm1_kernels_list,
     "a16w4_gfx950": a16w4_gemm1_kernels_list_gfx950,
     "a16w4": a16w4_gemm1_kernels_list,
+    "a8w4_gfx950": a8w4_gemm1_kernels_list_gfx950,
 }
 
 gemm2_kernels_dict = {
@@ -171,6 +195,7 @@ gemm2_kernels_dict = {
     "a8w8": a8w8_gemm2_kernels_list,
     "a16w4_gfx950": a16w4_gemm2_kernels_list_gfx950,
     "a16w4": a16w4_gemm2_kernels_list,
+    "a8w4_gfx950": a8w4_gemm2_kernels_list_gfx950,
 }
 
 
@@ -178,26 +203,27 @@ a8w8_gfx950_heuristic_dispatch = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+template <>
+MoeKernel moe_gemm1_heuristic_dispatch<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 32)
     {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 1)}<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 64)
     {{
-        return {(1, 2)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 2)}<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>;
     }}
     //else if (block_m == 128)
     //{{
-    //    return {(1, 4)}<ADataType, BDataType, AccDataType, CDataType>;
+    //    return {(1, 4)}<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>;
     //}}
     //else if (block_m == 256)
     //{{
-    //    return {(1, 6)}<ADataType, BDataType, AccDataType, CDataType>;
+    //    return {(1, 6)}<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>;
     //}}
     else
     {{
@@ -208,25 +234,25 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     }}
 }}
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+template <>
+MoeKernel moe_gemm2_heuristic_dispatch<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 32)
     {{
-        return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 0)}<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 64)
     {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 1)}<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>;
     }}
     //else if (block_m == 128)
     //{{
-    //    return {(2, 2)}<ADataType, BDataType, AccDataType, CDataType>;
+    //    return {(2, 2)}<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>;
     //}}
     //else if (block_m == 256)
     //{{
-    //    return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+    //    return {(2, 3)}<ck_tile::fp8_t, ck_tile::fp8_t, float, ck_tile::bf16_t>;
     //}}
     else
     {{
@@ -242,22 +268,23 @@ a16w4_gfx950_heuristic_dispatch = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+template <>
+MoeKernel moe_gemm1_heuristic_dispatch<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 16)
     {{
-        return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 0)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 32)
     {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 1)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 64)
     {{
-        return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 3)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else
     {{
@@ -268,21 +295,21 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     }}
 }}
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+template <>
+MoeKernel moe_gemm2_heuristic_dispatch<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 16)
     {{
-        return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 0)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 32)
     {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 1)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 64)
     {{
-        return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 3)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else
     {{
@@ -298,22 +325,23 @@ a16w4_heuristic_dispatch = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+template <>
+MoeKernel moe_gemm1_heuristic_dispatch<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 16)
     {{
-        return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 0)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 32)
     {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 1)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 64)
     {{
-        return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 3)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else
     {{
@@ -324,21 +352,78 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     }}
 }}
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+template <>
+MoeKernel moe_gemm2_heuristic_dispatch<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 16)
     {{
-        return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 0)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 32)
     {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 1)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else if (block_m == 64)
     {{
-        return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 3)}<ck_tile::bf16_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
+    }}
+    else
+    {{
+        TORCH_CHECK(
+            false,
+            "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
+            block_m);
+    }}
+}}
+"""
+
+a8w4_gfx950_heuristic_dispatch = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
+
+template <>
+MoeKernel moe_gemm1_heuristic_dispatch<ck_tile::fp8_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(
+    int M,
+    int N,
+    int K,
+    int block_m)
+{{
+    // Apply shape heuristics to find a suitable kernel implementation.
+    if (block_m == 32)
+    {{
+        return {(1, 1)}<ck_tile::fp8_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
+    }}
+    else if (block_m == 64)
+    {{
+        return {(1, 3)}<ck_tile::fp8_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
+    }}
+    else
+    {{
+        TORCH_CHECK(
+            false,
+            "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
+            block_m);
+    }}
+}}
+
+template <>
+MoeKernel moe_gemm2_heuristic_dispatch<ck_tile::fp8_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>(
+    int M,
+    int N,
+    int K,
+    int block_m)
+{{
+    // Apply shape heuristics to find a suitable kernel implementation.
+    if (block_m == 32)
+    {{
+        return {(2, 1)}<ck_tile::fp8_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
+    }}
+    else if (block_m == 64)
+    {{
+        return {(2, 3)}<ck_tile::fp8_t, ck_tile::pk_fp4_t, float, ck_tile::bf16_t>;
     }}
     else
     {{
@@ -355,6 +440,7 @@ heuristic_dispatch_dict = {
     # "a8w8": a8w8_gemm2_kernels_list,
     "a16w4_gfx950": a16w4_gfx950_heuristic_dispatch,
     "a16w4": a16w4_heuristic_dispatch,
+    "a8w4_gfx950": a8w4_gfx950_heuristic_dispatch,
 }
 
 
@@ -382,6 +468,13 @@ def get_gemm1_kernels_list(
             tag = "a16w4_gfx950"
         else:
             tag = "a16w4"
+    elif Adtype.lower() in bit8_list and Bdtype in bit4_list:
+        if arch == "gfx950":
+            tag = "a8w4_gfx950"
+        else:
+            raise ValueError(
+                f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}"
+            )
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
@@ -421,6 +514,13 @@ def get_gemm2_kernels_list(
             tag = "a16w4_gfx950"
         else:
             tag = "a16w4"
+    elif Adtype.lower() in bit8_list and Bdtype in bit4_list:
+        if arch == "gfx950":
+            tag = "a8w4_gfx950"
+        else:
+            raise ValueError(
+                f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}"
+            )
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm2_kernels_dict[tag]

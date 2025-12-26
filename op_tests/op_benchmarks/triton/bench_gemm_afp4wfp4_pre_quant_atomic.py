@@ -5,7 +5,7 @@ import math
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
     gemm_afp4wfp4_pre_quant,
 )
-from op_tests.triton_tests.test_gemm_afp4wfp4_pre_quant_atomic import (
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4_pre_quant_atomic import (
     generate_gemm_afp4wfp4_pre_quant_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (

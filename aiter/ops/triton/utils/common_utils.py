@@ -5,6 +5,7 @@ from typing import List
 
 import torch
 import triton
+import json
 
 
 def prev_power_of_2(x: int) -> int:
@@ -34,3 +35,11 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     if x.stride(-1) == 1:
         return x
     return x.contiguous()
+
+
+def serialize_dict(d: dict) -> str:
+    return json.dumps(d)
+
+
+def deserialize_str(s: str) -> dict:
+    return json.loads(s)

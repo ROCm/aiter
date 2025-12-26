@@ -11,6 +11,7 @@ from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.pid_preprocessing import remap_xcd
 from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -255,7 +256,27 @@ def _attn_fwd_inner(
     return acc, l_i, m_i
 
 
-@triton.jit
+_attn_fwd_repr = make_kernel_repr(
+    "_attn_fwd",
+    [
+        "IS_CAUSAL",
+        "NUM_Q_HEADS",
+        "NUM_K_HEADS",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_DMODEL",
+        "RETURN_SCORES",
+        "ENABLE_DROPOUT",
+        "IS_FP8",
+        "VARLEN",
+        "NUM_XCD",
+        "USE_INT64_STRIDES",
+        "ENABLE_SINK",
+    ],
+)
+
+
+@triton.jit(repr=_attn_fwd_repr)
 def _attn_fwd(
     q_ptr: torch.Tensor,
     k_ptr: torch.Tensor,
@@ -268,6 +289,7 @@ def _attn_fwd(
     s_dmask_ptr: torch.Tensor,
     dropout_mask_ptr: torch.Tensor,
     softmax_lse_ptr: torch.Tensor,
+    sink_ptr: torch.Tensor,
     stride_qz_in,
     stride_qh_in,
     stride_qm_in,
@@ -321,6 +343,7 @@ def _attn_fwd(
     BATCH,
     NUM_XCD: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -611,7 +634,13 @@ def _attn_fwd(
         dropout_mask_ptrs = None
         philox_ptrs = None
 
-    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    if ENABLE_SINK:
+        RCP_LN2: tl.constexpr = 1.4426950408889634
+        m_i_value = tl.load(sink_ptr + off_q_head).to(tl.float32) * RCP_LN2
+    else:
+        m_i_value = float("-inf")
+
+    m_i = tl.full([BLOCK_M], m_i_value, dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=tl.float32)
     if BLOCK_DMODEL == BLOCK_DMODEL_POW2:
@@ -855,7 +884,7 @@ def _get_config(
     has_pe: bool = False,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
         with open(fpath, "r") as file:

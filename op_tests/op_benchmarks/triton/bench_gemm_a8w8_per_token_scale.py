@@ -2,7 +2,7 @@ import sys
 import torch
 import triton
 from aiter.ops.triton.gemm_a8w8_per_token_scale import gemm_a8w8_per_token_scale
-from op_tests.triton_tests.test_gemm_a8w8_per_token_scale import (
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_per_token_scale import (
     generate_gemm_a8w8_per_token_scale_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (

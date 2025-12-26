@@ -37,7 +37,9 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bias_enum bias_type,
                                   bool has_lse,
                                   bool has_dropout,
+                                  quant_scale_enum qscale_type,
                                   bool use_ext_asm,
+                                  bool has_sink = false,
                                   int how_v3_bf16_cvt = 1,
                                   bool skip_min_seqlen_q = false)
 {{
@@ -50,9 +52,11 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           bias_type,
                           has_lse,
                           has_dropout,
+                          qscale_type,
                           use_ext_asm,
                           how_v3_bf16_cvt,
-                          skip_min_seqlen_q);
+                          skip_min_seqlen_q,
+                          has_sink);
 }}
 
 mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
@@ -62,7 +66,8 @@ mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
                                                   bool has_logits_soft_cap,
                                                   mask_enum mask_type,
                                                   bias_enum bias_type,
-                                                  bool has_lse)
+                                                  bool has_lse,
+                                                  bool has_sink)
 {{
     return mha_fwd_splitkv_traits(head_size_q,
                                   head_size_v,
@@ -71,7 +76,8 @@ mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
                                   has_logits_soft_cap,
                                   mask_type,
                                   bias_type,
-                                  has_lse);
+                                  has_lse,
+                                  has_sink);
 }}
 {F_dispatch}
 
@@ -87,7 +93,9 @@ float mha_fwd(mha_fwd_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
+              quant_scale_enum qscale_type,
               bool use_ext_asm,
+              bool has_sink,
               int how_v3_bf16_cvt,
               const void* seqstart_q_padding_ptr,
               const void* seqstart_k_padding_ptr,
@@ -105,7 +113,9 @@ float mha_fwd(mha_fwd_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
+                                     qscale_type,
                                      use_ext_asm,
+                                     has_sink,
                                      how_v3_bf16_cvt,
                                      args.min_seqlen_q != 0);
     float t = -1;
@@ -120,7 +130,8 @@ float mha_fwd_splitkv(mha_fwd_splitkv_args args,
                       bool is_group_mode,
                       mask_enum mask_type,
                       bias_enum bias_type,
-                      bool has_lse)
+                      bool has_lse,
+                      bool has_sink)
 {
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
@@ -131,7 +142,8 @@ float mha_fwd_splitkv(mha_fwd_splitkv_args args,
                                              args.logits_soft_cap > 0.f,
                                              mask_type,
                                              bias_type,
-                                             has_lse);
+                                             has_lse,
+                                             has_sink);
     return fmha_fwd_splitkv(traits, args, stream_config);
 }"""
 
@@ -157,6 +169,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
+                                     quant_scale_enum::no_scale,
                                      use_ext_asm);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
@@ -165,7 +178,7 @@ V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
 
 def get_v3_api():
-    v3_call = "fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check)"
+    v3_call = "fmha_fwd_v3(traits, args, stream_config, is_v3_api_check)"
     gfx_list = get_gfx_list()
     v3_arch_list = [arch for arch in ["gfx942", "gfx950"] if arch in gfx_list]
 

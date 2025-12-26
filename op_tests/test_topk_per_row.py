@@ -23,7 +23,7 @@ def create_random_logits(
         logits = torch.randn(
             row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
         )
-    elif data_generation == "10LSBits":
+    elif data_generation == "10LSBits" or data_generation == "mixed":
         top_22_bits_mask = 0xFFFFFC00
         last_10_bits_mask = 0x000003FF
         fixed_top_22_bits = 0x3F900000
@@ -40,6 +40,14 @@ def create_random_logits(
             random_bottom_bits & last_10_bits_mask
         )
         logits = logits_bits.view(dtype)
+
+    if data_generation == "mixed":
+        logits_random = torch.randn(
+            row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
+        )
+        # Mix the two logits tensors randomly
+        mask = torch.randint(0, 2, (row_starts.shape[0], 1), device="cuda").bool()
+        logits = torch.where(mask, logits, logits_random)
 
     for i, end in enumerate(row_ends):
         logits[i, end:] = float("-inf")
@@ -149,23 +157,37 @@ def run_top_k_per_row_decode(
     numRows: int,
     stride0: int,
     stride1: int,
+    fast: bool,
 ) -> None:
     """
     Run the top_k_per_row kernel.
     """
-    return aiter.top_k_per_row_decode(
-        logits,
-        next_n,
-        seqLens,
-        indices,
-        numRows,
-        stride0,
-        stride1,
-    )
+    if fast:
+        return aiter.top_k_per_row_decode_fast(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+        )
+    else:
+        return aiter.top_k_per_row_decode(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+        )
 
 
 @benchmark()
-def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> dict:
+def test_top_k_per_row_prefill(
+    num_rows: int, num_prefix: int, top_k: int, data_generation: str = "random"
+) -> dict:
     """
     Test topk_per_row_prefill.
     """
@@ -174,7 +196,9 @@ def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> di
 
     # Create test data
     row_starts, row_ends = create_row_boundaries(num_rows, num_prefix)
-    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    logits = create_random_logits(
+        row_starts, row_ends, torch.float32, 42, data_generation
+    )
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
@@ -188,7 +212,6 @@ def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> di
         row_ends,
         indices,
         None,  # values
-        # values,
         num_rows,
         logits.stride(0),
         logits.stride(1),
@@ -220,7 +243,8 @@ def test_top_k_per_row_decode(
     top_k: int,
     next_n: int,
     data_generation: str = "random",
-) -> None:
+    fast: bool = False,
+) -> dict:
     """
     Test top_k_per_row_decode with seq_lens tensor.
     """
@@ -235,7 +259,9 @@ def test_top_k_per_row_decode(
     row_indices = torch.arange(num_rows, device="cuda") // next_n
     next_n_offset = torch.arange(num_rows, device="cuda") % next_n
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
-    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    logits = create_random_logits(
+        row_starts, row_ends, torch.float32, 42, data_generation
+    )
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
@@ -249,6 +275,7 @@ def test_top_k_per_row_decode(
         num_rows,
         logits.stride(0),
         logits.stride(1),
+        fast,
     )
 
     torch.cuda.synchronize()
@@ -266,9 +293,10 @@ def test_top_k_per_row_decode(
     )
 
     # measure performance
-    # ret["context_len"] = logits.shape[1]
+    ret["context_len"] = logits.shape[1]
     ret["all_close"] = all_close
     ret["us"] = us
+    ret["fast"] = fast
     return ret
 
 
@@ -330,7 +358,7 @@ parser.add_argument(
     "--data_generation",
     type=str,
     default=["random"],
-    choices=["random", "10LSBits"],
+    choices=["random", "10LSBits", "mixed"],
     nargs="+",
     help="""Specify method for generating logits.
     e.g.: -d random""",
@@ -340,23 +368,29 @@ args = parser.parse_args()
 
 
 df = []
-for m in args.context_len:
-    for k in args.top_k:
-        for num_prefix in args.num_prefix:
-            ret = test_top_k_per_row_prefill(m, num_prefix, k)
-            df.append(ret)
+for data_generation in args.data_generation:
+    for m in args.context_len:
+        for k in args.top_k:
+            for num_prefix in args.num_prefix:
+                ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
+                df.append(ret)
 
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary for top_k_per_row_prefill kernel:\n{df}")
 
 
-# df = []
-# for m in args.decode_batch_size:
-#     for ctx in args.context_len:
-#         for k in args.top_k:
-#             for n in args.next_n:
-#                 ret = test_top_k_per_row_decode(m, ctx, k, n)
-#                 df.append(ret)
+df = []
+for data_generation in args.data_generation:
+    for m in args.decode_batch_size:
+        for ctx in args.context_len:
+            for k in args.top_k:
+                for n in args.next_n:
+                    ret = test_top_k_per_row_decode(
+                        m, ctx, k, n, data_generation, False
+                    )
+                    df.append(ret)
+                    ret = test_top_k_per_row_decode(m, ctx, k, n, data_generation, True)
+                    df.append(ret)
 
-# df = pd.DataFrame(df)
-# aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")

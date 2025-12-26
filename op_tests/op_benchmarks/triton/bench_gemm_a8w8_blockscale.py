@@ -7,7 +7,7 @@ from aiter.ops.triton.gemm_a8w8_blockscale import (
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
-from op_tests.triton_tests.test_gemm_a8w8_blockscale import (
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (

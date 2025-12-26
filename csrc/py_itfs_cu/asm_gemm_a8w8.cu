@@ -60,7 +60,7 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
 };
 
 std::tuple<std::string, int> get_heuristic_kernel(
-    int M, int N, int K, std::optional<int> k_split, std::optional<bool> bpreshuffle, CFG* cfgs)
+    int M, int N, int K, std::string arch_id, std::optional<int> k_split, std::optional<bool> bpreshuffle, CFG* cfgs)
 {
     k_split = k_split.value_or(0) ?: 1;
     hipDevice_t dev;
@@ -80,11 +80,13 @@ std::tuple<std::string, int> get_heuristic_kernel(
 
     for(const auto& el : *cfgs)
     {
+        if(el.first.find(arch_id) != 0)
+            continue;
         const auto& cfg = el.second;
         if(cfg.bpreshuffle == bpreshuffle_en &&
            ((cfg.splitK == k_split_en) || !k_split.has_value()))
         {
-            if((N % cfg.tile_N) == 0)
+            if((N % cfg.tile_n) == 0)
             {
                 std::vector<int> splitK_list =
                     (k_split.has_value() && cfg.splitK)
@@ -96,13 +98,13 @@ std::tuple<std::string, int> get_heuristic_kernel(
 
                 for(auto& splitK : splitK_list)
                 {
-                    int tg_num_M         = (M + cfg.tile_M - 1) / cfg.tile_M;
-                    int tg_num_N         = (N + cfg.tile_N - 1) / cfg.tile_N;
+                    int tg_num_M         = (M + cfg.tile_m - 1) / cfg.tile_m; 
+                    int tg_num_N         = (N + cfg.tile_n - 1) / cfg.tile_n;
                     tg_num               = tg_num_M * tg_num_N * splitK;
                     uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
 
                     float local_compute2mem_effi =
-                        cfg.tile_M * cfg.tile_N / (cfg.tile_M + cfg.tile_N);
+                        cfg.tile_m * cfg.tile_n / (cfg.tile_m + cfg.tile_n); 
 
                     bool is_earlier_round        = (local_round < round);
                     bool is_same_round           = (local_round == round);
@@ -190,7 +192,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
         TORCH_CHECK(false, __func__, " no kernel support a8w8 for this gpu arch");
     }
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-
+    std::string arch_id = get_gpu_arch();
+    kernelName          = kernelName.empty() ? "" : arch_id + kernelName;
     int selectedksplit = splitK.value_or(0) ?: 1;
     if(kernelName.empty())
     {
@@ -203,7 +206,7 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
         }
         else
         {
-            auto it = get_heuristic_kernel(Mdim, Ndim, Kdim, splitK, bpreshuffle, config_map);
+            auto it = get_heuristic_kernel(Mdim, Ndim, Kdim, arch_id, splitK, bpreshuffle, config_map);
 
             kernelName     = std::get<0>(it);
             selectedksplit = std::get<1>(it);
@@ -223,10 +226,10 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
     if(it != config_map->end())
     {
         const auto& cfg     = it->second;
-        const char* name    = cfg.name.c_str();
+        const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        SUBM                = cfg.tile_M;
-        SUBN                = cfg.tile_N;
+        SUBM                = cfg.tile_m;
+        SUBN                = cfg.tile_n;
         gdx                 = (Ndim / SUBN) * blockSizeX;
         gdy                 = (Mdim % SUBM == 0) ? Mdim / SUBM : Mdim / SUBM + 1;
         gdz                 = 1;

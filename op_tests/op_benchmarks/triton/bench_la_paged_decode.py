@@ -1,10 +1,5 @@
 import triton
-import triton.language as tl
-from utils.benchmark_utils import (
-    get_model_configs,
-    get_available_models,
-    get_dtype_bytes,
-)
+from utils.benchmark_utils import get_model_configs
 import torch
 import argparse
 from aiter.ops.triton.pa_decode import paged_attention_decode

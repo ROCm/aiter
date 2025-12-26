@@ -21,53 +21,59 @@
 # ========================================================================
 
 import os
-import torch
-import triton
+import math
 from functools import lru_cache
 
+import torch
+import triton
+from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
     "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
 )
 enable_aot_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits == "1"
-
-if triton.__version__ >= "3.5.0":
+triton_version = Version(Version(triton.__version__).base_version)
+if triton_version >= Version("3.5.0"):
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
+
     from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
+        _deepgemm_fp8_paged_mqa_logits,
+        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
+        _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
-        _deepgemm_fp8_paged_mqa_logits,
-        _deepgemm_fp8_paged_mqa_logits_ragged_k,
     )
     from aiter.ops.triton.gluon.pa_mqa_logits import (
         _gluon_deepgemm_fp8_paged_mqa_logits,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
     )
 
     enable_gluon_pa_mqa_logits = True
-    enable_jit_gluon_pa_mqa_logits_kernel = True
+    enable_jit_gluon_pa_mqa_logits_kernel = not enable_aot_gluon_pa_mqa_logits
 else:
     from triton.compiler import ASTSource
+
     from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
+        _deepgemm_fp8_paged_mqa_logits,
+        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
+        _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
-        _deepgemm_fp8_paged_mqa_logits,
-        _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _gluon_deepgemm_fp8_paged_mqa_logits,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
     )
 
-    assert triton.__version__ < "3.4.0"
     enable_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.utility.triton.triton_metadata_redirect import (
-    AOTMetadataContext,
-)
 from aiter import dtypes
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
+
 from ...jit.utils.chip_info import get_gfx
 
 
@@ -244,6 +250,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     HiddenDim,
     is_padded_mode: bool,
     WavePerEU: int = 2,
+    VarCtxOpt: bool = False,
 ):
     gfx_version = get_gfx()
     assert gfx_version == "gfx942" or gfx_version == "gfx950"
@@ -271,9 +278,14 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "stride_out_batch": "i32",
         "max_model_len": "i32",
         "max_block_len": "i32",
-        "SplitKV": "i32",
     }
-    if not enable_jit_gluon_pa_mqa_logits_kernel:
+    if VarCtxOpt:
+        fn_signature["safe_chunks_per_cta_ptr"] = "*i32"
+    else:
+        fn_signature["SplitKV"] = "i32"
+
+    if triton_version < Version("3.4.0"):
+        assert not enable_jit_gluon_pa_mqa_logits_kernel
         fn_signature["dummyPointerArg"] = "*i32"
     fn_signature["ChunkQ"] = "constexpr"
     fn_signature["ChunkK"] = "constexpr"
@@ -292,7 +304,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "name": (
             "_gluon_deepgemm_fp8_paged_mqa_logits"
             if not Preshuffle
-            else "_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle"
+            else (
+                "_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx"
+                if VarCtxOpt
+                else "_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle"
+            )
         ),
     }
 
@@ -303,7 +319,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     kernel_fn = (
         _gluon_deepgemm_fp8_paged_mqa_logits
         if not Preshuffle
-        else _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
+        else (
+            _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx
+            if VarCtxOpt
+            else _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
+        )
     )
     src = ASTSource(
         fn=kernel_fn,
@@ -343,7 +363,9 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         )
     else:
         padded_str = "T" if is_padded_mode and not Preshuffle else "F"
-        kernel_str = f"paged_mqa_logits{"_preshuffle" if Preshuffle else ""}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
+        preshuffle_suffix = "_preshuffle" if Preshuffle else ""
+        varctx_suffix = "_varctx" if VarCtxOpt else ""
+        kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
@@ -355,6 +377,41 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
                 options=options,
             )
     return kernel
+
+
+def deepgemm_fp8_paged_mqa_logits_schedule(
+    batch_size,
+    next_n,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    ChunkK: int = 256,
+    TotalCuCount: int = 80 if get_gfx() == "gfx942" else 256,
+    WavePerEU: int = 2,
+):
+    assert batch_size < TotalCuCount * WavePerEU // next_n
+
+    max_chunks = math.ceil(max_model_len / ChunkK)
+    schedule_waves_per_eu = 4
+    grid = (TotalCuCount * schedule_waves_per_eu, 1, 1)
+    TryCount = math.ceil(max_chunks / grid[0])
+    align_power_of_2_batch = 1 << (batch_size - 1).bit_length()
+
+    safe_chunks_per_cta = torch.empty(
+        (1,),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    _deepgemm_fp8_paged_mqa_logits_varctx_schedule[grid](
+        batch_size,
+        context_lens,
+        safe_chunks_per_cta,
+        TotalCuCount * WavePerEU // next_n,
+        ChunkK,
+        align_power_of_2_batch,
+        TryCount,
+        waves_per_eu=schedule_waves_per_eu,
+    )
+    return safe_chunks_per_cta
 
 
 def deepgemm_fp8_paged_mqa_logits(
@@ -370,6 +427,7 @@ def deepgemm_fp8_paged_mqa_logits(
     ChunkK: int = 256,
     TotalCuCount: int = 80 if get_gfx() == "gfx942" else 256,
     WavePerEU: int = 2,
+    VarCtxSchedule: torch.Tensor = None,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     num_block, block_Size, _, index_dim = kv_cache.size()
@@ -378,7 +436,7 @@ def deepgemm_fp8_paged_mqa_logits(
     TileQCount = batch_size * next_n
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
-    assert ChunkK % KVBlockSize == 0
+    assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
     if Preshuffle:
         assert (
@@ -393,7 +451,12 @@ def deepgemm_fp8_paged_mqa_logits(
     kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
 
-    grid = (batch_size * next_n * SplitKV, 1, 1)
+    VarCtxOpt = VarCtxSchedule is not None
+    if VarCtxOpt:
+        grid = (TotalCuCount * WavePerEU, 1, 1)
+    else:
+        grid = (batch_size * next_n * SplitKV, 1, 1)
+
     if enable_gluon_pa_mqa_logits:
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
         kernel = _compile_deepgemm_fp8_paged_mqa_logits(
@@ -404,8 +467,9 @@ def deepgemm_fp8_paged_mqa_logits(
             HiddenDim=hidden_dim,
             is_padded_mode=is_padded_mode,
             WavePerEU=WavePerEU,
+            VarCtxOpt=VarCtxOpt,
         )
-        if enable_jit_gluon_pa_mqa_logits_kernel:
+        if triton_version >= Version("3.5.0"):
             kernel[grid](
                 batch_size,
                 next_n,
@@ -426,7 +490,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 out_logits.stride(0),
                 max_model_len,
                 max_block_len,
-                SplitKV,
+                SplitKV if not VarCtxOpt else VarCtxSchedule,
                 # constexpr
                 heads,
                 ChunkK,
@@ -434,6 +498,13 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
             )
         else:  #  load AOT compiled gluon kernel
+            assert triton_version < Version(
+                "3.4.0"
+            ), "https://github.com/triton-lang/triton/pull/7258 involves a ABI-breaking change on triton3.4, "
+            "which adding an extra pointer argument at the end of kernel arguments. To ensure compatibility"
+            "with AOT compiled gluon kernel on triton3.5, a feasible solution is to add a pointer parameter "
+            "at the end of the parameters and ensure that the Triton version used is before the ABI "
+            "modification, i.e., verison<3.4.0"
             kernel[grid](
                 batch_size,
                 next_n,
@@ -454,9 +525,8 @@ def deepgemm_fp8_paged_mqa_logits(
                 out_logits.stride(0),
                 max_model_len,
                 max_block_len,
-                SplitKV,
+                SplitKV if not VarCtxOpt else VarCtxSchedule,
                 out_logits,  # dummyPointerArg for triton version < 3.4.0,
-                # the kernel signature has an extra pointer argument on triton>=3.5.0
                 # constexpr
                 heads,
                 ChunkK,
@@ -464,6 +534,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
             )
     else:
+        assert KVBlockSize == 1
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
         kernel = _deepgemm_fp8_paged_mqa_logits[grid](
             batch_size,

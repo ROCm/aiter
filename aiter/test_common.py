@@ -6,6 +6,7 @@ import os
 import copy
 import numpy as np
 import pandas as pd
+import multiprocessing as mp
 from aiter import logger
 
 pd.set_option("display.max_rows", 200)
@@ -15,6 +16,31 @@ pd.set_option("display.max_rows", 200)
 # pd.set_option("display.width", None)
 # pd.set_option("display.max_colwidth", None)
 # pd.set_option("display.expand_frame_repr", False)
+
+
+def ensure_spawn_method():
+    """
+    Ensure multiprocessing uses 'spawn' start method.
+
+    This is required for CUDA/distributed tests. Only sets the method if
+    it hasn't been set yet, avoiding conflicts with existing initialization.
+
+    Usage:
+        Called at the beginning of multi-GPU test functions before spawning
+        worker processes.
+    """
+    try:
+        current_method = mp.get_start_method(allow_none=True)
+        if current_method is None:
+            mp.set_start_method("spawn")
+        elif current_method != "spawn":
+            logger.warning(
+                f"Multiprocessing start method already set to '{current_method}', "
+                f"expected 'spawn'. This may cause issues with CUDA."
+            )
+    except RuntimeError:
+        # Already set, which is fine
+        pass
 
 
 def perftest(
@@ -56,19 +82,7 @@ def perftest(
                     latencies.append(start_event.elapsed_time(end_event))
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
-            if testGraph:
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    data = run_iters_rotate(num_iters, func, rotate_args)
-                with tpf.profile(
-                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-                    profile_memory=True,
-                    with_stack=True,
-                    with_modules=True,
-                ) as prof:
-                    run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
-                logger.info(f"avg: {avg} us/iter with hipgraph")
+
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
@@ -84,6 +98,20 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+
+            if testGraph:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    data = run_iters_rotate(num_iters, func, rotate_args)
+                with tpf.profile(
+                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                    profile_memory=True,
+                    with_stack=True,
+                    with_modules=True,
+                ) as prof:
+                    run_iters(1, graph.replay)
+                avg = get_trace_perf(prof, num_iters)
+                logger.info(f"avg: {avg} us/iter with hipgraph")
 
             avg = get_trace_perf(prof, num_iters)
             return data, avg
@@ -175,7 +203,6 @@ def run_perftest(
     needTrace=False,
     **kwargs,
 ):
-
     @perftest(
         num_iters=num_iters,
         num_warmup=num_warmup,
@@ -384,7 +411,7 @@ def checkAllclose(
             a_msked = a[mask]
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
-        except RuntimeError as e:
+        except RuntimeError:
             mask = ~isClose.to("cpu")
             num = mask.sum()
             printNum = min(printNum, num)

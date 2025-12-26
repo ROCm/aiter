@@ -1,69 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
-import json
-import os
 import triton
 import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils.gemm_config_utils import get_gemm_config
 
 
 _gemm_afp4wfp4_repr = make_kernel_repr(
-    "_gemm_afp4_wfp4_kernel",
+    "_gemm_afp4wfp4_kernel",
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
-        "NUM_KSPLIT",
-        "SPLITK_BLOCK_SIZE",
-        "EVEN_K",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
         "cache_modifier",
-    ],
-)
-
-
-_gemm_afp4wfp4_preshuffled_repr = make_kernel_repr(
-    "_gemm_afp4_wfp4_kernel_preshuffled_scales",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "BLOCK_SIZE_K",
-        "GROUP_SIZE_M",
         "NUM_KSPLIT",
-        "SPLITK_BLOCK_SIZE",
-        "EVEN_K",
-        "cache_modifier",
-    ],
-)
-
-
-_gemm_afp4wfp4_preshuffled_weight_scales_repr = make_kernel_repr(
-    "_gemm_afp4_wfp4_kernel_preshuffled_weight_scales",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "BLOCK_SIZE_K",
-        "GROUP_SIZE_M",
-        "NUM_KSPLIT",
-        "SPLITK_BLOCK_SIZE",
-        "EVEN_K",
-        "cache_modifier",
-    ],
-)
-
-
-_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
-    "_gemm_afp4_wfp4_reduce_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "ACTUAL_KSPLIT",
-        "MAX_KSPLIT",
     ],
 )
 
@@ -76,7 +33,7 @@ _gemm_afp4wfp4_reduce_repr = make_kernel_repr(
     }
 )
 @triton.jit(repr=_gemm_afp4wfp4_repr)
-def _gemm_afp4_wfp4_kernel(
+def _gemm_afp4wfp4_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -104,6 +61,10 @@ def _gemm_afp4_wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -146,6 +107,7 @@ def _gemm_afp4_wfp4_kernel(
 
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
+    tl.assume(pid_k >= 0)
     # We assume 32 elements along K share the same scale.
     SCALE_GROUP_SIZE: tl.constexpr = 32
 
@@ -224,6 +186,23 @@ def _gemm_afp4_wfp4_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+_gemm_afp4wfp4_preshuffle_scales_repr = make_kernel_repr(
+    "_gemm_afp4wfp4_preshuffle_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -231,8 +210,8 @@ def _gemm_afp4_wfp4_kernel(
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
     }
 )
-@triton.jit(repr=_gemm_afp4wfp4_preshuffled_repr)
-def _gemm_afp4_wfp4_kernel_preshuffled_scales(
+@triton.jit(repr=_gemm_afp4wfp4_preshuffle_scales_repr)
+def _gemm_afp4wfp4_kernel_preshuffle_scales(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -260,6 +239,10 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -429,6 +412,23 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
 
+_gemm_afp4wfp4_preshuffle_repr = make_kernel_repr(
+    "_gemm_afp4wfp4_preshuffle_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -436,8 +436,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
     }
 )
-@triton.jit(repr=_gemm_afp4wfp4_preshuffled_weight_scales_repr)
-def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
+@triton.jit(repr=_gemm_afp4wfp4_preshuffle_repr)
+def _gemm_afp4wfp4_preshuffle_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -465,6 +465,10 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -525,12 +529,10 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
         b_ptrs = b_ptr + (
-            # offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-            offs_bn[:, None] * stride_bn
-            + offs_k_shuffle[None, :] * stride_bk
+            offs_bn[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
         )
-        # Create pointers for the first block of A and B scales
 
+        # Create pointers for the first block of A and B scales
         offs_asn = (
             pid_n * (BLOCK_SIZE_N // 32) + tl.arange(0, (BLOCK_SIZE_N // 32))
         ) % N
@@ -645,8 +647,20 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
 
+_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
+    "_gemm_afp4wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
+@triton.heuristics({})  # dummy heuristics to invoke kernel re-naming
 @triton.jit(repr=_gemm_afp4wfp4_reduce_repr)
-def _gemm_afp4_wfp4_reduce_kernel(
+def _gemm_afp4wfp4_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
     M,
@@ -692,52 +706,14 @@ def _gemm_afp4_wfp4_reduce_kernel(
     tl.store(c_out_ptrs, c)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
     shuffle: bool = False,
 ):
-    shuffle_filename_suffix = "" if not shuffle else "_PRESHUFFLED"
-    if not hasattr(_get_config, "_config_dict") or not hasattr(
-        _get_config._config_dict, f"default{shuffle_filename_suffix}"
-    ):
-        dev = arch_info.get_device()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict[f"default{shuffle_filename_suffix}"] = config
+    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
+    config_name = f"GEMM-AFP4WFP4{shuffle_suffix}"
 
-    key = f"{N}_{K}{shuffle_filename_suffix}"
-    if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4{shuffle_filename_suffix}-N={N}-K={2*K}.json"
-        if os.path.exists(fpath):
-            with open(fpath, "r") as file:
-                config = json.load(file)
-                _get_config._config_dict[key] = config
-        else:
-            key = f"default{shuffle_filename_suffix}"  # fall back to default config
-
-    if M < 32:
-        BLK_M = triton.next_power_of_2(M)
-        if BLK_M >= 16 and "small_M16" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["small_M16"]
-        return _get_config._config_dict[key]["small"]
-    elif M <= 128:
-        BLK_M = triton.next_power_of_2(M)
-        if BLK_M == 32:
-            return _get_config._config_dict[key]["medium_M32"]
-        elif BLK_M == 64:
-            return _get_config._config_dict[key]["medium_M64"]
-        elif BLK_M == 128:
-            return _get_config._config_dict[key]["medium_M128"]
-    elif M <= 256:
-        return _get_config._config_dict[key]["large"]
-    else:
-        BLK_M = triton.next_power_of_2(M)
-        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
-        return _get_config._config_dict[key]["xlarge"]
+    # Note: Config files use K=2*K in their naming
+    return get_gemm_config(config_name, M, N, 2 * K)

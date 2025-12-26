@@ -1,22 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import math
+
 import random
 import argparse
 
-import pytest
 import torch
 import os
 
 import triton
-import triton.language as tl
 
-from aiter.test_common import checkAllclose, run_perftest, perftest, benchmark
+from aiter.test_common import run_perftest
 from aiter.ops.triton.pa_mqa_logits import (
-    deepgemm_fp8_paged_mqa_logits_stage1,
     deepgemm_fp8_paged_mqa_logits,
-    deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
-    deepgemm_fp8_paged_mqa_logits_ragged_k,
+    deepgemm_fp8_paged_mqa_logits_schedule,
 )
 from aiter.ops.shuffle import shuffle_weight
 
@@ -189,8 +185,8 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
 
 
 def run_benchmark(args: argparse.Namespace):
-    ChunkK = 256
-    WavePerEU = 2
+    ChunkK = 128
+    WavePerEU = 5
 
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def test_deepgemm_fp8_paged_mqa_logits(
@@ -200,12 +196,14 @@ def run_benchmark(args: argparse.Namespace):
         random.seed(0)
 
         max_model_len = 2 * avg_kv_length
-        num_blocks = max_model_len
         blocksize = args.blocksize if args.kv_preshuffle else 1
+        num_blocks = (max_model_len + blocksize - 1) // blocksize
 
         assert blocksize == 1 or args.kv_preshuffle and blocksize % 16 == 0
 
-        var_ratio = 0.0
+        var_ratio = 0.5
+        EnableVarCtxOpt = var_ratio > 0.0
+
         context_lens = (
             torch.randint(
                 int((1 - var_ratio) * avg_kv_length),
@@ -302,6 +300,16 @@ def run_benchmark(args: argparse.Namespace):
                     split_kv_cache_data.view(kv_num_block, kv_block_Size * index_dim)
                 )
 
+            if EnableVarCtxOpt:
+                safe_chunks_per_cta = deepgemm_fp8_paged_mqa_logits_schedule(
+                    batch_size,
+                    next_n,
+                    context_lens,
+                    max_model_len,
+                    ChunkK=ChunkK,
+                    WavePerEU=WavePerEU,
+                )
+
             _, elapsed_us = run_perftest(
                 deepgemm_fp8_paged_mqa_logits,
                 q_fp8,
@@ -315,6 +323,7 @@ def run_benchmark(args: argparse.Namespace):
                 Preshuffle=Preshuffle,
                 KVBlockSize=blocksize,
                 WavePerEU=WavePerEU,
+                VarCtxSchedule=safe_chunks_per_cta if EnableVarCtxOpt else None,
             )
             cache_key = deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
@@ -328,6 +337,7 @@ def run_benchmark(args: argparse.Namespace):
                 Preshuffle=Preshuffle,
                 KVBlockSize=blocksize,
                 WavePerEU=WavePerEU,
+                VarCtxSchedule=safe_chunks_per_cta if EnableVarCtxOpt else None,
             )
 
             print(">>> ", cache_key)
@@ -374,7 +384,7 @@ def run_benchmark(args: argparse.Namespace):
 
             padded_str = "T" if args.padding else "F"
             os.makedirs(aot_kernel_dir, exist_ok=True)
-            aot_name = f"paged_mqa_logits{"_preshuffle" if args.kv_preshuffle else ""}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            aot_name = f"paged_mqa_logits{"_preshuffle" if args.kv_preshuffle else ""}{"_varctx" if EnableVarCtxOpt else ""}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)

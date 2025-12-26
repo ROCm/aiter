@@ -35,11 +35,14 @@ on:
         type: choice
         options:
           - aiter-k8s-build
+          - aiter-mi300-1gpu
+          - aiter-mi325-1gpu
+          - aiter-mi355-1gpu
           - aiter-1gpu-runner
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build_whl_package:
@@ -93,6 +96,7 @@ jobs:
           echo "Starting container: aiter_build_${{ matrix.python_version }}"
           docker run -dt \
           --shm-size=16G \
+          --network=host \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_build_${{ matrix.python_version }} \

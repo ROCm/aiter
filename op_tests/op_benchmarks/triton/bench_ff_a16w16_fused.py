@@ -5,7 +5,7 @@ import math
 from aiter.ops.triton.ff_a16w16_fused_gated import ff_a16w16_fused_gated
 from aiter.ops.triton.ff_a16w16_fused_ungated import ff_a16w16_fused_ungated
 from aiter.ops.triton.ff_a16w16 import ff_a16w16_gated, ff_a16w16_nogate
-from op_tests.triton_tests.ff_test_utils import (
+from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import (
     generate_ff_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
