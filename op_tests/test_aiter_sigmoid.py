@@ -5,6 +5,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose
+import argparse
 
 # from ater.test_common import checkAllclose, perftest
 from torch.profiler import profile, ProfilerActivity
@@ -15,19 +16,36 @@ from torch.profiler import profile, ProfilerActivity
 # input shape: torch.Size([4096, 64, 160]) (47360, 1, 296)
 # other shape: torch.Size([4096, 64, 160]) (10240, 160, 1)
 
-shape0 = (4096, 880)
-stride0 = (880, 1)
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-s",
+    "--shape",
+    type=dtypes.str2tuple,
+    default=(4096, 880),
+    help="""Input shape.
+    e.g.: -s 4096,880""",
+)
+parser.add_argument(
+    "-st",
+    "--stride",
+    type=dtypes.str2tuple,
+    default=(880, 1),
+    help="""Input stride.
+    e.g.: -st 880,1""",
+)
+args = parser.parse_args()
 
-# shape0 = (16,16)
-# stride0 = (16, 1)
 
-tensor0 = torch.empty_strided(shape0, stride0, dtype=dtypes.fp16, device="cuda")
-random_data0 = torch.rand(shape0)
+tensor0 = torch.empty_strided(args.shape, args.stride, dtype=dtypes.fp16, device="cuda")
+random_data0 = torch.rand(args.shape)
 tensor0.copy_(random_data0)
 # tensor0.fill_(1)
 
-print("shape0", shape0)
-print("strride0:", stride0)
+print("Shape", args.shape)
+print("Stride:", args.stride)
 
 with profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
