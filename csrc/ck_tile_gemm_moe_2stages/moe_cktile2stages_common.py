@@ -91,7 +91,7 @@ class kernelInstance:
         return ("_").join(
             element
             for element in [
-                f"moe_cktile2stages",
+                "moe_cktile2stages",
                 self.QuantType,
                 "MulRoutedWeight" if self.MulRoutedWeight else "",
                 "Bias" if self.HasBias else "NoBias",
