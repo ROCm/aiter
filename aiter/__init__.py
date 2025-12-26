@@ -74,3 +74,4 @@ from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from . import mla
+from .ops.groupnorm import *
