@@ -4,7 +4,7 @@ import pytest
 import os
 import torch
 from aiter.ops.triton.gemm_afp4wfp4 import (
-    gemm_afp4wfp4,
+    gemm_afp4wfp4_,
     gemm_afp4wfp4_preshuffle,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -232,8 +232,9 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     "shuffle_weight_scales",
     [True, False],
 )
+@pytest.mark.parametrize("skip_reduce", [True, False])
 def test_gemm_afp4_wfp4(
-    M: int, N: int, K: int, dtype, layout, output, shuffle_weight_scales
+    M: int, N: int, K: int, dtype, layout, output, shuffle_weight_scales, skip_reduce
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -281,6 +282,7 @@ def test_gemm_afp4_wfp4(
                 dtype,
                 y,
                 use_aot=(dtype == torch.bfloat16 and layout == "TN"),
+                skip_reduce=skip_reduce,
             )
         else:
             triton_out = gemm_afp4wfp4_preshuffle(
@@ -290,6 +292,7 @@ def test_gemm_afp4_wfp4(
                 w_scales_triton,
                 dtype,
                 use_aot=(dtype == torch.bfloat16 and layout == "TN"),
+                skip_reduce=skip_reduce,
             )
         # TODO: remove in the future
         # if output:
@@ -302,12 +305,26 @@ def test_gemm_afp4_wfp4(
         #     )
     else:
         if output:
-            triton_out = gemm_afp4wfp4(
-                x, w_triton, x_scales_triton, w_scales_triton, dtype, y
+            triton_out = gemm_afp4wfp4_(
+                x,
+                w_triton,
+                x_scales_triton,
+                w_scales_triton,
+                dtype,
+                y,
+                skip_reduce=skip_reduce,
             )
         else:
-            triton_out = gemm_afp4wfp4(
-                x, w_triton, x_scales_triton, w_scales_triton, dtype
+            triton_out = gemm_afp4wfp4_(
+                x,
+                w_triton,
+                x_scales_triton,
+                w_scales_triton,
+                dtype,
+                skip_reduce=skip_reduce,
             )
+
+    if triton_out.dim() == 3:
+        triton_out = triton_out.sum(dim=0).to(dtype)
 
     torch.testing.assert_close(torch_out, triton_out)
