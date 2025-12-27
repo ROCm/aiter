@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+from aiter.ops.triton.utils._triton import arch_info
 import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -27,8 +28,12 @@ def select_2d_config(
     TILE_SIZE = 64
     # in case head_size is large
     max_num_stages_2d = 4
+    dev = arch_info.get_arch()
     if head_size > 128:
-        max_num_stages_2d = 2
+        if block_size >= 64 and dev == "gfx1201":
+            max_num_stages_2d = 1
+        else:
+            max_num_stages_2d = 2
     if all_decode == False:
         num_stages_2d = 1
         num_warps = 2
