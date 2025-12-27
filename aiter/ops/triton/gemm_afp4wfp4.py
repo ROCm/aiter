@@ -79,15 +79,13 @@ def gemm_afp4wfp4_fake_tensor(
     M, K = x.shape
     N, _ = w.shape
 
-    if config is None:
-        config = _get_config(M, N, K)
-    else:
-        config = deserialize_str(config)
+    config = deserialize_str(config)
+
     num_ksplit = config["NUM_KSPLIT"]
     block_size_k = config["BLOCK_SIZE_K"]
 
     if num_ksplit > 1:
-        _, block_size_k, num_ksplit = get_splitk(K, config["BLOCK_SIZE_K"], num_ksplit)
+        _, block_size_k, num_ksplit = get_splitk(K, block_size_k, num_ksplit)
 
     if block_size_k >= 2 * K:
         num_ksplit = 1
@@ -257,15 +255,12 @@ def gemm_afp4wfp4(
     config: Optional[dict] = None,
     skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
-    if not skip_reduce:
-        config_hashable = serialize_dict(config) if config else None
-    else:
-        if config is None:
-            config_hashable = None
-            M, K = x.shape
-            N, _ = w.shape
-            config = _get_config(M, N, K)
-        config_hashable = serialize_dict(config)
+    if config is None:
+        config_hashable = None
+        M, K = x.shape
+        N, _ = w.shape
+        config, _ = _get_config(M, N, K)
+    config_hashable = serialize_dict(config)
     return gemm_afp4wfp4_(
         x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce
     )
