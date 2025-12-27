@@ -60,6 +60,9 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
             triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
         )
 
+    # re-ensuring NUM_KSPLIT is the correct value
+    NUM_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE // 2))
+
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
 
@@ -367,6 +370,7 @@ def gemm_afp4wfp4_preshuffle(
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
     use_aot: Optional[bool] = True,
+    skip_reduce: Optional[bool] = False,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights using preshuffled weight scales.
@@ -397,9 +401,6 @@ def gemm_afp4wfp4_preshuffle(
     N = N * 16
     K = K // 16
 
-    if y is None:
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
     if config is None:
         config = _get_config(M, N, K, True)
 
@@ -414,15 +415,18 @@ def gemm_afp4wfp4_preshuffle(
 
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
-                (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
+                (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=x.device
             )
         else:
             y_pp = torch.empty(
-                (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
+                (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
             )
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
+
+    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config["BLOCK_SIZE_K"] >= 2 * K:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
@@ -502,6 +506,9 @@ def gemm_afp4wfp4_preshuffle(
         )
 
     if config["NUM_KSPLIT"] > 1:
+        if skip_reduce:
+            return y_pp
+
         REDUCE_BLOCK_SIZE_M = 16
         # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
