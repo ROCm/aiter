@@ -689,8 +689,9 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        # (attn_logits, attn_lse), us_asm_decode = run_perftest(
-        aiter.mla.mla_decode_fwd(
+        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+            # aiter.mla.mla_decode_fwd(
+            aiter.mla.mla_decode_fwd,
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,

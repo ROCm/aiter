@@ -231,6 +231,30 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
                                             0,
                                             0);
     }
+    else
+    {
+        uintptr_t p_lds_warp_nope =
+            p_lds_k_nope + warp_idx * kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t);
+        uint4* p_lds_nope                    = reinterpret_cast<uint4*>(p_lds_warp_nope);
+        constexpr uint32_t kNumDw4PerThrNope = kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t) /
+                                               ckt::get_warp_size() / sizeof(uint4);
+#pragma unroll
+        for(uint32_t rid = 0; rid < kNumDw4PerThrNope; ++rid)
+        {
+            p_lds_nope[lane_idx + rid * ckt::get_warp_size()] = uint4(0u);
+        }
+
+        uintptr_t p_lds_warp_rope =
+            p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
+        uint32_t* p_lds_rope                = reinterpret_cast<uint32_t*>(p_lds_warp_rope);
+        constexpr uint32_t kNumDwPerThrRope = kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t) /
+                                              ckt::get_warp_size() / sizeof(uint32_t);
+#pragma unroll
+        for(uint32_t rid = 0; rid < kNumDwPerThrRope; ++rid)
+        {
+            p_lds_rope[lane_idx + rid * ckt::get_warp_size()] = 0u;
+        }
+    }
 #endif
 }
 
