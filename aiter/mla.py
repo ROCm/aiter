@@ -314,12 +314,12 @@ def mla_decode_fwd(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
-        )
+        ).fill_(2.33)
         attn_lse = torch.empty(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
             dtype=dtypes.fp32,
             device=device,
-        )
+        ).fill_(2.33)
         final_lse = (
             torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
@@ -344,6 +344,53 @@ def mla_decode_fwd(
                 attn_lse,
                 o,
                 dbg_tr,
+            )
+
+            # ref_logits = torch.full_like(logits, 2.33)
+            # ref_attn_lse = torch.full_like(attn_lse, 2.33)
+            # ref_o = torch.full_like(o, 2.33)
+            # aiter.mla_decode_stage1_asm_fwd(
+            #     q,
+            #     kv_buffer,
+            #     qo_indptr,
+            #     kv_indptr,
+            #     kv_indices,
+            #     kv_last_page_lens,
+            #     num_kv_splits_indptr,
+            #     work_meta_data,
+            #     work_indptr,
+            #     work_info_set,
+            #     max_seqlen_q,
+            #     sm_scale,
+            #     ref_logits,
+            #     ref_attn_lse,
+            #     ref_o,
+            #     q_scale,
+            #     kv_scale,
+            # )
+            # checkAllclose(ref_logits, logits, tol_err_ratio=0, msg="compare logits")
+            # checkAllclose(ref_attn_lse, attn_lse, msg="compare attn_lse")
+            # print(f"{logits[0][0][0][:64]=}\n{logits[14][0][0][:64]=}")
+            # for i in range(8):
+            #     if not torch.all(dbg_tr[0] == dbg_tr[0]):
+            #         print(f"dbg_tr[{i}]=\n{dbg_tr[i].view(-1,4)}")
+            #     else:
+            #         print(f"dbg_tr[{i}] has no nan")
+            # # torch.set_printoptions(threshold=9999999)
+            # # print ((logits != logits).nonzero())
+            # # torch.set_printoptions(threshold=1000)
+
+            torch.cuda.synchronize()
+
+            aiter.mla_reduce_v1(
+                logits,
+                attn_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                o,
+                final_lse,
             )
             qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
             kvc = torch.index_select(kv_buffer, 0, kv_indices).squeeze(1)
@@ -417,7 +464,6 @@ def mla_decode_fwd(
                     o_tile[0].to(o.dtype),
                     msg=f"out[{i}] vs. o_tile[0]",
                 )
-
 
                 # print(datetime.datetime.now())
 

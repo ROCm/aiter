@@ -630,6 +630,21 @@ __device__ __forceinline__ void float_2_bf16_pair(uint32_t dst, uint32_t src_0, 
 #endif
 }
 
+template <uint32_t DST_GPR>
+__device__ __forceinline__ void transpose(const uint32_t lane_idx,
+                                          const uint32_t src_0,
+                                          const uint32_t src_1,
+                                          const uint32_t src_2,
+                                          const uint32_t src_3)
+{
+    const uint32_t quad_idx    = lane_idx % 4;
+    const uint32_t perm_0      = 0x0c0c0400 + quad_idx * 0x00000101;
+    const uint32_t perm_1      = 0x04000c0c + quad_idx * 0x01010000;
+    const uint32_t front_part  = __builtin_amdgcn_perm(src_1, src_0, perm_0);
+    const uint32_t latter_part = __builtin_amdgcn_perm(src_3, src_2, perm_1);
+    asm volatile("v_or_b32_e32 v[%0], %1, %2" : : "i"(DST_GPR), "v"(front_part), "v"(latter_part));
+};
+
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(72))) void kn_mla_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
@@ -670,8 +685,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     constexpr uint32_t k_p_mfma_sz = 2;
     constexpr uint32_t k_p_comp_sz = 8;
     constexpr uint32_t k_kv_size   = 4;
-    constexpr uint32_t k_rope_sz   = 4;
-    constexpr uint32_t k_nope_sz   = 32;
+    constexpr uint32_t k_q_rope_sz = 4;
+    constexpr uint32_t k_q_nope_sz = 32;
 
     constexpr uint32_t k_o_end        = 255;
     constexpr uint32_t k_o_begin      = k_o_end - k_o_sz + 1;
@@ -684,9 +699,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     constexpr uint32_t k_kv_0_end     = k_kv_1_begin - 1;
     constexpr uint32_t k_kv_0_begin   = k_kv_0_end - k_kv_size + 1;
     constexpr uint32_t k_q_rope_end   = k_kv_0_begin - 1;
-    constexpr uint32_t k_q_rope_begin = k_q_rope_end - k_rope_sz + 1;
+    constexpr uint32_t k_q_rope_begin = k_q_rope_end - k_q_rope_sz + 1;
     constexpr uint32_t k_q_nope_end   = k_q_rope_begin - 1;
-    constexpr uint32_t k_q_nope_begin = k_q_nope_end - k_nope_sz + 1;
+    constexpr uint32_t k_q_nope_begin = k_q_nope_end - k_q_nope_sz + 1;
 
     using q_nope_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_nope_begin, k_q_nope_end>>,
@@ -859,9 +874,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                "n"(src_idx + 3));
             });
 
+            __builtin_amdgcn_sched_barrier(0);
+
             // GEMM on PV
-            const uint32_t row_idx         = lane_idx % 16;
-            const uint32_t col_idx         = 4 * (lane_idx / 16);
+
+            /// TODO: replace 512 with other value if LDS padding is used!
+            constexpr uint32_t v_row_stride = 512 / (sizeof(uint32_t) / sizeof(kv_t));
+            constexpr uint32_t v_col_stride =
+                16 / (sizeof(uint32_t) / sizeof(kv_t)); // 16 = qk gemm result tile size
+            const uint32_t row_idx = (lane_idx / 16) * 4;
+            const uint32_t col_idx = (lane_idx % 16) / 4;
+            const uint32_t off_00  = row_idx * v_row_stride + col_idx;
+
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2);
             ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
                 constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
@@ -876,31 +900,79 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_range_1>
                     oaccu_1;
 
-                // Load V from LDS directly
-                /// TODO: This shouldn't be efficient!!!!
-                const ckt::fp8_t* p_kv =
-                    reinterpret_cast<ckt::fp8_t*>(p_lds_k_nope) + idx.value * (T::kBlockK * 2);
-                FUI temp0, temp1, temp2, temp3;
-                temp0.x = p_kv[row_idx + (col_idx + 0) * 512];
-                temp0.y = p_kv[row_idx + (col_idx + 1) * 512];
-                temp0.z = p_kv[row_idx + (col_idx + 2) * 512];
-                temp0.w = p_kv[row_idx + (col_idx + 3) * 512];
-                temp1.x = p_kv[row_idx + (col_idx + 16 + 0) * 512];
-                temp1.y = p_kv[row_idx + (col_idx + 16 + 1) * 512];
-                temp1.z = p_kv[row_idx + (col_idx + 16 + 2) * 512];
-                temp1.w = p_kv[row_idx + (col_idx + 16 + 3) * 512];
-                temp2.x = p_kv[row_idx + 16 + (col_idx + 0) * 512];
-                temp2.y = p_kv[row_idx + 16 + (col_idx + 1) * 512];
-                temp2.z = p_kv[row_idx + 16 + (col_idx + 2) * 512];
-                temp2.w = p_kv[row_idx + 16 + (col_idx + 3) * 512];
-                temp3.x = p_kv[row_idx + 16 + (col_idx + 16 + 0) * 512];
-                temp3.y = p_kv[row_idx + 16 + (col_idx + 16 + 1) * 512];
-                temp3.z = p_kv[row_idx + 16 + (col_idx + 16 + 2) * 512];
-                temp3.w = p_kv[row_idx + 16 + (col_idx + 16 + 3) * 512];
-                hkm::v_mov_b32_up2p<k_kv_0_begin + 0>(temp0.ui);
-                hkm::v_mov_b32_up2p<k_kv_0_begin + 1>(temp1.ui);
-                hkm::v_mov_b32_up2p<k_kv_0_begin + 2>(temp2.ui);
-                hkm::v_mov_b32_up2p<k_kv_0_begin + 3>(temp3.ui);
+                const uint32_t* p_lds_v_0 =
+                    reinterpret_cast<const uint32_t*>(p_lds_k_nope + idx.value * T::kBlockK * 2);
+
+                uintptr_t p_lds_v = p_lds_k_nope + idx.value * T::kBlockK * 2 + off_00 * 4;
+                uint32_t t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, ta, tb, tc, td, te, tf;
+                hkm::ds_read_b32(t0, p_lds_v, 0 * v_row_stride * 4);
+                hkm::ds_read_b32(t1, p_lds_v, 1 * v_row_stride * 4);
+                hkm::ds_read_b32(t2, p_lds_v, 2 * v_row_stride * 4);
+                hkm::ds_read_b32(t3, p_lds_v, 3 * v_row_stride * 4);
+                hkm::ds_read_b32(t4, p_lds_v, 16 * v_row_stride * 4 + 0 * v_row_stride * 4);
+                hkm::ds_read_b32(t5, p_lds_v, 16 * v_row_stride * 4 + 1 * v_row_stride * 4);
+                hkm::ds_read_b32(t6, p_lds_v, 16 * v_row_stride * 4 + 2 * v_row_stride * 4);
+                hkm::ds_read_b32(t7, p_lds_v, 16 * v_row_stride * 4 + 3 * v_row_stride * 4);
+                hkm::ds_read_b32(t8, p_lds_v, v_col_stride * 4 + 0 * v_row_stride * 4);
+                hkm::ds_read_b32(t9, p_lds_v, v_col_stride * 4 + 1 * v_row_stride * 4);
+                hkm::ds_read_b32(ta, p_lds_v, v_col_stride * 4 + 2 * v_row_stride * 4);
+                hkm::ds_read_b32(tb, p_lds_v, v_col_stride * 4 + 3 * v_row_stride * 4);
+                hkm::ds_read_b32(
+                    tc, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 0 * v_row_stride * 4);
+                hkm::ds_read_b32(
+                    td, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 1 * v_row_stride * 4);
+                hkm::ds_read_b32(
+                    te, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 2 * v_row_stride * 4);
+                hkm::ds_read_b32(
+                    tf, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 3 * v_row_stride * 4);
+
+                // For 2nd part of V load
+                constexpr uint32_t v1_offset =
+                    8 * (sizeof(uint32_t) / sizeof(kv_t)); // move 8 dw/32 elements
+
+                asm volatile("s_waitcnt lgkmcnt(12)");
+                transpose<k_kv_0_begin + 0>(lane_idx, t0, t1, t2, t3);
+                hkm::ds_read_b32(t0, p_lds_v, v1_offset + 0 * v_row_stride * 4);
+                hkm::ds_read_b32(t1, p_lds_v, v1_offset + 1 * v_row_stride * 4);
+                hkm::ds_read_b32(t2, p_lds_v, v1_offset + 2 * v_row_stride * 4);
+                hkm::ds_read_b32(t3, p_lds_v, v1_offset + 3 * v_row_stride * 4);
+
+                asm volatile("s_waitcnt lgkmcnt(12)");
+                transpose<k_kv_0_begin + 1>(lane_idx, t4, t5, t6, t7);
+                hkm::ds_read_b32(
+                    t4, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 0 * v_row_stride * 4);
+                hkm::ds_read_b32(
+                    t5, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 1 * v_row_stride * 4);
+                hkm::ds_read_b32(
+                    t6, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 2 * v_row_stride * 4);
+                hkm::ds_read_b32(
+                    t7, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 3 * v_row_stride * 4);
+
+                asm volatile("s_waitcnt lgkmcnt(12)");
+                transpose<k_kv_0_begin + 2>(lane_idx, t8, t9, ta, tb);
+                hkm::ds_read_b32(t8, p_lds_v, v1_offset + v_col_stride * 4 + 0 * v_row_stride * 4);
+                hkm::ds_read_b32(t9, p_lds_v, v1_offset + v_col_stride * 4 + 1 * v_row_stride * 4);
+                hkm::ds_read_b32(ta, p_lds_v, v1_offset + v_col_stride * 4 + 2 * v_row_stride * 4);
+                hkm::ds_read_b32(tb, p_lds_v, v1_offset + v_col_stride * 4 + 3 * v_row_stride * 4);
+
+                asm volatile("s_waitcnt lgkmcnt(12)");
+                transpose<k_kv_0_begin + 3>(lane_idx, tc, td, te, tf);
+                hkm::ds_read_b32(tc,
+                                 p_lds_v,
+                                 v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
+                                     0 * v_row_stride * 4);
+                hkm::ds_read_b32(td,
+                                 p_lds_v,
+                                 v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
+                                     1 * v_row_stride * 4);
+                hkm::ds_read_b32(te,
+                                 p_lds_v,
+                                 v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
+                                     2 * v_row_stride * 4);
+                hkm::ds_read_b32(tf,
+                                 p_lds_v,
+                                 v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
+                                     3 * v_row_stride * 4);
 
                 if constexpr(kIsFirstIter)
                 {
@@ -911,26 +983,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
                 }
 
-                temp0.x = p_kv[row_idx + 32 + (col_idx + 0) * 512];
-                temp0.y = p_kv[row_idx + 32 + (col_idx + 1) * 512];
-                temp0.z = p_kv[row_idx + 32 + (col_idx + 2) * 512];
-                temp0.w = p_kv[row_idx + 32 + (col_idx + 3) * 512];
-                temp1.x = p_kv[row_idx + 32 + (col_idx + 16 + 0) * 512];
-                temp1.y = p_kv[row_idx + 32 + (col_idx + 16 + 1) * 512];
-                temp1.z = p_kv[row_idx + 32 + (col_idx + 16 + 2) * 512];
-                temp1.w = p_kv[row_idx + 32 + (col_idx + 16 + 3) * 512];
-                temp2.x = p_kv[row_idx + 32 + 16 + (col_idx + 0) * 512];
-                temp2.y = p_kv[row_idx + 32 + 16 + (col_idx + 1) * 512];
-                temp2.z = p_kv[row_idx + 32 + 16 + (col_idx + 2) * 512];
-                temp2.w = p_kv[row_idx + 32 + 16 + (col_idx + 3) * 512];
-                temp3.x = p_kv[row_idx + 32 + 16 + (col_idx + 16 + 0) * 512];
-                temp3.y = p_kv[row_idx + 32 + 16 + (col_idx + 16 + 1) * 512];
-                temp3.z = p_kv[row_idx + 32 + 16 + (col_idx + 16 + 2) * 512];
-                temp3.w = p_kv[row_idx + 32 + 16 + (col_idx + 16 + 3) * 512];
-                hkm::v_mov_b32_up2p<k_kv_1_begin + 0>(temp0.ui);
-                hkm::v_mov_b32_up2p<k_kv_1_begin + 1>(temp1.ui);
-                hkm::v_mov_b32_up2p<k_kv_1_begin + 2>(temp2.ui);
-                hkm::v_mov_b32_up2p<k_kv_1_begin + 3>(temp3.ui);
+                asm volatile("s_waitcnt lgkmcnt(12)");
+                transpose<k_kv_1_begin + 0>(lane_idx, t0, t1, t2, t3);
+                asm volatile("s_waitcnt lgkmcnt(8)");
+                transpose<k_kv_1_begin + 1>(lane_idx, t4, t5, t6, t7);
+                asm volatile("s_waitcnt lgkmcnt(4)");
+                transpose<k_kv_1_begin + 2>(lane_idx, t8, t9, ta, tb);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                transpose<k_kv_1_begin + 3>(lane_idx, tc, td, te, tf);
 
                 if constexpr(kIsFirstIter)
                 {
