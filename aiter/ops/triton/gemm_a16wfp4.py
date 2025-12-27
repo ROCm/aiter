@@ -4,9 +4,10 @@
 from typing import Optional
 import torch
 import triton
+import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import deserialize_str
 from aiter.ops.triton._triton_kernels.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
     _get_config,
@@ -17,38 +18,20 @@ from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
 from aiter.ops.triton.gemm_afp4wfp4 import (
     get_splitk,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 _LOGGER = AiterTritonLogger()
 
 
-def gemm_a16wfp4_fake_tensor(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scales: torch.Tensor,
-    atomic_add: bool = False,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-) -> torch.Tensor:
-    if y is None:
-        M, _ = x.shape
-        N, _ = w.shape
-        return torch.zeros((M, N), dtype=dtype, device=x.device)
-    return y
-
-
-@torch_compile_guard(gen_fake=gemm_a16wfp4_fake_tensor)
 def gemm_a16wfp4(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scales: torch.Tensor,
+    x,
+    w,
+    w_scales,
     atomic_add: bool = False,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
+    dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-) -> torch.Tensor:
+    config: Optional[dict] = None,
+):
     """
     Computes the matmul Y = X x W
     W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
@@ -79,8 +62,6 @@ def gemm_a16wfp4(
 
     if config is None:
         config = _get_config(M, N, K)
-    else:
-        config = deserialize_str(config)
 
     if y is None:
         if atomic_add:
