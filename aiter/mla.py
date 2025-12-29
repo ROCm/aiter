@@ -472,7 +472,8 @@ def mla_ps_prefill_fwd(
         reduce_final_map,
         reduce_partial_map,
         output,
-        final_lse,
+        tile_q=256,
+        use_triton=True,  # Set to False to use PyTorch fallback
     )
     # final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
     # aiter.mla_reduce_v1(
