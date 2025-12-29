@@ -81,7 +81,6 @@ def ref_masked_attention(
     return out.to(dtype), lse
 
 
-@perftest()
 def torch_mla_extend(
     q,  # [total_q, nheads, headdim_q]
     kvc_cache,  # [num_block * block_size, nhead_kv, qk_head_dim]
@@ -117,9 +116,7 @@ def torch_mla_extend(
         q = qs[i]
         k = kvc
         v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-        # print("torch q", q.shape)
-        # print("torch k", k.shape)
-        # print("torch v", v.shape)
+
         o, lse = ref_masked_attention(
             q,
             k,
@@ -177,6 +174,7 @@ def test_mla_prefill(
         seq_lens_kv.fill_(ctx_lens)
     seq_lens_qo = seq_lens_kv.clone()
     max_qlen = seq_lens_qo.max().item()
+    max_kvlen = seq_lens_kv.max().item()
 
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     # convert input for pa persistent interface
@@ -204,7 +202,7 @@ def test_mla_prefill(
     kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
 
     # CRITICAL: Use bf16 tensors for reference (not fp8), and same data as kernel
-    (out_ref, lse_ref), us_torch_prefill = torch_mla_extend(
+    out_ref, lse_ref = torch_mla_extend(
         Q_bf16,
         kv_buffer,
         qo_indptr,
@@ -231,8 +229,12 @@ def test_mla_prefill(
         (reduce_partial_map_size, reduce_partial_map_type),
     ) = aiter.get_ps_metadata_info_v1(
         batch_size=batch_size,
+        num_head_q=num_head_q,
         max_qlen=max_qlen,
+        max_kvlen=max_kvlen,
+        qhead_granularity=qhead_granularity,
         qlen_granularity=qlen_granularity,
+        kvlen_granularity=kvlen_granularity
     )
     work_metadata_ptrs = torch.zeros(
         work_meta_data_size, dtype=work_meta_data_type, device=device
@@ -269,11 +271,14 @@ def test_mla_prefill(
             torch.set_printoptions(threshold=999999, linewidth=120)
             print(f"==>load {name} from {file_name}:\n{meta}")
     else:
+        qo_indptr_cpu = qo_indptr.to("cpu")
+        kv_indptr_cpu = kv_indptr.to("cpu")
+        seq_lens_kv_cpu = seq_lens_kv.to("cpu")
         start = time.time()
         aiter.get_ps_metadata_v1(
-            qo_indptr,
-            kv_indptr,
-            seq_lens_kv,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            seq_lens_kv_cpu,
             gqa_ratio,
             num_head_kv,
             work_metadata_ptrs,
@@ -322,8 +327,6 @@ def test_mla_prefill(
         v_scale,
     )
 
-    print(out_ref.shape)
-    print(output.shape)
     err = checkAllclose(
         out_ref,
         output,
@@ -340,8 +343,7 @@ def test_mla_prefill(
 l_dtype = ["fp8"]
 l_kv_dtype = ["fp8"]
 l_num_heads = [1, 8, 16, 32, 128]
-# l_ctx_len = [512, 522, 1024, 1200, 3200, 8192, 65536]
-l_ctx_len = [512]
+l_ctx_len = [42, 522, 1024, 4097, 65537, 70047]
 l_batch_size = [1, 32, 64, 128]
 l_block_size = [1]
 l_varlen = [False]
