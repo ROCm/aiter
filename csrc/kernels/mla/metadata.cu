@@ -241,7 +241,7 @@ void get_ps_metadata_v1(
     const int32_t        block_size,
     const bool           is_causal)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(pages_kv_indptr));
+    // const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(pages_kv_indptr));
 
     TORCH_CHECK((kvlen_granlarity & (kvlen_granlarity - 1)) == 0,
                 __func__, ": kvlen_granlarity Must be power of 2!");
