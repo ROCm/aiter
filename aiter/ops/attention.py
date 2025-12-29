@@ -603,8 +603,12 @@ def get_pa_metadata_v1(
 
 def get_ps_metadata_info_v1(
     batch_size: int,
+    num_head_q: int,
     max_qlen: int,
+    max_kvlen: int,
+    qhead_granularity: int = 1,
     qlen_granularity: int = 256,
+    kvlen_granularity: int = 1
 ):
     """
     Returns:
@@ -620,22 +624,21 @@ def get_ps_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(device)
     cu_num = device_properties.multi_processor_count
 
-    max_qo_tiles_per_batch = int(math.ceil(max_qlen / qlen_granularity))
-    qo_tile_cnt = batch_size * max_qo_tiles_per_batch
+    max_qhead_split_per_batch = math.ceil(num_head_q / qhead_granularity)
+    max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
+    max_kv_split_per_batch = math.ceil(max_kvlen / kvlen_granularity)
+    qo_tile_cnt = batch_size * max_qo_split_per_batch
 
-    # TODO: check calc of max allocation
-    max_work = qo_tile_cnt + cu_num - 1
-    max_partial_tiles = (
-        min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
-    )
+    max_works = max_qhead_split_per_batch * qo_tile_cnt * max_kv_split_per_batch
+    max_partials = qo_tile_cnt * max_kv_split_per_batch
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs
         (cu_num + 1, torch.int32),  # work_indptr
-        ((max_work, 8), torch.int32),  # work_info
+        ((max_works, 8), torch.int32),  # work_info
         (qo_tile_cnt + 1, torch.int32),  # reduce_indptr
         ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
-        (max_partial_tiles, torch.int32),  # reduce_partial_map
+        (max_partials, torch.int32),  # reduce_partial_map
     )
 
 
