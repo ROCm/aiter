@@ -4,6 +4,7 @@
 import os
 import torch
 import torch.distributed as dist
+from typing import Optional
 import argparse
 from aiter import dtypes
 
@@ -17,7 +18,7 @@ from aiter.dist.parallel_state import (
     destroy_distributed_environment,
 )
 from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import *
+from aiter.dist.communication_op import tensor_model_parallel_reduce_scatter
 from aiter.test_common import (
     checkAllclose,
     perftest,
