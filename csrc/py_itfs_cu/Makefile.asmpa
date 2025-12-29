@@ -1,0 +1,22 @@
+TORCH_LIB := $(shell python3 -c "import torch; print(torch.__path__[0])")/lib
+TORCH_INC := $(shell python3 -c "import torch; print(torch.__path__[0])")/include
+PY_INC := $(shell python3 -c "from sysconfig import get_paths; print(get_paths()['include'])")
+PYBIND_INC := $(shell python3 -c "import pybind11; print(pybind11.get_include())")
+AITER_JIT := $(shell cd ../.. && pwd)/aiter/jit
+
+CXX := hipcc
+CFLAGS := -std=c++17 -O3 -fPIC -D__HIP_PLATFORM_AMD__ -DBUILD_PYBIND_MODULE -I$(TORCH_INC) -I$(TORCH_INC)/torch/csrc/api/include -I/opt/rocm/include -I$(PY_INC) -I$(PYBIND_INC)
+LDFLAGS := -L$(TORCH_LIB) -L$(AITER_JIT) -Wl,-rpath,$(TORCH_LIB) -Wl,-rpath,$(AITER_JIT) -ltorch -ltorch_cpu -ltorch_hip -lc10 -lc10_hip -lamdhip64
+TARGET := run_asm_pa.so
+
+all: $(TARGET)
+	@rm -f *.o
+
+$(TARGET): run_asm_pa.o
+	$(CXX) -shared -o $@ $< $(LDFLAGS) $(AITER_JIT)/module_attention_asm.so
+
+run_asm_pa.o: run_asm_pa.cpp
+	$(CXX) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(TARGET) *.o
