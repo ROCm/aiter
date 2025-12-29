@@ -24,6 +24,7 @@ def fused_rms_mxfp4_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
+    quant_type=dtypes.fp4x2,
     x2: Optional[torch.Tensor] = None,
     x2_weight: Optional[torch.Tensor] = None,
     x2_epsilon: float = 0.0,
@@ -66,7 +67,7 @@ def fused_rms_mxfp4_quant(
     BLOCK_SIZE_M = 1
     # BLOCK_SIZE_M = 32
     BLOCK_SIZE_N = max(BLOCK_SIZE_N, MXFP4_QUANT_BLOCK_SIZE)
-    out1_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=x1.device)
+    out1_fp4 = torch.empty((M, N1 // 2), dtype=dtypes.fp4x2, device=x1.device)
     SCALE_N_valid = triton.cdiv(N1, MXFP4_QUANT_BLOCK_SIZE)
     use_scale_shuffle_padding = shuffle or scale_shuffle_padding
     if use_scale_shuffle_padding:
@@ -79,7 +80,7 @@ def fused_rms_mxfp4_quant(
         SCALE_N = SCALE_N_valid
     out1_bs = torch.empty(
         (SCALE_M, SCALE_N),
-        dtype=torch.uint8,
+        dtype=torch.float8_e8m0fnu,
         device=x1.device,
     )
 
