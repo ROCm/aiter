@@ -187,4 +187,5 @@ df = pd.DataFrame(df)
 df["speedup (aiter vs torch)"] = df["time_us (torch)"] / df["time_us (aiter)"]
 df["speedup (aiter vs triton)"] = df["time_us (triton)"] / df["time_us (aiter)"]
 
-aiter.logger.info(f"topk_plain summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("topk_plain summary (markdown):\n%s", df_md)

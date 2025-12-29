@@ -774,4 +774,5 @@ for nhead, decode_qlen in list_nhead:
             df.append(ret)
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    aiter.logger.info(f"mla_sparse summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mla_sparse summary (markdown):\n%s", df_md)

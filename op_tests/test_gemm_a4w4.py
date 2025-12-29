@@ -272,4 +272,5 @@ for dtype in l_dtype:
         ret = test_gemm(dtype, m, n, k)
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"gemm_a4w4 summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)
