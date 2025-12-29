@@ -2,7 +2,6 @@ import importlib
 import inspect
 from typing import Optional
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from ..gemm_config_utils import get_gemm_config
 
 _LOGGER = AiterTritonLogger()
 
