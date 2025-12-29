@@ -618,10 +618,6 @@ def test_fused_dynamic_mxfp4_quant_moe_sort(
     torch.testing.assert_close(x_ref, x_triton, atol=tol, rtol=tol)
 
 
-def silu_mul_mxfp4_quant_ref():
-    
-
-
 @pytest.mark.parametrize(
     "M, N1, N2",
     [
