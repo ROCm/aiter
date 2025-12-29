@@ -49,7 +49,7 @@ def gemm_a16w16_atomic(
 
     if config is None:
         config = _get_config(M, N, K)
-    else:
+    elif isinstance(config, str):
         config = deserialize_str(config)
 
     # For compatability reasons, these keys may not exist in the config

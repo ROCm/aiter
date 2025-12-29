@@ -62,7 +62,7 @@ def gemm_a16wfp4(
 
     if config is None:
         config = _get_config(M, N, K)
-    else:
+    elif isinstance(config, str):
         config = deserialize_str(config)
 
     if y is None:
