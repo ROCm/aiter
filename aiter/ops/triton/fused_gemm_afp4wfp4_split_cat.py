@@ -72,7 +72,7 @@ def fused_gemm_afp4wfp4_split_cat(
     w_scale = w_scale.T  # (scale_k, scale_n)
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
     c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)

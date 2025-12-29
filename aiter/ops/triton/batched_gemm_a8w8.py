@@ -73,7 +73,7 @@ def batched_gemm_a8w8(
         YQ = torch.empty((B, M, N), dtype=dtype, device=XQ.device)
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     grid = lambda META: (  # noqa: E731
         B,

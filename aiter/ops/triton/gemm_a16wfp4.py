@@ -78,7 +78,7 @@ def gemm_a16wfp4(
     w = w.T
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
 
