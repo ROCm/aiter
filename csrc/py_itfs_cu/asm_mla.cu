@@ -171,6 +171,28 @@ void mla_decode_stage1_asm_fwd(
                     "/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co");
                 impl_ptr = &impl_a16w16_bf16_subQ128;
             }
+            else if(gqa_ratio == 32)
+            {
+                if(!persistent)
+                {
+                    sub_Q = 64;
+                    static AiterAsmKernel impl_a16w16_bf16_subQ32(
+                        "_ZN5aiter39mla_a16w16_qh16_m32x1_n16x1_coex0_mask1E",
+                        "/mla/MLA_A16W16_1TG_4W_32mx1_16nx1_Coex0_Msk1_QH16.co");
+                    impl_ptr = &impl_a16w16_bf16_subQ32;
+                }
+            }
+            else if(gqa_ratio == 64)
+            {
+                if(!persistent)
+                {
+                    sub_Q = 64;
+                    static AiterAsmKernel impl_a16w16_bf16_subQ64(
+                        "_ZN5aiter39mla_a16w16_qh16_m64x1_n16x1_coex0_mask1E",
+                        "/mla/MLA_A16W16_1TG_4W_64mx1_16nx1_Coex0_Msk1_QH16.co");
+                    impl_ptr = &impl_a16w16_bf16_subQ64;
+                }
+            }
             else if(gqa_ratio == 16)
             {
                 if(persistent)
@@ -261,10 +283,14 @@ void mla_decode_stage1_asm_fwd(
                 else if(max_seqlen_q <= 4)
                 {
                     // assert(false);
-                    sub_Q = 128;
+                    //sub_Q = 128;
+                    //static AiterAsmKernel impl_fp8(
+                    //    "_ZN5aiter36mla_a8w8_qh16_qseqlen4_gqaratio16_psE",
+                    //    "/mla/mla_a8w8_qh16_qseqlen4_gqaratio16_ps.co");
+                    sub_Q = 64;
                     static AiterAsmKernel impl_fp8(
-                        "_ZN5aiter36mla_a8w8_qh16_qseqlen4_gqaratio16_psE",
-                        "/mla/mla_a8w8_qh16_qseqlen4_gqaratio16_ps.co");
+                        "_ZN5aiter36mla_a8w8_qh64_qseqlen4_gqaratio16_psE",
+                        "/mla/mla_a8w8_qh64_qseqlen4_gqaratio16_ps.co");
                     impl_ptr = &impl_fp8;
                 }
                 else
@@ -293,10 +319,14 @@ void mla_decode_stage1_asm_fwd(
                 else if(max_seqlen_q <= 4)
                 {
                     // assert(false);
-                    sub_Q = 128;
+                    //sub_Q = 128;
+                    //static AiterAsmKernel impl_fp8(
+                    //    "_ZN5aiter33mla_a8w8_qh16_qseqlen4_gqaratio16E",
+                    //    "/mla/mla_a8w8_qh16_qseqlen4_gqaratio16.co");
+                    sub_Q = 64;
                     static AiterAsmKernel impl_fp8(
-                        "_ZN5aiter33mla_a8w8_qh16_qseqlen4_gqaratio16E",
-                        "/mla/mla_a8w8_qh16_qseqlen4_gqaratio16.co");
+                        "_ZN5aiter33mla_a8w8_qh64_qseqlen4_gqaratio16E",
+                        "/mla/mla_a8w8_qh64_qseqlen4_gqaratio16.co");
                     impl_ptr = &impl_fp8;
                 }
                 else
