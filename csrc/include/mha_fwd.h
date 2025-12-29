@@ -7,6 +7,7 @@
 #include "aiter_hip_common.h"
 #include "fmha_fwd.hpp"
 #include "mask.hpp"
+#include <iostream>
 
 namespace aiter {
 struct mha_fwd_traits : public fmha_fwd_traits
@@ -89,7 +90,9 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      int how_v3_bf16_cvt                = 1,
                                                      const void* seqstart_q_padding_ptr = nullptr,
                                                      const void* seqstart_k_padding_ptr = nullptr,
-                                                     bool is_v3_api_check = false);
+                                                     bool is_v3_api_check = false,
+                                                     int magic_const = 0,
+                                                     int tokens_per_frame = 0);
 
 __attribute__((visibility("default"))) float
 mha_fwd_splitkv(mha_fwd_splitkv_args args,
@@ -177,6 +180,10 @@ struct __attribute__((packed)) fmha_fwd_v3_args
     p2 _p30;
     const void* ptr_kseq_padding;
     p2 _p31;
+    unsigned int tokens_per_frame_magic_const;
+    p3 _p32;
+    unsigned int tokens_per_frame;
+    p3 _p33;
 };
 
 struct fmha_fwd_v3_traits
@@ -231,6 +238,8 @@ namespace gfx950 {
 float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
-                  bool is_v3_api_check = false);
+                  bool is_v3_api_check = false,
+                  int magic_const = 0,
+                  int tokens_per_frame = 0);
 }
 } // namespace aiter
