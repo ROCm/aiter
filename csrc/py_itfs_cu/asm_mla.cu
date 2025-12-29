@@ -171,6 +171,28 @@ void mla_decode_stage1_asm_fwd(
                     "/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co");
                 impl_ptr = &impl_a16w16_bf16_subQ128;
             }
+            else if(gqa_ratio == 32)
+            {
+                if(!persistent)
+                {
+                    sub_Q = 64;
+                    static AiterAsmKernel impl_a16w16_bf16_subQ32(
+                        "_ZN5aiter39mla_a16w16_qh16_m32x1_n16x1_coex0_mask1E",
+                        "/mla/MLA_A16W16_1TG_4W_32mx1_16nx1_Coex0_Msk1_QH16.co");
+                    impl_ptr = &impl_a16w16_bf16_subQ32;
+                }
+            }
+            else if(gqa_ratio == 64)
+            {
+                if(!persistent)
+                {
+                    sub_Q = 64;
+                    static AiterAsmKernel impl_a16w16_bf16_subQ64(
+                        "_ZN5aiter39mla_a16w16_qh16_m64x1_n16x1_coex0_mask1E",
+                        "/mla/MLA_A16W16_1TG_4W_64mx1_16nx1_Coex0_Msk1_QH16.co");
+                    impl_ptr = &impl_a16w16_bf16_subQ64;
+                }
+            }
             else if(gqa_ratio == 16)
             {
                 if(persistent)
