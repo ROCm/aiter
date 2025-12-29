@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.fused_fp8_quant import (
     _fused_flatten_fp8_group_quant_kernel,
     _fused_reduce_act_mul_fp8_group_quant,
     _fused_reduce_rms_fp8_group_quant_kernel,
+    _fused_quant_fp8_sort_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
@@ -18,6 +19,7 @@ _LOGGER = AiterTritonLogger()
 
 
 fp8_dtype = aiter.dtypes.fp8
+fp8_e8m0_dtype = aiter.dtypes.fp8_e8m0
 
 
 def fused_rms_fp8_per_tensor_static_quant(
@@ -721,3 +723,79 @@ def fused_reduce_rms_fp8_group_quant(
     )
 
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
+
+
+def fused_quant_fp8_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_size: int = 32,
+    quant_block_size: int = 8,
+    quant_dtype: torch.dtype = fp8_dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    BLOCK_SIZE_M = block_size
+    BLOCK_SIZE_N = quant_block_size
+    BLOCK_SIZE_M_u32 = BLOCK_SIZE_M // 2
+    BLOCK_SIZE_N_u32 = BLOCK_SIZE_N // 2
+
+    M, N = input.shape
+    assert (
+        N % quant_block_size == 0
+    ), f"N ({N}) must be multiple of quant_block_size ({quant_block_size})"
+    assert block_size % 32 == 0, "block_size must be multiple of 32"
+
+    N_blocks = triton.cdiv(N, block_size)
+
+    if quant_dtype == fp8_dtype:
+        DTYPE_MAX = 448.0
+        DTYPE_MIN = -448.0
+    elif quant_dtype == torch.float8_e4m3fn:
+        DTYPE_MAX = 448.0
+        DTYPE_MIN = -448.0
+    else:
+        DTYPE_MAX = 448.0
+        DTYPE_MIN = -448.0
+
+    x_fp8 = torch.empty_like(input, dtype=quant_dtype, device="cuda")
+    M_o, N_o = sorted_ids.shape[0], N_blocks
+
+    # [M_sorted_blocks/2, N_blocks/2, BLOCK_SIZE_N_u32, BLOCK_SIZE_M_u32]
+    scale_e8m0_packed = torch.empty(
+        (
+            triton.cdiv(M_o, BLOCK_SIZE_M),
+            triton.cdiv(N_o, BLOCK_SIZE_N),
+            BLOCK_SIZE_N_u32,
+            BLOCK_SIZE_M_u32,
+        ),
+        dtype=torch.uint32,
+        device=input.device,
+    )
+
+    grid = (
+        triton.cdiv(M_o, BLOCK_SIZE_M),  # 32
+        triton.cdiv(N_o, BLOCK_SIZE_N),  # 8
+    )
+
+    _fused_quant_fp8_sort_kernel[grid](
+        input,
+        sorted_ids,
+        num_valid_ids,
+        x_fp8,
+        scale_e8m0_packed,
+        *input.stride(),
+        *x_fp8.stride(),
+        *scale_e8m0_packed.stride(),
+        M_input=M,
+        N_input=N,
+        N_scale_cols=N_blocks,
+        token_num=token_num,
+        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
+        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
+        QUANT_BLOCK_SIZE=32,
+        TOPK=M // token_num,
+        DTYPE_MAX=DTYPE_MAX,
+        DTYPE_MIN=DTYPE_MIN,
+    )
+
+    return x_fp8, scale_e8m0_packed.view(fp8_e8m0_dtype).view(-1, N_o)
