@@ -52,7 +52,8 @@ namespace py = pybind11;
           py::arg("out"),                                                         \
           py::arg("use_silu"),                                                    \
           py::arg("cache_seqlens")      = torch::Tensor(),                        \
-          py::arg("conv_state_indices") = torch::Tensor());
+          py::arg("conv_state_indices") = torch::Tensor(),                        \
+          py::arg("pad_slot_id")        = -1);
 
 #define AITER_OPERATOR_PYBIND                                                   \
     m.def("add", &aiter_add, "apply for add with transpose and broadcast.");    \

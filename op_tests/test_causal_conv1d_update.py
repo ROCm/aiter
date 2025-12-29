@@ -354,6 +354,147 @@ def test_circular_buffer_performance(dtype=torch.float32):
 
 
 @benchmark()
+def test_causal_conv1d_update_pytest_params(dtype=torch.bfloat16):
+    """
+    Test matching pytest_causal_conv1d_aiter.py::test_causal_conv1d_update parameters
+    - dim: 2048
+    - width: 4
+    - seqlen: 1
+    - batch: 64
+    - has_bias: True
+    - silu_activation: True
+    - itype: bfloat16
+    - Test both circular and non-circular modes
+    """
+    ret = {}
+    
+    # Configuration matching pytest test
+    batch = 64
+    dim = 2048
+    width = 4
+    seqlen = 1
+    use_silu = True
+    
+    # Random state_len between width-1 and width+9 (matching pytest test)
+    torch.manual_seed(0)
+    state_len = torch.randint(width - 1, width + 10, (1,)).item()
+    
+    # Initialize inputs
+    x = torch.randn(batch, seqlen, dim, device="cuda", dtype=dtype).transpose(-1, -2)
+    conv_state = torch.randn(batch, state_len, dim, device="cuda", dtype=dtype).transpose(-1, -2)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.float32)
+    bias = torch.randn(dim, device="cuda", dtype=torch.float32)
+    out = torch.empty(batch, dim, seqlen, device="cuda", dtype=dtype)
+    
+    max_err = 0.0
+    all_passed = True
+    modes_tested = []
+    
+    # Test 1: Non-circular mode (has_cache_seqlens=False)
+    print(f"\n  Testing non-circular mode (cache_seqlens=None)...")
+    conv_state_test1 = conv_state.clone()
+    conv_state_ref1 = conv_state.clone()
+    x_test1 = x.clone()
+    cache_seqlens_empty = torch.empty(0, dtype=torch.int32, device="cuda")
+    conv_state_indices_empty = torch.empty(0, dtype=torch.int32, device="cuda")
+    
+    # Reference
+    activation = "silu"
+    ref1 = torch_causal_conv1d_update_ref(
+        x_test1, conv_state_ref1, weight, bias, activation=activation, cache_seqlens=None
+    )
+    
+    # AIter
+    _, us_aiter1 = run_perftest(
+        aiter.causal_conv1d_update,
+        x_test1,
+        conv_state_test1,
+        weight,
+        bias,
+        out,
+        use_silu,
+        cache_seqlens_empty,
+        conv_state_indices_empty,
+    )
+    
+    err1 = checkAllclose(ref1, out, rtol=1e-2, atol=5e-2)
+    max_err = max(max_err, err1)
+    print(f"  Non-circular mode error: {err1:.2e}")
+    
+    if err1 > 0.1:
+        all_passed = False
+        print(f"  ⚠️  Non-circular mode: error {err1:.2e} exceeds threshold")
+    
+    modes_tested.append({
+        "mode": "non-circular",
+        "err": err1,
+        "us": us_aiter1,
+        "passed": err1 <= 0.1
+    })
+    
+    # Test 2: Circular buffer mode (has_cache_seqlens=True)
+    print(f"\n  Testing circular buffer mode (cache_seqlens provided)...")
+    conv_state_test2 = conv_state.clone()
+    conv_state_ref2 = conv_state.clone()
+    x_test2 = x.clone()
+    cache_seqlens = torch.randint(0, 1024, (batch,), dtype=torch.int32, device="cuda")
+    
+    # Reference
+    ref2 = torch_causal_conv1d_update_ref(
+        x_test2, conv_state_ref2, weight, bias, activation=activation, cache_seqlens=cache_seqlens
+    )
+    
+    # AIter
+    _, us_aiter2 = run_perftest(
+        aiter.causal_conv1d_update,
+        x_test2,
+        conv_state_test2,
+        weight,
+        bias,
+        out,
+        use_silu,
+        cache_seqlens,
+        conv_state_indices_empty,
+    )
+    
+    err2 = checkAllclose(ref2, out, rtol=1e-2, atol=5e-2)
+    max_err = max(max_err, err2)
+    print(f"  Circular buffer mode error: {err2:.2e}")
+    
+    if err2 > 0.1:
+        all_passed = False
+        print(f"  ⚠️  Circular buffer mode: error {err2:.2e} exceeds threshold")
+    
+    modes_tested.append({
+        "mode": "circular",
+        "err": err2,
+        "us": us_aiter2,
+        "passed": err2 <= 0.1
+    })
+    
+    # Compute metrics
+    bytes_read = x.nbytes + conv_state.nbytes + weight.nbytes + bias.nbytes
+    bytes_write = out.nbytes + conv_state.nbytes
+    total_bytes = bytes_read + bytes_write
+    avg_us = (us_aiter1 + us_aiter2) / 2
+    
+    ret["us"] = avg_us
+    ret["TB/s"] = total_bytes / avg_us / 1e6
+    ret["err"] = max_err
+    ret["GFLOPS"] = (batch * dim * seqlen * width * 2) / (avg_us * 1e3)
+    ret["batch"] = batch
+    ret["dim"] = dim
+    ret["seqlen"] = seqlen
+    ret["width"] = width
+    ret["state_len"] = state_len
+    ret["dtype"] = str(dtype).split('.')[-1]
+    ret["passed"] = all_passed
+    ret["scenario"] = "pytest_params_test"
+    
+    return ret
+
+
+@benchmark()
 def test_causal_conv1d_update_continuous_batching(batch, dim, seqlen, width, state_len, dtype, use_silu=False):
     """
     Test continuous batching mode with conv_state_indices.
@@ -477,8 +618,8 @@ parser = argparse.ArgumentParser(
     description="Causal Conv1D Update test configuration (matching C++ test flow)",
 )
 parser.add_argument("--scenario", type=str, default="all",
-                   choices=["all", "scenario1", "scenario2", "scenario3"],
-                   help="Test scenario: scenario1/scenario2/scenario3/all")
+                   choices=["all", "scenario1", "scenario2", "scenario3", "pytest_params"],
+                   help="Test scenario: scenario1/scenario2/scenario3/pytest_params/all")
 parser.add_argument("--batch", type=int, default=None, help="Override batch size")
 parser.add_argument("--dim", type=int, default=None, help="Override dim")
 parser.add_argument("--seqlen", type=int, default=None, help="Override seqlen (for single-step tests)")
@@ -521,12 +662,17 @@ def main():
             "name": "Scenario 3: High-Performance Circular Buffer",
             "func": test_circular_buffer_performance,
             "description": "4 concurrent requests, Circular mode, steps=[1,2,1,3,1]"
+        },
+        "pytest_params": {
+            "name": "Pytest Parameters Test",
+            "func": test_causal_conv1d_update_pytest_params,
+            "description": "batch=64, dim=2048, seqlen=1, width=4, bfloat16, both circular and non-circular"
         }
     }
     
     # Determine which scenarios to run
     if args.scenario == "all":
-        scenarios_to_run = ["scenario1", "scenario2", "scenario3"]
+        scenarios_to_run = ["scenario1", "scenario2", "scenario3", "pytest_params"]
     else:
         scenarios_to_run = [args.scenario]
     

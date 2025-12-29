@@ -59,14 +59,15 @@ def causal_conv1d_fn(
 
 @compile_ops("module_causal_conv1d_update")
 def causal_conv1d_update(
-    x: Tensor,                    # [batch, dim, seqlen] - new input (typically seqlen=1)
-    conv_state: Tensor,           # [batch, dim, state_len] - state buffer (updated in-place)
-    weight: Tensor,               # [dim, width]
-    bias: Tensor,                 # [dim] or empty
-    out: Tensor,                  # [batch, dim, seqlen] - output
+    x: Tensor,
+    conv_state: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    out: Tensor,
     use_silu: bool,
-    cache_seqlens: Tensor,        # [batch] or empty tensor - for circular buffer
-    conv_state_indices: Tensor    # [batch] or empty tensor - for continuous batching
+    cache_seqlens: Tensor,
+    conv_state_indices: Tensor,
+    pad_slot_id: int
 ) -> None:
     """
     Causal 1D convolution update with state management (for inference/decoding).
@@ -86,7 +87,7 @@ def causal_conv1d_update(
                       If not empty, enables circular buffer indexing for state management.
         conv_state_indices: [batch] int32 tensor or empty for continuous batching.
                            Maps logical batch indices to physical conv_state indices.
-                           Negative values indicate padding tokens (outputs zeros).
+        pad_slot_id: Padding slot ID. If conv_state_indices[i] == pad_slot_id, skip processing.
     
     Modes:
         - Non-circular mode (cache_seqlens empty): Shifts state buffer linearly
@@ -94,7 +95,7 @@ def causal_conv1d_update(
     
     Features:
         - Continuous batching: Different sequences can use different state slots
-        - Padding token handling: Negative indices in conv_state_indices → zero output
+        - Padding token handling: conv_state_indices[i] == pad_slot_id → skip processing
         - In-place state update: conv_state is modified during execution
         - Optimized for small seqlen (1-4 tokens), typical for decoding
     
