@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 import random
 import numpy as np
 import torch
@@ -11,8 +8,9 @@ random.seed(0)
 torch.manual_seed(0)
 np.random.seed(0)
 
+
 class GroupNormTimer:
-    
+
     def __init__(self, num_groups, num_channels, device, dtype):
         self.norm = GroupNorm(
             num_groups, num_channels, eps=1e-6, affine=True, device=device, dtype=dtype
@@ -75,12 +73,12 @@ class GroupNormTimer:
 
 
 def str2tuple(s):
-    return tuple(map(int, s.split(',')))
+    return tuple(map(int, s.split(",")))
 
 
 def main(args):
     torch.set_printoptions(precision=6)
-    
+
     device = torch.device(args.device)
     if args.dtype == "float16":
         dtype = torch.float16
@@ -90,9 +88,9 @@ def main(args):
         dtype = torch.bfloat16
     else:
         raise ValueError(f"Unsupported dtype: {args.dtype}")
-    
+
     bench_shapes = args.bench_shapes
-    
+
     speedups = []
     for shape in bench_shapes:
         norm_timer = GroupNormTimer(shape[0], shape[2], device, dtype)
@@ -123,7 +121,7 @@ def main(args):
 
 if __name__ == "__main__":
     default_bench_shapes = [
-        [1, 1, 1, 2],  # [num_groups, n, c, ...]
+        [1, 1, 1, 2],
         [4, 1, 4, 4],
         [8, 1, 512, 1728],
         [16, 1, 128, 9, 144, 256],
@@ -141,68 +139,68 @@ if __name__ == "__main__":
         [32, 1, 512, 5, 32, 32],
         [32, 1, 512, 5, 64, 64],
         [32, 1, 512, 9, 128, 128],
-        # add extra cases with batch_size>1
         [32, 4, 256, 17, 144, 256],
         [32, 7, 512, 3, 18, 32],
         [32, 3, 512, 5, 64, 64],
-        # add extra cases with prime or odd hw value
         [16, 3, 256, 5, 7, 11],
         [16, 1, 32, 15, 17, 11],
         [16, 5, 32, 2, 5, 3],
     ]
-    
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="GroupNorm Performance Benchmark",
     )
-    
+
     parser.add_argument(
-        "-b", "--bench_shapes",
+        "-b",
+        "--bench_shapes",
         nargs="*",
         type=str2tuple,
         default=default_bench_shapes,
         help="""Benchmark shapes in format [num_groups, batch_size, num_channels, ...]
-        e.g.: -b 1,1,1,2 4,1,4,4 8,1,512,1728"""
+        e.g.: -b 1,1,1,2 4,1,4,4 8,1,512,1728""",
     )
-    
+
     parser.add_argument(
-        "-d", "--device",
+        "-d",
+        "--device",
         type=str,
         default="cuda",
         choices=["cuda", "cpu"],
-        help="Device to run benchmark on (default: cuda)"
+        help="Device to run benchmark on (default: cuda)",
     )
-    
+
     parser.add_argument(
         "--dtype",
         type=str,
         default="float16",
         choices=["float16", "float32", "bfloat16"],
-        help="Data type to use (default: float16)"
+        help="Data type to use (default: float16)",
     )
-    
+
     parser.add_argument(
         "--print_tensors",
         action="store_true",
-        help="Print input and output tensors for debugging"
+        help="Print input and output tensors for debugging",
     )
-    
+
     parser.add_argument(
         "--num_warmups",
         type=int,
         default=5,
-        help="Number of warmup iterations (default: 5)"
+        help="Number of warmup iterations (default: 5)",
     )
-    
+
     parser.add_argument(
         "--num_iters",
         type=int,
         default=25,
-        help="Number of measurement iterations (default: 25)"
+        help="Number of measurement iterations (default: 25)",
     )
-    
+
     args = parser.parse_args()
-    
+
     print("=== GroupNorm Performance Benchmark ===", flush=True)
     print(f"Device: {args.device}", flush=True)
     print(f"Data type: {args.dtype}", flush=True)
@@ -210,7 +208,7 @@ if __name__ == "__main__":
     print(f"Number of iterations: {args.num_iters}", flush=True)
     print(f"Number of benchmark shapes: {len(args.bench_shapes)}", flush=True)
     print("=" * 50, flush=True)
-    
+
     main(args)
-    
+
     print("\n=== Benchmark Complete ===", flush=True)
