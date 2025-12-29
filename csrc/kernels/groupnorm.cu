@@ -319,7 +319,7 @@ torch::Tensor GroupNorm::launchGroupNormKernel(uint32_t num_groups, float epsilo
         static_cast<const T*>(x.data_ptr()),
         mean_accumulator_.mutable_data_ptr<float>(),
         mean_accumulator_.mutable_data_ptr<float>()+num_acc_slots);
-    CHECK_HIP(hipGetLastError());
+    HIP_CALL(hipGetLastError());
 
     groupnorm_kernel_dispatch_down<T, THREADS_PER_BLOCK><<<grid_dim, block_dim, 0, stream>>>(
         num_groups,
@@ -333,7 +333,7 @@ torch::Tensor GroupNorm::launchGroupNormKernel(uint32_t num_groups, float epsilo
         mean_accumulator_.data_ptr<float>(),
         mean_accumulator_.data_ptr<float>()+num_acc_slots,
         static_cast<T*>(y.mutable_data_ptr()));
-    CHECK_HIP(hipGetLastError());
+    HIP_CALL(hipGetLastError());
 
     return y;
 }

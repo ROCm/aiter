@@ -1113,7 +1113,7 @@
 	"flags_extra_hip": [], 
 	"extra_ldflags": "None",
 	"extra_include": [],
-	"verbose": "True",
+	"verbose": "False",
 	"blob_gen_cmd": "''"
     }
 }

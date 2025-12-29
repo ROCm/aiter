@@ -1,7 +1,6 @@
 #include <torch/extension.h>
 
-#include "common.hpp"
-
+#include "aiter_hip_common.h"
 #include <optional>
 
 namespace rocm_torch_x {
