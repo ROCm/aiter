@@ -1886,7 +1886,7 @@ def paged_attention_decode_sliding_window(
             attention_accumulator += attention_output
         max_logits = new_max_logits
 
-    if sinks_ptr is not None:
+    if ONE_SHOT and sinks_ptr is not None:
         sinks_values = gl.load(
             sinks_ptr + (kv_head_idx * query_group_size + query_group_offsets),
             mask=query_group_offsets < query_group_size,

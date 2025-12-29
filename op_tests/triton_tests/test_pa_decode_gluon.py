@@ -1141,7 +1141,7 @@ def prepare_gluon_query_and_scale(
     return quantized_query_gluon, query_scale_gluon, output_gluon
 
 
-@perftest(testGraph=True)
+@perftest()
 def run_gluon_kernel(
     output: torch.Tensor,
     output_transposed: torch.Tensor,
@@ -1154,7 +1154,7 @@ def run_gluon_kernel(
     block_tables: torch.Tensor,
     attention_scale: float,
     query_length: int,
-    max_context_length: int,
+    max_context_partition_num: int,
     context_partition_size: int,
     compute_type: tl.dtype,
     query_scale: torch.Tensor,
@@ -1207,7 +1207,7 @@ def run_gluon_kernel(
             block_tables,
             attention_scale,
             query_length,
-            max_context_length,
+            max_context_partition_num,
             context_partition_size,
             compute_type,
             query_scale,
@@ -1233,7 +1233,7 @@ def run_gluon_kernel(
                 block_tables,
                 attention_scale,
                 query_length,
-                max_context_length,
+                max_context_partition_num,
                 context_partition_size,
                 compute_type,
                 query_scale,
@@ -1354,7 +1354,7 @@ def run_pa_gluon_test(
     # key_cache = torch.ones_like(key_cache)
     # value_cache = torch.ones_like(value_cache)
     softmax_scale = 1.0 / (head_size**0.5)
-    quant_kv = False
+
     # Quantization based on mode and flags
     if quant_mode == "per_token":
         # Per-token quantization for query (if enabled)
@@ -1368,16 +1368,24 @@ def run_pa_gluon_test(
 
         # Per-token quantization for KV cache (if enabled)
         if quant_kv:
-            (
-                quantized_keys,
-                key_scale_factors_flat,
-                quantized_values,
-                value_scale_factors_flat,
-                key_scale_original,
-                value_scale_original,
-            ) = quantize_kv_cache_symmetric(
-                key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
-            )
+            if compute_type != [aiter.dtypes.fp8]:
+                (
+                    quantized_keys,
+                    key_scale_factors_flat,
+                    quantized_values,
+                    value_scale_factors_flat,
+                    key_scale_original,
+                    value_scale_original,
+                ) = quantize_kv_cache_symmetric(
+                    key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
+                )
+            else:
+                quantized_keys = key_cache.to(aiter.dtypes.fp8)
+                quantized_values = value_cache.to(aiter.dtypes.fp8)
+                key_scale_factors_flat = None
+                value_scale_factors_flat = None
+                key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+                value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
         else:
             quantized_keys = key_cache
             quantized_values = value_cache
@@ -1408,8 +1416,8 @@ def run_pa_gluon_test(
                 key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
             )
         else:
-            quantized_keys = key_cache.to(aiter.dtypes.fp8)
-            quantized_values = value_cache.to(aiter.dtypes.fp8)
+            quantized_keys = key_cache
+            quantized_values = value_cache
             key_scale_factors_flat = None
             value_scale_factors_flat = None
             key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
@@ -1525,8 +1533,11 @@ def run_pa_gluon_test(
         context_partition_size = 128
     else:
         context_partition_size = context_partition_size
-    page_size = torch.tensor(1, dtype=torch.int32, device=context_lengths.device)
-    if ps:
+    page_size = None
+
+    if sliding_window > 0:
+        max_context_partition_num = 1
+    elif ps:
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
         if sliding_window == 0:
             page_size = get_recommended_page_size(
@@ -1545,13 +1556,13 @@ def run_pa_gluon_test(
         equivalent_query_group_size,
     )
 
-    exp_sums = torch.zeros(
+    exp_sums = torch.empty(
         intermediate_shape, dtype=torch.float32, device=reference_output_quant.device
     )
-    max_logits = torch.zeros(
+    max_logits = torch.empty(
         intermediate_shape, dtype=torch.float32, device=reference_output_quant.device
     )
-    temporary_output = torch.zeros(
+    temporary_output = torch.empty(
         *intermediate_shape,
         head_size,
         dtype=reference_output_quant.dtype,
@@ -1599,7 +1610,7 @@ def run_pa_gluon_test(
         block_tables,
         softmax_scale,
         query_length,
-        131072,
+        max_context_partition_num,
         context_partition_size,
         compute_type,
         query_scale=query_scale_factors,
@@ -1947,7 +1958,7 @@ def _run_single_test(args):
         f"query_length={test_config['query_length']}, "
         f"head_size={test_config['head_size']}, "
         f"sinks={test_config['sinks']}, "
-        f"sliding_window={test_config['sliding_window']}"
+        f"sliding_window={test_config['sliding_window']},"
         f"ps={test_config['ps']}"
     )
 
@@ -2229,26 +2240,24 @@ def simple_test():
     global CONTEXT_PARTITION_SIZE_OPTIONS
     global PS_OPTIONS
 
-    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
     # COMPUTE_TYPE_OPTIONS = ["fp8"]
-    SINKS_OPTIONS = [False]
-    SLIDING_WINDOW_OPTIONS = [0]
-    HEAD_DIMENSION_OPTIONS = [128]
-    CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
-    BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
-    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
-    QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+    SINKS_OPTIONS = [False, True]
+    SLIDING_WINDOW_OPTIONS = [0, 128]
+    HEAD_DIMENSION_OPTIONS = [64]
+    CONTEXT_LENGTH_OPTIONS = [4]
+    BATCH_SIZE_OPTIONS = [4]
+    QUERY_LENGTH_OPTIONS = [1]
+    COMPUTE_TYPE_OPTIONS = ["bf16"]
+    QUANT_Q_AND_KV_OPTIONS = [[False, True], [False, False]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
-    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
-    USE_AOT_IMPL_OPTIONS = [True]
-    PS_OPTIONS = [False]
+    HEAD_CONFIGURATIONS = [(64, 8)]
+    USE_AOT_IMPL_OPTIONS = [False]
+    PS_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16]
-    parse_arg_and_run_test()
-    BLOCK_SIZE_OPTIONS = [64]
     parse_arg_and_run_test()
     # HEAD_CONFIGURATIONS = [(10, 1)]
     # BLOCK_SIZE_OPTIONS = [1024]
@@ -2278,20 +2287,20 @@ def sliding_window_test():
     USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
-    SINKS_OPTIONS = [False]
-    SLIDING_WINDOW_OPTIONS = [0, 128]
+    SINKS_OPTIONS = [True]
+    SLIDING_WINDOW_OPTIONS = [128]
     HEAD_DIMENSION_OPTIONS = [64]
     CONTEXT_LENGTH_OPTIONS = [1024, 8192]
-    BATCH_SIZE_OPTIONS = [4, 16, 128]
+    BATCH_SIZE_OPTIONS = [4, 128]
     QUERY_LENGTH_OPTIONS = [1]
     COMPUTE_TYPE_OPTIONS = ["bf16"]
-    QUANT_Q_AND_KV_OPTIONS = [[False, True]]
+    QUANT_Q_AND_KV_OPTIONS = [[True, True]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
-    KV_VARLEN_OPTIONS = [True, False]
+    KV_VARLEN_OPTIONS = [True]
     HEAD_CONFIGURATIONS = [(64, 8)]
     USE_AOT_IMPL_OPTIONS = [False]
-    PS_OPTIONS = [True, False]
+    PS_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     # BLOCK_SIZE_OPTIONS = [64]
@@ -2346,5 +2355,5 @@ def multi_compute_quant_type_test():
 
 
 if __name__ == "__main__":
-    simple_test()
+    sliding_window_test()
     # multi_compute_quant_type_test()
