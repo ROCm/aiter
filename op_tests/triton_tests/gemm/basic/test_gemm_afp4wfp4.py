@@ -3,7 +3,7 @@
 import pytest
 import torch
 from aiter.ops.triton.gemm_afp4wfp4 import (
-    gemm_afp4wfp4_,
+    gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffle,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -304,7 +304,7 @@ def test_gemm_afp4_wfp4(
         #     )
     else:
         if output:
-            triton_out = gemm_afp4wfp4_(
+            triton_out = gemm_afp4wfp4(
                 x,
                 w_triton,
                 x_scales_triton,
@@ -314,7 +314,7 @@ def test_gemm_afp4_wfp4(
                 skip_reduce=skip_reduce,
             )
         else:
-            triton_out = gemm_afp4wfp4_(
+            triton_out = gemm_afp4wfp4(
                 x,
                 w_triton,
                 x_scales_triton,

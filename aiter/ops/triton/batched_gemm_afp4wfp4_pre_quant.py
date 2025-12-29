@@ -27,11 +27,14 @@ def batched_gemm_afp4wfp4_pre_quant(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-):
+) -> torch.Tensor:
+    """
+    This this a backward-compatible API and will be deprecated in future release,
+    As for torch compile guard version, please use aiter/ops/triton/batched_gemm_a16wfp4.py::batched_gemm_a16wfp4_torch_compile_guard
+    """
     _LOGGER.info(
         "batched_gemm_afp4wfp4_pre_quant will be deprecated in future AITER release, please switch to batched_gemm_a16wfp4"
     )
-
     config_hashable = serialize_dict(config) if config else None
     return batched_gemm_a16wfp4(
         x, w, w_scales, dtype, y, config_hashable, transpose_bm=False, prequant=True

@@ -66,32 +66,14 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
 
-def gemm_afp4wfp4_fake_tensor(
+def gemm_afp4wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
-) -> torch.Tensor:
-    if y is None:
-        M, _ = x.shape
-        N, _ = w.shape
-        return torch.empty((M, N), dtype=dtype, device=x.device)
-    return y
-
-
-@torch_compile_guard(gen_fake=gemm_afp4wfp4_fake_tensor)
-def gemm_afp4wfp4_(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    x_scales: torch.Tensor,
-    w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    config: Optional[str | dict] = None,
     skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
     """
@@ -232,7 +214,7 @@ def gemm_afp4wfp4_preshuffled_scales(
     w,
     x_scales,
     w_scales,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
 ):
@@ -366,7 +348,7 @@ def gemm_afp4wfp4_preshuffle(
     w,
     x_scales,
     w_scales,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
     use_aot: Optional[bool] = True,
@@ -544,25 +526,52 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     w,
     x_scales,
     w_scales,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
     use_aot: Optional[bool] = True,
 ):
+    """
+    This this a backward-compatible API and will be deprecated in future release
+    """
     _LOGGER.info(
         "gemm_afp4wfp4_preshuffled_weight_scales will be deprecated in future AITER release, please switch to gemm_afp4wfp4_preshuffle"
     )
     return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config, use_aot)
 
 
-def gemm_afp4wfp4(
+def gemm_afp4wfp4_torch_compile_guard_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    config: Optional[str] = None,
+    skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
+    if y is None:
+        M, _ = x.shape
+        N, _ = w.shape
+        return torch.empty((M, N), dtype=dtype, device=x.device)
+    return y
+
+
+@torch_compile_guard(gen_fake=gemm_afp4wfp4_torch_compile_guard_fake_tensor)
+def gemm_afp4wfp4_torch_compile_guard(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+) -> torch.Tensor:
+    """
+    This wrapper API is a torch compile guarded version of gemm_afp4wfp4
+    Note that this wrapper function blocks the usage of skip_reduce.
+    """
     config_hashable = serialize_dict(config) if config else None
-    return gemm_afp4wfp4_(x, w, x_scales, w_scales, dtype, y, config_hashable)
+    return gemm_afp4wfp4(
+        x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce=False
+    )

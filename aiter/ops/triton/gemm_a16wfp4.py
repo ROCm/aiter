@@ -6,7 +6,7 @@ import torch
 import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import deserialize_str
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton._triton_kernels.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
     _get_config,
@@ -23,23 +23,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 _LOGGER = AiterTritonLogger()
 
 
-def gemm_a16wfp4_fake_tensor(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scales: torch.Tensor,
-    atomic_add: bool = False,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-) -> torch.Tensor:
-    if y is None:
-        M, _ = x.shape
-        N, _ = w.shape
-        return torch.zeros((M, N), dtype=dtype, device=x.device)
-    return y
-
-
-@torch_compile_guard(gen_fake=gemm_a16wfp4_fake_tensor)
 def gemm_a16wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -47,7 +30,7 @@ def gemm_a16wfp4(
     atomic_add: bool = False,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    config: Optional[str | dict] = None,
 ) -> torch.Tensor:
     """
     Computes the matmul Y = X x W
@@ -168,3 +151,37 @@ def gemm_a16wfp4(
         )
 
     return y
+
+
+def gemm_a16wfp4_torch_compile_guard_fake_tensor(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    atomic_add: bool = False,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+) -> torch.Tensor:
+    if y is None:
+        M, _ = x.shape
+        N, _ = w.shape
+        return torch.zeros((M, N), dtype=dtype, device=x.device)
+    return y
+
+
+@torch_compile_guard(gen_fake=gemm_a16wfp4_torch_compile_guard_fake_tensor)
+def gemm_a16wfp4_torch_compile_guard(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    atomic_add: bool = False,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+) -> torch.Tensor:
+    """
+    This wrapper API is a torch compile guarded version of gemm_afp4wfp4,
+    Note that this wrapper function blocks the usage of skip_reduce.
+    """
+    config_hashable = serialize_dict(config) if config else None
+    return gemm_a16wfp4(x, w, w_scales, True, dtype, y, config_hashable)

@@ -11,7 +11,7 @@ from aiter.ops.triton._triton_kernels.batched_gemm_a16wfp4 import (
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import deserialize_str
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton.gemm_a16wfp4 import (
     get_splitk,
 )
@@ -28,32 +28,13 @@ def set_use_gemm_splitk_bf16(value: bool):
     _USE_GEMM_SPLITK_BF16 = value
 
 
-def batched_gemm_a16wfp4_fake_tensor(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    transpose_bm: Optional[bool] = False,
-    prequant: Optional[bool] = True,
-    y_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if y is None:
-        Bx, M, _ = x.shape
-        _, N, _ = w.shape
-        return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
-    return y
-
-
-@torch_compile_guard(gen_fake=batched_gemm_a16wfp4_fake_tensor)
 def batched_gemm_a16wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    config: Optional[str | dict] = None,
     transpose_bm: Optional[bool] = False,
     prequant: Optional[bool] = True,
     y_scale: Optional[torch.Tensor] = None,
@@ -219,3 +200,42 @@ def batched_gemm_a16wfp4(
             config["NUM_KSPLIT"],
         )
     return y
+
+
+def batched_gemm_a16wfp4_torch_compile_guard_fake_tensor(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+    transpose_bm: Optional[bool] = False,
+    prequant: Optional[bool] = True,
+    y_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if y is None:
+        Bx, M, _ = x.shape
+        _, N, _ = w.shape
+        return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
+    return y
+
+
+@torch_compile_guard(gen_fake=batched_gemm_a16wfp4_torch_compile_guard_fake_tensor)
+def batched_gemm_a16wfp4_torch_compile_guard(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+    transpose_bm: Optional[bool] = False,
+    prequant: Optional[bool] = True,
+    y_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    This wrapper API is a torch compile guarded function that blocks the usage of skip_reduce
+    """
+    config_hashable = serialize_dict(config) if config else None
+    return batched_gemm_a16wfp4(
+        x, w, w_scales, dtype, y, config_hashable, transpose_bm, prequant, y_scale
+    )
