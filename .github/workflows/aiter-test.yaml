@@ -65,11 +65,18 @@ jobs:
           echo "Multiple: ${{ steps.machines.outputs.multigpu_runners }}"
 
   build_aiter_image:
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-k8s-build.test
     needs: [define-runners]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Prepare docker config
+        run: |
+          export DOCKER_CONFIG="$HOME/.docker"
+          mkdir -p "$DOCKER_CONFIG" || true
+          cp /docker-config/config.json "$DOCKER_CONFIG/config.json"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
       
       - name: Generate Dockerfile
         run: |
