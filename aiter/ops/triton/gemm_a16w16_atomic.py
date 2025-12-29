@@ -113,7 +113,7 @@ def gemm_a16w16_atomic_torch_compile_guard(
     w: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    config: Optional[str] = None,
 ) -> torch.Tensor:
     """
     This wrapper API is a torch compile guarded version of gemm_a16w16_atomic,
