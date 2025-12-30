@@ -18,7 +18,7 @@ std::vector<at::Tensor> mha_batch_prefill(
     std::optional<at::Tensor> out_,                // [total_q, hq, d]
     std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
     std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-    std::optional<const at::Tensor> sink_ptr_, // [hq];
+    std::optional<const at::Tensor> sink_ptr_,     // [hq],
     std::optional<at::Generator> gen_);
 } // namespace torch_itfs
 } // namespace aiter
