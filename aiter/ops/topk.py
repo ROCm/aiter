@@ -219,3 +219,15 @@ def top_k_per_row_decode(
     stride0: int,
     stride1: int,
 ) -> None: ...
+
+
+@compile_ops("module_top_k_per_row")
+def top_k_per_row_decode_fast(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+) -> None: ...

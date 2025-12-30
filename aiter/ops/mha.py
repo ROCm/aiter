@@ -6,7 +6,7 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import AITER_CSRC_DIR, CK_DIR, compile_ops
+from ..jit.core import AITER_CSRC_DIR, CK_DIR, AITER_META_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
@@ -21,6 +21,7 @@ def cmdGenFunc_mha_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -28,6 +29,9 @@ def cmdGenFunc_mha_fwd(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
     (_, seqlen_q, _, _) = q.shape
@@ -45,9 +49,11 @@ def cmdGenFunc_mha_fwd(
         md_name += "_bf16"
         filter += "bf16*"
     elif q.dtype == dtypes.fp8:
-        # only support bf16 out for fp8 input
-        md_name += "_fp8bf16"
-        filter += "fp8bf16*"
+        if out is None or out.dtype == dtypes.bf16:
+            md_name += "_fp8bf16"
+            filter += "fp8bf16*"
+        else:
+            raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
@@ -75,6 +81,13 @@ def cmdGenFunc_mha_fwd(
     else:
         md_name += "_dropout"
         filter += "_dropout*"
+    if q_descale is None or k_descale is None or v_descale is None:
+        md_name += "_nqscale"
+        filter += "_nqscale*"
+    else:
+        # only support per-tensor quantization for now
+        md_name += "_pertensor"
+        filter += "_pertensor*"
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
@@ -103,7 +116,8 @@ def common_mha_fwd_fake_tensors(
     seqlen_k = k.size(1)
 
     if out is not None:
-        assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
+        if q.dtype != dtypes.fp8:
+            assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
         assert out.device == q.device, "Output must be on the same device as inputs"
         assert out.stride(-1) == 1, "Output tensor must have contiguous last dimension"
         assert out.shape == (
@@ -151,6 +165,7 @@ def gen_mha_fwd_fake_tensors(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -158,6 +173,9 @@ def gen_mha_fwd_fake_tensors(
     out: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return common_mha_fwd_fake_tensors(
@@ -180,6 +198,7 @@ def mha_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -187,6 +206,9 @@ def mha_fwd(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
@@ -251,12 +273,16 @@ def cmdGenFunc_mha_varlen_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -275,9 +301,11 @@ def cmdGenFunc_mha_varlen_fwd(
             md_name += "_bf16"
             filter_fwd += "bf16*"
         elif q.dtype == dtypes.fp8:
-            # only support bf16 out for fp8 input
-            md_name += "_fp8bf16"
-            filter_fwd += "fp8bf16*"
+            if out is None or out.dtype == dtypes.bf16:
+                md_name += "_fp8bf16"
+                filter_fwd += "fp8bf16*"
+            else:
+                raise NotImplementedError("Unsupported output dtype for FP8 MHA")
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
             filter_fwd += "_logits*"
@@ -317,6 +345,13 @@ def cmdGenFunc_mha_varlen_fwd(
         else:
             md_name += "_skip"
             filter_fwd += "_skip*"
+        if q_descale is None or k_descale is None or v_descale is None:
+            md_name += "_nqscale"
+            filter_fwd += "_nqscale*"
+        else:
+            # only support per-tensor quantization for now
+            md_name += "_pertensor"
+            filter_fwd += "_pertensor*"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -404,12 +439,16 @@ def gen_mha_varlen_fwd_fake_tensor(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -468,12 +507,16 @@ def mha_varlen_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -485,7 +528,7 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -504,6 +547,8 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
+    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
     device = q.device
@@ -548,7 +593,7 @@ def fmha_v3_varlen_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -567,6 +612,8 @@ def fmha_v3_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
+    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -647,11 +694,12 @@ def cmdGenFunc_mha_bwd(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
         "--receipt 300 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
     }
 
 
@@ -898,11 +946,12 @@ def cmdGenFunc_mha_varlen_bwd(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
         "--receipt 400 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
     }
 
 
@@ -925,7 +974,11 @@ def cmdGenFunc_mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
     # causal=true is the same as causal=false in this case
@@ -940,6 +993,12 @@ def cmdGenFunc_mha_batch_prefill(
     elif q.dtype == torch.bfloat16:
         md_name += "_bf16"
         filter_fwd += "bf16*"
+    elif q.dtype == dtypes.fp8:
+        if out is None or out.dtype == dtypes.bf16:
+            md_name += "_fp8bf16"
+            filter_fwd += "fp8bf16*"
+        else:
+            raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if 0.0 < logits_soft_cap:
         md_name += "_logits"
         filter_fwd += "_logits*"
@@ -970,6 +1029,13 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_dropout"
         filter_fwd += "_dropout*"
+    if q_descale is None or k_descale is None or v_descale is None:
+        md_name += "_nqscale"
+        filter_fwd += "_nqscale*"
+    else:
+        # only support per-tensor quantization for now
+        md_name += "_pertensor"
+        filter_fwd += "_pertensor*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -1174,8 +1240,12 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
+    q_descale: Optional[torch.Tensor],
+    k_descale: Optional[torch.Tensor],
+    v_descale: Optional[torch.Tensor],
     return_lse: bool,
     return_softmax: bool,
     how_v3_bf16_cvt: Optional[int] = 1,
@@ -1199,7 +1269,7 @@ def _flash_attn_forward(
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
+        ret = ret and (hdim_q == 128 or hdim_q == 192)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
@@ -1248,6 +1318,7 @@ def _flash_attn_forward(
             causal,
             window_size_left,
             window_size_right,
+            sink_size,
             return_lse,
             return_softmax,
             cu_seqlens_q,
@@ -1255,6 +1326,9 @@ def _flash_attn_forward(
             None,
             bias,
             alibi_slopes,
+            q_descale,
+            k_descale,
+            v_descale,
             None,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
@@ -1539,7 +1613,6 @@ def _flash_attn_backward(
         and hdim_q > 64
         and hdim_q <= 128
         and hdim_q % 8 == 0
-        and not swa
     )
 
     def can_impl_fmha_v3_bwd_gfx950():
@@ -1554,6 +1627,7 @@ def _flash_attn_backward(
             (hdim_q > 64 and hdim_q <= 128)
             or (hdim_q == 192 and hdim_v == 128 and nmask)
         ) and hdim_q % 8 == 0
+        ret &= not swa
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
@@ -1663,8 +1737,12 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=int(window_size[0]),
             window_size_right=int(window_size[1]),
+            sink_size=int(window_size[2]) if len(window_size) == 3 else 0,
             bias=bias,
             alibi_slopes=alibi_slopes,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
             how_v3_bf16_cvt=how_v3_bf16_cvt,
@@ -1778,7 +1856,7 @@ def flash_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     bias=None,
     alibi_slopes=None,
     deterministic=True,
@@ -1877,8 +1955,12 @@ def _flash_attn_varlen_forward(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    sink_size: int = 0,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
     how_v3_bf16_cvt: Optional[int] = 1,
@@ -1894,6 +1976,7 @@ def _flash_attn_varlen_forward(
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
+    sink_size = 0 if sink_size >= max_seqlen_k else sink_size
     mask = causal == True and window_size_left == -1  # causal mask
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
@@ -1906,11 +1989,11 @@ def _flash_attn_varlen_forward(
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
+        ret = ret and (hdim_q == 128 or hdim_q == 192)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
-        ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
+        ret = ret and logits_soft_cap == 0.0
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1940,6 +2023,8 @@ def _flash_attn_varlen_forward(
             bias,
             alibi_slopes,
             None,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     else:
@@ -1976,12 +2061,16 @@ def _flash_attn_varlen_forward(
             causal,
             window_size_left,
             window_size_right,
+            sink_size,
             return_lse,
             return_softmax,
             out=out,
             block_table=block_table,
             bias=bias,
             alibi_slopes=alibi_slopes,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             gen=None,
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_k_padded=cu_seqlens_k_padded,
@@ -2240,8 +2329,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             logits_soft_cap=logits_soft_cap,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            sink_size=window_size[2] if len(window_size) > 2 else 0,
             bias=bias,
             alibi_slopes=alibi_slopes,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
             how_v3_bf16_cvt=how_v3_bf16_cvt,
@@ -2390,7 +2483,7 @@ def flash_attn_varlen_func(
     softmax_scale=None,
     logits_soft_cap=0.0,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     bias=None,
     alibi_slopes=None,
     deterministic=False,
@@ -2514,6 +2607,9 @@ def mha_batch_prefill_fake_tensors(
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2578,7 +2674,11 @@ def mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
@@ -2598,11 +2698,15 @@ def _mha_batch_prefill(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
     zero_tensors: bool = False,
     out: torch.Tensor = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2625,8 +2729,11 @@ def _mha_batch_prefill(
         return_lse,
         return_softmax,
         out,
+        bias,
         alibi_slopes,
-        None,
+        q_descale,
+        k_descale,
+        v_descale,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
@@ -2651,6 +2758,9 @@ def mha_batch_prefill_func(
     return_lse=False,
     return_attn_probs=False,
     out=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -2680,6 +2790,9 @@ def mha_batch_prefill_func(
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
         out=out,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     out = out_padded[..., :head_size_v_og]
 
@@ -2696,8 +2809,11 @@ def flash_attn_fp8_pertensor_func(
     q,
     k,
     v,
+    q_descale,
+    k_descale,
+    v_descale,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     softmax_scale=None,
 ):
     if softmax_scale is None:
@@ -2718,8 +2834,12 @@ def flash_attn_fp8_pertensor_func(
         causal=causal,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
+        sink_size=int(window_size[2]) if len(window_size) == 3 else 0,
         bias=None,
         alibi_slopes=None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         return_lse=False,
         return_softmax=False,
     )
@@ -2731,6 +2851,9 @@ def flash_attn_varlen_fp8_pertensor_func(
     q,
     k,
     v,
+    q_descale,
+    k_descale,
+    v_descale,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -2738,7 +2861,7 @@ def flash_attn_varlen_fp8_pertensor_func(
     min_seqlen_q=0,
     logits_soft_cap=0.0,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window
     softmax_scale=None,
 ):
     if softmax_scale is None:
@@ -2767,8 +2890,12 @@ def flash_attn_varlen_fp8_pertensor_func(
         logits_soft_cap=logits_soft_cap,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
+        sink_size=int(window_size[2]) if len(window_size) == 3 else 0,
         bias=None,
         alibi_slopes=None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         return_lse=False,
         return_softmax=False,
     )
