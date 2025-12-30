@@ -414,7 +414,7 @@ def primary_output(result):
     return result
 
 
-def attention_caller(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
+def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
@@ -494,7 +494,7 @@ def bench_kernel(q, k, v, args, provider):
             False
         ), "One of -fav3_fp8, -sagev1 or -fav3_sage must be specified for diffusion attention benchmark."
 
-    fn = attention_caller(
+    fn = attn_forward_func(
         q,
         k,
         v,
@@ -517,7 +517,7 @@ def bench_kernel(q, k, v, args, provider):
             )  # we do comparison in BSHD
 
         reference_primary = primary_output(
-            attention_caller(
+            attn_forward_func(
                 q,
                 k,
                 v,
