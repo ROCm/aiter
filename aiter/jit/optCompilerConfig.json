@@ -14,12 +14,14 @@
     "module_activation": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/activation_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/activation_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/activation_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fused_act_quant_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
+            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'",
+            "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
         "extra_include": [

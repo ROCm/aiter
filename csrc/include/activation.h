@@ -10,4 +10,9 @@ void scaled_silu_and_mul(torch::Tensor &out, torch::Tensor &input, torch::Tensor
 void gelu_and_mul(torch::Tensor &out, torch::Tensor &input);
 void gelu_tanh_and_mul(torch::Tensor &out, torch::Tensor &input);
 
+// Fused activation+mul+quant kernels
+void fused_silu_mul_quant(torch::Tensor &out, torch::Tensor &scales, torch::Tensor &input);
+void fused_gelu_mul_quant(torch::Tensor &out, torch::Tensor &scales, torch::Tensor &input);
+void fused_gelu_tanh_mul_quant(torch::Tensor &out, torch::Tensor &scales, torch::Tensor &input);
+
 } // namespace aiter
