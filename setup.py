@@ -100,12 +100,18 @@ if IS_ROCM:
         for module in all_modules:
             if PREBUILD_KERNELS == 1:
                 # Exclude mha, _tune, and specific module
+                # But keep module_fmha_v3_fwd and module_fmha_v3_varlen_fwd
                 if (
                     "mha" in module
                     or "_tune" in module
                     or module == "module_gemm_mi350_a8w8_blockscale_asm"
                 ):
-                    exclude_ops.append(module)
+                    # Allow module_fmha_v3_fwd and module_fmha_v3_varlen_fwd
+                    if module not in [
+                        "module_fmha_v3_fwd",
+                        "module_fmha_v3_varlen_fwd",
+                    ]:
+                        exclude_ops.append(module)
             elif PREBUILD_KERNELS == 2:
                 # Exclude _bwd, _tune, and specific module
                 if (
@@ -166,12 +172,23 @@ if IS_ROCM:
                     f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
                 ]
 
+                # Modify blob_gen_cmd for module_fmha_v3_varlen_fwd based on PREBUILD_KERNELS
+                blob_gen_cmd = one_opt_args["blob_gen_cmd"]
+                if one_opt_args["md_name"] == "module_fmha_v3_varlen_fwd":
+                    if PREBUILD_KERNELS == 1:
+                        blob_gen_cmd = [
+                            f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter *bf16*_nlogits*_nbias*_mask*_nlse*_ndropout*_nskip*_nqscale* --output_dir {{}}",
+                            f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
+                            f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
+                            f"{core.get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}",
+                        ]
+
                 core.build_module(
                     md_name=one_opt_args["md_name"],
                     srcs=one_opt_args["srcs"],
                     flags_extra_cc=flags_cc,
                     flags_extra_hip=flags_hip,
-                    blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+                    blob_gen_cmd=blob_gen_cmd,
                     extra_include=one_opt_args["extra_include"],
                     extra_ldflags=None,
                     verbose=False,
