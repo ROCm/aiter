@@ -1,0 +1,460 @@
+W1217 14:25:53.631000 487470 torch/distributed/run.py:803] 
+W1217 14:25:53.631000 487470 torch/distributed/run.py:803] *****************************************
+W1217 14:25:53.631000 487470 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1217 14:25:53.631000 487470 torch/distributed/run.py:803] *****************************************
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+[aiter] import [module_aiter_enum] under /home/jukorhon/aiter/aiter/jit/module_aiter_enum.so
+INFO 12-17 14:26:02 [envs.py:196] Using AITER as the attention library
+INFO 12-17 14:26:02 [envs.py:196] Using AITER as the attention library
+WARNING 12-17 14:26:02 [args.py:377] Distributed environment is not initialized. Initializing...
+WARNING 12-17 14:26:02 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 14:26:02 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+DEBUG 12-17 14:26:02 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+INFO 12-17 14:26:02 [envs.py:196] Using AITER as the attention library
+WARNING 12-17 14:26:02 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 14:26:02 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+INFO 12-17 14:26:02 [envs.py:196] Using AITER as the attention library
+INFO 12-17 14:26:02 [envs.py:196] Using AITER as the attention library
+INFO 12-17 14:26:02 [envs.py:196] Using AITER as the attention library
+INFO 12-17 14:26:02 [envs.py:196] Using AITER as the attention library
+WARNING 12-17 14:26:02 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 14:26:02 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+WARNING 12-17 14:26:03 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 14:26:03 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+WARNING 12-17 14:26:03 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 14:26:03 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+WARNING 12-17 14:26:03 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 14:26:03 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+INFO 12-17 14:26:03 [envs.py:196] Using AITER as the attention library
+WARNING 12-17 14:26:03 [args.py:377] Distributed environment is not initialized. Initializing...
+DEBUG 12-17 14:26:03 [parallel_state.py:222] world_size=-1 rank=-1 local_rank=-1 distributed_init_method=env:// backend=nccl
+[Gloo] Rank 2 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 0 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 1 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank [Gloo] Rank 5 is connected to 6[Gloo] Rank 7 is connected to 4 peer ranks. 7 is connected to Expected number of connected peer ranks is : 7 peer ranks. 7 peer ranks. Expected number of connected peer ranks is : Expected number of connected peer ranks is : 
+77
+
+[Gloo] Rank 7 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+INFO 12-17 14:26:03 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 14:26:03 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 14:26:03 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 14:26:03 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 14:26:03 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 14:26:03 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 14:26:03 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 14:26:03 [config.py:124] Ring degree not set, using default value 1
+INFO 12-17 14:26:03 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 14:26:03 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 14:26:03 [config.py:166] Pipeline patch number not set, using default value 1
+INFO 12-17 14:26:03 [config.py:166] Pipeline patch number not set, using default value 1
+--------------------PARAMETERS--------------------INFO 12-17 14:26:03 [config.py:124] Ring degree not set, using default value 1
+
+INFO 12-17 14:26:03 [config.py:124] Ring degree not set, using default value 1
+                             height = 720
+                              width = 1280
+                         num_frames = 81
+             use_resolution_binning = True
+                         batch_size = 1
+                      img_file_path = /app/Wan/i2v_input.JPG
+                             prompt = ["Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."]
+                    negative_prompt = 
+INFO 12-17 14:26:03 [config.py:166] Pipeline patch number not set, using default value 1
+                num_inference_steps = 40
+                max_sequence_length = 256
+                               seed = 42
+                        output_type = pilINFO 12-17 14:26:03 [config.py:166] Pipeline patch number not set, using default value 1
+
+                     guidance_scale = 3.5
+                              model = Wan-AI/Wan2.2-I2V-A14B-Diffusers
+                       download_dir = None
+                  trust_remote_code = False
+                       warmup_steps = 1
+                              dtype = torch.float16
+                     use_cuda_graph = False
+                   use_parallel_vae = False
+                       use_profiler = False
+                  use_torch_compile = True
+                        use_onediff = False
+                 use_fp8_t5_encoder = False
+                       use_teacache = False
+                        use_fbcache = False
+                          dp_degree = 1
+                   use_cfg_parallel = False
+                  dit_parallel_size = 8
+                         cfg_degree = 1
+                     ulysses_degree = 8
+                        ring_degree = 1
+                  dit_parallel_size = 8
+                          sp_degree = 8
+                          pp_degree = 1
+                 num_pipeline_patch = 1
+              attn_layer_num_for_pp = None
+                  dit_parallel_size = 8
+                          tp_degree = 1
+                       split_scheme = row
+                  dit_parallel_size = 8
+                           filename = /home/jukorhon/aiter/op_tests/sagev1_tests/run_wan.py
+--------------------PARAMETERS--------------------
+Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]`torch_dtype` is deprecated! Use `dtype` instead!
+Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]Loading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 185.81it/s]
+
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][ALoading pipeline components...:   0%|          | 0/6 [00:00<?, ?it/s]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 181.65it/s]
+Loading pipeline components...:  17%|█▋        | 1/6 [00:00<00:01,  2.84it/s]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 182.71it/s]
+Loading pipeline components...:  50%|█████     | 3/6 [00:00<00:00,  5.39it/s]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][ALoading pipeline components...:  50%|█████     | 3/6 [00:00<00:00,  3.33it/s]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:17,  1.62s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:18,  1.66s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:20,  1.84s/it][A
+
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:20,  1.90s/it][ALoading checkpoint shards:   8%|▊         | 1/12 [00:01<00:20,  1.87s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:20,  1.89s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:17,  1.61s/it][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:01<00:17,  1.61s/it][A
+
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:03<00:19,  1.93s/it]Loading checkpoint shards:  17%|█▋        | 2/12 [00:03<00:19,  1.95s/it][A[A
+
+
+
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:04<00:20,  2.07s/it]Loading checkpoint shards:  17%|█▋        | 2/12 [00:04<00:20,  2.07s/it][ALoading checkpoint shards:  17%|█▋        | 2/12 [00:04<00:20,  2.06s/it][A[ALoading checkpoint shards:  17%|█▋        | 2/12 [00:03<00:16,  1.68s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:04<00:20,  2.06s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:03<00:16,  1.60s/it][A
+
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:05<00:15,  1.75s/it]Loading checkpoint shards:  25%|██▌       | 3/12 [00:05<00:15,  1.76s/it][A[A
+
+
+
+
+
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:14,  1.61s/it]Loading checkpoint shards:  25%|██▌       | 3/12 [00:05<00:16,  1.88s/it]Loading checkpoint shards:  25%|██▌       | 3/12 [00:05<00:16,  1.87s/it]Loading checkpoint shards:  25%|██▌       | 3/12 [00:05<00:16,  1.88s/it][A[ALoading checkpoint shards:  25%|██▌       | 3/12 [00:04<00:15,  1.67s/it][A[ALoading checkpoint shards:  25%|██▌       | 3/12 [00:05<00:16,  1.88s/it][A[A
+
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:06<00:13,  1.66s/it]Loading checkpoint shards:  33%|███▎      | 4/12 [00:06<00:13,  1.66s/it][A[A
+
+
+
+
+
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:07<00:14,  1.80s/it]Loading checkpoint shards:  33%|███▎      | 4/12 [00:06<00:13,  1.63s/it]Loading checkpoint shards:  33%|███▎      | 4/12 [00:07<00:14,  1.80s/it]Loading checkpoint shards:  33%|███▎      | 4/12 [00:07<00:14,  1.79s/it][A[A[A[ALoading checkpoint shards:  33%|███▎      | 4/12 [00:06<00:13,  1.67s/it][ALoading checkpoint shards:  33%|███▎      | 4/12 [00:07<00:14,  1.79s/it][A
+
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:08<00:11,  1.61s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:08<00:11,  1.62s/it][A[A
+
+
+
+
+
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:09<00:12,  1.76s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:09<00:12,  1.76s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:08<00:11,  1.66s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:09<00:12,  1.76s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:09<00:12,  1.76s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:08<00:11,  1.68s/it][A[A[A[A[A[A
+
+Loading checkpoint shards:  50%|█████     | 6/12 [00:09<00:09,  1.61s/it]Loading checkpoint shards:  50%|█████     | 6/12 [00:10<00:09,  1.62s/it][A[A
+
+
+
+
+
+Loading checkpoint shards:  50%|█████     | 6/12 [00:10<00:10,  1.71s/it]Loading checkpoint shards:  50%|█████     | 6/12 [00:10<00:10,  1.71s/it]Loading checkpoint shards:  50%|█████     | 6/12 [00:09<00:09,  1.64s/it][ALoading checkpoint shards:  50%|█████     | 6/12 [00:09<00:09,  1.66s/it]Loading checkpoint shards:  50%|█████     | 6/12 [00:10<00:10,  1.71s/it][A[A[ALoading checkpoint shards:  50%|█████     | 6/12 [00:10<00:10,  1.71s/it][A[A
+
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:11<00:07,  1.57s/it]Loading checkpoint shards:  58%|█████▊    | 7/12 [00:11<00:07,  1.57s/it][A[A
+
+
+
+
+
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:11<00:08,  1.64s/it][ALoading checkpoint shards:  58%|█████▊    | 7/12 [00:12<00:08,  1.69s/it][ALoading checkpoint shards:  58%|█████▊    | 7/12 [00:12<00:08,  1.69s/it][ALoading checkpoint shards:  58%|█████▊    | 7/12 [00:11<00:08,  1.65s/it][ALoading checkpoint shards:  58%|█████▊    | 7/12 [00:12<00:08,  1.69s/it][ALoading checkpoint shards:  58%|█████▊    | 7/12 [00:12<00:08,  1.69s/it][A
+
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:13<00:06,  1.56s/it]Loading checkpoint shards:  67%|██████▋   | 8/12 [00:12<00:06,  1.56s/it][A[A
+
+
+
+
+
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:13<00:06,  1.65s/it][ALoading checkpoint shards:  67%|██████▋   | 8/12 [00:14<00:06,  1.68s/it]Loading checkpoint shards:  67%|██████▋   | 8/12 [00:13<00:06,  1.66s/it][A[ALoading checkpoint shards:  67%|██████▋   | 8/12 [00:14<00:06,  1.68s/it][ALoading checkpoint shards:  67%|██████▋   | 8/12 [00:14<00:06,  1.68s/it][ALoading checkpoint shards:  67%|██████▋   | 8/12 [00:14<00:06,  1.68s/it][A
+
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:14<00:04,  1.56s/it]Loading checkpoint shards:  75%|███████▌  | 9/12 [00:14<00:04,  1.56s/it][A[A
+
+
+
+
+
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:14<00:04,  1.65s/it]Loading checkpoint shards:  75%|███████▌  | 9/12 [00:14<00:04,  1.65s/it][A[ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:15<00:05,  1.67s/it][ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:15<00:05,  1.67s/it][ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:15<00:05,  1.67s/it][ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:15<00:05,  1.67s/it][A
+
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:16<00:03,  1.60s/it]Loading checkpoint shards:  83%|████████▎ | 10/12 [00:16<00:03,  1.60s/it][A[A
+
+
+
+
+
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:16<00:03,  1.66s/it][ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:16<00:03,  1.67s/it]Loading checkpoint shards:  83%|████████▎ | 10/12 [00:17<00:03,  1.68s/it]Loading checkpoint shards:  83%|████████▎ | 10/12 [00:17<00:03,  1.68s/it][A[A[ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:17<00:03,  1.68s/it][ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:17<00:03,  1.68s/it][A
+
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:17<00:01,  1.61s/it]Loading checkpoint shards:  92%|█████████▏| 11/12 [00:17<00:01,  1.61s/it][A[A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:18<00:00,  1.45s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:18<00:00,  1.58s/it]
+Loading pipeline components...:  33%|███▎      | 2/6 [00:19<00:38,  9.54s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:19<00:00,  1.47s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:19<00:00,  1.59s/it]
+Loading pipeline components...:  17%|█▋        | 1/6 [00:19<01:35, 19.14s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 120.25it/s]
+
+
+
+
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:18<00:01,  1.70s/it]Loading checkpoint shards:  92%|█████████▏| 11/12 [00:18<00:01,  1.70s/it][A[A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:19<00:01,  1.71s/it][ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:19<00:01,  1.71s/it][ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:19<00:01,  1.71s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:19<00:01,  1.71s/it][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:23<00:00,  2.81s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:23<00:00,  1.97s/it]
+Loading pipeline components...:  83%|████████▎ | 5/6 [00:24<00:06,  6.23s/it]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:25<00:00,  3.22s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:25<00:00,  2.09s/it]
+Loading pipeline components...:  67%|██████▋   | 4/6 [00:25<00:16,  8.25s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:25<00:00,  3.24s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:25<00:00,  2.16s/it]
+Loading pipeline components...:  17%|█▋        | 1/6 [00:25<02:09, 25.98s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:25<00:00,  3.26s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:25<00:00,  2.16s/it]
+Loading pipeline components...:  17%|█▋        | 1/6 [00:26<02:10, 26.05s/it]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:26<00:00,  3.41s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:26<00:00,  2.20s/it]
+Loading pipeline components...:  33%|███▎      | 2/6 [00:26<00:53, 13.27s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:26<00:00,  3.46s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:26<00:00,  2.22s/it]
+Loading pipeline components...:  17%|█▋        | 1/6 [00:26<02:13, 26.69s/it]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][ALoading pipeline components...:  83%|████████▎ | 5/6 [00:27<00:06,  6.22s/it]Loading pipeline components...:  50%|█████     | 3/6 [00:27<00:22,  7.39s/it]
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:08<01:37,  8.87s/it][ALoading pipeline components...:  67%|██████▋   | 4/6 [00:29<00:10,  5.50s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][A
+Loading checkpoint shards:   8%|▊         | 1/12 [00:10<01:56, 10.57s/it][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 166.87it/s]
+
+Loading checkpoint shards:   0%|          | 0/12 [00:00<?, ?it/s][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:11<00:53,  5.32s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:12<00:53,  5.36s/it][A
+
+
+
+
+Loading checkpoint shards:   8%|▊         | 1/12 [00:04<00:44,  4.02s/it]
+[ALoading checkpoint shards:   8%|▊         | 1/12 [00:04<00:54,  4.99s/it][ALoading checkpoint shards:   8%|▊         | 1/12 [00:05<01:04,  5.82s/it][ALoading checkpoint shards:   8%|▊         | 1/12 [00:07<01:17,  7.07s/it][ALoading checkpoint shards:   8%|▊         | 1/12 [00:02<00:23,  2.11s/it][ALoading checkpoint shards:   8%|▊         | 1/12 [00:04<00:54,  4.91s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:16<00:47,  5.27s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:18<00:52,  5.84s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:14<01:15,  7.52s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:11<01:02,  6.28s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:13<01:10,  7.02s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:12<01:07,  6.75s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:13<01:07,  6.79s/it][A
+Loading checkpoint shards:  17%|█▋        | 2/12 [00:10<00:56,  5.68s/it][A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:21<00:40,  5.11s/it][A
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:22<00:38,  4.85s/it][A
+
+
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:16<00:43,  4.89s/it][ALoading checkpoint shards:  25%|██▌       | 3/12 [00:13<00:37,  4.20s/it]Loading checkpoint shards:  25%|██▌       | 3/12 [00:15<00:41,  4.60s/it][A[A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:14<00:40,  4.48s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:12<00:34,  3.87s/it][A
+Loading checkpoint shards:  25%|██▌       | 3/12 [00:14<00:41,  4.57s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:23<00:27,  3.92s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:23<00:26,  3.77s/it][A
+
+
+
+
+Loading checkpoint shards:  33%|███▎      | 4/12 [00:14<00:26,  3.31s/it][ALoading checkpoint shards:  33%|███▎      | 4/12 [00:16<00:29,  3.63s/it][ALoading checkpoint shards:  33%|███▎      | 4/12 [00:18<00:30,  3.87s/it]
+[ALoading checkpoint shards:  33%|███▎      | 4/12 [00:19<00:32,  4.04s/it][ALoading checkpoint shards:  33%|███▎      | 4/12 [00:17<00:29,  3.71s/it][ALoading checkpoint shards:  33%|███▎      | 4/12 [00:17<00:29,  3.70s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:27<00:22,  3.79s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:27<00:21,  3.66s/it][A
+
+
+
+
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:17<00:22,  3.18s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:19<00:23,  3.39s/it]Loading checkpoint shards:  42%|████▏     | 5/12 [00:22<00:25,  3.65s/it][A[A[ALoading checkpoint shards:  42%|████▏     | 5/12 [00:21<00:24,  3.54s/it][A
+Loading checkpoint shards:  42%|████▏     | 5/12 [00:20<00:24,  3.44s/it][ALoading checkpoint shards:  42%|████▏     | 5/12 [00:20<00:24,  3.43s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:28<00:15,  3.09s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:29<00:15,  3.02s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:30<00:10,  2.59s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:30<00:10,  2.58s/it][A
+
+
+
+Loading checkpoint shards:  50%|█████     | 6/12 [00:25<00:19,  3.33s/it][ALoading checkpoint shards:  50%|█████     | 6/12 [00:20<00:18,  3.02s/it]Loading checkpoint shards:  50%|█████     | 6/12 [00:22<00:18,  3.15s/it][A[ALoading checkpoint shards:  50%|█████     | 6/12 [00:23<00:19,  3.26s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:22<00:19,  3.19s/it][A
+Loading checkpoint shards:  50%|█████     | 6/12 [00:23<00:19,  3.21s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:31<00:06,  2.28s/it][A
+
+
+
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:26<00:13,  2.73s/it]Loading checkpoint shards:  58%|█████▊    | 7/12 [00:21<00:12,  2.52s/it][ALoading checkpoint shards:  58%|█████▊    | 7/12 [00:23<00:13,  2.61s/it][A[ALoading checkpoint shards:  58%|█████▊    | 7/12 [00:25<00:13,  2.68s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:24<00:13,  2.63s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:32<00:06,  2.29s/it][A
+Loading checkpoint shards:  58%|█████▊    | 7/12 [00:24<00:13,  2.72s/it][A
+
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:23<00:08,  2.19s/it][ALoading checkpoint shards:  67%|██████▋   | 8/12 [00:26<00:09,  2.30s/it][A
+
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:28<00:09,  2.38s/it][ALoading checkpoint shards:  67%|██████▋   | 8/12 [00:25<00:09,  2.30s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:26<00:09,  2.31s/it][A
+Loading checkpoint shards:  67%|██████▋   | 8/12 [00:26<00:09,  2.38s/it][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:34<00:04,  2.44s/it][A
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:34<00:04,  2.37s/it][A
+
+
+
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:24<00:06,  2.09s/it]Loading checkpoint shards:  75%|███████▌  | 9/12 [00:29<00:06,  2.17s/it][A[ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:26<00:06,  2.12s/it][ALoading checkpoint shards:  75%|███████▌  | 9/12 [00:28<00:06,  2.16s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:27<00:06,  2.13s/it][A
+Loading checkpoint shards:  75%|███████▌  | 9/12 [00:28<00:06,  2.18s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:37<00:02,  2.39s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:37<00:02,  2.45s/it][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:38<00:00,  2.02s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:38<00:00,  3.21s/it]
+Loading pipeline components...:  67%|██████▋   | 4/6 [00:57<00:30, 15.27s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:38<00:00,  2.07s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:38<00:00,  3.20s/it]
+Loading pipeline components...:  50%|█████     | 3/6 [00:57<00:57, 19.24s/it]Loading pipeline components...:  83%|████████▎ | 5/6 [00:58<00:10, 10.90s/it]Loading pipeline components...:  67%|██████▋   | 4/6 [00:58<00:25, 12.79s/it]
+
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:28<00:05,  2.53s/it][A
+
+
+
+Loading checkpoint shards:  83%|████████▎ | 10/12 [00:32<00:05,  2.59s/it][ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:33<00:05,  2.59s/it]Loading checkpoint shards:  83%|████████▎ | 10/12 [00:30<00:05,  2.55s/it][A[ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:31<00:04,  2.49s/it][ALoading checkpoint shards:  83%|████████▎ | 10/12 [00:31<00:05,  2.56s/it][ALoading pipeline components...: 100%|██████████| 6/6 [00:58<00:00,  7.73s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:58<00:00,  9.73s/it]
+WARNING 12-17 14:27:02 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Loading pipeline components...:  83%|████████▎ | 5/6 [00:58<00:08,  8.64s/it]Loading pipeline components...: 100%|██████████| 6/6 [00:58<00:00,  9.75s/it]
+WARNING 12-17 14:27:02 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+
+
+
+
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:30<00:02,  2.46s/it]
+[ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:35<00:02,  2.50s/it][ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:32<00:02,  2.47s/it][ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:34<00:02,  2.49s/it][ALoading checkpoint shards:  92%|█████████▏| 11/12 [00:33<00:02,  2.47s/it][A
+Loading checkpoint shards:  92%|█████████▏| 11/12 [00:33<00:02,  2.47s/it][A
+Loading checkpoint shards: 100%|██████████| 12/12 [00:34<00:00,  2.03s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:34<00:00,  2.88s/it]
+
+
+
+
+Loading checkpoint shards: 100%|██████████| 12/12 [00:31<00:00,  2.02s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:36<00:00,  2.05s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:33<00:00,  2.03s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:35<00:00,  2.05s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:31<00:00,  2.65s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:36<00:00,  3.06s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:33<00:00,  2.81s/it]
+Loading checkpoint shards: 100%|██████████| 12/12 [00:35<00:00,  2.96s/it]
+Loading pipeline components...: 100%|██████████| 6/6 [01:01<00:00, 10.69s/it]Loading pipeline components...: 100%|██████████| 6/6 [01:01<00:00, 10.26s/it]
+Loading pipeline components...:  50%|█████     | 3/6 [01:01<01:07, 22.34s/it]Loading pipeline components...:  50%|█████     | 3/6 [01:01<00:59, 19.92s/it]Loading pipeline components...: 100%|██████████| 6/6 [01:01<00:00, 14.80s/it]Loading pipeline components...: 100%|██████████| 6/6 [01:01<00:00, 14.50s/it]Loading pipeline components...: 100%|██████████| 6/6 [01:01<00:00, 10.23s/it]Loading pipeline components...: 100%|██████████| 6/6 [01:01<00:00, 10.27s/it]
+
+WARNING 12-17 14:27:05 [runtime_state.py:77] Model parallel is not initialized, initializing...
+WARNING 12-17 14:27:05 [runtime_state.py:77] Model parallel is not initialized, initializing...
+WARNING 12-17 14:27:05 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Loading pipeline components...:  67%|██████▋   | 4/6 [01:01<00:26, 13.11s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 177.91it/s]
+
+Loading checkpoint shards: 100%|██████████| 12/12 [00:34<00:00,  2.08s/it][ALoading checkpoint shards: 100%|██████████| 12/12 [00:34<00:00,  2.91s/it]
+Loading pipeline components...:  33%|███▎      | 2/6 [01:01<02:06, 31.71s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 164.81it/s]
+Loading pipeline components...:  67%|██████▋   | 4/6 [01:02<00:28, 14.17s/it]Loading pipeline components...:  83%|████████▎ | 5/6 [01:02<00:09,  9.32s/it]`torch_dtype` is deprecated! Use `dtype` instead!
+
+Loading checkpoint shards:   0%|          | 0/3 [00:00<?, ?it/s][ALoading checkpoint shards: 100%|██████████| 3/3 [00:00<00:00, 172.30it/s]
+Loading pipeline components...: 100%|██████████| 6/6 [01:02<00:00, 10.38s/it]
+WARNING 12-17 14:27:06 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Loading pipeline components...: 100%|██████████| 6/6 [01:02<00:00,  6.72s/it]Loading pipeline components...: 100%|██████████| 6/6 [01:02<00:00, 10.39s/it]
+WARNING 12-17 14:27:06 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Loading pipeline components...:  83%|████████▎ | 5/6 [01:02<00:09,  9.13s/it]Loading pipeline components...: 100%|██████████| 6/6 [01:02<00:00,  6.87s/it]Loading pipeline components...: 100%|██████████| 6/6 [01:02<00:00, 10.45s/it]
+WARNING 12-17 14:27:06 [runtime_state.py:77] Model parallel is not initialized, initializing...
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 1 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 2 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 3 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 4 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 6 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 5 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 7 is connected to 7 peer ranks. Expected number of connected peer ranks is : 7
+[Gloo] Rank 0[Gloo] Rank  is connected to 0 peer ranks. Expected number of connected peer ranks is : 00[Gloo] Rank  is connected to 
+0 peer ranks. 0Expected number of connected peer ranks is :  is connected to 00 peer ranks. Expected number of connected peer ranks is : 
+0[Gloo] Rank 
+[Gloo] Rank 0 is connected to 0 peer ranks. 0Expected number of connected peer ranks is :  is connected to 00 peer ranks. 
+Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0[Gloo] Rank 
+0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+Running i2v task
+Input width and height are used to calculate the max area for the video and the output video's aspect ratio is retained from the input image.
+Input image resolution: 1104x832
+Generating a video with resolution: 1104x832
+  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]  0%|          | 0/40 [00:00<?, ?it/s]final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=144696080
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
+final peak_memory=48889180
