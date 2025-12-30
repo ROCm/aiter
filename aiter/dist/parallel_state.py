@@ -418,10 +418,7 @@ class GroupCoordinator:
         ), "input shape error, input.numel() % world_size should equals to 0"
         if input_.shape[0] % world_size == 0:
             out_dim0 = input_.shape[0] // world_size
-            if out_dim0 == 1:
-                out_shape = input_.shape[1:]
-            else:
-                out_shape = (out_dim0,) + input_.shape[1:]
+            out_shape = (out_dim0,) + input_.shape[1:]
         else:
             out_shape = (input_.numel() // world_size,)
 
