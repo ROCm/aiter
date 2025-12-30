@@ -6,6 +6,7 @@ from aiter.ops.triton.fused_fp8_quant import (
     fused_flatten_fp8_group_quant,
     fused_reduce_act_mul_fp8_group_quant,
     fused_reduce_rms_fp8_group_quant,
+    fused_quant_fp8_sort,
 )
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 import aiter
@@ -453,3 +454,141 @@ def test_fused_reduce_rms_fp8_group_quant(
 
     if y3_torch is not None:
         torch.testing.assert_close(y3_torch, y3_triton, atol=0.1, rtol=0.1)
+
+
+def run_torch(scale, sorted_ids, num_valid_ids, token_num):
+    topk = 1
+    if len(scale.shape) == 3:
+        topk = scale.shape[1]
+        scale = scale.view(-1, scale.shape[-1])
+    sorted_ids[num_valid_ids:] = token_num
+    topk_ids = sorted_ids >> 24
+    sorted_ids = sorted_ids & 0xFFFFFF
+    mask = sorted_ids == token_num
+    if topk > 1:
+        sorted_ids = sorted_ids * topk + topk_ids
+    sorted_ids[mask] = 0  # set to 0 to avoid overflow
+    scale = scale[sorted_ids]
+    scale[mask] = 0
+    sm, sn = scale.shape
+    tmp = torch.zeros(
+        ((sm + 31) // 32 * 32, sn), dtype=scale.dtype, device=scale.device
+    )
+    tmp[:sm, :sn] = scale
+    scale = tmp
+    sm, sn = scale.shape
+    scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
+    scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
+    ref = scale.view(-1, sn)
+    return ref
+
+@pytest.mark.parametrize("hidden_dim", [256])
+# @pytest.mark.parametrize("token_num", [1, 32, 1024])
+@pytest.mark.parametrize("token_num", [1])
+@pytest.mark.parametrize(
+    "token_num_sort, num_valid_ids_0", [(1, 1)]
+)
+@pytest.mark.parametrize("topk", [1])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_quant_fp8_sort_sort(
+    hidden_dim: int,
+    token_num: int,
+    token_num_sort: int,
+    num_valid_ids_0: int,
+    topk: int,
+    dtype,
+):
+    num_local_tokens = None
+    num_valid_ids = torch.zeros(2, dtype=torch.int64, device="cuda")
+    num_valid_ids[0] = num_valid_ids_0
+    num_valid_ids[1] = token_num
+
+    topk_ids = torch.randint(0, topk, (token_num_sort,), device="cuda")
+    topk_ids, _ = torch.sort(topk_ids)
+    # sorted_ids = torch.randint(0, token_num, (token_num_sort,), device="cuda")
+    sorted_ids = torch.arange(token_num, device="cuda")
+    print(topk_ids)
+    print(sorted_ids)
+    sorted_ids = (topk_ids << 24) | sorted_ids
+
+    x = torch.randn((token_num, topk, hidden_dim), dtype=dtype, device="cuda") / 20
+    x = x.view(-1, hidden_dim)
+
+    fp8_dtype = aiter.dtypes.fp8
+    fp8_e8m0_dtype = aiter.dtypes.fp8_e8m0
+    from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+    x_fp8_1, scale_1 = per_1x32_f8_scale_f8_quant(x, quant_dtype=fp8_dtype, scale_type=fp8_e8m0_dtype, shuffle=False)
+    x_fp8, scale_e8m0_packed = fused_quant_fp8_sort(
+        x,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        quant_dtype=fp8_dtype,
+    )
+    # print(x)
+    print(x_fp8)
+    print(x_fp8_1)
+    print(x_fp8.shape, x_fp8_1.shape)
+    print(scale_e8m0_packed.view(torch.uint8).shape, scale_1.view(torch.uint8).shape)
+    print(scale_e8m0_packed.dtype, scale_1.dtype)
+    print(scale_1[:token_num, ...].view(torch.uint8))
+    print(scale_e8m0_packed[:token_num, ...].view(torch.uint8))
+    print(x_fp8_1[:token_num, 64], x_fp8[:token_num, 64])
+    tol = 0.01
+    torch.testing.assert_close(scale_1[:token_num, ...].view(torch.uint8), scale_e8m0_packed[:token_num, ...].view(torch.uint8), atol=tol, rtol=tol)
+    torch.testing.assert_close(x_fp8_1[:token_num, ...], x_fp8[:token_num, ...])
+    # print(x_fp8.shape, scale_e8m0_packed.shape)
+    # print(x_fp8.dtype, scale_e8m0_packed.dtype)
+    # x_fp4_ref, x_scales_ref, x_scales_ref_not_sorted = (
+    #     run_fused_dynamic_mxfp4_quant_moe_sort_ref(
+    #         x,
+    #         sorted_ids,
+    #         token_num,
+    #         topk,
+    #         q_dtype_a,
+    #         num_local_tokens,
+    #         num_valid_ids,
+    #         block_size_M,
+    #     )
+    # )
+
+    # x_fp4_triton, x_scales_triton = run_fused_dynamic_mxfp4_quant_moe_sort_triton(
+    #     x,
+    #     sorted_ids,
+    #     token_num,
+    #     topk,
+    #     q_dtype_a,
+    #     num_local_tokens,
+    #     num_valid_ids,
+    #     block_size_M,
+    # )
+
+    # tol = 0.1
+    # x_scales_ref = x_scales_ref[: num_valid_ids[0]]
+    # x_scales_triton = x_scales_triton[: num_valid_ids[0]]
+    # torch.testing.assert_close(
+    #     x_scales_ref.view(torch.uint8),
+    #     x_scales_triton.view(torch.uint8),
+    #     atol=tol,
+    #     rtol=tol,
+    # )
+    # # torch.testing.assert_close(x_fp4_ref.view(torch.uint8), x_fp4_triton.view(torch.uint8), atol=tol, rtol=tol)
+
+    # _, x_scales_ref_triton_not_sorted = dynamic_mxfp4_quant(x)
+    # x_scales_ref_triton_not_sorted = x_scales_ref_triton_not_sorted[
+    #     : x_scales_ref_not_sorted.shape[0], : x_scales_ref_not_sorted.shape[1]
+    # ]
+    # torch.testing.assert_close(
+    #     x_scales_ref_not_sorted.view(torch.uint8),
+    #     x_scales_ref_triton_not_sorted.view(torch.uint8),
+    #     atol=tol,
+    #     rtol=tol,
+    # )
+
+    # x_ref = convert_mxfp4_to_fp32(
+    #     x_fp4_ref.view(torch.uint8), x_scales_ref_not_sorted.view(torch.uint8)
+    # )
+    # x_triton = convert_mxfp4_to_fp32(
+    #     x_fp4_triton.view(torch.uint8), x_scales_ref_triton_not_sorted.view(torch.uint8)
+    # )
+    # torch.testing.assert_close(x_ref, x_triton, atol=tol, rtol=tol)
