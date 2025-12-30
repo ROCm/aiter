@@ -81,6 +81,7 @@ def ref_masked_attention(
     return out.to(dtype), lse
 
 
+@perftest()
 def torch_mla_extend(
     q,  # [total_q, nheads, headdim_q]
     kvc_cache,  # [num_block * block_size, nhead_kv, qk_head_dim]
@@ -202,7 +203,7 @@ def test_mla_prefill(
     kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
 
     # CRITICAL: Use bf16 tensors for reference (not fp8), and same data as kernel
-    out_ref, lse_ref = torch_mla_extend(
+    (out_ref, lse_ref), us_torch_prefill = torch_mla_extend(
         Q_bf16,
         kv_buffer,
         qo_indptr,
@@ -234,7 +235,7 @@ def test_mla_prefill(
         max_kvlen=max_kvlen,
         qhead_granularity=qhead_granularity,
         qlen_granularity=qlen_granularity,
-        kvlen_granularity=kvlen_granularity
+        kvlen_granularity=kvlen_granularity,
     )
     work_metadata_ptrs = torch.zeros(
         work_meta_data_size, dtype=work_meta_data_type, device=device
@@ -336,6 +337,8 @@ def test_mla_prefill(
     )
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
+    print(f"us_torch_prefill: {us_torch_prefill}")
+    print(f"us_asm_prefill: {us_aiter_asm}")
 
     return ret
 
@@ -456,7 +459,15 @@ if args.varlen is not None:
     l_varlen = [args.varlen]
 
 df = []
-for num_head, dtype, kv_dtype, ctx_len, batch_size, block_size, varlen in itertools.product(
+for (
+    num_head,
+    dtype,
+    kv_dtype,
+    ctx_len,
+    batch_size,
+    block_size,
+    varlen,
+) in itertools.product(
     l_num_heads, l_dtype, l_kvdtype, l_ctx_len, l_batch_size, l_block_size, l_varlen
 ):
     ret = test_mla_prefill(
