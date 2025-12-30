@@ -644,6 +644,7 @@ def cmdGenFunc_mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    sink_ptr: Optional[Tensor] = None,
 ):
     md_name = "mha_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
@@ -794,6 +795,7 @@ def gen_mha_bwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
@@ -825,6 +827,7 @@ def mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1105,6 +1108,7 @@ def gen_mha_varlen_bwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return gen_mha_varlen_bwd_fake_tensors_common(
         q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
@@ -1535,6 +1539,7 @@ def _flash_attn_backward_fake(
     rng_state: Optional[torch.Tensor] = None,
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
+    sink_ptr: Optional[Tensor] = None,
 ) -> torch.Tensor:
     batch_size = q.size(0)
     seqlen_q = q.size(1)
@@ -1571,6 +1576,7 @@ def _flash_attn_backward(
     rng_state: Optional[torch.Tensor] = None,
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
+    sink_ptr: Optional[Tensor] = None,
 ) -> torch.Tensor:
     # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
@@ -1688,7 +1694,8 @@ def _flash_attn_backward(
             bias,
             alibi_slopes,
             rng_state,
-            None,
+            sink_ptr,
+            None
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
@@ -1805,6 +1812,7 @@ class FlashAttnFunc(torch.autograd.Function):
             rng_state,
             ctx.is_v3_atomic_fp32,
             ctx.how_v3_bf16_cvt,
+            sink_ptr=None,
         )
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
@@ -1846,6 +1854,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # how_v3_bf16_cvt
             None,  # cu_seqlens_q
             None,  # cu_seqlens_kv
+            None,  # sink_ptr
         )
 
 
