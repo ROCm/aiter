@@ -37,7 +37,8 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    float p_dropout,
                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset,
                                    const std::optional<at::Tensor> &cu_seqlens_q_,
-                                   const std::optional<at::Tensor> &cu_seqlens_kv_)
+                                   const std::optional<at::Tensor> &cu_seqlens_kv_,
+                                   const std::optional<at::Tensor> &sink_ptr_)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -96,6 +97,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
 
     const ck_tile::index_t *cu_seqlen_q_ptr = cu_seqlens_q_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_q_.value().data_ptr<int32_t>()) : nullptr;
     const ck_tile::index_t *cu_seqlen_kv_ptr = cu_seqlens_kv_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_kv_.value().data_ptr<int32_t>()) : nullptr;
+    const void *sink_ptr      = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
 
     return mha_fwd_args{q.data_ptr(),
                         k.data_ptr(),
@@ -113,6 +115,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         nullptr, // seqlen_k_ptr
                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
                         cu_seqlen_kv_ptr, // cu_seqlen_k_ptr
+                        sink_ptr, // sink_ptr
                         seqlen_q,
                         seqlen_k,
                         b,
@@ -173,6 +176,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::optional<const at::Tensor> q_descale_,    // [1]
         std::optional<const at::Tensor> k_descale_,    // [1]
         std::optional<const at::Tensor> v_descale_,    // [1]
+        std::optional<const at::Tensor> sink_ptr,      // [hq]
         std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.scalar_type();
@@ -355,8 +359,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p_dropout,
                 drop_seed_offset,
                 cu_seqlens_q_,
-                cu_seqlens_kv_);
-
+                cu_seqlens_kv_,
+                sink_ptr);
         float t = aiter::mha_fwd(args,
                                  stream_config,
                                  dtype_str,
