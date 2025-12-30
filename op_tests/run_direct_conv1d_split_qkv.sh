@@ -26,7 +26,7 @@ if [ $? -eq 0 ]; then
     echo "Compilation successful!"
     echo ""
     echo "=== Running Test ==="
-    ./$OUT_FILE
+    ./$OUT_FILE "$@"
 else
     echo "Compilation failed!"
     exit 1

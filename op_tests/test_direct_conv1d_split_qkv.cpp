@@ -1,13 +1,26 @@
 // Direct HIP kernel test for causal_conv1d_update
-// Test configuration: batch=1, dim=2048, seqlen=1, width=4, state_len=3, silu=true, dtype=float32
+// Test configuration: batch=1, dim=2048, seqlen=1, width=4, state_len=3, silu=true, dtype=float32/bf16
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 #include <iostream>
 #include <vector>
 #include <random>
 #include <cmath>
 #include <chrono>
 #include <iomanip>
+
+// BFloat16 type alias for convenience
+using bfloat16 = hip_bfloat16;
+
+// Helper functions for BFloat16 conversions
+inline float bf16_to_float(bfloat16 val) {
+    return static_cast<float>(val);
+}
+
+inline bfloat16 float_to_bf16(float val) {
+    return bfloat16(val);
+}
 
 // Kernel parameters structure (same as in the original kernel)
 struct ConvParamsBaseUpdate {
@@ -57,7 +70,7 @@ struct ConvParamsBaseUpdate {
 
 // Kernel traits
 template<int kNThreads_, int kWidth_, typename input_t_, typename weight_t_>
-struct Causal_conv1d_update_kernel_traits {
+struct Causal_conv1d_update_split_qkv_kernel_traits {
     using input_t = input_t_;
     using weight_t = weight_t_;
     static constexpr int kNThreads = kNThreads_;
@@ -68,7 +81,7 @@ struct Causal_conv1d_update_kernel_traits {
 // The actual kernel (non-circular buffer version)
 template<typename Ktraits, bool kIsCircularBuffer>
 __global__ __launch_bounds__(Ktraits::kNThreads)
-void causal_conv1d_update_kernel(ConvParamsBaseUpdate params) {
+void causal_conv1d_update_split_qkv_kernel(ConvParamsBaseUpdate params) {
     constexpr int kWidth = Ktraits::kWidth;
     constexpr int kNThreads = Ktraits::kNThreads;
     using input_t = typename Ktraits::input_t;
@@ -192,8 +205,8 @@ void causal_conv1d_update_kernel(ConvParamsBaseUpdate params) {
     }
 }
 
-// CPU reference implementation - matches GPU kernel logic exactly
-void cpu_causal_conv1d_update(
+// CPU reference implementation - matches GPU kernel logic exactly (Float32 version)
+void cpu_causal_conv1d_update_split_qkv_fp32(
     const float* x,           // [batch, dim, seqlen]
     float* conv_state,        // [batch, dim, state_len]
     const float* weight,      // [dim, width]
@@ -291,6 +304,114 @@ void cpu_causal_conv1d_update(
     }
 }
 
+// CPU reference implementation for BFloat16
+void cpu_causal_conv1d_update_split_qkv_bf16(
+    const bfloat16* x,           // [batch, dim, seqlen]
+    bfloat16* conv_state,        // [batch, dim, state_len]
+    const bfloat16* weight,      // [dim, width]
+    const bfloat16* bias,        // [dim]
+    bfloat16* q_out,             // [batch, q_dim, seqlen]
+    bfloat16* k_out,             // [batch, k_dim, seqlen]
+    bfloat16* v_out,             // [batch, v_dim, seqlen]
+    int batch, int dim, int seqlen, int width, int state_len, bool silu,
+    int q_dim, int k_dim, int v_dim) {
+    
+    for (int b = 0; b < batch; ++b) {
+        for (int d = 0; d < dim; ++d) {
+            // Get pointers for this batch and channel
+            const bfloat16* x_ptr = x + b * dim * seqlen + d * seqlen;
+            bfloat16* state_ptr = conv_state + b * dim * state_len + d * state_len;
+            const bfloat16* weight_ptr = weight + d * width;
+            
+            // Determine which output this channel belongs to
+            bfloat16* out_ptr;
+            int local_d;
+            if (d < q_dim) {
+                local_d = d;
+                out_ptr = q_out + b * q_dim * seqlen + local_d * seqlen;
+            } else if (d < q_dim + k_dim) {
+                local_d = d - q_dim;
+                out_ptr = k_out + b * k_dim * seqlen + local_d * seqlen;
+            } else {
+                local_d = d - q_dim - k_dim;
+                out_ptr = v_out + b * v_dim * seqlen + local_d * seqlen;
+            }
+            
+            float bias_val = bias ? bf16_to_float(bias[d]) : 0.0f;
+            
+            // Load weight values and convert to float
+            float weight_vals[4] = {0};
+            for (int i = 0; i < width; ++i) {
+                weight_vals[i] = bf16_to_float(weight_ptr[i]);
+            }
+            
+            // Sliding window buffer for input values (matches GPU kernel)
+            float x_vals[4] = {0};
+            int advance_len = seqlen;
+            
+            // Step 1: Shift old state data (non-circular buffer mode)
+            int shift_count = state_len - advance_len - (width - 1);
+            for (int i = 0; i < shift_count; ++i) {
+                state_ptr[i] = state_ptr[i + advance_len];
+            }
+            
+            // Step 2: Load the most recent (width-1) historical states into x_vals
+            for (int i = 0; i < width - 1; ++i) {
+                float state_val = bf16_to_float(state_ptr[state_len - (width - 1) + i]);
+                // Copy condition from GPU kernel
+                if (i < advance_len + (width - 1) && state_len - advance_len - (width - 1) + i >= 0) {
+                    state_ptr[state_len - advance_len - (width - 1) + i] = state_ptr[state_len - (width - 1) + i];
+                }
+                x_vals[i] = state_val;
+            }
+            
+            // Step 3: Main convolution loop - Process each new input token
+            for (int i = 0; i < seqlen; ++i) {
+                // Read new input
+                float x_val = bf16_to_float(x_ptr[i]);
+                
+                // Update conv_state with new input (non-circular mode)
+                if (i < advance_len && state_len - advance_len + i >= 0) {
+                    state_ptr[state_len - advance_len + i] = x_ptr[i];
+                }
+                
+                // Add new input to the sliding window
+                x_vals[width - 1] = x_val;
+                
+                // Compute convolution output
+                float out_val = bias_val;
+                for (int j = 0; j < width; ++j) {
+                    out_val += weight_vals[j] * x_vals[j];
+                }
+                
+                // Apply SiLU activation
+                if (silu) {
+                    out_val = out_val / (1.0f + expf(-out_val));
+                }
+                
+                // Write output
+                out_ptr[i] = float_to_bf16(out_val);
+                
+                // Shift the sliding window left by 1 position
+                for (int j = 0; j < width - 1; ++j) {
+                    x_vals[j] = x_vals[j + 1];
+                }
+            }
+        }
+    }
+}
+
+// Helper wrapper for CPU reference (auto-dispatches based on dtype)
+void cpu_causal_conv1d_update_split_qkv(
+    const float* x, float* conv_state, const float* weight, const float* bias,
+    float* q_out, float* k_out, float* v_out,
+    int batch, int dim, int seqlen, int width, int state_len, bool silu,
+    int q_dim, int k_dim, int v_dim) {
+    cpu_causal_conv1d_update_split_qkv_fp32(x, conv_state, weight, bias,
+        q_out, k_out, v_out, batch, dim, seqlen, width, state_len, silu,
+        q_dim, k_dim, v_dim);
+}
+
 // Helper function to check HIP errors
 #define HIP_CHECK(cmd) \
     do { \
@@ -301,7 +422,9 @@ void cpu_causal_conv1d_update(
         } \
     } while(0)
 
-int main() {
+// Template test function for different dtypes
+template<typename T>
+int run_test(const char* dtype_name) {
     // Test configuration
     const int batch = 1;
     const int q_dim = 1024;
@@ -326,7 +449,7 @@ int main() {
     std::cout << "  Width: " << width << std::endl;
     std::cout << "  State Length: " << state_len << std::endl;
     std::cout << "  SiLU: " << (silu ? "Yes" : "No") << std::endl;
-    std::cout << "  Dtype: Float32" << std::endl;
+    std::cout << "  Dtype: " << dtype_name << std::endl;
     std::cout << "  Warmup iterations: " << warmup_iters << std::endl;
     std::cout << "  Benchmark iterations: " << bench_iters << std::endl;
     std::cout << std::endl;
@@ -337,42 +460,66 @@ int main() {
     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
     
     // Allocate host memory
-    std::vector<float> h_x(batch * dim * seqlen);
-    std::vector<float> h_conv_state(batch * dim * state_len);
-    std::vector<float> h_conv_state_cpu(batch * dim * state_len);
-    std::vector<float> h_weight(dim * width);
-    std::vector<float> h_bias(dim);
-    std::vector<float> h_q_out(batch * q_dim * seqlen);
-    std::vector<float> h_k_out(batch * k_dim * seqlen);
-    std::vector<float> h_v_out(batch * v_dim * seqlen);
-    std::vector<float> h_q_out_cpu(batch * q_dim * seqlen);
-    std::vector<float> h_k_out_cpu(batch * k_dim * seqlen);
-    std::vector<float> h_v_out_cpu(batch * v_dim * seqlen);
+    std::vector<T> h_x(batch * dim * seqlen);
+    std::vector<T> h_conv_state(batch * dim * state_len);
+    std::vector<T> h_conv_state_cpu(batch * dim * state_len);
+    std::vector<T> h_weight(dim * width);
+    std::vector<T> h_bias(dim);
+    std::vector<T> h_q_out(batch * q_dim * seqlen);
+    std::vector<T> h_k_out(batch * k_dim * seqlen);
+    std::vector<T> h_v_out(batch * v_dim * seqlen);
+    std::vector<T> h_q_out_cpu(batch * q_dim * seqlen);
+    std::vector<T> h_k_out_cpu(batch * k_dim * seqlen);
+    std::vector<T> h_v_out_cpu(batch * v_dim * seqlen);
     
     // Initialize with random data
-    for (auto& v : h_x) v = dis(gen);
-    for (auto& v : h_conv_state) v = dis(gen);
-    for (auto& v : h_weight) v = dis(gen);
-    for (auto& v : h_bias) v = dis(gen);
+    for (auto& v : h_x) {
+        if constexpr (std::is_same_v<T, float>) {
+            v = dis(gen);
+        } else {
+            v = float_to_bf16(dis(gen));
+        }
+    }
+    for (auto& v : h_conv_state) {
+        if constexpr (std::is_same_v<T, float>) {
+            v = dis(gen);
+        } else {
+            v = float_to_bf16(dis(gen));
+        }
+    }
+    for (auto& v : h_weight) {
+        if constexpr (std::is_same_v<T, float>) {
+            v = dis(gen);
+        } else {
+            v = float_to_bf16(dis(gen));
+        }
+    }
+    for (auto& v : h_bias) {
+        if constexpr (std::is_same_v<T, float>) {
+            v = dis(gen);
+        } else {
+            v = float_to_bf16(dis(gen));
+        }
+    }
     
     // Copy state for CPU reference
     h_conv_state_cpu = h_conv_state;
     
     // Allocate device memory
-    float *d_x, *d_conv_state, *d_weight, *d_bias, *d_q_out, *d_k_out, *d_v_out;
-    HIP_CHECK(hipMalloc(&d_x, batch * dim * seqlen * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_conv_state, batch * dim * state_len * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_weight, dim * width * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_bias, dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_q_out, batch * q_dim * seqlen * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_k_out, batch * k_dim * seqlen * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_v_out, batch * v_dim * seqlen * sizeof(float)));
+    T *d_x, *d_conv_state, *d_weight, *d_bias, *d_q_out, *d_k_out, *d_v_out;
+    HIP_CHECK(hipMalloc(&d_x, batch * dim * seqlen * sizeof(T)));
+    HIP_CHECK(hipMalloc(&d_conv_state, batch * dim * state_len * sizeof(T)));
+    HIP_CHECK(hipMalloc(&d_weight, dim * width * sizeof(T)));
+    HIP_CHECK(hipMalloc(&d_bias, dim * sizeof(T)));
+    HIP_CHECK(hipMalloc(&d_q_out, batch * q_dim * seqlen * sizeof(T)));
+    HIP_CHECK(hipMalloc(&d_k_out, batch * k_dim * seqlen * sizeof(T)));
+    HIP_CHECK(hipMalloc(&d_v_out, batch * v_dim * seqlen * sizeof(T)));
     
     // Copy data to device
-    HIP_CHECK(hipMemcpy(d_x, h_x.data(), batch * dim * seqlen * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_conv_state, h_conv_state.data(), batch * dim * state_len * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_weight, h_weight.data(), dim * width * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_bias, h_bias.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_x, h_x.data(), batch * dim * seqlen * sizeof(T), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_conv_state, h_conv_state.data(), batch * dim * state_len * sizeof(T), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_weight, h_weight.data(), dim * width * sizeof(T), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_bias, h_bias.data(), dim * sizeof(T), hipMemcpyHostToDevice));
     
     // Setup kernel parameters
     ConvParamsBaseUpdate params;
@@ -426,7 +573,7 @@ int main() {
     
     // Kernel configuration
     constexpr int kNThreads = 64;
-    using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, 4, float, float>;
+    using Ktraits = Causal_conv1d_update_split_qkv_kernel_traits<kNThreads, 4, T, T>;
     dim3 grid(batch, (dim + kNThreads - 1) / kNThreads);
     dim3 block(kNThreads);
     
@@ -438,15 +585,15 @@ int main() {
     std::cout << "Warming up..." << std::endl;
     for (int i = 0; i < warmup_iters; ++i) {
         // Reset state before each warmup
-        HIP_CHECK(hipMemcpy(d_conv_state, h_conv_state.data(), batch * dim * state_len * sizeof(float), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_conv_state, h_conv_state.data(), batch * dim * state_len * sizeof(T), hipMemcpyHostToDevice));
         hipLaunchKernelGGL(
-            (causal_conv1d_update_kernel<Ktraits, false>),
+            (causal_conv1d_update_split_qkv_kernel<Ktraits, false>),
             grid, block, 0, 0, params);
     }
     HIP_CHECK(hipDeviceSynchronize());
     
     // Reset state before benchmarking
-    HIP_CHECK(hipMemcpy(d_conv_state, h_conv_state.data(), batch * dim * state_len * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_conv_state, h_conv_state.data(), batch * dim * state_len * sizeof(T), hipMemcpyHostToDevice));
     
     // Benchmark
     std::cout << "Benchmarking..." << std::endl;
@@ -457,7 +604,7 @@ int main() {
     HIP_CHECK(hipEventRecord(start, 0));
     for (int i = 0; i < bench_iters; ++i) {
         hipLaunchKernelGGL(
-            (causal_conv1d_update_kernel<Ktraits, false>),
+            (causal_conv1d_update_split_qkv_kernel<Ktraits, false>),
             grid, block, 0, 0, params);
     }
     HIP_CHECK(hipEventRecord(stop, 0));
@@ -467,25 +614,32 @@ int main() {
     HIP_CHECK(hipEventElapsedTime(&elapsed_ms, start, stop));
     
     // Reset state and run once for accuracy check
-    HIP_CHECK(hipMemcpy(d_conv_state, h_conv_state.data(), batch * dim * state_len * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_conv_state, h_conv_state.data(), batch * dim * state_len * sizeof(T), hipMemcpyHostToDevice));
     hipLaunchKernelGGL(
-        (causal_conv1d_update_kernel<Ktraits, false>),
+        (causal_conv1d_update_split_qkv_kernel<Ktraits, false>),
         grid, block, 0, 0, params);
     HIP_CHECK(hipDeviceSynchronize());
     
     // Copy result back
-    HIP_CHECK(hipMemcpy(h_q_out.data(), d_q_out, batch * q_dim * seqlen * sizeof(float), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(h_k_out.data(), d_k_out, batch * k_dim * seqlen * sizeof(float), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(h_v_out.data(), d_v_out, batch * v_dim * seqlen * sizeof(float), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(h_conv_state.data(), d_conv_state, batch * dim * state_len * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_q_out.data(), d_q_out, batch * q_dim * seqlen * sizeof(T), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_k_out.data(), d_k_out, batch * k_dim * seqlen * sizeof(T), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_v_out.data(), d_v_out, batch * v_dim * seqlen * sizeof(T), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_conv_state.data(), d_conv_state, batch * dim * state_len * sizeof(T), hipMemcpyDeviceToHost));
     
     // Run CPU reference
     std::cout << "Running CPU reference..." << std::endl;
     auto cpu_start = std::chrono::high_resolution_clock::now();
-    cpu_causal_conv1d_update(
-        h_x.data(), h_conv_state_cpu.data(), h_weight.data(), h_bias.data(),
-        h_q_out_cpu.data(), h_k_out_cpu.data(), h_v_out_cpu.data(),
-        batch, dim, seqlen, width, state_len, silu, q_dim, k_dim, v_dim);
+    if constexpr (std::is_same_v<T, float>) {
+        cpu_causal_conv1d_update_split_qkv_fp32(
+            h_x.data(), h_conv_state_cpu.data(), h_weight.data(), h_bias.data(),
+            h_q_out_cpu.data(), h_k_out_cpu.data(), h_v_out_cpu.data(),
+            batch, dim, seqlen, width, state_len, silu, q_dim, k_dim, v_dim);
+    } else {
+        cpu_causal_conv1d_update_split_qkv_bf16(
+            h_x.data(), h_conv_state_cpu.data(), h_weight.data(), h_bias.data(),
+            h_q_out_cpu.data(), h_k_out_cpu.data(), h_v_out_cpu.data(),
+            batch, dim, seqlen, width, state_len, silu, q_dim, k_dim, v_dim);
+    }
     auto cpu_end = std::chrono::high_resolution_clock::now();
     auto cpu_time = std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count();
     
@@ -496,9 +650,18 @@ int main() {
     float sum_diff = 0.0f;
     int count = 0;
     
+    // Helper lambda to convert to float for comparison
+    auto to_float = [](const T& val) -> float {
+        if constexpr (std::is_same_v<T, float>) {
+            return val;
+        } else {
+            return bf16_to_float(val);
+        }
+    };
+    
     // Compare Q output
     for (int i = 0; i < batch * q_dim * seqlen; ++i) {
-        float diff = std::abs(h_q_out[i] - h_q_out_cpu[i]);
+        float diff = std::abs(to_float(h_q_out[i]) - to_float(h_q_out_cpu[i]));
         max_diff = std::max(max_diff, diff);
         sum_diff += diff;
         count++;
@@ -506,7 +669,7 @@ int main() {
     
     // Compare K output
     for (int i = 0; i < batch * k_dim * seqlen; ++i) {
-        float diff = std::abs(h_k_out[i] - h_k_out_cpu[i]);
+        float diff = std::abs(to_float(h_k_out[i]) - to_float(h_k_out_cpu[i]));
         max_diff = std::max(max_diff, diff);
         sum_diff += diff;
         count++;
@@ -514,7 +677,7 @@ int main() {
     
     // Compare V output
     for (int i = 0; i < batch * v_dim * seqlen; ++i) {
-        float diff = std::abs(h_v_out[i] - h_v_out_cpu[i]);
+        float diff = std::abs(to_float(h_v_out[i]) - to_float(h_v_out_cpu[i]));
         max_diff = std::max(max_diff, diff);
         sum_diff += diff;
         count++;
@@ -529,7 +692,7 @@ int main() {
     float max_state_diff = 0.0f;
     float sum_state_diff = 0.0f;
     for (int i = 0; i < batch * dim * state_len; ++i) {
-        float diff = std::abs(h_conv_state[i] - h_conv_state_cpu[i]);
+        float diff = std::abs(to_float(h_conv_state[i]) - to_float(h_conv_state_cpu[i]));
         max_state_diff = std::max(max_state_diff, diff);
         sum_state_diff += diff;
     }
@@ -538,8 +701,9 @@ int main() {
     std::cout << "  Max absolute error: " << std::scientific << max_state_diff << std::endl;
     std::cout << "  Avg absolute error: " << std::scientific << avg_state_diff << std::endl;
     
-    // Check if test passed
-    bool accuracy_passed = (max_diff < 1e-5f) && (max_state_diff < 1e-5f);
+    // Check if test passed (relaxed threshold for bf16)
+    float threshold = std::is_same_v<T, float> ? 1e-5f : 5e-3f;
+    bool accuracy_passed = (max_diff < threshold) && (max_state_diff < threshold);
     std::cout << std::endl;
     std::cout << "Accuracy test: " << (accuracy_passed ? "PASSED ✓" : "FAILED ✗") << std::endl;
     
@@ -569,6 +733,28 @@ int main() {
     std::cout << std::endl;
     std::cout << "Test completed successfully!" << std::endl;
     
-    return 0;
+    return accuracy_passed ? 0 : 1;
 }
 
+int main(int argc, char** argv) {
+    // Parse command line arguments for dtype
+    std::string dtype = "fp32";
+    if (argc > 1) {
+        dtype = argv[1];
+    }
+    
+    std::cout << "Testing with dtype: " << dtype << std::endl << std::endl;
+    
+    int result = 0;
+    if (dtype == "fp32" || dtype == "float32") {
+        result = run_test<float>("Float32");
+    } else if (dtype == "bf16" || dtype == "bfloat16") {
+        result = run_test<bfloat16>("BFloat16");
+    } else {
+        std::cerr << "Unknown dtype: " << dtype << std::endl;
+        std::cerr << "Supported dtypes: fp32, float32, bf16, bfloat16" << std::endl;
+        return 1;
+    }
+    
+    return result;
+}
