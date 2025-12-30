@@ -7,3 +7,5 @@ Triton's implementation uses numpy under the hood. Switch back to Triton if you'
 
 2. When possible, generate test inputs directly on the GPU (e.g with `torch.randn((M, K), device="cuda")` as opposed to `torch.randn((M, K)).cuda()`).
 It's ~2 orders of magnitude faster for large test cases. 
+
+** Run the tests with ```AITER_TRITON_LOG_LEVEL=INFO``` to get logging

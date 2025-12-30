@@ -324,7 +324,7 @@ def quantize_fp8(
     tensor: torch.Tensor, dim=()
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dev = arch_info.get_arch()
-    if dev == "gfx950":
+    if dev in ["gfx950", "gfx1201"]:
         fp8_type = torch.float8_e4m3fn
     else:
         fp8_type = torch.float8_e4m3fnuz
@@ -372,7 +372,6 @@ def quantize_int8(
 def quantize_int4(
     tensor: torch.Tensor, group_size: int, has_zp: bool
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
     # reshape tensor
     k, n = tensor.shape
     tensor = tensor.reshape(-1, group_size, n)
@@ -486,7 +485,6 @@ def input_helper_int4_w4a16(
     group_size: int,
     has_zp: bool,
 ):
-
     a = torch.randn((M, K), dtype=dtype, device="cuda")
     b = torch.rand((E, N, K), dtype=dtype, device="cuda")
 
@@ -775,7 +773,6 @@ def test_fused_moe_int4_w4a16(
     persistent: bool,
     silu_fused: bool,
 ):
-
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     if (
         M == 1
