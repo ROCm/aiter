@@ -401,7 +401,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                                    cu_seqlens_q,
                                                    kv_indptr,
                                                    kv_page_indices,
-						                           sink_ptr),
+                                                   sink_ptr,
                                                    bias_,
                                                    alibi_slopes_,
                                                    q_descale,
