@@ -50,6 +50,9 @@ def fused_mrope_3d_rms_set_kv(
     k_out: Optional[Tensor],
     v_out: Optional[Tensor],
     return_kv: bool,
+    use_shuffle_layout: bool,
+    block_size: int,
+    x: int,
 ) -> None: ...
 
 
@@ -93,4 +96,7 @@ def fused_rope_rms_set_kv(
     k_out: Optional[Tensor],
     v_out: Optional[Tensor],
     return_kv: bool,
+    use_shuffle_layout: bool,
+    block_size: int,
+    x: int,
 ) -> None: ...

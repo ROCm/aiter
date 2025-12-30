@@ -37,9 +37,10 @@ def moe_sorting(
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
-    max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
 
+    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+
     sorted_ids = torch.empty((max_num_tokens_padded,), dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
         (max_num_tokens_padded,), dtype=dtypes.fp32, device=device
@@ -59,7 +60,7 @@ def moe_sorting(
         num_valid_ids,
         moe_buf,
         num_experts,
-        block_size,
+        int(block_size),
         expert_mask,
         num_local_tokens,
         dispatch_policy,
@@ -239,6 +240,9 @@ def fused_moe_(
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    # Ensure block_size_M is int (metadata.block_m from CSV may be float)
+    if block_size_M is not None:
+        block_size_M = int(block_size_M)
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
