@@ -106,7 +106,19 @@ __global__ void fused_act_mul_quant_kernel(
     }
 
     // Phase 2: Block reduction to find the maximum absolute value
-    absMax = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
+    // Use blockDim.x (runtime block size) instead of compile-time BlockSize constant
+    if (blockDim.x == 64) {
+        absMax = block_reduce<float, hipcub::Max, 64, true>(absMax, hipcub::Max());
+    } else if (blockDim.x == 128) {
+        absMax = block_reduce<float, hipcub::Max, 128, true>(absMax, hipcub::Max());
+    } else if (blockDim.x == 256) {
+        absMax = block_reduce<float, hipcub::Max, 256, true>(absMax, hipcub::Max());
+    } else if (blockDim.x == 512) {
+        absMax = block_reduce<float, hipcub::Max, 512, true>(absMax, hipcub::Max());
+    } else {
+        // Fallback for other block sizes
+        absMax = block_reduce<float, hipcub::Max, 256, true>(absMax, hipcub::Max());
+    }
 
     // Phase 3: Compute scale
     const float inverted_DTYPE_MAX =
