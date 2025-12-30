@@ -79,7 +79,10 @@ def gemm_afp4wfp4_fake_tensor(
     M, K = x.shape
     N, _ = w.shape
 
-    config = deserialize_str(config)
+    if config is None:
+        config = _get_config(M, N, K)
+    else:
+        config = deserialize_str(config)
     num_ksplit = config["NUM_KSPLIT"]
     block_size_k = config["BLOCK_SIZE_K"]
 
@@ -114,8 +117,8 @@ def gemm_afp4wfp4_(
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
 
     Args:
-        x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K).
-        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N, K), internally transposed.
+        x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K//2).
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N, K//2), internally transposed.
         x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M, K//32).
             One scale per 32 elements in K dimension.
         w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N, K//32).
@@ -124,9 +127,10 @@ def gemm_afp4wfp4_(
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+        skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
 
     Returns:
-        torch.Tensor: Output with shape (M, N).
+        y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
     """
     _LOGGER.info(
         f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
@@ -142,7 +146,7 @@ def gemm_afp4wfp4_(
 
     if config is None:
         config = _get_config(M, N, K)
-    elif isinstance(config, str):
+    else:
         config = deserialize_str(config)
 
     if config["NUM_KSPLIT"] > 1:
@@ -253,12 +257,15 @@ def gemm_afp4wfp4(
     config: Optional[dict] = None,
     skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
-    if config is None:
-        config_hashable = None
-        M, K = x.shape
-        N, _ = w.shape
-        config = _get_config(M, N, K)
-    config_hashable = serialize_dict(config)
+    if not skip_reduce:
+        config_hashable = serialize_dict(config) if config else None
+    else:
+        if config is None:
+            config_hashable = None
+            M, K = x.shape
+            N, _ = w.shape
+            config = _get_config(M, N, K)
+        config_hashable = serialize_dict(config)
     return gemm_afp4wfp4_(
         x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce
     )
@@ -399,36 +406,35 @@ def gemm_afp4wfp4_preshuffled_scales(
 
 
 def gemm_afp4wfp4_preshuffle(
-    x,
-    w,
-    x_scales,
-    w_scales,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
     use_aot: Optional[bool] = True,
     skip_reduce: Optional[bool] = False,
-):
+) -> torch.Tensor:
     """
-    Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights using preshuffled weight scales.
+    Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
     Weight matrix and scales are stored in optimized layout for improved performance.
 
     Args:
-        x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K).
+        x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K//2).
         w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16), internally transposed.
-            Preshuffled layout: logical shape after unpacking is (N, K).
-        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M//32, K) if M >= 32,
-            or (M, K//32) if M < 32.
-        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N//32, K).
-            Groups of 32 rows in N dimension share K scales.
+        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M//32, K) if M >= 32 otherwise (M, K//32).
+            One scale per 32 elements in K dimension.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (M//32, K).
+            One scale per 32 elements in K dimension.
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
-        use_aot (Optional[bool]): Enable ahead-of-time compilation metadata.
+        skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
 
     Returns:
-        torch.Tensor: Output with shape (M, N).
+        y (torch.Tensor): Output with shape (M, N) or (SPK, M, N).
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"

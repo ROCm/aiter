@@ -28,36 +28,53 @@ def set_use_gemm_splitk_bf16(value: bool):
     _USE_GEMM_SPLITK_BF16 = value
 
 
-def batched_gemm_a16wfp4(
+def batched_gemm_a16wfp4_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str | dict] = None,
+    config: Optional[str] = None,
+    transpose_bm: Optional[bool] = False,
+    prequant: Optional[bool] = True,
+    y_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if y is None:
+        Bx, M, _ = x.shape
+        _, N, _ = w.shape
+        return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
+    return y
+
+
+@torch_compile_guard(gen_fake=batched_gemm_a16wfp4_fake_tensor)
+def batched_gemm_a16wfp4_(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
     transpose_bm: Optional[bool] = False,
     prequant: Optional[bool] = True,
     y_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Computes batched FP4 matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
-    X is quantized to MXFP4 during computation, W is pre-quantized FP4.
+    Computes batched matrix multiplication Y[i] = X[i] @ W[i]^T with BF16 activations and FP4 weights.
 
     Args:
-        x (torch.Tensor): Higher precision input batch with shape (B, M, K) (BF16 or FP16).
+        x (torch.Tensor): BF16/FP16 input matrix with shape (B, M, K).
             Quantized to MXFP4 on-the-fly during GEMM.
-        w (torch.Tensor): FP4 E2M1 weight batch with shape (B, N, K), internally transposed.
+        w (torch.Tensor): FP4 E2M1 weight batch with shape (B, N, K//2), internally transposed.
         w_scales (torch.Tensor): E8M0 per-group scale for w with shape (B, N, K//32).
             One scale per 32 elements in K dimension.
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+        config (Optional[str]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
         transpose_bm (Optional[bool]): Transpose batch and M dimensions in output.
 
-
     Returns:
-        torch.Tensor: Output batch with shape (B, M, N).
+        y (torch.Tensor): Output batch with shape (B, M, N).
     """
     _LOGGER.info(
         f"BATCHED_GEMM_AFP4WFP_PREQUANT: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w.shape)}"
@@ -74,7 +91,7 @@ def batched_gemm_a16wfp4(
 
     if config is None:
         config = _get_config(M, N, K)
-    elif isinstance(config, str):
+    else:
         config = deserialize_str(config)
 
     if y is None:
@@ -202,40 +219,18 @@ def batched_gemm_a16wfp4(
     return y
 
 
-def batched_gemm_a16wfp4_torch_compile_guard_fake_tensor(
+def batched_gemm_a16wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    config: Optional[dict] = None,
     transpose_bm: Optional[bool] = False,
     prequant: Optional[bool] = True,
     y_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if y is None:
-        Bx, M, _ = x.shape
-        _, N, _ = w.shape
-        return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
-    return y
-
-
-@torch_compile_guard(gen_fake=batched_gemm_a16wfp4_torch_compile_guard_fake_tensor)
-def batched_gemm_a16wfp4_torch_compile_guard(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    transpose_bm: Optional[bool] = False,
-    prequant: Optional[bool] = True,
-    y_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    This wrapper API is a torch compile guarded function that blocks the usage of skip_reduce
-    """
     config_hashable = serialize_dict(config) if config else None
-    return batched_gemm_a16wfp4(
+    return batched_gemm_a16wfp4_(
         x, w, w_scales, dtype, y, config_hashable, transpose_bm, prequant, y_scale
     )
