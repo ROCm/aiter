@@ -10,6 +10,7 @@ import itertools
 import argparse
 import triton
 import triton.language as tl
+import pandas as pd
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -23,7 +24,12 @@ torch.set_printoptions(sci_mode=False)
 def check_support(dtype, kv_dtype, nhead, non_persistent_mode):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if non_persistent_mode and dtype == dtypes.fp8 and kv_dtype == dtypes.fp8 and nhead not in [16, 128]:
+    if (
+        non_persistent_mode
+        and dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and nhead not in [16, 128]
+    ):
         return False
     return True
 
@@ -497,7 +503,6 @@ def test_mla(
         dtype=out_dtype,
     )
 
-
     def test_sparse_mla_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
@@ -616,7 +621,6 @@ def test_mla(
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
             )
-
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
@@ -784,8 +788,6 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
-
-import pandas as pd
 
 args = parser.parse_args()
 list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
