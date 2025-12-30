@@ -57,6 +57,7 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                              bias_enum bias_type,
                              bool has_lse,
                              bool has_dropout,
+                             quant_scale_enum qscale_type,
                              bool skip_min_seqlen_q,
                              ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
                              int page_size)
@@ -71,9 +72,9 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
               bias_type,
               has_lse,
               has_dropout,
-              quant_scale_enum::no_scale, // qscale_type
+              qscale_type,
               skip_min_seqlen_q,
-              false,
+              false, // has_sink
               ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT,
               kv_lookup_table,
               page_size}
