@@ -799,7 +799,6 @@ def test_mrope_3d_rms_set_kv(
 
 
 if __name__ == "__main__":
-    """
     print("\n\n================== test_rope_rms ==================\n\n")
     is_neox_styles = [True, False]
     num_tokens = [513, 1257, 127, 778, 10024, 3]
@@ -893,7 +892,6 @@ if __name__ == "__main__":
                                         use_shuffle_layout=use_shuffle_layout,
                                         page_size=page_size,
                                     )
-    """
     print("\n\n================== test_mrope_3d_rms_set_kv ==================\n\n")
     is_neox_styles = [True, False]
     num_tokens = [513, 1257, 127, 778, 10024, 3]

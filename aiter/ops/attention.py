@@ -144,7 +144,7 @@ def gen_pa_ps_fwd_asm(
         return torch.empty_like(Q)
 
 
-@compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
+@compile_ops("module_attention_asm", gen_fake=gen_pa_ps_fwd_asm)
 def pa_ps_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
