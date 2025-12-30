@@ -251,5 +251,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-    config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
-    return compute_splitk_params(config, K)
+    config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K)
+    return compute_splitk_params(config, K), is_tunned
