@@ -2687,7 +2687,7 @@ def mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
-    bias:Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
