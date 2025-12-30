@@ -1054,6 +1054,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/topk_per_row_kernels.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topk_per_row_decode.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topk_per_row_prefill.cu'",
             "f'{AITER_CSRC_DIR}/pybind/topk_per_row_pybind.cu'"
         ],
         "flags_extra_cc": [],
