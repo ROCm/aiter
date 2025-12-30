@@ -66,14 +66,62 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
 
-def gemm_afp4wfp4(
+def gemm_afp4wfp4_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str | dict] = None,
+    config: Optional[str] = None,
+    skip_reduce: Optional[bool] = False,
+) -> torch.Tensor:
+    M, K = x.shape
+    N, _ = w.shape
+
+    config = deserialize_str(config)
+    num_ksplit = config["NUM_KSPLIT"]
+    block_size_k = config["BLOCK_SIZE_K"]
+
+    if num_ksplit > 1:
+        _, block_size_k, num_ksplit = get_splitk(
+            K, config["BLOCK_SIZE_K"], num_ksplit
+        )
+
+    if block_size_k >= 2 * K:
+        num_ksplit= 1
+
+    if num_ksplit > 1:
+        if _USE_GEMM_SPLITK_BF16:
+            y_pp = torch.empty(
+                (num_ksplit, M, N), dtype=y.dtype, device=x.device
+            )
+        else:
+            y_pp = torch.empty(
+                (num_ksplit, M, N), dtype=torch.float32, device=x.device
+            )
+    else:
+        y_pp = None
+
+    if y is None and (num_ksplit == 1 or not skip_reduce):
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+    if num_ksplit > 1:
+        if skip_reduce:
+            return y_pp
+
+    return y
+
+
+@torch_compile_guard(gen_fake=gemm_afp4wfp4_fake_tensor)
+def gemm_afp4wfp4_(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
     skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
     """
@@ -540,38 +588,20 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config, use_aot)
 
 
-def gemm_afp4wfp4_torch_compile_guard_fake_tensor(
+def gemm_afp4wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    config: Optional[dict] = None,
     skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
-    if y is None:
-        M, _ = x.shape
+    if config is None:
+        config_hashable = None
+        M, K = x.shape
         N, _ = w.shape
-        return torch.empty((M, N), dtype=dtype, device=x.device)
-    return y
-
-
-@torch_compile_guard(gen_fake=gemm_afp4wfp4_torch_compile_guard_fake_tensor)
-def gemm_afp4wfp4_torch_compile_guard(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    x_scales: torch.Tensor,
-    w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-) -> torch.Tensor:
-    """
-    This wrapper API is a torch compile guarded version of gemm_afp4wfp4
-    Note that this wrapper function blocks the usage of skip_reduce.
-    """
-    config_hashable = serialize_dict(config) if config else None
-    return gemm_afp4wfp4(
-        x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce=False
-    )
+        config = _get_config(M, N, K)
+    config_hashable = serialize_dict(config)
+    return gemm_afp4wfp4_(x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce)
