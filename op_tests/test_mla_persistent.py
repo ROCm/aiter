@@ -15,7 +15,7 @@ torch.set_printoptions(sci_mode=False)
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
-# qdtype fp8, kdtype bf16: nhead16
+# qdtype bf16, kdtype fp8: nhead16
 
 
 def check_support(dtype, kv_dtype, nhead):

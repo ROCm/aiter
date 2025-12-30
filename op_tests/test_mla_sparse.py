@@ -17,11 +17,13 @@ torch.set_printoptions(sci_mode=False)
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
-# qdtype fp8, kdtype bf16: nhead16
+# qdtype bf16, kdtype fp8: nhead16
 
 
-def check_support(dtype, kv_dtype, nhead):
+def check_support(dtype, kv_dtype, nhead, non_persistent_mode):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    if non_persistent_mode and dtype == dtypes.fp8 and kv_dtype == dtypes.fp8 and nhead not in [16, 128]:
         return False
     return True
 
@@ -512,7 +514,6 @@ def test_mla(
                 kv_last_page_lens,
                 1,
                 sm_scale,
-                num_kv_splits=max_split_per_batch,
             )
         else:
             (attn_logits, attn_lse), us_asm_decode = run_perftest(
@@ -797,7 +798,7 @@ for nhead, decode_qlen in list_nhead:
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
         list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
-        if check_support(dtype, kvtype, nhead):
+        if check_support(dtype, kvtype, nhead, args.non_persistent_mode):
             ret = test_mla(
                 ctx_len,
                 batch_size,
