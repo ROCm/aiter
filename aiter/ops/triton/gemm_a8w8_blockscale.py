@@ -166,6 +166,7 @@ def gemm_a8w8_blockscale_preshuffle(
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
     skip_reduce: Optional[bool] = False,
+    is_x_scale_tranposed: Optional[bool] = True,
 ):
     """
     Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
@@ -266,8 +267,12 @@ def gemm_a8w8_blockscale_preshuffle(
         0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
         y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scale.stride(0),
-        x_scale.stride(1),
+        x_scale.stride(1) if is_x_scale_tranposed else x_scale.stride(0),
+        (
+            (x_scale.numel() // x_scale.stride(0))
+            if is_x_scale_tranposed
+            else x_scale.stride(1)
+        ),
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
