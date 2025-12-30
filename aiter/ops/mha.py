@@ -976,6 +976,9 @@ def cmdGenFunc_mha_batch_prefill(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
@@ -993,6 +996,12 @@ def cmdGenFunc_mha_batch_prefill(
     elif q.dtype == torch.bfloat16:
         md_name += "_bf16"
         filter_fwd += "bf16*"
+    elif q.dtype == dtypes.fp8:
+        if out is None or out.dtype == dtypes.bf16:
+            md_name += "_fp8bf16"
+            filter_fwd += "fp8bf16*"
+        else:
+            raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if 0.0 < logits_soft_cap:
         md_name += "_logits"
         filter_fwd += "_logits*"
@@ -1023,6 +1032,13 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_dropout"
         filter_fwd += "_dropout*"
+    if q_descale is None or k_descale is None or v_descale is None:
+        md_name += "_nqscale"
+        filter_fwd += "_nqscale*"
+    else:
+        # only support per-tensor quantization for now
+        md_name += "_pertensor"
+        filter_fwd += "_pertensor*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -2595,6 +2611,9 @@ def mha_batch_prefill_fake_tensors(
     out: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
@@ -2666,10 +2685,13 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    kv_last_page_lens: Optional[Tensor]=None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -2688,6 +2710,7 @@ def _mha_batch_prefill(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
@@ -2696,6 +2719,9 @@ def _mha_batch_prefill(
     kv_last_page_lens: torch.Tensor = None,
     block_table: torch.Tensor = None,
     seqlen_k: torch.Tensor = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2718,9 +2744,11 @@ def _mha_batch_prefill(
         return_lse,
         return_softmax,
         out,
-        None,
+        bias,
         alibi_slopes,
-        None,
+        q_descale,
+        k_descale,
+        v_descale,
         kv_last_page_lens,
         block_table,
         seqlen_k,
@@ -2751,19 +2779,23 @@ def mha_batch_prefill_func(
     kv_last_page_lens=None,
     block_table=None,
     seqlen_k=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(-1)
+    k_vector_size = 16 // k.element_size()
     if k.dim() != 5 or v.dim() != 5:
         raise ValueError("Batch prefill requires 5D vectorized K/V tensors")
     head_size_v_og = v.size(-2)
-    if head_size_q_og % 8 != 0 or head_size_v_og % 8 != 0:
-        raise ValueError("Vectorized KV requires head size divisible by 8")
-    if k.size(-3) * 8 != head_size_q_og:
+    if head_size_q_og % k_vector_size != 0 or head_size_v_og % k_vector_size != 0:
+        raise ValueError("Vectorized KV requires head size divisible by vector size")
+    if k.size(-3) * k_vector_size != head_size_q_og:
         raise ValueError("K vectorized layout does not match Q head size")
-    if k.size(-2) % 8 != 0:
-        raise ValueError("Vectorized KV requires page size divisible by 8")
+    if k.size(-2) % k_vector_size != 0:
+        raise ValueError("Vectorized KV requires page size divisible by vector size")
     if not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("Vectorized KV requires contiguous K/V")
     out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
@@ -2788,6 +2820,9 @@ def mha_batch_prefill_func(
         kv_last_page_lens=kv_last_page_lens,
         block_table=block_table,
         seqlen_k=seqlen_k,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     out = out_padded[..., :head_size_v_og]
 

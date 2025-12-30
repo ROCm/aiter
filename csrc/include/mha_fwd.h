@@ -144,6 +144,7 @@ mha_batch_prefill(mha_batch_prefill_args args,
                   mask_enum mask_type,
                   bias_enum bias_type,
                   bool has_lse,
+                  quant_scale_enum qscale_type,
                   bool use_ext_asm);
 
 struct __attribute__((packed)) fmha_fwd_v3_args

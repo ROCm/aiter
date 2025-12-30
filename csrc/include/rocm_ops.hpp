@@ -1031,10 +1031,13 @@ namespace py = pybind11;
           py::arg("out")               = std::nullopt, \
           py::arg("bias")              = std::nullopt, \
           py::arg("alibi_slopes")      = std::nullopt, \
-          py::arg("gen")               = std::nullopt, \
+          py::arg("q_descale")         = std::nullopt, \
+          py::arg("k_descale")         = std::nullopt, \
+          py::arg("v_descale")         = std::nullopt, \
           py::arg("kv_last_page_lens") = std::nullopt, \
           py::arg("block_table")       = std::nullopt, \
-          py::arg("seqlen_k")          = std::nullopt);
+          py::arg("seqlen_k")          = std::nullopt, \
+          py::arg("gen")               = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
     m.def("topk_softmax",                                                      \
