@@ -202,7 +202,7 @@ def test_sage(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     layout: str,
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ):
     torch.cuda.empty_cache()
 

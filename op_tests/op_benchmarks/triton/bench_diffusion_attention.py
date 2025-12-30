@@ -6,7 +6,6 @@ import glob
 
 import sys
 import argparse
-import itertools
 import aiter
 import triton
 
@@ -195,7 +194,7 @@ def fav3_fp8_forward_func(
     )
 
 
-def sagev1_forward_func(q, k, v, sm_scale, layout, k_smooth=True):
+def sagev1_forward_func(q, k, v, sm_scale, layout, dtype, k_smooth=True):
     config = _get_config()
     # permute back to BHSD which is the underlying tensor format
 
@@ -218,7 +217,7 @@ def sagev1_forward_func(q, k, v, sm_scale, layout, k_smooth=True):
         q_scale,
         k_scale,
         layout=reversed_tensor_converter[layout],
-        output_dtype=torch.bfloat16,
+        output_dtype=dtype,
         config=config,
     )
 
@@ -292,19 +291,6 @@ def fav3_sage_forward_func(
         inference_mode=inference_mode,
         layout=layout,
     )
-
-
-def nonvarlen_benchmark_configs():
-    batch_sizes = [1, 4, 16]
-    N_HEADS = [16, 48]
-    seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192]
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
-    configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
-        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
-    ]
-    return configs
 
 
 def create_benchmark_configs(args):
@@ -428,7 +414,7 @@ def primary_output(result):
     return result
 
 
-def attention_caller(q, k, v, func_name, softmax_scale, k_smooth, layout):
+def attention_caller(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
@@ -446,6 +432,7 @@ def attention_caller(q, k, v, func_name, softmax_scale, k_smooth, layout):
             layout=layout,
             sm_scale=softmax_scale,
             k_smooth=k_smooth,
+            dtype=dtype,
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -490,7 +477,7 @@ def bench_kernel(q, k, v, args, provider):
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
     softmax_scale = 1.0 / (D_HEAD**0.5)
-    k_smooth = not args.no_k_smooth
+    k_smooth = args.k_smooth
 
     # FLOPS calculation variables
     total_flops = 0.0
@@ -515,6 +502,7 @@ def bench_kernel(q, k, v, args, provider):
         softmax_scale=softmax_scale,
         k_smooth=k_smooth,
         layout=args.layout,
+        dtype=arg_to_torch_dtype[args.dtype],
     )
     ms = triton.testing.do_bench(fn)
 
@@ -537,6 +525,7 @@ def bench_kernel(q, k, v, args, provider):
                 softmax_scale=softmax_scale,
                 k_smooth=k_smooth,
                 layout=args.layout,
+                dtype=arg_to_torch_dtype[args.dtype],
             )()
         )
 
@@ -718,10 +707,8 @@ def parse_args():
         default=False,
         help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.",
     )
-    parser.add_argument("-no_k_smooth", action="store_true", default=False)
-    parser.add_argument("-quantize_p", action="store_true", default=False)
-    parser.add_argument("--dtype", default="fp16")
-    parser.add_argument("-bench_torch", action="store_true", default=False)
+    parser.add_argument("-k_smooth", action="store_true", default=True)
+    parser.add_argument("--dtype", default="bf16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
     parser.add_argument("--layout", type=str, default="bshd", help=supported_layouts())
     parser.add_argument(
@@ -802,7 +789,6 @@ def main():
     ), "Only fp16, bf16 and f32 types currently supported."
 
     if args.print_vgpr:
-        assert not args.bench_torch, "Do not use -bench_torch with -print_vgpr."
         print("Retrieving VGPR usage for Triton kernels...")
 
         print_vgpr(lambda: run_benchmark(args), get_caller_name_no_ext())
