@@ -68,6 +68,7 @@ mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
                                   bias_enum bias_type,
                                   bool has_lse,
                                   bool has_dropout,
+                                  quant_scale_enum qscale_type,
                                   ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
                                   int page_size,
                                   bool skip_min_seqlen_q = false)
@@ -81,6 +82,7 @@ mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
                           bias_type,
                           has_lse,
                           has_dropout,
+                          qscale_type,
                           skip_min_seqlen_q,
                           kv_lookup_table,
                           page_size);
@@ -182,6 +184,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
+              quant_scale_enum qscale_type,
               bool use_ext_asm)
 {
     int head_size_q = args.hdim_q;
@@ -199,6 +202,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
+                                     qscale_type,
                                      kv_lookup_table,
                                      args.page_block_size);
     return fmha_batch_prefill(traits, args, stream_config);

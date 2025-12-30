@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck_tile/core.hpp"
+#include <cstdint>
 #include <hip/hip_runtime.h>
 #include <iostream>
 
@@ -10,6 +11,16 @@ enum class GPUArch
     gfx942,
     gfx950
 };
+
+#define CHECK_COND(x)                                                                             \
+    do                                                                                            \
+    {                                                                                             \
+        if(!(x))                                                                                  \
+        {                                                                                         \
+            std::cerr << "check failed, file=" << __FILE__ << ", line=" << __LINE__ << std::endl; \
+            std::terminate();                                                                     \
+        }                                                                                         \
+    } while(0)
 
 #define HIP_CALL(call)                                                       \
     do                                                                       \
