@@ -29,6 +29,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   std::optional<const at::Tensor> q_descale,     // [1]
                   std::optional<const at::Tensor> k_descale,     // [1]
                   std::optional<const at::Tensor> v_descale,     // [1]
+                  std::optional<const at::Tensor> sink_ptr_,     // [hq];
                   std::optional<at::Generator> gen_);
 } // namespace torch_itfs
 } // namespace aiter

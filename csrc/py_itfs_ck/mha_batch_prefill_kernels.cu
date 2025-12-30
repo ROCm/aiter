@@ -27,6 +27,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                const at::Tensor seqlens_q,
                                const at::Tensor kv_indptr,
                                const at::Tensor kv_page_indices,
+			                   const at::Tensor sink_ptr_,
                                std::optional<const at::Tensor>& bias_,
                                std::optional<const at::Tensor>& alibi_slopes_,
                                std::optional<const at::Tensor>& q_descale,
@@ -109,6 +110,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.q_descale_ptr   = q_descale.has_value() ? q_descale.value().data_ptr() : nullptr;
     args.k_descale_ptr   = k_descale.has_value() ? k_descale.value().data_ptr() : nullptr;
     args.v_descale_ptr   = v_descale.has_value() ? v_descale.value().data_ptr() : nullptr;
+    args.sink_ptr        = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
     args.rand_val_ptr    = has_dropout_randval ? dropout_randval.data_ptr() : nullptr;
     args.lse_ptr         = has_lse ? softmax_lse.data_ptr() : nullptr;
     args.o_ptr           = out.data_ptr();
@@ -184,6 +186,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   std::optional<const at::Tensor> q_descale,     // [1]
                   std::optional<const at::Tensor> k_descale,     // [1]
                   std::optional<const at::Tensor> v_descale,     // [1]
+                  std::optional<const at::Tensor> sink_ptr,      // [hq]
                   std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.scalar_type();
@@ -242,7 +245,6 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     const int num_heads_k = k.size(1);
 
     const int num_blocks = k.size(0);
-
     if(max_seqlen_q == 1 && !alibi_slopes_.has_value())
     {
         is_causal = false;
@@ -399,6 +401,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                                    cu_seqlens_q,
                                                    kv_indptr,
                                                    kv_page_indices,
+						                           sink_ptr),
                                                    bias_,
                                                    alibi_slopes_,
                                                    q_descale,

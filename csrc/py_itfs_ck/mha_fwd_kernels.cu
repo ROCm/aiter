@@ -40,7 +40,8 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    const std::optional<at::Tensor> &cu_seqlens_kv_,
                                    const std::string& data_type,
                                    bias_enum bias_type,
-                                   quant_scale_enum qscale_type)
+                                   quant_scale_enum qscale_type,
+                                   const std::optional<at::Tensor> &sink_ptr_)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -99,7 +100,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
 
     const ck_tile::index_t *cu_seqlen_q_ptr = cu_seqlens_q_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_q_.value().data_ptr<int32_t>()) : nullptr;
     const ck_tile::index_t *cu_seqlen_kv_ptr = cu_seqlens_kv_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_kv_.value().data_ptr<int32_t>()) : nullptr;
-
+    const void *sink_ptr      = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
     return mha_fwd_args{false, // use_asm_v3
                         false, // v3_api_check
                         1, // how_v3_bf16_cvt
@@ -125,6 +126,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         nullptr, // seqlen_k_ptr
                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
                         cu_seqlen_kv_ptr, // cu_seqlen_k_ptr
+                        sink_ptr, // sink_ptr
                         seqlen_q,
                         seqlen_k,
                         b,
@@ -185,6 +187,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::optional<const at::Tensor> q_descale_,    // [1]
         std::optional<const at::Tensor> k_descale_,    // [1]
         std::optional<const at::Tensor> v_descale_,    // [1]
+        std::optional<const at::Tensor> sink_ptr,      // [hq]
         std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.scalar_type();
@@ -369,7 +372,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 cu_seqlens_kv_,
                 dtype_str,
                 bias_type,
-                qscale_type);
+                qscale_type,
+                sink_ptr);
 
         float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
