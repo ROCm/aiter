@@ -46,6 +46,15 @@ except ImportError:
     )
     GLUON_AOT_COMPILE_ENABLED = False
 
+TORCH_TO_TL_DTYPE = {
+    torch.float8_e4m3fnuz: tl.float8e4b8,
+    torch.float8_e4m3fn: tl.float8e4nv,
+}
+TORCH_TO_TL_DTYPE_SIG = {
+    torch.float8_e4m3fnuz: "fp8e4b8",
+    torch.float8_e4m3fn: "fp8e4nv",
+}
+
 MD_NAME = "pa_decode_attention_reduce_kernel"
 
 
@@ -166,14 +175,16 @@ def compile(
             else:
                 waves_per_eu = 4
 
-        if compute_type == tl.float8e4b8 or compute_type == tl.bfloat16:
+        tl_fp8_type = TORCH_TO_TL_DTYPE[aiter.dtypes.fp8]
+        tl_fp8_type_sig = TORCH_TO_TL_DTYPE_SIG[aiter.dtypes.fp8]
+        if compute_type == tl_fp8_type or compute_type == tl.bfloat16:
             if query_quant_mode >= 0:
-                query_sig = "*fp8e4b8:16"
+                query_sig = f"*{tl_fp8_type_sig}:16"
             else:
                 query_sig = "*bf16:16"
             if kv_quant_mode >= 0:
-                key_cache_sig = "*fp8e4b8:16"
-                value_cache_sig = "*fp8e4b8:16"
+                key_cache_sig = f"*{tl_fp8_type_sig}:16"
+                value_cache_sig = f"*{tl_fp8_type_sig}:16"
             else:
                 key_cache_sig = "*bf16:16"
                 value_cache_sig = "*bf16:16"
@@ -181,12 +192,12 @@ def compile(
             output_sig = "*bf16:16"
         elif compute_type == tl.float16:
             if query_quant_mode >= 0:
-                query_sig = "*fp8e4b8:16"
+                query_sig = f"*{tl_fp8_type_sig}:16"
             else:
                 query_sig = "*fp16:16"
             if kv_quant_mode >= 0:
-                key_cache_sig = "*fp8e4b8:16"
-                value_cache_sig = "*fp8e4b8:16"
+                key_cache_sig = f"*{tl_fp8_type_sig}:16"
+                value_cache_sig = f"*{tl_fp8_type_sig}:16"
             else:
                 key_cache_sig = "*fp16:16"
                 value_cache_sig = "*fp16:16"

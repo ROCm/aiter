@@ -65,6 +65,17 @@ struct MoeFlatmmConfig
     static constexpr bool TiledMMAPermuteN = false;
 };
 
+__host__ static constexpr int32_t GetBMemNTType(int32_t M, int32_t N, int32_t K)
+{
+	(void)N;
+	(void)K;
+	if(M <= 416)
+	{
+		return 2;
+	}
+	return 0;
+}
+
 template <typename FlatmmConfig,
           typename ADataType,
           typename BDataType,
@@ -141,8 +152,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
 
-    const int32_t b_mem_nt_type =
-        static_cast<int32_t>(BaseGemmPipeline::GetBMemNTType(args.NumTokens, args.N, args.K));
+    const int32_t b_mem_nt_type = GetBMemNTType(args.NumTokens, args.N, args.K);
 
     float ave_time{0};
 
