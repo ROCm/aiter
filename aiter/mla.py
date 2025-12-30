@@ -72,7 +72,7 @@ def _fwd_kernel_stage2_asm(
         else:
             e_sum = 0.0
             e_max = -float("inf")
-            acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+            acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
             for split_kv_id in range(0, num_valid_kv_splits):
                 tv = tl.load(
                     Mid_O + offs_v + split_kv_id * stride_mid_os * Lv,
@@ -431,12 +431,10 @@ def mla_ps_prefill_fwd(
     total_partial_rows = padded_num_tokens * available_tgs
 
     logits = torch.empty(
-        (total_partial_rows, nhead, v_head_dim),
-        dtype=dtypes.fp32, device=device
+        (total_partial_rows, nhead, v_head_dim), dtype=dtypes.fp32, device=device
     )
     attn_lse = torch.empty(
-        (total_partial_rows, nhead),
-        dtype=dtypes.fp32, device=device
+        (total_partial_rows, nhead), dtype=dtypes.fp32, device=device
     )
 
     aiter.mla_ps_prefill_asm_fwd(
@@ -482,31 +480,29 @@ def mla_ps_prefill_fwd(
     #     final_lse,
     # )
 
-
     return output.view(total_s, nhead, v_head_dim), attn_lse
-
 
 
 @triton.jit
 def _mla_prefill_reduce_kernel(
     # Input tensors
-    partial_output_ptr,     # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
-    partial_lse_ptr,        # [padded_num_tokens * available_tgs, num_head_q]
+    partial_output_ptr,  # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
+    partial_lse_ptr,  # [padded_num_tokens * available_tgs, num_head_q]
     # Metadata tensors
-    reduce_indptr_ptr,      # [num_reduce_groups + 1]
-    reduce_final_map_ptr,   # [num_reduce_groups, 2]: [qo_start, qo_end]
-    reduce_partial_map_ptr, # [num_partial_tiles]: [partial_qo_loc]
+    reduce_indptr_ptr,  # [num_reduce_groups + 1]
+    reduce_final_map_ptr,  # [num_reduce_groups, 2]: [qo_start, qo_end]
+    reduce_partial_map_ptr,  # [num_partial_tiles]: [partial_qo_loc]
     # Output tensor
-    output_ptr,             # [total_tokens, num_head_q, v_head_dim]
+    output_ptr,  # [total_tokens, num_head_q, v_head_dim]
     # Strides
-    stride_po_tok: tl.constexpr,
-    stride_po_head: tl.constexpr,
-    stride_po_dim: tl.constexpr,
-    stride_lse_tok: tl.constexpr,
-    stride_lse_head: tl.constexpr,
-    stride_o_tok: tl.constexpr,
-    stride_o_head: tl.constexpr,
-    stride_o_dim: tl.constexpr,
+    stride_po_tok,
+    stride_po_head,
+    stride_po_dim,
+    stride_lse_tok,
+    stride_lse_head,
+    stride_o_tok,
+    stride_o_head,
+    stride_o_dim,
     # Constants
     TILE_Q: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
@@ -519,9 +515,10 @@ def _mla_prefill_reduce_kernel(
 
     All heads are uniformly split and reduced together.
     """
+
     group_id = tl.program_id(0)
     head_id = tl.program_id(1)
-    tok_offset = tl.program_id(2) # q_tile
+    tok_offset = tl.program_id(2)  # q_tile
 
     # Load reduce group metadata (read once per block)
     start_idx = tl.load(reduce_indptr_ptr + group_id)
@@ -543,46 +540,33 @@ def _mla_prefill_reduce_kernel(
     if tok_id >= q_len:
         return
 
-    # Load all partial_qo_loc
-    partial_qo_locs = tl.zeros([MAX_PARTIALS], dtype=tl.int32)
-    for p_idx in range(MAX_PARTIALS):
-        if p_idx < num_partials:
-            partial_map_idx = start_idx + p_idx
-            partial_qo_locs = tl.where(
-                p_idx == tl.arange(0, MAX_PARTIALS),
-                tl.load(reduce_partial_map_ptr + partial_map_idx),
-                partial_qo_locs
-            )
+    # compute max LSE and collect LSE values
+    max_lse = -float("inf")
+    lse_values = tl.zeros((MAX_PARTIALS,), dtype=tl.float32) - float("inf")
 
-    # compute max LSE (read LSE once per token)
-    max_lse = -float('inf')
-    lse_values = tl.zeros([MAX_PARTIALS], dtype=tl.float32)
-
-    for p_idx in range(MAX_PARTIALS):
+    for p_idx in range(num_partials):
         if p_idx < num_partials:
             partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
 
-            lse_offset = (partial_qo_loc + tok_id) * stride_lse_tok + head_id * stride_lse_head
+            lse_offset = (
+                partial_qo_loc + tok_id
+            ) * stride_lse_tok + head_id * stride_lse_head
             lse = tl.load(partial_lse_ptr + lse_offset)
 
             is_valid = lse == lse
-            lse = tl.where(is_valid, lse, -float('inf'))
+            lse = tl.where(is_valid, lse, -float("inf"))
 
-            # Store for reuse
-            lse_values = tl.where(
-                p_idx == tl.arange(0, MAX_PARTIALS),
-                lse,
-                lse_values
-            )
+            lse_values = tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse, lse_values)
 
             # Update max
             max_lse = tl.maximum(max_lse, lse)
 
-    # compute sum_exp (reuse loaded LSE values)
+    # compute sum_exp
     sum_exp = 0.0
-    for p_idx in range(MAX_PARTIALS):
+    for p_idx in tl.static_range(MAX_PARTIALS):
         if p_idx < num_partials:
-            lse = tl.sum(tl.where(p_idx == tl.arange(0, MAX_PARTIALS), lse_values, 0.0))
+            # Extract the lse value for this partition
+            lse = tl.sum(tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse_values, 0.0))
             exp_val = tl.exp(lse - max_lse)
             sum_exp += exp_val
 
@@ -596,20 +580,28 @@ def _mla_prefill_reduce_kernel(
         dim_offs = dim_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
         dim_mask = dim_offs < V_HEAD_DIM
 
-        acc = tl.zeros([BLOCK_DIM], dtype=tl.float32)
+        acc = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
 
-        for p_idx in range(MAX_PARTIALS):
+        for p_idx in tl.static_range(MAX_PARTIALS):
             if p_idx < num_partials:
                 partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
 
-                # reuse LSE value
-                lse = tl.sum(tl.where(p_idx == tl.arange(0, MAX_PARTIALS), lse_values, 0.0))
+                # Extract lse value
+                lse = tl.sum(
+                    tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse_values, 0.0)
+                )
 
                 scale = tl.exp(lse - final_lse)
 
                 # load partial output
-                out_offset = (partial_qo_loc + tok_id) * stride_po_tok + head_id * stride_po_head + dim_offs * stride_po_dim
-                partial_out = tl.load(partial_output_ptr + out_offset, mask=dim_mask, other=0.0)
+                out_offset = (
+                    (partial_qo_loc + tok_id) * stride_po_tok
+                    + head_id * stride_po_head
+                    + dim_offs * stride_po_dim
+                )
+                partial_out = tl.load(
+                    partial_output_ptr + out_offset, mask=dim_mask, other=0.0
+                )
 
                 # Handle NaN in output (NaN != NaN)
                 is_valid_out = partial_out == partial_out
@@ -617,34 +609,52 @@ def _mla_prefill_reduce_kernel(
 
                 acc += scale * partial_out
 
-        output_offset = (qo_start + tok_id) * stride_o_tok + head_id * stride_o_head + dim_offs * stride_o_dim
-        tl.store(output_ptr + output_offset, acc.to(output_ptr.dtype.element_ty), mask=dim_mask)
+        output_offset = (
+            (qo_start + tok_id) * stride_o_tok
+            + head_id * stride_o_head
+            + dim_offs * stride_o_dim
+        )
+        tl.store(
+            output_ptr + output_offset,
+            acc.to(output_ptr.dtype.element_ty),
+            mask=dim_mask,
+        )
 
 
 def mla_prefill_reduce_triton(
-    partial_output: torch.Tensor,      # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
-    partial_lse: torch.Tensor,         # [padded_num_tokens * available_tgs, num_head_q]
-    reduce_indptr: torch.Tensor,       # [num_reduce_groups + 1], int32
-    reduce_final_map: torch.Tensor,    # [num_reduce_groups, 2], int32: [qo_start, qo_end]
+    partial_output: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
+    partial_lse: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q]
+    reduce_indptr: torch.Tensor,  # [num_reduce_groups + 1], int32
+    reduce_final_map: torch.Tensor,  # [num_reduce_groups, 2], int32: [qo_start, qo_end]
     reduce_partial_map: torch.Tensor,  # [num_partial_tiles], int32: [partial_qo_loc]
-    output: torch.Tensor,              # [total_tokens, num_head_q, v_head_dim], output buffer
-    tile_q: int = 256,                 # Q tile size (for padding)
+    output: torch.Tensor,  # [total_tokens, num_head_q, v_head_dim], output buffer
+    tile_q: int = 256,  # Q tile size (for padding)
+    max_partials_static: int = None,  # Maximum number of partials, defaults to num_cu
 ) -> None:
     """Triton version of mla_prefill_reduce.
     All heads are uniformly split and reduced together.
     """
+    MAX_PARTIALS_STATIC = (
+        max_partials_static if max_partials_static is not None else get_cu_num()
+    )
 
     num_reduce_groups = reduce_indptr.shape[0] - 1
     _, num_heads, v_head_dim = partial_output.shape
 
-    # Determine max number of partials
+    if num_reduce_groups == 0:
+        return
+
+    # Check max_partials doesn't exceed the fixed constant in kernel
     max_partials = 0
     for i in range(num_reduce_groups):
         num_p = (reduce_indptr[i + 1] - reduce_indptr[i]).item()
-        max_partials = max(max_partials, num_p) # 2
+        max_partials = max(max_partials, num_p)
 
-    if max_partials == 0:
-        return
+    if max_partials > MAX_PARTIALS_STATIC:
+        raise ValueError(
+            f"max_partials={max_partials} exceeds MAX_PARTIALS_STATIC={MAX_PARTIALS_STATIC}. "
+            "Consider increasing MAX_PARTIALS_STATIC."
+        )
 
     # Choose block size for v_head_dim chunks
     BLOCK_DIM = 64
@@ -674,27 +684,32 @@ def mla_prefill_reduce_triton(
         TILE_Q=tile_q,
         V_HEAD_DIM=v_head_dim,
         BLOCK_DIM=BLOCK_DIM,
-        MAX_PARTIALS=max_partials,
+        MAX_PARTIALS=MAX_PARTIALS_STATIC,
         num_warps=4,
     )
 
 
 def mla_prefill_reduce(
-    partial_output: torch.Tensor,      # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
-    partial_lse: torch.Tensor,         # [padded_num_tokens * available_tgs, num_head_q]
-    reduce_indptr: torch.Tensor,       # [num_reduce_groups + 1], int32
-    reduce_final_map: torch.Tensor,    # [num_reduce_groups, 2], int32: [qo_start, qo_end]
+    partial_output: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
+    partial_lse: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q]
+    reduce_indptr: torch.Tensor,  # [num_reduce_groups + 1], int32
+    reduce_final_map: torch.Tensor,  # [num_reduce_groups, 2], int32: [qo_start, qo_end]
     reduce_partial_map: torch.Tensor,  # [num_partial_tiles], int32: [partial_qo_loc]
-    output: torch.Tensor,              # [total_tokens, num_head_q, v_head_dim], output buffer
-    tile_q: int = 256,                 # Q tile size (for padding)
-    use_triton: bool = True,           # Whether to use Triton kernel
+    output: torch.Tensor,  # [total_tokens, num_head_q, v_head_dim], output buffer
+    tile_q: int = 256,  # Q tile size (for padding)
+    use_triton: bool = True,  # Whether to use Triton kernel
 ) -> None:
 
     if True:
         try:
             return mla_prefill_reduce_triton(
-                partial_output, partial_lse, reduce_indptr,
-                reduce_final_map, reduce_partial_map, output, tile_q
+                partial_output,
+                partial_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                output,
+                tile_q,
             )
         except Exception as e:
             print(f"Warning: Triton reduce failed ({e}), falling back to PyTorch")
@@ -707,7 +722,7 @@ def mla_prefill_reduce(
 
     for group_id in range(num_reduce_groups):
         start_idx = reduce_indptr[group_id].item()  # 0
-        end_idx = reduce_indptr[group_id + 1].item() # 2
+        end_idx = reduce_indptr[group_id + 1].item()  # 2
         num_partials = end_idx - start_idx
 
         if num_partials == 0:
@@ -732,9 +747,7 @@ def mla_prefill_reduce(
             partial_outputs = []
 
             for partial_qo_loc in partial_indices:
-                lse = partial_lse[
-                    partial_qo_loc : partial_qo_loc + read_len, head_idx
-                ]
+                lse = partial_lse[partial_qo_loc : partial_qo_loc + read_len, head_idx]
                 partial_lses.append(lse)
 
                 out = partial_output[
@@ -749,7 +762,7 @@ def mla_prefill_reduce(
             partial_outputs = torch.stack(partial_outputs, dim=0)  # [K, tile_q, D]
 
             nan_mask = torch.isnan(partial_lses)  # [K, tile_q]
-            neg_inf = torch.tensor(float('-inf'), device=device, dtype=dtype)
+            neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
             zero = torch.tensor(0.0, device=device, dtype=dtype)
 
             partial_lses_clean = torch.where(nan_mask, neg_inf, partial_lses)
@@ -759,20 +772,23 @@ def mla_prefill_reduce(
             # Compute sum_exp (NaN values contribute 0 to sum)
             # exp(-inf - max) = 0, so NaN values are automatically excluded
             sum_exp = torch.sum(
-                torch.where(nan_mask,
-                           zero,
-                           torch.exp(partial_lses - max_lse.unsqueeze(0))),
-                dim=0
+                torch.where(
+                    nan_mask, zero, torch.exp(partial_lses - max_lse.unsqueeze(0))
+                ),
+                dim=0,
             )
 
             final_lse = max_lse + torch.log(sum_exp)
 
-            scales = torch.exp(partial_lses_clean - final_lse.unsqueeze(0)).unsqueeze(-1)  # [K, tile_q, 1]
+            scales = torch.exp(partial_lses_clean - final_lse.unsqueeze(0)).unsqueeze(
+                -1
+            )  # [K, tile_q, 1]
 
             nan_output_mask = torch.isnan(partial_outputs)  # [K, tile_q, D]
             partial_outputs_clean = torch.where(nan_output_mask, zero, partial_outputs)
 
-            final_output = torch.sum(partial_outputs_clean * scales, dim=0)  # [tile_q, v_head_dim]
+            final_output = torch.sum(
+                partial_outputs_clean * scales, dim=0
+            )  # [tile_q, v_head_dim]
 
             output[qo_start:qo_end, head_idx, :] = final_output[:q_len, :]
-
