@@ -5,7 +5,6 @@ import torch
 import pytest
 import logging
 import numpy as np
-import math
 from aiter.ops.triton.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -103,42 +102,6 @@ def fp8_assert_close(
         f"Greatest absolute difference: {max_abs_diff} at index {max_abs_pos} (up to {atol} allowed)\n"
         f"Greatest relative difference: {max_rel_diff} at index {max_rel_pos} (up to {rtol} allowed)"
     )
-
-
-def _tensor_from_result(result):
-    if isinstance(result, torch.Tensor):
-        return result
-    if isinstance(result, (list, tuple)) and result:
-        return _tensor_from_result(result[0])
-    raise TypeError(f"Unsupported result type for comparison: {type(result)}")
-
-
-def check_attention_outputs(
-    current,
-    reference,
-    fp8=False,
-    atol=None,
-    rtol=None,
-    max_diff_percentage=0.5,
-):
-    current_tensor = _tensor_from_result(current)
-    reference_tensor = _tensor_from_result(reference).to(current_tensor.dtype)
-
-    if fp8:
-        fp8_assert_close(
-            current_tensor,
-            reference_tensor,
-            atol=atol or ATOL_fp8,
-            rtol=rtol or RTOL_fp8,
-            max_diff_percentage=max_diff_percentage,
-        )
-    else:
-        torch.testing.assert_close(
-            current_tensor,
-            reference_tensor,
-            atol=atol or 1e-2,
-            rtol=rtol or 1e-2,
-        )
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])

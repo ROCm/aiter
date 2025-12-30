@@ -1,11 +1,9 @@
+import torch
 import sys
 import warnings
 import argparse
 import itertools
-
-import torch
 import triton
-
 from aiter.ops.triton.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -15,32 +13,16 @@ from aiter.ops.triton.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
-from aiter.ops.triton.attn_qk_int8_per_block import (
-    attn_qk_int8_per_block,
-    per_block_int8,
-    _get_config,
-)
 from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
 )
-from compare_outputs import save_benchmark_output
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.attn_qk_int8_per_block import int8_per_block_quantize_bshd
-from op_tests.triton_tests.test_mha import check_attention_outputs
-from op_tests.op_benchmarks.triton.mha_correctness_utils import (
-    primary_output,
-    restore_tensor_layout,
-    print_output_comparison_stats,
-    run_sage_reference,
-)
-
-
 # test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
 import logging
 logging.getLogger().setLevel(logging.INFO)
@@ -167,7 +149,7 @@ def create_benchmark_configs(custom, args):
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
-    
+
     if args.metric == "all":
         unit = ""
         line_vals = ["time(ms)", "throughput(TFLOPS)", "bandwidth(GB/s)", "arithmetic_intensity(FLOP/byte)"]
@@ -205,7 +187,7 @@ def create_benchmark_configs(custom, args):
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_vals,
-            styles=[("red", "-"), ("green", "-"), ("yellow", "-"), ("blue", "-")],
+            styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
             ylabel=unit,
             plot_name=plot_name,
             args=extra_args,
@@ -216,7 +198,6 @@ def create_benchmark_configs(custom, args):
 
 def run_benchmark(custom, args):
     torch.manual_seed(20)
-    saved_output_keys = set()
 
     @triton.testing.perf_report(create_benchmark_configs(custom, args))
     def bench_mha(
@@ -559,109 +540,7 @@ def run_benchmark(custom, args):
                     )
                     return grads
 
-        if args.qk_int8:
-            assert args.layout == "bshd", "int8 quantization only supports bshd layout."
-            # tensor_layout for attn_qk_int8_per_block kernel: "HND" (batch, heads, seq, dim) or "NHD" (batch, seq, heads, dim)
-            tensor_layout = args.qk_int8_layout
-            config = _get_config()
-            
-            if args.real_quant:
-                # Real quantization: use per_block_int8 for proper quantization
-                # Original tensors are in NHD format (batch, seq, heads, dim)
-                if tensor_layout == "HND":
-                    # Convert from NHD to HND for better memory access
-                    q = q.transpose(1, 2).contiguous()
-                    k = k.transpose(1, 2).contiguous()
-                    v = v.transpose(1, 2).contiguous().to(torch.float16)
-                else:  # NHD
-                    # Keep original layout
-                    v = v.to(torch.float16)
-                k_mean = None
-                sm_scale = D_HEAD**-0.5
-                q, q_scale, k, k_scale, _ = per_block_int8(
-                    q, k, km=k_mean, BLKQ=config["BLOCK_SIZE_M"], BLKK=config["BLOCK_SIZE_N"], sm_scale=sm_scale, tensor_layout=tensor_layout
-                )
-                q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
-                k_scale = k_scale.to(torch.float32).unsqueeze(-1).contiguous()
-                # q, q_scale = int8_per_block_quantize_bshd(q, torch.int8, block_size=config["BLOCK_SIZE_M"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd", include_sqrt_scale=True)
-                # k, k_scale = int8_per_block_quantize_bshd(k, torch.int8, block_size=config["BLOCK_SIZE_N"], tensor_layout= "bhsd" if tensor_layout == "HND" else "bshd")
-            else:
-                # Fake quantization: use random int8 tensors directly (faster, for benchmarking kernel only)
-                if tensor_layout == "HND":
-                    # HND format: (batch, heads, seq, dim)
-                    q = torch.randint(-127, 127, (BATCH, HQ, N_CTX_Q, D_HEAD), dtype=torch.int8, device=device)
-                    k = torch.randint(-127, 127, (BATCH, HK, N_CTX_K, D_HEAD), dtype=torch.int8, device=device)
-                    v = torch.randn(BATCH, HQ, N_CTX_Q, D_HEAD_V, dtype=torch.float16, device=device)
-                    q_scale = torch.randn(BATCH, HQ, ((N_CTX_Q + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
-                    k_scale = torch.randn(BATCH, HK, ((N_CTX_K + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
-                else:  # NHD
-                    # NHD format: (batch, seq, heads, dim)
-                    q = torch.randint(-127, 127, (BATCH, N_CTX_Q, HQ, D_HEAD), dtype=torch.int8, device=device)
-                    k = torch.randint(-127, 127, (BATCH, N_CTX_K, HK, D_HEAD), dtype=torch.int8, device=device)
-                    v = torch.randn(BATCH, N_CTX_Q, HQ, D_HEAD_V, dtype=torch.float16, device=device)
-                    q_scale = torch.randn(BATCH, HQ, ((N_CTX_Q + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]), 1, dtype=torch.float32, device=device)
-                    k_scale = torch.randn(BATCH, HK, ((N_CTX_K + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]), 1, dtype=torch.float32, device=device)
-            fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=torch.bfloat16, config=config)
-        
-        metric_is_all = args.metric == "all"
-        primary_provider = "time(ms)" if metric_is_all else None
-        run_correctness_check = (
-            args.check_correctness_FAv3FP8_SageAttnV1
-            and args.fp8
-            and not varlen
-            and (
-                not metric_is_all
-                or provider == primary_provider
-            )
-        )
-        if args.check_correctness_FAv3FP8_SageAttnV1 and args.fp8 and varlen:
-            raise ValueError("--check_correctness_FAv3FP8_SageAttnV1 currently supports only dense (bshd) layout.")
-
         ms = triton.testing.do_bench(fn)
-
-        needs_output_value = args.save_output or run_correctness_check
-        cached_output = fn() if needs_output_value else None
-
-        if args.save_output:
-            assert cached_output is not None
-            save_benchmark_output(
-                args,
-                lambda output=cached_output: output,
-                saved_output_keys,
-                model or "",
-                BATCH,
-                HQ,
-                HK,
-                N_CTX_Q,
-                N_CTX_K,
-                D_HEAD,
-                D_HEAD_V,
-                dtype,
-                causal,
-                mode,
-                varlen,
-            )
-
-        if run_correctness_check:
-            assert cached_output is not None
-            current_primary = primary_output(cached_output).contiguous()
-            reference_primary = primary_output(
-                run_sage_reference(
-                    q_input,
-                    k_input,
-                    v_input,
-                    args,
-                    D_HEAD,
-                    D_HEAD_V,
-                )
-            )
-            reference_primary = restore_tensor_layout(
-                reference_primary,
-                args.qk_int8_layout,
-            )
-            print("Asserting FP8 output matches SageAttnV1 reference...")
-            print_output_comparison_stats(current_primary, reference_primary)
-            check_attention_outputs(current_primary, reference_primary, fp8=True)
 
         if mode == "bwd":
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
@@ -747,11 +626,6 @@ def parse_args():
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
-    parser.add_argument("-qk_int8", action="store_true", default=False)
-    parser.add_argument("-real_quant", action="store_true", default=False,
-        help="Use real per_block_int8 quantization. If not specified, uses fake int8 (random tensors). Only valid with -qk_int8.")
-    parser.add_argument("-qk_int8_layout", type=str, default="HND", choices=["HND", "NHD"],
-        help="Tensor layout for qk_int8: HND (batch, heads, seq, dim) or NHD (batch, seq, heads, dim). Default: HND.")
     parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)
