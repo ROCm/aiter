@@ -982,7 +982,7 @@ def cmdGenFunc_mha_batch_prefill(
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
-    sink_ptr:Optional[Tensor] = None,
+    sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
     # causal=true is the same as causal=false in this case
