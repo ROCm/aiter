@@ -189,7 +189,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
        (a.data_type != "bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
-        std::cout << "[Warning]unsupport condition!!!" << std::endl;
+        std::cout << "[Warning]unsupported condition in fwd_v3!!!" << std::endl;
         return -1;
     }
 
