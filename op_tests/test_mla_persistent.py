@@ -546,8 +546,8 @@ parser.add_argument(
     --varlen # True""",
 )
 parser.add_argument(
-    "-nps",
-    "--non_persistent_mode",
+    "-mnps",
+    "--mock_non_persistent_mode",
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
@@ -581,7 +581,7 @@ for nhead, decode_qlen in list_nhead:
                 varlen=args.varlen,
                 decode_qlen=decode_qlen,
                 max_split_per_batch=max_split_per_batch,
-                non_persistent_mode=args.non_persistent_mode,
+                non_persistent_mode=args.mock_non_persistent_mode,
             )
             df.append(ret)
     df = pd.DataFrame(df)
