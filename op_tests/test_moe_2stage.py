@@ -263,7 +263,7 @@ def test_fmoe(
         return 1 - sim
 
     logits_diff = calc_diff(out2_ref, out2_ck)
-    if logits_diff > 1e-2:
+    if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
@@ -274,28 +274,25 @@ def test_fmoe(
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
 l_dim = [(7168, 256)]
-# l_dim = [(4096, 1536)]
+# l_dim = [(3072, 3072)]
 l_tokenNum = [
-    # 1,
-    # 2,
-    4,
-    8,
+    1,
+    3,
+    5,
     16,
     32,
     64,
     128,
     256,
     1024,
-    2048,
     4096,
-    # 8192,
-    # 163840,
+    163840,
 ]
 l_quant = [
-    # (aiter.QuantType.No, None, None),  # a16w16
-    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    (aiter.QuantType.No, None, None),  # a16w16
+    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
@@ -303,8 +300,9 @@ l_quant = [
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
-l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][0:1]
-l_preshuffle = [True]
+# l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+l_hidden_intermediate_pad = [(0, 0), (192, 128), (129, 191)][1:2]
+l_preshuffle = [False, True]
 
 
 parser = argparse.ArgumentParser(
@@ -456,7 +454,7 @@ for (
                     inter_dim,
                     args.expert,
                     args.topk,
-                    aiter.ActivationType.Silu,
+                    aiter.ActivationType.Swiglu,
                     quant_type,
                     aq_dtype,
                     wq_dtype,
