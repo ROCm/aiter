@@ -99,19 +99,16 @@ if IS_ROCM:
 
         for module in all_modules:
             if PREBUILD_KERNELS == 1:
-                # Exclude mha, _tune, and specific module
-                # But keep module_fmha_v3_fwd and module_fmha_v3_varlen_fwd
                 if (
-                    "mha" in module
-                    or "_tune" in module
+                    "_tune" in module
                     or module == "module_gemm_mi350_a8w8_blockscale_asm"
                 ):
-                    # Allow module_fmha_v3_fwd and module_fmha_v3_varlen_fwd
-                    if module not in [
-                        "module_fmha_v3_fwd",
-                        "module_fmha_v3_varlen_fwd",
-                    ]:
-                        exclude_ops.append(module)
+                    exclude_ops.append(module)
+                if "mha" in module and module not in [
+                    "module_fmha_v3_fwd",
+                    "module_fmha_v3_varlen_fwd",
+                ]:
+                    exclude_ops.append(module)
             elif PREBUILD_KERNELS == 2:
                 # Exclude _bwd, _tune, and specific module
                 if (
@@ -155,14 +152,36 @@ if IS_ROCM:
             all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
             bd = f"{core.get_user_jit_dir()}/build"
-            import glob
+            # import glob
 
-            shutil.rmtree(bd, ignore_errors=True)
-            for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
+            # shutil.rmtree(bd, ignore_errors=True)
+            # for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
+            #     try:
+            #         os.remove(f)
+            #     except Exception:
+            #         pass
+
+            if PREBUILD_KERNELS == 1:
+                base_args = core.get_args_of_build("module_mha_varlen_fwd")
+                if isinstance(base_args, dict) and base_args.get("srcs"):
+                    variant_args = dict(base_args)
+                    variant_args["md_name"] = (
+                        "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale"
+                    )
+                    variant_args["blob_gen_cmd"] = [
+                        f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter *bf16*_nlogits*_nbias*_mask*_nlse*_ndropout*_nskip*_nsquant* --output_dir {{}}",
+                        f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
+                    ]
+                    all_opts_args_build.append(variant_args)
+                    variant_args2 = dict(base_args)
+                    variant_args2["md_name"] = (
+                        "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale"
+                    )
+                    variant_args2["blob_gen_cmd"] = [
+                        f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
+                        f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
+                    ]
+                    all_opts_args_build.append(variant_args2)
 
             def build_one_module(one_opt_args):
                 flags_cc = list(one_opt_args["flags_extra_cc"]) + [
@@ -172,17 +191,7 @@ if IS_ROCM:
                     f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
                 ]
 
-                # Modify blob_gen_cmd for module_fmha_v3_varlen_fwd based on PREBUILD_KERNELS
                 blob_gen_cmd = one_opt_args["blob_gen_cmd"]
-                if one_opt_args["md_name"] == "module_fmha_v3_varlen_fwd":
-                    if PREBUILD_KERNELS == 1:
-                        blob_gen_cmd = [
-                            f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter *bf16*_nlogits*_nbias*_mask*_nlse*_ndropout*_nskip*_nqscale* --output_dir {{}}",
-                            f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
-                            f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
-                            f"{core.get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}",
-                        ]
-
                 core.build_module(
                     md_name=one_opt_args["md_name"],
                     srcs=one_opt_args["srcs"],
@@ -205,8 +214,14 @@ if IS_ROCM:
                 prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
             os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
+            to_build = [
+                args
+                for args in all_opts_args_build
+                if not os.path.exists(f"{core.get_user_jit_dir()}/{args['md_name']}.so")
+            ]
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-                list(executor.map(build_one_module, all_opts_args_build))
+                # list(executor.map(build_one_module, all_opts_args_build))
+                list(executor.map(build_one_module, to_build))
 
 else:
     raise NotImplementedError("Only ROCM is supported")
