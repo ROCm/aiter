@@ -26,7 +26,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.test_sage_attn import check_attention_outputs
+from op_tests.triton_tests.attention.test_sage_attn import check_attention_outputs
 from op_tests.triton_tests.utils.accuarcy_analysis import compare_accuracy
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.mha_v3 import _quantize_bshd
@@ -54,7 +54,13 @@ logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def layout_preprocess(q, k, v, layout: Literal["bshd", "bhsd"], target_layout: Literal["bshd", "bhsd"] = "bshd"):
+def layout_preprocess(
+    q,
+    k,
+    v,
+    layout: Literal["bshd", "bhsd"],
+    target_layout: Literal["bshd", "bhsd"] = "bshd",
+):
     """
     Preprocess input tensors to the target layout.
 
@@ -412,6 +418,7 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
     ]
     return configs
 
+
 def primary_output(result):
     """Return the main tensor output produced by a Triton kernel."""
     if isinstance(result, torch.Tensor):
@@ -422,7 +429,7 @@ def primary_output(result):
 
 
 def attention_caller(q, k, v, func_name, softmax_scale, k_smooth, layout):
-    if func_name == "fav3_sage": # fav3 sage hybrid
+    if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
             k,
@@ -472,13 +479,14 @@ def attention_caller(q, k, v, func_name, softmax_scale, k_smooth, layout):
             )
     return fn
 
+
 def bench_kernel(q, k, v, args, provider):
     # Default softmax scale
     if args.layout == "bshd":
-        BATCH, N_CTX_Q, HQ,  D_HEAD = q.shape
+        BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
         _, N_CTX_K, HK, D_HEAD_V = v.shape
     else:  # bhsd
-        BATCH, HQ, N_CTX_Q,  D_HEAD = q.shape
+        BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
     softmax_scale = 1.0 / (D_HEAD**0.5)
@@ -495,7 +503,9 @@ def bench_kernel(q, k, v, args, provider):
     elif args.fav3_sage:
         bench_func_name = "fav3_sage"
     else:
-        assert False, "One of -fav3_fp8, -sagev1 or -fav3_sage must be specified for diffusion attention benchmark."
+        assert (
+            False
+        ), "One of -fav3_fp8, -sagev1 or -fav3_sage must be specified for diffusion attention benchmark."
 
     fn = attention_caller(
         q,
@@ -514,20 +524,26 @@ def bench_kernel(q, k, v, args, provider):
         current_primary = primary_output(current_output)
 
         if (args.sagev1 or args.fav3_sage) and args.layout == "bhsd":
-            current_primary = current_primary.permute(0,2,1,3) # we do comparison in BSHD
+            current_primary = current_primary.permute(
+                0, 2, 1, 3
+            )  # we do comparison in BSHD
 
-        reference_primary = primary_output(attention_caller(
-            q,
-            k,
-            v,
-            func_name=args.ref,
-            softmax_scale=softmax_scale,
-            k_smooth=k_smooth,
-            layout=args.layout,
-        )())
+        reference_primary = primary_output(
+            attention_caller(
+                q,
+                k,
+                v,
+                func_name=args.ref,
+                softmax_scale=softmax_scale,
+                k_smooth=k_smooth,
+                layout=args.layout,
+            )()
+        )
 
         if args.ref == "sagev1" or args.ref == "fav3_sage" and args.layout == "bhsd":
-            reference_primary = reference_primary.permute(0,2,1,3) # we do comparison in BSHD
+            reference_primary = reference_primary.permute(
+                0, 2, 1, 3
+            )  # we do comparison in BSHD
 
         check_attention_outputs(current_primary, reference_primary, fp8=False)
         compare_accuracy(current_primary, reference_primary)
@@ -599,7 +615,9 @@ def run_benchmark_captured(args):
         return bench_kernel(q, k, v, args, provider)
 
     args.layout = "bhsd"  # captured inputs are in BHSD format
-    logger.info(f"Captured inpputs are in BHSD format. Setting args.layout to bhsd for benchmark.")
+    logger.info(
+        f"Captured inpputs are in BHSD format. Setting args.layout to bhsd for benchmark."
+    )
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
 
 

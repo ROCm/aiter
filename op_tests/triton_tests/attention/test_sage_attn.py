@@ -178,7 +178,7 @@ def input_helper(
         sm_scale=softmax_scale,
         BLKQ=BLKQ,
         BLKK=BLKK,
-        tensor_layout=layout,
+        layout=layout,
     )
 
     return q, k, v, q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale
