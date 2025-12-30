@@ -595,4 +595,4 @@ def gemm_afp4wfp4(
         N, _ = w.shape
         config = _get_config(M, N, K)
     config_hashable = serialize_dict(config)
-    return gemm_afp4wfp4_(x, w, x_scales, w_scales, dtype, y, config_hashable)
+    return gemm_afp4wfp4_(x, w, x_scales, w_scales, dtype, y, config_hashable, skip_reduce)
