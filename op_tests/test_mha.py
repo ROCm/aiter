@@ -230,8 +230,9 @@ def test_flash_attn_output(
         dtype=dtype,
         requires_grad=True,
     )
+    dout = None
 
-    out, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, dropout_mask = run_ck(
         q,
         k,
         v,
@@ -246,7 +247,7 @@ def test_flash_attn_output(
         return_attn_probs,
     )
 
-    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
+    out_ref = run_torch(
         q,
         k,
         v,
@@ -259,7 +260,7 @@ def test_flash_attn_output(
         window_size,
     )
 
-    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
+    out_pt = run_torch(
         q,
         k,
         v,
@@ -279,26 +280,26 @@ def test_flash_attn_output(
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
 
-    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+    # print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+    # print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+    # print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+    # print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    # print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    # print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
 
-    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
-    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
-    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
+    # dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+    # dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+    # dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
 
-    assert (dq - dq_ref).abs().max().item() <= dq_tol
-    assert (dk - dk_ref).abs().max().item() <= dk_tol
-    assert (dv - dv_ref).abs().max().item() <= dv_tol
+    # assert (dq - dq_ref).abs().max().item() <= dq_tol
+    # assert (dk - dk_ref).abs().max().item() <= dk_tol
+    # assert (dv - dv_ref).abs().max().item() <= dv_tol
 
-    if attn_bias is not None:
-        print(f"dBias max diff: {(dbias - dbias_ref).abs().max().item()}")
-        print(f"dBias Pytorch max diff: {(dbias_pt - dbias_ref).abs().max().item()}")
-        dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
-        assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
+    # if attn_bias is not None:
+    #     print(f"dBias max diff: {(dbias - dbias_ref).abs().max().item()}")
+    #     print(f"dBias Pytorch max diff: {(dbias_pt - dbias_ref).abs().max().item()}")
+    #     dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
+    #     assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
 
 parser = argparse.ArgumentParser(

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "mha_fwd.h"
 #include "ck_tile/host.hpp"
 #include "ck_tile/ref/naive_attention.hpp"
+#include "mha_fwd.h"
 #include "rotary.hpp"
 #include "utils.hpp"
 
@@ -130,8 +130,11 @@ auto create_args(int argc, char* argv[])
                 "# of splits for key/value. 0 to determine actual number by heuristic")
         .insert("page_block_size", "0", "paged-kvcache block size. 0 means not use paged-kvcahe")
         .insert("cache_batch_idx", "0", "whether to use index map to the kvcache")
-        .insert("warmup", "5", "number of iterations before benchmark the kernel")
-        .insert("repeat", "20", "number of iterations to benchmark the kernel")
+        .insert("warmup", "10", "number of iterations before benchmark the kernel")
+        .insert("repeat", "10", "number of iterations to benchmark the kernel")
+        .insert("v3_bf16_cvt",
+                "1",
+                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
         .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel");
 
     bool result = arg_parser.parse(argc, argv);
@@ -179,8 +182,8 @@ int num_splits_heuristic(int batch_nhead_mblocks, int num_SMs, int num_n_blocks,
     {
         return 1;
     }
-    int max_splits_tmp           = std::min(max_splits, num_SMs);
-    max_splits               = std::min(max_splits_tmp, num_n_blocks);
+    int max_splits_tmp   = std::min(max_splits, num_SMs);
+    max_splits           = std::min(max_splits_tmp, num_n_blocks);
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
@@ -465,6 +468,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     int stream_repeat = arg_parser.get_int("repeat");
     bool kname        = arg_parser.get_bool("kname");
     bool fwd_v3       = arg_parser.get_bool("fwd_v3");
+    int v3_bf16_cvt   = arg_parser.get_int("v3_bf16_cvt");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -962,7 +966,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.seqlen_k_ptr = ((mode == mode_enum::batch && use_kvcache) || 0 <= k_paddings_[0]
                                      ? seqlen_k_buf.GetDeviceBuffer()
                                      : nullptr);
-
             args.seqlen_k     = shape_seqlen_k; // unused in group mode (or kvcache enabled)
             args.max_seqlen_q = max_seqlen_q;
 
@@ -1051,7 +1054,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
 #endif
         aiter::mha_fwd_args fmha_args;
         init_args(fmha_args);
-
         return aiter::mha_fwd(fmha_args,
                               stream_config,
                               data_type,
@@ -1059,7 +1061,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
                               mask.type,
                               bias.type,
                               lse,
-                              fwd_v3);
+                              fwd_v3,
+                              v3_bf16_cvt);
     }();
 
     if(fwd_ave_time < 0.0f)

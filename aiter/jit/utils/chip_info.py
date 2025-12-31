@@ -4,8 +4,28 @@ import functools
 import os
 import re
 import subprocess
+from torch_guard import torch_compile_guard
 
 from cpp_extension import executable_path
+
+
+@functools.lru_cache(maxsize=1)
+def _detect_native() -> list[str]:
+    try:
+        rocminfo = executable_path("rocminfo")
+        result = subprocess.run(
+            [rocminfo],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        for line in result.stdout.splitlines():
+            if "gfx" in line.lower():
+                return [line.split(":", 1)[-1].strip()]
+    except Exception as e:
+        raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
+    raise RuntimeError("No gfx arch found in rocminfo output.")
 
 
 @functools.lru_cache(maxsize=1)
@@ -29,7 +49,17 @@ def get_gfx():
 
 
 @functools.lru_cache(maxsize=1)
-def get_cu_num():
+def get_gfx_list() -> list[str]:
+
+    gfx_env = os.getenv("GPU_ARCHS", "native")
+    if gfx_env == "native":
+        return _detect_native()
+
+    return [g.strip() for g in gfx_env.split(";") if g.strip()]
+
+
+@torch_compile_guard()
+def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
@@ -51,6 +81,12 @@ def get_cu_num():
             raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
+    return cu_num
+
+
+@functools.lru_cache(maxsize=1)
+def get_cu_num():
+    cu_num = get_cu_num_custom_op()
     return cu_num
 
 
