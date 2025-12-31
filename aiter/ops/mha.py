@@ -199,39 +199,7 @@ def _parse_mha_varlen_fwd_md_name(md_name: str):
     )
 
 
-def get_mha_varlen_prebuild_variants_by_names(md_names, receipt: int = 200):
-    variants = []
-    for md_name in md_names:
-        (
-            dtype,
-            logits_positive,
-            has_bias,
-            has_alibi,
-            use_mask,
-            return_lse,
-            dropout_zero,
-            skip_zero,
-            has_qscale,
-        ) = _parse_mha_varlen_fwd_md_name(md_name)
-        suffix, filter_pattern = compose_mha_fwd_variant_suffix_and_filter(
-            dtype=dtype,
-            logits_positive=logits_positive,
-            has_bias=has_bias,
-            has_alibi=has_alibi,
-            use_mask=use_mask,
-            return_lse=return_lse,
-            dropout_zero=dropout_zero,
-            skip_zero=skip_zero,
-            has_qscale=has_qscale,
-        )
-        blob_gen_cmd = [
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt {receipt} --filter {filter_pattern} --output_dir {{}}",
-            f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt {receipt} --filter " @ " --output_dir {{}}',
-        ]
-        variants.append(
-            {"md_name": f"mha_varlen_fwd{suffix}", "blob_gen_cmd": blob_gen_cmd}
-        )
-    return variants
+# duplicate removed; single source of truth is the ck_dir-parameterized version above
 
 
 def cmdGenFunc_mha_fwd(
