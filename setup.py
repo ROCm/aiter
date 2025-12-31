@@ -164,24 +164,28 @@ if IS_ROCM:
             if PREBUILD_KERNELS == 1:
                 base_args = core.get_args_of_build("module_mha_varlen_fwd")
                 if isinstance(base_args, dict) and base_args.get("srcs"):
+                    # Build the exact nlse variant used by JIT
                     variant_args = dict(base_args)
                     variant_args["md_name"] = (
                         "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale"
                     )
                     variant_args["blob_gen_cmd"] = [
-                        f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter *bf16*_nlogits*_nbias*_mask*_nlse*_ndropout*_nskip*_nsquant* --output_dir {{}}",
+                        # CK instance generation must match JIT (receipt=600, filter reflects flags)
+                        f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --filter *bf16*_nlogits*_nbias*_mask*_nlse*_ndropout*_nskip*_nsquant* --output_dir {{}}",
+                        # AITER combined API generation for varlen fwd
                         f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
                     ]
                     all_opts_args_build.append(variant_args)
-                    variant_args2 = dict(base_args)
-                    variant_args2["md_name"] = (
+                    # Also prebuild splitkv path to mirror JIT fallback behavior
+                    variant_args_splitkv = dict(base_args)
+                    variant_args_splitkv["md_name"] = (
                         "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale"
                     )
-                    variant_args2["blob_gen_cmd"] = [
-                        f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
+                    variant_args_splitkv["blob_gen_cmd"] = [
+                        f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --filter " @ " --output_dir {{}}',
                         f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
                     ]
-                    all_opts_args_build.append(variant_args2)
+                    all_opts_args_build.append(variant_args_splitkv)
 
             def build_one_module(one_opt_args):
                 flags_cc = list(one_opt_args["flags_extra_cc"]) + [
@@ -216,7 +220,6 @@ if IS_ROCM:
 
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
                 list(executor.map(build_one_module, all_opts_args_build))
-
 else:
     raise NotImplementedError("Only ROCM is supported")
 
