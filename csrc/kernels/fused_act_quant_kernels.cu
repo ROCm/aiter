@@ -408,7 +408,6 @@ __global__ void fused_act_mul_quant_kernel_cached(
             scale[token_idx] = row_scale;
         }
     }
-    __syncthreads();
 
     // Phase 4: Quantize and write output (reads r from LDS; no 2nd global load; no ACT recompute)
     const float inverted_scale =
