@@ -12,7 +12,7 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     e8m0_to_f32,
 )
 
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.shuffle import shuffle_weight
