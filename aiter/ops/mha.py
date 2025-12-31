@@ -1540,7 +1540,9 @@ def _flash_attn_backward_fake(
     return softmax_d
 
 
-@torch_compile_guard(gen_fake=_flash_attn_backward_fake)
+@torch_compile_guard(
+    mutates_args=["dq", "dk", "dv"], gen_fake=_flash_attn_backward_fake
+)
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
