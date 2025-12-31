@@ -90,7 +90,7 @@ def batched_gemm_a16wfp4_(
     B = Bx
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
 

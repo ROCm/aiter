@@ -63,7 +63,7 @@ def gemm_a16w16_atomic_(
     K, N = w.shape
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
 

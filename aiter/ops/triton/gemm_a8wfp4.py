@@ -75,7 +75,7 @@ def gemm_a8wfp4(
     ), f"Scale shapes incorrect: x_scales should be ({M}, 1), got {x_scales.shape}; w_scales should be ({N}, {K//32}), got {w_scales.shape}"
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     if M <= 128:
         if _USE_GEMM_SPLITK_BF16:
