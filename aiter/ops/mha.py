@@ -2620,10 +2620,14 @@ def mha_batch_prefill_fake_tensors(
     seqlen_k: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if k.dim() != 5 or v.dim() != 5:
-        raise ValueError("Batch prefill requires 5D vectorized K/V tensors")
+    is_vectorized = k.dim() == 5 and v.dim() == 5
+    is_linear = k.dim() == 4 and v.dim() == 4
+    if not (is_vectorized or is_linear):
+        raise ValueError(
+            "Batch prefill requires 5D vectorized or 4D linear K/V tensors"
+        )
     num_heads = q.size(1)  # num_heads = q.sizes()[1]
-    head_size_v = v.size(-2)  # head_size_v = v.size(-2)
+    head_size_v = v.size(-2) if is_vectorized else v.size(-1)
     total_q = q.size(0)  # total_q = q.size(0)
 
     if out is None:
@@ -2787,17 +2791,31 @@ def mha_batch_prefill_func(
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(-1)
     k_vector_size = 16 // k.element_size()
-    if k.dim() != 5 or v.dim() != 5:
-        raise ValueError("Batch prefill requires 5D vectorized K/V tensors")
-    head_size_v_og = v.size(-2)
+    is_vectorized = k.dim() == 5 and v.dim() == 5
+    is_linear = k.dim() == 4 and v.dim() == 4
+    if not (is_vectorized or is_linear):
+        raise ValueError(
+            "Batch prefill requires 5D vectorized or 4D linear K/V tensors"
+        )
+    head_size_v_og = v.size(-2) if is_vectorized else v.size(-1)
     if head_size_q_og % k_vector_size != 0 or head_size_v_og % k_vector_size != 0:
-        raise ValueError("Vectorized KV requires head size divisible by vector size")
-    if k.size(-3) * k_vector_size != head_size_q_og:
-        raise ValueError("K vectorized layout does not match Q head size")
-    if k.size(-2) % k_vector_size != 0:
-        raise ValueError("Vectorized KV requires page size divisible by vector size")
+        raise ValueError("Batch prefill requires head size divisible by vector size")
+    if is_vectorized:
+        if k.size(-3) * k_vector_size != head_size_q_og:
+            raise ValueError("K vectorized layout does not match Q head size")
+        if k.size(-2) % k_vector_size != 0:
+            raise ValueError(
+                "Vectorized KV requires page size divisible by vector size"
+            )
+        if v.size(-1) != k_vector_size:
+            raise ValueError("Vectorized KV requires last dim equal to vector size")
+    else:
+        if k.size(-1) != head_size_q_og:
+            raise ValueError("K linear layout does not match Q head size")
+        if k.size(1) != v.size(1) or k.size(2) != v.size(2):
+            raise ValueError("K/V linear layout must match page size and head count")
     if not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError("Vectorized KV requires contiguous K/V")
+        raise ValueError("Batch prefill requires contiguous K/V")
     out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
         q,
         k,

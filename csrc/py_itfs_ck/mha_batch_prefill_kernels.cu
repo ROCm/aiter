@@ -22,6 +22,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                const int d_v,
                                const int num_total_pages,
                                const int page_block_size,
+                               ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout,
                                // device pointers
                                const at::Tensor q,
                                const at::Tensor k,
@@ -59,45 +60,68 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     ck_tile::index_t stride_v;
 
     const int k_vector_size = 16 / static_cast<int>(k.element_size());
-    
-    // Strictly enforce 5D vectorized layout
-    TORCH_CHECK(k.dim() == 5,
-                "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]");
-    TORCH_CHECK(v.dim() == 5,
-                "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
-    TORCH_CHECK(k.is_contiguous(), "K tensor must be contiguous for vectorized layout");
-    TORCH_CHECK(v.is_contiguous(), "V tensor must be contiguous for vectorized layout");
 
-    // Vectorized layout strides
-    // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize] -> stride(-2) is PageSize
-    // V: [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize] -> stride(-2) is HeadDim
-    stride_k = k.stride(-2); 
-    stride_v = v.stride(-2); 
-    
-    TORCH_CHECK(stride_k == k_vector_size,
-                "stride_k (PageSize stride) must be ",
-                k_vector_size,
-                " in 5D vectorized layout");
-    TORCH_CHECK(stride_v == k_vector_size,
-                "stride_v (HeadDim stride) must be ",
-                k_vector_size,
-                " in 5D vectorized layout");
-    TORCH_CHECK(k.stride(-1) == 1 && k.size(-1) == k_vector_size,
-                "K last dim must be ",
-                k_vector_size,
-                " and contiguous");
-    TORCH_CHECK(v.stride(-1) == 1 && v.size(-1) == k_vector_size,
-                "V last dim must be ",
-                k_vector_size,
-                " and contiguous");
+    if(kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT)
+    {
+        TORCH_CHECK(
+            k.dim() == 5,
+            "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]");
+        TORCH_CHECK(
+            v.dim() == 5,
+            "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
+        TORCH_CHECK(k.is_contiguous(), "K tensor must be contiguous for vectorized layout");
+        TORCH_CHECK(v.is_contiguous(), "V tensor must be contiguous for vectorized layout");
+
+        // Vectorized layout strides
+        // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize] -> stride(-2) is PageSize
+        // V: [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize] -> stride(-2) is HeadDim
+        stride_k = k.stride(-2);
+        stride_v = v.stride(-2);
+
+        TORCH_CHECK(stride_k == k_vector_size,
+                    "stride_k (PageSize stride) must be ",
+                    k_vector_size,
+                    " in 5D vectorized layout");
+        TORCH_CHECK(stride_v == k_vector_size,
+                    "stride_v (HeadDim stride) must be ",
+                    k_vector_size,
+                    " in 5D vectorized layout");
+        TORCH_CHECK(k.stride(-1) == 1 && k.size(-1) == k_vector_size,
+                    "K last dim must be ",
+                    k_vector_size,
+                    " and contiguous");
+        TORCH_CHECK(v.stride(-1) == 1 && v.size(-1) == k_vector_size,
+                    "V last dim must be ",
+                    k_vector_size,
+                    " and contiguous");
+    }
+    else
+    {
+        TORCH_CHECK(k.dim() == 4,
+                    "K tensor must be 4D [NumBlocks, PageSize, NumHeads, HeadDim]");
+        TORCH_CHECK(v.dim() == 4,
+                    "V tensor must be 4D [NumBlocks, PageSize, NumHeads, HeadDim]");
+        TORCH_CHECK(k.is_contiguous(), "K tensor must be contiguous for linear layout");
+        TORCH_CHECK(v.is_contiguous(), "V tensor must be contiguous for linear layout");
+
+        // Linear layout strides
+        // K/V: [NumBlocks, PageSize, NumHeads, HeadDim] -> stride(1) is PageSize
+        stride_k = k.stride(1);
+        stride_v = v.stride(1);
+
+        TORCH_CHECK(k.stride(-1) == 1, "K last dim must be contiguous");
+        TORCH_CHECK(v.stride(-1) == 1, "V last dim must be contiguous");
+    }
 
     ck_tile::index_t stride_o       = out.stride(-3);
     ck_tile::index_t stride_randval = has_dropout_randval ? dropout_randval.stride(1) : 0;
 
     ck_tile::index_t nhead_stride_q       = q.stride(-2);
-    // For 5D, Head dim is at index 1
-    ck_tile::index_t nhead_stride_k       = k.stride(1);
-    ck_tile::index_t nhead_stride_v       = v.stride(1);
+    const bool is_vectorized_layout =
+        kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
+    // Vectorized: head dim at index 1. Linear: head dim at index 2.
+    ck_tile::index_t nhead_stride_k       = is_vectorized_layout ? k.stride(1) : k.stride(2);
+    ck_tile::index_t nhead_stride_v       = is_vectorized_layout ? v.stride(1) : v.stride(2);
     
     ck_tile::index_t nhead_stride_o       = out.stride(-2);
     ck_tile::index_t nhead_stride_lse     = has_lse ? softmax_lse.stride(0) : 0;
@@ -169,6 +193,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.nhead_k           = h_k;
     args.num_total_pages   = num_total_pages;
     args.page_block_size   = page_block_size;
+    args.kv_memory_layout  = kv_memory_layout;
     args.kv_indptr         = kv_indptr.data_ptr();
     args.kv_page_indices   = kv_page_indices.data_ptr();
     args.kv_last_page_lens = kv_last_page_lens_ptr;
@@ -298,22 +323,48 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     int num_heads         = sizes[1];
     const int head_size_q = sizes[2];
     
-    TORCH_CHECK(k.dim() == 5,
-                "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]");
-    TORCH_CHECK(v.dim() == 5,
-                "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
+    ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout;
+    int num_heads_k     = 0;
+    int page_block_size = 0;
+    int head_size_v     = 0;
+    int num_blocks      = 0;
 
-    // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]
-    const int num_heads_k = k.size(1);
-    const int page_block_size = k.size(3);
-    TORCH_CHECK(page_block_size % k_vector_size == 0,
-                "Vectorized KV requires page size divisible by ",
-                k_vector_size);
-    
-    // V: [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]
-    const int head_size_v = v.size(3);
+    if(k.dim() == 5)
+    {
+        kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
+        TORCH_CHECK(
+            v.dim() == 5,
+            "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
 
-    const int num_blocks      = k.size(0);
+        // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]
+        num_heads_k     = k.size(1);
+        page_block_size = k.size(3);
+        TORCH_CHECK(page_block_size % k_vector_size == 0,
+                    "Vectorized KV requires page size divisible by ",
+                    k_vector_size);
+
+        // V: [NumBlocks, NumHeads, PageSize/kVector_size, HeadDim, kVector_size]
+        head_size_v = v.size(3);
+        num_blocks  = k.size(0);
+    }
+    else if(k.dim() == 4)
+    {
+        kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT;
+        TORCH_CHECK(v.dim() == 4,
+                    "V tensor must be 4D [NumBlocks, PageSize, NumHeads, HeadDim]");
+
+        // K/V: [NumBlocks, PageSize, NumHeads, HeadDim]
+        num_heads_k     = k.size(2);
+        page_block_size = k.size(1);
+        head_size_v     = v.size(3);
+        num_blocks      = k.size(0);
+    }
+    else
+    {
+        TORCH_CHECK(false,
+                    "K tensor must be 5D (vectorized) or 4D (linear) for batch prefill");
+    }
+
 
     if(max_seqlen_q == 1 && !alibi_slopes_.has_value())
     {
@@ -376,10 +427,29 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
 
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
     
-    // K: [NumBlocks, NumHeads, HeadDim/k_vector_size, PageSize, k_vector_size]
-    CHECK_SHAPE(k, num_blocks, num_heads_k, head_size_q / k_vector_size, page_block_size, k_vector_size);
-    // V: [NumBlocks, NumHeads, PageSize/k_vector_size, HeadDim, k_vector_size]
-    CHECK_SHAPE(v, num_blocks, num_heads_k, page_block_size / k_vector_size, head_size_v, k_vector_size);
+    if(kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT)
+    {
+        // K: [NumBlocks, NumHeads, HeadDim/k_vector_size, PageSize, k_vector_size]
+        CHECK_SHAPE(k,
+                    num_blocks,
+                    num_heads_k,
+                    head_size_q / k_vector_size,
+                    page_block_size,
+                    k_vector_size);
+        // V: [NumBlocks, NumHeads, PageSize/k_vector_size, HeadDim, k_vector_size]
+        CHECK_SHAPE(v,
+                    num_blocks,
+                    num_heads_k,
+                    page_block_size / k_vector_size,
+                    head_size_v,
+                    k_vector_size);
+    }
+    else
+    {
+        // K/V: [NumBlocks, PageSize, NumHeads, HeadDim]
+        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size_q);
+        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size_v);
+    }
 
     if(page_block_size > 1 && !block_table_.has_value())
     {
@@ -478,6 +548,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                                    head_size_v,
                                                    num_blocks,
                                                    page_block_size,
+                                                   kv_memory_layout,
                                                    q,
                                                    k,
                                                    v,

@@ -59,25 +59,25 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                              bool has_dropout,
                              quant_scale_enum qscale_type,
                              bool skip_min_seqlen_q,
+                             ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout,
                              ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
                              int page_size)
-        : fmha_batch_prefill_traits{
-              head_size_q,
-              head_size_v,
-              dtype,
-              is_group_mode,
-              true, // is_v_rowmajor
-              has_logits_soft_cap,
-              mask_type,
-              bias_type,
-              has_lse,
-              has_dropout,
-              qscale_type,
-              skip_min_seqlen_q,
-              false, // has_sink
-              ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT,
-              kv_lookup_table,
-              page_size}
+        : fmha_batch_prefill_traits{head_size_q,
+                                    head_size_v,
+                                    dtype,
+                                    is_group_mode,
+                                    true, // is_v_rowmajor
+                                    has_logits_soft_cap,
+                                    mask_type,
+                                    bias_type,
+                                    has_lse,
+                                    has_dropout,
+                                    qscale_type,
+                                    skip_min_seqlen_q,
+                                    false, // has_sink
+                                    kv_memory_layout,
+                                    kv_lookup_table,
+                                    page_size}
     {
     }
 };

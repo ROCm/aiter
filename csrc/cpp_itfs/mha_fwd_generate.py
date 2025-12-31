@@ -69,6 +69,7 @@ mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
                                   bool has_lse,
                                   bool has_dropout,
                                   quant_scale_enum qscale_type,
+                                  ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout,
                                   ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
                                   int page_size,
                                   bool skip_min_seqlen_q = false)
@@ -84,6 +85,7 @@ mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
                           has_dropout,
                           qscale_type,
                           skip_min_seqlen_q,
+                          kv_memory_layout,
                           kv_lookup_table,
                           page_size);
 }}
@@ -193,6 +195,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     auto kv_lookup_table = args.block_table_ptr != nullptr
                                ? ck_tile::BlockAttentionKVCacheLookupTableEnum::VLLM_BLOCK_TABLE_2D
                                : ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D;
+    auto kv_memory_layout = args.kv_memory_layout;
     auto traits = get_mha_batch_prefill_traits(head_size_q,
                                      head_size_v,
                                      q_dtype_str,
@@ -203,6 +206,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      has_lse,
                                      has_dropout,
                                      qscale_type,
+                                     kv_memory_layout,
                                      kv_lookup_table,
                                      args.page_block_size);
     return fmha_batch_prefill(traits, args, stream_config);
