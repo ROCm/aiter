@@ -813,14 +813,10 @@ def compile_ops(
                     raise ModuleNotFoundError("start rebuild")
                 if module is None:
                     try:
-                        preferred_md = (
-                            custom_build_args.get("md_name", md_name)
-                            if gen_func is not None
-                            else md_name
-                        )
-                        module = get_module(preferred_md)
-                    except Exception:
                         module = get_module(md_name)
+                    except Exception as e:
+                        md = custom_build_args.get("md_name", md_name)
+                        module = get_module(md)
             except ModuleNotFoundError:
                 d_args = get_args_of_build(md_name)
                 d_args.update(custom_build_args)
