@@ -2790,6 +2790,7 @@ def mha_batch_prefill_func(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(-1)
+    # 16 bytes = 128-bit (dwordx4) vector width assumed by CK kernels.
     k_vector_size = 16 // k.element_size()
     is_vectorized = k.dim() == 5 and v.dim() == 5
     is_linear = k.dim() == 4 and v.dim() == 4

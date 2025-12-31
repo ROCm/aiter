@@ -194,11 +194,11 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.num_total_pages   = num_total_pages;
     args.page_block_size   = page_block_size;
     args.kv_memory_layout  = kv_memory_layout;
+    args.kv_lookup_table   = ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D;
     args.kv_indptr         = kv_indptr.data_ptr();
     args.kv_page_indices   = kv_page_indices.data_ptr();
     args.kv_last_page_lens = kv_last_page_lens_ptr;
     args.seqlen_k_ptr      = nullptr;
-    args.block_table_ptr   = nullptr;
     args.batch_stride_block_table = 0;
     args.scale_s           = softmax_scale;
     args.scale_p           = 1;
@@ -591,9 +591,11 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
             TORCH_CHECK(seqlen_k.size(0) == batch_size,
                         "seqlen_k must have shape [batch_size]");
 
-            args.block_table_ptr = block_table.data_ptr();
+            args.kv_page_indices = block_table.data_ptr();
             args.batch_stride_block_table = block_table.stride(0);
             args.seqlen_k_ptr = seqlen_k.data_ptr();
+            args.kv_lookup_table =
+                ck_tile::BlockAttentionKVCacheLookupTableEnum::VLLM_BLOCK_TABLE_2D;
         }
 
         float t = aiter::mha_batch_prefill(args,

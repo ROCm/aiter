@@ -192,9 +192,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
-    auto kv_lookup_table = args.block_table_ptr != nullptr
-                               ? ck_tile::BlockAttentionKVCacheLookupTableEnum::VLLM_BLOCK_TABLE_2D
-                               : ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D;
+    auto kv_lookup_table = args.kv_lookup_table;
     auto kv_memory_layout = args.kv_memory_layout;
     auto traits = get_mha_batch_prefill_traits(head_size_q,
                                      head_size_v,
