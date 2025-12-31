@@ -268,7 +268,7 @@ def _get_config(
 ):
     from ..utils.gemm_config_utils import get_gemm_config
 
-    config = get_gemm_config("GEMM-A8WFP4", M, N, K)
+    config, is_tunned = get_gemm_config("GEMM-A8WFP4", M, N, K)
 
     if M <= 128:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = _get_splitk(
@@ -280,7 +280,7 @@ def _get_config(
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
 
-    return config
+    return config, is_tunned
 
 
 def _get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):

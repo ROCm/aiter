@@ -37,8 +37,8 @@ if __name__ == "__main__":
         "--module",
         required=True,
         help="""module of ASM kernel,
-    e.g.: -m bf16gemm
-""",
+            e.g.: -m bf16gemm
+        """,
     )
     parser.add_argument(
         "-o",
