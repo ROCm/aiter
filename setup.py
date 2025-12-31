@@ -152,42 +152,58 @@ if IS_ROCM:
             all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
             bd = f"{core.get_user_jit_dir()}/build"
-            import glob
+            # import glob
 
-            shutil.rmtree(bd, ignore_errors=True)
-            for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
+            # shutil.rmtree(bd, ignore_errors=True)
+            # for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
+            #     try:
+            #         os.remove(f)
+            #     except Exception:
+            #         pass
 
             if PREBUILD_KERNELS == 1:
                 base_args = core.get_args_of_build("module_mha_varlen_fwd")
                 if isinstance(base_args, dict) and base_args.get("srcs"):
-                    # Build the exact nlse variant used by JIT
-                    variant_args = dict(base_args)
-                    variant_args["md_name"] = (
-                        "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale"
-                    )
-                    variant_args["blob_gen_cmd"] = [
-                        # CK instance generation must match JIT (receipt=200, filter reflects flags)
-                        f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter *bf16*_nlogits*_nbias*_mask*_nlse*_ndropout*_nskip*_nqscale* --output_dir {{}}",
-                        f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
-                        # AITER combined API generation for varlen fwd
-                        f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
+
+                    import re
+
+                    _mha_path = os.path.join(this_dir, "aiter", "ops", "mha.py")
+                    with open(_mha_path, "r", encoding="utf-8") as f:
+                        _src = f.read()
+
+                    def _extract_def(src, name):
+                        pat = re.compile(rf"^def\s+{name}\s*\(.*?\):", re.M | re.S)
+                        m = pat.search(src)
+                        if not m:
+                            raise RuntimeError(f"Failed to extract function: {name}")
+                        start = m.start()
+                        pat_next = re.compile(r"^(def|class)\s+", re.M)
+                        m2 = pat_next.search(src, m.end())
+                        end = m2.start() if m2 else len(src)
+                        return src[start:end]
+
+                    blocks = []
+                    for fn in [
+                        "compose_mha_fwd_variant_suffix_and_filter",
+                        "_parse_mha_varlen_fwd_md_name",
+                        "get_mha_varlen_prebuild_variants_by_names",
+                    ]:
+                        blocks.append(_extract_def(_src, fn))
+                    _ns = {}
+                    exec("\n\n".join(blocks), _ns)
+                    get_variants_by_names = _ns[
+                        "get_mha_varlen_prebuild_variants_by_names"
                     ]
-                    all_opts_args_build.append(variant_args)
-                    # Also prebuild splitkv path to mirror JIT fallback behavior
-                    variant_args_splitkv = dict(base_args)
-                    variant_args_splitkv["md_name"] = (
-                        "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale"
-                    )
-                    variant_args_splitkv["blob_gen_cmd"] = [
-                        f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter *bf16*_nlogits*_nbias*_nmask*_lse*_ndropout*_nskip*_nqscale* --output_dir {{}}",
-                        f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
-                        f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
+
+                    md_names = [
+                        "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
+                        "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale",
                     ]
-                    all_opts_args_build.append(variant_args_splitkv)
+                    for v in get_variants_by_names(md_names, ck_dir):
+                        variant_args = dict(base_args)
+                        variant_args["md_name"] = v["md_name"]
+                        variant_args["blob_gen_cmd"] = v["blob_gen_cmd"]
+                        all_opts_args_build.append(variant_args)
 
             def build_one_module(one_opt_args):
                 flags_cc = list(one_opt_args["flags_extra_cc"]) + [
@@ -220,8 +236,20 @@ if IS_ROCM:
                 prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
             os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
+            to_build = [
+                args
+                for args in all_opts_args_build
+                if not os.path.exists(f"{core.get_user_jit_dir()}/{args['md_name']}.so")
+            ]
+
+            to_build = [
+                args
+                for args in all_opts_args_build
+                if not os.path.exists(f"{core.get_user_jit_dir()}/{args['md_name']}.so")
+            ]
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-                list(executor.map(build_one_module, all_opts_args_build))
+                # list(executor.map(build_one_module, all_opts_args_build))
+                list(executor.map(build_one_module, to_build))
 else:
     raise NotImplementedError("Only ROCM is supported")
 
