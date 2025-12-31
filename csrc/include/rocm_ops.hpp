@@ -378,6 +378,12 @@ namespace py = pybind11;
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
           py::arg("out"));                                                                     \
+    m.def("reduce_scatter",                                                                    \
+          &aiter::reduce_scatter,                                                              \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"),                                                                      \
+          py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("all_reduce",                                                                        \
           &aiter::all_reduce,                                                                  \
           py::arg("_fa"),                                                                      \
@@ -1031,6 +1037,9 @@ namespace py = pybind11;
           py::arg("out")          = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
+          py::arg("q_descale")    = std::nullopt, \
+          py::arg("k_descale")    = std::nullopt, \
+          py::arg("v_descale")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
