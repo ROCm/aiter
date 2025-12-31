@@ -152,14 +152,14 @@ if IS_ROCM:
             all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
             bd = f"{core.get_user_jit_dir()}/build"
-            import glob
+            # import glob
 
-            shutil.rmtree(bd, ignore_errors=True)
-            for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
+            # shutil.rmtree(bd, ignore_errors=True)
+            # for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
+            #     try:
+            #         os.remove(f)
+            #     except Exception:
+            #         pass
 
             if PREBUILD_KERNELS == 1:
                 base_args = core.get_args_of_build("module_mha_varlen_fwd")
@@ -170,8 +170,9 @@ if IS_ROCM:
                         "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale"
                     )
                     variant_args["blob_gen_cmd"] = [
-                        # CK instance generation must match JIT (receipt=600, filter reflects flags)
-                        f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --filter *bf16*_nlogits*_nbias*_mask*_nlse*_ndropout*_nskip*_nsquant* --output_dir {{}}",
+                        # CK instance generation must match JIT (receipt=200, filter reflects flags)
+                        f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter *bf16*_nlogits*_nbias*_mask*_nlse*_ndropout*_nskip*_nqscale* --output_dir {{}}",
+                        f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
                         # AITER combined API generation for varlen fwd
                         f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
                     ]
@@ -182,7 +183,8 @@ if IS_ROCM:
                         "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale"
                     )
                     variant_args_splitkv["blob_gen_cmd"] = [
-                        f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --filter " @ " --output_dir {{}}',
+                        f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --filter *bf16*_nlogits*_nbias*_nmask*_lse*_ndropout*_nskip*_nqscale* --output_dir {{}}",
+                        f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --filter " @ " --output_dir {{}}',
                         f"{core.AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
                     ]
                     all_opts_args_build.append(variant_args_splitkv)
@@ -218,8 +220,14 @@ if IS_ROCM:
                 prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
             os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
+            to_build = [
+                args
+                for args in all_opts_args_build
+                if not os.path.exists(f"{core.get_user_jit_dir()}/{args['md_name']}.so")
+            ]
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-                list(executor.map(build_one_module, all_opts_args_build))
+                # list(executor.map(build_one_module, all_opts_args_build))
+                list(executor.map(build_one_module, to_build))
 else:
     raise NotImplementedError("Only ROCM is supported")
 
