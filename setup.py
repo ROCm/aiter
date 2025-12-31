@@ -152,8 +152,8 @@ if IS_ROCM:
             all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
             bd = f"{core.get_user_jit_dir()}/build"
-            
             import glob
+
             shutil.rmtree(bd, ignore_errors=True)
             for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
                 try:
