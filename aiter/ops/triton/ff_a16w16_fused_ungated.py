@@ -5,7 +5,6 @@ from typing import Optional
 import torch
 import warnings
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.ff_a16w16_fused_ungated import (
     _ff_a16w16_fused_ungated,
     _get_config,
@@ -70,7 +69,7 @@ def ff_a16w16_fused_ungated(
         )  # zeros, as this does atomic adds on top
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),

@@ -155,7 +155,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             qr_comm is not None
             and not qr_comm.disabled
             and qr_comm.should_quick_allreduce(input_)
-            and (input_.nelement() * input_.element_size()) >= 4*1024*1024 # input shape should be such that quick reduce will show benefits.
+            and (input_.nelement() * input_.element_size())
+            >= 4
+            * 1024
+            * 1024  # input shape should be such that quick reduce will show benefits.
             # input shape estimated at 2 * max concurrency for now. if performance issues, subject to change
         ):
             out = qr_comm.quick_all_reduce(input_)
@@ -226,30 +229,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         return out, residual_out
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+    def reduce_scatter(
+        self, input_: torch.Tensor, output_: torch.Tensor, dim: int = -1
+    ):
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+        ):
+            ca_comm.custom_reduce_scatter(input_, output_)
+        else:
+            pynccl_comm = self.pynccl_comm
+            assert pynccl_comm is not None
+            if dim < 0:
+                # Convert negative dim to positive.
+                dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+            # Note: This will produce an incorrect answer if we don't make
+            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+            input_tensor = input_.movedim(0, dim).contiguous()
 
-        assert input_tensor.shape[0] % world_size == 0
-        chunk_size = input_tensor.shape[0] // world_size
-        output_shape = (chunk_size,) + input_tensor.shape[1:]
+            assert input_tensor.shape[0] % world_size == 0
+            chunk_size = input_tensor.shape[0] // world_size
+            output_shape = (chunk_size,) + input_tensor.shape[1:]
+            output_.reshape(output_shape)
 
-        output = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+            pynccl_comm.reduce_scatter(output_, input_tensor)
 
-        pynccl_comm.reduce_scatter(output, input_tensor)
-
-        # Reshape before returning
-        return output.movedim(0, dim).contiguous()
+            # Reshape before returning
+            output_.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None

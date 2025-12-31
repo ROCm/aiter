@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.gemm_a16w16 import (
     _gemm_a16_w16_kernel,
     _gemm_a16w16_reduce_kernel,
@@ -56,7 +55,7 @@ def gemm_a16w16(
     w = w.T
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)

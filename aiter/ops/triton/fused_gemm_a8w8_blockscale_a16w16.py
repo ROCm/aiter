@@ -2,12 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
-import functools
-import json
-import os
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.fused_gemm_a8w8_blockscale_a16w16 import (
     _fused_gemm_a8w8_blockscale_a16w16_kernel,
     _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
@@ -83,7 +79,7 @@ def fused_gemm_a8w8_blockscale_a16w16(
     w_fp8_scale = w_fp8_scale.T
 
     if config is None:
-        config = _get_config(M, N_fp8, N_bf16, K)
+        config, _ = _get_config(M, N_fp8, N_bf16, K)
 
     if y_fp8 is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y_fp8 = torch.empty((M, N_fp8), dtype=dtype, device=x_fp8.device)

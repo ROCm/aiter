@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.gemm_a16w16_gated import (
     _gemm_a16_w16_gated_kernel,
     _get_config,
@@ -55,7 +54,7 @@ def gemm_a16w16_gated(
         y = torch.empty((M, N // 2), dtype=dtype, device=x.device)
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),

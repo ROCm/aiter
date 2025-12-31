@@ -10,7 +10,6 @@ from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
-import argparse
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -80,7 +79,7 @@ def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
 
 class GemmA8W8Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
-        "verbose": False,
+        **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8}",
         "untune_file": "aiter/configs/a8w8_untuned_gemm.csv",
         "errRatio": 0.05,
@@ -148,7 +147,10 @@ class GemmA8W8Tuner(GemmCommonTuner):
                             (M, N, K, seed),
                             run_gemm_a8w8,
                             (gemm_a8w8_data_idx, i, splitK),
-                            {},
+                            {
+                                "num_warmup": args.warmup,
+                                "num_iters": args.iters,
+                            },
                             gemm_a8w8_ref,
                             (ref_data_idx,),
                             {},
@@ -163,7 +165,16 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
         return ret
 
 

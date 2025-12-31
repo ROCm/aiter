@@ -4,8 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.gemm_a16w16_atomic import (
     _gemm_a16_w16_atomic_kernel,
     _get_config,
@@ -49,7 +47,7 @@ def gemm_a16w16_atomic_(
     K, N = w.shape
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
 
