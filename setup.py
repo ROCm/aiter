@@ -152,14 +152,14 @@ if IS_ROCM:
             all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
             bd = f"{core.get_user_jit_dir()}/build"
-            # import glob
+            import glob
 
-            # shutil.rmtree(bd, ignore_errors=True)
-            # for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
-            #     try:
-            #         os.remove(f)
-            #     except Exception:
-            #         pass
+            shutil.rmtree(bd, ignore_errors=True)
+            for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
 
             if PREBUILD_KERNELS == 1:
                 base_args = core.get_args_of_build("module_mha_varlen_fwd")
@@ -236,20 +236,8 @@ if IS_ROCM:
                 prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
             os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-            to_build = [
-                args
-                for args in all_opts_args_build
-                if not os.path.exists(f"{core.get_user_jit_dir()}/{args['md_name']}.so")
-            ]
-
-            to_build = [
-                args
-                for args in all_opts_args_build
-                if not os.path.exists(f"{core.get_user_jit_dir()}/{args['md_name']}.so")
-            ]
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-                # list(executor.map(build_one_module, all_opts_args_build))
-                list(executor.map(build_one_module, to_build))
+                list(executor.map(build_one_module, all_opts_args_build))
 else:
     raise NotImplementedError("Only ROCM is supported")
 

@@ -5,7 +5,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
-from ..jit.core import AITER_CSRC_DIR, CK_DIR, AITER_META_DIR, compile_ops
+from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
@@ -1212,9 +1212,7 @@ def cmdGenFunc_mha_batch_prefill(
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
     ]
-    blob_gen_cmd.append(
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 4 --output_dir {{}}"
-    )
+
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
