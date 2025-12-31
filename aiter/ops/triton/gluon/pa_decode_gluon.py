@@ -48,33 +48,10 @@ def get_recommended_splits(num_sequences, num_kv_heads):
     return max_context_partition_num
 
 
-@triton.jit
-def get_recommended_page_size_kernel(
-    max_context_length_ptr, max_context_partition_num: int, context_partition_size: int
-):
-    """Return the smallest power of 2 greater than or equal to n"""
-    max_context_length = tl.load(max_context_length_ptr)
-    n = tl.cdiv(max_context_length, max_context_partition_num).to(tl.int64)
-    n -= 1
-    n |= n >> 1
-    n |= n >> 2
-    n |= n >> 4
-    n |= n >> 8
-    n |= n >> 16
-    n |= n >> 32
-    n += 1
-    n = tl.maximum(n, context_partition_size)
-    tl.store(max_context_length_ptr, n.to(tl.int32))
-
-
 def get_recommended_page_size(
-    context_lengths, max_context_partition_num, context_partition_size
+    context_lengths, max_context_partition_num
 ):
-    max_context_length = context_lengths.max()
-    get_recommended_page_size_kernel[(1,)](
-        max_context_length, max_context_partition_num, context_partition_size
-    )
-    return max_context_length
+    return triton.cdiv(context_lengths, max_context_partition_num)
 
 
 @gluon.jit
@@ -1172,7 +1149,7 @@ def paged_attention_decode_sliding_window(
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     sinks_ptr,  # [num_query_heads]
-    page_size_ptr,
+    page_sizes_ptr,
     stride_max_logits_seq: int,
     stride_max_logits_head: int,
     stride_max_logits_part: int,
@@ -1533,6 +1510,10 @@ def paged_attention_decode_sliding_window(
     output_mask = (output_group_offsets[:, None] < query_group_size) & (
         output_head_size_offsets[None, :] < head_size
     )
+
+    max_logits_base_offsets = gl.arange(
+        0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
+    )
     if ONE_SHOT:
         output_offsets = (
             sequence_idx * stride_output_seq
@@ -1547,9 +1528,6 @@ def paged_attention_decode_sliding_window(
             sequence_split_idx * stride_output_part
             + output_group_offsets[:, None] * stride_output_group
             + output_head_size_offsets[None, :]
-        )
-        max_logits_base_offsets = gl.arange(
-            0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
         )
         max_logits_offsets = (
             sequence_idx * stride_max_logits_seq
@@ -1583,7 +1561,7 @@ def paged_attention_decode_sliding_window(
         ) // CONTEXT_PARTITION_SIZE
         sequence_partition_end_idx = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
     else:
-        page_size = gl.load(page_size_ptr)
+        page_size = gl.load(page_sizes_ptr + sequence_idx)
         sequence_start_idx = page_size * sequence_split_idx
         if sequence_start_idx >= context_length:
             if not ONE_SHOT:
@@ -1886,17 +1864,20 @@ def paged_attention_decode_sliding_window(
             attention_accumulator += attention_output
         max_logits = new_max_logits
 
+    # ==================== SINKS HANDLING ====================
+    # Add sinks contribution to exp_sums (does not contribute to attention output)
     if ONE_SHOT and sinks_ptr is not None:
         sinks_values = gl.load(
-            sinks_ptr + (kv_head_idx * query_group_size + query_group_offsets),
-            mask=query_group_offsets < query_group_size,
+            sinks_ptr + kv_head_idx * query_group_size + max_logits_base_offsets,
+            mask=max_logits_base_offsets < query_group_size,
+            other=float("-inf"),
         ).to(gl.float32)
-        exp_sums += gl.exp(
-            gl.convert_layout(sinks_values, layout=max_logits.type.layout) - max_logits
-        )
+        # Add exp(sinks - max_logits) to exp_sums using exp2
+        exp_sums += tl.math.exp2((sinks_values - max_logits) * LOG2_E)
+
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
-    exp_sums_reciprocal = 1.0 / (exp_sums + 1e-8)
+    exp_sums_reciprocal = 1.0 / exp_sums
     exp_sums_reciprocal_cvt = gl.convert_layout(
         exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )

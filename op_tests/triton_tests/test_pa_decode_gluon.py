@@ -1541,7 +1541,7 @@ def run_pa_gluon_test(
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
         if sliding_window == 0:
             page_size = get_recommended_page_size(
-                context_lengths, max_context_partition_num, context_partition_size
+                context_lengths, max_context_partition_num
             )
     else:
         max_context_partition_num = triton.cdiv(
@@ -1635,7 +1635,7 @@ def run_pa_gluon_test(
         rtol=fp8_tolerance,
         msg=f"[PyTorch vs Gluon_FP8][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
     )
-    # torch.testing.assert_close(final_output_gluon, reference_output_quant, atol=fp8_tolerance, rtol=fp8_tolerance)
+    torch.testing.assert_close(final_output_gluon, reference_output_quant, atol=fp8_tolerance, rtol=fp8_tolerance)
     if err_gluon > 0:
         err_gluon = 1
     print("\n=== Detailed Error Analysis ===")
@@ -2287,11 +2287,11 @@ def sliding_window_test():
     USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
-    SINKS_OPTIONS = [True]
-    SLIDING_WINDOW_OPTIONS = [128]
+    SINKS_OPTIONS = [True, False]
+    SLIDING_WINDOW_OPTIONS = [0, 128]
     HEAD_DIMENSION_OPTIONS = [64]
     CONTEXT_LENGTH_OPTIONS = [1024, 8192]
-    BATCH_SIZE_OPTIONS = [4, 128]
+    BATCH_SIZE_OPTIONS = [128]
     QUERY_LENGTH_OPTIONS = [1]
     COMPUTE_TYPE_OPTIONS = ["bf16"]
     QUANT_Q_AND_KV_OPTIONS = [[True, True]]
@@ -2300,7 +2300,7 @@ def sliding_window_test():
     KV_VARLEN_OPTIONS = [True]
     HEAD_CONFIGURATIONS = [(64, 8)]
     USE_AOT_IMPL_OPTIONS = [False]
-    PS_OPTIONS = [True]
+    PS_OPTIONS = [True, False]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     # BLOCK_SIZE_OPTIONS = [64]
