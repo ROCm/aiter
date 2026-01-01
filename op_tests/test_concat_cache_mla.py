@@ -635,7 +635,8 @@ if "normal" in ltests:
             )
             df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"concat_and_cache_mla summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("concat_and_cache_mla summary (markdown):\n%s", df_md)
 
 
 if "fused_qk" in ltests:
@@ -663,4 +664,5 @@ if "fused_qk" in ltests:
                         )
                         df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"fused_rope_concat_and_cache_mla summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)
