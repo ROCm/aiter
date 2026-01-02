@@ -5,7 +5,7 @@ from typing import Optional, Union
 import torch
 import triton
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton._triton_kernels.fused_gemm_a8w8_blockscale_mul_add import (
+from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     _fused_gemm_a8w8_blockscale_mul_add_kernel,
     _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel,
     _get_config,
