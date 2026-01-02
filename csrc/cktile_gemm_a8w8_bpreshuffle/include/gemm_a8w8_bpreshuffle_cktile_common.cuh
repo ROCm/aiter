@@ -12,11 +12,11 @@
 #include <iostream>
 #include <numeric>
 
+#include "flatmm_basic.hpp"
 #include <ATen/ATen.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/extension.h>
-#include "flatmm_basic.hpp"
 
 using F16         = ck_tile::half_t;
 using BF16        = ck_tile::bf16_t;
@@ -330,7 +330,7 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
     using ADataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::ADataType;
     using BDataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::BDataType;
-    using CDataType      = ck_tile::bf16_t;;
+    using CDataType      = EDataType;
     using AccDataType    = typename GemmBasicTypeConfig<ck_tile::fp8_t>::AccDataType;
     using DsDataType     = ck_tile::tuple<>;
     using ALayout        = ck_tile::tensor_layout::gemm::RowMajor;
@@ -342,15 +342,16 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
     int n                = out.size(1);
     int k                = XQ.size(1);
 
-    using ScaleM       = typename ck_tile::FlatmmScalePointer<1>;
-    using ScaleN       = typename ck_tile::FlatmmScalePointer<1>;
-
+    using ScaleM = typename ck_tile::FlatmmScalePointer<1>;
+    using ScaleN = typename ck_tile::FlatmmScalePointer<1>;
 
     ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN> args;
     args.a_ptr = (void*)XQ.data_ptr();
     args.b_ptr = (void*)WQ.data_ptr();
-    args.scale_m = ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(x_scale.data_ptr()),m};
-    args.scale_n = ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(w_scale.data_ptr()),n};
+    args.scale_m =
+        ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(x_scale.data_ptr()), m};
+    args.scale_n =
+        ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(w_scale.data_ptr()), n};
     args.e_ptr = (void*)out.data_ptr();
 
     args.k_batch  = 1;

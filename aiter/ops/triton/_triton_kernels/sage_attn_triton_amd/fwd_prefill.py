@@ -2108,7 +2108,7 @@ def fav3_sage_triton_impl(
 
 
 def compute_k_smoothing_factors(
-    k: torch.Tensor, tensor_layout: str = "NHD"
+    k: torch.Tensor, layout: str = "bshd"
 ) -> torch.Tensor:
     """
     Compute per-channel smoothing factors for K tensor following SageAttention approach.
@@ -2117,23 +2117,23 @@ def compute_k_smoothing_factors(
     to reduce outliers before quantization, improving INT8 accuracy.
 
     Args:
-        k: Key tensor with shape (B, kv_len, H, head_dim) for NHD layout
-           or (B, H, kv_len, head_dim) for HND layout
-        tensor_layout: Either "NHD" or "HND"
+        k: Key tensor with shape (B, kv_len, H, head_dim) for bshd layout
+           or (B, H, kv_len, head_dim) for bhsd layout
+        layout: Either "bshd" or "bhsd"
 
     Returns:
         k_smooth: Smoothing factors with shape matching k, computed as per-channel mean
     """
-    if tensor_layout == "NHD":
+    if layout == "bshd":
         # k shape: [B, kv_len, H, head_dim]
         # Compute mean across sequence dimension (dim=1), keep dims for broadcasting
         k_mean = k.mean(dim=1, keepdim=True)  # [B, 1, H, head_dim]
-    elif tensor_layout == "HND":
+    elif layout == "bhsd":
         # k shape: [B, H, kv_len, head_dim]
         # Compute mean across sequence dimension (dim=2), keep dims for broadcasting
         k_mean = k.mean(dim=2, keepdim=True)  # [B, H, 1, head_dim]
     else:
-        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+        raise ValueError(f"Unknown tensor layout: {layout}")
 
     return k_mean
 
@@ -2147,7 +2147,7 @@ def sage_quant(
     BLKQ=128,
     BLKK=64,
     sm_scale=None,
-    tensor_layout="NHD",
+    layout="bshd",
     smooth_kv=True,
 ):
     """
@@ -2159,7 +2159,7 @@ def sage_quant(
         BLKQ: Block size for Q quantization
         BLKK: Block size for K quantization
         sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
-        tensor_layout: Either "NHD" or "HND"
+        layout: Either "bshd" or "bhsd"
         smooth_kv: Whether to apply K tensor smoothing before quantization
 
     Returns:
@@ -2171,21 +2171,20 @@ def sage_quant(
         v_scale: Per-block scales for V
         v_mean: Mean of V tensor if smoothing applied, else None
     """
-    if tensor_layout == "HND":
+    if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = k.shape
 
         stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
-
-    elif tensor_layout == "NHD":
+    elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = k.shape
 
         stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
     else:
-        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+        raise ValueError(f"Unknown tensor layout: {layout}")
 
     # Apply K tensor smoothing following SageAttention approach
     v_mean = None

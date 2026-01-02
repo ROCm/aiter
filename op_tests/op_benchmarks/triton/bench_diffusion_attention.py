@@ -1,12 +1,11 @@
 from __future__ import annotations
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Literal, Optional, Tuple, List, Dict, Any
 import torch
 import os
 import glob
 
 import sys
 import argparse
-import itertools
 import aiter
 import triton
 
@@ -26,11 +25,8 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.test_mha import check_attention_outputs
-from op_tests.op_benchmarks.triton.mha_correctness_utils import (
-    primary_output,
-    print_output_comparison_stats,
-)
+from op_tests.triton_tests.attention.test_sage_attn import check_attention_outputs
+from op_tests.triton_tests.utils.accuarcy_analysis import compare_accuracy
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.mha_v3 import _quantize_bshd
 
@@ -42,12 +38,45 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     sage_quant,
 )
 
+CAUSAL = False
+layout_converter = {
+    "bshd": "NHD",
+    "bhsd": "HND",
+}
+
+reversed_tensor_converter = {v: k for k, v in layout_converter.items()}
 
 # test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
 import logging
 
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def layout_preprocess(
+    q,
+    k,
+    v,
+    layout: Literal["bshd", "bhsd"],
+    target_layout: Literal["bshd", "bhsd"] = "bshd",
+):
+    """
+    Preprocess input tensors to the target layout.
+
+    Args:
+        q, k, v: Input tensors
+        layout: Current layout of the tensors
+        target_layout: Desired layout of the tensors
+
+    Returns:
+        q, k, v tensors in the target layout
+    """
+    if layout != target_layout:
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
+    return q, k, v
 
 
 def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
@@ -84,7 +113,6 @@ def fav3_fp8_forward_func(
     window_size: Tuple[int, int],
     attention_chunk: int,
     softcap: float,
-    deterministic: bool,
     sm_margin: int,
 ):
     batch, seqlen, num_q_heads, head_dim = q.shape
@@ -166,12 +194,10 @@ def fav3_fp8_forward_func(
     )
 
 
-def sagev1_forward_func(q, k, v, sm_scale, k_smooth=True):
+def sagev1_forward_func(q, k, v, sm_scale, layout, dtype, k_smooth=True):
     config = _get_config()
     # permute back to BHSD which is the underlying tensor format
-    q = q.permute(0,2,1,3)
-    k = k.permute(0,2,1,3)
-    v = v.permute(0,2,1,3).to(torch.float16)
+
     q, q_scale, k, k_scale, _ = per_block_int8(
         q,
         k,
@@ -179,7 +205,7 @@ def sagev1_forward_func(q, k, v, sm_scale, k_smooth=True):
         BLKQ=config["BLOCK_SIZE_M"],
         BLKK=config["BLOCK_SIZE_N"],
         sm_scale=sm_scale,
-        tensor_layout="HND",
+        layout=reversed_tensor_converter[layout],
         smooth_k=k_smooth,
     )
     q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
@@ -190,8 +216,8 @@ def sagev1_forward_func(q, k, v, sm_scale, k_smooth=True):
         v,
         q_scale,
         k_scale,
-        tensor_layout="HND",
-        output_dtype=torch.bfloat16,
+        layout=reversed_tensor_converter[layout],
+        output_dtype=dtype,
         config=config,
     )
 
@@ -224,6 +250,7 @@ def fav3_sage_forward_func(
     v: torch.Tensor,
     causal: bool,
     inference_mode: bool,  # not return softmax_lse
+    layout: Literal["bshd", "bhsd"],
 ):
     config = get_fwd_configs(False)
     # assert (
@@ -236,9 +263,7 @@ def fav3_sage_forward_func(
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
     k_mean = None
-    ## following quantization already considered softmax scale and RCP_LN2
-    # Enable both methods and compare results
-    # Method 1: Original separate quantization
+
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
@@ -252,7 +277,7 @@ def fav3_sage_forward_func(
         sm_scale=softmax_scale,
         BLKQ=BLKQ,
         BLKK=BLKK,
-        tensor_layout="NHD",
+        layout=layout,
     )
     return lambda: fav3_sage_func(
         q_int8,
@@ -265,19 +290,8 @@ def fav3_sage_forward_func(
         v_mean,
         causal=causal,
         inference_mode=inference_mode,
+        layout=layout,
     )
-
-def nonvarlen_benchmark_configs():
-    batch_sizes = [1, 4, 16]
-    N_HEADS = [16, 48]
-    seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192]
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
-    configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
-        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
-    ]
-    return configs
 
 
 def create_benchmark_configs(args):
@@ -286,7 +300,7 @@ def create_benchmark_configs(args):
     sk = args.sq if not args.sk else args.sk
     head_size = 128 if not args.d else args.d
     head_size_v = head_size if not args.dv else args.dv
-    mode = args.mode
+    layout = args.layout if args.layout else "bshd"
     x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
     causal = False
 
@@ -296,8 +310,8 @@ def create_benchmark_configs(args):
         "D_HEAD": head_size,
         "D_HEAD_V": head_size_v,
         "dtype": dtype,
+        "layout": layout,
         "causal": causal,
-        "mode": mode,
     }
     x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
     unit = ""
@@ -349,21 +363,10 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
     x_vals_list = []
     for i, inp in enumerate(inputs):
         # Shape from BSHD format: (batch, seqlen, heads, dim)
-        batch, seq_q, hq, d_head = inp["q"].shape
-        _, seq_k, hk, _ = inp["k"].shape
-        d_head_v = inp["v_shape"][-1]
-
-        x_vals_list.append((i, batch, seq_q, seq_k, hq, hk, d_head, d_head_v))
+        x_vals_list.append((i))
 
     x_names = [
         "INPUT_IDX",
-        "BATCH",
-        "N_CTX_Q",
-        "N_CTX_K",
-        "HQ",
-        "HK",
-        "D_HEAD",
-        "D_HEAD_V",
     ]
 
     # Determine line_vals based on metric
@@ -397,123 +400,143 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
             plot_name=plot_name,
             args={
                 "inputs": inputs,
-                "causal": False,
-                "mode": args.mode,
             },
         )
     ]
     return configs
 
 
-def bench_kernel(q, k, v, args, provider):
-    # Default softmax scale
-    print("bench kernel assumes shape BSHD")
-    print(f"q.shape = {q.shape}. Should correspond to BSHD, make sure that this is right!")
-    BATCH, N_CTX_Q, HQ,  D_HEAD = q.shape
-    _, N_CTX_K, HK, D_HEAD_V = v.shape
-    softmax_scale = 1.0 / (D_HEAD**0.5)
-    k_smooth = not args.no_k_smooth
+def primary_output(result):
+    """Return the main tensor output produced by a Triton kernel."""
+    if isinstance(result, torch.Tensor):
+        return result
+    if isinstance(result, (list, tuple)) and len(result) > 0:
+        return result[0]
+    return result
 
-    # FLOPS calculation variables
-    total_flops = 0.0
-    total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-    if args.fav3_fp8:  #  fav3 fp8
-        fn = fav3_fp8_forward_func(
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            causal=False,
-            window_size=(-1, -1),
-            attention_chunk=0,
-            softcap=0.0,
-            deterministic=False,
-            sm_margin=0,
-        )
-    elif args.sagev1:  # sage v1
-        fn = sagev1_forward_func(
-            q,
-            k,
-            v,
-            sm_scale=softmax_scale,
-            k_smooth=k_smooth,
-        )
-    elif args.fav3_sage:  # sage v1, fused on fav3
+
+def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
+    if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
             k,
             v,
             causal=False,
             inference_mode=True,
+            layout=layout,
         )
-    else:  # fav2 (no quantization)
-        fn = fav2_forward_func(
+    elif func_name == "sagev1":  # sage v1
+        fn = sagev1_forward_func(
             q,
             k,
             v,
-            dropout_p=0.0,
-            softmax_scale=softmax_scale,
-            causal=False,
-            return_lse=False,
-            return_attn_probs=False,
+            layout=layout,
+            sm_scale=softmax_scale,
+            k_smooth=k_smooth,
+            dtype=dtype,
         )
+    else:
+        q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
 
+        if func_name == "fav2":  # fav2 (no quantization)
+            fn = fav2_forward_func(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                softmax_scale=softmax_scale,
+                causal=False,
+                return_lse=False,
+                return_attn_probs=False,
+            )
+        elif func_name == "fav3_fp8":  #  fav3 fp8
+            fn = fav3_fp8_forward_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=False,
+                window_size=(-1, -1),
+                attention_chunk=0,
+                softcap=0.0,
+                sm_margin=0,
+            )
+        else:
+            fn = lambda: attention_ref(
+                q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
+            )
+    return fn
+
+
+def bench_kernel(q, k, v, args, provider):
+    # Default softmax scale
+    if args.layout == "bshd":
+        BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
+        _, N_CTX_K, HK, D_HEAD_V = v.shape
+    else:  # bhsd
+        BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
+        _, HK, N_CTX_K, D_HEAD_V = v.shape
+
+    softmax_scale = 1.0 / (D_HEAD**0.5)
+    k_smooth = args.k_smooth
+
+    # FLOPS calculation variables
+    total_flops = 0.0
+    total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+    bench_func_name = ""
+    if args.sagev1:
+        bench_func_name = "sagev1"
+    elif args.fav3_fp8:
+        bench_func_name = "fav3_fp8"
+    elif args.fav3_sage:
+        bench_func_name = "fav3_sage"
+    else:
+        assert (
+            False
+        ), "One of -fav3_fp8, -sagev1 or -fav3_sage must be specified for diffusion attention benchmark."
+
+    fn = attn_forward_func(
+        q,
+        k,
+        v,
+        func_name=bench_func_name,
+        softmax_scale=softmax_scale,
+        k_smooth=k_smooth,
+        layout=args.layout,
+        dtype=arg_to_torch_dtype[args.dtype],
+    )
     ms = triton.testing.do_bench(fn)
 
     if args.compare_to_ref:
         current_output = fn()
         assert current_output is not None
         current_primary = primary_output(current_output)
-        if args.sagev1:
-            current_primary = current_primary.permute(0,2,1,3) # sagev1 output is BHSD
 
+        if (args.sagev1 or args.fav3_sage) and args.layout == "bhsd":
+            current_primary = current_primary.permute(
+                0, 2, 1, 3
+            )  # we do comparison in BSHD
 
-        def reference_output():
-            if args.ref == "fav3_fp8":  #  fav3 fp8
-                fn = fav3_fp8_forward_func(
-                    q,
-                    k,
-                    v,
-                    softmax_scale=softmax_scale,
-                    causal=False,
-                    window_size=(-1, -1),
-                    attention_chunk=0,
-                    softcap=0.0,
-                    deterministic=False,
-                    sm_margin=0,
-                )
-            elif args.ref == "sagev1":  # sage v1
-                fn = sagev1_forward_func(
-                    q,
-                    k,
-                    v,
-                    tensor_layout="NHD",
-                    sm_scale=softmax_scale,
-                    k_smooth=k_smooth,
-                )
-            elif args.ref == "fav2":  # fav2 (no quantization)
-                fn = fav2_forward_func(
-                    q,
-                    k,
-                    v,
-                    dropout_p=0.0,
-                    softmax_scale=softmax_scale,
-                    causal=False,
-                    return_lse=False,
-                    return_attn_probs=False,
-                )
-            else:
-                fn = lambda: attention_ref(
-                    q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
-                )
-            return fn()
+        reference_primary = primary_output(
+            attn_forward_func(
+                q,
+                k,
+                v,
+                func_name=args.ref,
+                softmax_scale=softmax_scale,
+                k_smooth=k_smooth,
+                layout=args.layout,
+                dtype=arg_to_torch_dtype[args.dtype],
+            )()
+        )
 
-        reference_primary = primary_output(reference_output())
-        if args.ref == "sagev1":
-            reference_primary = reference_primary.permute(0,2,1,3) # sagev1 output is BHSD
+        if args.ref == "sagev1" or args.ref == "fav3_sage" and args.layout == "bhsd":
+            reference_primary = reference_primary.permute(
+                0, 2, 1, 3
+            )  # we do comparison in BSHD
+
         check_attention_outputs(current_primary, reference_primary, fp8=False)
-        if args.print_compare_stats:
-            print_output_comparison_stats(current_primary, reference_primary)
+        compare_accuracy(current_primary, reference_primary)
 
     q_element_size = (
         1 if args.sagev1 or args.fav3_fp8 or args.fav3_sage else q.element_size()
@@ -562,16 +585,7 @@ def run_benchmark_captured(args):
     @triton.testing.perf_report(create_benchmark_configs_from_captured(inputs, args))
     def bench_mha_captured(
         INPUT_IDX,
-        BATCH,
-        HQ,
-        HK,
-        N_CTX_Q,
-        N_CTX_K,
-        D_HEAD,
-        D_HEAD_V,
         inputs,
-        causal,
-        mode,
         provider,
         device="cuda",
     ):
@@ -584,11 +598,16 @@ def run_benchmark_captured(args):
 
         # Load tensors to GPU - captured inputs are in BHSD format (batch, heads, seq, dim). Permute it to the BSHD which bench kernel expects.
         # Permute shouldnt move data, so contiguousness of dimensions should stay intact.
-        q = inp["q"].permute(0,2,1,3).to(device)
-        k = inp["k"].permute(0,2,1,3).to(device)
-        v = inp["v"].permute(0,2,1,3).to(device)
+        q = inp["q"].to(device)
+        k = inp["k"].to(device)
+        v = inp["v"].to(device)
+
         return bench_kernel(q, k, v, args, provider)
 
+    args.layout = "bhsd"  # captured inputs are in BHSD format
+    logger.info(
+        f"Captured inpputs are in BHSD format. Setting args.layout to bhsd for benchmark."
+    )
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
 
 
@@ -608,18 +627,15 @@ def run_benchmark(args):
         D_HEAD,
         D_HEAD_V,
         dtype,
+        layout,
         causal,
-        mode,
         provider,
         dropout=0.0,
-        model=None,
-        sm_scale=None,
         device="cuda",
     ):
         """
         Benchmark function for attention kernels with generated random inputs.
         """
-        assert args.layout == "bshd"
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         assert causal == False, "Causal not supported in this benchmark."
 
@@ -630,11 +646,10 @@ def run_benchmark(args):
         q.requires_grad = False
         k.requires_grad = False
         v.requires_grad = False
+
         # permute to the BSHD layout which is expected by the bench_kernel
         # permute does not move data so this doesnt affect the performance
-        q = q.permute(0,2,1,3)
-        k = k.permute(0,2,1,3)
-        v = v.permute(0,2,1,3)
+        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
 
         return bench_kernel(q, k, v, args, provider)
 
@@ -644,7 +659,7 @@ def run_benchmark(args):
 def supported_layouts():
     layouts = (
         "bshd: Q, K, V are individual tensors of [batch, seqlen_q/k, num_heads, head_size]. "
-        "thd: Q, K, V are individual tensors of [total_q/k, num_heads, head_size]. "
+        "bhsd: Q, K, V are individual tensors of [batch, num_heads, seqlen_q/k, head_size]. "
     )
     return layouts
 
@@ -663,20 +678,11 @@ def str2bool(v):
 
 def parse_args():
     parser = get_parser(kernel_name="FlashAttention")
-    parser.add_argument(
-        "-mode", type=str, default="fwd", help="fwd:forward kernel, bwd:backward kernel"
-    )
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
     parser.add_argument("-sq", type=int, default=0)
     parser.add_argument("-sk", type=int, default=0)
-    parser.add_argument(
-        "-equal_seqlens",
-        action="store_true",
-        default=False,
-        help="If specified, uses equal sequence lengths with thd layout, i.e t = b * sq",
-    )
     parser.add_argument(
         "-d",
         type=int,
@@ -684,7 +690,6 @@ def parse_args():
         help="Q and K head size, if -dv is absent then -d specifies V head size too",
     )
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
-    # parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument(
         "-fav3_fp8",
         action="store_true",
@@ -703,15 +708,10 @@ def parse_args():
         default=False,
         help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.",
     )
-    parser.add_argument("-no_k_smooth", action="store_true", default=False)
-    parser.add_argument("-quantize_p", action="store_true", default=False)
-    parser.add_argument("--dtype", default="fp16")
-    parser.add_argument("-bench_torch", action="store_true", default=False)
-    parser.add_argument("-fused_bwd", action="store_true", default=False)
+    parser.add_argument("-k_smooth", action="store_true", default=True)
+    parser.add_argument("--dtype", default="bf16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument("-print_compare_stats", action="store_true", default=False)
-
-    parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
+    parser.add_argument("--layout", type=str, default="bshd", help=supported_layouts())
     parser.add_argument(
         "-ref",
         type=str,
@@ -725,14 +725,6 @@ def parse_args():
         choices=["all", "time", "throughput", "bandwidth", "arithmetic_intensity"],
         default=None,
         help="Metrics for the kernel benchmark.",
-    )
-    parser.add_argument(
-        "-persistent",
-        nargs="?",
-        const="fixed",
-        choices=["fixed", "dynamic"],
-        default=None,
-        help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.",
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
@@ -778,9 +770,6 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
-    # hardcode non-variable length and non-causal for now
-    args.causal = False
-    args.layout = "bshd"
 
     # Handle captured input mode separately
     if args.load_captured:
@@ -801,13 +790,9 @@ def main():
     ), "Only fp16, bf16 and f32 types currently supported."
 
     if args.print_vgpr:
-        assert not args.bench_torch, "Do not use -bench_torch with -print_vgpr."
         print("Retrieving VGPR usage for Triton kernels...")
 
-        def fun():
-            return run_benchmark(args)
-
-        print_vgpr(fun, get_caller_name_no_ext())
+        print_vgpr(lambda: run_benchmark(args), get_caller_name_no_ext())
         return 0
 
     run_benchmark(args)

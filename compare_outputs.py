@@ -14,9 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
-from op_tests.op_benchmarks.triton.mha_correctness_utils import (
-    print_output_comparison_stats,
-)
+from op_tests.triton_tests.utils.accuarcy_analysis import compare_accuracy
 
 
 def sanitize_file_component(value: Any) -> str:
@@ -207,7 +205,7 @@ def compare_outputs(ref_file: str, test_file: str):
         )
 
     # Shared stats + correctness summary (keeps inline + file-based outputs consistent)
-    print_output_comparison_stats(test_output, ref_output)
+    compare_accuracy(test_output, ref_output)
 
 
 def main():
