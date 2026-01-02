@@ -11,19 +11,15 @@ import argparse
 
 
 def torch_silu_and_mul_quant(input: torch.Tensor, quant_dtype: torch.dtype) -> tuple:
-    """Reference implementation: SiLU+mul followed by per-token quantization"""
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
 
-    # SiLU and multiply
     out_fp = F.silu(x) * y
 
-    # Per-token quantization
     shape = out_fp.shape
     out_fp_2d = out_fp.view(-1, shape[-1])
     num_tokens = out_fp_2d.shape[0]
 
-    # Compute per-token scale
     absmax = torch.max(torch.abs(out_fp_2d), dim=-1, keepdim=True)[0]
 
     if quant_dtype == dtypes.fp8:
@@ -36,7 +32,6 @@ def torch_silu_and_mul_quant(input: torch.Tensor, quant_dtype: torch.dtype) -> t
     scale = absmax / dtype_max
     scale[scale == 0] = 1.0
 
-    # Quantize
     out_quant = (out_fp_2d / scale).to(quant_dtype)
     out_quant = out_quant.view(shape)
     scale = scale.view(num_tokens, 1).to(torch.float32)  # Ensure scale is float32
@@ -45,14 +40,11 @@ def torch_silu_and_mul_quant(input: torch.Tensor, quant_dtype: torch.dtype) -> t
 
 
 def torch_gelu_and_mul_quant(input: torch.Tensor, quant_dtype: torch.dtype) -> tuple:
-    """Reference implementation: GELU+mul followed by per-token quantization"""
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
 
-    # GELU and multiply
     out_fp = F.gelu(x) * y
 
-    # Per-token quantization (same as silu)
     shape = out_fp.shape
     out_fp_2d = out_fp.view(-1, shape[-1])
     num_tokens = out_fp_2d.shape[0]
@@ -71,22 +63,19 @@ def torch_gelu_and_mul_quant(input: torch.Tensor, quant_dtype: torch.dtype) -> t
 
     out_quant = (out_fp_2d / scale).to(quant_dtype)
     out_quant = out_quant.view(shape)
-    scale = scale.view(num_tokens, 1).to(torch.float32)  # Ensure scale is float32
+    scale = scale.view(num_tokens, 1).to(torch.float32)
 
     return out_quant, scale
 
 
 def separate_kernel_baseline(input: torch.Tensor, quant_dtype: torch.dtype, activation_fn) -> tuple:
-    """Run activation+mul and quantization as separate kernels"""
     d = input.shape[-1] // 2
     shape = input.shape
     num_tokens = input.numel() // input.shape[-1]
 
-    # Activation and multiply
     out_act = torch.empty((num_tokens, d), dtype=input.dtype, device=input.device)
     activation_fn(out_act, input)
 
-    # Quantization
     out_quant = torch.empty((num_tokens, d), dtype=quant_dtype, device=input.device)
     scales = torch.empty((num_tokens, 1), dtype=torch.float32, device=input.device)
     dynamic_per_token_scaled_quant(out_quant, out_act, scales)
@@ -102,10 +91,8 @@ def test_fused_silu_mul_quant(m, n, dtype, quant_dtype):
     out = torch.empty((m, n // 2), dtype=quant_dtype, device="cuda")
     scales = torch.empty((m, 1), dtype=torch.float32, device="cuda")
 
-    # Reference implementation
     ref_out, ref_scales = torch_silu_and_mul_quant(input_data, quant_dtype)
 
-    # Fused kernel
     _, us_fused = run_perftest(
         fused_silu_mul_quant,
         out,
@@ -113,9 +100,6 @@ def test_fused_silu_mul_quant(m, n, dtype, quant_dtype):
         input_data,
     )
 
-    # Check correctness - compare dequantized values, not quantized values
-    # For quantized data, small scale differences can cause large quantized value differences
-    # but the dequantized values should be close
     ref_dequant = ref_out.to(torch.float) * ref_scales
     fused_dequant = out.to(torch.float) * scales
     err_out = checkAllclose(ref_dequant, fused_dequant, rtol=5e-2, atol=5e-2)
@@ -133,16 +117,13 @@ def test_fused_silu_mul_quant(m, n, dtype, quant_dtype):
 
 @benchmark()
 def test_fused_gelu_mul_quant(m, n, dtype, quant_dtype):
-    """Test fused GELU+mul+quant kernel"""
     ret = {}
     input_data = torch.randn(m, n, dtype=dtype, device="cuda")
     out = torch.empty((m, n // 2), dtype=quant_dtype, device="cuda")
     scales = torch.empty((m, 1), dtype=torch.float32, device="cuda")
 
-    # Reference implementation
     ref_out, ref_scales = torch_gelu_and_mul_quant(input_data, quant_dtype)
 
-    # Fused kernel
     _, us_fused = run_perftest(
         fused_gelu_mul_quant,
         out,
@@ -150,7 +131,6 @@ def test_fused_gelu_mul_quant(m, n, dtype, quant_dtype):
         input_data,
     )
 
-    # Check correctness - compare dequantized values, not quantized values
     ref_dequant = ref_out.to(torch.float) * ref_scales
     fused_dequant = out.to(torch.float) * scales
     err_out = checkAllclose(ref_dequant, fused_dequant, rtol=5e-2, atol=5e-2)
@@ -168,11 +148,9 @@ def test_fused_gelu_mul_quant(m, n, dtype, quant_dtype):
 
 @benchmark()
 def benchmark_fused_vs_separate(m, n, dtype, quant_dtype, activation="silu"):
-    """Compare fused kernel performance against separate kernel calls"""
     ret = {}
     input_data = torch.randn(m, n, dtype=dtype, device="cuda")
 
-    # Select activation function
     if activation == "silu":
         fused_fn = fused_silu_mul_quant
         separate_act_fn = silu_and_mul
@@ -185,7 +163,6 @@ def benchmark_fused_vs_separate(m, n, dtype, quant_dtype, activation="silu"):
     else:
         raise ValueError(f"Unknown activation: {activation}")
 
-    # Fused kernel
     out_fused = torch.empty((m, n // 2), dtype=quant_dtype, device="cuda")
     scales_fused = torch.empty((m, 1), dtype=torch.float32, device="cuda")
     _, us_fused = run_perftest(
@@ -195,13 +172,11 @@ def benchmark_fused_vs_separate(m, n, dtype, quant_dtype, activation="silu"):
         input_data,
     )
 
-    # Separate kernels
     out_separate, scales_separate = separate_kernel_baseline(input_data, quant_dtype, separate_act_fn)
     _, us_separate = run_perftest(
         lambda: separate_kernel_baseline(input_data, quant_dtype, separate_act_fn),
     )
 
-    # Check that results match - compare dequantized values
     fused_dequant = out_fused.to(torch.float) * scales_fused
     sep_dequant = out_separate.to(torch.float) * scales_separate
     err_out = checkAllclose(fused_dequant, sep_dequant, rtol=5e-2, atol=5e-2)
@@ -228,6 +203,8 @@ if __name__ == "__main__":
     parser.add_argument("--test", type=str, default="all",
                        choices=["correctness", "benchmark", "all"],
                        help="Which tests to run")
+    parser.add_argument("--save-csv", action="store_true", default=False,
+                        help="Save results to CSV")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -239,7 +216,6 @@ if __name__ == "__main__":
         print("Correctness Tests")
         print("=" * 80)
 
-        # Test different sizes and dtypes
         test_configs = [
             (32, 4096, dtypes.bf16, dtypes.fp8),
             (128, 4096, dtypes.bf16, dtypes.fp8),
@@ -273,7 +249,6 @@ if __name__ == "__main__":
         print("Performance Benchmarks: Fused vs Separate Kernels")
         print("=" * 80)
 
-        # Benchmark different sizes
         benchmark_configs = [
             (32, 4096),
             (64, 4096),
@@ -302,13 +277,12 @@ if __name__ == "__main__":
                 print(f"{m:6d} {n:6d} {result['us_fused']:12.2f} {result['us_separate']:14.2f} "
                       f"{result['speedup']:10.2f}x {result['TB/s_fused']:11.2f}T {result['TB/s_separate']:11.2f}T")
 
-        # Save results to CSV
         df = pd.DataFrame(all_results)
-        csv_path = "fused_act_quant_benchmark.csv"
-        df.to_csv(csv_path, index=False)
-        print(f"\nBenchmark results saved to {csv_path}")
+        if args.save_csv:
+            csv_path = "fused_act_quant_benchmark.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"\nBenchmark results saved to {csv_path}")
 
-        # Print summary
         print("\n" + "=" * 80)
         print("Summary Statistics")
         print("=" * 80)

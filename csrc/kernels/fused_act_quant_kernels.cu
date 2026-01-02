@@ -45,8 +45,7 @@ __device__ __forceinline__ T max2(T a, T b)
 
 __device__ __forceinline__ float wave_reduce_max_f32(float v)
 {
-    // AMD wavefront is 64 lanes for CDNA GPUs; our block size is always a multiple of 64.
-    // Use xor-shuffles to reduce within the wave.
+    // Shuffle within 64 wavefronts
     v = max2(v, __shfl_xor(v, 32, 64));
     v = max2(v, __shfl_xor(v, 16, 64));
     v = max2(v, __shfl_xor(v, 8, 64));
@@ -61,7 +60,6 @@ __device__ __forceinline__ uintptr_t align_up_uintptr(uintptr_t x, uintptr_t a)
     return (x + (a - 1)) & ~(a - 1);
 }
 
-// Activation function templates
 template <typename T>
 __device__ __forceinline__ float silu_kernel(const T& x)
 {
@@ -75,7 +73,6 @@ __device__ __forceinline__ float silu_kernel(const T& x)
 template <typename T>
 __device__ __forceinline__ float gelu_kernel(const T& x)
 {
-    // Equivalent to PyTorch GELU with 'none' approximation.
     const float f         = ck_tile::type_convert<float>(x);
     constexpr float ALPHA = M_SQRT1_2;
     return f * 0.5f * (1.0f + ::erf(f * ALPHA));
@@ -84,7 +81,6 @@ __device__ __forceinline__ float gelu_kernel(const T& x)
 template <typename T>
 __device__ __forceinline__ float gelu_tanh_kernel(const T& x)
 {
-    // Equivalent to PyTorch GELU with 'tanh' approximation.
     const float f         = ck_tile::type_convert<float>(x);
     constexpr float BETA  = M_SQRT2 * M_2_SQRTPI * 0.5f;
     constexpr float KAPPA = 0.044715;
@@ -93,8 +89,6 @@ __device__ __forceinline__ float gelu_tanh_kernel(const T& x)
     return 0.5f * f * (1.0f + ::tanhf(inner));
 }
 
-// Fused activation+mul+per_token_quant kernel
-// This kernel combines act_and_mul and dynamic_per_token_scaled_quant
 template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void fused_act_mul_quant_kernel_nocache(
     DTYPE_O* __restrict__ out,         // [..., d]
@@ -104,7 +98,6 @@ __global__ void fused_act_mul_quant_kernel_nocache(
 {
     const int64_t token_idx = blockIdx.x;
 
-    // Pointers to the two halves of input
     auto const* ptr_x = (input + token_idx * 2 * d);
     auto const* ptr_y = (input + token_idx * 2 * d + d);
 
@@ -117,7 +110,7 @@ __global__ void fused_act_mul_quant_kernel_nocache(
     buffer_x.init_raw();
     buffer_y.init_raw();
 
-    // Phase 1: Apply activation and multiply, computing absMax
+    // Phase 1: Apply activation and multiply to compute absmax
     float absMax = 1e-10f;
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
@@ -125,7 +118,6 @@ __global__ void fused_act_mul_quant_kernel_nocache(
         vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
         vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        // Compute activation and multiply, track absMax
 #pragma unroll
         for(size_t j = 0; j < VEC_SIZE_I; j++)
         {
@@ -139,8 +131,6 @@ __global__ void fused_act_mul_quant_kernel_nocache(
         }
     }
 
-    // Phase 2: Block reduction to find the maximum absolute value
-    // Use blockDim.x (runtime block size) instead of compile-time BlockSize constant
     if (blockDim.x == 64) {
         absMax = block_reduce<float, hipcub::Max, 64, true>(absMax, hipcub::Max());
     } else if (blockDim.x == 128) {
@@ -150,7 +140,6 @@ __global__ void fused_act_mul_quant_kernel_nocache(
     } else if (blockDim.x == 512) {
         absMax = block_reduce<float, hipcub::Max, 512, true>(absMax, hipcub::Max());
     } else {
-        // Fallback for other block sizes
         absMax = block_reduce<float, hipcub::Max, 256, true>(absMax, hipcub::Max());
     }
 
@@ -176,7 +165,7 @@ __global__ void fused_act_mul_quant_kernel_nocache(
                           ? fp4_scale(absMax) * inverted_DTYPE_MAX
                           : absMax * inverted_DTYPE_MAX;
 
-    // Thread 0 stores the scale
+    // Shuffle scale to thread 0
     if(threadIdx.x == 0)
     {
         if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
@@ -214,10 +203,8 @@ __global__ void fused_act_mul_quant_kernel_nocache(
         vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
         vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
 
-        // Recompute activation and multiply, then quantize
         if constexpr(VEC_SIZE_I == 1)
         {
-            // Special case for VEC_SIZE=1: quantize directly without vec_convert
             float ax = ACT_FN(x[0]);
             float yv = ck_tile::type_convert<float>(y[0]);
             float result_fp = ax * yv;
@@ -240,7 +227,6 @@ __global__ void fused_act_mul_quant_kernel_nocache(
         }
         else
         {
-            // VEC_SIZE >= 2: use vec_convert
             vec_i result;
 #pragma unroll
             for(size_t j = 0; j < VEC_SIZE_I; j++)
@@ -250,14 +236,12 @@ __global__ void fused_act_mul_quant_kernel_nocache(
                 result[j] = ck_tile::type_convert<DTYPE_I>(ax * yv);
             }
 
-            // Quantize - use vec_convert which requires VEC_SIZE >= 2
             static constexpr int32_t vec_size_o =
                 std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? VEC_SIZE_I / 2 : VEC_SIZE_I;
 
             auto out_s = ck_tile::vec_convert<DTYPE_O, DTYPE_I, VEC_SIZE_I>(result, inverted_scale)
                              .template get_as<DTYPE_STORE>();
 
-            // Write output
             int64_t out_idx = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? idx / 2 : idx;
 
             if constexpr(VEC_SIZE_I <= 16)
@@ -281,8 +265,7 @@ __global__ void fused_act_mul_quant_kernel_nocache(
     }
 }
 
-// Same as fused_act_mul_quant_kernel_nocache, but caches ACT_FN(x)*y in LDS so we don't
-// reload/recompute it in the quantization pass. This is especially beneficial for large d.
+// Cached version caching act_and_mul results in LDS
 template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
 __global__ void fused_act_mul_quant_kernel_cached(
     DTYPE_O* __restrict__ out,         // [..., d]
@@ -292,7 +275,6 @@ __global__ void fused_act_mul_quant_kernel_cached(
 {
     const int64_t token_idx = blockIdx.x;
 
-    // Pointers to the two halves of input
     auto const* ptr_x = (input + token_idx * 2 * d);
     auto const* ptr_y = (input + token_idx * 2 * d + d);
 
@@ -306,7 +288,6 @@ __global__ void fused_act_mul_quant_kernel_cached(
     buffer_x.init_raw();
     buffer_y.init_raw();
 
-    // Round up to VEC_SIZE_I so idx+j accesses are always in-bounds for LDS.
     const int32_t oob_smem = (d + VEC_SIZE_I - 1) / VEC_SIZE_I * VEC_SIZE_I;
 
     // Dynamic shared memory layout:
@@ -318,7 +299,7 @@ __global__ void fused_act_mul_quant_kernel_cached(
                                            static_cast<uintptr_t>(alignof(float)));
     auto* smem_wave_max = reinterpret_cast<float*>(smem_raw + waves_off);
 
-    // Phase 1: Load x/y once, compute r=ACT_FN(x)*y, write r to LDS, and compute absMax.
+    // Phase 1: Load x/y once, compute ACT_FN(x)*y, write to LDS, and compute per-thread absMax
     float absMax = 1e-10f;
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
@@ -340,7 +321,7 @@ __global__ void fused_act_mul_quant_kernel_cached(
             }
             else if(e < oob_smem)
             {
-                // Pad the LDS cache for safe vector reads later.
+                // Pad the LDS cache for safe vector reads
                 smem_r[e] = ck_tile::type_convert<DTYPE_I>(0.0f);
             }
         }
@@ -348,7 +329,7 @@ __global__ void fused_act_mul_quant_kernel_cached(
 
     __syncthreads(); // ensure smem_r is fully populated before any thread reuses it
 
-    // Phase 2: Block reduction of absMax using wave reductions + a tiny shared scratch.
+    // Phase 2: Block reduction of absMax using wave reductions + a tiny shared scratch
     const int lane_id = threadIdx.x & 63;
     const int wave_id = threadIdx.x >> 6;
     const int num_waves = blockDim.x >> 6;
@@ -409,7 +390,7 @@ __global__ void fused_act_mul_quant_kernel_cached(
         }
     }
 
-    // Phase 4: Quantize and write output (reads r from LDS; no 2nd global load; no ACT recompute)
+    // Phase 4: Quantize and write output
     const float inverted_scale =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? row_scale : 1.0f / row_scale;
 
@@ -496,6 +477,9 @@ static constexpr int nextPow2(unsigned int num)
     int64_t num_tokens = input.numel() / input.size(-1);                                        \
     int vec_size = nextPow2(d / 64);                                                            \
     vec_size = vec_size < 2 ? 2 : vec_size;                                                    \
+    if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>) {                                  \
+        vec_size = vec_size < 4 ? 4 : vec_size;                                                \
+    }                                                                                           \
     vec_size = vec_size > max_vec_size ? max_vec_size : vec_size;                              \
     int num_wave = nextPow2(d / 64 / vec_size);                                                 \
     num_wave = num_wave > max_wave_num ? max_wave_num : num_wave;                              \
@@ -515,16 +499,35 @@ static constexpr int nextPow2(unsigned int num)
         HIP_CHECK(hipGetDevice(&dev));                                                           \
         HIP_CHECK(hipGetDeviceProperties(&prop, dev));                                           \
         const bool use_cache = smem_bytes <= prop.sharedMemPerBlock;                             \
-        AITER_DISPATCH_CASE_VEC_SIZE(                                                           \
-            vec_size,                                                                           \
-            (use_cache                                                                            \
-                 ? aiter::fused_act_mul_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE> \
-                 : aiter::fused_act_mul_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
-            <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                               \
-                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                      \
-                scales.data_ptr<float>(),                                                       \
-                reinterpret_cast<input_dtype*>(input.data_ptr()),                               \
-                d);)                                                                            \
+        if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>) {                                \
+            /* FP4: Only dispatch vec_size >= 4 due to vec_convert constraints */                \
+            auto launch_kernel = [&]<int VEC_SIZE>() {                                           \
+                (use_cache                                                                        \
+                     ? aiter::fused_act_mul_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE> \
+                     : aiter::fused_act_mul_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
+                <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                           \
+                    reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                  \
+                    scales.data_ptr<float>(),                                                   \
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),                           \
+                    d);                                                                          \
+            };                                                                                   \
+            if(vec_size == 32) launch_kernel.template operator()<32>();                          \
+            else if(vec_size == 16) launch_kernel.template operator()<16>();                     \
+            else if(vec_size == 8) launch_kernel.template operator()<8>();                       \
+            else if(vec_size == 4) launch_kernel.template operator()<4>();                       \
+            else TORCH_CHECK(false, __func__, " FP4 requires vec_size >= 4, got ", vec_size);   \
+        } else {                                                                                 \
+            AITER_DISPATCH_CASE_VEC_SIZE(                                                       \
+                vec_size,                                                                       \
+                (use_cache                                                                        \
+                     ? aiter::fused_act_mul_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE> \
+                     : aiter::fused_act_mul_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
+                <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                           \
+                    reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                  \
+                    scales.data_ptr<float>(),                                                   \
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),                           \
+                    d);)                                                                        \
+        }                                                                                        \
     });
 
 namespace aiter {
