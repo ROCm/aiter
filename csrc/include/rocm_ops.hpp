@@ -962,7 +962,9 @@ namespace py = pybind11;
           py::arg("x_scale")        = std::nullopt, \
           py::arg("w_scale")        = std::nullopt, \
           py::arg("exp_bias")       = std::nullopt, \
-          py::arg("block_m")        = 32);                 \
+          py::arg("activation")     = 0,            \
+          py::arg("block_m")        = 32,           \
+          py::arg("split_k")        = 1);                 \
                                                     \
     m.def("cktile_moe_gemm2",                       \
           &cktile_moe_gemm2,                        \
@@ -980,7 +982,9 @@ namespace py = pybind11;
           py::arg("x_scale")        = std::nullopt, \
           py::arg("w_scale")        = std::nullopt, \
           py::arg("exp_bias")       = std::nullopt, \
-          py::arg("block_m")        = 32);
+          py::arg("activation")     = 0,            \
+          py::arg("block_m")        = 32,           \
+          py::arg("split_k")        = 1);
 
 #define MHA_VARLEN_FWD_PYBIND                            \
     m.def("mha_varlen_fwd",                              \

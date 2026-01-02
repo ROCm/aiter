@@ -129,7 +129,7 @@ def test_fmoe(
         a1_scale = a1_scale.squeeze(-1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8] or token <= 4)
         and WQDType == dtypes.fp4x2
     ):  # a16w4 & a8w4
         a1_qt = input.to(dtypes.bf16)
@@ -207,7 +207,7 @@ def test_fmoe(
         a2_scale = a2_scale.view(token, topk, -1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8] or token <= 4)
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 & a8w4
         a2_qt = out1_ref
@@ -510,6 +510,8 @@ for (
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
                         preshuffle=preshuffle,
+                        hidden_pad=0,
+                        intermediate_pad=0,
                     )
                     df.append(ret)
     else:
