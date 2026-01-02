@@ -195,14 +195,12 @@ def compute_splitk_params(config: dict, K: int) -> dict:
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
-    if (
-        "BLOCK_SIZE_K" in config
-        and config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]
-    ):
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-
+    if "BLOCK_SIZE_K" in config:
         if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
+            config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+
+            if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+                config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
 
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
