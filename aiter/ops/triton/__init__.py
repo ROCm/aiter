@@ -95,7 +95,6 @@ _BACKWARD_COMPAT_MAP = {
     "pa_prefill": "attention.pa_prefill",
     "pod_attention": "attention.pod_attention",
     "prefill_attention": "attention.prefill_attention",
-    "split_qkv": "attention.split_qkv",
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
     # Fusions modules (fusions/)
@@ -114,7 +113,6 @@ _BACKWARD_COMPAT_MAP = {
     "moe_op": "moe.moe_op",
     "moe_routing_sigmoid_top1_fused": "moe.moe_routing_sigmoid_top1_fused",
     "quant_moe": "moe.quant_moe",
-    "moe_routing": "moe.moe_routing",
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
     "norm": "normalization.norm",

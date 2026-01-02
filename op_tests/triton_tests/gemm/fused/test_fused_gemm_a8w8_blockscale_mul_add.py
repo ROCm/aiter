@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
-import os
 import torch
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     fused_gemm_a8w8_blockscale_mul_add,
