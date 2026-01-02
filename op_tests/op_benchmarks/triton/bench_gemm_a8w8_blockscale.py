@@ -1,7 +1,7 @@
 import sys
 import torch
 import triton
-from aiter.ops.triton.gemm_a8w8_blockscale import (
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
