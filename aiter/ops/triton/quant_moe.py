@@ -168,3 +168,61 @@ def upcast_from_mxfp(
     )
     out = out.transpose(axis, scale.ndim - 1).contiguous()
     return out
+
+
+def dequant_x_blockscale(x, x_scales, per_row_x_scale, group_shape):
+    assert x_scales is not None
+    group_shape_m, _, group_shape_k = group_shape
+    M, K = x.shape
+
+    K_blocks = (K + group_shape_k - 1) // group_shape_k
+    if per_row_x_scale:
+        assert x_scales.shape == (M, K_blocks)
+        K_pad = K_blocks * group_shape_k
+        if K_pad != K:
+            x_pad = x.new_zeros((M, K_pad))
+            x_pad[:, :K] = x
+            x = x_pad
+
+        x = x.to(torch.float32).view(M, K_blocks, group_shape_k) * x_scales.to(
+            torch.float32
+        ).view(M, K_blocks, 1)
+        x = x.view(M, K_pad)[:, :K]
+    else:
+        M_blocks = (M + group_shape_m - 1) // group_shape_m
+        assert x_scales.shape == (M_blocks, K_blocks)
+        M_pad = M_blocks * group_shape_m
+        K_pad = K_blocks * group_shape_k
+        if M_pad != M or K_pad != K:
+            x_pad = x.new_zeros((M_pad, K_pad))
+            x_pad[:M, :K] = x
+            x = x_pad
+
+        x = x.to(torch.float32).view(M_blocks, group_shape_m, K_blocks, group_shape_k)
+        scales = x_scales.to(torch.float32).view(M_blocks, 1, K_blocks, 1)
+        x = x * scales
+        x = x.view(M_pad, K_pad)[:M, :K]
+    return x
+
+
+def dequant_w_blockscale(w, w_scales, group_shape):
+    assert w_scales is not None
+    _, group_shape_n, group_shape_k = group_shape
+    E, K, N = w.shape
+
+    K_blocks = (K + group_shape_k - 1) // group_shape_k
+    N_blocks = (N + group_shape_n - 1) // group_shape_n
+
+    assert w_scales.shape == (E, K_blocks, N_blocks)
+
+    K_pad = K_blocks * group_shape_k
+    N_pad = N_blocks * group_shape_n
+    if K_pad != K or N_pad != N:
+        w_pad = w.new_zeros((E, K_pad, N_pad))
+        w_pad[:, :K, :N] = w
+        w = w_pad
+    w = w.to(torch.float32).view(E, K_blocks, group_shape_k, N_blocks, group_shape_n)
+    scales = w_scales.to(torch.float32).view(E, K_blocks, 1, N_blocks, 1)
+    w = w * scales
+    w = w.view(E, K_pad, N_pad)[:, :K, :N]
+    return w
