@@ -126,12 +126,20 @@ def common_mha_fwd_fake_tensors(
             head_size_v,
         ), "Output tensor has incorrect shape"
     else:
-        out = torch.empty(
-            (batch_size, seqlen_q, num_heads, head_size_v),
-            dtype=q.dtype,
-            device=q.device,
-            requires_grad=q.requires_grad,
-        )
+        if q.dtype == dtypes.fp8:
+            out = torch.empty(
+                (batch_size, seqlen_q, num_heads, head_size_v),
+                dtype=dtypes.bf16,
+                device=q.device,
+                requires_grad=q.requires_grad,
+            )
+        else:
+            out = torch.empty(
+                (batch_size, seqlen_q, num_heads, head_size_v),
+                dtype=q.dtype,
+                device=q.device,
+                requires_grad=q.requires_grad,
+            )
 
     if return_softmax_lse:
         softmax_lse = torch.empty(
