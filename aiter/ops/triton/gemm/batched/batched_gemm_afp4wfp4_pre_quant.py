@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
