@@ -4,6 +4,7 @@
 from typing import Optional, Union
 import torch
 import triton
+import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
@@ -11,6 +12,9 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add imp
     _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel,
     _fused_gemm_afp4wfp4_mul_add_reduce_kernel,
     _get_config,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_reduce_kernel,
 )
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
