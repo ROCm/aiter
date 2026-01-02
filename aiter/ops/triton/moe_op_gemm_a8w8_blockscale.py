@@ -70,11 +70,11 @@ def allocate_output(
 
 def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
-    group_m = 1
+    group_m = 4
     blockscale_m = 128
     blockscale_k = 128
     blockscale_n = 128
-    num_xcds = 2
+    num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
