@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
+// Kernels fusing act_and_mul with dynamic per-token quantization
+
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/extension.h>
@@ -90,7 +92,7 @@ __device__ __forceinline__ float gelu_tanh_kernel(const T& x)
 }
 
 template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
-__global__ void fused_act_mul_quant_kernel_nocache(
+__global__ void fused_act_mul_pt_quant_kernel_nocache(
     DTYPE_O* __restrict__ out,         // [..., d]
     float* __restrict__ scale,         // [num_tokens]
     const DTYPE_I* __restrict__ input, // [..., 2, d]
@@ -267,7 +269,7 @@ __global__ void fused_act_mul_quant_kernel_nocache(
 
 // Cached version caching act_and_mul results in LDS
 template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
-__global__ void fused_act_mul_quant_kernel_cached(
+__global__ void fused_act_mul_pt_quant_kernel_cached(
     DTYPE_O* __restrict__ out,         // [..., d]
     float* __restrict__ scale,         // [num_tokens]
     const DTYPE_I* __restrict__ input, // [..., 2, d]
@@ -472,7 +474,7 @@ static constexpr int nextPow2(unsigned int num)
 }
 
 // Launch fused activation+mul+quant kernel
-#define LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(KERNEL, DTYPE_O)                                      \
+#define LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(KERNEL, DTYPE_O)                            \
     int d = input.size(-1) / 2;                                                                 \
     int64_t num_tokens = input.numel() / input.size(-1);                                        \
     int vec_size = nextPow2(d / 64);                                                            \
@@ -503,8 +505,8 @@ static constexpr int nextPow2(unsigned int num)
             /* FP4: Only dispatch vec_size >= 4 due to vec_convert constraints */                \
             auto launch_kernel = [&]<int VEC_SIZE>() {                                           \
                 (use_cache                                                                        \
-                     ? aiter::fused_act_mul_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE> \
-                     : aiter::fused_act_mul_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
+                     ? aiter::fused_act_mul_pt_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE> \
+                     : aiter::fused_act_mul_pt_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
                 <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                           \
                     reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                  \
                     scales.data_ptr<float>(),                                                   \
@@ -520,8 +522,8 @@ static constexpr int nextPow2(unsigned int num)
             AITER_DISPATCH_CASE_VEC_SIZE(                                                       \
                 vec_size,                                                                       \
                 (use_cache                                                                        \
-                     ? aiter::fused_act_mul_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE> \
-                     : aiter::fused_act_mul_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
+                     ? aiter::fused_act_mul_pt_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE> \
+                     : aiter::fused_act_mul_pt_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
                 <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                           \
                     reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                  \
                     scales.data_ptr<float>(),                                                   \
@@ -532,22 +534,22 @@ static constexpr int nextPow2(unsigned int num)
 
 namespace aiter {
 
-void fused_silu_mul_quant(torch::Tensor& out,     // [..., d]
+void fused_silu_mul_per_token_quant(torch::Tensor& out,     // [..., d]
                           torch::Tensor& scales,   // [num_tokens]
                           torch::Tensor& input)    // [..., 2 * d]
 {
     if(out.dtype() == torch_fp8)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::silu_kernel, FP8_TYPE);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::silu_kernel, FP8_TYPE);
     }
     else if(out.dtype() == torch::kInt8)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::silu_kernel, ck_tile::int8_t);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::silu_kernel, ck_tile::int8_t);
     }
 #if defined(__Float4_e2m1fn_x2)
     else if(out.dtype() == torch_fp4x2)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::silu_kernel, ck_tile::fp4x2_t);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::silu_kernel, ck_tile::fp4x2_t);
     }
 #endif
     else
@@ -556,22 +558,22 @@ void fused_silu_mul_quant(torch::Tensor& out,     // [..., d]
     }
 }
 
-void fused_gelu_mul_quant(torch::Tensor& out,     // [..., d]
+void fused_gelu_mul_per_token_quant(torch::Tensor& out,     // [..., d]
                           torch::Tensor& scales,   // [num_tokens]
                           torch::Tensor& input)    // [..., 2 * d]
 {
     if(out.dtype() == torch_fp8)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::gelu_kernel, FP8_TYPE);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::gelu_kernel, FP8_TYPE);
     }
     else if(out.dtype() == torch::kInt8)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::gelu_kernel, ck_tile::int8_t);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::gelu_kernel, ck_tile::int8_t);
     }
 #if defined(__Float4_e2m1fn_x2)
     else if(out.dtype() == torch_fp4x2)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::gelu_kernel, ck_tile::fp4x2_t);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::gelu_kernel, ck_tile::fp4x2_t);
     }
 #endif
     else
@@ -580,22 +582,22 @@ void fused_gelu_mul_quant(torch::Tensor& out,     // [..., d]
     }
 }
 
-void fused_gelu_tanh_mul_quant(torch::Tensor& out,     // [..., d]
+void fused_gelu_tanh_mul_per_token_quant(torch::Tensor& out,     // [..., d]
                                torch::Tensor& scales,   // [num_tokens]
                                torch::Tensor& input)    // [..., 2 * d]
 {
     if(out.dtype() == torch_fp8)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::gelu_tanh_kernel, FP8_TYPE);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::gelu_tanh_kernel, FP8_TYPE);
     }
     else if(out.dtype() == torch::kInt8)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::gelu_tanh_kernel, ck_tile::int8_t);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::gelu_tanh_kernel, ck_tile::int8_t);
     }
 #if defined(__Float4_e2m1fn_x2)
     else if(out.dtype() == torch_fp4x2)
     {
-        LAUNCH_FUSED_ACT_MUL_QUANT_KERNEL(aiter::gelu_tanh_kernel, ck_tile::fp4x2_t);
+        LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(aiter::gelu_tanh_kernel, ck_tile::fp4x2_t);
     }
 #endif
     else

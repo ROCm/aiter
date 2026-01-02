@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import aiter
 from aiter.test_common import run_perftest, checkAllclose, benchmark
 from aiter import dtypes
-from aiter.ops.activation import fused_silu_mul_quant, fused_gelu_mul_quant, fused_gelu_tanh_mul_quant
+from aiter.ops.activation import fused_silu_mul_per_token_quant, fused_gelu_mul_per_token_quant, fused_gelu_tanh_mul_per_token_quant
 from aiter.ops.quant import dynamic_per_token_scaled_quant
 from aiter.ops.activation import silu_and_mul, gelu_and_mul, gelu_tanh_and_mul
 import pandas as pd
@@ -94,7 +94,7 @@ def test_fused_silu_mul_quant(m, n, dtype, quant_dtype):
     ref_out, ref_scales = torch_silu_and_mul_quant(input_data, quant_dtype)
 
     _, us_fused = run_perftest(
-        fused_silu_mul_quant,
+        fused_silu_mul_per_token_quant,
         out,
         scales,
         input_data,
@@ -125,7 +125,7 @@ def test_fused_gelu_mul_quant(m, n, dtype, quant_dtype):
     ref_out, ref_scales = torch_gelu_and_mul_quant(input_data, quant_dtype)
 
     _, us_fused = run_perftest(
-        fused_gelu_mul_quant,
+        fused_gelu_mul_per_token_quant,
         out,
         scales,
         input_data,
@@ -152,13 +152,13 @@ def benchmark_fused_vs_separate(m, n, dtype, quant_dtype, activation="silu"):
     input_data = torch.randn(m, n, dtype=dtype, device="cuda")
 
     if activation == "silu":
-        fused_fn = fused_silu_mul_quant
+        fused_fn = fused_silu_mul_per_token_quant
         separate_act_fn = silu_and_mul
     elif activation == "gelu":
-        fused_fn = fused_gelu_mul_quant
+        fused_fn = fused_gelu_mul_per_token_quant
         separate_act_fn = gelu_and_mul
     elif activation == "gelu_tanh":
-        fused_fn = fused_gelu_tanh_mul_quant
+        fused_fn = fused_gelu_tanh_mul_per_token_quant
         separate_act_fn = gelu_tanh_and_mul
     else:
         raise ValueError(f"Unknown activation: {activation}")
@@ -226,7 +226,7 @@ if __name__ == "__main__":
             (128, 4096, dtypes.fp16, torch.int8),
         ]
 
-        print("\nTesting fused_silu_mul_quant:")
+        print("\nTesting fused_silu_mul_per_token_quant:")
         results = []
         for m, n, dtype, quant_dtype in test_configs:
             result = test_fused_silu_mul_quant(m, n, dtype, quant_dtype)
@@ -235,7 +235,7 @@ if __name__ == "__main__":
                   f"err_out={result['err_out']:.2e}, err_scale={result['err_scale']:.2e}, "
                   f"time={result['us']:.2f}us, BW={result['TB/s']:.2f}TB/s")
 
-        print("\nTesting fused_gelu_mul_quant:")
+        print("\nTesting fused_gelu_mul_per_token_quant:")
         results = []
         for m, n, dtype, quant_dtype in test_configs:
             result = test_fused_gelu_mul_quant(m, n, dtype, quant_dtype)
