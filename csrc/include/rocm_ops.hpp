@@ -1110,7 +1110,43 @@ namespace py = pybind11;
           py::arg("a1_scale")       = std::nullopt,                            \
           py::arg("w1_scale")       = std::nullopt,                            \
           py::arg("sorted_weights") = std::nullopt);                           \
-    m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
+    m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");     \
+    m.def("moe_stage1_g1u1_small_batch1",                                      \
+          &moe_stage1_g1u1_small_batch1,                                       \
+          py::arg("hidden_states"),                                            \
+          py::arg("w1"),                                                       \
+          py::arg("gemm1_out"),                                                \
+          py::arg("topk_ids"),                                                 \
+          py::arg("topk_weight"),                                              \
+          py::arg("w1_scale"));                                                \
+    m.def("moe_stage2_g1u1_small_batch1",                                      \
+          &moe_stage2_g1u1_small_batch1,                                       \
+          py::arg("gemm1_out"),                                                \
+          py::arg("w2"),                                                       \
+          py::arg("gemm2_out"),                                                \
+          py::arg("topk_ids"),                                                 \
+          py::arg("topk_weight"),                                              \
+          py::arg("w2_scale"));                                                \
+    m.def("moe_stage1_g1u1_small_batch",                                       \
+          &moe_stage1_g1u1_small_batch,                                        \
+          py::arg("hidden_states"),                                            \
+          py::arg("w1"),                                                       \
+          py::arg("gemm1_out"),                                                \
+          py::arg("sorted_ids"),                                               \
+          py::arg("sorted_weights"),                                           \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("w1_scale"));                                                \
+    m.def("moe_stage2_g1u1_small_batch",                                       \
+          &moe_stage2_g1u1_small_batch,                                        \
+          py::arg("gemm1_out"),                                                \
+          py::arg("w2"),                                                       \
+          py::arg("moe_buf"),                                                  \
+          py::arg("sorted_ids"),                                               \
+          py::arg("sorted_weights"),                                           \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("w2_scale"));
 
 #define MOE_TOPK_PYBIND             \
     m.def("topk_sigmoid",           \

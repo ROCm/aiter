@@ -51,11 +51,14 @@ def test_fmoe(
     hidden_pad=0,
     intermediate_pad=0,
     preshuffle=False,
+    use_raw_for_ref=False,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
+    if qType == aiter.QuantType.per_128x128 or qType == aiter.QuantType.per_1x32:
+        use_raw_for_ref = False
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         if hidden_pad != 0 and intermediate_pad != 0:
@@ -188,7 +191,7 @@ def test_fmoe(
 
     # # ######################## stage 1 start ###########
     out1_ref = torch_moe_stage1(
-        a1_qt,
+        input if use_raw_for_ref else a1_qt,
         w1_qt,
         w2_qt,
         topk_weights,
@@ -196,7 +199,7 @@ def test_fmoe(
         dtype=dtype,
         activation=actType,
         quant_type=qType,
-        a1_scale=a1_scale,
+        a1_scale=torch.tensor([1], dtype=torch.float32) if use_raw_for_ref else a1_scale,
         w1_scale=w1_scale,
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
@@ -220,7 +223,7 @@ def test_fmoe(
     a2_qt = a2_qt.view(token, topk, -1)
 
     out2_ref = torch_moe_stage2(
-        a2_qt,
+        out1_ref if use_raw_for_ref else a2_qt,
         w1_qt,  # E, inter_dim*2, model_dim
         w2_qt,  # E, model_dim, inter_dim
         topk_weights,
@@ -228,7 +231,7 @@ def test_fmoe(
         dtype=dtype,
         quant_type=qType,
         w2_scale=w2_scale,
-        a2_scale=a2_scale,
+        a2_scale=torch.tensor([1], dtype=torch.float32) if use_raw_for_ref else a2_scale,
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
     )
@@ -409,6 +412,16 @@ parser.add_argument(
     -p t    # True.""",
 )
 
+parser.add_argument(
+    "--use-raw-for-ref",
+    type=dtypes.str2bool,
+    nargs="?",
+    const=None,
+    default=False,
+    help="""Whether to use raw input instead of quant/dequant input for reference computation. Default is [False].
+    e.g.: --use-raw-for-ref t    # True.""",
+)
+
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -461,6 +474,7 @@ for (
                     doweight_stage1=doweight_stage1,
                     hidden_pad=hidden_pad,
                     intermediate_pad=intermediate_pad,
+                    use_raw_for_ref=args.use_raw_for_ref,
                 )
                 df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
@@ -485,6 +499,7 @@ for (
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
                         preshuffle=preshuffle,
+                        use_raw_for_ref=args.use_raw_for_ref,
                     )
                     df.append(ret)
     else:
@@ -503,6 +518,7 @@ for (
                     wq_dtype,
                     use_g1u1=True,
                     doweight_stage1=doweight_stage1,
+                    use_raw_for_ref=args.use_raw_for_ref,
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
