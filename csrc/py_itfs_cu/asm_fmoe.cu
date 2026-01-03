@@ -73,7 +73,7 @@ struct __attribute__((packed)) KernelArgs
 
 class FMoeKernel
 {
-    private:
+    protected:
     hipModule_t module;
     hipFunction_t kernel_func;
     uint32_t sub_GU             = 512;
@@ -869,4 +869,299 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
     }
     else
         TORCH_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");
+}
+
+class FMoeSmallBatchKernel : public FMoeKernel
+{
+public:
+    struct __attribute__((packed)) Batch1KernelArgs
+    {
+        void* p_hidden_states;
+        void* p_w;
+        void* p_gemm_out;
+        void* p_topk_ids;
+        void* p_topk_weight;
+        void* p_w_scale;
+        int M;
+        int N;
+        int K;
+    };
+    struct __attribute__((packed)) BatchKernelArgs
+    {
+        void* p_hidden_states;
+        void* p_w;
+        void* p_gemm_out;
+        void* p_sorted_ids;
+        void* p_sorted_weights;
+        void* p_sorted_expert_ids;
+        void* p_num_valid_ids;
+        void* p_w_scale;
+        int M;
+        int N;
+        int K;
+        int topk;
+    };
+    using FMoeKernel::FMoeKernel;
+
+    void launch_batch1_kernel(uint wave_size,
+                              torch::Tensor& hidden_states,             // [token_cnt, dim] M,K
+                              torch::Tensor& w,                         // [expert, N, K]
+                              torch::Tensor& gemm_out,                  // [token_cnt, dim]
+                              torch::Tensor& topk_ids,                  // [token_cnt, topk]
+                              torch::Tensor& topk_weight,               // [token_cnt, topk]
+                              torch::Tensor& w_scale                    // [expert, N, 1]
+    )
+    {
+        auto M = hidden_states.size(0);
+        auto N = w.size(1);
+        auto K = w.size(2);
+        auto topk = topk_ids.size(1);
+        Batch1KernelArgs args = {
+            hidden_states.data_ptr(),
+            w.data_ptr(),
+            gemm_out.data_ptr(),
+            topk_ids.data_ptr(),
+            topk_weight.data_ptr(),
+            w_scale.data_ptr(),
+            static_cast<int>(M),
+            static_cast<int>(N),
+            static_cast<int>(K),
+        };
+        size_t arg_size = sizeof(args);
+        void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
+                          &args,
+                          HIP_LAUNCH_PARAM_BUFFER_SIZE,
+                          &arg_size,
+                          HIP_LAUNCH_PARAM_END};
+
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(hidden_states));
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        HIP_CALL(hipModuleLaunchKernel(
+            kernel_func, N / 32, topk, 1, wave_size, 1, 1, 0, stream, nullptr, (void**)&config));
+    }
+
+    void launch_batch_kernel(uint wave_size,
+                             uint topk,
+                             torch::Tensor& hidden_states,             // [token_cnt, dim] M,K
+                             torch::Tensor& w,                         // [expert, inter_dim*2, dim] N,K
+                             torch::Tensor& gemm_out,                  // [token_cnt, dim]
+                             torch::Tensor& sorted_ids,                // [max_num_tokens_padded]
+                             torch::Tensor& sorted_weights,            // [max_num_tokens_padded]
+                             torch::Tensor& sorted_expert_ids,         // [max_num_m_blocks]
+                             torch::Tensor& num_valid_ids,             // [1]
+                             torch::Tensor& w_scale)                   // [expert, inter_dim*2, 1]
+    {
+        auto M = hidden_states.size(0);
+        auto N = w.size(1);
+        auto K = w.size(2);
+        BatchKernelArgs args = {
+            hidden_states.data_ptr(),
+            w.data_ptr(),
+            gemm_out.data_ptr(),
+            sorted_ids.data_ptr(),
+            sorted_weights.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            num_valid_ids.data_ptr(),
+            w_scale.data_ptr(),
+            static_cast<int>(M),
+            static_cast<int>(N),
+            static_cast<int>(K),
+            static_cast<int>(topk),
+        };
+        size_t arg_size = sizeof(args);
+        void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
+                          &args,
+                          HIP_LAUNCH_PARAM_BUFFER_SIZE,
+                          &arg_size,
+                          HIP_LAUNCH_PARAM_END};
+
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(hidden_states));
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        HIP_CALL(hipModuleLaunchKernel(
+            kernel_func, N / 32, sorted_expert_ids.size(0), 1, wave_size, 1, 1, 0, stream, nullptr, (void**)&config));
+    }
+};
+
+void moe_stage1_g1u1_small_batch1(torch::Tensor& hidden_states,             // [token_cnt, dim] M,K
+                                  torch::Tensor& w1,                        // [expert, inter_dim*2, dim] N,K
+                                  torch::Tensor& gemm1_out,                 // [token_cnt, dim]
+                                  torch::Tensor& topk_ids,                  // [token_cnt, topk]
+                                  torch::Tensor& topk_weight,               // [token_cnt, topk]
+                                  torch::Tensor& w1_scale)                  // [expert, inter_dim*2, 1]
+{
+    FMoeSmallBatchKernel* impl_ptr = nullptr;
+    int dim = w1.size(2);
+
+    if(w1.dtype() == torch_fp8)
+    {
+        if(dim % 64 == 0 && dim >= 128)
+        {
+            static FMoeSmallBatchKernel kernel(
+                "_Z15moe_gemm_batch1PvS_S_S_PfS0_iii", "fmoe_2stages/fmoe_small_stage1_bf16_pertokenFp8_g1u1_16x32_batch1.co", 512);
+            impl_ptr = &kernel;
+        }
+        else
+            TORCH_CHECK(
+                false, __func__, " unsupported dim: ", dim);
+    }
+    else if (w1.dtype() == at::ScalarType::BFloat16)
+    {
+        if(dim % 32 == 0 && dim >= 64)
+        {
+            static FMoeSmallBatchKernel kernel(
+                "_Z15moe_gemm_batch1PvS_S_S_PfS0_iii", "fmoe_2stages/fmoe_small_stage1_bf16_pertokenBf16_g1u1_16x32_batch1.co", 512);
+            impl_ptr = &kernel;
+        }
+        else
+            TORCH_CHECK(
+                false, __func__, " unsupported dim: ", dim);
+    }
+    impl_ptr->launch_batch1_kernel(256,
+                                   hidden_states,
+                                   w1,
+                                   gemm1_out,
+                                   topk_ids,
+                                   topk_weight,
+                                   w1_scale);
+}
+
+void moe_stage2_g1u1_small_batch1(torch::Tensor& gemm1_out,
+                                  torch::Tensor& w2,
+                                  torch::Tensor& gemm2_out,
+                                  torch::Tensor& topk_ids,
+                                  torch::Tensor& topk_weight,
+                                  torch::Tensor& w2_scale)
+{
+    FMoeSmallBatchKernel* impl_ptr = nullptr;
+    int dim = w2.size(2);
+
+    if(w2.dtype() == torch_fp8)
+    {
+        if(dim % 64 == 0 && dim >= 128)
+        {
+            static FMoeSmallBatchKernel kernel(
+                "_Z15moe_gemm_batch1PvS_S_S_PfS0_iii", "fmoe_2stages/fmoe_small_stage2_bf16_pertokenFp8_g1u1_16x32_batch1.co", 512);
+            impl_ptr = &kernel;
+        }
+        else
+            TORCH_CHECK(
+                false, __func__, " unsupported dim: ", dim);
+    }
+    else if (w2.dtype() == at::ScalarType::BFloat16)
+    {
+        if(dim % 32 == 0 && dim >= 64)
+        {
+            static FMoeSmallBatchKernel kernel(
+                "_Z15moe_gemm_batch1PvS_S_S_PfS0_iii", "fmoe_2stages/fmoe_small_stage2_bf16_pertokenBf16_g1u1_16x32_batch1.co", 512);
+            impl_ptr = &kernel;
+        }
+        else
+            TORCH_CHECK(
+                false, __func__, " unsupported dim: ", dim);
+    }
+    impl_ptr->launch_batch1_kernel(64,
+                                   gemm1_out,
+                                   w2,
+                                   gemm2_out,
+                                   topk_ids,
+                                   topk_weight,
+                                   w2_scale);
+}
+
+void moe_stage1_g1u1_small_batch(torch::Tensor& hidden_states,             // [token_cnt, dim] M,K
+                                 torch::Tensor& w1,                        // [expert, inter_dim*2, dim] N,K
+                                 torch::Tensor& gemm1_out,                 // [token_cnt, dim]
+                                 torch::Tensor& sorted_ids,                // [max_num_tokens_padded]
+                                 torch::Tensor& sorted_weights,            // [max_num_tokens_padded]
+                                 torch::Tensor& sorted_expert_ids,         // [max_num_m_blocks]
+                                 torch::Tensor& num_valid_ids,             // [1]
+                                 torch::Tensor& w1_scale)                  // [expert, inter_dim*2, 1]
+{
+    FMoeSmallBatchKernel* impl_ptr = nullptr;
+    int dim = w1.size(2);
+    uint topk = gemm1_out.size(1);
+
+    if(w1.dtype() == torch_fp8)
+    {
+        if(dim % 64 == 0 && dim >= 128)
+        {
+            static FMoeSmallBatchKernel kernel(
+                "_Z14moe_gemm_batchPvS_S_S_PfS_S_S0_iiii", "fmoe_2stages/fmoe_small_stage1_bf16_pertokenFp8_g1u1_16x32_batch.co", 512);
+            impl_ptr = &kernel;
+        }
+        else
+            TORCH_CHECK(
+                false, __func__, " unsupported dim: ", dim);
+    }
+    else if (w1.dtype() == at::ScalarType::BFloat16)
+    {
+        if(dim % 32 == 0 && dim >= 64)
+        {
+            static FMoeSmallBatchKernel kernel(
+                "_Z14moe_gemm_batchPvS_S_S_PfS_S_S0_iiii", "fmoe_2stages/fmoe_small_stage1_bf16_pertokenBf16_g1u1_16x32_batch.co", 512);
+            impl_ptr = &kernel;
+        }
+        else
+            TORCH_CHECK(
+                false, __func__, " unsupported dim: ", dim);
+    }
+    impl_ptr->launch_batch_kernel(256,
+                                  topk,
+                                  hidden_states,
+                                  w1,
+                                  gemm1_out,
+                                  sorted_ids,
+                                  sorted_weights,
+                                  sorted_expert_ids,
+                                  num_valid_ids,
+                                  w1_scale);
+}
+
+void moe_stage2_g1u1_small_batch(torch::Tensor& gemm1_out,
+                                 torch::Tensor& w2,
+                                 torch::Tensor& moe_buf,
+                                 torch::Tensor& sorted_ids,
+                                 torch::Tensor& sorted_weights,
+                                 torch::Tensor& sorted_expert_ids,
+                                 torch::Tensor& num_valid_ids,
+                                 torch::Tensor& w2_scale)
+{
+    FMoeSmallBatchKernel* impl_ptr = nullptr;
+    int dim = w2.size(2);
+    uint topk = gemm1_out.size(1);
+
+    if(w2.dtype() == torch_fp8)
+    {
+        if(dim % 64 == 0 && dim >= 128)
+        {
+            static FMoeSmallBatchKernel kernel(
+                "_Z14moe_gemm_batchPvS_S_S_PfS_S_S0_iiii", "fmoe_2stages/fmoe_small_stage2_bf16_pertokenFp8_g1u1_16x32_batch.co", 512);
+            impl_ptr = &kernel;
+        }
+        else
+            TORCH_CHECK(
+                false, __func__, " unsupported dim: ", dim);
+    }
+    else if (w2.dtype() == at::ScalarType::BFloat16)
+    {
+        if(dim % 32 == 0 && dim >= 64)
+        {
+            static FMoeSmallBatchKernel kernel(
+                "_Z14moe_gemm_batchPvS_S_S_PfS_S_S0_iiii", "fmoe_2stages/fmoe_small_stage2_bf16_pertokenBf16_g1u1_16x32_batch.co", 512);
+            impl_ptr = &kernel;
+        }
+        else
+            TORCH_CHECK(
+                false, __func__, " unsupported dim: ", dim);
+    }
+    impl_ptr->launch_batch_kernel(64,
+                                  topk,
+                                  gemm1_out,
+                                  w2,
+                                  moe_buf,
+                                  sorted_ids,
+                                  sorted_weights,
+                                  sorted_expert_ids,
+                                  num_valid_ids,
+                                  w2_scale);
 }

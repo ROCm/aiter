@@ -9,4 +9,3 @@ ninja
 # Iris library for Triton-based GPU communication
 # Pinned to commit 905ec1c (Nov 18, 2024) for reproducibility
 iris @ git+https://github.com/ROCm/iris.git@905ec1cea8f350211a70c7d0b2bc11a09a6f6429
-git+https://github.com/tingqli/pyhip.git@205706a8bfd9950caa5ac04cde3de48697adc6a0
