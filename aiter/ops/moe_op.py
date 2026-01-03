@@ -207,6 +207,54 @@ def moe_stage1_g1u1(
 ) -> None: ...
 
 
+@compile_ops("module_moe_asm")
+def moe_stage1_g1u1_small_batch1(
+    hidden_states: Tensor,
+    w1: Tensor,
+    gemm1_out: Tensor,
+    topk_ids: Tensor,
+    topk_weight: Tensor,
+    w1_scale: Optional[Tensor],
+) -> None: ...
+
+
+@compile_ops("module_moe_asm")
+def moe_stage2_g1u1_small_batch1(
+    gemm1_out: Tensor,
+    w2: Tensor,
+    gemm2_out: Tensor,
+    topk_ids: Tensor,
+    topk_weight: Tensor,
+    w2_scale: Optional[Tensor],
+) -> None: ...
+
+
+@compile_ops("module_moe_asm")
+def moe_stage1_g1u1_small_batch(
+    hidden_states: Tensor,
+    w1: Tensor,
+    gemm1_out: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    w1_scale: Tensor
+) -> None: ...
+
+
+@compile_ops("module_moe_asm")
+def moe_stage2_g1u1_small_batch(
+    gemm1_out: Tensor,
+    w2: Tensor,
+    gemm2_out: Tensor,
+    sorted_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    w2_scale: Tensor
+) -> None: ...
+
+
 def cmdGenFunc_ck_moe_stage(
     hidden_states: Tensor,
     w1: Tensor,
