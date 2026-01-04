@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -12,10 +12,16 @@ import argparse
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
+# mla persistent mode ut, persistent mla means the mla kernel with schedule
+# in persistent mode, it will generate schedule metadata by metadata kernel, and generate num_cu tgs
+# mock_non_persistent_mode uses metadata_v0 generate the non-persistent like schedule.
+
+# if splits = 4
+# it will generate 8 tgs: [0, 4, 8, 12, 16, 20, 24, 28, 31]
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
-# qdtype fp8, kdtype bf16: nhead16
+# qdtype bf16, kdtype fp8: nhead16
 
 
 def check_support(dtype, kv_dtype, nhead):
@@ -546,8 +552,8 @@ parser.add_argument(
     --varlen # True""",
 )
 parser.add_argument(
-    "-nps",
-    "--non_persistent_mode",
+    "-mnps",
+    "--mock_non_persistent_mode",
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
@@ -581,7 +587,7 @@ for nhead, decode_qlen in list_nhead:
                 varlen=args.varlen,
                 decode_qlen=decode_qlen,
                 max_split_per_batch=max_split_per_batch,
-                non_persistent_mode=args.non_persistent_mode,
+                non_persistent_mode=args.mock_non_persistent_mode,
             )
             df.append(ret)
     df = pd.DataFrame(df)
