@@ -2402,8 +2402,19 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         )
 
     # Initialize output pointers and accumulators
-    max_logits_base_offsets = gl.arange(
+    max_logits_base_offsets_mtp = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
+    )
+    # Convert MTP layout indices to continuous indices for exp_sums/max_logits
+    max_logits_query_len_idx = (
+        max_logits_base_offsets_mtp // QUERY_GROUP_SIZE_ONE_Q_POW2
+    )
+    max_logits_group_idx_in_len = (
+        max_logits_base_offsets_mtp % QUERY_GROUP_SIZE_ONE_Q_POW2
+    )
+    max_logits_base_offsets = (
+        max_logits_query_len_idx * query_group_size_original
+        + max_logits_group_idx_in_len
     )
     max_logits_offsets = (
         sequence_idx * stride_max_logits_seq
@@ -2413,8 +2424,16 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     )
     max_logits_group_mask = qk_row_mask
 
-    output_group_offsets = gl.arange(
+    output_group_offsets_mtp = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, pv_mfma_layout)
+    )
+    # Convert MTP layout indices to continuous indices for temporary_output
+    # MTP layout: [QUERY_SEQ_LEN_POW2 * QUERY_GROUP_SIZE_ONE_Q_POW2] with valid indices at non-contiguous positions
+    # Continuous layout: [QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL] with valid indices at contiguous positions
+    output_query_len_idx = output_group_offsets_mtp // QUERY_GROUP_SIZE_ONE_Q_POW2
+    output_group_idx_in_len = output_group_offsets_mtp % QUERY_GROUP_SIZE_ONE_Q_POW2
+    output_group_offsets = (
+        output_query_len_idx * query_group_size_original + output_group_idx_in_len
     )
     output_head_size_offsets = gl.arange(
         0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
@@ -2782,8 +2801,7 @@ def paged_attention_decode_v2_reduce_kernel(
 
     # Calculate output layout parameters
     OUTPUT_SEQ_LEN_POW2: tl.constexpr = triton.next_power_of_2(OUTPUT_SEQ_LEN)
-    # OUTPUT_GROUP_SIZE_POW2: tl.constexpr = QUERY_GROUP_SIZE_POW2 // OUTPUT_SEQ_LEN_POW2
-    if OUTPUT_GROUP_SIZE <= 16 // OUTPUT_SEQ_LEN:
+    if OUTPUT_GROUP_SIZE <= 16 // OUTPUT_SEQ_LEN_POW2:
         ONE_OUTPUT_GROUP_SIZE_POW2: gl.constexpr = 16 // OUTPUT_SEQ_LEN_POW2
     else:
         ONE_OUTPUT_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(
@@ -2803,7 +2821,11 @@ def paged_attention_decode_v2_reduce_kernel(
     # Generate coordinate ranges
     output_len_offsets = tl.arange(0, OUTPUT_SEQ_LEN_POW2)
     output_group_offsets = tl.arange(0, ONE_OUTPUT_GROUP_SIZE_POW2)
-    query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
+    query_group_offsets_mtp = tl.arange(0, QUERY_GROUP_SIZE_POW2)
+    # Convert MTP layout indices to continuous indices for reading from temporary_output
+    query_len_idx = query_group_offsets_mtp // ONE_OUTPUT_GROUP_SIZE_POW2
+    group_idx_in_len = query_group_offsets_mtp % ONE_OUTPUT_GROUP_SIZE_POW2
+    query_group_offsets = query_len_idx * OUTPUT_GROUP_SIZE + group_idx_in_len
     head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
 
     query_group_mask = (output_len_offsets[:, None] < OUTPUT_SEQ_LEN) & (
@@ -2842,7 +2864,9 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Create mask for valid partitions and query groups
-        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & query_group_mask[None, :]
+        exp_sums_mask = (
+            partition_offsets[:, None] < context_partition_num
+        ) & query_group_mask[None, :]
 
         # Load maximum logits from current chunk of partitions
         max_logits = tl.load(
@@ -2884,7 +2908,9 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Create mask for valid partitions and query groups
-        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & query_group_mask[None, :]
+        exp_sums_mask = (
+            partition_offsets[:, None] < context_partition_num
+        ) & query_group_mask[None, :]
 
         # Load maximum logits and exponential sums from current chunk
         max_logits = tl.load(
@@ -2917,7 +2943,9 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Create mask for valid logits access
-        logits_mask = (partition_offsets[None, :] < context_partition_num) & query_group_mask[:, None]
+        logits_mask = (
+            partition_offsets[None, :] < context_partition_num
+        ) & query_group_mask[:, None]
 
         # Load partial logits from current chunk of partitions
         partial_logits = tl.load(
