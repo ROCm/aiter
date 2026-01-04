@@ -99,12 +99,15 @@ if IS_ROCM:
 
         for module in all_modules:
             if PREBUILD_KERNELS == 1:
-                # Exclude mha, _tune, and specific module
                 if (
-                    "mha" in module
-                    or "_tune" in module
+                    "_tune" in module
                     or module == "module_gemm_mi350_a8w8_blockscale_asm"
                 ):
+                    exclude_ops.append(module)
+                if "mha" in module and module not in [
+                    "module_fmha_v3_fwd",
+                    "module_fmha_v3_varlen_fwd",
+                ]:
                     exclude_ops.append(module)
             elif PREBUILD_KERNELS == 2:
                 # Exclude _bwd, _tune, and specific module
@@ -158,6 +161,50 @@ if IS_ROCM:
                 except Exception:
                     pass
 
+            if PREBUILD_KERNELS == 1:
+                base_args = core.get_args_of_build("module_mha_varlen_fwd")
+                if isinstance(base_args, dict) and base_args.get("srcs"):
+
+                    import re
+
+                    _mha_path = os.path.join(this_dir, "aiter", "ops", "mha.py")
+                    with open(_mha_path, "r", encoding="utf-8") as f:
+                        _src = f.read()
+
+                    def _extract_def(src, name):
+                        pat = re.compile(rf"^def\s+{name}\s*\(.*?\):", re.M | re.S)
+                        m = pat.search(src)
+                        if not m:
+                            raise RuntimeError(f"Failed to extract function: {name}")
+                        start = m.start()
+                        pat_next = re.compile(r"^(def|class)\s+", re.M)
+                        m2 = pat_next.search(src, m.end())
+                        end = m2.start() if m2 else len(src)
+                        return src[start:end]
+
+                    blocks = []
+                    for fn in [
+                        "compose_mha_fwd_variant_suffix_and_filter",
+                        "_parse_mha_varlen_fwd_md_name",
+                        "get_mha_varlen_prebuild_variants_by_names",
+                    ]:
+                        blocks.append(_extract_def(_src, fn))
+                    _ns = {}
+                    exec("\n\n".join(blocks), _ns)
+                    get_variants_by_names = _ns[
+                        "get_mha_varlen_prebuild_variants_by_names"
+                    ]
+
+                    md_names = [
+                        "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
+                        "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale",
+                    ]
+                    for v in get_variants_by_names(md_names, ck_dir):
+                        variant_args = dict(base_args)
+                        variant_args["md_name"] = v["md_name"]
+                        variant_args["blob_gen_cmd"] = v["blob_gen_cmd"]
+                        all_opts_args_build.append(variant_args)
+
             def build_one_module(one_opt_args):
                 flags_cc = list(one_opt_args["flags_extra_cc"]) + [
                     f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
@@ -166,12 +213,13 @@ if IS_ROCM:
                     f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
                 ]
 
+                blob_gen_cmd = one_opt_args["blob_gen_cmd"]
                 core.build_module(
                     md_name=one_opt_args["md_name"],
                     srcs=one_opt_args["srcs"],
                     flags_extra_cc=flags_cc,
                     flags_extra_hip=flags_hip,
-                    blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+                    blob_gen_cmd=blob_gen_cmd,
                     extra_include=one_opt_args["extra_include"],
                     extra_ldflags=None,
                     verbose=False,
@@ -190,7 +238,6 @@ if IS_ROCM:
 
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
                 list(executor.map(build_one_module, all_opts_args_build))
-
 else:
     raise NotImplementedError("Only ROCM is supported")
 
