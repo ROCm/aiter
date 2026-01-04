@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_blockscale_common.h"
+#include "gemm_a8w8_blockscale_common_legacy.cuh"
 #include "gemm_a8w8_blockscale_lookup_legacy.h"
 #include "gemm_a8w8_blockscale_manifest_legacy.h"
 
@@ -62,11 +63,11 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
         EDataType>;
 }
 
-torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
-                                   torch::Tensor& WQ,
-                                   torch::Tensor& x_scale,
-                                   torch::Tensor& w_scale,
-                                   torch::Tensor& Y)
+torch::Tensor gemm_a8w8_blockscale_legacy(torch::Tensor& XQ,
+                                          torch::Tensor& WQ,
+                                          torch::Tensor& x_scale,
+                                          torch::Tensor& w_scale,
+                                          torch::Tensor& Y)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
