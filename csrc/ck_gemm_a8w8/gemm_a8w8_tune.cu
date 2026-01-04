@@ -5,7 +5,6 @@
 #include "gemm_a8w8_manifest.h"
 #include "gemm_a8w8_lookup.h"
 #include <string>
-#include "py_itfs_common.h"
 
 using RowwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
@@ -62,9 +61,9 @@ torch::Tensor gemm_a8w8_tune(
     int kernelId,
     int splitK)
 {
-  TORCH_CHECK(XQ.dtype() == torch_fp8 && WQ.dtype() == torch_fp8,
-              "gemm_a8w8_tune now only supports FP8 inputs!");
-  TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
+  // TORCH_CHECK(XQ.dtype() == at::ScalarType::Char && XQ.dtype() == WQ.dtype(),
+  //             "Weights and activations should both be int8!");
+  TORCH_CHECK( x_scale.dtype() == w_scale.dtype(),
               "Scales should have the same dtype!");
   std::optional<torch::Tensor> bias = std::nullopt;
 
@@ -73,26 +72,13 @@ torch::Tensor gemm_a8w8_tune(
   int K = XQ.size(1);
   int KBatch = std::pow(2, splitK);
 
-  // Dispatch FP8 kernels only based on scale/output dtype
-  if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
+  if (Y.dtype() == at::ScalarType::BFloat16)
   {
     rowwise_dispatch<F8, F32, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
   }
-  else if (x_scale.dtype() == at::ScalarType::BFloat16 && Y.dtype() == at::ScalarType::BFloat16)
-  {
-    rowwise_dispatch<F8, B16, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-  }
-  else if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
-  {
-    rowwise_dispatch<F8, F32, F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-  }
-  else if (x_scale.dtype() == at::ScalarType::Half && Y.dtype() == at::ScalarType::Half)
-  {
-    rowwise_dispatch<F8, F16, F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-  }
   else
   {
-    TORCH_CHECK(false, "Unsupported scales/output dtype for gemm_a8w8_tune!");
+    TORCH_CHECK(false, "Unsupported output dtype! Tune mode only supports BFloat16 output.");
   }
   return Y;
 }

@@ -175,17 +175,16 @@ template torch::Tensor
 
 """
         if self.istune:
-            for EDtype in ["B16", "F16"]:
-                for DDtype in ["F32", EDtype]:
-                    instance = INSTANCE_template.format(
-                        name=k.name, dtypes=f"F8, {DDtype}, {EDtype}"
-                    )
-                    Path(
-                        os.path.join(
-                            self.instances_path,
-                            f"{k.name}_abF8_d{DDtype}_e{EDtype}.cpp",
-                        )
-                    ).write_text(instance)
+            # Only generate abF8_dF32_eB16 for tune mode (FP8 input + FP32 scale + BF16 output)
+            instance = INSTANCE_template.format(
+                name=k.name, dtypes="F8, F32, B16"
+            )
+            Path(
+                os.path.join(
+                    self.instances_path,
+                    f"{k.name}_abF8_dF32_eB16.cpp",
+                )
+            ).write_text(instance)
         else:
             for EDtype in ["B16", "F16"]:
                 for ABDtype in ["I8", "F8"]:

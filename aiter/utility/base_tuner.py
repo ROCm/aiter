@@ -366,6 +366,7 @@ class TunerCommon:
                 if max_err_ratio <= tol_err_ratio
                 and us != self.INVALID_TIME
                 and us != self.INF_TIME
+                and us > 0  # Filter out us=0 which causes tflops=inf
             ]
             if len(filtered_time) == 0:
                 logger.error(
