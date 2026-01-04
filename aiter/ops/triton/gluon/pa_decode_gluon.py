@@ -3467,7 +3467,7 @@ def pa_decode_gluon(
             head_size=head_size,
         )
     one_shot = max_context_partition_num <= 1
-    if exp_sums is None and not one_shot:
+    if exp_sums is None:
         exp_sums = torch.empty(
             num_sequences,
             num_kv_heads,
@@ -3476,7 +3476,7 @@ def pa_decode_gluon(
             device=query.device,
             dtype=aiter.dtypes.fp32,
         )
-    if max_logits is None and not one_shot:
+    if max_logits is None:
         max_logits = torch.empty(
             num_sequences,
             num_kv_heads,
@@ -3485,7 +3485,7 @@ def pa_decode_gluon(
             device=query.device,
             dtype=aiter.dtypes.fp32,
         )
-    if temporary_output is None and not one_shot:
+    if temporary_output is None:
         temporary_output = torch.empty(
             num_sequences,
             num_kv_heads,
