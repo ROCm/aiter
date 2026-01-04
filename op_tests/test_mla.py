@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import itertools
@@ -13,6 +13,13 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
+
+# mla non-persistent mode ut, non-persistent mla means the mla kernel without schedule
+# every batch use the same splits
+# eg:
+# kv_indptr = [0, 16, 31] -> kv_lengths = [16, 15]
+# if splits = 4
+# it will generate 8 tgs: [0, 4, 8, 12, 16, 20, 24, 28, 31]
 
 # current supported case in decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16, nhead128

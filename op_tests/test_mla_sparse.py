@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -14,6 +14,10 @@ import pandas as pd
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
+
+# sparse mla ut
+# using persistent mla kernel as default
+# using non-persistent mla kernel when setting non_persistent_mode
 
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
