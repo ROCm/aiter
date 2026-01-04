@@ -27,9 +27,9 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    x = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
-    scale = torch.matmul(x_scale, w_scale)
-    out = torch.mul(x, scale)
+    x = x.to(dtypes.fp32) * x_scale
+    weight = weight.to(dtypes.fp32) * w_scale
+    out = F.linear(x, weight)
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
@@ -54,12 +54,26 @@ def get_tuned_gemm_list(tuned_gemm_file):
     return tunedf
 
 
-def generate_data(m, n, k, seed, device="cuda"):
+def generate_data(m, n, k, seed, ab_dtype: str = "i8", device="cuda"):
     torch.manual_seed(seed)
-    x = torch.randint(-20, 20, (m, k), dtype=dtypes.i8, device=device)
-    weight = torch.randint(-20, 20, (n, k), dtype=dtypes.i8, device=device)
-    x_scale = torch.rand([m, 1], dtype=dtypes.bf16, device=device)
-    w_scale = torch.rand([1, n], dtype=dtypes.bf16, device=device)
+    # Generate fp16/bf16 source, then quantize per-token (same style as `test_gemm`)
+    x_fp = torch.randn((m, k), dtype=dtypes.bf16, device=device)
+    w_fp = torch.randn((n, k), dtype=dtypes.bf16, device=device)
+
+    if ab_dtype == "i8":
+        qdtype = dtypes.i8
+    elif ab_dtype == "fp8":
+        if dtypes.fp8 == torch.uint8:
+            raise RuntimeError(
+                "Requested fp8 tuning, but this environment has no real torch fp8 dtype "
+                "(aiter.dtypes.fp8 fell back to uint8)."
+            )
+        qdtype = dtypes.fp8
+    else:
+        raise ValueError(f"Unsupported {ab_dtype=}, expected 'i8' or 'fp8'")
+
+    x, x_scale = aiter.pertoken_quant(x_fp, quant_dtype=qdtype)
+    weight, w_scale = aiter.pertoken_quant(w_fp, quant_dtype=qdtype)
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     # x.share_memory_()
     # weight.share_memory_()
@@ -94,8 +108,12 @@ class GemmA8W8Tuner(GemmCommonTuner):
         return kernels_list[kernelId].name
 
     def _setup_specific_arguments(self):
-        # self.parser.add_argument()
-        pass
+        self.parser.add_argument(
+            "--ab_dtype",
+            choices=["i8", "fp8"],
+            default="i8",
+            help="Datatype for XQ/WQ generated during tuning (default: i8).",
+        )
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
@@ -145,7 +163,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
                         (
                             info,
                             generate_data,
-                            (M, N, K, seed),
+                            (M, N, K, seed, args.ab_dtype),
                             run_gemm_a8w8,
                             (gemm_a8w8_data_idx, i, splitK),
                             {
