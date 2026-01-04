@@ -427,7 +427,7 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_arch()
-        if int(dev.split("MI")[1].replace("X", "")) < 350:
+        if int(dev.split("gfx")[1]) < 950:
             raise ValueError(
                 "Gluon implementation is not supported on this device (requires CDNA4)."
             )
