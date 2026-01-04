@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
 import aiter
-import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
@@ -10,7 +8,6 @@ from aiter.test_common import perftest
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_blockscale_common import kernels_list
-import argparse
 from einops import rearrange
 from aiter.utility.mp_tuner import mp_tuner
 

@@ -10,7 +10,6 @@ from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
-import argparse
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):

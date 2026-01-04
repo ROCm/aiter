@@ -4,7 +4,6 @@
 from typing import Optional, Union
 import torch
 import triton
-import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.fused_gemm_afp4wfp4_mul_add import (
