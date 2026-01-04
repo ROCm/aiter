@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
 import argparse
@@ -19,7 +19,6 @@ from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.ops.attention import pa_decode_gluon
 from aiter.ops.triton.gluon.pa_decode_gluon import (
-    get_recommended_page_size,
     get_recommended_splits,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
@@ -1246,7 +1245,6 @@ def run_gluon_kernel(
                 sinks=sinks,
                 sliding_window=sliding_window,
                 ps=ps,
-                page_size=page_size,
             )
         else:
             raise RuntimeError(
@@ -1529,20 +1527,14 @@ def run_pa_gluon_test(
         if sliding_window > 0
         else context_lengths.max().item()
     )
-    if ps or sliding_window > 0:
-        context_partition_size = 128
-    else:
-        context_partition_size = context_partition_size
+    context_partition_size = min(context_partition_size, 256 if sliding_window > 128 else 128) if sliding_window > 0 else context_partition_size
+    # context_partition_size = 128
     page_size = None
 
     if sliding_window > 0:
         max_context_partition_num = 1
     elif ps:
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
-        if sliding_window == 0:
-            page_size = get_recommended_page_size(
-                context_lengths, max_context_partition_num
-            )
     else:
         max_context_partition_num = triton.cdiv(
             max_context_length, context_partition_size
