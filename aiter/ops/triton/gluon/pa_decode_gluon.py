@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
@@ -46,12 +46,6 @@ def get_recommended_splits(num_sequences, num_kv_heads):
     num_sm = props.multi_processor_count * get_occupancy()
     max_context_partition_num = triton.cdiv(num_sm, num_sequences * num_kv_heads)
     return max_context_partition_num
-
-
-def get_recommended_page_size(
-    context_lengths, max_context_partition_num
-):
-    return triton.cdiv(context_lengths, max_context_partition_num)
 
 
 @gluon.jit
@@ -1149,7 +1143,6 @@ def paged_attention_decode_sliding_window(
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     sinks_ptr,  # [num_query_heads]
-    page_sizes_ptr,
     stride_max_logits_seq: int,
     stride_max_logits_head: int,
     stride_max_logits_part: int,
@@ -1561,7 +1554,7 @@ def paged_attention_decode_sliding_window(
         ) // CONTEXT_PARTITION_SIZE
         sequence_partition_end_idx = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
     else:
-        page_size = gl.load(page_sizes_ptr + sequence_idx)
+        page_size = gl.cdiv(context_length, gl.num_programs(2))
         sequence_start_idx = page_size * sequence_split_idx
         if sequence_start_idx >= context_length:
             if not ONE_SHOT:
@@ -3054,7 +3047,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     sinks_ptr,
     PS,
     CDNA_VERSION,
-    page_size,
 ):
     """
     Wrapper function for paged attention decode kernel with dynamic kernel selection.
@@ -3104,7 +3096,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 key_scale,
                 value_scale,
                 sinks_ptr,
-                page_size,
                 stride_max_logits_seq,
                 stride_max_logits_head,
                 stride_max_logits_part,
@@ -3319,7 +3310,6 @@ def pa_decode_gluon(
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     ps: bool = False,
-    page_size: torch.Tensor = None,
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -3455,8 +3445,6 @@ def pa_decode_gluon(
         3,
         4,
     ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
-    if page_size is None:
-        page_size = 1
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
@@ -3688,7 +3676,6 @@ def pa_decode_gluon(
         sinks_ptr=sinks,
         PS=ps,
         CDNA_VERSION=cdna_version,
-        page_size=page_size,
     )
     if max_context_partition_num > 1:
         # ==================== REDUCTION KERNEL EXECUTION ====================
