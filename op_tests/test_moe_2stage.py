@@ -462,6 +462,7 @@ for (
                     doweight_stage1=doweight_stage1,
                     hidden_pad=hidden_pad,
                     intermediate_pad=intermediate_pad,
+                    preshuffle=preshuffle,
                 )
                 df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
@@ -492,6 +493,35 @@ for (
         aiter.QuantType.per_1x32,
         dtypes.fp4x2,
         dtypes.fp4x2,
+    ):
+        for preshuffle in l_preshuffle:
+            for act_type in l_act:
+                for m in l_tokenNum:
+                    ret = test_fmoe(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        args.expert,
+                        args.topk,
+                        act_type,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        use_g1u1=True,
+                        doweight_stage1=doweight_stage1,
+                        preshuffle=preshuffle,
+                    )
+                    df.append(ret)
+    elif (
+        aq_dtype == dtypes.fp8
+        and wq_dtype == dtypes.fp8
+        and quant_type
+        in [
+            aiter.QuantType.per_Tensor,
+            aiter.QuantType.per_Token,
+            aiter.QuantType.per_128x128,
+        ]
     ):
         for preshuffle in l_preshuffle:
             for act_type in l_act:
