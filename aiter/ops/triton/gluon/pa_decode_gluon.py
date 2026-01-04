@@ -811,12 +811,15 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     qk_row_offsets = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
     )
-    qk_row_mask_3d = (mtp_query_len_offsets[:, None, None] < QUERY_SEQ_LEN) & (
+    query_row_mask_3d = (mtp_query_len_offsets[:, None, None] < QUERY_SEQ_LEN) & (
         mtp_query_group_size_offsets[None, :, None] < QUERY_GROUP_SIZE_ORIGINAL
     )
-    qk_row_mask_1d = gl.reshape(qk_row_mask_3d, [QUERY_GROUP_SIZE_POW2])
-    qk_row_mask_1d = gl.convert_layout(
-        qk_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
+    query_row_mask_1d = gl.reshape(query_row_mask_3d, [QUERY_GROUP_SIZE_POW2])
+    qk_row_mask = gl.convert_layout(
+        query_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
+    )
+    pv_row_mask = gl.convert_layout(
+        query_row_mask_1d, layout=gl.SliceLayout(1, pv_mfma_layout)
     )
 
     # ==================== Program ID and Sequence Setup ====================
@@ -883,8 +886,20 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         )
 
     # ==================== Output Buffer Setup ====================
-    max_logits_base_offsets = gl.arange(
+    # Create MTP layout indices for max_logits/exp_sums
+    max_logits_base_offsets_mtp = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
+    )
+    # Convert MTP layout indices to continuous indices for exp_sums/max_logits
+    max_logits_query_len_idx = (
+        max_logits_base_offsets_mtp // QUERY_GROUP_SIZE_ONE_Q_POW2
+    )
+    max_logits_group_idx_in_len = (
+        max_logits_base_offsets_mtp % QUERY_GROUP_SIZE_ONE_Q_POW2
+    )
+    max_logits_base_offsets = (
+        max_logits_query_len_idx * query_group_size_original
+        + max_logits_group_idx_in_len
     )
     max_logits_offsets = (
         sequence_idx * stride_max_logits_seq
@@ -892,17 +907,24 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         + sequence_partition_idx * stride_max_logits_part
         + max_logits_base_offsets
     )
-    max_logits_group_mask = max_logits_base_offsets < QUERY_GROUP_SIZE
+    # Use qk_row_mask for max_logits/exp_sums mask (consistent with paged_attention_decode_v2_gluon_dot_kernel)
+    max_logits_group_mask = qk_row_mask
 
-    output_group_offsets = gl.arange(
+    # Create MTP layout indices for output
+    output_group_offsets_mtp = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, pv_mfma_layout)
+    )
+    # Convert MTP layout indices to continuous indices for temporary_output
+    output_query_len_idx = output_group_offsets_mtp // QUERY_GROUP_SIZE_ONE_Q_POW2
+    output_group_idx_in_len = output_group_offsets_mtp % QUERY_GROUP_SIZE_ONE_Q_POW2
+    output_group_offsets = (
+        output_query_len_idx * query_group_size_original + output_group_idx_in_len
     )
     output_head_size_offsets = gl.arange(
         0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
-    output_mask = (output_group_offsets[:, None] < QUERY_GROUP_SIZE) & (
-        output_head_size_offsets[None, :] < head_size
-    )
+    # Use pv_row_mask for output mask (consistent with paged_attention_decode_v2_gluon_dot_kernel)
+    output_mask = pv_row_mask[:, None] & (output_head_size_offsets[None, :] < head_size)
 
     output_offsets = sequence_idx * stride_output_seq
     output_offsets += kv_head_idx * stride_output_head
@@ -1073,7 +1095,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             causal_mask = qk_column_offsets[None, :] < context_length
 
         # Combine masks
-        combined_mask = qk_row_mask_1d[:, None] & causal_mask
+        combined_mask = qk_row_mask[:, None] & causal_mask
 
         # Apply masking to QK scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         qk_matrix = tl.where(combined_mask, qk_matrix, float(-3.4e38))
@@ -1513,12 +1535,15 @@ def paged_attention_decode_sliding_window(
     qk_row_offsets = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
     )
-    qk_row_mask_3d = (mtp_query_len_offsets[:, None, None] < QUERY_SEQ_LEN) & (
+    query_row_mask_3d = (mtp_query_len_offsets[:, None, None] < QUERY_SEQ_LEN) & (
         mtp_query_group_size_offsets[None, :, None] < QUERY_GROUP_SIZE_ORIGINAL
     )
-    qk_row_mask_1d = gl.reshape(qk_row_mask_3d, [QUERY_GROUP_SIZE_POW2])
-    qk_row_mask_1d = gl.convert_layout(
-        qk_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
+    query_row_mask_1d = gl.reshape(query_row_mask_3d, [QUERY_GROUP_SIZE_POW2])
+    qk_row_mask = gl.convert_layout(
+        query_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
+    )
+    pv_row_mask = gl.convert_layout(
+        query_row_mask_1d, layout=gl.SliceLayout(1, pv_mfma_layout)
     )
     # For sinks handling
     query_group_offsets = gl.arange(0, QUERY_GROUP_SIZE_POW2)
@@ -1586,9 +1611,8 @@ def paged_attention_decode_sliding_window(
     output_head_size_offsets = gl.arange(
         0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
-    output_mask = (output_group_offsets[:, None] < query_group_size) & (
-        output_head_size_offsets[None, :] < head_size
-    )
+    # Use pv_row_mask for output mask (consistent with paged_attention_decode_v2_gluon_dot_kernel)
+    output_mask = pv_row_mask[:, None] & (output_head_size_offsets[None, :] < head_size)
 
     # Output will be reshaped and stored in 3D format at the end
     output_offsets = (
@@ -1832,7 +1856,7 @@ def paged_attention_decode_sliding_window(
         else:
             causal_mask = qk_column_offsets[None, :] < context_length
 
-        boundary_mask = qk_row_mask_1d[:, None] & causal_mask
+        boundary_mask = qk_row_mask[:, None] & causal_mask
 
         # Apply sliding window mask
         if SLIDING_WINDOW > 0:
