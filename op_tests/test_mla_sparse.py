@@ -202,6 +202,17 @@ def sparse_kv_indptr_to_dense(
     )
 
 
+# can be calculated in metadata prepare time
+def sparse_kv_indptr_to_dense_nps(
+    kv_indptr: torch.Tensor,
+):
+    kv_len = torch.diff(kv_indptr)
+    sparse_kv_len = torch.clamp(kv_len, max=2048)
+    new_kv_indptr = torch.zeros_like(kv_indptr)
+    new_kv_indptr[1 : kv_indptr.shape[0]] = torch.cumsum(sparse_kv_len, dim=0)
+    return new_kv_indptr
+
+
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     kv_indptr,  # int32 [num_requests]
@@ -330,6 +341,103 @@ def triton_convert_req_index_to_global_index(
     return out
 
 
+@triton.jit
+def _convert_req_index_to_global_index_kernel_nps(
+    dsa_qo_indptr,  # int32 [num_tokens + 1]
+    ori_kv_indptr,  # int32 [num_tokens + 1]
+    dsa_kv_indptr,  # int32 [num_tokens + 1]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    kv_indices,  # int32 [num_req, max_num_blocks_per_req]
+    out_kv_indices,  # int32
+    # shapes (compile-time where possible)
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,  # tile width along columns
+    # strides (in elements)
+    ti_stride0: tl.int64,  # topk_indices stride 0
+    ti_stride1: tl.constexpr,  # topk_indices stride 1
+):
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+
+    col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    kv_start_ori = tl.load(ori_kv_indptr + token_id)
+
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_end = tl.load(dsa_kv_indptr + token_id + 1)
+    kv_len = kv_end - kv_start
+
+    if tile_id * BLOCK_N > kv_len:
+        return
+
+    # Load token indices for this tile
+    indice = tl.load(
+        topk_indices + token_id * ti_stride0 + col_id * ti_stride1
+    )  # int32
+
+    # Guard block_table access
+    valid_mask = col_id < kv_len
+    out_val = tl.load(
+        kv_indices + kv_start_ori + indice,
+        mask=valid_mask,
+        other=0,
+    )
+
+    # Store results
+    out_ptr_ij = out_kv_indices + kv_start + col_id
+    tl.store(
+        out_ptr_ij,
+        out_val,
+        mask=valid_mask,
+    )
+
+
+def triton_convert_req_index_to_global_index_nps(
+    qo_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    new_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]
+    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    BLOCK_SIZE: int = 1,  # page_block_size = 1 for now
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,  # tile width along columns
+):
+    assert topk_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"BLOCK_N ({BLOCK_N})"
+    )
+
+    num_tokens = qo_indptr.shape[0] - 1
+    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+
+    new_kv_indices = torch.empty(
+        num_tokens * NUM_TOPK_TOKENS, dtype=torch.int32, device=topk_indices.device
+    )
+
+    # Strides in elements
+    ti_stride0, ti_stride1 = topk_indices.stride()
+
+    grid = (num_tokens, tiles_per_row)
+
+
+    _convert_req_index_to_global_index_kernel_nps[grid](
+        qo_indptr,
+        kv_indptr,
+        new_kv_indptr,
+        topk_indices,
+        kv_indices,
+        new_kv_indices,
+        # shapes / constexprs
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        # strides
+        ti_stride0,
+        ti_stride1,
+    )
+    return new_kv_indices
+
+
 @benchmark()
 def test_mla(
     ctx_lens,
@@ -355,8 +463,12 @@ def test_mla(
     )  # calculated by rest of mem after weight loaded in frameworks
     num_page = (kv_max_sz + page_size - 1) // page_size
 
-    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
-    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    batch_size_ext = batch_size
+    if non_persistent_mode:
+        batch_size_ext = batch_size * decode_qlen
+
+    qo_indptr = torch.zeros(batch_size_ext + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size_ext + 1, dtype=torch.int)
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int)
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -371,9 +483,18 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
 
-    kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
-    kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
+    seq_lens_kv_ext = seq_lens_kv
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+
+    if non_persistent_mode:
+        seq_lens_kv_ext = torch.cat([seq_lens_kv] * decode_qlen)
+        seq_lens_kv_ext = seq_lens_kv_ext.reshape(batch_size, decode_qlen)
+        seq_lens_kv_ext.permute(1, 0)
+        seq_lens_kv_ext = seq_lens_kv_ext.view(-1)
+
+    kv_indptr[1 : batch_size_ext + 1] = torch.cumsum(seq_lens_kv_ext, dim=0)
+    kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
+
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
     total_qo = qo_indptr[-1].item()
@@ -399,24 +520,15 @@ def test_mla(
     seq_lens_qo.fill_(decode_qlen)
 
     max_seqlen_qo = seq_lens_qo.max().item()
-    qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    if non_persistent_mode:
+        qo_indptr = torch.arange(0, batch_size_ext + 1, dtype=torch.int)
+    else:
+        qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
+
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
     # troch implementation
-    out_ref, lse_ref = torch_mla_extend(
-        q,
-        kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        is_causal=True,
-        dtype=dtype,
-    )
-
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),
@@ -456,50 +568,67 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-    meta = aiter.get_mla_metadata_v1(
-        qo_indptr,
-        kv_indptr,
-        nhead // nhead_kv,
-        nhead_kv,
-        True,
-        work_meta_data,
-        work_info_set,
-        work_indptr,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        kv_granularity=max(page_size, 16),
-        max_seqlen_qo=1,
-        uni_seqlen_qo=1,
-        fast_mode=True,
-        max_split_per_batch=max_split_per_batch,
-        topk=2048,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
-    )
-
+    token_indices = generate_topk_kv(kv_indptr,
+                                     1 if non_persistent_mode else decode_qlen)
     # generate kv topk per token & convert indices into per token
-    token_indices = generate_topk_kv(kv_indptr, decode_qlen)
-    converted_indices = triton_convert_req_index_to_global_index(
-        kv_indptr,
-        kv_indices,
-        token_indices,
-        decode_qlen,
-    )
+    if non_persistent_mode:
+        new_qo_indptr = qo_indptr
+        new_kv_indptr = sparse_kv_indptr_to_dense_nps(kv_indptr)
 
-    # convert kv indptr perbatch into pertoken and calc ref
-    new_qo_indptr, new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
-        kv_indptr,
-        converted_indices,
-        decode_qlen,
-    )
+        converted_indices = triton_convert_req_index_to_global_index_nps(
+            new_qo_indptr,
+            kv_indptr,
+            new_kv_indptr,
+            kv_indices,
+            token_indices,
+        )
+
+        new_indices = converted_indices
+
+    else:
+        meta = aiter.get_mla_metadata_v1(
+            qo_indptr,
+            kv_indptr,
+            nhead // nhead_kv,
+            nhead_kv,
+            True,
+            work_meta_data,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            kv_granularity=max(page_size, 16),
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+            max_split_per_batch=max_split_per_batch,
+            topk=2048,
+            dtype_q=dtype,
+            dtype_kv=kvtype,
+        )
+
+        converted_indices = triton_convert_req_index_to_global_index(
+            kv_indptr,
+            kv_indices,
+            token_indices,
+            decode_qlen,
+        )
+
+        # convert kv indptr perbatch into pertoken and calc ref
+        new_qo_indptr, new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
+            kv_indptr,
+            converted_indices,
+            decode_qlen,
+        )
+
     total_kv = new_kv_indptr[-1].item()  # change into pertoken total_kv
     out_ref, lse_ref = torch_mla_extend(
         q,
         kv_buffer,
         new_qo_indptr,
         new_kv_indptr,
-        new_indices,
+        new_indices[:new_kv_indptr[-1]],
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
@@ -577,7 +706,7 @@ def test_mla(
             kv_buffer_fp8,
             new_qo_indptr,
             new_kv_indptr,
-            new_indices,
+            new_indices[:new_kv_indptr[-1]],
             sm_scale,
             kv_lora_rank,
             qk_rope_head_dim,
