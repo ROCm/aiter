@@ -625,12 +625,19 @@ def get_ps_metadata_info_v1(
     cu_num = device_properties.multi_processor_count
 
     max_qhead_split_per_batch = math.ceil(num_head_q / qhead_granularity)
-    max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
-    max_kv_split_per_batch = math.ceil(max_kvlen / kvlen_granularity)
+    if max_qlen > qlen_granularity:  # prefill
+        # split qlen
+        max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
+        # consider causal mask boundary
+        max_kv_split0 = math.ceil((max_kvlen - max_qlen + qlen_granularity) / kvlen_granularity)
+        max_kv_split1 = math.ceil(max_kvlen / kvlen_granularity)
+        max_kv_split_per_batch = math.ceil((max_kv_split0 + max_kv_split1) * max_qo_split_per_batch / 2)
+    else:  # decode
+        max_qo_split_per_batch = 1
+        max_kv_split_per_batch = math.ceil(max_kvlen / kvlen_granularity)
     qo_tile_cnt = batch_size * max_qo_split_per_batch
-
-    max_works = max_qhead_split_per_batch * qo_tile_cnt * max_kv_split_per_batch
-    max_partials = qo_tile_cnt * max_kv_split_per_batch
+    max_works = batch_size * max_qhead_split_per_batch * max_kv_split_per_batch
+    max_partials = batch_size * max_kv_split_per_batch
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs

@@ -419,16 +419,11 @@ def mla_ps_prefill_fwd(
         return (a + b - 1) // b
 
     tile_q = 256
-    num_q_tile = ceil_div(total_s, tile_q)
-    padded_num_tokens = num_q_tile * tile_q
-    available_tgs = work_indptr.size(0) - 1
-    total_partial_rows = padded_num_tokens * available_tgs
-
     logits = torch.empty(
-        (total_partial_rows, nhead, v_head_dim), dtype=dtypes.fp32, device=device
+        (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim), dtype=dtypes.fp32, device=device
     )
     attn_lse = torch.empty(
-        (total_partial_rows, nhead), dtype=dtypes.fp32, device=device
+        (reduce_partial_map.size(0) * tile_q, nhead), dtype=dtypes.fp32, device=device
     )
 
     aiter.mla_ps_prefill_asm_fwd(
