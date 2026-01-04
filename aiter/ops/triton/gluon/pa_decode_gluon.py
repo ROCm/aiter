@@ -3466,8 +3466,8 @@ def pa_decode_gluon(
             query_group_size=query_group_size,
             head_size=head_size,
         )
-
-    if exp_sums is None:
+    one_shot = max_context_partition_num <= 1
+    if exp_sums is None and not one_shot:
         exp_sums = torch.empty(
             num_sequences,
             num_kv_heads,
@@ -3476,7 +3476,7 @@ def pa_decode_gluon(
             device=query.device,
             dtype=aiter.dtypes.fp32,
         )
-    if max_logits is None:
+    if max_logits is None and not one_shot:
         max_logits = torch.empty(
             num_sequences,
             num_kv_heads,
@@ -3485,7 +3485,7 @@ def pa_decode_gluon(
             device=query.device,
             dtype=aiter.dtypes.fp32,
         )
-    if temporary_output is None:
+    if temporary_output is None and not one_shot:
         temporary_output = torch.empty(
             num_sequences,
             num_kv_heads,
@@ -3621,12 +3621,12 @@ def pa_decode_gluon(
 
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
 
-    ps = ps or max_context_partition_num <= 1
+    ps = ps or one_shot
     _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         grid,
         exp_sums,
         max_logits,
-        output_gluon if max_context_partition_num <= 1 else temporary_output,
+        output_gluon if one_shot else temporary_output,
         query_gluon,
         key_cache,
         value_cache,
@@ -3639,10 +3639,10 @@ def pa_decode_gluon(
         exp_sums.stride(0),
         exp_sums.stride(1),
         exp_sums.stride(2),
-        (output_gluon if max_context_partition_num <= 1 else temporary_output).stride(
+        (output_gluon if one_shot else temporary_output).stride(
             0
         ),
-        (output_gluon if max_context_partition_num <= 1 else temporary_output).stride(
+        (output_gluon if one_shot else temporary_output).stride(
             1
         ),
         temporary_output.stride(2),
@@ -3677,7 +3677,7 @@ def pa_decode_gluon(
         PS=ps,
         CDNA_VERSION=cdna_version,
     )
-    if max_context_partition_num > 1:
+    if not one_shot:
         # ==================== REDUCTION KERNEL EXECUTION ====================
         grid = (num_sequences, num_kv_heads, 1)
         _paged_attention_decode_v2_reduce_kernel_wrapper(
