@@ -1701,8 +1701,8 @@ def _flash_attn_backward(
             bias,
             alibi_slopes,
             rng_state,
-            sink_ptr,
-            None
+            None,
+            sink_ptr
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
