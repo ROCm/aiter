@@ -251,7 +251,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
         TORCH_CHECK(gdx <= 64, __func__, " gdx (", gdx, ") must be <= 64");
     }
     // semaphore.fill_(selectedksplit);
-    if(semaphore.numel() > 0)
+    if (split > 1 && semaphore.numel() > 0)
     {
         args.ptr_semaphore = (void*)semaphore.data_ptr<uint32_t>();
     }
