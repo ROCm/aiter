@@ -8,13 +8,14 @@ from aiter.ops.quant import dynamic_per_token_scaled_quant
 from aiter.ops.activation import silu_and_mul, gelu_and_mul, gelu_tanh_and_mul
 import pandas as pd
 import argparse
+from functools import partial
 
 
-def torch_silu_and_mul_quant(input: torch.Tensor, quant_dtype: torch.dtype) -> tuple:
+def torch_act_and_mul_quant(torch_act_fn, input, quant_dtype):
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
 
-    out_fp = F.silu(x) * y
+    out_fp = torch_act_fn(x) * y
 
     shape = out_fp.shape
     out_fp_2d = out_fp.view(-1, shape[-1])
@@ -39,35 +40,6 @@ def torch_silu_and_mul_quant(input: torch.Tensor, quant_dtype: torch.dtype) -> t
     return out_quant, scale
 
 
-def torch_gelu_and_mul_quant(input: torch.Tensor, quant_dtype: torch.dtype) -> tuple:
-    d = input.shape[-1] // 2
-    x, y = input.split([d, d], dim=-1)
-
-    out_fp = F.gelu(x) * y
-
-    shape = out_fp.shape
-    out_fp_2d = out_fp.view(-1, shape[-1])
-    num_tokens = out_fp_2d.shape[0]
-
-    absmax = torch.max(torch.abs(out_fp_2d), dim=-1, keepdim=True)[0]
-
-    if quant_dtype == dtypes.fp8:
-        dtype_max = torch.finfo(dtypes.fp8).max
-    elif quant_dtype == torch.int8:
-        dtype_max = 127.0
-    else:
-        raise ValueError(f"Unsupported quant dtype: {quant_dtype}")
-
-    scale = absmax / dtype_max
-    scale[scale == 0] = 1.0
-
-    out_quant = (out_fp_2d / scale).to(quant_dtype)
-    out_quant = out_quant.view(shape)
-    scale = scale.view(num_tokens, 1).to(torch.float32)
-
-    return out_quant, scale
-
-
 def separate_kernel_baseline(input: torch.Tensor, quant_dtype: torch.dtype, activation_fn) -> tuple:
     d = input.shape[-1] // 2
     shape = input.shape
@@ -84,48 +56,17 @@ def separate_kernel_baseline(input: torch.Tensor, quant_dtype: torch.dtype, acti
 
 
 @benchmark()
-def test_fused_silu_mul_quant(m, n, dtype, quant_dtype):
-    """Test fused SiLU+mul+quant kernel"""
+def test_fused_act_mul_quant(torch_act_fn, fused_fn, m, n, dtype, quant_dtype):
+    """Test fused ACT+mul+quant kernel"""
     ret = {}
     input_data = torch.randn(m, n, dtype=dtype, device="cuda")
     out = torch.empty((m, n // 2), dtype=quant_dtype, device="cuda")
     scales = torch.empty((m, 1), dtype=torch.float32, device="cuda")
 
-    ref_out, ref_scales = torch_silu_and_mul_quant(input_data, quant_dtype)
+    ref_out, ref_scales = torch_act_and_mul_quant(torch_act_fn, input_data, quant_dtype)
 
     _, us_fused = run_perftest(
-        fused_silu_mul_per_token_quant,
-        out,
-        scales,
-        input_data,
-    )
-
-    ref_dequant = ref_out.to(torch.float) * ref_scales
-    fused_dequant = out.to(torch.float) * scales
-    err_out = checkAllclose(ref_dequant, fused_dequant, rtol=5e-2, atol=5e-2)
-    err_scale = checkAllclose(ref_scales, scales, rtol=1e-2, atol=1e-2)
-
-    ret["us"] = us_fused
-    ret["TB/s"] = (input_data.nbytes + out.nbytes + scales.nbytes) / us_fused / 1e6
-    ret["err_out"] = err_out
-    ret["err_scale"] = err_scale
-    ret["dtype"] = str(dtype)
-    ret["quant_dtype"] = str(quant_dtype)
-
-    return ret
-
-
-@benchmark()
-def test_fused_gelu_mul_quant(m, n, dtype, quant_dtype):
-    ret = {}
-    input_data = torch.randn(m, n, dtype=dtype, device="cuda")
-    out = torch.empty((m, n // 2), dtype=quant_dtype, device="cuda")
-    scales = torch.empty((m, 1), dtype=torch.float32, device="cuda")
-
-    ref_out, ref_scales = torch_gelu_and_mul_quant(input_data, quant_dtype)
-
-    _, us_fused = run_perftest(
-        fused_gelu_mul_per_token_quant,
+        fused_fn,
         out,
         scales,
         input_data,
@@ -225,24 +166,21 @@ if __name__ == "__main__":
             (32, 4096, dtypes.fp16, torch.int8),
             (128, 4096, dtypes.fp16, torch.int8),
         ]
-
-        print("\nTesting fused_silu_mul_per_token_quant:")
-        results = []
-        for m, n, dtype, quant_dtype in test_configs:
-            result = test_fused_silu_mul_quant(m, n, dtype, quant_dtype)
-            results.append(result)
-            print(f"  [{m:4d} x {n:5d}] {dtype} -> {quant_dtype}: "
-                  f"err_out={result['err_out']:.2e}, err_scale={result['err_scale']:.2e}, "
-                  f"time={result['us']:.2f}us, BW={result['TB/s']:.2f}TB/s")
-
-        print("\nTesting fused_gelu_mul_per_token_quant:")
-        results = []
-        for m, n, dtype, quant_dtype in test_configs:
-            result = test_fused_gelu_mul_quant(m, n, dtype, quant_dtype)
-            results.append(result)
-            print(f"  [{m:4d} x {n:5d}] {dtype} -> {quant_dtype}: "
-                  f"err_out={result['err_out']:.2e}, err_scale={result['err_scale']:.2e}, "
-                  f"time={result['us']:.2f}us, BW={result['TB/s']:.2f}TB/s")
+        
+        for module in [
+            ("silu", fused_silu_mul_per_token_quant, F.silu),
+            ("gelu", fused_gelu_mul_per_token_quant, F.gelu),
+            ("gelu_tanh", fused_gelu_tanh_mul_per_token_quant, partial(F.gelu, approximate="tanh")),
+        ]:
+            name, fused_fn, torch_act_fn = module
+            print(f"\nTesting {name.upper()} + MUL + Token QUANT Fusion:")
+            results = []
+            for m, n, dtype, quant_dtype in test_configs:
+                result = test_fused_act_mul_quant(torch_act_fn, fused_fn, m, n, dtype, quant_dtype)
+                results.append(result)
+                print(f"  [{m:4d} x {n:5d}] {dtype} -> {quant_dtype}: "
+                    f"err_out={result['err_out']:.2e}, err_scale={result['err_scale']:.2e}, "
+                    f"time={result['us']:.2f}us, BW={result['TB/s']:.2f}TB/s")
 
     if args.test in ["benchmark", "all"]:
         print("\n" + "=" * 80)
