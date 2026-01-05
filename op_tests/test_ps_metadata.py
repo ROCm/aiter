@@ -78,6 +78,7 @@ def test_ps_metadata(
         (reduce_partial_map_size, reduce_partial_map_type),
     ) = aiter.get_ps_metadata_info_v1(
         batch_size=batch_size,
+        num_head_k=num_head_kv,
         max_qlen=max_qlen,
         qlen_granularity=qlen_granularity,
     )
