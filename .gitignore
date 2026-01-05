@@ -56,3 +56,15 @@ aiter_logs
 # artifacts
 aiter_meta
 aiter/install_mode
+
+# vim 
+*.swo
+*.swp
+*.swo
+*.swp
+
+# captured inputs and videos
+*.mp4
+captured_inputs/*
+*.pt
+*.png
