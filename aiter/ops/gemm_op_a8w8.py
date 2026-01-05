@@ -163,6 +163,7 @@ def gemm_a8w8_blockscale_ck_tile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    isBpreshuffled: bool = True,
 ) -> torch.Tensor: ...
 
 
@@ -288,6 +289,7 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
 
+    cu_num = get_cu_num()
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
@@ -550,24 +552,29 @@ def gemm_a8w8_blockscale(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     from aiter.jit.utils.chip_info import get_gfx
 
+    config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+    )
+    libtype = config["libtype"] if config else None
+
     if isBpreshuffled:
-        if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+        if get_gfx() == "gfx950" and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
-        else:
-            assert 0, "asm kernel only support B preshuffle and m >= 16"
-    else:
-        config = get_CKGEMM_config(
-            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
-        )
-        if config is not None:
-            libtype = config["libtype"]
-            if libtype == "ck_legacy":
-                return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
-            elif libtype == "ck_tile":
-                return gemm_a8w8_blockscale_ck_tile(XQ, WQ, x_scale, w_scale, Y)
-            else:
-                assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+        if libtype == "ck_tile":
+            return gemm_a8w8_blockscale_ck_tile(
+                XQ, WQ, x_scale, w_scale, Y, isBpreshuffled=True
+            )
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+
+    if libtype == "ck_legacy":
         return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
+    if libtype == "ck_tile":
+        return gemm_a8w8_blockscale_ck_tile(
+            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled=False
+        )
+    if libtype is not None:
+        assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+    return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
 
 
 def flatmm_a8w8_blockscale_ASM(

@@ -46,7 +46,8 @@ torch::Tensor gemm_a8w8_blockscale_tune_tile(torch::Tensor& XQ,
                                              torch::Tensor& w_scale,
                                              torch::Tensor& Y,
                                              int kernelId,
-                                             int splitK)
+                                             int splitK,
+                                             bool isBpreshuffled)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -59,11 +60,13 @@ torch::Tensor gemm_a8w8_blockscale_tune_tile(torch::Tensor& XQ,
 
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockwise_dispatch_tile<TILE_FP32, TILE_BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch_tile<TILE_FP32, TILE_BF16>(kernelId)(
+            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
-        blockwise_dispatch_tile<TILE_FP32, TILE_FP16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch_tile<TILE_FP32, TILE_FP16>(kernelId)(
+            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled);
     }
     else
     {
