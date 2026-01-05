@@ -1551,11 +1551,8 @@ def paged_attention_decode_sliding_window(
     if SLIDING_WINDOW > 0:
         sequence_start_idx = context_length - SLIDING_WINDOW
         sequence_end_idx = context_length
-        sequence_partition_start_idx = (
-            sequence_start_idx
-        ) // CONTEXT_PARTITION_SIZE
+        sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
         sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
-
     else:
         page_size = gl.cdiv(context_length, gl.num_programs(2))
         sequence_start_idx = page_size * sequence_split_idx
@@ -1606,10 +1603,13 @@ def paged_attention_decode_sliding_window(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
         kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+
         num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
+
         qk_column_offsets = kv_block_start_idx * KV_BLOCK_SIZE + gl.arange(
             0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
+        qk_column_offsets = gl.maximum(qk_column_offsets, 0)
         # Load KV block indices from block table
         block_indices = gl.arange(
             0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout
@@ -1769,6 +1769,9 @@ def paged_attention_decode_sliding_window(
         # kv_pos = qk_column_offsets
 
         # Apply causal masking if required
+        # if SLIDING_WINDOW > 0:
+        #     sequence_start_idx = sequence_start_idx + query_token_idx[:, None] + 1
+
         if IS_CAUSAL:
             # Compute causal mask based on sequence positions
             sequence_position_extension = query_seq_len - 1 - query_token_idx
@@ -1779,21 +1782,24 @@ def paged_attention_decode_sliding_window(
             causal_mask = causal_mask & (sequence_position_extension[:, None] + qk_column_offsets[None, :] >= sequence_start_idx)
         else:
             causal_mask = qk_column_offsets[None, :] < sequence_end_idx
-            causal_mask = causal_mask & (qk_column_offsets[None, :] >= sequence_start_idx)
+            if SLIDING_WINDOW > 0:
+                causal_mask = causal_mask & (qk_column_offsets[None, :] >= sequence_start_idx + query_token_idx[:, None] + 1)
+            else:
+                causal_mask = causal_mask & (qk_column_offsets[None, :] >= sequence_start_idx)
 
         boundary_mask = boundary_mask & causal_mask
 
         # Apply sliding window mask
-        if SLIDING_WINDOW > 0:
-            # Sliding window: keep only KV tokens within SLIDING_WINDOW distance from query position
-            # query_pos - kv_pos < SLIDING_WINDOW
-            # (context_length + query_token_idx) - qk_column_offsets < SLIDING_WINDOW
-            # OR: qk_column_offsets > context_length + query_token_idx - SLIDING_WINDOW
-            sliding_window_mask = (
-                qk_column_offsets[None, :]
-                > sequence_start_idx + query_token_idx[:, None]
-            )
-            boundary_mask = boundary_mask & sliding_window_mask
+        # if SLIDING_WINDOW > 0:
+        #     # Sliding window: keep only KV tokens within SLIDING_WINDOW distance from query position
+        #     # query_pos - kv_pos < SLIDING_WINDOW
+        #     # (context_length + query_token_idx) - qk_column_offsets < SLIDING_WINDOW
+        #     # OR: qk_column_offsets > context_length + query_token_idx - SLIDING_WINDOW
+        #     sliding_window_mask = (
+        #         qk_column_offsets[None, :]
+        #         > sequence_start_idx + query_token_idx[:, None]
+        #     )
+        #     boundary_mask = boundary_mask & sliding_window_mask
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
 
