@@ -478,6 +478,7 @@ def test_mla(
 
     return ret
 
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
