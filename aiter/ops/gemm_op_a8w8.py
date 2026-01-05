@@ -568,7 +568,12 @@ def gemm_a8w8_blockscale(
             XQ, WQ, x_scale, w_scale, Y, use_bpreshuffle
         )
     elif libtype == "ck_legacy":
-        return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
+        if isBpreshuffled:
+            return gemm_a8w8_blockscale_bpreshuffle_ck(
+                XQ, WQ, x_scale, w_scale, Y
+            )
+        else:
+            return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
     else:
         assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
 

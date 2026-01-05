@@ -201,6 +201,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             gemm_a8w8_idx,
                             i,
                             splitK,
+                            isBpreshuffled,
                         ),
                         {},
                         run_torch,
