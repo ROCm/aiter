@@ -603,12 +603,9 @@ def get_pa_metadata_v1(
 
 def get_ps_metadata_info_v1(
     batch_size: int,
-    num_head_q: int,
+    num_head_k: int,
     max_qlen: int,
-    max_kvlen: int,
-    qhead_granularity: int = 1,
     qlen_granularity: int = 256,
-    kvlen_granularity: int = 1
 ):
     """
     Returns:
@@ -624,20 +621,16 @@ def get_ps_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(device)
     cu_num = device_properties.multi_processor_count
 
-    max_qhead_split_per_batch = math.ceil(num_head_q / qhead_granularity)
-    if max_qlen > qlen_granularity:  # prefill
-        # split qlen
-        max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
-        # consider causal mask boundary
-        max_kv_split0 = math.ceil((max_kvlen - max_qlen + qlen_granularity) / kvlen_granularity)
-        max_kv_split1 = math.ceil(max_kvlen / kvlen_granularity)
-        max_kv_split_per_batch = math.ceil((max_kv_split0 + max_kv_split1) * max_qo_split_per_batch / 2)
-    else:  # decode
-        max_qo_split_per_batch = 1
-        max_kv_split_per_batch = math.ceil(max_kvlen / kvlen_granularity)
+    num_clusters       = math.gcd(num_head_k, cu_num)
+    cus_per_cluster    = cu_num // num_clusters
+    kheads_per_cluster = num_head_k // num_clusters
+
+    max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
+
     qo_tile_cnt = batch_size * max_qo_split_per_batch
-    max_works = batch_size * max_qhead_split_per_batch * max_kv_split_per_batch
-    max_partials = batch_size * max_kv_split_per_batch
+    # TODO: consider split q to reduce max_works & max_partials
+    max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
+    max_partials = min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2) * max_qo_split_per_batch
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs
