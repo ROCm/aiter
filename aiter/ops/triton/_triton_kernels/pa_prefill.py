@@ -9,7 +9,7 @@
 
 import triton
 import triton.language as tl
-from ..utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 _fwd_kernel_repr = make_kernel_repr(

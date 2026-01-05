@@ -24,11 +24,11 @@ import triton
 import triton.language as tl
 
 
-from .activation import _tanh
-from ..utils._triton.pid_preprocessing import remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.activation import _tanh
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 _fwd_kernel_extend_repr = make_kernel_repr(

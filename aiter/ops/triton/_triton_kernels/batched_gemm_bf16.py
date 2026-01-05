@@ -3,8 +3,8 @@
 
 import triton
 import triton.language as tl
-from ..utils._triton.kernel_repr import make_kernel_repr
-from ..utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _batched_gemm_bf16_repr = make_kernel_repr(
     "_batched_gemm_bf16_kernel",

@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 
-from .quant import _mxfp4_quant_op
+from aiter.ops.triton.quant import _mxfp4_quant_op
 
 
 @triton.jit

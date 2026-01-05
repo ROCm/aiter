@@ -4,10 +4,10 @@
 import triton
 import triton.language as tl
 
-from ..utils._triton.kernel_repr import make_kernel_repr
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils.gemm_config_utils import get_gemm_config
-from .quant import _mxfp4_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.quant import _mxfp4_quant_op
 
 _batched_gemm_a16wfp4_repr = make_kernel_repr(
     "_batched_gemm_a16wfp4_kernel",
