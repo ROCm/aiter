@@ -2803,7 +2803,7 @@ def mha_batch_prefill_func(
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(2)
     head_size_v_og = v.size(2)
-    if(sink_ptr is not None):
+    if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
         assert sink_ptr.shape[0] == q.size(1), "sink_ptr has incorrect shape"
         if sink_ptr.dtype != torch.float32:
