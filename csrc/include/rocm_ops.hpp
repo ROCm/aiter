@@ -1414,7 +1414,18 @@ namespace py = pybind11;
           py::arg("return_kv"),                                      \
           py::arg("use_shuffle_layout"),                             \
           py::arg("block_size"),                                     \
-          py::arg("x"));
+          py::arg("x"));                                             \
+    m.def("shuffle_kv_cache_cuda",                                   \
+          &shuffle_kv_cache_cuda,                                    \
+          py::arg("key"),                                            \
+          py::arg("value"),                                          \
+          py::arg("k_cache"),                                        \
+          py::arg("v_cache"),                                        \
+          py::arg("slot_mapping"),                                   \
+          py::arg("block_size"),                                     \
+          py::arg("x"),                                              \
+          py::arg("k_scale"),                                        \
+          py::arg("v_scale"));
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \

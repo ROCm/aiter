@@ -87,3 +87,14 @@ void fused_rope_rms_set_kv(Tensor& qkv,
                            bool use_shuffle_layout,
                            int64_t block_size,
                            int64_t x);
+
+// Shuffle KV Cache kernel - optimized for quant + shuffle layout
+void shuffle_kv_cache_cuda(Tensor& key,
+                           Tensor& value,
+                           Tensor& k_cache,
+                           Tensor& v_cache,
+                           Tensor& slot_mapping,
+                           int64_t block_size,
+                           int64_t x,
+                           double k_scale,
+                           double v_scale);
