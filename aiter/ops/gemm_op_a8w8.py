@@ -605,27 +605,6 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
-@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
-def gemm_a8w8_blockscale_bpreshuffle(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    dtype: torch.dtype = dtypes.bf16,
-) -> Tensor:
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    m = XQ.shape[0]
-    n = WQ.shape[0]
-    k = XQ.shape[1]
-    get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
-    )
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
-
 
 def gfx950_a8w8_blockscale_ASM(
     XQ: Tensor,
@@ -710,6 +689,7 @@ def gemm_a8w8_blockscale_tune_tile(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    isBpreshuffled: bool = True,
 ) -> torch.Tensor: ...
 
 
