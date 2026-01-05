@@ -58,10 +58,11 @@ def gemm_a16w16(
     bias: Optional[Tensor] = None,
     splitK: Optional[int] = None,
     kernelName: Optional[str] = None,
+    bpreshuffle: bool = False,
 ):
     if splitK > 1:
         sema = get_semaphore_workspace(out.device)
     else:
         sema = torch.empty((0,), dtype=torch.uint32, device=out.device)
 
-    return gemm_a16w16_asm(A, B, out, bias, sema, splitK, kernelName)
+    return gemm_a16w16_asm(A, B, out, sema, bias, splitK, kernelName, bpreshuffle)

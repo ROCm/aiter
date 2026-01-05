@@ -60,17 +60,10 @@ def call_hipb_mm(
 def run_gemm_bf16_asm(
     inp, w, out, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
-
-    if splitK > 1:
-        sema = get_semaphore_workspace(inp.device)
-    else:
-        sema = torch.empty((16, 64), dtype=torch.uint32, device=inp.device)
-
-    return aiter.gemm_a16w16_asm(
+    return aiter.gemm_a16w16(
         inp,
         w,
         out,
-        sema,
         bias=bias,
         splitK=splitK,
         kernelName=kernelName,
