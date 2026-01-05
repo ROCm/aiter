@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 import os
@@ -243,8 +243,6 @@ def fused_moe_(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
-        bias1,
-        bias2,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -587,8 +585,6 @@ def get_2stage_cfgs(
     doweight_stage1,
     hidden_pad,
     intermediate_pad,
-    bias1,
-    bias2,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -765,14 +761,12 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                bias1=bias1,
             ),
             functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
-                bias2=bias2,
             ),
             get_block_m(),
             ksplit,
@@ -791,7 +785,6 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                bias1=bias1,
                 split_k=ksplit,
             ),
             functools.partial(
@@ -799,7 +792,6 @@ def get_2stage_cfgs(
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
-                bias2=bias2,
             ),
             16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
@@ -911,8 +903,6 @@ def fused_moe_2stages(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
-        bias1,
-        bias2,
     )
     if (
         quant_type == QuantType.per_1x32

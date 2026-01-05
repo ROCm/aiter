@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import itertools
@@ -129,7 +129,7 @@ def test_fmoe(
         a1_scale = a1_scale.squeeze(-1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8] or token <= 4)
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and WQDType == dtypes.fp4x2
     ):  # a16w4 & a8w4
         a1_qt = input.to(dtypes.bf16)
@@ -207,7 +207,7 @@ def test_fmoe(
         a2_scale = a2_scale.view(token, topk, -1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8] or token <= 4)
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 & a8w4
         a2_qt = out1_ref
