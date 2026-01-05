@@ -151,7 +151,8 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                  GemmTraits,
                                                                  ComputeDataType>;
 
-    using BaseGemmPipeline = ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>;
+    using BaseGemmPipeline =
+        ck_tile::BaseWeightPreshufflePipelineAGmemBGmemCRegV2<GemmPipelineProblem>;
 
     const ck_tile::index_t K_split =
         (args.K + GemmConfig::K_Tile_v - 1) / GemmConfig::K_Tile_v * GemmConfig::K_Tile_v;
@@ -178,7 +179,10 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                     has_hot_loop_v,
                                                                     tail_number_v>;
 
-        using GemmPipeline = ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>;
+        using GemmPipeline =
+            std::conditional_t<GemmConfig::DoubleSmemBuffer && isBpreshuffled,
+                               ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
+                               ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>;
 
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ADataType,
