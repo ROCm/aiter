@@ -73,7 +73,7 @@ def generate_data(m, n, k, seed, device="cuda"):
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
-        "verbose": False,
+        **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}",
         "untune_file": "aiter/configs/a8w8_blockscale_untuned_gemm.csv",
         "errRatio": 0.05,
@@ -144,7 +144,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                                 i,
                                 splitK,
                             ),
-                            {},
+                            {
+                                "num_warmup": args.warmup,
+                                "num_iters": args.iters,
+                            },
                             run_torch,
                             (ref_data_idx, None, dtypes.bf16),
                             {},
@@ -158,7 +161,16 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
         return ret
 
 

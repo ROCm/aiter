@@ -776,9 +776,12 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/mha_fwd_asm_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/mha_fwd_asm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV3_ON=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
@@ -789,17 +792,19 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'"
         ]
     },
     "module_mha_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_fwd_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/mha_fwd_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/mha_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV2_ON=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
@@ -811,17 +816,20 @@
         "verbose": "False",
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'"
         ]
     },
     "module_mha_varlen_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_fwd_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cpp'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV2_ON=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
@@ -835,15 +843,15 @@
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'"
         ]
     },
     "module_mha_batch_prefill": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_batch_prefill_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/mha_batch_prefill_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/mha_batch_prefill_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -858,8 +866,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --filter \"*_ndropout_*\" --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --filter \"*_ndropout_*\" --output_dir {{}}'"
         ]
     },
     "module_fmha_v3_bwd": {
@@ -911,9 +918,12 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_fwd.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_asm_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_asm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV3_ON=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
         ],
@@ -923,8 +933,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'"
         ]
     },
     "module_mha_bwd": {
@@ -974,7 +983,11 @@
         ]
     },
     "libmha_fwd": {
-        "srcs": [],
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cpp'"
+        ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
@@ -992,9 +1005,7 @@
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'"
         ]
     },
     "libmha_bwd": {
@@ -1054,6 +1065,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/topk_per_row_kernels.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topk_per_row_decode.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topk_per_row_prefill.cu'",
             "f'{AITER_CSRC_DIR}/pybind/topk_per_row_pybind.cu'"
         ],
         "flags_extra_cc": [],
