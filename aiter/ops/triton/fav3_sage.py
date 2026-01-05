@@ -67,7 +67,6 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         BLKK = config["BLOCK_N"]
 
         softmax_scale = head_dim**-0.5
-        tensor_layout = "NHD" if layout == "bshd" else "HND"
         ## following quantization already considered softmax scale and RCP_LN2 
         fp8_dtype = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(fp8_dtype).max
@@ -82,7 +81,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             sm_scale=softmax_scale,
             BLKQ=BLKQ,
             BLKK=BLKK,
-            tensor_layout=tensor_layout,
+            layout=layout,
         )
 
         # For GQA/MQA: quantize query with grouped scaling
