@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 
 from aiter.jit.core import AITER_LOG_TUNED_CONFIG
+from aiter import logger
 from gemm_a8w8_blockscale_instance_legacy import (
     default_kernels_dict_legacy,
     LegacyKernelInstance,
