@@ -1,6 +1,6 @@
 """
 * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-* Copyright (C) 2024-2025, The vLLM team.
+* Copyright (C) 2024-2026, The vLLM team.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -60,7 +60,12 @@ def call_hipb_mm(
 def run_gemm_bf16_asm(
     inp, w, out, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
-    sema = get_semaphore_workspace(inp.device)
+
+    if splitK > 1:
+        sema = get_semaphore_workspace(inp.device)
+    else:
+        sema = torch.empty((16, 64), dtype=torch.uint32, device=inp.device)
+
     return aiter.gemm_a16w16_asm(
         inp,
         w,
