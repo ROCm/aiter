@@ -97,7 +97,7 @@ def fused_gemm_afp4wfp4_mul_add(
     """
 
     _LOGGER.info(
-        f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
+        f"FUSED_GEMM_AFPWFP4_MUL_ADD: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
     if isinstance(a, float) or isinstance(a, int):

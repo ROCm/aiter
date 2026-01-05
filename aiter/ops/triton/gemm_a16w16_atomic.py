@@ -37,6 +37,22 @@ def gemm_a16w16_atomic_(
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
 ) -> torch.Tensor:
+    """
+    Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
+
+    Args:
+        x (torch.Tensor): BF16/FP16 input matrix  matrix with shape (M, K).
+        w (torch.Tensor): BF16/FP16 weight matrix with shape (N, K), internally transposed.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+            Note: BF16 atomic aggregation may have slight precision loss.
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+            Must be zero-initialized for split-K (NUM_KSPLIT > 1).
+        config (Optional[str]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier).
+
+    Returns:
+        y (torch.Tensor): Output with shape (M, N).
+    """
     _LOGGER.info(
         f"GEMM_A16W16_ATOMIC: x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)} "
     )
@@ -99,21 +115,5 @@ def gemm_a16w16_atomic(
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
 ) -> torch.Tensor:
-    """
-    Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
-
-    Args:
-        x (torch.Tensor): Input matrix with shape (M, K).
-        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-            Note: BF16 atomic aggregation may have slight precision loss.
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-            Must be zero-initialized for split-K (NUM_KSPLIT > 1).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier).
-
-    Returns:
-        torch.Tensor: Output with shape (M, N).
-    """
     config_hashable = serialize_dict(config) if config else None
     return gemm_a16w16_atomic_(x, w, dtype, y, config_hashable)
