@@ -10,6 +10,8 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
+pd.set_option("future.no_silent_downcasting", True)
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.basename(this_dir)
 archs = [el for el in os.environ["AITER_GPU_ARCHS"].split(";")]
@@ -35,8 +37,8 @@ if __name__ == "__main__":
         "--module",
         required=True,
         help="""module of ASM kernel,
-    e.g.: -m bf16gemm
-""",
+            e.g.: -m bf16gemm
+        """,
     )
     parser.add_argument(
         "-o",
@@ -80,7 +82,9 @@ if __name__ == "__main__":
             relpath = os.path.relpath(
                 os.path.dirname(single_file), f"{this_dir}/{arch}"
             )
-            combine_df = pd.concat(dfs, ignore_index=True).fillna(0)
+            combine_df = (
+                pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
+            )
             if not have_get_header:
                 headers_list = combine_df.columns.tolist()
                 required_columns = {"knl_name", "co_name", "arch"}

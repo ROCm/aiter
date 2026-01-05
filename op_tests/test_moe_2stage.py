@@ -11,8 +11,6 @@ from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
-import os
-import numpy as np
 import logging
 
 from aiter.fused_moe import (
@@ -28,7 +26,6 @@ from aiter.ops.shuffle import (
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
 )
-from aiter import ActivationType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
@@ -132,10 +129,10 @@ def test_fmoe(
         a1_scale = a1_scale.squeeze(-1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and WQDType == dtypes.fp4x2
-    ):  # a16w4
-        a1_qt = input.to(AQDType)
+    ):  # a16w4 & a8w4
+        a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
@@ -143,7 +140,7 @@ def test_fmoe(
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
@@ -170,7 +167,7 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
@@ -210,9 +207,9 @@ def test_fmoe(
         a2_scale = a2_scale.view(token, topk, -1)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a16w4 & a8w4
         a2_qt = out1_ref
         a2_scale = None
     else:
@@ -299,10 +296,12 @@ l_quant = [
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
-l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+# l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+l_hidden_intermediate_pad = [(0, 0), (192, 128), (129, 191)][1:2]
 l_preshuffle = [False, True]
 
 
@@ -354,7 +353,9 @@ parser.add_argument(
     2: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
     3: aiter.QuantType.per_Token, dtypes.fp8, torch.int4  # a8w4
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
-    5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8""",
+    5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
+    6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
+    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
 )
 
 parser.add_argument(
@@ -465,6 +466,30 @@ for (
                 df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
+        dtypes.fp8,
+        dtypes.fp4x2,
+    ):
+        for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
+            for m in l_tokenNum:
+                ret = test_fmoe(
+                    dtype,
+                    m,
+                    model_dim,
+                    inter_dim,
+                    args.expert,
+                    args.topk,
+                    aiter.ActivationType.Swiglu,
+                    quant_type,
+                    aq_dtype,
+                    wq_dtype,
+                    use_g1u1=True,
+                    doweight_stage1=doweight_stage1,
+                    hidden_pad=hidden_pad,
+                    intermediate_pad=intermediate_pad,
+                )
+                df.append(ret)
+    elif (quant_type, aq_dtype, wq_dtype) == (
+        aiter.QuantType.per_1x32,
         dtypes.fp4x2,
         dtypes.fp4x2,
     ):
@@ -506,4 +531,5 @@ for (
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)

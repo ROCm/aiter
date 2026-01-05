@@ -1,0 +1,52 @@
+#include "{{triton_header}}"
+
+
+extern "C" {
+void {{func_name}}(void* output_ptr,             // [num_seqs, num_kv_heads, q_group_size, head_size]
+                    void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max_parts, q_group_size]
+                    void* max_logits_ptr,         // [num_seqs, num_kv_heads, max_parts, q_group_size]
+                    void* logits_ptr,             // [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
+                    void* sequence_lengths_ptr,   // [num_seqs]
+                    int stride_output_seq,
+                    int stride_output_head,
+                    int stride_exp_sums_seq,
+                    int stride_exp_sums_head,
+                    int stride_exp_sums_part,
+                    int stride_logits_seq,
+                    int stride_logits_head,
+                    int stride_logits_part,
+                    int stride_logits_group,
+                    int query_group_size,
+                    int head_size,
+                    int num_seqs,
+                    int num_kv_heads,
+                    void* stream
+                    );
+}
+
+
+void {{func_name}}(void* output_ptr,             // [num_seqs, num_kv_heads, q_group_size, head_size]
+                    void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max_parts, q_group_size]
+                    void* max_logits_ptr,         // [num_seqs, num_kv_heads, max_parts, q_group_size]
+                    void* logits_ptr,             // [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
+                    void* sequence_lengths_ptr,   // [num_seqs]
+                    int stride_output_seq,
+                    int stride_output_head,
+                    int stride_exp_sums_seq,
+                    int stride_exp_sums_head,
+                    int stride_exp_sums_part,
+                    int stride_logits_seq,
+                    int stride_logits_head,
+                    int stride_logits_part,
+                    int stride_logits_group,
+                    int query_group_size,
+                    int head_size,
+                    int num_seqs,
+                    int num_kv_heads,
+                    void* stream
+                    ){
+    {{triton_kernel}}(reinterpret_cast<hipStream_t>(stream), output_ptr, exp_sums_ptr, max_logits_ptr, logits_ptr, sequence_lengths_ptr,
+                      stride_output_seq, stride_output_head, stride_exp_sums_seq, stride_exp_sums_head,
+                      stride_exp_sums_part, stride_logits_seq, stride_logits_head, stride_logits_part,
+                      stride_logits_group, query_group_size, head_size, num_seqs, num_kv_heads);
+}

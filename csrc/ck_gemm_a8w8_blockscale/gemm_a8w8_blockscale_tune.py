@@ -96,7 +96,7 @@ def generate_data(m, n, k, seed, device="cuda"):
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
-        "verbose": False,
+        **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}",
         "untune_file": "aiter/configs/a8w8_blockscale_untuned_gemm.csv",
         "errRatio": 0.05,

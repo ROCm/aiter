@@ -211,7 +211,9 @@ class AITER_CONFIG(object):
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
-            keys.append("cu_num")
+            # Add "cu_num" if not already present
+            if "cu_num" not in keys:
+                keys.append("cu_num")
             merge_df = (
                 merge_df.sort_values("us")
                 .drop_duplicates(subset=keys, keep="first")
@@ -361,6 +363,8 @@ def validate_and_update_archs():
         "gfx1151",
         "gfx1152",
         "gfx1153",
+        "gfx1200",
+        "gfx1201",
         "gfx950",
     ]
 
@@ -373,12 +377,38 @@ def validate_and_update_archs():
 
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str) -> bool:
-    ret = os.system(f"hipcc {flag_hip} -x hip -E -P /dev/null -o /dev/null")
-    if ret == 0:
-        return True
-    else:
-        logger.warning(f"{flag_hip} is not supported by hipcc.")
+    import subprocess
+
+    cmd = (
+        ["hipcc"]
+        + flag_hip.split()
+        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    )
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
+    return True
+
+
+@functools.lru_cache()
+def check_LLVM_MAIN_REVISION():
+    # for https://github.com/ROCm/ROCm/issues/5646 and https://github.com/ROCm/composable_kernel/pull/3469
+    # ck using following logic...
+    """#if LLVM_MAIN_REVISION < 554785
+    #define CK_TILE_HOST_DEVICE_EXTERN __host__ __device__
+    #else
+    #define CK_TILE_HOST_DEVICE_EXTERN"""
+    import subprocess
+
+    cmd = """echo "#include <tuple>
+__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -"""
+    try:
+        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError:
+        return 554785
+    return 554785 - 1
 
 
 def check_and_set_ninja_worker():
@@ -500,6 +530,7 @@ def build_module(
     torch_exclude,
     hipify=False,
 ):
+    os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
@@ -538,6 +569,7 @@ def build_module(
             "-Wno-macro-redefined",
             "-Wno-missing-template-arg-list-after-template-kw",
             "-fgpu-flush-denormals-to-zero",
+            f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
         ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
@@ -576,7 +608,7 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob"
+                blob_dir = f"{op_dir}/blob/"
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
@@ -861,7 +893,7 @@ def compile_ops(
                     pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
                     doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                     for el in enum_types:
-                        doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
+                        doc_str = re.sub(f" (module_)?aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
                         "Optional": Optional,

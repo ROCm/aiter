@@ -3,8 +3,6 @@
 
 from itertools import chain
 from pathlib import Path
-from copy import deepcopy
-import csv
 import triton.profiler as proton
 import torch
 import argparse

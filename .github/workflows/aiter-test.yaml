@@ -133,7 +133,13 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
-      
+
+      - name: Collect test logs
+        run: |
+          echo "Collecting test logs..."
+          echo "Aiter Operator Tests Summary:" >> $GITHUB_STEP_SUMMARY
+          python3 ./.github/scripts/collect_logs.py latest_test.log >> $GITHUB_STEP_SUMMARY
+
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
@@ -242,4 +248,3 @@ jobs:
         if: always()
         run: |
           ./.github/scripts/clean_up_rocm.sh
-

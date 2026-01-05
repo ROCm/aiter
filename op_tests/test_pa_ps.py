@@ -541,6 +541,7 @@ def test_pa_mtp(
         aiter.get_pa_metadata_v1(
             qo_indptr,
             kv_indptr,
+            seq_lens_kv,
             num_query_heads // num_kv_heads,
             num_kv_heads,
             True,
@@ -551,6 +552,7 @@ def test_pa_mtp(
             reduce_final_map,
             reduce_partial_map,
             kv_granularity=max(block_size, 16),
+            block_size=block_size,
             max_seqlen_qo=int(max_qlen),
             uni_seqlen_qo=qlen,
             fast_mode=True,
@@ -579,8 +581,8 @@ def test_pa_mtp(
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
                 context_lens=seq_lens_kv,
-                K_QScale=k_scale_,
-                V_QScale=v_scale_,
+                K_QScale=k_scale_asm,
+                V_QScale=v_scale_asm,
                 work_indptr=work_indptr,
                 work_info=work_info,
                 reduce_indptr=reduce_indptr,
@@ -602,8 +604,8 @@ def test_pa_mtp(
                 seq_lens_kv,
                 block_tables.size(1),
                 max_qlen,
-                k_scale=k_scale_,
-                v_scale=v_scale_,
+                k_scale=k_scale_asm,
+                v_scale=v_scale_asm,
                 qo_indptr=qo_indptr,
             ),
             num_runs=10,
@@ -648,8 +650,8 @@ def test_pa_mtp(
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             context_lens=seq_lens_kv,
-            K_QScale=k_scale_,
-            V_QScale=v_scale_,
+            K_QScale=k_scale_asm,
+            V_QScale=v_scale_asm,
             work_indptr=work_indptr,
             work_info=work_info,
             reduce_indptr=reduce_indptr,
@@ -853,5 +855,6 @@ for dtype in l_dtype:
         )
         df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
-    df.to_csv("mla_prefill.csv")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
+    df.to_csv("pa_ps.csv")

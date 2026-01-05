@@ -44,12 +44,13 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 class FmoeTuner(TunerCommon):
 
     ARG_DEFAULTS = {
+        **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
         "untune_file": "aiter/configs/untuned_fmoe.csv",
         "errRatio": 0.5,
         "batch": 100,
-        "profile_file": "aiter/configs/profile_fmoe.csv",  # for all results
+        "profile_file": "",  # for all results
     }
 
     def _setup_specific_arguments(self):
@@ -1222,8 +1223,8 @@ class FmoeTuner(TunerCommon):
             use_g1u1,
             doweight_stage1,
         ) = key
-        if us == self.INVALID_TIME:
-            return -1, -1
+        if us == self.INVALID_TIME or us == self.INF_TIME:
+            return 0, 0
         flop = 0
         data_bytes = 0
         stage = ""
@@ -1403,6 +1404,7 @@ class FmoeTuner(TunerCommon):
                         True,
                     )
                 )
+
         return task_1stage
 
     def gen_2stages_asm1_task(self, key, blockMs):
@@ -1662,13 +1664,13 @@ class FmoeTuner(TunerCommon):
     ):
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
-        args = self.keys
-        print(untunedf[args])
+        keys = self.keys
+        print(untunedf[keys])
         tasks = []
         tasks_ck = []
         task_1stage = []
         in_data = []
-        for line in untunedf[args].values:
+        for line in untunedf[keys].values:
             (
                 cu_num,
                 token,
@@ -1727,7 +1729,13 @@ class FmoeTuner(TunerCommon):
         if len(tasks) + len(tasks_ck) + len(task_1stage) > 0:
             ### shape_grouped should be False as multiple stages
             rets = mp_tuner(
-                tasks + tasks_ck + task_1stage, in_data, mp_num, True, False
+                tasks + tasks_ck + task_1stage,
+                in_data,
+                mp_num,
+                True,
+                False,
+                timeout=args.timeout,
+                verbose=args.verbose,
             )
         if not rets:
             print("no shape to tune or no solution found")
@@ -1819,7 +1827,9 @@ class FmoeTuner(TunerCommon):
 
             ## remove invalid candidate
             profileDF = profileDF[
-                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf"))
+                (profileDF["err"] < args.errRatio)
+                & (profileDF["us"] != float("-inf"))
+                & (profileDF["us"] != -1)
             ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
@@ -1958,6 +1968,13 @@ class FmoeTuner(TunerCommon):
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
             profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
             profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
+            if args.profile_file != "":
+                if os.path.exists(args.profile_file):
+                    old_df = pd.read_csv(args.profile_file)
+                else:
+                    old_df = pd.DataFrame(columns=self.columns)
+                tmpprofileDF = pd.concat([old_df, profileDF], ignore_index=True)
+                tmpprofileDF.to_csv(args.profile_file, index=False)
             best_one = profileDF.loc[profileDF["us"].idxmin()].copy()
             print(
                 f"Tuning result for {key} is {best_one['block_m'] ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
@@ -1971,12 +1988,12 @@ class FmoeTuner(TunerCommon):
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
             profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")
+            profile_file = f"aiter/configs/profile_fmoe.csv"
             old_profile = self.get_tuned_gemm_list(
-                args.profile_file, profile_result.columns.tolist()
+                profile_file, profile_result.columns.tolist()
             )
-
             profile_result = pd.concat([old_profile, profile_result])
-            profile_result.to_csv(args.profile_file, index=False)
+            profile_result.to_csv(profile_file, index=False)
         if len(bests) > 0:
             return pd.concat(bests, axis=1).T
         else:
