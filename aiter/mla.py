@@ -13,6 +13,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.test_common import checkAllclose
 
 
 @triton.jit
@@ -354,78 +355,142 @@ def mla_decode_fwd(
                 o,
                 final_lse,
             )
-            # qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
-            # kvc = torch.index_select(kv_buffer, 0, kv_indices).squeeze(1)
-            # kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
-            # for i in range(bs):
-            #     key = kvs[i]
-            #     value, _ = torch.split(key, [512, 64], dim=-1)
-            #     query = qs[i]
-            #     qk = (
-            #         torch.einsum("qhd,khd->hqk", query.float(), key.float()).squeeze(1)
-            #         * sm_scale
-            #     )
-            #     lse = qk.logsumexp(dim=-1)
-            #     m = qk.max(-1).values
-            #     qk_exp = torch.exp(qk - m.unsqueeze(-1)).unsqueeze(1)
-            #     l = qk_exp.sum(-1)
-            #     out = torch.einsum(
-            #         "hqk,khd->qhd", qk_exp.to(value.dtype).float(), value.float()
-            #     )
-            #     out = out / l.transpose(0, 1).unsqueeze(-1)
-            #     checkAllclose(o[i], out[0].to(o.dtype), msg=f"o[{i}] vs. out[{i}]")
 
-            #     #
-            #     # Simulate Kernel
-            #     log2e = 1.4426950408889634
-            #     for kv_tile_start in range(0, key.shape[0], 32):
-            #         kv_tile_end = min(kv_tile_start + 32, key.shape[0])
-            #         k_tile = key[kv_tile_start:kv_tile_end, :, :]
-            #         v_tile, _ = torch.split(k_tile, [512, 64], dim=-1)
-            #         # QK GEMM
-            #         qk_tile = (
-            #             torch.einsum(
-            #                 "qhd,khd->hqk", query.float(), k_tile.float()
-            #             ).squeeze(1)
-            #             * sm_scale
-            #         )
-            #         # SOTFMAX
-            #         local_m_tile = qk_tile.max(-1).values
-            #         new_m_tile = (
-            #             local_m_tile
-            #             if kv_tile_start == 0
-            #             else torch.max(m_tile, local_m_tile)
-            #         )
-            #         rescale_tile = (
-            #             torch.full_like(new_m_tile, 1.0)
-            #             if kv_tile_start == 0
-            #             else torch.exp2((m_tile - new_m_tile) * log2e)
-            #         )
-            #         p_tile = torch.exp2(
-            #             (qk_tile - new_m_tile.unsqueeze(-1)) * log2e
-            #         ).unsqueeze(1)
-            #         sum_e_tile = (
-            #             p_tile.sum(-1)
-            #             if kv_tile_start == 0
-            #             else p_tile.sum(-1) + sum_e_tile * rescale_tile.unsqueeze(-1)
-            #         )
-            #         m_tile = new_m_tile
-            #         # PV GEMM
-            #         pv_tile = torch.einsum(
-            #             "hqk,khd->qhd", p_tile.to(v_tile.dtype).float(), v_tile.float()
-            #         )
-            #         o_tile = (
-            #             pv_tile
-            #             if kv_tile_start == 0
-            #             else o_tile * rescale_tile.unsqueeze(-1) + pv_tile
-            #         )
-            #     o_tile = o_tile / sum_e_tile.transpose(0, 1).unsqueeze(-1)
-            #     checkAllclose(o[i], o_tile[0].to(o.dtype), msg=f"o[{i}] vs. o_tile[0]")
-            #     checkAllclose(
-            #         out[0].to(o.dtype),
-            #         o_tile[0].to(o.dtype),
-            #         msg=f"out[{i}] vs. o_tile[0]",
-            #     )
+            compare_with_asm = True
+            compare_with_golden = True
+            compare_with_emu = True
+
+            #
+            # ASM
+            if compare_with_asm:
+                logits_asm = torch.empty_like(logits)
+                attn_lse_asm = torch.empty_like(attn_lse)
+                final_lse_asm = torch.empty_like(final_lse) if return_lse else None
+                out_asm = torch.empty_like(o)
+                aiter.mla_decode_stage1_asm_fwd(
+                    q,
+                    kv_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    num_kv_splits_indptr,
+                    work_meta_data,
+                    work_indptr,
+                    work_info_set,
+                    max_seqlen_q,
+                    sm_scale,
+                    logits_asm,
+                    attn_lse_asm,
+                    out_asm,
+                    q_scale,
+                    kv_scale,
+                )
+                aiter.mla_reduce_v1(
+                    logits_asm,
+                    attn_lse_asm,
+                    reduce_indptr,
+                    reduce_final_map,
+                    reduce_partial_map,
+                    max_seqlen_q,
+                    out_asm,
+                    final_lse_asm,
+                )
+
+            qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
+            kvc = torch.index_select(kv_buffer, 0, kv_indices).squeeze(1)
+            kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
+            for i in range(bs):
+                key = kvs[i]
+                value, _ = torch.split(key, [512, 64], dim=-1)
+                query = qs[i]
+
+                #
+                # Golden reference
+                if compare_with_golden:
+                    qk = (
+                        torch.einsum(
+                            "qhd,khd->hqk", query.float(), key.float()
+                        ).squeeze(1)
+                        * sm_scale
+                    )
+                    lse = qk.logsumexp(dim=-1)
+                    m = qk.max(-1).values
+                    qk_exp = torch.exp(qk - m.unsqueeze(-1)).unsqueeze(1)
+                    l = qk_exp.sum(-1)
+                    out_golden = torch.einsum(
+                        "hqk,khd->qhd", qk_exp.to(value.dtype).float(), value.float()
+                    )
+                    out_golden = out_golden / l.transpose(0, 1).unsqueeze(-1)
+
+                #
+                # Simulate Kernel
+                if compare_with_emu:
+                    log2e = 1.4426950408889634
+                    for kv_tile_start in range(0, key.shape[0], 32):
+                        kv_tile_end = min(kv_tile_start + 32, key.shape[0])
+                        k_tile = key[kv_tile_start:kv_tile_end, :, :]
+                        v_tile, _ = torch.split(k_tile, [512, 64], dim=-1)
+                        # QK GEMM
+                        qk_tile = (
+                            torch.einsum(
+                                "qhd,khd->hqk", query.float(), k_tile.float()
+                            ).squeeze(1)
+                            * sm_scale
+                        )
+                        # SOTFMAX
+                        local_m_tile = qk_tile.max(-1).values
+                        new_m_tile = (
+                            local_m_tile
+                            if kv_tile_start == 0
+                            else torch.max(m_tile, local_m_tile)
+                        )
+                        rescale_tile = (
+                            torch.full_like(new_m_tile, 1.0)
+                            if kv_tile_start == 0
+                            else torch.exp2((m_tile - new_m_tile) * log2e)
+                        )
+                        p_tile = torch.exp2(
+                            (qk_tile - new_m_tile.unsqueeze(-1)) * log2e
+                        ).unsqueeze(1)
+                        sum_e_tile = (
+                            p_tile.sum(-1)
+                            if kv_tile_start == 0
+                            else p_tile.sum(-1)
+                            + sum_e_tile * rescale_tile.unsqueeze(-1)
+                        )
+                        m_tile = new_m_tile
+                        # PV GEMM
+                        pv_tile = torch.einsum(
+                            "hqk,khd->qhd",
+                            p_tile.to(v_tile.dtype).float(),
+                            v_tile.float(),
+                        )
+                        o_tile = (
+                            pv_tile
+                            if kv_tile_start == 0
+                            else o_tile * rescale_tile.unsqueeze(-1) + pv_tile
+                        )
+                    o_tile = o_tile / sum_e_tile.transpose(0, 1).unsqueeze(-1)
+
+                if compare_with_asm:
+                    checkAllclose(
+                        o[i],
+                        out_asm[i].to(o.dtype),
+                        msg=f"hk vs. asm | o[{i}] vs. out_asm[{i}]",
+                    )
+                if compare_with_golden:
+                    checkAllclose(
+                        o[i],
+                        out_golden[0].to(o.dtype),
+                        msg=f"hk vs. golden | o[{i}] vs. out_golden[0]",
+                    )
+                if compare_with_emu:
+                    checkAllclose(
+                        o[i],
+                        o_tile[0].to(o.dtype),
+                        msg=f"hk vs. emu | o[{i}] vs. o_tile[0]",
+                    )
 
             # exit()
 
