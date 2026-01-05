@@ -198,6 +198,7 @@ jobs:
           bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
 
       - name: Collect test logs
+        if: always()
         run: |
           echo "Collecting test logs..."
           echo "Aiter Operator Tests Summary:" >> $GITHUB_STEP_SUMMARY
