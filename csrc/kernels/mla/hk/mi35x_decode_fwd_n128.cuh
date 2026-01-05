@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 
@@ -199,15 +199,27 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
             const int32_t row         = rows[didx / T::kQkNopeHeadDim];
             const int32_t col         = didx % T::kQkNopeHeadDim;
             uintptr_t p_lds_warp_nope = p_lds_warp_nope_base + rid;
-            const int32_t voffset_nope =
-                (kCheckBoundary && (row == -1)) ? 0x80000000 : (row * T::kQkHeadDim + col);
-            hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                (as3_uint32_ptr)(p_lds_warp_nope),
-                                                kNumBytesPerThreadPerRoundNope,
-                                                voffset_nope,
-                                                0,
-                                                0,
-                                                0);
+
+            if(kCheckBoundary && (row == -1))
+            {
+#if defined(__gfx950__)
+                *reinterpret_cast<uint4*>(p_lds_warp_nope + lane_idx * 4 * sizeof(uint32_t)) =
+                    uint4(0);
+#elif defined(__gfx94__)
+                *reinterpret_cast<uint32_t*>(p_lds_warp_nope + lane_idx * sizeof(uint32_t)) = 0u;
+#endif
+            }
+            else
+            {
+                const int32_t voffset_nope = row * T::kQkHeadDim + col;
+                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                                    (as3_uint32_ptr)(p_lds_warp_nope),
+                                                    kNumBytesPerThreadPerRoundNope,
+                                                    voffset_nope,
+                                                    0,
+                                                    0,
+                                                    0);
+            }
         }
 
         // Load ROPE
@@ -217,19 +229,25 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
         static_assert(kNumBytesPerThreadRope == 4);
         const int32_t row_rope = rows[sub_warp_rope_idx];
         const int32_t col_rope = sub_lane_rope_idx * kNumBytesPerThreadRope;
-        const int32_t voffset_rope =
-            (kCheckBoundary && (row_rope == -1))
-                ? 0x80000000
-                : (row_rope * T::kQkHeadDim + col_rope + T::kQkNopeHeadDim) * sizeof(kv_t);
         uintptr_t p_lds_warp_rope =
             p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
-        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds_warp_rope),
-                                            kNumBytesPerThreadRope,
-                                            voffset_rope,
-                                            0,
-                                            0,
-                                            0);
+
+        if(kCheckBoundary && (row_rope == -1))
+        {
+            *reinterpret_cast<uint32_t*>(p_lds_warp_rope + lane_idx * sizeof(uint32_t)) = 0u;
+        }
+        else
+        {
+            const int32_t voffset_rope =
+                (row_rope * T::kQkHeadDim + col_rope + T::kQkNopeHeadDim) * sizeof(kv_t);
+            hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                                (as3_uint32_ptr)(p_lds_warp_rope),
+                                                kNumBytesPerThreadRope,
+                                                voffset_rope,
+                                                0,
+                                                0,
+                                                0);
+        }
     }
     else
     {
