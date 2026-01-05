@@ -18,15 +18,16 @@ from gemm_a8w8_blockscale_instance_tile import (
 
 
 """
-a8w8_blockscale_gemm instance gen for tile CK 
+a8w8_blockscale_gemm instance gen for tile CK
 """
+
 
 class gemm_a8w8_blockscale_codegen:
     def __init__(self, working_path: str, istune=False, tune_file=None):
         self.working_path = working_path
         if not os.path.exists(working_path):
             os.makedirs(working_path)
-        
+
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
@@ -36,9 +37,9 @@ class gemm_a8w8_blockscale_codegen:
         """
         Get tune dict from csv file
         """
-        
+
         tune_dict = default_kernels_dict_tile
-        
+
         if os.path.exists(tune_dict_csv):
             tune_df = pd.read_csv(tune_dict_csv)
             if torch.cuda.is_available():
@@ -53,19 +54,21 @@ class gemm_a8w8_blockscale_codegen:
                 N = int(tune_df.loc[i, "N"])
                 K = int(tune_df.loc[i, "K"])
                 kid = int(tune_df.loc[i, "kernelId"])
-                
+
                 if kid in candidate_kernels_dict_tile:
                     tune_dict[(M, N, K)] = candidate_kernels_dict_tile[kid]
                 else:
-                    print(f"Warning: kernelId {kid} not found in candidate_kernels_dict_tile for shape ({M}, {N}, {K})")
-                
+                    print(
+                        f"Warning: kernelId {kid} not found in candidate_kernels_dict_tile for shape ({M}, {N}, {K})"
+                    )
+
         return tune_dict
-    
+
     def gen_tile_instance(self, k: TileKernelInstance):
         """
         Generate kernel instance code for tile gemm a8w8 blockscale
         """
-        
+
         TILE_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -85,13 +88,13 @@ torch::Tensor
     int M = XQ.numel() / XQ.size(-1);
     int N = WQ.size(0);
     int K = WQ.size(1);
-    
+
     // Instantiate tile gemm instance.
     __TILE_INSTANCE_PLACEHOLDER__
-    
+
 }}
 
-"""    
+"""
         TILE_INSTANCE = f"""using TileGemmInstance = TileGemmConfig<
             {k.M_Tile}, {k.N_Tile}, {k.K_Tile},
             {k.M_Warp}, {k.N_Warp}, {k.K_Warp},
@@ -102,7 +105,7 @@ torch::Tensor
             {str(k.UsePersistentKernel).lower()},
             ck_tile::GemmPipelineScheduler::{k.Scheduler},
             {k.BlockPerCu}>;
-            
+
         // Run kernel instance.
         return tile_gemm_a8w8_blockscale_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
 """
@@ -111,10 +114,8 @@ torch::Tensor
             "__TILE_INSTANCE_PLACEHOLDER__", TILE_INSTANCE
         )
 
-        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-            TILE_INSTANCE_IMPL_str
-        )
-        
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(TILE_INSTANCE_IMPL_str)
+
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -133,19 +134,19 @@ template torch::Tensor
         INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="TILE_FP32, TILE_BF16")
         INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="TILE_FP32, TILE_FP16")
         # TODO: dFP8_eFP8
-        
-        Path(
-            os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
-        ).write_text(INSTANCE_dFP32_eBF16)
-        Path(
-            os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-        ).write_text(INSTANCE_dFP32_eFP16)
+
+        Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")).write_text(
+            INSTANCE_dFP32_eBF16
+        )
+        Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")).write_text(
+            INSTANCE_dFP32_eFP16
+        )
 
     def gen_lookup_dict(self, kernels_dict: dict):
         """
         Generate lookup dictionary for kernel instances
         """
-        
+
         LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -164,18 +165,14 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup_tile.h"), "w"
-        ) as f:
+        with open(os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup_tile.h"), "w") as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
                 # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
                 if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
                     f.write(
                         LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
+                            MNK="{" + (", ").join(map(lambda x: str(x), list(mnk))) + "}",
                             kernel_name=k.name,
                         )
                     )
@@ -187,7 +184,7 @@ template torch::Tensor
         """
         Generate manifest header for kernel instances, declaring all the kernel APIs
         """
-        
+
         MAINFEST_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -225,11 +222,12 @@ torch::Tensor
         """
         Codegen for tile gemm a8w8 blockscale
         """
-        
+
         # generate instances code
         if AITER_LOG_TUNED_CONFIG:
             logger.info(
-                f"Generating {len(kernels_dict)} instances for tile gemm a8w8 blockscale...")
+                f"Generating {len(kernels_dict)} instances for tile gemm a8w8 blockscale..."
+            )
         for _, k in kernels_dict.items():
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(f"Generating tile instance: {k.name}")
@@ -237,16 +235,15 @@ torch::Tensor
 
         # generate lookup dict for kernel instances
         self.gen_lookup_dict(kernels_dict)
-        
+
         # generate manifest header for kernel instances
         self.gen_manifest_head(kernels_dict)
-    
-    
+
     def run(self):
         """
         Run codegen and generate all the files together
         """
-        
+
         # clean impl and instances path
         if os.path.exists(self.impl_path):
             shutil.rmtree(self.impl_path)
@@ -254,7 +251,7 @@ torch::Tensor
         if os.path.exists(self.instances_path):
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
-        
+
         # generate code for legacy and tile
         if self.istune:
             # generate code for default kernels
@@ -262,14 +259,14 @@ torch::Tensor
         else:
             # generate code for tuned kernels from tune_file
             self.gen_code(self.get_tune_dict(self.tune_file))
-        
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
         description="gen API for CK gemm a8w8 kernel",
     )
-    
+
     # the directory for list_blobs/gen_blobs to write files into
     parser.add_argument(
         "-w",
@@ -296,6 +293,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     codegen = gemm_a8w8_blockscale_codegen(args.working_path, args.tune, args.tune_file)
     codegen.run()
-    
-    
-

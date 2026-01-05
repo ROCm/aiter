@@ -14,22 +14,22 @@ class TileKernelInstance:
     M_Warp_Tile: int
     N_Warp_Tile: int
     K_Warp_Tile: int
-    
-    Scheduler: str # Default, Intrawave, Interwave
-    
+
+    Scheduler: str  # Default, Intrawave, Interwave
+
     TiledMMAPermuteN: bool
     TransposeC: bool
     DoubleSmemBuffer: bool
     UsePersistentKernel: bool
-    
-    BlockPerCu: int # 1,2
-    
+
+    BlockPerCu: int  # 1,2
+
     @property
     def name(self) -> str:
         """
-        Generate a unique name for the kernel instance based on its parameters.        
+        Generate a unique name for the kernel instance based on its parameters.
         """
-        
+
         return ("_").join(
             [
                 "a8w8_blockscale_tile",
@@ -55,10 +55,15 @@ class TileKernelInstance:
                 ("x").join(
                     map(
                         lambda x: str(int(x)),
-                        [self.TiledMMAPermuteN, self.TransposeC, self.DoubleSmemBuffer, self.UsePersistentKernel],
+                        [
+                            self.TiledMMAPermuteN,
+                            self.TransposeC,
+                            self.DoubleSmemBuffer,
+                            self.UsePersistentKernel,
+                        ],
                     )
                 ),
-                str(self.BlockPerCu)
+                str(self.BlockPerCu),
             ]
         )
 
@@ -108,4 +113,3 @@ default_kernels_dict_tile = {
     -1:  TileKernelInstance(  128,     128,      256,     1,        4,       1,        16,            16,           32,       "Intrawave",        False,             False,        False,               False,             1      ), 
 }
 # fmt: on
-

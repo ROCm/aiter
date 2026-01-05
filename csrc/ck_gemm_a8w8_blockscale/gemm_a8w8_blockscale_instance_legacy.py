@@ -30,7 +30,7 @@ class LegacyKernelInstance:
     @property
     def name(self) -> str:
         """
-        Generate a unique name for the kernel instance based on its parameters.        
+        Generate a unique name for the kernel instance based on its parameters.
         """
 
         return ("_").join(

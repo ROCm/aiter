@@ -18,15 +18,16 @@ from gemm_a8w8_blockscale_instance_legacy import (
 
 
 """
-a8w8_blockscale_gemm instance gen for legacy CK  
+a8w8_blockscale_gemm instance gen for legacy CK
 """
+
 
 class gemm_a8w8_blockscale_codegen:
     def __init__(self, working_path: str, istune=False, tune_file=None):
         self.working_path = working_path
         if not os.path.exists(working_path):
             os.makedirs(working_path)
-        
+
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
@@ -38,7 +39,7 @@ class gemm_a8w8_blockscale_codegen:
         """
 
         tune_dict = default_kernels_dict_legacy
-           
+
         if os.path.exists(tune_dict_csv):
             tune_df = pd.read_csv(tune_dict_csv)
             if torch.cuda.is_available():
@@ -48,26 +49,27 @@ class gemm_a8w8_blockscale_codegen:
                 tune_df = tune_df[
                     (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck_legacy")
                 ].reset_index()
-                
+
             for i in range(len(tune_df)):
                 M = int(tune_df.loc[i, "M"])
                 N = int(tune_df.loc[i, "N"])
                 K = int(tune_df.loc[i, "K"])
                 kid = int(tune_df.loc[i, "kernelId"])
-                
+
                 if kid in candidate_kernels_dict_legacy:
                     tune_dict[(M, N, K)] = candidate_kernels_dict_legacy[kid]
                 else:
-                    print(f"Warning: kernelId {kid} not found in candidate_kernels_dict_legacy for shape ({M}, {N}, {K})")
-        
+                    print(
+                        f"Warning: kernelId {kid} not found in candidate_kernels_dict_legacy for shape ({M}, {N}, {K})"
+                    )
+
         return tune_dict
-    
-    
+
     def gen_legacy_instance(self, k: LegacyKernelInstance):
         """
         Generate kernel instance code for legacy gemm a8w8 blockscale
         """
-        
+
         LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -131,11 +133,11 @@ torch::Tensor
     int M = XQ.numel() / XQ.size(-1);
     int N = WQ.size(0);
     int K = WQ.size(1);
-    
+
     // Get whether this input needs to be padded.
     auto gemm_spec = GetGemmSpec(M, N, K, {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK});
-    
-    
+
+
     if(gemm_spec == GemmSpecialization::Default)
     {{
         // Default
@@ -193,31 +195,46 @@ torch::Tensor
             ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
-            
+
         // Run kernel instance.
         return legacy_gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
 """
-        INSTANCE_IMPL_str = LEGACY_INSTANCE_IMPL.replace(
-            "__INSTANCE_CONTENT_DEFAULT__", LEGACY_INSTANCE.replace("{GemmSpec}", "Default")
-        ).replace(
-            "__INSTANCE_CONTENT_MPAD__", LEGACY_INSTANCE.replace("{GemmSpec}", "MPadding")
-        ).replace(
-            "__INSTANCE_CONTENT_NPAD__", LEGACY_INSTANCE.replace("{GemmSpec}", "NPadding")
-        ).replace(
-            "__INSTANCE_CONTENT_KPAD__", LEGACY_INSTANCE.replace("{GemmSpec}", "KPadding")
-        ).replace(
-            "__INSTANCE_CONTENT_MNPAD__", LEGACY_INSTANCE.replace("{GemmSpec}", "MNPadding")
-        ).replace(
-            "__INSTANCE_CONTENT_MKPAD__", LEGACY_INSTANCE.replace("{GemmSpec}", "MKPadding")
-        ).replace(
-            "__INSTANCE_CONTENT_NKPAD__", LEGACY_INSTANCE.replace("{GemmSpec}", "NKPadding")
-        ).replace(
-            "__INSTANCE_CONTENT_MNKPAD__", LEGACY_INSTANCE.replace("{GemmSpec}", "MNKPadding")
+        INSTANCE_IMPL_str = (
+            LEGACY_INSTANCE_IMPL.replace(
+                "__INSTANCE_CONTENT_DEFAULT__",
+                LEGACY_INSTANCE.replace("{GemmSpec}", "Default"),
+            )
+            .replace(
+                "__INSTANCE_CONTENT_MPAD__",
+                LEGACY_INSTANCE.replace("{GemmSpec}", "MPadding"),
+            )
+            .replace(
+                "__INSTANCE_CONTENT_NPAD__",
+                LEGACY_INSTANCE.replace("{GemmSpec}", "NPadding"),
+            )
+            .replace(
+                "__INSTANCE_CONTENT_KPAD__",
+                LEGACY_INSTANCE.replace("{GemmSpec}", "KPadding"),
+            )
+            .replace(
+                "__INSTANCE_CONTENT_MNPAD__",
+                LEGACY_INSTANCE.replace("{GemmSpec}", "MNPadding"),
+            )
+            .replace(
+                "__INSTANCE_CONTENT_MKPAD__",
+                LEGACY_INSTANCE.replace("{GemmSpec}", "MKPadding"),
+            )
+            .replace(
+                "__INSTANCE_CONTENT_NKPAD__",
+                LEGACY_INSTANCE.replace("{GemmSpec}", "NKPadding"),
+            )
+            .replace(
+                "__INSTANCE_CONTENT_MNKPAD__",
+                LEGACY_INSTANCE.replace("{GemmSpec}", "MNKPadding"),
+            )
         )
 
-        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-            INSTANCE_IMPL_str
-        )
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL_str)
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -234,23 +251,26 @@ template torch::Tensor
     );
 
 """
-        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="LEGACY_FP32, LEGACY_BF16")
-        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="LEGACY_FP32, LEGACY_FP16")
+        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
+            name=k.name, dtypes="LEGACY_FP32, LEGACY_BF16"
+        )
+        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
+            name=k.name, dtypes="LEGACY_FP32, LEGACY_FP16"
+        )
         # TODO: dFP8_eFP8
-        
-        Path(
-            os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
-        ).write_text(INSTANCE_dFP32_eBF16)
-        Path(
-            os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-        ).write_text(INSTANCE_dFP32_eFP16)
 
-    
+        Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")).write_text(
+            INSTANCE_dFP32_eBF16
+        )
+        Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")).write_text(
+            INSTANCE_dFP32_eFP16
+        )
+
     def gen_lookup_dict(self, kernels_dict):
         """
         Generate lookup dictionary for kernel instances
         """
-        
+
         LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -278,9 +298,7 @@ template torch::Tensor
                 if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
                     f.write(
                         LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
+                            MNK="{" + (", ").join(map(lambda x: str(x), list(mnk))) + "}",
                             kernel_name=k.name,
                         )
                     )
@@ -288,12 +306,11 @@ template torch::Tensor
                     f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
             f.write(LOOKUP_end)
 
-
     def gen_manifest_head(self, kernels_dict):
         """
         Generate manifest header for kernel instances, declaring all the kernel APIs
         """
-        
+
         MAINFEST_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -320,7 +337,8 @@ torch::Tensor
 """
 
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest_legacy.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest_legacy.h"),
+            "w",
         ) as f:
             f.write(MAINFEST_head)
             for _, k in kernels_dict.items():
@@ -331,11 +349,12 @@ torch::Tensor
         """
         Codegen for legacy gemm a8w8 blockscale
         """
-        
+
         # generate instances code
         if AITER_LOG_TUNED_CONFIG:
             logger.info(
-                f"Generating {len(kernels_dict)} instances for legacy gemm a8w8 blockscale...")
+                f"Generating {len(kernels_dict)} instances for legacy gemm a8w8 blockscale..."
+            )
         for _, k in kernels_dict.items():
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(f"Generating legacy instance: {k.name}")
@@ -343,16 +362,15 @@ torch::Tensor
 
         # generate lookup dict for kernel instances
         self.gen_lookup_dict(kernels_dict)
-        
+
         # generate manifest header for kernel instances
         self.gen_manifest_head(kernels_dict)
-    
-    
+
     def run(self):
         """
         Run codegen and generate all the files together
         """
-        
+
         # clean impl and instances path
         if os.path.exists(self.impl_path):
             shutil.rmtree(self.impl_path)
@@ -360,7 +378,7 @@ torch::Tensor
         if os.path.exists(self.instances_path):
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
-        
+
         # generate code for legacy and tile
         if self.istune:
             # generate code for default kernels
@@ -368,14 +386,14 @@ torch::Tensor
         else:
             # generate code for tuned kernels from tune_file
             self.gen_code(self.get_tune_dict(self.tune_file))
-        
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
         description="gen API for CK gemm a8w8 kernel",
     )
-    
+
     # the directory for list_blobs/gen_blobs to write files into
     parser.add_argument(
         "-w",
@@ -402,6 +420,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     codegen = gemm_a8w8_blockscale_codegen(args.working_path, args.tune, args.tune_file)
     codegen.run()
-    
-    
-

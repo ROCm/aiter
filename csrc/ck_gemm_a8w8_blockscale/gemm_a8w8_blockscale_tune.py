@@ -26,7 +26,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     """
     Run the reference GEMM operation using PyTorch.
     """
-    
+
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape
     n = weight.shape[0]
@@ -34,9 +34,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     scale_k = (k + block_shape_k - 1) // block_shape_k
     # x_scale = rearrange(x_scale.view(-1, 1).repeat(1, block_shape_n*block_shape_k).view(m, scale_k, 1, block_shape_k),
     #                           'num_blk_n num_blk_k blk_n blk_k ->(num_blk_n blk_n) (num_blk_k blk_k)')
-    x = x.to(x_scale.dtype).view(
-        m, k // block_shape[1], block_shape[1]
-    ) * x_scale.unsqueeze(-1)
+    x = x.to(x_scale.dtype).view(m, k // block_shape[1], block_shape[1]) * x_scale.unsqueeze(-1)
     x = x.view(m, k)
 
     w_scale = rearrange(
@@ -60,7 +58,7 @@ def run_ck_gemm_a8w8_blockscale_tile(x, weight, x_scale, w_scale, out, kernel_id
     """
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
     """
-    
+
     return aiter.gemm_a8w8_blockscale_tune_tile(x, weight, x_scale, w_scale, out, kernel_id, splitK)
 
 
@@ -68,15 +66,17 @@ def run_ck_gemm_a8w8_blockscale_legacy(x, weight, x_scale, w_scale, out, kernel_
     """
     Run gemm a8w8 blockscale tuned kernel for ck_legacy type.
     """
-    
-    return aiter.gemm_a8w8_blockscale_tune_legacy(x, weight, x_scale, w_scale, out, kernel_id, splitK)
+
+    return aiter.gemm_a8w8_blockscale_tune_legacy(
+        x, weight, x_scale, w_scale, out, kernel_id, splitK
+    )
 
 
 def generate_data(m, n, k, seed, device="cuda"):
     """
     Generate random data for testing the gemm a8w8 blockscale kernel.
     """
-    
+
     torch.manual_seed(seed)
     block_shape_n, block_shape_k = block_shape
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -98,19 +98,19 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         "batch": 100,
         "profile_file": "",  # for both results
     }
-    
+
     def __init__(self, name, keys, resultList, description=""):
         """
         Initialize the Gemm A8W8 BlockScale Tuner.
         """
-        
+
         super().__init__(name, keys, resultList, description)
 
     def _setup_specific_arguments(self):
         """
         Setup specific arguments for the tuner.
         """
-        
+
         self.parser.add_argument(
             "--libtype",
             type=str,
@@ -124,14 +124,14 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         """
         Calculate performance metrics based on results.
         """
-        
+
         return super().calculate(results, bpes=(1, 1, 2))
 
     def getKernelName(self, kernelId, type="ck_legacy"):
         """
         Get the kernel name based on the kernel ID for different types.
         """
-        
+
         candidate_kernels_dict = {}
         if type == "ck_legacy":
             if kernelId >= len(candidate_kernels_dict_legacy) or kernelId < 0:
@@ -299,7 +299,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
 
         return ret
-    
 
     def result_to_df(self, results):
         """
@@ -313,11 +312,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME
-                else (
-                    self.getKernelName(kernelId, libtype)
-                    if kernelName == ""
-                    else kernelName
-                )
+                else (self.getKernelName(kernelId, libtype) if kernelName == "" else kernelName)
             )
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
@@ -344,8 +339,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             else:
                 resultdf = pd.concat([resultdf, temp], ignore_index=True)
         return resultdf
-            
-        
+
+
 if __name__ == "__main__":
     key = ["cu_num", "M", "N", "K"]
     resultList = [
