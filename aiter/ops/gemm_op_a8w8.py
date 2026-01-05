@@ -552,29 +552,24 @@ def gemm_a8w8_blockscale(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     from aiter.jit.utils.chip_info import get_gfx
 
+    # give the priority to gfx950 asm when possible
+    if isBpreshuffled and get_gfx() == "gfx950" and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+            return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+        
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
     libtype = config["libtype"] if config else None
 
-    if isBpreshuffled:
-        if get_gfx() == "gfx950" and m >= 16 and k >= 512 and dtype == dtypes.bf16:
-            return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
-        if libtype == "ck_tile":
-            return gemm_a8w8_blockscale_ck_tile(
-                XQ, WQ, x_scale, w_scale, Y, isBpreshuffled=True
-            )
-        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
-
-    if libtype == "ck_legacy":
-        return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
     if libtype == "ck_tile":
+        isBpreshuffled = config["isBpreshuffled"] if config else False
         return gemm_a8w8_blockscale_ck_tile(
-            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled=False
+            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled
         )
-    if libtype is not None:
+    elif libtype == "ck_legacy":
+        return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
+    else:
         assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-    return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
 
 
 def flatmm_a8w8_blockscale_ASM(
