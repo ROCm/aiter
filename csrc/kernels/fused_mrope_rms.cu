@@ -1,5 +1,6 @@
 #include "rope/rope_common.h"
 #include "hip_float8.h"
+#include "ck_tile/core.hpp"
 
 using namespace at;
 
@@ -121,6 +122,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
                                                        int access_id_in_head, std::array<int64_t, M> &mrope_section) {
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     if constexpr (IS_INTERLEAVED) {
+        #pragma unroll
         for (int i = 0; i < VEC_SIZE; ++i) {
             auto id = access_id_in_head + i;
             auto id_ = (access_id_in_head < HALF_HEAD_SIZE) ? id : id - HALF_HEAD_SIZE;
@@ -133,6 +135,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
             }
         }
     } else {
+        #pragma unroll
         for (int i = 0; i < VEC_SIZE; ++i) {
             auto id = access_id_in_head + i;
             auto id_ = (access_id_in_head < HALF_HEAD_SIZE) ? id : id - HALF_HEAD_SIZE;
@@ -150,7 +153,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
 }
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M>
-__global__ void fused_mrope_rms_neox_kernel(
+__global__  void fused_mrope_rms_neox_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps) {
@@ -206,7 +209,7 @@ __global__ void fused_mrope_rms_neox_kernel(
 }
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M>
-__global__ void fused_mrope_rms_noneox_kernel(
+__global__  void fused_mrope_rms_noneox_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps) {
@@ -263,7 +266,7 @@ void fused_rope_rms(
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
     bool is_neox_style, double eps, hipStream_t stream) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
-    constexpr int block_size = 256;
+    constexpr int block_size = 64;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k);
     auto num_warps_per_block = block_size / 32;
     dim3 threadsPerBlock(block_size);
@@ -302,7 +305,7 @@ void fused_mrope_rms(
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     TORCH_CHECK(dim == head_size / 2);
-    constexpr int block_size = 256;
+    constexpr int block_size = 64;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k);
     auto num_warps_per_block = block_size / 32;
     dim3 threadsPerBlock(block_size);
@@ -415,8 +418,8 @@ __device__ __forceinline__ vec_t<OutT, VEC_SIZE> convert_to(vec_t<T, VEC_SIZE> &
     vec_t<OutT, VEC_SIZE> out_vec;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-        volatile float out = static_cast<float>(in_vec[i]) / scale;
-        out_vec[i] = static_cast<OutT>(out);
+        float out = ck_tile::type_convert<float>(in_vec[i]) / scale;
+        out_vec[i] = ck_tile::type_convert<OutT>(out);
     }
     return out_vec;
 }
@@ -427,13 +430,13 @@ __device__ __forceinline__ vec_t<OutT, VEC_SIZE> convert_to_fast(vec_t<T, VEC_SI
     vec_t<OutT, VEC_SIZE> out_vec;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-        out_vec[i] = static_cast<OutT>(static_cast<float>(in_vec[i]));
+        out_vec[i] = ck_tile::type_convert<OutT>(ck_tile::type_convert<float>(in_vec[i]));
     }
     return out_vec;
 }
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M, typename KVT = T>
-__global__ void fused_mrope_rms_neox_kv_kernel(
+__global__  void fused_mrope_rms_neox_kv_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps,
@@ -504,26 +507,13 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
                 int64_t block_id = slot_id / block_size;
                 int64_t block_offset = slot_id % block_size;
                 int64_t dst_offset = block_id * num_heads_k * (HEAD_SIZE / x) * block_size * x + head_id_kv * (HEAD_SIZE / x) * block_size * x;
-                
                 // For key: shuffle within each head_size chunk
-                // Optimization: when VEC_SIZE <= x, the VEC_SIZE elements within a chunk are contiguous
-                // so we can use vectorized store instead of element-by-element store
-                int64_t chunk_id = access_id_in_head / x;
-                int64_t elem_in_chunk = access_id_in_head % x;
-                int64_t dst_k_base = dst_offset + chunk_id * block_size * x + block_offset * x + elem_in_chunk;
-                
                 if constexpr (std::is_same_v<T, KVT>) {
-                    if (VEC_SIZE <= x && elem_in_chunk + VEC_SIZE <= x) {
-                        // VEC_SIZE elements are contiguous within the same chunk, use vectorized store
-                        out_vec.store(k_cache + dst_k_base);
-                    } else {
-                        // Elements span across chunks, fallback to element-by-element store
-                        #pragma unroll
-                        for (int i = 0; i < VEC_SIZE; ++i) {
-                            int64_t offset_in_head = access_id_in_head + i;
-                            int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
-                            k_cache[dst_k_shuffle_offset] = out_vec[i];
-                        }
+                    #pragma unroll
+                    for (int i = 0; i < VEC_SIZE; ++i) {
+                        int64_t offset_in_head = access_id_in_head + i;
+                        int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
+                        k_cache[dst_k_shuffle_offset] = out_vec[i];
                     }
                     if (return_kv && k_out != nullptr) {
                         auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
@@ -531,17 +521,11 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
                     }
                 } else {
                     auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
-                    if (VEC_SIZE <= x && elem_in_chunk + VEC_SIZE <= x) {
-                        // VEC_SIZE elements are contiguous within the same chunk, use vectorized store
-                        out_vec_fp8.store(k_cache + dst_k_base);
-                    } else {
-                        // Elements span across chunks, fallback to element-by-element store
-                        #pragma unroll
-                        for (int i = 0; i < VEC_SIZE; ++i) {
-                            int64_t offset_in_head = access_id_in_head + i;
-                            int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
-                            k_cache[dst_k_shuffle_offset] = out_vec_fp8[i];
-                        }
+                    #pragma unroll
+                    for (int i = 0; i < VEC_SIZE; ++i) {
+                        int64_t offset_in_head = access_id_in_head + i;
+                        int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
+                        k_cache[dst_k_shuffle_offset] = out_vec_fp8[i];
                     }
                     if (return_kv && k_out != nullptr) {
                         auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
@@ -585,6 +569,7 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
             int64_t dst_offset = block_id * num_heads_v * (block_size / x) * HEAD_SIZE * x + head_id_kv * (block_size / x) * HEAD_SIZE * x;
             // For value: shuffle within each block_size chunk
             if constexpr (std::is_same_v<T, KVT>) {
+                #pragma unroll
                 for (int i = 0; i < VEC_SIZE; ++i) {
                     int64_t offset_in_head = access_id_in_head + i;
                     int64_t dst_v_shuffle_offset = dst_offset + (block_offset / x) * HEAD_SIZE * x + offset_in_head * x + (block_offset % x);
@@ -596,6 +581,7 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
                 }
             } else {
                 auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
+                #pragma unroll
                 for (int i = 0; i < VEC_SIZE; ++i) {
                     int64_t offset_in_head = access_id_in_head + i;
                     int64_t dst_v_shuffle_offset = dst_offset + (block_offset / x) * HEAD_SIZE * x + offset_in_head * x + (block_offset % x);
@@ -630,7 +616,7 @@ __global__ void fused_mrope_rms_neox_kv_kernel(
 }
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M, typename KVT = T>
-__global__ void fused_mrope_rms_noneox_kv_kernel(
+__global__  void fused_mrope_rms_noneox_kv_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps,
@@ -695,26 +681,13 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
                 int64_t block_id = slot_id / block_size;
                 int64_t block_offset = slot_id % block_size;
                 int64_t dst_offset = block_id * num_heads_k * (HEAD_SIZE / x) * block_size * x + head_id_kv * (HEAD_SIZE / x) * block_size * x;
-                
                 // For key: shuffle within each head_size chunk
-                // Optimization: when VEC_SIZE <= x, the VEC_SIZE elements within a chunk are contiguous
-                // so we can use vectorized store instead of element-by-element store
-                int64_t chunk_id = access_id_in_head / x;
-                int64_t elem_in_chunk = access_id_in_head % x;
-                int64_t dst_k_base = dst_offset + chunk_id * block_size * x + block_offset * x + elem_in_chunk;
-                
                 if constexpr (std::is_same_v<T, KVT>) {
-                    if (VEC_SIZE <= x && elem_in_chunk + VEC_SIZE <= x) {
-                        // VEC_SIZE elements are contiguous within the same chunk, use vectorized store
-                        out_vec.store(k_cache + dst_k_base);
-                    } else {
-                        // Elements span across chunks, fallback to element-by-element store
-                        #pragma unroll
-                        for (int i = 0; i < VEC_SIZE; ++i) {
-                            int64_t offset_in_head = access_id_in_head + i;
-                            int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
-                            k_cache[dst_k_shuffle_offset] = out_vec[i];
-                        }
+                    #pragma unroll
+                    for (int i = 0; i < VEC_SIZE; ++i) {
+                        int64_t offset_in_head = access_id_in_head + i;
+                        int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
+                        k_cache[dst_k_shuffle_offset] = out_vec[i];
                     }
                     if (return_kv && k_out != nullptr) {
                         auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
@@ -722,17 +695,11 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
                     }
                 } else {
                     auto out_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(out_vec, k_scale);
-                    if (VEC_SIZE <= x && elem_in_chunk + VEC_SIZE <= x) {
-                        // VEC_SIZE elements are contiguous within the same chunk, use vectorized store
-                        out_vec_fp8.store(k_cache + dst_k_base);
-                    } else {
-                        // Elements span across chunks, fallback to element-by-element store
-                        #pragma unroll
-                        for (int i = 0; i < VEC_SIZE; ++i) {
-                            int64_t offset_in_head = access_id_in_head + i;
-                            int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
-                            k_cache[dst_k_shuffle_offset] = out_vec_fp8[i];
-                        }
+                    #pragma unroll
+                    for (int i = 0; i < VEC_SIZE; ++i) {
+                        int64_t offset_in_head = access_id_in_head + i;
+                        int64_t dst_k_shuffle_offset = dst_offset + (offset_in_head / x) * block_size * x + block_offset * x + (offset_in_head % x);
+                        k_cache[dst_k_shuffle_offset] = out_vec_fp8[i];
                     }
                     if (return_kv && k_out != nullptr) {
                         auto k_out_offset = (token_id * num_heads_k + head_id_kv) * HEAD_SIZE + access_id_in_head;
@@ -775,6 +742,7 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
             int64_t dst_offset = block_id * num_heads_v * (block_size / x) * HEAD_SIZE * x + head_id_kv * (block_size / x) * HEAD_SIZE * x;
             // For value: shuffle within each block_size chunk
             if constexpr (std::is_same_v<T, KVT>) {
+                #pragma unroll
                 for (int i = 0; i < VEC_SIZE; ++i) {
                     int64_t offset_in_head = access_id_in_head + i;
                     int64_t dst_v_shuffle_offset = dst_offset + (block_offset / x) * HEAD_SIZE * x + offset_in_head * x + (block_offset % x);
@@ -786,6 +754,7 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(
                 }
             } else {
                 auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
+                #pragma unroll
                 for (int i = 0; i < VEC_SIZE; ++i) {
                     int64_t offset_in_head = access_id_in_head + i;
                     int64_t dst_v_shuffle_offset = dst_offset + (block_offset / x) * HEAD_SIZE * x + offset_in_head * x + (block_offset % x);
@@ -830,7 +799,7 @@ void fused_mrope_rms_set_kv(
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     TORCH_CHECK(dim == head_size / 2);
-    constexpr int THREAD_BLOCK_SIZE = 256;
+   constexpr int THREAD_BLOCK_SIZE = 64;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block = THREAD_BLOCK_SIZE / WARP_SIZE;
     dim3 threadsPerBlock(THREAD_BLOCK_SIZE);
@@ -885,7 +854,7 @@ void fused_rope_rms_set_kv(
     KVT *k_out = nullptr, KVT *v_out = nullptr, bool return_kv = false,
     bool use_shuffle_layout = false, int64_t block_size = 0, int64_t x = 0) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
-    constexpr int THREAD_BLOCK_SIZE = 256;
+   constexpr int THREAD_BLOCK_SIZE = 64;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block = THREAD_BLOCK_SIZE / WARP_SIZE;
     dim3 threadsPerBlock(THREAD_BLOCK_SIZE);
@@ -929,7 +898,7 @@ void fused_rope_rms_set_kv(
 // ============================================================================
 
 template <typename T, int HEAD_SIZE, typename KVT = T>
-__global__ void shuffle_kv_cache_kernel(
+__global__  void shuffle_kv_cache_kernel(
     const T *__restrict__ key,           // [num_tokens, num_kv_heads, head_size]
     const T *__restrict__ value,         // [num_tokens, num_kv_heads, head_size]
     KVT *__restrict__ k_cache,           // [num_blocks, num_kv_heads, head_size // x, block_size, x]
@@ -997,7 +966,7 @@ __global__ void shuffle_kv_cache_kernel(
                 }
             }
         } else {
-            auto k_vec_fp8 = convert_to_fast<T, VEC_SIZE, KVT>(k_vec);
+            auto k_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(k_vec, k_scale);
             if (VEC_SIZE <= x && elem_in_chunk + VEC_SIZE <= x) {
                 k_vec_fp8.store(dst_k_base);
             } else {
@@ -1034,7 +1003,7 @@ __global__ void shuffle_kv_cache_kernel(
                 v_base[offset_in_head * x] = v_vec[i];
             }
         } else {
-            auto v_vec_fp8 = convert_to_fast<T, VEC_SIZE, KVT>(v_vec);
+            auto v_vec_fp8 = convert_to<T, VEC_SIZE, KVT>(v_vec, v_scale);
             #pragma unroll
             for (int i = 0; i < VEC_SIZE; ++i) {
                 const int offset_in_head = access_id_in_head + i;
@@ -1061,7 +1030,7 @@ void shuffle_kv_cache(
     hipStream_t stream) {
     
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
-    constexpr int THREAD_BLOCK_SIZE = 256;
+    constexpr int THREAD_BLOCK_SIZE = 64;
     // Each warp handles one (token, head) pair, processing BOTH K and V
     int total_warps = static_cast<int>(num_tokens * num_kv_heads);
     int num_warps_per_block = THREAD_BLOCK_SIZE / WARP_SIZE;
@@ -1520,6 +1489,6 @@ void shuffle_kv_cache_cuda(
                     stream);
             } else {
                 TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
-            }
-        });
+        }
+    });
 }
