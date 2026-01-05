@@ -62,6 +62,6 @@ def gemm_a16w16(
     if splitK > 1:
         sema = get_semaphore_workspace(out.device)
     else:
-        sema = torch.empty((16, 64), dtype=torch.uint32, device=out.device)
+        sema = torch.empty((0,), dtype=torch.uint32, device=out.device)
 
     return gemm_a16w16_asm(A, B, out, bias, sema, splitK, kernelName)
