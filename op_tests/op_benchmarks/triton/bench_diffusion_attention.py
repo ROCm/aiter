@@ -530,13 +530,13 @@ def bench_kernel(q, k, v, args, provider):
             )()
         )
 
-        if args.ref == "sagev1" or args.ref == "fav3_sage" and args.layout == "bhsd":
+        if (args.ref == "sagev1" or args.ref == "fav3_sage") and args.layout == "bhsd":
             reference_primary = reference_primary.permute(
                 0, 2, 1, 3
             )  # we do comparison in BSHD
 
-        check_attention_outputs(current_primary, reference_primary, fp8=False)
         compare_accuracy(current_primary, reference_primary)
+        check_attention_outputs(current_primary, reference_primary, fp8=False)
 
     q_element_size = (
         1 if args.sagev1 or args.fav3_fp8 or args.fav3_sage else q.element_size()

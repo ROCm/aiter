@@ -1581,19 +1581,6 @@ def attn_fwd(
     else:
         acc = (acc * l_recip * v_descale) / FP8_MAX
 
-    if V_Mean is not None:
-        v_mean_ptr = (
-            V_Mean
-            + off_z * stride_v_mean_z
-            + off_h_k * stride_v_mean_h
-        )
-        v_mean = tl.load(
-            v_mean_ptr + offs_d_v[None, :],
-            mask=offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V,
-            other=0.0,
-        )
-        acc += v_mean
-
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
@@ -1701,7 +1688,22 @@ def attn_fwd(
     if PADDED_HEAD_V:
         o_ptrs_mask = o_ptrs_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
 
-    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
+    acc = acc.to(Out.dtype.element_ty)
+
+    if V_Mean is not None:
+        v_mean_ptr = (
+            V_Mean
+            + off_z * stride_v_mean_z
+            + off_h_k * stride_v_mean_h
+        )
+        v_mean = tl.load(
+            v_mean_ptr + offs_d_v[None, :],
+            mask=offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V,
+            other=0.0,
+        )
+        acc += v_mean
+
+    tl.store(o_ptrs, acc, mask=o_ptrs_mask)
 
 
 def fav3_sage_triton_impl(
@@ -2193,7 +2195,7 @@ def sage_quant(
         k_smoothed = torch.empty_like(k)
         v_smoothed = torch.empty_like(v)
 
-        v_mean = torch.empty((b, h_kv, head_dim), device=v.device, dtype=torch.float32)
+        v_mean = torch.empty((b, h_kv, head_dim), device=v.device, dtype=v.dtype)
 
         # Launch kernel
         SEQLEN_K_PADDED = triton.next_power_of_2(kv_len)
@@ -2248,7 +2250,6 @@ def sage_quant(
 
     grid = (q_task_count + k_task_count + v_task_count,)
 
-    # call sage_quant_kernel
     sage_quant_kernel[grid](
         q,
         q_int8,
@@ -2318,20 +2319,20 @@ def kv_smooth_kernel(
     k_ptrs = K_ptrs + k_offs
     v_ptrs = V_ptrs + k_offs
 
-    k_vals = tl.load(k_ptrs, mask=offs_k < SEQLEN, other=0.0).to(tl.float32)
-    k_mean = tl.sum(k_vals, axis=0) / SEQLEN
+    k_vals = tl.load(k_ptrs, mask=offs_k < SEQLEN, other=0.0)
+    k_mean = (tl.sum(k_vals, axis=0) / SEQLEN).to(k_vals.dtype)
     k_smooth = k_vals - k_mean
     k_smoothed_ptrs = K_smoothed_ptrs + k_offs
     tl.store(k_smoothed_ptrs, k_smooth, mask=offs_k < SEQLEN)
 
-    v_vals = tl.load(v_ptrs, mask=offs_k < SEQLEN, other=0.0).to(tl.float32)
-    v_mean = tl.sum(v_vals, axis=0) / SEQLEN
+    v_vals = tl.load(v_ptrs, mask=offs_k < SEQLEN, other=0.0)
+    v_mean = (tl.sum(v_vals, axis=0) / SEQLEN).to(v_vals.dtype)
     v_smooth = v_vals - v_mean
     v_smoothed_ptrs = V_smoothed_ptrs + k_offs
     tl.store(v_smoothed_ptrs, v_smooth, mask=offs_k < SEQLEN)
 
     v_mean_out_ptrs = V_mean_ptrs + off_b * stride_mean_bz + off_h * stride_mean_h + off_d
-    tl.store(v_mean_out_ptrs, v_mean)
+    tl.store(v_mean_out_ptrs, (v_mean).to(V_mean_ptrs.dtype.element_ty))
 
 
 @triton.jit

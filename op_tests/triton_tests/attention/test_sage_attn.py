@@ -168,20 +168,19 @@ def input_helper(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, _ = sage_quant(
+    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, v_mean = sage_quant(
         q,
         k,
         v,
         fp8_dtype,
         FP8_MAX,
-        km=None,
         sm_scale=softmax_scale,
         BLKQ=BLKQ,
         BLKK=BLKK,
         layout=layout,
     )
 
-    return q, k, v, q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale
+    return q, k, v, q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, v_mean
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -214,7 +213,7 @@ def test_sage(
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
-    q, k, v, q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = input_helper(
+    q, k, v, q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, v_mean = input_helper(
         BATCH,
         NUM_Q_HEADS,
         NUM_K_HEADS,
@@ -240,6 +239,7 @@ def test_sage(
         causal=False,
         inference_mode=True,
         layout=layout,
+        v_mean=v_mean,
     )
 
     if DEBUG_MODE:
