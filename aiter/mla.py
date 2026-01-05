@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # user interface
 
@@ -271,8 +271,7 @@ def mla_decode_fwd(
             num_kv_splits = get_cu_num()
         if nhead == 16 or (
             nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8) or (
-            nhead == 64 and q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16) or (
-            nhead == 32 and q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
+            nhead in [32, 64] and q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16
         ):
             # Natively support cases
             pass
@@ -284,6 +283,7 @@ def mla_decode_fwd(
             q = q.view(total_s, nhead, -1)
             o = o.view(total_s, nhead, -1)
             io_transformed = True
+            max_seqlen_q = 1
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "v1_comm.cuh"
 
@@ -443,7 +443,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     // launch kernel
     MLA_NUM_HEADS_DISPATCHER(
-        num_heads,
+        num_heads_per_head_k,
         MLA_METADATA_DISPATCHER(
             max_seqlen_qo * num_heads_per_head_k,
             kPackedQoLenPerWg,
@@ -455,6 +455,5 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                 max_seqlen_qo,
                 dev_prop.warpSize,
                 dev_prop.maxSharedMemoryPerMultiProcessor)));
-
 
 }

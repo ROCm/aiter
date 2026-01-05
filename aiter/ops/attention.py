@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
 from typing import Optional, Tuple
@@ -631,6 +631,7 @@ def get_mla_metadata_info_v1(
         int(math.ceil(max_seqlen_qo * num_head_qo / 128))
         if num_head_qo == 16
         or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
+        or (num_head_qo in [32, 64] and kv_dtype == dtypes.bf16 and q_dtype == dtypes.bf16)
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
