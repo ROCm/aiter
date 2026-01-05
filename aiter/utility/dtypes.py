@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
+from ..ops.enum import QuantType
 import argparse
 
 defaultDtypes = {
@@ -72,11 +73,24 @@ def str2tuple(v):
 
 
 def str2Dtype(v):
+    def _convert(s):
+        if s.lower() == "none":
+            return None
+        elif s in d_dtypes:
+            return d_dtypes[s]
+        else:
+            # Case-insensitive lookup for QuantType
+            s_lower = s.lower()
+            for name in dir(QuantType):
+                if not name.startswith("_") and name.lower() == s_lower:
+                    return getattr(QuantType, name)
+            raise ValueError(f"'{s}' not in d_dtypes or QuantType")
+
     try:
         parts = [p.strip() for p in v.strip("()").split(",") if p.strip()]
-        # Return single value if only one element and no comma; otherwise return list
+        # Return single value if only one element and no comma; otherwise return tuple
         if len(parts) == 1 and "," not in v:
-            return d_dtypes[parts[0]]
-        return [d_dtypes[p] for p in parts]
+            return _convert(parts[0])
+        return tuple(_convert(p) for p in parts)
     except Exception as e:
-        raise argparse.ArgumentTypeError(f"invalid format of data type: {v}") from e
+        raise argparse.ArgumentTypeError(f"invalid format of type: {v}") from e
