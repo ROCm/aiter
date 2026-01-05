@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 import os
@@ -774,8 +774,9 @@ def get_2stage_cfgs(
             False,
             True,
         )
-    if (kernelName1 is not None and "ck2stages" in kernelName1) or (
-        kernelName1 is None
+
+    if (kernelName1 and "ck2stages" in kernelName1) or (
+        not kernelName1
         and (
             (q_type == QuantType.per_1x128 and doweight_stage1)
             or q_dtype_w
