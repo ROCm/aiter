@@ -269,6 +269,7 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.o_ptr,
                        a.seqstart_q_ptr,
                        a.seqstart_k_ptr,
+                       a.sink_ptr,
                        a.seqlen_q_ptr,
                        a.seqlen_k_ptr,
                        a.cu_seqlen_q_ptr,

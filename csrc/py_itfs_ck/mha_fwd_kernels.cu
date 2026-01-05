@@ -109,7 +109,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         static_cast<int>(bias_type),
                         has_lse,
                         static_cast<int>(qscale_type),
-                        mask.sink > 0, // hsa_sink
+                        mask.sink > 0, // has_sink
                         q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),

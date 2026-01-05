@@ -143,6 +143,7 @@ struct mha_fwd_args
                                            // array [batch + 1]. (Used with padding)
     const void* cu_seqlen_k_ptr = nullptr; // Cumulative logical (excluding padding) sequence length
                                            // array [batch + 1]. (Used with padding)
+    const void* sink_ptr;
 
     ck_tile::index_t seqlen_q;
     ck_tile::index_t seqlen_k;
