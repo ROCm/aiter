@@ -982,7 +982,7 @@ def cmdGenFunc_mha_batch_prefill(
     q_descale: Optional[Tensor] = None,
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
-    sink_ptr:Optional[Tensor] = None,
+    sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
     # causal=true is the same as causal=false in this case
@@ -1259,7 +1259,7 @@ def _flash_attn_forward(
 
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
-    if(sink_ptr is not None):
+    if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
         assert sink_ptr.shape[0] == nhead_q, "sink_ptr has incorrect shape"
         if sink_ptr.dtype != torch.float32:
@@ -1702,7 +1702,7 @@ def _flash_attn_backward(
             alibi_slopes,
             rng_state,
             None,
-            sink_ptr
+            sink_ptr,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
@@ -1992,7 +1992,7 @@ def _flash_attn_varlen_forward(
 
     nhead_k = v.shape[-2]
     hdim_v = v.shape[-1]
-    if(sink_ptr is not None):
+    if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
         assert sink_ptr.shape[0] == nhead_q, "sink_ptr has incorrect shape"
         if sink_ptr.dtype != torch.float32:
@@ -2835,7 +2835,7 @@ def mha_batch_prefill_func(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
-        sink_ptr=sink_ptr
+        sink_ptr=sink_ptr,
     )
     out = out_padded[..., :head_size_v_og]
 
