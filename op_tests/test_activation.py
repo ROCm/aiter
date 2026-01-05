@@ -184,7 +184,8 @@ df = pd.DataFrame(df)
 df = df[
     ["M", "N", "input_dtype", "output_dtype", "us", "TB/s", "RD TB/s", "WR TB/s", "err"]
 ]
-aiter.logger.info(f"scaled_silu_and_mul summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("scaled_silu_and_mul summary (markdown):\n%s", df_md)
 
 df = []
 for dtype in args.dtype:
@@ -202,4 +203,6 @@ df = pd.DataFrame(df)
 df = df[
     ["M", "N", "input_dtype", "output_dtype", "us", "TB/s", "RD TB/s", "WR TB/s", "err"]
 ]
-aiter.logger.info(f"silu_and_mul summary:\n{df}")
+
+df_md = df.to_markdown(index=False)
+aiter.logger.info("silu_and_mul summary (markdown):\n%s", df_md)

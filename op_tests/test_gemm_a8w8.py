@@ -275,7 +275,8 @@ def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk):
                 ret = test_gemm(dtype, m, n, k, quantDtype)
                 df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("gemm_a8w8 summary (markdown):\n%s", df_md)
 
 
 def test_skinny_gemm_a8w8_pertoken_quant():

@@ -29,6 +29,9 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                const at::Tensor kv_page_indices,
                                std::optional<const at::Tensor>& bias_,
                                std::optional<const at::Tensor>& alibi_slopes_,
+                               std::optional<const at::Tensor>& q_descale,
+                               std::optional<const at::Tensor>& k_descale,
+                               std::optional<const at::Tensor>& v_descale,
                                at::Tensor out,
                                at::Tensor softmax_lse,
                                at::Tensor dropout_randval,
@@ -103,6 +106,9 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.k_ptr           = k.data_ptr();
     args.v_ptr           = v.data_ptr();
     args.bias_ptr        = bias_ptr;
+    args.q_descale_ptr   = q_descale.has_value() ? q_descale.value().data_ptr() : nullptr;
+    args.k_descale_ptr   = k_descale.has_value() ? k_descale.value().data_ptr() : nullptr;
+    args.v_descale_ptr   = v_descale.has_value() ? v_descale.value().data_ptr() : nullptr;
     args.rand_val_ptr    = has_dropout_randval ? dropout_randval.data_ptr() : nullptr;
     args.lse_ptr         = has_lse ? softmax_lse.data_ptr() : nullptr;
     args.o_ptr           = out.data_ptr();
@@ -175,18 +181,39 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   std::optional<at::Tensor> out_,                // [total_q, hq, d]
                   std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                   std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+                  std::optional<const at::Tensor> q_descale,     // [1]
+                  std::optional<const at::Tensor> k_descale,     // [1]
+                  std::optional<const at::Tensor> v_descale,     // [1]
                   std::optional<at::Generator> gen_)
 {
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    auto q_dtype = q.scalar_type();
+    bool is_qkv_fp8 =
+        q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 ||
+                    is_qkv_fp8,
+                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(kv_indptr.dtype() == torch::kInt32, "kv_indptr must have dtype int32");
 
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    std::string dtype_str = torchDTypeToStr(c10::scalarTypeToTypeMeta(q_dtype));
+    if(is_qkv_fp8)
+    {
+        if(!out_.has_value() || out_.value().dtype() == at::ScalarType::BFloat16)
+            dtype_str = "fp8bf16"; // BF16 output is required for FP8 input due to current kernel
+                                   // implementation constraints
+        else
+            TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
+    }
+
+    TORCH_CHECK(q_descale.has_value() == k_descale.has_value() &&
+                    k_descale.has_value() == v_descale.has_value(),
+                "q_descale, k_descale, v_descale must be all provided or all not provided");
+
+    quant_scale_enum qscale_type =
+        q_descale.has_value() ? quant_scale_enum::pertensor : quant_scale_enum::no_scale;
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);
@@ -281,18 +308,21 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     CHECK_SHAPE(kv_indptr, batch_size + 1);
     auto opts = q.options();
 
+    auto out_type = dtype_str == "fp8bf16" ? at::ScalarType::BFloat16 : q_dtype;
     at::Tensor out;
     if(out_.has_value())
     {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_type,
+                    "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 "
+                    "input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, total_q, num_heads, head_size_v);
     }
     else
     {
-        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -371,6 +401,9 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                                    kv_page_indices,
                                                    bias_,
                                                    alibi_slopes_,
+                                                   q_descale,
+                                                   k_descale,
+                                                   v_descale,
                                                    out,
                                                    softmax_lse,
                                                    p,
@@ -381,13 +414,14 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
 
         float t = aiter::mha_batch_prefill(args,
                                            stream_config,
-                                           q_dtype_str,
+                                           dtype_str,
                                            true, // is_group_mode
                                            mask.type,
                                            bias_type,
                                            has_lse,
+                                           qscale_type,
                                            false);
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
+        TORCH_CHECK(t >= 0, "invalid argument for batch_prefill");
     }
     else
     {

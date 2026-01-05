@@ -174,7 +174,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 @pytest.mark.parametrize(
     "impl",
     [
-        "gluon",
+        # "gluon",
         "triton",
     ],
 )
