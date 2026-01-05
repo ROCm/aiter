@@ -105,6 +105,6 @@ candidate_kernels_dict_tile = {
 
 default_kernels_dict_tile = {
    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | DoubleSmemBuffer | UsePersistentKernel | BlockPerCu |
-    -1:  TileKernelInstance(  128,     128,      256,     1,        4,       1,        16,            16,           32,       "Intrawave",        False,             False,        False,               False,             1      ),
+    -1:  TileKernelInstance(  128,     128,      256,     1,        4,       1,        16,            16,           32,       "Intrawave",        False,             False,        True,               False,             1      ),
 }
 # fmt: on

@@ -58,7 +58,8 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     }
 
     // Default tile kernel
-    return a8w8_blockscale_tile_128x128x256_1x4x1_16x16x32_intrawave_0x0x0_1<DDataType, EDataType>;
+    return a8w8_blockscale_tile_128x128x256_1x4x1_16x16x32_intrawave_0x0x1x0_1<DDataType,
+                                                                               EDataType>;
 }
 
 torch::Tensor gemm_a8w8_blockscale_tile(torch::Tensor& XQ,
