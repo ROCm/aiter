@@ -113,4 +113,5 @@ for m in args.m:
         ret = test_indexer_k_quant_and_cache(m, block_size, 128, 128)
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("indexer_k_quant_and_cache summary (markdown):\n%s", df_md)

@@ -236,4 +236,5 @@ print("=" * 150)
 print(df.to_string(index=False))
 print("=" * 150)
 
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)

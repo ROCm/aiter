@@ -219,8 +219,12 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
-    auto result =
-        impl_ptr_map.try_emplace(name, std::make_unique<AiterAsmKernel>(name, co_name.c_str()));
+
+    auto result = impl_ptr_map.emplace(name, nullptr);
+    if(result.second)
+    {
+        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
+    }
     impl_ptr = result.first->second.get();
     fmha_fwd_v3_args args;
     int arg_size = sizeof(args);
