@@ -34,7 +34,9 @@ def gen_gemm_a8w8_ck_fake_tensors(
     return Out
 
 
-@compile_ops("module_gemm_a8w8", fc_name="gemm_a8w8", gen_fake=gen_gemm_a8w8_ck_fake_tensors)
+@compile_ops(
+    "module_gemm_a8w8", fc_name="gemm_a8w8", gen_fake=gen_gemm_a8w8_ck_fake_tensors
+)
 def gemm_a8w8_ck(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -282,9 +284,9 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
         _CKGEMM_CONFIG_CACHE = {}
     if tuned_file not in _CKGEMM_CONFIG_CACHE:
         ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
-        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(["cu_num", "M", "N", "K"]).to_dict(
-            "index"
-        )
+        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+            ["cu_num", "M", "N", "K"]
+        ).to_dict("index")
 
     padded_M = M
     config = None
@@ -421,7 +423,9 @@ def gemm_a8w8_ASM(
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-        return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=splitK)
+        return gemm_a8w8_asm(
+            XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=splitK
+        )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=1)
 
@@ -552,7 +556,9 @@ def gemm_a8w8_blockscale(
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
-        config = get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
+        config = get_CKGEMM_config(
+            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+        )
         if config is not None:
             libtype = config["libtype"]
             if libtype == "ck_legacy":
@@ -606,7 +612,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE)
+    get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 

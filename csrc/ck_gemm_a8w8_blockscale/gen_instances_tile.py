@@ -114,7 +114,9 @@ torch::Tensor
             "__TILE_INSTANCE_PLACEHOLDER__", TILE_INSTANCE
         )
 
-        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(TILE_INSTANCE_IMPL_str)
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
+            TILE_INSTANCE_IMPL_str
+        )
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -131,8 +133,12 @@ template torch::Tensor
     );
 
 """
-        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="TILE_FP32, TILE_BF16")
-        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="TILE_FP32, TILE_FP16")
+        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
+            name=k.name, dtypes="TILE_FP32, TILE_BF16"
+        )
+        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
+            name=k.name, dtypes="TILE_FP32, TILE_FP16"
+        )
         # TODO: dFP8_eFP8
 
         Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")).write_text(
@@ -165,14 +171,18 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup_tile.h"), "w") as f:
+        with open(
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup_tile.h"), "w"
+        ) as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
                 # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
                 if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
                     f.write(
                         LOOKUP_template.format(
-                            MNK="{" + (", ").join(map(lambda x: str(x), list(mnk))) + "}",
+                            MNK="{"
+                            + (", ").join(map(lambda x: str(x), list(mnk)))
+                            + "}",
                             kernel_name=k.name,
                         )
                     )

@@ -234,7 +234,9 @@ torch::Tensor
             )
         )
 
-        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL_str)
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
+            INSTANCE_IMPL_str
+        )
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -298,7 +300,9 @@ template torch::Tensor
                 if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
                     f.write(
                         LOOKUP_template.format(
-                            MNK="{" + (", ").join(map(lambda x: str(x), list(mnk))) + "}",
+                            MNK="{"
+                            + (", ").join(map(lambda x: str(x), list(mnk)))
+                            + "}",
                             kernel_name=k.name,
                         )
                     )

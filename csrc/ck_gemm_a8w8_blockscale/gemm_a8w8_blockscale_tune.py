@@ -34,7 +34,9 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     scale_k = (k + block_shape_k - 1) // block_shape_k
     # x_scale = rearrange(x_scale.view(-1, 1).repeat(1, block_shape_n*block_shape_k).view(m, scale_k, 1, block_shape_k),
     #                           'num_blk_n num_blk_k blk_n blk_k ->(num_blk_n blk_n) (num_blk_k blk_k)')
-    x = x.to(x_scale.dtype).view(m, k // block_shape[1], block_shape[1]) * x_scale.unsqueeze(-1)
+    x = x.to(x_scale.dtype).view(
+        m, k // block_shape[1], block_shape[1]
+    ) * x_scale.unsqueeze(-1)
     x = x.view(m, k)
 
     w_scale = rearrange(
@@ -54,15 +56,21 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-def run_ck_gemm_a8w8_blockscale_tile(x, weight, x_scale, w_scale, out, kernel_id, splitK):
+def run_ck_gemm_a8w8_blockscale_tile(
+    x, weight, x_scale, w_scale, out, kernel_id, splitK
+):
     """
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
     """
 
-    return aiter.gemm_a8w8_blockscale_tune_tile(x, weight, x_scale, w_scale, out, kernel_id, splitK)
+    return aiter.gemm_a8w8_blockscale_tune_tile(
+        x, weight, x_scale, w_scale, out, kernel_id, splitK
+    )
 
 
-def run_ck_gemm_a8w8_blockscale_legacy(x, weight, x_scale, w_scale, out, kernel_id, splitK):
+def run_ck_gemm_a8w8_blockscale_legacy(
+    x, weight, x_scale, w_scale, out, kernel_id, splitK
+):
     """
     Run gemm a8w8 blockscale tuned kernel for ck_legacy type.
     """
@@ -312,7 +320,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME
-                else (self.getKernelName(kernelId, libtype) if kernelName == "" else kernelName)
+                else (
+                    self.getKernelName(kernelId, libtype)
+                    if kernelName == ""
+                    else kernelName
+                )
             )
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
