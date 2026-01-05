@@ -81,7 +81,6 @@ def ref_masked_attention(
     return out.to(dtype), lse
 
 
-@perftest()
 def torch_mla_extend(
     q,  # [total_q, nheads, headdim_q]
     kvc_cache,  # [num_block * block_size, nhead_kv, qk_head_dim]
@@ -203,7 +202,7 @@ def test_mla_prefill(
     kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
 
     # CRITICAL: Use bf16 tensors for reference (not fp8), and same data as kernel
-    (out_ref, lse_ref), us_torch_prefill = torch_mla_extend(
+    out_ref, lse_ref = torch_mla_extend(
         Q_bf16,
         kv_buffer,
         qo_indptr,
@@ -230,12 +229,9 @@ def test_mla_prefill(
         (reduce_partial_map_size, reduce_partial_map_type),
     ) = aiter.get_ps_metadata_info_v1(
         batch_size=batch_size,
-        num_head_q=num_head_q,
+        num_head_k=num_head_kv,
         max_qlen=max_qlen,
-        max_kvlen=max_kvlen,
-        qhead_granularity=qhead_granularity,
         qlen_granularity=qlen_granularity,
-        kvlen_granularity=kvlen_granularity,
     )
     work_metadata_ptrs = torch.zeros(
         work_meta_data_size, dtype=work_meta_data_type, device=device
@@ -300,7 +296,7 @@ def test_mla_prefill(
     if dump_metadata:
         for name, meta in metadata_map.items():
             file_name = f"{name}.bin"
-            torch.set_printoptions(threshold=999999, linewidth=120)
+            torch.set_printoptions(threshold=99999999, linewidth=120)
             print(f"==>dump {name} to {file_name}:\n{meta}")
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
@@ -337,7 +333,6 @@ def test_mla_prefill(
     )
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
-    print(f"us_torch_prefill: {us_torch_prefill}")
     print(f"us_asm_prefill: {us_aiter_asm}")
 
     return ret
