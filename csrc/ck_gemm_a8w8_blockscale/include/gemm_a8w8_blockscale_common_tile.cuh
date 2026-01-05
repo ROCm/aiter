@@ -180,7 +180,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                     tail_number_v>;
 
         using GemmPipeline =
-            std::conditional_t<GemmConfig::DoubleSmemBuffer && isBpreshuffled,
+            std::conditional_t<GemmConfig::DoubleSmemBuffer_v && isBpreshuffled,
                                ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
                                ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>;
 
