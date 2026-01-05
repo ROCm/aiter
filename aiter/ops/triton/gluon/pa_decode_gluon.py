@@ -1549,10 +1549,13 @@ def paged_attention_decode_sliding_window(
     # ==================== SEQUENCE PROCESSING ====================
     query_converted = query_shared.load(qk_lhs_operand_layout)
     if SLIDING_WINDOW > 0:
+        sequence_start_idx = context_length - SLIDING_WINDOW
+        sequence_end_idx = context_length
         sequence_partition_start_idx = (
-            context_length - SLIDING_WINDOW
+            sequence_start_idx
         ) // CONTEXT_PARTITION_SIZE
-        sequence_partition_end_idx = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
+        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+
     else:
         page_size = gl.cdiv(context_length, gl.num_programs(2))
         sequence_start_idx = page_size * sequence_split_idx
@@ -1771,10 +1774,12 @@ def paged_attention_decode_sliding_window(
             sequence_position_extension = query_seq_len - 1 - query_token_idx
             causal_mask = (
                 sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                < context_length
+                < sequence_end_idx
             )
+            causal_mask = causal_mask & (sequence_position_extension[:, None] + qk_column_offsets[None, :] >= sequence_start_idx)
         else:
-            causal_mask = qk_column_offsets[None, :] < context_length
+            causal_mask = qk_column_offsets[None, :] < sequence_end_idx
+            causal_mask = causal_mask & (qk_column_offsets[None, :] >= sequence_start_idx)
 
         boundary_mask = boundary_mask & causal_mask
 
@@ -1786,11 +1791,10 @@ def paged_attention_decode_sliding_window(
             # OR: qk_column_offsets > context_length + query_token_idx - SLIDING_WINDOW
             sliding_window_mask = (
                 qk_column_offsets[None, :]
-                > context_length + query_token_idx[:, None] - SLIDING_WINDOW
+                > sequence_start_idx + query_token_idx[:, None]
             )
             boundary_mask = boundary_mask & sliding_window_mask
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-
         attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
