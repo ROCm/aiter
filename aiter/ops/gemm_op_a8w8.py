@@ -562,9 +562,10 @@ def gemm_a8w8_blockscale(
     libtype = config["libtype"] if config else None
 
     if libtype == "ck_tile":
-        isBpreshuffled = config["isBpreshuffled"] if config else False
+        isBpreshuffled_config = config["isBpreshuffled"] if config else False
+        use_bpreshuffle = isBpreshuffled and isBpreshuffled_config
         return gemm_a8w8_blockscale_ck_tile(
-            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled
+            XQ, WQ, x_scale, w_scale, Y, use_bpreshuffle
         )
     elif libtype == "ck_legacy":
         return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
