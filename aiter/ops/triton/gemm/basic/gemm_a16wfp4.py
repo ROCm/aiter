@@ -252,7 +252,7 @@ def gemm_a16wfp4_preshuffle_(
     )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    assert prequant == True, "prequant == False is not supported yet"
+    assert prequant, "prequant == False is not supported yet"
 
     M, K = x.shape
     N, K = w.shape
