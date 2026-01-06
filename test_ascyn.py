@@ -15,6 +15,88 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
 from aiter.test_common import checkAllclose
 
+
+# @gluon.jit
+# def test_async_load(
+#     input,
+#     output,
+#     in_stride,
+#     out_stride,
+#     BLOCK_H: gl.constexpr,
+#     BLOCK_C: gl.constexpr,
+#     ):
+# 
+#     pid = gl.program_id(0)
+# 
+#     # blocked_ld_in: gl.constexpr = gl.BlockedLayout(
+#     #     size_per_thread=[2, 8],  # 64 * 512
+#     #     threads_per_warp=[8, 8],
+#     #     warps_per_cta=[1, 4],
+#     #     order=[1, 0],
+#     # )
+#     blocked_ld_in: gl.constexpr = gl.BlockedLayout([1, 8], [2, 32], [4, 1], [1, 0])
+#     blocked_ld_out: gl.constexpr = gl.BlockedLayout([4, 8], [2, 32], [4, 1], [1, 0])
+# 
+#     cur_head = gl.arange(
+#         0, BLOCK_H, layout=gl.SliceLayout(1, blocked_ld_in)
+#     )
+# 
+#     offs_k_c = gl.arange(
+#         0, BLOCK_C, layout=gl.SliceLayout(0, blocked_ld_in)
+#     )
+# 
+#     shared_in: gl.constexpr = gl.SwizzledSharedLayout(
+#         8, 1, 1, [1, 0]
+#     )
+#     smem_in = gl.allocate_shared_memory(
+#         input.type.element_ty, [BLOCK_H * 4, BLOCK_C], layout=shared_in
+#     )
+#     smem_in0 = smem_in.slice(0,           BLOCK_H)
+#     smem_in1 = smem_in.slice(BLOCK_H,     BLOCK_H)
+#     smem_in2 = smem_in.slice(BLOCK_H * 2, BLOCK_H)
+#     smem_in3 = smem_in.slice(BLOCK_H * 3, BLOCK_H)
+# 
+#     offs = cur_head[:, None] * BLOCK_C + offs_k_c[None, :]
+# 
+#     gl.amd.cdna4.async_copy.buffer_load_to_shared(
+#         smem_in0,
+#         input,
+#         offsets=offs,
+#     )
+#     gl.amd.cdna4.async_copy.buffer_load_to_shared(
+#         smem_in1,
+#         input,
+#         offsets=offs + BLOCK_H * BLOCK_C,
+#     )
+#     gl.amd.cdna4.async_copy.buffer_load_to_shared(
+#         smem_in2,
+#         input,
+#         offsets=offs + BLOCK_H * BLOCK_C * 2,
+#     )
+#     gl.amd.cdna4.async_copy.buffer_load_to_shared(
+#         smem_in3,
+#         input,
+#         offsets=offs + BLOCK_H * BLOCK_C * 3,
+#     )
+# 
+#     cur_o = smem_in.load(layout=blocked_ld_out)
+#     # cdna4_async_copy.async_wait(0)
+#     # cur_o = cdna4_async_copy.load_shared_relaxed(smem_in, blocked_ld_in)
+#     cur_head_out = gl.arange(
+#         0, BLOCK_H * 4, layout=gl.SliceLayout(1, blocked_ld_out)
+#     )
+#     offs_k_c_out = gl.arange(
+#         0, BLOCK_C, layout=gl.SliceLayout(0, blocked_ld_out)
+#     )
+# 
+#     offs_out = cur_head_out[:, None] * BLOCK_C + offs_k_c_out[None, :]
+# 
+#     gl.amd.cdna3.buffer_store(
+#         stored_value=cur_o,
+#         ptr=output,
+#         offsets=offs_out,
+#     )
+
 @gluon.jit
 def test_async_load(
     input,
@@ -28,12 +110,27 @@ def test_async_load(
     pid = gl.program_id(0)
 
     # blocked_ld_in: gl.constexpr = gl.BlockedLayout(
-    #     size_per_thread=[2, 8],  # 64 * 512
+    #     size_per_thread=[1, 8],  # 64 * 512
     #     threads_per_warp=[8, 8],
     #     warps_per_cta=[1, 4],
     #     order=[1, 0],
     # )
-    blocked_ld_in: gl.constexpr = gl.BlockedLayout([1, 8], [2, 32], [4, 1], [1, 0])
+    blocked_b: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=((1,0),(2,0), (4,0), (0,64), (0, 128)),
+        lane_bases=((8, 0), (16, 0), (32, 0), (0, 1), (0, 16), (0, 32)),
+        warp_bases=((0, 2), (0, 4), (0, 8)),
+        block_bases=[],
+        shape=[64, 256],
+    )
+    blocked_ld_in: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=((0, 1), (0, 2), (0, 4)),
+        lane_bases=((0, 8), (0, 16), (0, 32), (0,64), (0, 128), (1, 0)),
+        warp_bases=((2, 0), (4, 0)),
+        block_bases=[],
+        shape=[8, 256],
+    )
+    # blocked_ld_in: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
+    # blocked_ld_in: gl.constexpr = gl.BlockedLayout([1, 8], [2, 32], [4, 1], [1, 0])
     blocked_ld_out: gl.constexpr = gl.BlockedLayout([4, 8], [2, 32], [4, 1], [1, 0])
 
     cur_head = gl.arange(
@@ -44,8 +141,14 @@ def test_async_load(
         0, BLOCK_C, layout=gl.SliceLayout(0, blocked_ld_in)
     )
 
-    shared_in: gl.constexpr = gl.SwizzledSharedLayout(
-        8, 1, 1, [1, 0]
+    # shared_in: gl.constexpr = gl.SwizzledSharedLayout(
+    #     8, 1, 1, [1, 0]
+    # )
+    shared_in: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs = [[512,16]],
+        offset_bases = [[0,1],  [0,2], [0,4], [0,8], [0,16], [0,32],[0,64], [0,128], [1, 0], [2,0], [4, 0], [8, 0], [16, 0]],
+        block_bases = [],
+        shape = [32, 256]
     )
     smem_in = gl.allocate_shared_memory(
         input.type.element_ty, [BLOCK_H * 4, BLOCK_C], layout=shared_in
@@ -245,12 +348,12 @@ def test_async_load_mfma(
     #     order=[1, 0],
     # )
 
-    blocked_ld_in: gl.constexpr = gl.DistributedLinearLayout(
+    blocked_b: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=((1,0),(2,0), (4,0), (0,64), (0, 128)),
-        lane_bases=((8, 0), (16, 0), (0, 1), (0, 8), (0, 16), (0, 32)),
-        warp_bases=((0, 2), (0, 4)),
+        lane_bases=((8, 0), (16, 0), (32, 0), (0, 1), (0, 16), (0, 32)),
+        warp_bases=((0, 2), (0, 4), (0, 8)),
         block_bases=[],
-        shape=[32, 256],
+        shape=[64, 256],
     )
     mfma_layout_qk: gl.constexpr = gl.amd.AMDMFMALayout(
         version=3, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[1, 4]
@@ -304,11 +407,11 @@ def test_async_load_mfma(
         8, 1, 1, [0, 1]
     )
 
-    shared_in: gl.constexpr = gl.PaddedSharedLayout(
+    shared_b: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs = [[512,16]],
-        offset_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0,1], [0,8], [0,16], [0,32], [0,2], [0,4], [0,64], [0,128]],
+        offset_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0,1], [0,16], [0,32], [0,2], [0,4], [0,8], [0,64], [0,128]],
         block_bases = [],
-        shape = [32, 256]
+        shape = [64, 256]
     )
 
     smem_kv1 = gl.allocate_shared_memory(
@@ -357,6 +460,7 @@ def test_async_load_mfma(
 
 
 def test():
+    H = 8
     TILE_H = 32
     TILE_C = 256
     BLOCK_H = 8
@@ -369,19 +473,8 @@ def test():
     C = A @ B.T
 
     grid = (1, 1, 1)
-    # output = torch.empty_like(B)
-    # test_async_load[grid](
-    #     B,
-    #     output,
-    #     BLOCK_C,
-    #     BLOCK_C,
-    #     BLOCK_H,
-    #     BLOCK_C,
-    # )
-    # checkAllclose(input, output)
-    output = torch.empty_like(C)
-    test_async_load_mfma[grid](
-        A,
+    output = torch.empty_like(B)
+    test_async_load[grid](
         B,
         output,
         BLOCK_C,
@@ -389,7 +482,18 @@ def test():
         BLOCK_H,
         BLOCK_C,
     )
-    checkAllclose(C, output)
+    checkAllclose(B, output)
+    # output = torch.empty_like(C)
+    # test_async_load_mfma[grid](
+    #     A,
+    #     B,
+    #     output,
+    #     BLOCK_C,
+    #     BLOCK_C,
+    #     BLOCK_H,
+    #     BLOCK_C,
+    # )
+    # checkAllclose(C, output)
 
 
 if __name__ == "__main__":

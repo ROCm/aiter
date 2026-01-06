@@ -1907,12 +1907,11 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         order=[1, 0],
     )
 
-    blocked_ld_k_nope_kn_async: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((1,0),(2,0), (4,0), (0,64), (0, 128)),
-        lane_bases=((8, 0), (16, 0), (32, 0), (0, 1), (0, 16), (0, 32)),
-        warp_bases=((0, 2), (0, 4), (0, 8)),
-        block_bases=[],
-        shape=[64, 256],
+    blocked_ld_k_nope_kn_async: gl.constexpr = gl.BlockedLayout(  # max 16 * 576 for per wave
+        size_per_thread=[1, 8],  # 64 * 512
+        threads_per_warp=[2, 32],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
     )
 
     # blocked_ld_k_rope_kn: gl.constexpr = gl.BlockedLayout(  # max 16 * 576 for per wave
@@ -1926,13 +1925,16 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     shared_q: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=1, max_phase=8, order=[1, 0]
     )
-
-    shared_k_store: gl.constexpr = gl.PaddedSharedLayout(
-        interval_padding_pairs = [[512,16]],
-        offset_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0,1], [0,16], [0,32], [0,2], [0,4], [0,8], [0,64], [0,128]],
-        block_bases = [],
-        shape = [64, 256]
+    shared_k_store: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=1, max_phase=1, order=[1, 0]
     )
+
+    # shared_k_store: gl.constexpr = gl.PaddedSharedLayout(
+    #     interval_padding_pairs = [[512,16]],
+    #     offset_bases = [[0,1],  [0,2], [0,4], [0,8], [0,16], [0,32],[0,64], [0,128], [1, 0], [2,0], [4, 0], [8, 0], [16, 0], [32, 0]],
+    #     block_bases = [],
+    #     shape = [64, 256]
+    # )
 
     shared_k: gl.constexpr = gl.SwizzledSharedLayout(
         # vec=8, per_phase=1, max_phase=16, order=[0, 1]
@@ -2133,20 +2135,125 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     smem_kv2 = gl.allocate_shared_memory(
         K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_k_store
     )
+    smem_kv10 = smem_kv1.slice(0,          TILE_N)
+    smem_kv11 = smem_kv1.slice(TILE_N,     TILE_N)
+    smem_kv12 = smem_kv1.slice(TILE_N * 2, TILE_N)
+    smem_kv13 = smem_kv1.slice(TILE_N * 3, TILE_N)
+    smem_kv14 = smem_kv1.slice(TILE_N * 4, TILE_N)
+    smem_kv15 = smem_kv1.slice(TILE_N * 5, TILE_N)
+    smem_kv16 = smem_kv1.slice(TILE_N * 6, TILE_N)
+    smem_kv17 = smem_kv1.slice(TILE_N * 7, TILE_N)
+
+    smem_kv20 = smem_kv2.slice(0,          TILE_N)
+    smem_kv21 = smem_kv2.slice(TILE_N,     TILE_N)
+    smem_kv22 = smem_kv2.slice(TILE_N * 2, TILE_N)
+    smem_kv23 = smem_kv2.slice(TILE_N * 3, TILE_N)
+    smem_kv24 = smem_kv2.slice(TILE_N * 4, TILE_N)
+    smem_kv25 = smem_kv2.slice(TILE_N * 5, TILE_N)
+    smem_kv26 = smem_kv2.slice(TILE_N * 6, TILE_N)
+    smem_kv27 = smem_kv2.slice(TILE_N * 7, TILE_N)
 
     ### =======   load kv1 ====== ###
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smem_kv1,
+        smem_kv10,
         K_Buffer,
         offsets=offs_buf_kv,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv11,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv12,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 2,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv13,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 3,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv14,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 4,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv15,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 5,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv16,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 6,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv17,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 7,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     ### =======   load kv1 end  ====== ###
 
     ### =======   load kv2  ====== ###
+    # gl.amd.cdna3.sched_barrier(0x0)
+    #
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smem_kv2,
+        smem_kv20,
         K_Buffer,
         offsets=offs_buf_kv + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv21,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv22,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 2 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv23,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 3 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv24,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 4 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv25,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 5 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv26,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 6 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
+    )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_kv27,
+        K_Buffer,
+        offsets=offs_buf_kv + TILE_N * 576 * 7 + 256,
         # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     ### =======   load kv2 end  ====== ###
@@ -2159,7 +2266,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     k_pe = gl.amd.cdna4.buffer_load(
         ptr=K_Buffer,
         offsets=offs_buf_k_pe,
-        mask=mask_k_pe[:, None] & mask_k_r[None, :]
+        # mask=mask_k_pe[:, None] & mask_k_r[None, :]
     )  # positional embedding part of keys
 
     # if pid == 2:
@@ -2218,25 +2325,111 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         gl.amd.cdna3.sched_barrier(0x0)
 
         smem_kv1 = smem_kv1._reinterpret(
-            K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k_store)
+            K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_k_store)
 
         ### =======   load kv1 ====== ###
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            smem_kv1,
+            smem_kv10,
             K_Buffer,
             offsets=offs_buf_kv,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv11,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv12,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 2,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv13,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 3,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv14,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 4,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv15,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 5,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv16,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 6,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv17,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 7,
             # mask=mask_k[:, None] & mask_k_c[None, :],
         )
         ### =======   load kv1 end  ====== ###
 
         smem_kv2 = smem_kv2._reinterpret(
-            K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k_store)
+            K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_k_store)
 
         ### =======   load kv2  ====== ###
+        # gl.amd.cdna3.sched_barrier(0x0)
+        #
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            smem_kv2,
+            smem_kv20,
             K_Buffer,
             offsets=offs_buf_kv + 256,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv21,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 + 256,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv22,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 2 + 256,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv23,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 3 + 256,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv24,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 4 + 256,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv25,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 5 + 256,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv26,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 6 + 256,
+            # mask=mask_k[:, None] & mask_k_c[None, :],
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_kv27,
+            K_Buffer,
+            offsets=offs_buf_kv + TILE_N * 576 * 7 + 256,
             # mask=mask_k[:, None] & mask_k_c[None, :],
         )
         ### =======   load kv2 end  ====== ###
