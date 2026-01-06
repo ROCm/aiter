@@ -320,7 +320,7 @@ def gemm_a16wfp4_preshuffle_(
         **config,
     )
 
-    if return_y_pp:    
+    if return_y_pp:
         return y_pp
     elif config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 16
