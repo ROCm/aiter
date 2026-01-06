@@ -23,6 +23,11 @@ def matmul_launch_metadata(grid, kernel, args):
     repr = lambda s, x: f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
+    # sindx = args.get("WriteBackIndx", None)
+    if gindx is not None:
+        ret["name"] += "_moe1"
+    else:
+        ret["name"] += "_moe2"
     if args["B"] is not None:
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
