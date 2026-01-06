@@ -9,7 +9,7 @@ __device__ int32_t get_local_splits(int32_t seqlen_kv,
                                     int32_t num_splits,
                                     int32_t num_splits_per_cu)
 {
-#if defined(__gfx942__) 
+#if defined(__gfx942__)
     return 16;
 #else
     int32_t ex_splits = seqlen_kv / 196; // magic num 196. Experiments shows 196 per splits can get better performance.
