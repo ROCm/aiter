@@ -153,7 +153,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
 }
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M>
-__global__  void fused_mrope_rms_neox_kernel(
+__global__ void fused_mrope_rms_neox_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps) {
@@ -209,7 +209,7 @@ __global__  void fused_mrope_rms_neox_kernel(
 }
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M>
-__global__  void fused_mrope_rms_noneox_kernel(
+__global__ void fused_mrope_rms_noneox_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps) {
@@ -266,7 +266,7 @@ void fused_rope_rms(
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
     bool is_neox_style, double eps, hipStream_t stream) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
-    constexpr int block_size = 64;
+    constexpr int block_size = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k);
     auto num_warps_per_block = block_size / 32;
     dim3 threadsPerBlock(block_size);
@@ -305,7 +305,7 @@ void fused_mrope_rms(
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     TORCH_CHECK(dim == head_size / 2);
-    constexpr int block_size = 64;
+    constexpr int block_size = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k);
     auto num_warps_per_block = block_size / 32;
     dim3 threadsPerBlock(block_size);
@@ -424,19 +424,8 @@ __device__ __forceinline__ vec_t<OutT, VEC_SIZE> convert_to(vec_t<T, VEC_SIZE> &
     return out_vec;
 }
 
-// Fast path: skip division when scale == 1.0
-template <typename T, int VEC_SIZE, typename OutT>
-__device__ __forceinline__ vec_t<OutT, VEC_SIZE> convert_to_fast(vec_t<T, VEC_SIZE> &in_vec) {
-    vec_t<OutT, VEC_SIZE> out_vec;
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-        out_vec[i] = ck_tile::type_convert<OutT>(ck_tile::type_convert<float>(in_vec[i]));
-    }
-    return out_vec;
-}
-
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M, typename KVT = T>
-__global__  void fused_mrope_rms_neox_kv_kernel(
+__global__ void fused_mrope_rms_neox_kv_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int num_heads_q, int num_heads_k, int num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int num_tokens, int total_warps,
@@ -638,7 +627,7 @@ __global__  void fused_mrope_rms_neox_kv_kernel(
 }
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M, typename KVT = T>
-__global__  void fused_mrope_rms_noneox_kv_kernel(
+__global__ void fused_mrope_rms_noneox_kv_kernel(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int num_heads_q, int num_heads_k, int num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int num_tokens, int total_warps,
@@ -840,7 +829,7 @@ void fused_mrope_rms_set_kv(
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     TORCH_CHECK(dim == head_size / 2);
-   constexpr int THREAD_BLOCK_SIZE = 256;
+    constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block = THREAD_BLOCK_SIZE / WARP_SIZE;
     dim3 threadsPerBlock(THREAD_BLOCK_SIZE);
