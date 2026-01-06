@@ -384,7 +384,7 @@ if __name__ == "__main__":
                 )
                 for i, head_size in enumerate(args.head_sizes):
                     for kv_cache_dtype in args.kv_cache_dtypes:
-                        if kv_cache_dtype == "fp8":
+                        if kv_cache_dtype == "fp8_e4m3":
                             cache_dtype = get_dtype_fp8()
                         else:
                             cache_dtype = args.dtype
