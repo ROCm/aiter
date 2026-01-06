@@ -85,6 +85,8 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t K0_B = KPerBlock / BK1;
     static constexpr ck::index_t K0_M_A = BLOCKSIZE / K0_A;
     static constexpr ck::index_t K0_N_B = BLOCKSIZE / K0_B;
+    static constexpr ck::index_t CSHUFFLE_N_THREADS = 16;
+    static constexpr ck::index_t CSHUFFLE_M_THREADS = BLOCKSIZE / CSHUFFLE_N_THREADS;
     static constexpr ck::index_t D0Vec = 1;
     static constexpr ck::index_t D1Vec = PerTensorQuant ? 1 : EVec;
     static constexpr ck::index_t D2Vec = 1;
@@ -104,7 +106,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                 MXDLPerWave,    NXDLPerWave,
                 S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                 S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
-                MXDLPerWave,    NXDLPerWave,   S<1, K0_M_A, 1, K0_A>, S<2, 1, 1, 1>,
+                MXDLPerWave,    NXDLPerWave,   S<1, CSHUFFLE_M_THREADS, 1, CSHUFFLE_N_THREADS>, S<2, 1, 1, 1>,
                 ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, IsSplitK, MulRoutedWeight, int32_t, A0DataType, A0DataType, A0DataType, A0DataType, NT>;
 
     // clang-format on
@@ -317,6 +319,8 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
     static constexpr ck::index_t AK1 = 16 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 = ck::is_same_v<B0DataType, I4> ? 32 / sizeof(B0DataType) : 16 / sizeof(B0DataType);
+    static constexpr ck::index_t CSHUFFLE_N_THREADS = 64;
+    static constexpr ck::index_t CSHUFFLE_M_THREADS = BLOCKSIZE / CSHUFFLE_N_THREADS;
     static constexpr ck::index_t EVec = 2;
     static constexpr ck::index_t D0Vec = 1;
     static constexpr ck::index_t D1Vec = PerTensorQuant ? 1 : EVec;
@@ -341,7 +345,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
               MXDLPerWave, NXDLPerWave,
               S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
               S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
-              MXDLPerWave,    NXDLPerWave,   S<1, 4, 1, 64>, S<2, 1, 1, 1>,
+              MXDLPerWave,    NXDLPerWave,   S<1, CSHUFFLE_M_THREADS, 1, CSHUFFLE_N_THREADS>, S<2, 1, 1, 1>,
               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, false, false, false, MulRoutedWeight, int32_t, A0DataType, A0DataType, A0DataType, A0DataType, NT>;
 
     auto a_element_op = AElementOp{};

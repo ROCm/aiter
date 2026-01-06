@@ -178,9 +178,10 @@ a8w8_gemm1_kernels_list= {
 }
 # gemm1 blockscale out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_blockscale_kernels_list= {
-     1: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
-     0: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
-     2: kernelInstanceGEMM1(       128,       16,        128,       128,     1,       2,        1,),
+     0: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
+     1: kernelInstanceGEMM1(       128,       16,        128,       128,     1,       2,        1,),
+     1: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
+     2: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
 }
 
@@ -299,8 +300,9 @@ a8w8_gemm2_kernels_list= {
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
 a8w8_gemm2_blockscale_kernels_list= {
      0: kernelInstanceGEMM2(       256,       16,        128,       256,     1,       4,        1,),
-     1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
-     2: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
+     1: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
+     2: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
+     3: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
 }
 
