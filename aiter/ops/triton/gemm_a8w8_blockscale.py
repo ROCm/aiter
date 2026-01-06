@@ -62,8 +62,7 @@ def gemm_a8w8_blockscale(
     if config is None:
         config, _ = _get_config(M, N, K)
 
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
         K, config["NUM_KSPLIT"]
@@ -76,6 +75,9 @@ def gemm_a8w8_blockscale(
         )
     else:
         y_pp = None
+
+    if y is None and not return_y_pp:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     compute_splitk_params(config, K)
 
@@ -123,10 +125,9 @@ def gemm_a8w8_blockscale(
         **config,
     )
 
-    if config["NUM_KSPLIT"] > 1:
-        if skip_reduce:
-            return y_pp
-
+    if return_y_pp:
+        return y_pp
+    elif config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 32
         REDUCE_BLOCK_SIZE_N = 32
         ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
@@ -196,19 +197,11 @@ def gemm_a8w8_blockscale_preshuffle(
     # Check constraints.
     assert x.shape[1] == w.shape[1] // 16, "Incompatible dimensions!!!"
 
-    # Transpose w and w_scale
-    # w = w.T  # (K, N)
-    w_scale = w_scale.T  # (scale_k, scale_n)
-
     if config is None:
         config, _ = _get_config(M, N, K, True)
 
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
@@ -218,22 +211,18 @@ def gemm_a8w8_blockscale_preshuffle(
     else:
         y_pp = None
 
-    # If block size is greater than split k size, shrink the block size
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(
-        config["BLOCK_SIZE_K"], 16
-    )  # minimum block size is 16 for perf
+    if y is None and not return_y_pp:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+    compute_splitk_params(config, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
     config["GROUP_K"] = triton.next_power_of_2(
-        triton.cdiv(K, w_scale.shape[0])
+        triton.cdiv(K, w_scale.shape[1])
     )  # scale_block_size_k
     config["GROUP_N"] = triton.next_power_of_2(
-        triton.cdiv(N, w_scale.shape[1])
+        triton.cdiv(N, w_scale.shape[0])
     )  # scale_block_size_n
 
     assert (
@@ -275,10 +264,9 @@ def gemm_a8w8_blockscale_preshuffle(
         **config,
     )
 
-    if config["NUM_KSPLIT"] > 1:
-        if skip_reduce:
-            return y_pp
-
+    if return_y_pp:
+        return y_pp
+    elif config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 32
         REDUCE_BLOCK_SIZE_N = 32
         ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])

@@ -81,6 +81,10 @@ def _gemm_a8w8_blockscale_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -224,11 +228,15 @@ _gemm_a8w8_blockscale_preshuffle_repr = make_kernel_repr(
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "GRID_MN",
-        "cache_modifier",
     ],
 )
 
@@ -265,8 +273,8 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
     stride_cn,
     stride_ascale_m,
     stride_ascale_k,
-    stride_bscale_k,
     stride_bscale_n,
+    stride_bscale_k,
     # Meta-parameters
     GROUP_K: tl.constexpr,
     GROUP_N: tl.constexpr,
@@ -278,6 +286,10 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """

@@ -159,7 +159,6 @@ def generate_gemm_a8w8_blockscale_inputs(
 
     if shuffle:
         weight_shuffle_layout = (16, 16)
-        # weight_shuffle_layout = (16, 32)
         weight_shuffled = shuffle_weight(weight, weight_shuffle_layout).reshape(
             weight.shape[0] // weight_shuffle_layout[0],
             weight.shape[1] * weight_shuffle_layout[0],
