@@ -151,7 +151,7 @@ parser.add_argument(
     metavar="{fp16, bf16}",
     default="fp16, bf16",
     help="""Data type.
-    e.g.: -d bf16, -d fp32""",
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
