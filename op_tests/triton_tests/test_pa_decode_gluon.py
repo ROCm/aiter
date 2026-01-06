@@ -1431,21 +1431,13 @@ def run_pa_gluon_test(
         sliding_window=sliding_window,
     )
     reference_output_quant = reference_output_quant.to(data_type)
-
-    pa_rw_bytes = (
-        batch_size
-        * head_size
-        * (
-            2
-            * (
-                min(context_length, sliding_window)
-                if sliding_window > 0
-                else context_length
-            )
-            * num_kv_heads
-            * quantized_keys.dtype.itemsize
-            + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
-        )
+    kv_len_list = [
+        min(context_length, sliding_window) if sliding_window > 0 else context_length
+        for context_length in kv_len_list
+    ]
+    pa_rw_bytes = head_size * (
+        2 * sum(kv_len_list) * num_kv_heads * quantized_keys.dtype.itemsize
+        + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
     )
     # print(f"quantized_keys[0, 0, 1, 0]([batch_id, kv_head_id, seq_id, hd_id])={quantized_keys[block_tables[0, 0], 0, 0, 1, 0].to(torch.float32)}")
     # print(f"quantized_keys[0, 0, 1, 1]([batch_id, kv_head_id, seq_id, hd_id])={quantized_keys[block_tables[0, 0], 0, 0, 1, 1].to(torch.float32)}")
