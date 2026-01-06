@@ -148,8 +148,10 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                  GemmTraits,
                                                                  ComputeDataType>;
 
-    using BaseGemmPipeline =
-        ck_tile::BaseWeightPreshufflePipelineAGmemBGmemCRegV2<GemmPipelineProblem>;
+    using BaseGemmPipeline = std::conditional_t<
+        GemmConfig::DoubleSmemBuffer_v && isBpreshuffled,
+        ck_tile::BaseWeightPreshufflePipelineAGmemBGmemCRegV2<GemmPipelineProblem>,
+        ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>>;
 
     const ck_tile::index_t K_split =
         (args.K + GemmConfig::K_Tile_v - 1) / GemmConfig::K_Tile_v * GemmConfig::K_Tile_v;
