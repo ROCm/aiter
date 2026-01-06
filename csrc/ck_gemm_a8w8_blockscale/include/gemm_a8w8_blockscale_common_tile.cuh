@@ -111,7 +111,8 @@ template <typename QDataType,
           typename GemmConfig,
           bool PadN,
           bool PadK,
-          bool isBpreshuffled>
+          bool isBpreshuffled,
+          bool useDoubleSmemBuffer = isBpreshuffled>
 void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 {
     using GemmShape = ck_tile::TileGemmShape<
@@ -122,8 +123,6 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                           GemmConfig::K_Warp_Tile_v>>;
 
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
-
-    bool DoubleSmemBuffer = isBpreshuffled;
 
     using GemmTraits = ck_tile::TileGemmQuantTraits<false, // PadM
                                                     PadN,
@@ -137,7 +136,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                     AQLayout,
                                                     BQLayout,
                                                     GemmConfig::TransposeC_v,
-                                                    DoubleSmemBuffer>;
+                                                    useDoubleSmemBuffer>;
 
     using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
                                                                  BDataType,
@@ -147,7 +146,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                  ComputeDataType>;
 
     using BaseGemmPipeline = std::conditional_t<
-        DoubleSmemBuffer && isBpreshuffled,
+        useDoubleSmemBuffer && isBpreshuffled,
         ck_tile::BaseWeightPreshufflePipelineAGmemBGmemCRegV2<GemmPipelineProblem>,
         ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>>;
 
@@ -177,7 +176,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                     tail_number_v>;
 
         using GemmPipeline =
-            std::conditional_t<DoubleSmemBuffer && isBpreshuffled,
+            std::conditional_t<useDoubleSmemBuffer && isBpreshuffled,
                                ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
                                ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>;
 
