@@ -5,12 +5,17 @@ import torch
 import pytest
 from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
     fused_gemm_a8w8_blockscale_split_cat,
+    fused_gemm_a8w8_blockscale_preshuffle_split_cat,
 )
 
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
+from aiter.ops.shuffle import shuffle_weight
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
 block_shape = (128, 128)
+DEVICE_ARCH = arch_info.get_arch()
 
 
 def run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
@@ -35,10 +40,10 @@ def run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
     return c1.to(dtype), c2.to(dtype)
 
 
-def run_triton(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
+def run_triton(impl, x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
     m = x.shape[0]
 
-    return fused_gemm_a8w8_blockscale_split_cat(
+    return impl(
         x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype
     )
 
@@ -101,6 +106,7 @@ def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
     block_shape_k: int,
     dtype=torch.bfloat16,
     layout: str = "TN",
+    shuffle: bool = False,
 ):
     """
     The GEMM kernel expects:
@@ -132,24 +138,36 @@ def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
     x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
 
+    if shuffle:
+        w_shuffle_layout = (16, 16)
+        w_shuffled = shuffle_weight(w, w_shuffle_layout).reshape(
+            w.shape[0] // w_shuffle_layout[0],
+            w.shape[1] * w_shuffle_layout[0],
+        )
+        x_scale_shuffled = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    else:
+        w_shuffled = w
+        x_scale_shuffled = x_scale
+
     y = torch.rand((M, S3), dtype=torch.bfloat16, device="cuda").unsqueeze(1)
 
-    return x, w, y, x_scale, w_scale
+    return x, w, w_shuffled, y, x_scale, x_scale_shuffled, w_scale
 
 
 # TODO d, s3, layout = 32 128 TT UT failed if AMDGCN_USE_BUFFER_OPS=1 on MI300
 @pytest.mark.parametrize(
-    "dtype, M, N, K, D, S3, layout",
+    "dtype, M, N, K, D, S3, layout, impl",
     [
-        (dtype, *shape, d, s3, layout)
+        (dtype, *shape, d, s3, layout, impl)
         for dtype in ["bf16"]
         for shape in get_shapes()
         for d in [16]
         for s3 in [64]
         for layout in ["TN", "TT", "NN", "NT"]
+        for impl in ["triton", "triton_shuffle"]
     ],
 )
-def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout):
+def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout, impl):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
@@ -163,6 +181,11 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout):
         )
     if N % D != 0:
         pytest.skip("N must be divisible by D as N = D * (S1 + S2)")
+    if impl == "triton_shuffle":
+        if N % 16 > 0 or K % 32 > 0:
+            pytest.skip(
+                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+            )
 
     # deconstruct N
     S = N // D
@@ -170,7 +193,7 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout):
     S2 = S - S1
 
     dtype = str_to_torch_dtype[dtype]
-    x, w, y, x_scale, w_scale = generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
+    x, w, w_triton, y, x_scale, x_scale_triton, w_scale = generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
         M,
         N,
         K,
@@ -179,10 +202,18 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout):
         block_shape_k,
         dtype=dtype,
         layout=layout,
+        shuffle=("_shuffle" in impl),
     )
 
+    if impl == "triton":
+        impl = fused_gemm_a8w8_blockscale_split_cat
+    elif impl == "triton_shuffle":
+        impl = fused_gemm_a8w8_blockscale_preshuffle_split_cat
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+
     c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
-    c1_triton, c2_triton = run_triton(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
+    c1_triton, c2_triton = run_triton(impl, x, w_triton, y, x_scale_triton, w_scale, S1, S2, D, dtype)
 
     torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
     torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
