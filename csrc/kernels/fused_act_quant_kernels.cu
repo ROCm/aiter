@@ -429,13 +429,25 @@ static constexpr int nextPow2(unsigned int num)
 }
 
 // Trimmed version of AITER_DISPATCH_CASE_VEC_SIZE for VEC_SIZE >= 4
-#define AITER_DISPATCH_CASE_VEC_SIZE_TRIMMED(vec_size, ...)                   \
+#define AITER_DISPATCH_CASE_VEC_SIZE_TRIMMED4(vec_size, ...)                  \
     switch(vec_size)                                                          \
     {                                                                         \
         AITER_CASE_VEC_SIZE(32, __VA_ARGS__)                                  \
         AITER_CASE_VEC_SIZE(16, __VA_ARGS__)                                  \
         AITER_CASE_VEC_SIZE(8, __VA_ARGS__)                                   \
         AITER_CASE_VEC_SIZE(4, __VA_ARGS__)                                   \
+    default: TORCH_CHECK(false, __func__, " does't support ", vec_size, "."); \
+    }
+
+// Trimmed version of AITER_DISPATCH_CASE_VEC_SIZE for VEC_SIZE >= 2
+#define AITER_DISPATCH_CASE_VEC_SIZE_TRIMMED2(vec_size, ...)                  \
+    switch(vec_size)                                                          \
+    {                                                                         \
+        AITER_CASE_VEC_SIZE(32, __VA_ARGS__)                                  \
+        AITER_CASE_VEC_SIZE(16, __VA_ARGS__)                                  \
+        AITER_CASE_VEC_SIZE(8, __VA_ARGS__)                                   \
+        AITER_CASE_VEC_SIZE(4, __VA_ARGS__)                                   \
+        AITER_CASE_VEC_SIZE(2, __VA_ARGS__)                                   \
     default: TORCH_CHECK(false, __func__, " does't support ", vec_size, "."); \
     }
 
@@ -467,16 +479,29 @@ static constexpr int nextPow2(unsigned int num)
         HIP_CHECK(hipGetDevice(&dev));                                                         \
         HIP_CHECK(hipGetDeviceProperties(&prop, dev));                                         \
         const bool use_cache = smem_bytes <= prop.sharedMemPerBlock;                           \
-        AITER_DISPATCH_CASE_VEC_SIZE_TRIMMED(                                                  \
-            vec_size,                                                                          \
-            (use_cache                                                                         \
-                    ? aiter::fused_act_mul_pt_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>   \
-                    : aiter::fused_act_mul_pt_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
-            <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                             \
-                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                    \
-                scales.data_ptr<float>(),                                                      \
-                reinterpret_cast<input_dtype*>(input.data_ptr()),                              \
-                d);)                                                                           \
+        if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>) {                              \
+            AITER_DISPATCH_CASE_VEC_SIZE_TRIMMED4(                                             \
+                vec_size,                                                                      \
+                (use_cache                                                                     \
+                        ? aiter::fused_act_mul_pt_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>   \
+                        : aiter::fused_act_mul_pt_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
+                <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                         \
+                    reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                \
+                    scales.data_ptr<float>(),                                                  \
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),                          \
+                    d);)                                                                       \
+        } else {                                                                               \
+            AITER_DISPATCH_CASE_VEC_SIZE_TRIMMED2(                                             \
+                vec_size,                                                                      \
+                (use_cache                                                                     \
+                        ? aiter::fused_act_mul_pt_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>   \
+                        : aiter::fused_act_mul_pt_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
+                <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                         \
+                    reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                \
+                    scales.data_ptr<float>(),                                                  \
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),                          \
+                    d);)                                                                       \
+        }                                                                                      \
     });
 
 namespace aiter {
