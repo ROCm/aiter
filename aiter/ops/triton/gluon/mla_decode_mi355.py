@@ -254,12 +254,12 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     q = gl.amd.cdna3.buffer_load(
         ptr=Q,
         offsets=offs_q,
-        mask=(mask_h[:, None]) & (mask_c[None, :]),
+        # mask=(mask_h[:, None]) & (mask_c[None, :]),
     )
     q_pe = gl.amd.cdna3.buffer_load(
         ptr=Q,
         offsets=off_q_pe,
-        mask=(mask_h_pe[:, None]) & (mask_qk_r[None, :]),
+        # mask=(mask_h_pe[:, None]) & (mask_qk_r[None, :]),
     )
     kv_loc = gl.load(
         kv_indices_base + split_kv_start,
@@ -297,21 +297,18 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     )
     # ??: ????mask??????
     k_id = kv_loc * PAGE_BLOCK_SIZE + cur_N
-    mask_k_id = split_kv_start * PAGE_BLOCK_SIZE + cur_N
-    mask_k = mask_k_id < cur_batch_seq_len
     offs_buf_kv = (k_id[:, None]) * stride_buf_kh + offs_k_c[None, :]
-    mask_k_c_combined = mask_k[:, None] & mask_k_c[None, :]
 
     kv1 = gl.amd.cdna3.buffer_load(
         ptr=K_Buffer,
         offsets=offs_buf_kv,
-        mask=mask_k_c_combined
+        # mask=mask_k_c_combined
     )  # the shared latent tensor for keys and values
 
     kv2 = gl.amd.cdna3.buffer_load(
         ptr=K_Buffer,
         offsets=offs_buf_kv + 256,
-        mask=mask_k_c_combined
+        # mask=mask_k_c_combined
     )  # the shared latent tensor for keys and values
 
     smem_kv1 = gl.allocate_shared_memory(
@@ -328,14 +325,11 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
 
     k_id_pe = kv_loc * PAGE_BLOCK_SIZE + cur_N_pe
     offs_buf_k_pe = k_id_pe[:, None] * stride_buf_kh + offs_k_r[None, :]
-    mask_k_id = split_kv_start * PAGE_BLOCK_SIZE + cur_N_pe
-    mask_k_pe = mask_k_id < cur_batch_seq_len
-    mask_k_r_combined = mask_k_pe[:, None] & mask_k_r[None, :]
 
     k_pe = gl.amd.cdna3.buffer_load(
         ptr=K_Buffer,
         offsets=offs_buf_k_pe,
-        mask=mask_k_r_combined
+        # mask=mask_k_r_combined
     )  # positional embedding part of keys
 
     e_sum = gl.arange(0, BLOCK_H, layout = gl.SliceLayout(1, mfma_layout_qk)).to(gl.float32) * float(0)
@@ -374,16 +368,13 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         gl.amd.cdna3.sched_barrier(0x0)
         k_id = kv_loc * PAGE_BLOCK_SIZE + cur_N
         offs_buf_kv = k_id[:, None] * stride_buf_kh + offs_k_c[None, :]
-        mask_k_id = start_n * PAGE_BLOCK_SIZE + cur_N
-        mask_k = mask_k_id < cur_batch_seq_len
-        mask_k_combined = mask_k[:, None] & mask_k_c[None, :]
         gl.amd.cdna3.sched_barrier(0x0)
 
         qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
         kv1 = gl.amd.cdna3.buffer_load(
             ptr=K_Buffer,
             offsets=offs_buf_kv,
-            mask=mask_k_combined
+            # mask=mask_k_combined
         )
 
         gl.amd.cdna3.sched_barrier(0x0)
@@ -392,7 +383,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         kv2 = gl.amd.cdna3.buffer_load(
             ptr=K_Buffer,
             offsets=offs_buf_kv + 256,
-            mask=mask_k_combined
+            # mask=mask_k_combined
         )
 
         cur_k1 = smem_kv1.load(layout=dot_v_layout)
@@ -404,15 +395,11 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
 
         k_id_pe = kv_loc * PAGE_BLOCK_SIZE + cur_N_pe
         offs_buf_k_pe = k_id_pe[:, None] * stride_buf_kh + offs_k_r[None, :]
-        mask_k_id = start_n * PAGE_BLOCK_SIZE + cur_N_pe
-        mask_k_pe = mask_k_id < cur_batch_seq_len
-        mask_k_pe_combined = mask_k_pe[:, None] & mask_k_r[None, :]
 
         gl.amd.cdna3.sched_barrier(0x0)
         k_pe = gl.amd.cdna3.buffer_load(
             ptr=K_Buffer,
             offsets=offs_buf_k_pe,
-            mask=mask_k_pe_combined
         )  # positional embedding part of keys
 
         n_e_max = gl.convert_layout(gl.max(qk, 1), gl.SliceLayout(1, mfma_layout_qk))
