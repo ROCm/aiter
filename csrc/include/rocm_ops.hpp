@@ -28,21 +28,21 @@ namespace py = pybind11;
           "Activation function used in GELU tanh.",     \
           py::arg("out"),                               \
           py::arg("input"));                            \
-    m.def("fused_silu_mul_per_token_quant",                       \
-          &aiter::fused_silu_mul_per_token_quant,                 \
-          "Fused SiLU+mul+per_token_quant.",            \
+    m.def("fused_silu_mul_per_token_quant",             \
+          &aiter::fused_silu_mul_per_token_quant,       \
+          "Fused SiLU and mul and per-token quant.",    \
           py::arg("out"),                               \
           py::arg("scales"),                            \
           py::arg("input"));                            \
-    m.def("fused_gelu_mul_per_token_quant",                       \
-          &aiter::fused_gelu_mul_per_token_quant,                 \
-          "Fused GELU+mul+per_token_quant.",            \
+    m.def("fused_gelu_mul_per_token_quant",             \
+          &aiter::fused_gelu_mul_per_token_quant,       \
+          "Fused GELU and mul and per-token quant.",    \
           py::arg("out"),                               \
           py::arg("scales"),                            \
           py::arg("input"));                            \
-    m.def("fused_gelu_tanh_mul_per_token_quant",                  \
-          &aiter::fused_gelu_tanh_mul_per_token_quant,            \
-          "Fused GELU-tanh+mul+per_token_quant.",       \
+    m.def("fused_gelu_tanh_mul_per_token_quant",        \
+          &aiter::fused_gelu_tanh_mul_per_token_quant,  \
+          "Fused GELU-tanh-mul and per-token quant.",   \
           py::arg("out"),                               \
           py::arg("scales"),                            \
           py::arg("input"));
