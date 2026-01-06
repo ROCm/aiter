@@ -1,7 +1,12 @@
 import torch
 import pytest
-from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
+from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4, gemm_a16wfp4_preshuffle
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    shuffle_scales,
+    un_shuffle_scales,
+)
+from aiter.ops.shuffle import shuffle_weight
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -15,6 +20,7 @@ def generate_gemm_a16wfp4_inputs(
     atomic_add: bool,
     dtype: bool,
     layout: str = "TN",
+    shuffle: bool = False,
 ):
     torch.manual_seed(5)
     # 34 is two packed e2m1 values 0010 which is 1.0.
@@ -49,12 +55,27 @@ def generate_gemm_a16wfp4_inputs(
     )
     w_scales = w_scales.T
 
+    if shuffle:
+        use_int4 = False
+        weight_shuffle_layout = (16, 16)
+        w_shuffed = shuffle_weight(
+            w, layout=weight_shuffle_layout, use_int4=use_int4
+        ).reshape(
+            w.shape[0] // weight_shuffle_layout[0],
+            w.shape[1] * weight_shuffle_layout[0],
+        )
+
+        w_scales_shuffled = shuffle_scales(w_scales)
+    else:
+        w_shuffed = w
+        w_scales_shuffled = w_scales
+
     y = None
     if output:
         dtype = torch.float32 if atomic_add else dtype
         y = torch.zeros((M, N), device=x.device, dtype=dtype)
 
-    return x, w, x_scales, w_scales, y
+    return x, w, w_shuffed, x_scales, w_scales, w_scales_shuffled, y
 
 
 def get_x_vals():
@@ -94,6 +115,7 @@ def get_x_vals():
     x_vals += [(32, 512, 7168)]
     x_vals += [(1, 1280, 8192)]
     x_vals += [(v, 7168, 2048) for v in [1, 4, 8, 32, 64, 128]]
+    x_vals += [(v, 2112, 7168) for v in [1, 4, 8, 32, 64, 128]]
     # x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case, TODO: fix
     return x_vals
 
@@ -147,9 +169,11 @@ def run_torch(x, w, w_scales, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("atomic_add", [True, False])
+@pytest.mark.parametrize(
+    "atomic_add, shuffle", [(True, False), (False, False), (False, True)]
+)
 def test_gemm_a16wfp4(
-    M: int, N: int, K: int, dtype, layout, output: bool, atomic_add: bool
+    M: int, N: int, K: int, dtype, layout, output: bool, atomic_add: bool, shuffle: bool
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -160,16 +184,36 @@ def test_gemm_a16wfp4(
     if M == 4864 and N == 8192 and K == 4160:
         pytest.skip("Skipping this config. due to compilation error.")
 
-    x, w, _, w_scales, y = generate_gemm_a16wfp4_inputs(
-        M, N, K, output=output, atomic_add=atomic_add, dtype=dtype, layout=layout
+    x, w, w_triton, _, w_scales, w_scales_triton, y = generate_gemm_a16wfp4_inputs(
+        M,
+        N,
+        K,
+        output=output,
+        atomic_add=atomic_add,
+        dtype=dtype,
+        layout=layout,
+        shuffle=shuffle,
     )
     y_dtype = torch.float32 if atomic_add else dtype
-    if output:
-        y = gemm_a16wfp4(x, w, w_scales, atomic_add=atomic_add, dtype=y_dtype, y=y).to(
-            dtype
-        )
+
+    if shuffle:
+        if output:
+            y = gemm_a16wfp4_preshuffle(
+                x, w_triton, w_scales_triton, prequant=True, dtype=y_dtype, y=y
+            )
+        else:
+            y = gemm_a16wfp4_preshuffle(
+                x, w_triton, w_scales_triton, prequant=True, dtype=y_dtype
+            )
     else:
-        y = gemm_a16wfp4(x, w, w_scales, atomic_add=atomic_add, dtype=y_dtype).to(dtype)
+        if output:
+            y = gemm_a16wfp4(
+                x, w_triton, w_scales_triton, atomic_add=atomic_add, dtype=y_dtype, y=y
+            ).to(dtype)
+        else:
+            y = gemm_a16wfp4(
+                x, w_triton, w_scales_triton, atomic_add=atomic_add, dtype=y_dtype
+            ).to(dtype)
 
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
