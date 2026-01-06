@@ -12,7 +12,7 @@ from moe_cktile2stages_common import (
     get_heuristic_dispatch_template,
 )
 import sys
-from chip_info import get_gfx
+from chip_info import get_gfx, get_gfx_list
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -222,15 +222,20 @@ template torch::Tensor
         # else:
         def fill_template(name, a_type, b_type, acc_type, c_type):
             nonlocal self
-            intsance = INSTANCE_template.format(
+            # Arch-aware scheduling: skip generating FP4 instances unless gfx950 is targeted
+            if "fp4" in b_type and ("gfx950" not in get_gfx_list()):
+                return
+            body = INSTANCE_template.format(
                 name=name, dtypes=f"{a_type}, {b_type}, {acc_type}, {c_type}"
             )
+            if "fp4" in b_type:
+                body = "#if defined(__gfx950__)\n" + body + "\n#endif\n"
             Path(
                 os.path.join(
                     self.instances_path,
                     f"{name}_a{a_type}_b{b_type}_acc{acc_type}_C{c_type}.cpp",
                 )
-            ).write_text(intsance)
+            ).write_text(body)
 
         if (k.QuantType == "1x32") and (a_type in ["bf16", "fp16", "fp8"]):
             fill_template(k.name, a_type, "pk_fp4", self.acc_dtype, self.c_dtype)
