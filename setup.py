@@ -165,35 +165,9 @@ if IS_ROCM:
                 base_args = core.get_args_of_build("module_mha_varlen_fwd")
                 if isinstance(base_args, dict) and base_args.get("srcs"):
 
-                    import re
-
-                    _mha_path = os.path.join(this_dir, "aiter", "ops", "mha.py")
-                    with open(_mha_path, "r", encoding="utf-8") as f:
-                        _src = f.read()
-
-                    def _extract_def(src, name):
-                        pat = re.compile(rf"^def\s+{name}\s*\(.*?\):", re.M | re.S)
-                        m = pat.search(src)
-                        if not m:
-                            raise RuntimeError(f"Failed to extract function: {name}")
-                        start = m.start()
-                        pat_next = re.compile(r"^(def|class)\s+", re.M)
-                        m2 = pat_next.search(src, m.end())
-                        end = m2.start() if m2 else len(src)
-                        return src[start:end]
-
-                    blocks = []
-                    for fn in [
-                        "compose_mha_fwd_variant_suffix_and_filter",
-                        "_parse_mha_varlen_fwd_md_name",
-                        "get_mha_varlen_prebuild_variants_by_names",
-                    ]:
-                        blocks.append(_extract_def(_src, fn))
-                    _ns = {}
-                    exec("\n\n".join(blocks), _ns)
-                    get_variants_by_names = _ns[
-                        "get_mha_varlen_prebuild_variants_by_names"
-                    ]
+                    from jit.utils.mha_recipes import (
+                        get_mha_varlen_prebuild_variants_by_names as get_variants_by_names,
+                    )
 
                     md_names = [
                         "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
