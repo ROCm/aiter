@@ -737,13 +737,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     constexpr uint32_t k_p_mfma_end   = k_p_comp_begin + k_p_mfma_sz - 1; // reuse p_mfma and p_comp
     constexpr uint32_t k_p_mfma_begin = k_p_mfma_end - k_p_mfma_sz + 1;
     constexpr uint32_t k_kv_1_end     = k_p_comp_begin - 1;
-    constexpr uint32_t k_kv_1_begin   = k_kv_1_end - k_kv_size + 1;
-    constexpr uint32_t k_kv_0_end     = k_kv_1_begin - 1;
-    constexpr uint32_t k_kv_0_begin   = k_kv_0_end - k_kv_size + 1;
-    constexpr uint32_t k_q_rope_end   = k_kv_0_begin - 1;
-    constexpr uint32_t k_q_rope_begin = k_q_rope_end - k_q_rope_sz + 1;
-    constexpr uint32_t k_q_nope_end   = k_q_rope_begin - 1;
-    constexpr uint32_t k_q_nope_begin = k_q_nope_end - k_q_nope_sz + 1;
+    constexpr uint32_t k_kv_1_begin   = k_kv_1_end - k_kv_size + 1;     // 116
+    constexpr uint32_t k_kv_0_end     = k_kv_1_begin - 1;               // 115
+    constexpr uint32_t k_kv_0_begin   = k_kv_0_end - k_kv_size + 1;     // 112
+    constexpr uint32_t k_q_rope_end   = k_kv_0_begin - 1;               // 111
+    constexpr uint32_t k_q_rope_begin = k_q_rope_end - k_q_rope_sz + 1; // 108
+    constexpr uint32_t k_q_nope_end   = k_q_rope_begin - 1;             // 107
+    constexpr uint32_t k_q_nope_begin = k_q_nope_end - k_q_nope_sz + 1; // 76
 
     using q_nope_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_nope_begin, k_q_nope_end>>,

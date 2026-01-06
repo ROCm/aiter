@@ -421,7 +421,7 @@ def mla_decode_fwd(
                     out_golden = torch.einsum(
                         "hqk,khd->qhd", qk_exp.to(value.dtype).float(), value.float()
                     )
-                    out_golden = out_golden / l.transpose(0, 1).unsqueeze(-1)
+                    out_god = out_golden / l.transpose(0, 1).unsqueeze(-1)
 
                 #
                 # Simulate Kernel
@@ -471,7 +471,7 @@ def mla_decode_fwd(
                             if kv_tile_start == 0
                             else o_tile * rescale_tile.unsqueeze(-1) + pv_tile
                         )
-                    o_tile = o_tile / sum_e_tile.transpose(0, 1).unsqueeze(-1)
+                    out_emu = o_tile / sum_e_tile.transpose(0, 1).unsqueeze(-1)
 
                 if compare_with_asm:
                     checkAllclose(
@@ -482,14 +482,14 @@ def mla_decode_fwd(
                 if compare_with_golden:
                     checkAllclose(
                         o[i],
-                        out_golden[0].to(o.dtype),
-                        msg=f"hk vs. golden | o[{i}] vs. out_golden[0]",
+                        out_god[0].to(o.dtype),
+                        msg=f"hk vs. god | o[{i}] vs. out_god[0]",
                     )
                 if compare_with_emu:
                     checkAllclose(
                         o[i],
-                        o_tile[0].to(o.dtype),
-                        msg=f"hk vs. emu | o[{i}] vs. o_tile[0]",
+                        out_emu[0].to(o.dtype),
+                        msg=f"hk vs. emu | o[{i}] vs. out_emu[0]",
                     )
 
             # exit()
