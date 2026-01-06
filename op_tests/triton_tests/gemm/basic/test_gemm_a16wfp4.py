@@ -2,9 +2,7 @@ import torch
 import pytest
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4, gemm_a16wfp4_preshuffle
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    shuffle_scales,
-)
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales
 from aiter.ops.shuffle import shuffle_weight
 
 # Note this is specified by the HW and cannot be changed.
