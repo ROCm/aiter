@@ -78,10 +78,10 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     head_size: int,
     is_neox_style: bool,
     eps: float,
-    k_cache: Tensor,  # [args.num_blocks, num_heads_k, head_size // x, args.page_size, x]
-    v_cache: Tensor,  # [args.num_blocks, num_heads_v, head_size, args.page_size]
-    k_scale: Tensor,  # [args.num_blocks, args.page_size]
-    v_scale: Tensor,  # [args.num_blocks, args.page_size]
+    k_cache: Tensor,  # [num_blocks, num_heads_k, head_size // x, page_size, x]
+    v_cache: Tensor,  # [num_blocks, num_heads_v, head_size, page_size]
+    k_scale: Tensor,  # [num_blocks, page_size]
+    v_scale: Tensor,  # [num_blocks, page_size]
     slot_mapping: Tensor,
     kv_cache_dtype: str,
 ):
