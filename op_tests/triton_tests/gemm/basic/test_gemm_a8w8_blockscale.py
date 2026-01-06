@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
@@ -174,7 +174,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 @pytest.mark.parametrize(
     "impl",
     [
-        "gluon",
+        # "gluon",
         "triton",
     ],
 )

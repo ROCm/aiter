@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import argparse
@@ -62,12 +62,14 @@ STR_DTYPE_TO_TORCH_DTYPE = {
 
 # Triton to PyTorch dtype mapping
 TL_TO_TORCH_DTYPE = {
-    tl.float8e4b8: aiter.dtypes.fp8,
+    tl.float8e4b8: torch.float8_e4m3fnuz,
+    tl.float8e4nv: torch.float8_e4m3fn,
     tl.bfloat16: torch.bfloat16,
     tl.float16: torch.float16,
 }
 TORCH_TO_TL_DTYPE = {
-    aiter.dtypes.fp8: tl.float8e4b8,
+    torch.float8_e4m3fnuz: tl.float8e4b8,
+    torch.float8_e4m3fn: tl.float8e4nv,
     torch.bfloat16: tl.bfloat16,
     torch.float16: tl.float16,
 }

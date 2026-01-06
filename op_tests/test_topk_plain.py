@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from aiter.test_common import (
@@ -7,8 +7,8 @@ from aiter.test_common import (
     benchmark,
     run_perftest,
 )
-from aiter import dtypes, logger
-from aiter.ops.triton.topk import topk as triton_topk
+import aiter
+from aiter import dtypes
 from aiter.ops.topk_plain import topk_plain
 import pandas as pd
 
@@ -187,7 +187,5 @@ df = pd.DataFrame(df)
 df["speedup (aiter vs torch)"] = df["time_us (torch)"] / df["time_us (aiter)"]
 df["speedup (aiter vs triton)"] = df["time_us (triton)"] / df["time_us (aiter)"]
 
-print("\n" + "=" * 60)
-print("SUMMARY")
-print("=" * 60)
-logger.info(f"\n{df.to_string(index=False)}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("topk_plain summary (markdown):\n%s", df_md)

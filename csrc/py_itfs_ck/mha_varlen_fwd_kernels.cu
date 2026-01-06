@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
@@ -42,7 +42,10 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           std::pair<uint64_t*, uint64_t*> drop_seed_offset,
                                           // optional padded physical seqstarts (including PAD)
                                           std::optional<const at::Tensor> &cu_seqlens_q_padded_,
-                                          std::optional<const at::Tensor> &cu_seqlens_k_padded_)
+                                          std::optional<const at::Tensor> &cu_seqlens_k_padded_,
+                                          const std::string& data_type,
+                                          bias_enum bias_type,
+                                          quant_scale_enum qscale_type)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -123,7 +126,16 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         seqstart_q_ptr = cu_seqlens_q.data_ptr();
     }
 
-    return mha_fwd_args{q.data_ptr(),
+    return mha_fwd_args{false, // use_asm_v3
+                        false, // v3_api_check
+                        1, // how_v3_bf16_cvt
+                        data_type,
+                        true, // is_group_mode
+                        static_cast<int>(bias_type),
+                        has_lse,
+                        static_cast<int>(qscale_type),
+                        mask.sink > 0, // hsa_sink
+                        q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
                         bias_ptr,
@@ -635,18 +647,11 @@ mha_varlen_fwd(
                     p_dropout,
                     drop_seed_offset,
                     const_cast<std::optional<const at::Tensor>&>(cu_seqlens_q_padded_),
-                    const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_));
-            float t = aiter::mha_fwd(args,
-                                     stream_config,
-                                     dtype_str,
-                                     true, //is_group_mode
-                                     mask.type,
-                                     bias_type,
-                                     has_lse,
-                                     qscale_type,
-                                     false, // use_ext_asm
-                                     has_sink,
-                                     1);     // how_v3_bf16_cvt
+                    const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_),
+                    dtype_str,
+                    bias_type,
+                    qscale_type);
+            float t = aiter::mha_fwd(args, stream_config);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
     }

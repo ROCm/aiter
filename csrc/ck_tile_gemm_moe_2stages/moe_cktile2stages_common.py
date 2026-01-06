@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 import os
 import sys
@@ -93,7 +93,7 @@ class kernelInstance:
         return ("_").join(
             element
             for element in [
-                f"moe_cktile2stages",
+                "moe_cktile2stages",
                 self.QuantType,
                 "MulRoutedWeight" if self.MulRoutedWeight else "",
                 "Bias" if self.HasBias else "NoBias",

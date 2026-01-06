@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 
 import pandas as pd
@@ -296,7 +296,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_in_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_in_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
         return ret
 
 

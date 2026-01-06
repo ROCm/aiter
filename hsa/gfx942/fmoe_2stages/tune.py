@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -44,6 +44,7 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 class FmoeTuner(TunerCommon):
 
     ARG_DEFAULTS = {
+        **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
         "untune_file": "aiter/configs/untuned_fmoe.csv",
@@ -1222,8 +1223,8 @@ class FmoeTuner(TunerCommon):
             use_g1u1,
             doweight_stage1,
         ) = key
-        if us == self.INVALID_TIME:
-            return -1, -1
+        if us == self.INVALID_TIME or us == self.INF_TIME:
+            return 0, 0
         flop = 0
         data_bytes = 0
         stage = ""
@@ -1403,6 +1404,7 @@ class FmoeTuner(TunerCommon):
                         True,
                     )
                 )
+
         return task_1stage
 
     def gen_2stages_asm1_task(self, key, blockMs):
@@ -1662,13 +1664,13 @@ class FmoeTuner(TunerCommon):
     ):
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
-        args = self.keys
-        print(untunedf[args])
+        keys = self.keys
+        print(untunedf[keys])
         tasks = []
         tasks_ck = []
         task_1stage = []
         in_data = []
-        for line in untunedf[args].values:
+        for line in untunedf[keys].values:
             (
                 cu_num,
                 token,
@@ -1727,7 +1729,13 @@ class FmoeTuner(TunerCommon):
         if len(tasks) + len(tasks_ck) + len(task_1stage) > 0:
             ### shape_grouped should be False as multiple stages
             rets = mp_tuner(
-                tasks + tasks_ck + task_1stage, in_data, mp_num, True, False
+                tasks + tasks_ck + task_1stage,
+                in_data,
+                mp_num,
+                True,
+                False,
+                timeout=args.timeout,
+                verbose=args.verbose,
             )
         if not rets:
             print("no shape to tune or no solution found")
@@ -1819,7 +1827,9 @@ class FmoeTuner(TunerCommon):
 
             ## remove invalid candidate
             profileDF = profileDF[
-                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf"))
+                (profileDF["err"] < args.errRatio)
+                & (profileDF["us"] != float("-inf"))
+                & (profileDF["us"] != -1)
             ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"

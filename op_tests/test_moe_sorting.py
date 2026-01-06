@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from typing import Tuple
 import aiter
@@ -292,4 +292,5 @@ for padding_token in l_padding_token:
                         )
                         df.append(ret)
             df = pd.DataFrame(df)
-            aiter.logger.info(f"summary:\n{df}")
+            df_md = df.to_markdown(index=False)
+            aiter.logger.info("moe_sorting summary (markdown):\n%s", df_md)

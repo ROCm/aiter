@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import argparse
 import itertools
@@ -649,11 +649,8 @@ if __name__ == "__main__":
         shutil.rmtree(manifests_path)
     os.mkdir(manifests_path)
 
-
     gen_dispatch_files = []
     gen_manifest_files = []
-    tags = []
-    kernel_list = []
 
     for a_type, c_dtype, act_type, is_split_k, b_nt_type in itertools.product(
         a_types, c_dtypes, act_types, is_split_k_l, b_nt_type_l

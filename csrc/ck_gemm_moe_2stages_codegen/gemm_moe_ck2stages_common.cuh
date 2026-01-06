@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_moe_gemm.hpp"
@@ -70,16 +70,20 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     static constexpr ck::index_t NXDLPerWave = NPerBlock / (MNPerXDL * NWaves);
     // static constexpr ck::index_t NPerBlock = PipelineVer == ck::BlockGemmPipelineVersion::v1 ? 64
     // : 128;
-    static constexpr ck::index_t CShuffleMXDLPerWave =
-        ck::is_same_v<B0DataType, I4> ? 2 : MXDLPerWave;
+    static constexpr ck::index_t CShuffleMXDLPerWave = std::min(2, MXDLPerWave);
     static constexpr ck::index_t CShuffleNXDLPerWave =
         ck::is_same_v<B0DataType, I4> ? 1 : NXDLPerWave;
     // Note: some fp8 instances didn't compile with AK1/BK1=16
+    static constexpr ck::index_t CShuffleMLane = MPerBlock == 16 ? 16 : NPerBlock / 2 / NXDLPerWave;
+    static constexpr ck::index_t CShuffleNLane = BLOCKSIZE / CShuffleMLane;
     static constexpr ck::index_t K1 =
-        (PipelineVer == ck::BlockGemmPipelineVersion::v3 && NPerBlock == 64 && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1) ? 8 : 16;
+        (PipelineVer == ck::BlockGemmPipelineVersion::v3 && NPerBlock == 64 &&
+         sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1)
+            ? 8
+            : 16;
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 = ck::is_same_v<B0DataType, I4> ? 32 : K1 / sizeof(B0DataType);
-    static constexpr ck::index_t EVec   = 16 / sizeof(EDataType);
+    static constexpr ck::index_t EVec   = MPerBlock == 16 ? 4 : 16 / sizeof(EDataType);
     static constexpr ck::index_t K0_A   = KPerBlock / AK1;
     static constexpr ck::index_t K0_B   = KPerBlock / BK1;
     static constexpr ck::index_t K0_M_A = BLOCKSIZE / K0_A;
@@ -103,7 +107,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                MXDLPerWave,    NXDLPerWave,
                S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
-               2,    CShuffleNXDLPerWave,   S<1, 32, 1, 8>, S<EVec, D0Vec, D1Vec>,
+               CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec>,
                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
     // clang-format on
 
@@ -249,12 +253,11 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
 
     static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
     // static constexpr ck::index_t BLOCKSIZE = 256;
-    static constexpr ck::index_t WAVES       = BLOCKSIZE / 64;
-    static constexpr ck::index_t MNPerXDL    = 16;
-    static constexpr ck::index_t MXDLPerWave = MPerBlock / (MNPerXDL * MWaves);
-    static constexpr ck::index_t NXDLPerWave = NPerBlock / (MNPerXDL * NWaves);
-    static constexpr ck::index_t CShuffleMXDLPerWave =
-        ck::is_same_v<B0DataType, I4> ? 2 : MXDLPerWave;
+    static constexpr ck::index_t WAVES               = BLOCKSIZE / 64;
+    static constexpr ck::index_t MNPerXDL            = 16;
+    static constexpr ck::index_t MXDLPerWave         = MPerBlock / (MNPerXDL * MWaves);
+    static constexpr ck::index_t NXDLPerWave         = NPerBlock / (MNPerXDL * NWaves);
+    static constexpr ck::index_t CShuffleMXDLPerWave = std::min(2, MXDLPerWave);
     static constexpr ck::index_t CShuffleNXDLPerWave =
         ck::is_same_v<B0DataType, I4> ? 2 : NXDLPerWave;
     static constexpr ck::index_t CShuffleNLane =
@@ -290,7 +293,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
               MXDLPerWave, NXDLPerWave,
               S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
               S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
-              2,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec, D2Vec>,
+              CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec, D2Vec>,
               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, Nswizzle, false, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
 
 

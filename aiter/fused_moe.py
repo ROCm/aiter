@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 import os
@@ -522,7 +522,7 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     tileN = 128
 
     tgM = token * topk  # decode tile num
-    tgN = (inter_dim * 2 + tileN - 1) // tileN
+    tgN = (inter_dim + tileN - 1) // tileN
 
     tg_num = tgN * tgM
     # if all cu already active
@@ -803,14 +803,12 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                bias1=bias1,
             ),
             functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
-                bias2=bias2,
             ),
             get_block_m(),
             ksplit,
@@ -845,17 +843,44 @@ def get_2stage_cfgs(
             run_1stage,
             get_b_nt_type(token),
         )
-    if (
-        "ck2stages" in kernelName1
-        or (q_type == QuantType.per_1x128 and doweight_stage1)
-        or q_dtype_w
-        in [
-            dtypes.bf16,
-            dtypes.fp16,
-            torch.uint32,
-            dtypes.fp4x2,
-            dtypes.fp8,
-        ]
+    elif (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and q_dtype_w in [dtypes.fp4x2]
+        and ksplit > 1
+    ):
+        return MOEMetadata(
+            functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
+                split_k=ksplit,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            16 if token < 2048 else 32 if token < 16384 else 64,
+            ksplit,
+            run_1stage,
+        )
+
+    if (kernelName1 and "ck2stages" in kernelName1) or (
+        not kernelName1
+        and (
+            (q_type == QuantType.per_1x128 and doweight_stage1)
+            or q_dtype_w
+            in [
+                dtypes.bf16,
+                dtypes.fp16,
+                torch.uint32,
+                dtypes.fp4x2,
+                dtypes.fp8,
+            ]
+        )
     ):
         return MOEMetadata(
             functools.partial(
@@ -863,6 +888,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
+                dtype=dtype,
                 splitk=ksplit,
             ),
             functools.partial(
@@ -877,7 +903,7 @@ def get_2stage_cfgs(
         )
 
     # TODO: remove when stage2 support more size
-    tmpList = [32, 64, 128]
+    tmpList = [16, 32, 64, 128]
     if block_m not in tmpList:
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
@@ -957,9 +983,12 @@ def fused_moe_2stages(
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
-        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
-        and (activation == ActivationType.Swiglu or metadata.ksplit > 1)
+        and (
+            q_dtype_a in [dtypes.bf16, dtypes.fp16]
+            and activation == ActivationType.Swiglu
+            or metadata.ksplit > 1
+        )
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
@@ -1052,15 +1081,17 @@ def fused_moe_2stages(
         ),
         b_nt_type=metadata.b_nt_type,
         sorted_weights=sorted_weights if doweight_stage1 else None,
-        dtype=dtype,
         **extra_stage1_args,
     )
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
-        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
-        and (activation == ActivationType.Swiglu or metadata.ksplit > 1)
+        and (
+            q_dtype_a in [dtypes.bf16, dtypes.fp16]
+            and activation == ActivationType.Swiglu
+            or metadata.ksplit > 1
+        )
     ):
         a2_scale = None
     elif (
@@ -1589,9 +1620,9 @@ def cktile_moe_stage1(
 
     if split_k > 1:
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.to(out.dtype))
+            aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
         else:
-            aiter.gelu_and_mul(out, tmp_out.to(out.dtype))
+            aiter.gelu_and_mul(out, tmp_out)
     return out
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from aiter.test_common import checkAllclose, run_perftest, benchmark
@@ -180,4 +180,5 @@ for q_dtype in list_q_dtype:
                 )
                 df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("moe_dp_share_expert summary (markdown):\n%s", df_md)

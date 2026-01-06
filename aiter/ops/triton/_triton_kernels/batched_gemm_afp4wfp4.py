@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
 import triton.language as tl
@@ -327,7 +327,7 @@ def _get_config(
     from ..utils.gemm_config_utils import get_gemm_config
 
     # Note: Config files use K=2*K in their naming
-    config = get_gemm_config("BATCHED_GEMM-AFP4WFP4", M, N, 2 * K)
+    config, is_tunned = get_gemm_config("BATCHED_GEMM-AFP4WFP4", M, N, 2 * K)
 
     # Apply custom split-K logic for AFP4WFP4
     if config["NUM_KSPLIT"] > 1:
@@ -345,4 +345,4 @@ def _get_config(
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
         config["SPLITK_BLOCK_SIZE"] = 2 * K
 
-    return config
+    return config, is_tunned

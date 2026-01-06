@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.gemm_a16w16_atomic import (
     _gemm_a16_w16_atomic_kernel,
     _get_config,
@@ -39,6 +37,22 @@ def gemm_a16w16_atomic_(
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
 ) -> torch.Tensor:
+    """
+    Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
+
+    Args:
+        x (torch.Tensor): BF16/FP16 input matrix  matrix with shape (M, K).
+        w (torch.Tensor): BF16/FP16 weight matrix with shape (N, K), internally transposed.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+            Note: BF16 atomic aggregation may have slight precision loss.
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+            Must be zero-initialized for split-K (NUM_KSPLIT > 1).
+        config (Optional[str]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier).
+
+    Returns:
+        y (torch.Tensor): Output with shape (M, N).
+    """
     _LOGGER.info(
         f"GEMM_A16W16_ATOMIC: x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)} "
     )
@@ -49,7 +63,7 @@ def gemm_a16w16_atomic_(
     K, N = w.shape
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
     else:
         config = deserialize_str(config)
 
@@ -101,21 +115,5 @@ def gemm_a16w16_atomic(
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
 ) -> torch.Tensor:
-    """
-    Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
-
-    Args:
-        x (torch.Tensor): Input matrix with shape (M, K).
-        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-            Note: BF16 atomic aggregation may have slight precision loss.
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-            Must be zero-initialized for split-K (NUM_KSPLIT > 1).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier).
-
-    Returns:
-        torch.Tensor: Output with shape (M, N).
-    """
     config_hashable = serialize_dict(config) if config else None
     return gemm_a16w16_atomic_(x, w, dtype, y, config_hashable)

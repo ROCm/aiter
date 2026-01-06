@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
 import torch
@@ -64,7 +64,7 @@ def batched_gemm_afp4wfp4(
     Batch = Bx
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     if config["NUM_KSPLIT"] > 1:
         if _USE_GEMM_SPLITK_BF16:

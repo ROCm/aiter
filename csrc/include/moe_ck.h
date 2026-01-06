@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include <torch/extension.h>
@@ -19,7 +19,7 @@ void ck_moe_stage1(torch::Tensor& hidden_states, // [m, k], input token
                    std::optional<torch::Tensor> sorted_weights,
                    int quant_type,
                    int activation,
-                   int splitk,
+                   std::optional<int> splitk,
                    std::optional<std::string> dst_type);
 
 void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
@@ -37,5 +37,5 @@ void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    std::optional<torch::Tensor> sorted_weights, // [max_num_tokens_padded]);
                    int quant_type,
                    int activation,
-                   int splitk,
+                   std::optional<int> splitk,
                    std::optional<std::string> dst_type);

@@ -376,7 +376,8 @@ for data_generation in args.data_generation:
                 df.append(ret)
 
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary for top_k_per_row_prefill kernel:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
 
 
 df = []
@@ -393,4 +394,5 @@ for data_generation in args.data_generation:
                     df.append(ret)
 
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
