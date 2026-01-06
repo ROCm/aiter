@@ -663,17 +663,17 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def use_cfg():
-        problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
-        bypass_type = (
-            ActivationType.Silu,
-            dtypes.bf16,
-            dtypes.fp8,
-            dtypes.fp8,
-            QuantType.per_1x128,
-        )
-        if problem_type == bypass_type and (token * topk) <= 512:  # bypass tuned
-            aiter.logger.info("bypass tuned results for fp8 blockscale")
-            return False
+        # problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
+        # bypass_type = (
+        #     ActivationType.Silu,
+        #     dtypes.bf16,
+        #     dtypes.fp8,
+        #     dtypes.fp8,
+        #     QuantType.per_1x128,
+        # )
+        # if problem_type == bypass_type and (token * topk) <= 512:  # bypass tuned
+        #     aiter.logger.info("bypass tuned results for fp8 blockscale")
+        #     return False
         return True
 
     # cfg = cfg_2stages.get(keys, None)
@@ -701,7 +701,7 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                run_1stage = token > 64 and (inter_dim % 256 == 0)
+                run_1stage = token > 64 and (inter_dim % 256 == 0) and False
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -729,7 +729,7 @@ def get_2stage_cfgs(
         )
         use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
-            f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_nt}"
+            f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}"
         )
     else:
         block_m = cfg["block_m"]
