@@ -24,12 +24,11 @@ from csrc.cpp_itfs.utils import (
 
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     pa_decode_gluon,
+    get_cdna_version,
 )
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
-)
-from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot_prebuild import (
-    prebuild_transpose_query_gluon_aot_so,
 )
 
 try:
@@ -96,19 +95,16 @@ BATCH_SIZE_OPTIONS = [4, 80, 128]
 
 def run_gluon_kernel(
     output: torch.Tensor,
-    output_transposed: torch.Tensor,
     query: torch.Tensor,
-    query_transposed: torch.Tensor,
-    query_scale_transposed: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     context_lengths: torch.Tensor,
     block_tables: torch.Tensor,
-    attention_scale: float,
-    query_sequence_length: int,
+    softmax_scale: float,
+    query_length: int,
     max_context_length: int,
     context_partition_size: int,
-    compute_type: tl.dtype,
+    compute_type: torch.dtype,
     query_scale: torch.Tensor,
     key_scale: torch.Tensor,
     value_scale: torch.Tensor,
@@ -116,27 +112,32 @@ def run_gluon_kernel(
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
     alibi_slopes: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
     use_aot_impl: bool = False,
 ) -> None:
-    """Run Gluon FP8/BF16/FP16 kernel for paged attention using Triton transpose kernel.
-
-    This function is similar to run_gluon_kernel but uses the transpose_query_for_gluon
-    Triton kernel to perform query and output transpositions instead of PyTorch operations.
+    """Run Gluon FP8/BF16/FP16 kernel for paged attention.
 
     Args:
         output: Output tensor [batch_size * query_length, num_query_heads, head_size]
-        output_transposed: Pre-allocated tensor [batch_size, num_kv_heads * query_length * query_group_size, head_size] (3D physical)
         query: Query tensor [batch_size * query_length, num_query_heads, head_size]
-        query_transposed: Pre-allocated tensor [batch_size, num_kv_heads * query_length * query_group_size, head_size] (3D physical)
-        query_scale_transposed: Pre-allocated tensor [batch_size, num_kv_heads * query_length * query_group_size, 1] (3D) or [1] (scalar)
         key_cache: Key cache tensor [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
         value_cache: Value cache tensor [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
         context_lengths: Current context lengths for each sequence [num_seqs]
         block_tables: Mapping from sequences to physical cache blocks [num_seqs, max_num_blocks_per_seq]
-        attention_scale: Attention scale
-        query_sequence_length: Query sequence length
+        softmax_scale: Softmax scale (typically 1/sqrt(head_size))
+        query_length: Query sequence length
         max_context_length: Maximum sequence length supported
         context_partition_size: Context partition size
+        compute_type: Compute data type (torch.dtype)
+        query_scale: Query quantization scale
+        key_scale: Key quantization scale
+        value_scale: Value quantization scale
+        exp_sums: Buffer for exponential sums
+        max_logits: Buffer for maximum logits
+        temporary_output: Buffer for partial outputs
+        alibi_slopes: ALiBi slopes (optional)
+        sinks: Sink tokens (optional)
+        use_aot_impl: Whether to use AOT implementation
 
     Returns:
         None (modifies output in-place)
@@ -146,16 +147,13 @@ def run_gluon_kernel(
     if use_aot_impl:
         pa_decode_gluon_aot(
             output,
-            output_transposed,
             query,
-            query_transposed,
-            query_scale_transposed,
             key_cache,
             value_cache,
             context_lengths,
             block_tables,
-            attention_scale,
-            query_sequence_length,
+            softmax_scale,
+            query_length,
             max_context_length,
             context_partition_size,
             compute_type,
@@ -167,22 +165,19 @@ def run_gluon_kernel(
             temporary_output=temporary_output,
             alibi_slopes=alibi_slopes,
             run_compiled_kernel=True,
-            # run_compiled_kernel=False,
+            sinks=sinks,
         )
     else:
         if pa_decode_gluon is not None:
             pa_decode_gluon(
                 output,
-                output_transposed,
                 query,
-                query_transposed,
-                query_scale_transposed,
                 key_cache,
                 value_cache,
                 context_lengths,
                 block_tables,
-                attention_scale,
-                query_sequence_length,
+                softmax_scale,
+                query_length,
                 max_context_length,
                 context_partition_size,
                 compute_type,
@@ -193,6 +188,7 @@ def run_gluon_kernel(
                 max_logits=max_logits,
                 temporary_output=temporary_output,
                 alibi_slopes=alibi_slopes,
+                sinks=sinks,
             )
 
 
@@ -483,10 +479,7 @@ def run_pa_gluon_test(
 
     run_gluon_kernel(
         output,
-        output_transposed,
         quantized_query,
-        query_transposed,
-        query_scale_transposed,
         quantized_keys,
         quantized_values,
         context_lengths,
@@ -495,7 +488,7 @@ def run_pa_gluon_test(
         query_length,
         context_lengths.max().item(),
         context_partition_size,
-        TORCH_TO_TL_DTYPE[compute_type],
+        compute_type,
         query_scale=query_scale_factors,
         key_scale=key_scale_original,
         value_scale=value_scale_original,
@@ -503,6 +496,7 @@ def run_pa_gluon_test(
         max_logits=max_logits,
         temporary_output=temporary_output,
         alibi_slopes=None,
+        sinks=None,
         use_aot_impl=use_aot_impl,
     )
 
@@ -744,6 +738,14 @@ def run_multi_pa_gluon_test(
     Returns:
         DataFrame containing all test results
     """
+    # Check CDNA version compatibility
+    # cdna_version = get_cdna_version()
+    cdna_version = 3
+    assert cdna_version in [
+        3,
+        4,
+    ], f"run_multi_pa_gluon_test only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
+
     # Generate all test configurations
     test_configs = []
 
@@ -852,22 +854,26 @@ def run_multi_pa_gluon_test(
                                                             # Determine is_causal
                                                             is_causal = int(ql > 1)
 
+                                                            # use_sinks for func_name (cdna_version already set at function start)
+                                                            use_sinks = 0  # Default: no sinks
+
                                                             # Calculate func_name
                                                             func_name = get_default_func_name(
                                                                 MD_NAME,
                                                                 (
-                                                                    TORCH_TO_TL_DTYPE[
-                                                                        ct
-                                                                    ],
-                                                                    equi_query_group_size_pow2,
+                                                                    ct,  # compute_type (torch.dtype)
+                                                                    ql,  # query_seq_len
+                                                                    query_group_size,  # one_query_group_size
                                                                     head_size_pow2,
-                                                                    bs,
+                                                                    bs,  # kv_block_size
                                                                     context_partition_size,
                                                                     query_quant_mode,
                                                                     kv_quant_mode,
                                                                     fp8_max_value,
-                                                                    int(trans_v_mode),
+                                                                    int(trans_v_mode),  # value_transposed
                                                                     is_causal,
+                                                                    use_sinks,
+                                                                    cdna_version,
                                                                 ),
                                                             )
                                                             # Store func_name in test_config for deduplication
@@ -972,19 +978,20 @@ def prebuild_pa_decode_gluon_aot_so():
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    BATCH_SIZE_OPTIONS = [4]
-    KV_VARLEN_OPTIONS = [False]
-    TRANS_V_OPTIONS = [False, True]
-    QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-    # COMPUTE_TYPE_OPTIONS = ["fp8"]
-    QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
-    HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-    BLOCK_SIZE_OPTIONS = [16, 64, 1024]
-    HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
-    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    CONTEXT_LENGTH_OPTIONS = [512]
-    USE_AOT_IMPL_OPTIONS = [True]
+
+    # BATCH_SIZE_OPTIONS = [4]
+    # KV_VARLEN_OPTIONS = [False]
+    # TRANS_V_OPTIONS = [False, True]
+    # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    # # COMPUTE_TYPE_OPTIONS = ["fp8"]
+    # QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
+    # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+    # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+    # HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
+    # QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    # CONTEXT_LENGTH_OPTIONS = [512]
+    # USE_AOT_IMPL_OPTIONS = [True]
 
     HEAD_DIMENSION_OPTIONS = [128]
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
@@ -1036,5 +1043,4 @@ def prebuild_pa_decode_gluon_aot_so():
 
 
 if __name__ == "__main__":
-    prebuild_transpose_query_gluon_aot_so()
     prebuild_pa_decode_gluon_aot_so()
