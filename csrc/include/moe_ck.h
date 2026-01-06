@@ -19,7 +19,7 @@ void ck_moe_stage1(torch::Tensor& hidden_states, // [m, k], input token
                    std::optional<torch::Tensor> sorted_weights,
                    int quant_type,
                    int activation,
-                   int splitk,
+                   std::optional<int> splitk,
                    bool nt,
                    std::optional<std::string> dst_type);
 
@@ -38,6 +38,6 @@ void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    std::optional<torch::Tensor> sorted_weights, // [max_num_tokens_padded]);
                    int quant_type,
                    int activation,
-                   int splitk,
+                   std::optional<int> splitk,
                    bool nt,
                    std::optional<std::string> dst_type);

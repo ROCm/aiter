@@ -12,6 +12,7 @@ pip install --upgrade pandas zmq einops numpy==1.26.2
 pip uninstall -y aiter || true
 pip install --upgrade "pybind11>=3.0.1"
 pip install --upgrade "ninja>=1.11.1"
+pip install tabulate
 python3 setup.py develop
 
 # Read BUILD_TRITON env var, default to 1. If 1, install Triton; if 0, skip installation.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "gemm_moe_ck2stages.h"
 #include "ck/tensor_operation/gpu/device/impl/device_moe_gemm_blockscale.hpp"
@@ -334,7 +334,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
             < Row, Col, DsLayout, ELayout,
               A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
               AElementOp,  BElementOp, CDEElementOp,   GemmSpec,
-              256,  Scale_Block_M, Scale_Block_N, Scale_Block_K,
+              BLOCKSIZE,  Scale_Block_M, Scale_Block_N, Scale_Block_K,
               MPerBlock,   NPerBlock,    KPerBlock,
               AK1,   BK1,
               MNPerXDL,   MNPerXDL,

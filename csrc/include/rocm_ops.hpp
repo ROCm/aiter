@@ -378,6 +378,12 @@ namespace py = pybind11;
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
           py::arg("out"));                                                                     \
+    m.def("reduce_scatter",                                                                    \
+          &aiter::reduce_scatter,                                                              \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"),                                                                      \
+          py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("all_reduce",                                                                        \
           &aiter::all_reduce,                                                                  \
           py::arg("_fa"),                                                                      \
@@ -1033,6 +1039,9 @@ namespace py = pybind11;
           py::arg("out")          = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
+          py::arg("q_descale")    = std::nullopt, \
+          py::arg("k_descale")    = std::nullopt, \
+          py::arg("v_descale")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
@@ -1447,6 +1456,9 @@ namespace py = pybind11;
     m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms); \
     m.def("fused_rope_rms", &fused_rope_rms);
 
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
@@ -1555,6 +1567,16 @@ namespace py = pybind11;
           py::arg("numRows"),          \
           py::arg("stride0"),          \
           py::arg("stride1"));         \
+      m.def("top_k_per_row_prefill_fast", \
+            &top_k_per_row_prefill_fast,  \
+            py::arg("logits"),       \
+            py::arg("rowStarts"),    \
+            py::arg("rowEnds"),      \
+            py::arg("indices"),      \
+            py::arg("values"),       \
+            py::arg("numRows"),      \
+            py::arg("stride0"),      \
+            py::arg("stride1"));     \
     m.def("top_k_per_row_decode",      \
           &top_k_per_row_decode,       \
           py::arg("logits"),           \
@@ -1637,15 +1659,15 @@ namespace py = pybind11;
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
-#define TOPK_PLAIN_PYBIND           \
-    m.def("topk_plain",             \
-          &topk_plain,              \
-          py::arg("values"),        \
-          py::arg("topk_ids"),      \
-          py::arg("topk_out"),      \
-          py::arg("topk"),          \
-          py::arg("largest") = true, \
+#define TOPK_PLAIN_PYBIND                         \
+    m.def("topk_plain",                           \
+          &topk_plain,                            \
+          py::arg("values"),                      \
+          py::arg("topk_ids"),                    \
+          py::arg("topk_out"),                    \
+          py::arg("topk"),                        \
+          py::arg("largest")   = true,            \
           py::arg("rowStarts") = torch::Tensor(), \
-          py::arg("rowEnds") = torch::Tensor(), \
-          py::arg("stride0") = -1,  \
-          py::arg("stride1") = 1);
+          py::arg("rowEnds")   = torch::Tensor(), \
+          py::arg("stride0")   = -1,              \
+          py::arg("stride1")   = 1);

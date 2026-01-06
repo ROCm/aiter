@@ -276,7 +276,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                             i,
                             splitK,
                         ),
-                        {},
+                        {
+                            "num_warmup": args.warmup,
+                            "num_iters": args.iters,
+                        },
                         run_torch,
                         (
                             ref_data_idx,
@@ -333,7 +336,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                             i,
                             splitK,
                         ),
-                        {},
+                        {
+                            "num_warmup": args.warmup,
+                            "num_iters": args.iters,
+                        },
                         run_torch,
                         (
                             ref_data_idx,
@@ -395,7 +401,16 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
 
         return ret
 
@@ -456,6 +471,7 @@ if __name__ == "__main__":
     tuner = GemmA8W8BpreShuffleTuner(
         "GemmA8W8BpreShuffleTuner",
         key=key,
+        resultList=resultList,
         description="gen API for gemm a8w8 bpreshuffle kernel",
     )
 

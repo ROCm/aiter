@@ -487,18 +487,6 @@ def test_fused_rope_concat_and_cache_mla(
     return ret
 
 
-kv_lora_rank = 128
-qk_rope_head_dim = 64
-l_num_tokens = [128, 256, 512, 1024, 2048, 4096]  # , 8192, 16384
-block_size = 64
-dtype = torch.float16
-l_qk_dtypes = ["auto", "fp8"]
-device = "cuda"
-l_kv_cache_dtypes = ["auto", "fp8"]
-ltests = ["normal", "fused_qk"]
-l_num_heads = [1, 2, 4, 8]
-num_heads = 4
-l_neox = [True, False]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -531,8 +519,10 @@ parser.add_argument(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
     default="bf16",
+    metavar="{bf16}",
     help="""Data type of input.
     e.g.: -d bf16""",
 )
@@ -547,11 +537,19 @@ parser.add_argument(
     e.g.: -kvd auto""",
 )
 parser.add_argument(
+    "-dev",
+    "--device",
+    type=str,
+    default="cuda",
+    help="""Device.
+    e.g.: -dev cuda""",
+)
+parser.add_argument(
     "-t",
     "--token",
     type=int,
     nargs="*",
-    default=l_num_tokens,
+    default=[128, 256, 512, 1024, 2048, 4096],  # , 8192, 16384,
     help="""token nums.
     e.g.: -t 128""",
 )
@@ -560,7 +558,7 @@ parser.add_argument(
     "--head",
     type=int,
     nargs="*",
-    default=l_num_heads,
+    default=[1, 2, 4, 8],
     help="""num heads.
     e.g.: -hd 1""",
 )
@@ -575,92 +573,74 @@ parser.add_argument(
     e.g.: -qd auto""",
 )
 parser.add_argument(
+    "-n",
     "--is_neox",
-    nargs="?",
+    type=dtypes.str2bool,
+    nargs="*",
     default=[True, False],
     help="""true: GPT-NeoX style rotary embedding or false: GPT-J style rotary embedding.
-    e.g.: --is_neox False""",
+    e.g.: --is_neox false
+          or --is_neox true""",
 )
 
 parser.add_argument(
     "-c",
     "--case",
     type=str,
-    choices=ltests,
+    choices=["normal", "fused_qk"],
     nargs="*",
-    default=ltests,
+    default=["normal", "fused_qk"],
     help="""tests concat and cache or fused_qk.
-    e.g.: -kvd normal""",
+    e.g.: -c normal""",
 )
 
 args = parser.parse_args()
-if args.dtype is not None:
-    dtype = dtypes.d_dtypes[args.dtype]
 
-if args.token is not None:
-    l_num_tokens = args.token
-if args.kv_dtype is not None:
-    l_kv_cache_dtypes = args.kv_dtype
-if args.q_dtype is not None:
-    l_qk_dtypes = args.q_dtype
-if args.block_size is not None:
-    block_size = args.block_size
-if args.qk_rope_head_dim is not None:
-    qk_rope_head_dim = args.qk_rope_head_dim
-if args.kv_lora_rank is not None:
-    kv_lora_rank = args.kv_lora_rank
-
-if args.case is not None:
-    ltests = args.case
-
-if args.head is not None:
-    l_num_heads = args.head
-
-l_neox: List[bool] = args.is_neox
-
-if "normal" in ltests:
+if "normal" in args.case:
     df = []
-    for num_token in l_num_tokens:
-        num_blocks = num_token // block_size
-        for kv_cache_dtype in l_kv_cache_dtypes:
+    for num_token in args.token:
+        num_blocks = num_token // args.block_size
+        for kv_cache_dtype in args.kv_dtype:
             ret = test_concat_and_cache_mla(
-                kv_lora_rank,
-                qk_rope_head_dim,
+                args.kv_lora_rank,
+                args.qk_rope_head_dim,
                 num_token,
-                block_size,
+                args.block_size,
                 num_blocks,
-                dtype,
-                device,
+                args.dtype,
+                args.device,
                 kv_cache_dtype,
             )
             df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"concat_and_cache_mla summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("concat_and_cache_mla summary (markdown):\n%s", df_md)
 
 
-if "fused_qk" in ltests:
+if "fused_qk" in args.case:
     df = []
-    for num_token in l_num_tokens:
-        num_blocks = num_token // block_size
-        for num_heads in l_num_heads:
-            for kv_cache_dtype in l_kv_cache_dtypes:
-                for is_neox in l_neox:
-                    for q_dtype in l_qk_dtypes:
+    for num_token in args.token:
+        num_blocks = num_token // args.block_size
+        for num_heads in args.head:
+            for kv_cache_dtype in args.kv_dtype:
+                for is_neox in args.is_neox:
+                    for q_dtype in args.q_dtype:
                         if q_dtype == "fp8" and kv_cache_dtype != "fp8":
                             continue
                         ret = test_fused_rope_concat_and_cache_mla(
-                            kv_lora_rank,
-                            qk_rope_head_dim,
+                            args.kv_lora_rank,
+                            args.qk_rope_head_dim,
                             num_token,
-                            block_size,
+                            args.block_size,
                             num_blocks,
                             num_heads,
-                            dtype,
-                            device,
+                            args.dtype,
+                            args.device,
                             kv_cache_dtype,
                             q_dtype,
                             is_neox,
                         )
                         df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"fused_rope_concat_and_cache_mla summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)
