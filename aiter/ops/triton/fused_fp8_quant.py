@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.fused_fp8_quant import (
     _fused_flatten_fp8_group_quant_kernel,
     _fused_reduce_act_mul_fp8_group_quant,
     _fused_reduce_rms_fp8_group_quant_kernel,
+    _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
@@ -31,6 +32,7 @@ def fused_rms_fp8_per_tensor_static_quant(
     dtype_quant=fp8_dtype,
     res1=None,
     output_unquantized_inp1=False,
+    rmsnorm_convert_to_inp1_type=False,
 ):
     """
     This op contains several steps:
@@ -80,7 +82,7 @@ def fused_rms_fp8_per_tensor_static_quant(
     if output_unquantized_inp1:
         out1 = torch.empty((M, N1), dtype=inp1.dtype, device=inp1.device)
         out1_row_stride = out1.stride(0)
-        out1_col_stride = out2.stride(1)
+        out1_col_stride = out1.stride(1)
 
     out_res1 = None
     res1_row_stride = 0
@@ -149,6 +151,7 @@ def fused_rms_fp8_per_tensor_static_quant(
         HAVE_SECOND_INPUT=(inp2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
         FIRST_INPUT_OUT=output_unquantized_inp1,
+        RMSNORM_CONVERT_TO_INP1_TYPE=rmsnorm_convert_to_inp1_type,
         num_warps=num_warps,
     )
 
@@ -721,3 +724,62 @@ def fused_reduce_rms_fp8_group_quant(
     )
 
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
+
+
+def fused_silu_mul_fp8_per_tensor_static_quant(
+    inp,
+    inp_scale,
+    dtype_quant=fp8_dtype,
+    silu_convert_to_inp_type=False,
+):
+    """
+    This op contains two steps:
+        1. compute the silu mul operations
+        2. perform fp8 quantization for inp1 only
+
+    Key parameters:
+    - x: Matrix X with shape (M, 2 * N).
+
+    Returns:
+    - out_fp8: The output matrix with shape (M, N).
+    """
+    M, N2 = inp.shape
+    assert N2 % 2 == 0
+    N = N2 // 2
+    BLOCK_SIZE_N = triton.next_power_of_2(N)
+
+    out_fp8 = torch.empty((M, N), dtype=dtype_quant, device=inp.device)
+
+    if BLOCK_SIZE_N <= 512:
+        num_warps = 1
+    elif BLOCK_SIZE_N <= 2048:
+        num_warps = 4
+    elif BLOCK_SIZE_N <= 4096:
+        num_warps = 8
+    else:
+        num_warps = 16
+
+    DTYPE_MAX = (
+        torch.finfo(out_fp8.dtype).max
+        if torch.is_floating_point(out_fp8)
+        else torch.iinfo(out_fp8.dtype).max
+    )
+
+    _fused_silu_mul_fp8_per_tensor_static_quant_kernel[(M,)](
+        inp,
+        out_fp8,
+        inp_scale,
+        M,
+        N,
+        inp.stride(0),
+        inp.stride(1),
+        out_fp8.stride(0),
+        out_fp8.stride(1),
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        DTYPE_MAX=DTYPE_MAX,
+        DTYPE_MIN=-DTYPE_MAX,
+        SILU_CONVERT_TO_INP_TYPE=silu_convert_to_inp_type,
+        num_warps=num_warps,
+    )
+
+    return out_fp8

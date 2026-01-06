@@ -157,19 +157,31 @@ def run_top_k_per_row_decode(
     numRows: int,
     stride0: int,
     stride1: int,
+    fast: bool,
 ) -> None:
     """
     Run the top_k_per_row kernel.
     """
-    return aiter.top_k_per_row_decode(
-        logits,
-        next_n,
-        seqLens,
-        indices,
-        numRows,
-        stride0,
-        stride1,
-    )
+    if fast:
+        return aiter.top_k_per_row_decode_fast(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+        )
+    else:
+        return aiter.top_k_per_row_decode(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+        )
 
 
 @benchmark()
@@ -231,6 +243,7 @@ def test_top_k_per_row_decode(
     top_k: int,
     next_n: int,
     data_generation: str = "random",
+    fast: bool = False,
 ) -> dict:
     """
     Test top_k_per_row_decode with seq_lens tensor.
@@ -262,6 +275,7 @@ def test_top_k_per_row_decode(
         num_rows,
         logits.stride(0),
         logits.stride(1),
+        fast,
     )
 
     torch.cuda.synchronize()
@@ -282,6 +296,7 @@ def test_top_k_per_row_decode(
     ret["context_len"] = logits.shape[1]
     ret["all_close"] = all_close
     ret["us"] = us
+    ret["fast"] = fast
     return ret
 
 
@@ -361,7 +376,8 @@ for data_generation in args.data_generation:
                 df.append(ret)
 
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary for top_k_per_row_prefill kernel:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
 
 
 df = []
@@ -370,8 +386,13 @@ for data_generation in args.data_generation:
         for ctx in args.context_len:
             for k in args.top_k:
                 for n in args.next_n:
-                    ret = test_top_k_per_row_decode(m, ctx, k, n, data_generation)
+                    ret = test_top_k_per_row_decode(
+                        m, ctx, k, n, data_generation, False
+                    )
+                    df.append(ret)
+                    ret = test_top_k_per_row_decode(m, ctx, k, n, data_generation, True)
                     df.append(ret)
 
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)

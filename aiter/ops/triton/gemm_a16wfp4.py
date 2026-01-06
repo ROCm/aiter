@@ -4,10 +4,9 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton._triton_kernels.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
     _get_config,
@@ -18,34 +17,55 @@ from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
 from aiter.ops.triton.gemm_afp4wfp4 import (
     get_splitk,
 )
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 _LOGGER = AiterTritonLogger()
 
 
-def gemm_a16wfp4(
-    x,
-    w,
-    w_scales,
-    atomic_add: bool = False,
-    dtype: Optional[float] = torch.bfloat16,
+def gemm_a16wfp4_fake_tensor(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    atomic_add: Optional[bool] = False,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-):
-    """
-    Computes the matmul Y = X x W
-    W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
-    Every 32 elements in the K dimension share one e8m0 scale.
-    X gets quantized to the microscale fp4 (mxfp4) format before the GEMM.
+    config: Optional[str] = None,
+) -> torch.Tensor:
+    if y is None:
+        M, _ = x.shape
+        N, _ = w.shape
+        return torch.zeros((M, N), dtype=dtype, device=x.device)
+    return y
 
+
+@torch_compile_guard(gen_fake=gemm_a16wfp4_fake_tensor)
+def gemm_a16wfp4_(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    atomic_add: Optional[bool] = False,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+) -> torch.Tensor:
+    """
+    Computes matrix multiplication Y = X @ W^T with BF16 activations and FP4 weights.
 
     Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - W_scales: Matrix with shape (N, K // 32)
+        x (torch.Tensor): BF16/FP16 input matrix X with shape (M, K).
+            Quantized to MXFP4 on-the-fly during GEMM.
+        w (torch.Tensor): FP4 E2M1 weight matrix W with shape (N, K//2).
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N, K//32).
+            One scale per 32 elements in K dimension.
+        atomic_add (Optional[bool]): use atomic_add for reduction
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[str]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        y (torch.Tensor): Output with shape (M, N).
     """
 
     _LOGGER.info(
@@ -61,7 +81,9 @@ def gemm_a16wfp4(
     w = w.T
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
+    else:
+        config = deserialize_str(config)
 
     if y is None:
         if atomic_add:
@@ -149,3 +171,16 @@ def gemm_a16wfp4(
         )
 
     return y
+
+
+def gemm_a16wfp4(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    atomic_add: Optional[bool] = False,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+) -> torch.Tensor:
+    config_hashable = serialize_dict(config) if config else None
+    return gemm_a16wfp4_(x, w, w_scales, atomic_add, dtype, y, config_hashable)

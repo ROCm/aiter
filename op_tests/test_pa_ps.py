@@ -581,8 +581,8 @@ def test_pa_mtp(
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
                 context_lens=seq_lens_kv,
-                K_QScale=k_scale_,
-                V_QScale=v_scale_,
+                K_QScale=k_scale_asm,
+                V_QScale=v_scale_asm,
                 work_indptr=work_indptr,
                 work_info=work_info,
                 reduce_indptr=reduce_indptr,
@@ -604,8 +604,8 @@ def test_pa_mtp(
                 seq_lens_kv,
                 block_tables.size(1),
                 max_qlen,
-                k_scale=k_scale_,
-                v_scale=v_scale_,
+                k_scale=k_scale_asm,
+                v_scale=v_scale_asm,
                 qo_indptr=qo_indptr,
             ),
             num_runs=10,
@@ -650,8 +650,8 @@ def test_pa_mtp(
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             context_lens=seq_lens_kv,
-            K_QScale=k_scale_,
-            V_QScale=v_scale_,
+            K_QScale=k_scale_asm,
+            V_QScale=v_scale_asm,
             work_indptr=work_indptr,
             work_info=work_info,
             reduce_indptr=reduce_indptr,
@@ -855,5 +855,6 @@ for dtype in l_dtype:
         )
         df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
     df.to_csv("pa_ps.csv")

@@ -1792,7 +1792,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_sml_(const int K,
                                                                     const int CuCount)
 {
     using scalar8 = __attribute__((__vector_size__((A_CHUNK / 4) * sizeof(float)))) float;
-    using intx2   = __attribute__((__vector_size__(2 * sizeof(int)))) int;
     using intx4   = __attribute__((__vector_size__(4 * sizeof(int)))) int;
     union bigType
     {
@@ -2014,7 +2013,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_(const int K,
                                                                 const int CuCount)
 {
     using scalar8 = __attribute__((__vector_size__((A_CHUNK / 4) * sizeof(float)))) float;
-    using intx2   = __attribute__((__vector_size__(2 * sizeof(int)))) int;
     using intx4   = __attribute__((__vector_size__(4 * sizeof(int)))) int;
     union bigType
     {

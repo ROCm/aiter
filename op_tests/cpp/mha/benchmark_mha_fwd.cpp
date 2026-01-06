@@ -119,7 +119,9 @@ auto create_args(int argc, char* argv[])
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
         .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel")
-        .insert("is_v3_check", "0", "if set to 1, check whether the input scenarios is supported by the asm kernel.");
+        .insert("is_v3_check",
+                "0",
+                "if set to 1, check whether the input scenarios is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -962,8 +964,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.max_seqlen_q = max_seqlen_q;
 
             args.scale_s = scale_s;
-            args.scale_p = scale_p;
-            args.scale_o = scale_o;
 
             args.logits_soft_cap = logits_soft_cap;
 
@@ -981,7 +981,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.window_size_right = mask.right;
             args.mask_type         = static_cast<ck_tile::index_t>(mask.type);
 
-            if constexpr(std::is_same_v<fmha_fwd_args, std::decay_t<decltype(args)>>)
+            if constexpr(std::is_same_v<aiter::mha_fwd_args, std::decay_t<decltype(args)>>)
             {
                 args.rand_val_ptr = randval_buf.GetDeviceBuffer();
 
@@ -1000,6 +1000,15 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 {
                     args.drop_seed_offset = std::make_pair(drop_seed, drop_offset);
                 }
+                args.use_asm_v3      = fwd_v3;
+                args.how_v3_bf16_cvt = v3_bf16_cvt;
+                args.v3_api_check    = is_v3_check;
+                args.data_type       = data_type;
+                args.is_group_mode   = (mode == mode_enum::group);
+                args.bias_type       = static_cast<int>(bias.type);
+                args.has_lse         = lse;
+                args.qscale_type     = static_cast<int>(quant_scale_enum::no_scale);
+                args.has_sink        = false;
             }
             else if constexpr(std::is_same_v<fmha_fwd_splitkv_args, std::decay_t<decltype(args)>>)
             {
@@ -1046,18 +1055,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
 #endif
         aiter::mha_fwd_args fmha_args;
         init_args(fmha_args);
-        return aiter::mha_fwd(fmha_args,
-                              stream_config,
-                              data_type,
-                              mode == mode_enum::group,
-                              mask.type,
-                              bias.type,
-                              lse,
-                              fwd_v3,
-                              v3_bf16_cvt,
-                              nullptr,
-                              nullptr,
-                              is_v3_check);
+        return aiter::mha_fwd(fmha_args, stream_config);
     }();
 
     if(fwd_ave_time < 0.0f)
