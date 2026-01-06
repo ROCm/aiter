@@ -75,6 +75,9 @@ __device__ __forceinline__ float silu_kernel(const T& x)
 template <typename T>
 __device__ __forceinline__ float gelu_kernel(const T& x)
 {
+    // Equivalent to PyTorch GELU with 'none' approximation.
+    // Refer to:
+    // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
     const float f         = ck_tile::type_convert<float>(x);
     constexpr float ALPHA = M_SQRT1_2;
     return f * 0.5f * (1.0f + ::erf(f * ALPHA));
@@ -83,6 +86,9 @@ __device__ __forceinline__ float gelu_kernel(const T& x)
 template <typename T>
 __device__ __forceinline__ float gelu_tanh_kernel(const T& x)
 {
+    // Equivalent to PyTorch GELU with 'tanh' approximation.
+    // Refer to:
+    // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L25-L30
     const float f         = ck_tile::type_convert<float>(x);
     constexpr float BETA  = M_SQRT2 * M_2_SQRTPI * 0.5f;
     constexpr float KAPPA = 0.044715;
@@ -434,43 +440,43 @@ static constexpr int nextPow2(unsigned int num)
     }
 
 // Launch fused activation+mul+quant kernel
-#define LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(KERNEL, DTYPE_O)                            \
-    int d = input.size(-1) / 2;                                                                 \
-    int64_t num_tokens = input.numel() / input.size(-1);                                        \
-    int vec_size = nextPow2(d / 64);                                                            \
+#define LAUNCH_FUSED_ACT_MUL_PER_TOKEN_QUANT_KERNEL(KERNEL, DTYPE_O)                           \
+    int d = input.size(-1) / 2;                                                                \
+    int64_t num_tokens = input.numel() / input.size(-1);                                       \
+    int vec_size = nextPow2(d / 64);                                                           \
     vec_size = vec_size < 2 ? 2 : vec_size;                                                    \
     if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>) {                                  \
         vec_size = vec_size < 4 ? 4 : vec_size;                                                \
-    }                                                                                           \
+    }                                                                                          \
     vec_size = vec_size > max_vec_size ? max_vec_size : vec_size;                              \
-    int num_wave = nextPow2(d / 64 / vec_size);                                                 \
+    int num_wave = nextPow2(d / 64 / vec_size);                                                \
     num_wave = num_wave > max_wave_num ? max_wave_num : num_wave;                              \
-    dim3 grid(num_tokens);                                                                      \
-    dim3 block(num_wave * 64);                                                                  \
+    dim3 grid(num_tokens);                                                                     \
+    dim3 block(num_wave * 64);                                                                 \
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));          \
-    const hipStream_t stream = at::hip::getCurrentHIPStream();                                  \
+    const hipStream_t stream = at::hip::getCurrentHIPStream();                                 \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "fused_act_mul_quant_kernel", [&] {   \
         using input_dtype = typename t2ck<scalar_t>::type;                                     \
-        auto align_up = [](size_t x, size_t a) { return (x + (a - 1)) & ~(a - 1); };            \
-        const int oob_smem = (d + vec_size - 1) / vec_size * vec_size;                          \
-        const size_t r_bytes = static_cast<size_t>(oob_smem) * sizeof(input_dtype);             \
-        const size_t smem_bytes = align_up(r_bytes, alignof(float)) +                           \
+        auto align_up = [](size_t x, size_t a) { return (x + (a - 1)) & ~(a - 1); };           \
+        const int oob_smem = (d + vec_size - 1) / vec_size * vec_size;                         \
+        const size_t r_bytes = static_cast<size_t>(oob_smem) * sizeof(input_dtype);            \
+        const size_t smem_bytes = align_up(r_bytes, alignof(float)) +                          \
                                   static_cast<size_t>(num_wave) * sizeof(float);               \
-        hipDeviceProp_t prop;                                                                    \
-        int dev = 0;                                                                             \
-        HIP_CHECK(hipGetDevice(&dev));                                                           \
-        HIP_CHECK(hipGetDeviceProperties(&prop, dev));                                           \
-        const bool use_cache = smem_bytes <= prop.sharedMemPerBlock;                             \
-        AITER_DISPATCH_CASE_VEC_SIZE_TRIMMED(                                                \
-            vec_size,                                                                       \
-            (use_cache                                                                        \
-                    ? aiter::fused_act_mul_pt_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE> \
+        hipDeviceProp_t prop;                                                                  \
+        int dev = 0;                                                                           \
+        HIP_CHECK(hipGetDevice(&dev));                                                         \
+        HIP_CHECK(hipGetDeviceProperties(&prop, dev));                                         \
+        const bool use_cache = smem_bytes <= prop.sharedMemPerBlock;                           \
+        AITER_DISPATCH_CASE_VEC_SIZE_TRIMMED(                                                  \
+            vec_size,                                                                          \
+            (use_cache                                                                         \
+                    ? aiter::fused_act_mul_pt_quant_kernel_cached<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>   \
                     : aiter::fused_act_mul_pt_quant_kernel_nocache<input_dtype, DTYPE_O, KERNEL<input_dtype>, VEC_SIZE>) \
-            <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                           \
-                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                  \
-                scales.data_ptr<float>(),                                                   \
-                reinterpret_cast<input_dtype*>(input.data_ptr()),                           \
-                d);)                                                                        \
+            <<<grid, block, use_cache ? smem_bytes : 0, stream>>>(                             \
+                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                    \
+                scales.data_ptr<float>(),                                                      \
+                reinterpret_cast<input_dtype*>(input.data_ptr()),                              \
+                d);)                                                                           \
     });
 
 namespace aiter {

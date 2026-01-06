@@ -163,6 +163,13 @@ if __name__ == "__main__":
             (1024, 4096, dtypes.bf16, dtypes.fp8),
             (32, 11008, dtypes.bf16, dtypes.fp8),
             (128, 11008, dtypes.bf16, dtypes.fp8),
+            (1024, 11008, dtypes.bf16, dtypes.fp8),
+            (32, 14784, dtypes.bf16, dtypes.fp8),
+            (128, 14784, dtypes.bf16, dtypes.fp8),
+            (1024, 14784, dtypes.bf16, dtypes.fp8),
+            (32, 29568, dtypes.bf16, dtypes.fp8),
+            (128, 29568, dtypes.bf16, dtypes.fp8),
+            (1024, 29568, dtypes.bf16, dtypes.fp8),
             (32, 4096, dtypes.fp16, torch.int8),
             (128, 4096, dtypes.fp16, torch.int8),
         ]
@@ -188,6 +195,7 @@ if __name__ == "__main__":
         print("=" * 80)
 
         benchmark_configs = [
+            # (num_tokens, intermediate_size)
             (32, 4096),
             (64, 4096),
             (128, 4096),
@@ -198,6 +206,12 @@ if __name__ == "__main__":
             (32, 11008),
             (128, 11008),
             (1024, 11008),
+            (32, 14784),
+            (128, 14784),
+            (1024, 14784),
+            (32, 29568),
+            (128, 29568),
+            (1024, 29568),
         ]
 
         activations = ["silu", "gelu", "gelu_tanh"]
