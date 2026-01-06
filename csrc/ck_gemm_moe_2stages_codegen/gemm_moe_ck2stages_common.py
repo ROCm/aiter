@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 import os
 import sys
@@ -180,6 +180,7 @@ a8w8_gemm1_kernels_list= {
 a8w8_gemm1_blockscale_kernels_list= {
      1: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
      0: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
+     2: kernelInstanceGEMM1(       128,       16,        128,       128,     1,       2,        1,),
      #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
 }
 
@@ -299,6 +300,7 @@ a8w8_gemm2_kernels_list= {
 a8w8_gemm2_blockscale_kernels_list= {
      0: kernelInstanceGEMM2(       256,       16,        128,       256,     1,       4,        1,),
      1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
+     2: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
      #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
 }
 
