@@ -27,6 +27,12 @@ def matmul_launch_metadata(grid, kernel, args):
 
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
+    gindx = args.get("GatherIndx", None)
+    # sindx = args.get("WriteBackIndx", None)
+    if gindx is not None:
+        ret["name"] += "_moe1"
+    else:
+        ret["name"] += "_moe2"
     if args["B"] is not None:
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
@@ -141,7 +147,6 @@ def _reduce_grouped(
     BLOCK_N: tl.constexpr,
     EVEN_N: tl.constexpr,
 ):
-
     pid_t = tl.program_id(1)
     pid_n = tl.program_id(0)
 
@@ -309,7 +314,6 @@ def _moe_gemm_a4w4(
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
 ):
-
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
     tl.assume(stride_y_n >= 0)
