@@ -1,10 +1,30 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
+#include <cmath>
+#include <functional>
+#include <unordered_map>
+
+#include <torch/extension.h>
+
 #include "gemm_a8w8_blockscale_common_legacy.cuh"
-#include "gemm_a8w8_blockscale_common_tune.h"
 #include "gemm_a8w8_blockscale_lookup_legacy.h"
 #include "gemm_a8w8_blockscale_manifest_legacy.h"
+
+// Helper function to return the next largest power of 2
+static constexpr int nextPow2(unsigned int num)
+{
+    if(num <= 1)
+        return 1;
+    return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
+}
+
+using BlockwiseKernel = std::function<torch::Tensor(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+
+// For certain high priority shapes, we directly use the best kernel rather
+// than use heuristics.
+using BlockwiseKernelMap = std::unordered_map<int, BlockwiseKernel>;
 
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockwise_dispatch_legacy(int id)
