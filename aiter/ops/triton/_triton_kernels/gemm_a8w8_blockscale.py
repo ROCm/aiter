@@ -197,9 +197,6 @@ def _gemm_a8w8_blockscale_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
-            # k_cur = k * BLOCK_SIZE_K // GROUP_K
-            # k_nxt = (k + 1) * BLOCK_SIZE_K // GROUP_K
-            # offs_ks = k_nxt - k_cur
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
@@ -348,7 +345,9 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         offs_k_shuffle = pid_k * SPLITK_BLOCK_SIZE * 16 + offs_k_shuffle_arr
 
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % N
+        offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % (
+            N // 16
+        )
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
@@ -357,7 +356,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         )
 
         # Create pointers for the scales
-        offs_bsn = (pid_n * (BLOCK_SIZE_N) + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_bsn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
@@ -392,9 +391,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
                     1,
                     BLOCK_SIZE_N // 16,
                     BLOCK_SIZE_K // 32,
-                    # BLOCK_SIZE_K // 64,
                     2,
-                    # 4,
                     16,
                     16,
                 )
@@ -417,9 +414,6 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * 16 * stride_bk
 
-            # k_cur = k * BLOCK_SIZE_K // GROUP_K
-            # k_nxt = (k + 1) * BLOCK_SIZE_K // GROUP_K
-            # offs_ks = k_nxt - k_cur
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
