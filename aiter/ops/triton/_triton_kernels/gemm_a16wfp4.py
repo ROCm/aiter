@@ -138,8 +138,6 @@ def _gemm_a16wfp4_kernel(
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             b_scales = tl.load(b_scale_ptrs)
-            # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
-            # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -295,8 +293,6 @@ def _gemm_a16wfp4_preshuffle_kernel(
             offs_am[:, None] * stride_am + offs_k_split_bf16[None, :] * stride_ak
         )
 
-        # offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
-        # offs_k_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_k
         offs_k_shuffle_arr = tl.arange(0, (BLOCK_SIZE_K // 2) * 16)
         offs_k_shuffle = pid_k * (SPLITK_BLOCK_SIZE // 2) * 16 + offs_k_shuffle_arr
         offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % N
@@ -335,8 +331,6 @@ def _gemm_a16wfp4_preshuffle_kernel(
                 .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
             )
 
-            # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
-            # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
