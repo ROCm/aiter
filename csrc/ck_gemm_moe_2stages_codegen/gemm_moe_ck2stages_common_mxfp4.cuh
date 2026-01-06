@@ -39,7 +39,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         void*& out,                    // [max_num_tokens_padded, inter_dim]
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a1_scale, // [m, 1], token scale
-                        std::optional<int>   splitk     // splitk
+                        std::optional<int>   splitk,    // splitk
+                        std::optional<bool>   nt
 )
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -197,7 +198,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                             void*& out,                       \
                                             std::optional<void*> w1_scale,    \
                                             std::optional<void*> a1_scale,    \
-                                            std::optional<int>   splitk);
+                                            std::optional<int>   splitk,      \
+                                            std::optional<bool>   nt);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -231,7 +233,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         void*& out,                    // [m, out_dim]
                         std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
-                        std::optional<int>   splitk     // splitk
+                        std::optional<int>   splitk,   // splitk
+                        std::optional<bool>   nt
 )
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -370,4 +373,5 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         void *&out,                                                                                                                                                  \
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
-        std::optional<int>   splitk);
+        std::optional<int>   splitk,                                                                                                                                 \
+        std::optional<bool>   nt);
