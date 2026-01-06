@@ -559,22 +559,33 @@ def gemm_a8w8_blockscale(
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
-    libtype = config["libtype"] if config else None
-
-    if libtype == "ck_tile":
-        return gemm_a8w8_blockscale_ck_tile(
-            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled
-        )
-    elif libtype == "ck_legacy":
+    
+    if config is not None:
+        # config found in tuned file
+        libtype = config["libtype"]
+        if config["isBpreshuffled"] == isBpreshuffled:
+            if libtype == "ck_tile":
+                return gemm_a8w8_blockscale_ck_tile(
+                    XQ, WQ, x_scale, w_scale, Y, isBpreshuffled
+                )
+            elif libtype == "ck_legacy":
+                if isBpreshuffled:
+                    return gemm_a8w8_blockscale_bpreshuffle_ck(
+                        XQ, WQ, x_scale, w_scale, Y
+                    )
+                else:
+                    return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
+            else:
+                assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+    
+    else:
+        # default to legacy ck implementation
         if isBpreshuffled:
             return gemm_a8w8_blockscale_bpreshuffle_ck(
                 XQ, WQ, x_scale, w_scale, Y
             )
         else:
             return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
-    else:
-        assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-
 
 def flatmm_a8w8_blockscale_ASM(
     XQ: Tensor,

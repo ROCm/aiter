@@ -127,9 +127,6 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                           GemmConfig::K_Warp_Tile_v>>;
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
-    // Note: DoubleSmemBuffer_v must be true if isBpreshuffled is true
-    static_assert(!(isBpreshuffled && !GemmConfig::DoubleSmemBuffer_v),
-                  "DoubleSmemBuffer must be true when isBpreshuffled is true!");
     using GemmTraits = ck_tile::TileGemmQuantTraits<false, // kPadM_v,
                                                     PadN,
                                                     PadK,

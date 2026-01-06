@@ -303,14 +303,15 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     )
                 )
             if "both" in args.libtype or "ck_tile" in args.libtype:
-                task.extend(
-                    self.get_ck_tile_gemm_a8w8_blockscale_tune_task(
-                        info_keys,
-                        useSplitK,
-                        seed,
-                        isBpreshuffled=True,
+                for b_preshuffled in [True, False]:
+                    task.extend(
+                        self.get_ck_tile_gemm_a8w8_blockscale_tune_task(
+                            info_keys,
+                            useSplitK,
+                            seed,
+                            b_preshuffled
+                        )
                     )
-                )
 
             total_kernel_nums = len(task)
 
@@ -350,6 +351,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 {
                     "libtype": [libtype],
                     "kernelId": [kernelId],
+                    "isBpreshuffled": [isBpreshuffled],
                     "splitK": [splitK],
                     "us": [time],
                     "kernelName": [kernelName],
@@ -371,6 +373,7 @@ if __name__ == "__main__":
     resultList = [
         "libtype",
         "kernelId",
+        "isBpreshuffled",
         "splitK",
         "us",
         "kernelName",
