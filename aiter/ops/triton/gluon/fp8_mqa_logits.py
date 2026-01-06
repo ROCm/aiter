@@ -1,15 +1,15 @@
 import triton
 import triton.language as tl
 import torch
-import math
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from packaging.version import Version
 
-
-def print_irs_to_files(compiled_kernel, prefix):
-    for key in compiled_kernel.asm.keys():
-        with open(f"{prefix}_{key}.txt", "w") as fptr:
-            print(compiled_kernel.asm[key], file=fptr)
+# check whether triton version is greater than 3.6
+TRITON_VERSION = Version(triton.__version__)
+USE_MFMA_TRIPLET_INST = False
+if TRITON_VERSION >= Version("3.6"):
+    USE_MFMA_TRIPLET_INST = True
 
 
 @gluon.jit
@@ -39,13 +39,12 @@ def fp8_mqa_logits_kernel(
     BLOCK_KV: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     PRESHUFFLE_KV: gl.constexpr,
+    USE_MFMA_TRIPLET_INST: gl.constexpr,
 ):
     row_id = gl.program_id(axis=0)
     # go from larger to smaller in terms of work
     # to reduce the tail effect
     row_id = gl.num_programs(0) - row_id - 1
-    # row_id = remap_xcd(row_id, gl.num_programs(0), 8)
-    NUM_THREADS: gl.constexpr = 64
 
     layout_q: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],
@@ -60,20 +59,10 @@ def fp8_mqa_logits_kernel(
         order=[0, 1],
     )
 
-    layout_scales: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1],
-        threads_per_warp=[64],
-        warps_per_cta=[NUM_WARPS],
-        order=[0],
-    )
-    # TODO (cagri): instr_shape should be [32, 32, 16] for newer triton versions
-    # the kernel needs to be updated to support this based on the version of triton
+    # V_MFMA_F32_32x32x16_FP8_FP8 instruction
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=3,
-        instr_shape=[
-            32,
-            32,
-        ],  # V_MFMA_F32_32x32x16_FP8_FP8 instruction
+        instr_shape=[32, 32, 16] if USE_MFMA_TRIPLET_INST else [32, 32],
         transposed=False,
         warps_per_cta=[1, NUM_WARPS],
     )
@@ -93,7 +82,6 @@ def fp8_mqa_logits_kernel(
 
     # Prepare KV block load offsets
     if PRESHUFFLE_KV:
-        # TODO (cagri): double check if this is correct
         kv_block_offsets = (
             gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(1, dot_b_layout)) % 16
             + gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(1, dot_b_layout))
@@ -268,8 +256,6 @@ def fp8_mqa_logits(Q, KV, kv_scales, weights, cu_starts, cu_ends, preshuffle_kv=
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
     """
-    # TODO (cagri): double check what value to put for causally masked logits, 0 or -inf?
-    # TODO (cagri): Tune/optimize
     BLOCK_KV = 128
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
@@ -289,11 +275,7 @@ def fp8_mqa_logits(Q, KV, kv_scales, weights, cu_starts, cu_ends, preshuffle_kv=
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
 
-    matrix_instr_nonkdim = 32
-    if seq_len <= 1024:
-        matrix_instr_nonkdim = 16
-
-    k = fp8_mqa_logits_kernel[(seq_len,)](
+    fp8_mqa_logits_kernel[(seq_len,)](
         Q_ptr=Q,
         KV_ptr=KV,
         kv_scales_ptr=kv_scales,
@@ -320,10 +302,7 @@ def fp8_mqa_logits(Q, KV, kv_scales, weights, cu_starts, cu_ends, preshuffle_kv=
         num_stages=1,
         waves_per_eu=4,
         PRESHUFFLE_KV=preshuffle_kv,
-        # matrix_instr_nonkdim=matrix_instr_nonkdim,
+        USE_MFMA_TRIPLET_INST=USE_MFMA_TRIPLET_INST,
     )
 
-    if getattr(fp8_mqa_logits, "print", True):
-        setattr(fp8_mqa_logits, "print", False)
-        print_irs_to_files(k, "fp8_mqa_logits_single_q_3_5_gluon")
     return logits

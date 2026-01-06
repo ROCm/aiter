@@ -4,6 +4,7 @@ import pytest
 from typing import Tuple
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.gluon.fp8_mqa_logits import fp8_mqa_logits as fp8_mqa_logits_gluon
 from aiter.ops.shuffle import shuffle_weight
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -89,8 +90,9 @@ def generate_cp_test_data(seq_len, seq_len_kv):
 @pytest.mark.parametrize("num_heads", [64, 32])
 @pytest.mark.parametrize("head_dim", [128, 64])
 @pytest.mark.parametrize("disable_cp", [True, False])
-@pytest.mark.parametrize("randomize", [False, True])
 @pytest.mark.parametrize("preshuffle_kv", [True, False])
+@pytest.mark.parametrize("use_gluon", [True, False])
+@pytest.mark.parametrize("randomize", [True, False])
 @torch.inference_mode()
 def test_fp8_mqa_logits(
     s_q: int,
@@ -99,9 +101,13 @@ def test_fp8_mqa_logits(
     head_dim: int,
     disable_cp: bool,
     preshuffle_kv: bool,
+    use_gluon: bool,
     randomize: bool,
 ) -> None:
     torch.manual_seed(0)
+    # only gluon kernel supports preshuffling for now
+    if not use_gluon and preshuffle_kv:
+        pytest.skip()
     if s_q > s_k:
         pytest.skip()
     # TODO (cagri): Check this one later
@@ -134,9 +140,12 @@ def test_fp8_mqa_logits(
     )
     if preshuffle_kv:
         kv_fp8 = shuffle_weight(kv_fp8)
-    logits = fp8_mqa_logits(
-        q_fp8, kv_fp8, scales, weights, ks, ke, preshuffle_kv=preshuffle_kv
-    )
+    if use_gluon:
+        logits = fp8_mqa_logits_gluon(
+            q_fp8, kv_fp8, scales, weights, ks, ke, preshuffle_kv=preshuffle_kv
+        )
+    else:
+        logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
 
     ref_neginf_mask = ref_logits == float("-inf")
     neginf_mask = logits == float("-inf")
