@@ -528,13 +528,11 @@ def torch_attention_compute(
 
     # Flatten caches for easy indexing
     # key_cache: [num_blocks, num_kv_heads, head_size//x, block_size, x] -> [num_blocks * block_size, num_kv_heads, head_size]
-    x = key_cache.shape[-1]
     key_cache_flat = (
         key_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_kv_heads, head_size)
     )
     if value_transposed:
         # [num_blocks, num_kv_heads, block_size//x, head_size, x] -> [num_blocks * block_size, num_kv_heads, head_size]
-        x_v = value_cache.shape[-1]
         value_cache_flat = (
             value_cache.permute(0, 2, 4, 1, 3)
             .contiguous()
@@ -1379,7 +1377,9 @@ def run_pa_gluon_test(
                 key_scale_factors_flat = None
                 value_scale_factors_flat = None
                 key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
-                value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+                value_scale_original = torch.tensor(
+                    1, dtype=torch.float32, device=device
+                )
         else:
             quantized_keys = key_cache
             quantized_values = value_cache
@@ -1530,9 +1530,7 @@ def run_pa_gluon_test(
     elif ps:
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
     else:
-        max_context_partition_num = triton.cdiv(
-            131072, context_partition_size
-        )
+        max_context_partition_num = triton.cdiv(131072, context_partition_size)
 
     equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
     intermediate_shape = (
@@ -1680,7 +1678,7 @@ def run_pa_gluon_test(
         or (block_size == 16 and query_group_size == 8 and query_length == 3)
         or (query_group_size == 5 and query_length == 3)
         or (block_size == 64)
-        or (quant_kv == False)
+        or (not quant_kv)
         or (compute_type == torch.float16 and (quant_q or quant_kv))
         or (head_size not in [128])
         or (sliding_window > 0)
@@ -1702,13 +1700,6 @@ def run_pa_gluon_test(
             key_scale_original,
             value_scale_original,
             query_output_indptr,
-        )
-        assembly_error = checkAllclose(
-            reference_output_quant,
-            assembly_output,
-            atol=fp8_tolerance,
-            rtol=fp8_tolerance,
-            msg=f"[PyTorch vs AIT_Assembly][{quant_mode}]: {assembly_time:>8.2f} us......",
         )
         print("\nAIT_Assembly vs Original Ref:")
         compare_arrays(

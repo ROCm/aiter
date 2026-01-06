@@ -1551,7 +1551,9 @@ def paged_attention_decode_sliding_window(
     if SLIDING_WINDOW > 0:
         sequence_start_idx = context_length - SLIDING_WINDOW
         sequence_end_idx = context_length
-        sequence_partition_start_idx = gl.maximum(0, sequence_start_idx // CONTEXT_PARTITION_SIZE)
+        sequence_partition_start_idx = gl.maximum(
+            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
+        )
         sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
     else:
         page_size = gl.cdiv(context_length, gl.num_programs(2))
@@ -1775,13 +1777,21 @@ def paged_attention_decode_sliding_window(
                 sequence_position_extension[:, None] + qk_column_offsets[None, :]
                 < sequence_end_idx
             )
-            causal_mask = causal_mask & (sequence_position_extension[:, None] + qk_column_offsets[None, :] >= sequence_start_idx)
+            causal_mask = causal_mask & (
+                sequence_position_extension[:, None] + qk_column_offsets[None, :]
+                >= sequence_start_idx
+            )
         else:
             causal_mask = qk_column_offsets[None, :] < sequence_end_idx
             if SLIDING_WINDOW > 0:
-                causal_mask = causal_mask & (qk_column_offsets[None, :] >= sequence_start_idx + query_token_idx[:, None] + 1)
+                causal_mask = causal_mask & (
+                    qk_column_offsets[None, :]
+                    >= sequence_start_idx + query_token_idx[:, None] + 1
+                )
             else:
-                causal_mask = causal_mask & (qk_column_offsets[None, :] >= sequence_start_idx)
+                causal_mask = causal_mask & (
+                    qk_column_offsets[None, :] >= sequence_start_idx
+                )
 
         boundary_mask = boundary_mask & causal_mask
 
@@ -3571,7 +3581,11 @@ def pa_decode_gluon(
             query_scale_stride_0 = query_scale.stride(0)
 
     # Configure KV quantization
-    if key_scale is not None and value_scale is not None and key_cache.dtype == aiter.dtypes.fp8:
+    if (
+        key_scale is not None
+        and value_scale is not None
+        and key_cache.dtype == aiter.dtypes.fp8
+    ):
         assert (
             isinstance(key_scale, torch.Tensor) and key_scale.dtype == aiter.dtypes.fp32
         ), f"key_scale tensor only support dtype == {aiter.dtypes.fp32}, but got key_scale.dtype == {key_scale.dtype}"
@@ -3634,12 +3648,8 @@ def pa_decode_gluon(
         exp_sums.stride(0),
         exp_sums.stride(1),
         exp_sums.stride(2),
-        (output_gluon if one_shot else temporary_output).stride(
-            0
-        ),
-        (output_gluon if one_shot else temporary_output).stride(
-            1
-        ),
+        (output_gluon if one_shot else temporary_output).stride(0),
+        (output_gluon if one_shot else temporary_output).stride(1),
         temporary_output.stride(2),
         temporary_output.stride(3),
         query_gluon.stride(0),
