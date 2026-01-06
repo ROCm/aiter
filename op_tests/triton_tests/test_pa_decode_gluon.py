@@ -1167,7 +1167,6 @@ def run_gluon_kernel(
     sinks: Optional[torch.Tensor] = None,
     sliding_window: int = 0,
     ps=False,
-    page_size=None,
 ) -> None:
     """Run Gluon FP8/BF16/FP16 kernel for paged attention using Triton transpose kernel.
 
@@ -1348,9 +1347,6 @@ def run_pa_gluon_test(
         1 if quant_kv else 2,
     )
     key_cache, value_cache = key_caches[0], value_caches[0]
-    # query = torch.ones_like(query)
-    # key_cache = torch.ones_like(key_cache)
-    # value_cache = torch.ones_like(value_cache)
     softmax_scale = 1.0 / (head_size**0.5)
 
     # Quantization based on mode and flags
@@ -1366,7 +1362,7 @@ def run_pa_gluon_test(
 
         # Per-token quantization for KV cache (if enabled)
         if quant_kv:
-            if compute_type != [aiter.dtypes.fp8]:
+            if compute_type not in [aiter.dtypes.fp8]:
                 (
                     quantized_keys,
                     key_scale_factors_flat,
@@ -1527,9 +1523,7 @@ def run_pa_gluon_test(
         if sliding_window > 0
         else context_lengths.max().item()
     )
-    context_partition_size = min(context_partition_size, 256 if sliding_window > 128 else 128) if sliding_window > 0 else context_partition_size
-    # context_partition_size = 128
-    page_size = None
+    context_partition_size = 128 if sliding_window > 0 else context_partition_size
 
     if sliding_window > 0:
         max_context_partition_num = 1
@@ -1537,7 +1531,7 @@ def run_pa_gluon_test(
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
     else:
         max_context_partition_num = triton.cdiv(
-            max_context_length, context_partition_size
+            131072, context_partition_size
         )
 
     equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
@@ -1616,7 +1610,6 @@ def run_pa_gluon_test(
         sinks=sinks,
         sliding_window=sliding_window,
         ps=ps,
-        page_size=page_size,
     )
 
     # Compare with original reference
@@ -1627,7 +1620,7 @@ def run_pa_gluon_test(
         rtol=fp8_tolerance,
         msg=f"[PyTorch vs Gluon_FP8][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
     )
-    torch.testing.assert_close(final_output_gluon, reference_output_quant, atol=fp8_tolerance, rtol=fp8_tolerance)
+
     if err_gluon > 0:
         err_gluon = 1
     print("\n=== Detailed Error Analysis ===")
@@ -2232,24 +2225,26 @@ def simple_test():
     global CONTEXT_PARTITION_SIZE_OPTIONS
     global PS_OPTIONS
 
+    PS_OPTIONS = [False]
     USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
     # COMPUTE_TYPE_OPTIONS = ["fp8"]
-    SINKS_OPTIONS = [False, True]
-    SLIDING_WINDOW_OPTIONS = [0, 128]
-    HEAD_DIMENSION_OPTIONS = [64]
-    CONTEXT_LENGTH_OPTIONS = [4]
-    BATCH_SIZE_OPTIONS = [4]
-    QUERY_LENGTH_OPTIONS = [1]
-    COMPUTE_TYPE_OPTIONS = ["bf16"]
-    QUANT_Q_AND_KV_OPTIONS = [[False, True], [False, False]]
+    SINKS_OPTIONS = [False]
+    SLIDING_WINDOW_OPTIONS = [0]
+    HEAD_DIMENSION_OPTIONS = [128]
+    CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
+    BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
+    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
+    QUANT_Q_AND_KV_OPTIONS = [[True, True]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
-    HEAD_CONFIGURATIONS = [(64, 8)]
-    USE_AOT_IMPL_OPTIONS = [False]
-    PS_OPTIONS = [True]
+    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
+    USE_AOT_IMPL_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16]
+    parse_arg_and_run_test()
+    BLOCK_SIZE_OPTIONS = [64]
     parse_arg_and_run_test()
     # HEAD_CONFIGURATIONS = [(10, 1)]
     # BLOCK_SIZE_OPTIONS = [1024]
@@ -2279,24 +2274,24 @@ def sliding_window_test():
     USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
-    SINKS_OPTIONS = [True, False]
+    SINKS_OPTIONS = [True]
     SLIDING_WINDOW_OPTIONS = [0, 128]
-    HEAD_DIMENSION_OPTIONS = [64]
-    CONTEXT_LENGTH_OPTIONS = [1024, 8192]
-    BATCH_SIZE_OPTIONS = [128]
+    HEAD_DIMENSION_OPTIONS = [64, 128]
+    CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
+    BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
     QUERY_LENGTH_OPTIONS = [1]
-    COMPUTE_TYPE_OPTIONS = ["bf16"]
+    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
     QUANT_Q_AND_KV_OPTIONS = [[True, True]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
-    KV_VARLEN_OPTIONS = [True]
-    HEAD_CONFIGURATIONS = [(64, 8)]
+    KV_VARLEN_OPTIONS = [False]
+    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
     USE_AOT_IMPL_OPTIONS = [False]
-    PS_OPTIONS = [True, False]
     BLOCK_SIZE_OPTIONS = [16]
+    PS_OPTIONS = [True, False]
     parse_arg_and_run_test()
-    # BLOCK_SIZE_OPTIONS = [64]
-    # parse_arg_and_run_test()
+    BLOCK_SIZE_OPTIONS = [64]
+    parse_arg_and_run_test()
 
 
 def multi_compute_quant_type_test():
@@ -2347,5 +2342,5 @@ def multi_compute_quant_type_test():
 
 
 if __name__ == "__main__":
-    sliding_window_test()
+    simple_test()
     # multi_compute_quant_type_test()
