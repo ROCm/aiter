@@ -1565,6 +1565,16 @@ namespace py = pybind11;
           py::arg("numRows"),          \
           py::arg("stride0"),          \
           py::arg("stride1"));         \
+      m.def("top_k_per_row_prefill_fast", \
+            &top_k_per_row_prefill_fast,  \
+            py::arg("logits"),       \
+            py::arg("rowStarts"),    \
+            py::arg("rowEnds"),      \
+            py::arg("indices"),      \
+            py::arg("values"),       \
+            py::arg("numRows"),      \
+            py::arg("stride0"),      \
+            py::arg("stride1"));     \
     m.def("top_k_per_row_decode",      \
           &top_k_per_row_decode,       \
           py::arg("logits"),           \

@@ -3,62 +3,47 @@
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
-_gemm_a8w8_blockscale_repr = make_kernel_repr(
-    "_gemm_a8w8_blockscale_kernel",
+
+_fused_gemm_a8w8_blockscale_mul_add_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_mul_add_kernel",
     [
-        "GROUP_K",
-        "GROUP_N",
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
-        "NUM_KSPLIT",
-        "SPLITK_BLOCK_SIZE",
-        "EVEN_K",
-        "GRID_MN",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
         "cache_modifier",
-    ],
-)
-
-
-_gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
-    "_gemm_a8w8_blockscale_reduce_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "ACTUAL_KSPLIT",
-        "MAX_KSPLIT",
+        "NUM_KSPLIT",
     ],
 )
 
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "EVEN_K": lambda args: (args["K"] % args["BLOCK_SIZE_K"] == 0)
+        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
+        and (args["K"] % args["SPLITK_BLOCK_SIZE"] == 0),
     }
 )
-@triton.jit(repr=_gemm_a8w8_blockscale_repr)
-def _gemm_a8w8_blockscale_kernel(
-    # Pointers to matrices
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_mul_add_repr)
+def _fused_gemm_a8w8_blockscale_mul_add_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
     a_scale_ptr,
     b_scale_ptr,
-    # Matrix dimensions
+    c_a_ptr,
+    c_b_ptr,
     M,
     N,
     K,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
     stride_am,
     stride_ak,
     stride_bk,
@@ -70,6 +55,10 @@ def _gemm_a8w8_blockscale_kernel(
     stride_ascale_k,
     stride_bscale_k,
     stride_bscale_n,
+    stride_cam,
+    stride_can,
+    stride_cbm,
+    stride_cbn,
     # Meta-parameters
     GROUP_K: tl.constexpr,
     GROUP_N: tl.constexpr,
@@ -80,39 +69,40 @@ def _gemm_a8w8_blockscale_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
+    IS_A_SCALAR: tl.constexpr,
+    IS_B_SCALAR: tl.constexpr,
+    IS_A_TENSOR: tl.constexpr,
+    IS_B_TENSOR: tl.constexpr,
+    FUSE_TYPE: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
-    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
-    below
-
-    Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
-
-    Key parameters:
-    - A: Matrix A with shape (M, K).
-    - B: Matrix B with shape (K, N).
-    - C: Matrix C with shape (M, N).
-    - A_scale: Scale tensor for A with shape (M, *scale_k).
-    - B_scale: Scale tensor for B with shape (*scale_k, **scale_n).
-
-    *scale_k = (K + GROUP_K - 1) // GROUP_K
-    **scale_n = (N + GROUP_N - 1) // GROUP_N
-
-    For this kernel implementation, GROUP_K must equal BLOCK_K.
+    Kernel for computing the matmul C = A x B.
+    A and B inputs are in the microscale fp4 (mxfp4) format.
+    A_scales and B_scales are in e8m0 format.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bk > 0)
     tl.assume(stride_bn > 0)
-    tl.assume(stride_ck > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
     tl.assume(stride_ascale_m > 0)
     tl.assume(stride_ascale_k > 0)
     tl.assume(stride_bscale_k > 0)
     tl.assume(stride_bscale_n > 0)
+    tl.assume(stride_cam > 0)
+    tl.assume(stride_can > 0)
+    tl.assume(stride_cbm > 0)
+    tl.assume(stride_cbn > 0)
+
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -124,7 +114,8 @@ def _gemm_a8w8_blockscale_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        # TODO: fix remap
+        # remap_xcd(pid, GRID_MN)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -137,11 +128,10 @@ def _gemm_a8w8_blockscale_kernel(
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
 
-        # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
-        # ^ Number of K blocks within our split-K partition
 
         # Create pointers for first block of A and B input matrices
+        # The BLOCK sizes are of the elements and in fp4 we pack 2 per uint8 container.
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
@@ -167,7 +157,7 @@ def _gemm_a8w8_blockscale_kernel(
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -177,10 +167,13 @@ def _gemm_a8w8_blockscale_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    b_ptrs,
+                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                    other=0,
+                    cache_modifier=cache_modifier,
                 )
 
             a_scale = tl.load(a_scale_ptrs)
@@ -203,25 +196,72 @@ def _gemm_a8w8_blockscale_kernel(
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
-        c = accumulator.to(c_ptr.type.element_ty)
-
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+        if NUM_KSPLIT == 1:
+            if IS_A_SCALAR and IS_A_TENSOR:
+                c_a = tl.load(c_a_ptr)
+            elif IS_A_SCALAR:
+                c_a = c_a_ptr
+            else:
+                c_a = tl.load(
+                    c_a_ptr
+                    + stride_cam * offs_cm[:, None]
+                    + stride_can * offs_cn[None, :],
+                    mask=c_mask,
+                )
+            c_a = c_a.to(tl.float32)
+
+            if IS_B_SCALAR and IS_B_TENSOR:
+                c_b = tl.load(c_b_ptr)
+            elif IS_B_SCALAR:
+                c_b = c_b_ptr
+            else:
+                c_b = tl.load(
+                    c_b_ptr
+                    + stride_cbm * offs_cm[:, None]
+                    + stride_cbn * offs_cn[None, :],
+                    mask=c_mask,
+                )
+            c_b = c_b.to(tl.float32)
+
+            if FUSE_TYPE == 0:
+                accumulator = c_a * accumulator + c_b
+            else:
+                accumulator = c_b * c_a + accumulator
+
+        c = accumulator.to(c_ptr.type.element_ty)
+
         c_ptrs = (
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
             + pid_k * stride_ck
         )
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit(repr=_gemm_a8w8_blockscale_reduce_repr)
-def _gemm_a8w8_blockscale_reduce_kernel(
+_fused_gemm_a8w8_blockscale_mul_add_reduce_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_mul_add_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
+@triton.heuristics({})  # dummy heuristics to invoke kernel re-naming
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_mul_add_reduce_repr)
+def _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
+    c_a_ptr,
+    c_b_ptr,
     M,
     N,
     stride_c_in_k,
@@ -229,23 +269,26 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     stride_c_in_n,
     stride_c_out_m,
     stride_c_out_n,
+    stride_cam,
+    stride_can,
+    stride_cbm,
+    stride_cbn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     ACTUAL_KSPLIT: tl.constexpr,
     MAX_KSPLIT: tl.constexpr,
+    IS_A_SCALAR: tl.constexpr,
+    IS_B_SCALAR: tl.constexpr,
+    IS_A_TENSOR: tl.constexpr,
+    IS_B_TENSOR: tl.constexpr,
+    FUSE_TYPE: tl.constexpr,
 ):
-
-    tl.assume(stride_c_in_k > 0)
-    tl.assume(stride_c_in_m > 0)
-    tl.assume(stride_c_in_n > 0)
-    tl.assume(stride_c_out_m > 0)
-    tl.assume(stride_c_out_n > 0)
 
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -260,9 +303,33 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     if ACTUAL_KSPLIT == MAX_KSPLIT:
         c = tl.load(c_in_ptrs)
     else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
+        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT)
     c = tl.sum(c, axis=0)
 
+    if IS_A_SCALAR and IS_A_TENSOR:
+        c_a = tl.load(c_a_ptr)
+    elif IS_A_SCALAR:
+        c_a = c_a_ptr
+    else:
+        c_a = tl.load(
+            c_a_ptr + stride_cam * offs_m[:, None] + stride_can * offs_n[None, :]
+        )
+    c_a = c_a.to(tl.float32)
+
+    if IS_B_SCALAR and IS_B_TENSOR:
+        c_b = tl.load(c_b_ptr)
+    elif IS_B_SCALAR:
+        c_b = c_b_ptr
+    else:
+        c_b = tl.load(
+            c_b_ptr + stride_cbm * offs_m[:, None] + stride_cbn * offs_n[None, :]
+        )
+    c_b = c_b.to(tl.float32)
+
+    if FUSE_TYPE == 0:
+        c = c_a * c + c_b
+    else:
+        c = c_b * c_a + c
     c = c.to(c_out_ptr.type.element_ty)
 
     c_out_ptrs = (
