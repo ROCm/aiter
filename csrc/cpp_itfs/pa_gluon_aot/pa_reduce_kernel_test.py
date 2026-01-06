@@ -326,7 +326,13 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     # Create test tensors with the provided shapes
     # Output in 5D format: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     output_5d = torch.empty(
-        (num_sequences, query_sequence_length, num_kv_heads, query_group_size, head_size),
+        (
+            num_sequences,
+            query_sequence_length,
+            num_kv_heads,
+            query_group_size,
+            head_size,
+        ),
         dtype=data_type,
         device="cuda",
     )
@@ -377,7 +383,9 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     temporary_output.uniform_(-1.0, 1.0)
 
     # Run reference implementation (needs 3D output format)
-    output_3d = output_5d.reshape(num_sequences, num_kv_heads * equivalent_query_group_size, head_size)
+    output_3d = output_5d.reshape(
+        num_sequences, num_kv_heads * equivalent_query_group_size, head_size
+    )
     reference_output = torch_reduce_compute(
         output_3d.clone(),
         exp_sums,
@@ -430,7 +438,9 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
         raise ValueError(f"Unknown kernel type: {kernel_type}")
 
     # Reshape output_5d to 3D for comparison
-    output = output_5d.reshape(num_sequences, num_kv_heads * equivalent_query_group_size, head_size)
+    output = output_5d.reshape(
+        num_sequences, num_kv_heads * equivalent_query_group_size, head_size
+    )
 
     # Compare results
     print("\n=== Comparing Results ===")

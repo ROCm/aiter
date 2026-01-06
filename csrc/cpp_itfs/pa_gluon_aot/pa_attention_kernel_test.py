@@ -149,9 +149,9 @@ def compile_attention_kernel(
     head_size_pow2 = triton.next_power_of_2(head_size)
 
     # Calculate QUERY_GROUP_SIZE_POW2 based on QUERY_SEQ_LEN and ONE_QUERY_GROUP_SIZE
-    equi_query_group_size_pow2 = triton.next_power_of_2(query_seq_len) * triton.next_power_of_2(
-        one_query_group_size
-    )
+    equi_query_group_size_pow2 = triton.next_power_of_2(
+        query_seq_len
+    ) * triton.next_power_of_2(one_query_group_size)
 
     if func_name is None:
         func_name = get_default_func_name(
@@ -569,9 +569,9 @@ def run_direct_attention_kernel(
         ), f"Key and value scales must have same shape, but got key: {key_scale.shape}, value: {value_scale.shape}"
 
     # Production path - select and launch appropriate kernel
-    equi_query_group_size_pow2 = triton.next_power_of_2(query_seq_len) * triton.next_power_of_2(
-        query_group_size
-    )
+    equi_query_group_size_pow2 = triton.next_power_of_2(
+        query_seq_len
+    ) * triton.next_power_of_2(query_group_size)
     # KV_COMPUTE_BLOCK_SIZE defaults to CONTEXT_PARTITION_SIZE (same as wrapper function)
     kv_compute_block_size = context_partition_size
     waves_per_eu = 1
@@ -666,7 +666,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
         3,
         4,
     ], f"test_attention_kernel only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
-    
+
     print(f"\n=== Testing Attention Kernel (Type: {kernel_type}) ===")
     setup_seed(123)
     device = "cuda:0"

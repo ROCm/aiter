@@ -855,7 +855,9 @@ def run_multi_pa_gluon_test(
                                                             is_causal = int(ql > 1)
 
                                                             # use_sinks for func_name (cdna_version already set at function start)
-                                                            use_sinks = 0  # Default: no sinks
+                                                            use_sinks = (
+                                                                0  # Default: no sinks
+                                                            )
 
                                                             # Calculate func_name
                                                             func_name = get_default_func_name(
@@ -870,7 +872,9 @@ def run_multi_pa_gluon_test(
                                                                     query_quant_mode,
                                                                     kv_quant_mode,
                                                                     fp8_max_value,
-                                                                    int(trans_v_mode),  # value_transposed
+                                                                    int(
+                                                                        trans_v_mode
+                                                                    ),  # value_transposed
                                                                     is_causal,
                                                                     use_sinks,
                                                                     cdna_version,

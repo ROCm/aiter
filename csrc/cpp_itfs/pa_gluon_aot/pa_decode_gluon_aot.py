@@ -129,9 +129,9 @@ def compile(
     head_size_pow2 = triton.next_power_of_2(head_size)
 
     # Calculate QUERY_GROUP_SIZE_POW2 based on QUERY_SEQ_LEN and ONE_QUERY_GROUP_SIZE
-    query_group_size_pow2 = triton.next_power_of_2(query_seq_len) * triton.next_power_of_2(
-        one_query_group_size
-    )
+    query_group_size_pow2 = triton.next_power_of_2(
+        query_seq_len
+    ) * triton.next_power_of_2(one_query_group_size)
 
     if func_name is None:
         func_name = get_default_func_name(

@@ -174,9 +174,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(
             ONE_QUERY_GROUP_SIZE
         )
-    QUERY_GROUP_SIZE_POW2: gl.constexpr = (
-        QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
-    )
+    QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
 
     # ==================== Memory Layout Definitions ====================
     # Query tensor layout - blocked for efficient memory access (2D)
@@ -440,15 +438,12 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
     )
     # Convert MTP layout indices to continuous indices for exp_sums/max_logits
-    max_logits_query_len_idx = (
-        max_logits_base_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
-    )
+    max_logits_query_len_idx = max_logits_base_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
     max_logits_group_idx_in_len = (
         max_logits_base_offsets_mtp % ONE_QUERY_GROUP_SIZE_POW2
     )
     max_logits_base_offsets = (
-        max_logits_query_len_idx * ONE_QUERY_GROUP_SIZE
-        + max_logits_group_idx_in_len
+        max_logits_query_len_idx * ONE_QUERY_GROUP_SIZE + max_logits_group_idx_in_len
     )
     max_logits_offsets = (
         sequence_idx * stride_max_logits_seq
@@ -885,9 +880,7 @@ def paged_attention_decode_sliding_window(
         ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(
             ONE_QUERY_GROUP_SIZE
         )
-    QUERY_GROUP_SIZE_POW2: gl.constexpr = (
-        QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
-    )
+    QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
 
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access (2D)
@@ -1093,9 +1086,7 @@ def paged_attention_decode_sliding_window(
     # Convert MTP layout indices to continuous indices for exp_sums/max_logits
     sinks_query_len_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
     sinks_group_idx_in_len = qk_row_offsets % ONE_QUERY_GROUP_SIZE_POW2
-    sinks_offsets = (
-        sinks_query_len_idx * ONE_QUERY_GROUP_SIZE + sinks_group_idx_in_len
-    )
+    sinks_offsets = sinks_query_len_idx * ONE_QUERY_GROUP_SIZE + sinks_group_idx_in_len
     load_sinks_mask = qk_row_mask
 
     # ==================== PROGRAM ID AND INITIALIZATION ====================
@@ -1651,9 +1642,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(
             ONE_QUERY_GROUP_SIZE
         )
-    QUERY_GROUP_SIZE_POW2: gl.constexpr = (
-        QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
-    )
+    QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
 
     K_HEAD_SIZE_SPLITS: gl.constexpr = HEAD_SIZE_POW2 // KV_16B_ELEMENT_COUNT
     MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
@@ -1954,15 +1943,12 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
     )
     # Convert MTP layout indices to continuous indices for exp_sums/max_logits
-    max_logits_query_len_idx = (
-        max_logits_base_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
-    )
+    max_logits_query_len_idx = max_logits_base_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
     max_logits_group_idx_in_len = (
         max_logits_base_offsets_mtp % ONE_QUERY_GROUP_SIZE_POW2
     )
     max_logits_base_offsets = (
-        max_logits_query_len_idx * ONE_QUERY_GROUP_SIZE
-        + max_logits_group_idx_in_len
+        max_logits_query_len_idx * ONE_QUERY_GROUP_SIZE + max_logits_group_idx_in_len
     )
     max_logits_offsets = (
         sequence_idx * stride_max_logits_seq
@@ -2432,7 +2418,10 @@ def paged_attention_decode_v2_reduce_kernel(
     if USE_SINKS:
         sink_token_values = gl.load(
             sink_token_ptr
-            + (kv_head_idx * OUTPUT_SEQ_LEN * ONE_OUTPUT_GROUP_SIZE + query_group_offsets),
+            + (
+                kv_head_idx * OUTPUT_SEQ_LEN * ONE_OUTPUT_GROUP_SIZE
+                + query_group_offsets
+            ),
             mask=query_group_mask,
         )
         global_exp_sum += gl.exp(sink_token_values - global_max)
