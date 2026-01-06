@@ -109,16 +109,16 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
     # cast to float32:
     ref = ref.to(torch.float32).detach()
     tri = tri.to(torch.float32).detach()
-    assert (
-        ref.shape == tri.shape
-    ), f"Tensors must have same size {ref.shape=} {tri.shape=}"
+    assert ref.shape == tri.shape, (
+        f"Tensors must have same size {ref.shape=} {tri.shape=}"
+    )
 
     # deal with infinite elements:
     inf_mask_ref = torch.isinf(ref)
     inf_mask_tri = torch.isinf(tri)
-    assert torch.equal(
-        inf_mask_ref, inf_mask_tri
-    ), "Tensor must have same infinite elements"
+    assert torch.equal(inf_mask_ref, inf_mask_tri), (
+        "Tensor must have same infinite elements"
+    )
     refn = torch.where(inf_mask_ref, 0, ref)
     trin = torch.where(inf_mask_tri, 0, tri)
 
@@ -227,7 +227,6 @@ def test_op(
     hbm_swizzling,
     device="cuda",
 ):
-
     if get_arch() != "gfx950":
         pytest.skip("FP4 kernels are not supported on MI300.")
     if hbm_swizzling:

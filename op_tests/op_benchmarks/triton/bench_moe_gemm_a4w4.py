@@ -69,7 +69,7 @@ def compute_roofline(
     # collect performance data
     perfs = []
     print("=========================================")
-    print(f"{out_path   }...")
+    print(f"{out_path}...")
     print("=========================================")
     for val in intensity_proxy_values:
         perf = inject_proxy_and_call(val, args, kwargs)
