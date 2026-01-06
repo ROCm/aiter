@@ -9,13 +9,13 @@ import argparse
 import random
 import tempfile
 import torch
+from jinja2 import Template
+from aiter.test_common import perftest
+from aiter import pertoken_quant, per_tensor_quant
+from csrc.cpp_itfs.torch_utils import torch_to_c_types
 import triton
 import triton.language as tl
 
-from jinja2 import Template
-from aiter.test_common import perftest, run_perftest
-from aiter import pertoken_quant, per_tensor_quant
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     compile_gluon_kernel,
     CompileGluonArgs,
@@ -24,7 +24,6 @@ from csrc.cpp_itfs.utils import (
     compile_template_op,
     AITER_CORE_DIR,
     get_default_func_name,
-    not_built,
     run_lib,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -41,16 +40,13 @@ from op_tests.triton_tests.test_pa_decode_gluon import (
     shuffle_value_cache_layout,
 )
 
-
-# Global configuration from reference implementation
-UNIFORM_RANGE = (-1, 1)
 TORCH_TO_TL_DTYPE = {
     torch.float8_e4m3fnuz: tl.float8e4b8,
     torch.float8_e4m3fn: tl.float8e4nv,
     torch.bfloat16: tl.bfloat16,
     torch.float16: tl.float16,
 }
-# os.environ['TRITON_CACHE_DIR'] = '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache'
+UNIFORM_RANGE = (-1, 1)
 compile_reduce_kernel_count = 0
 
 
@@ -147,8 +143,6 @@ def compile_attention_kernel(
 ):
     """Compile the attention kernel for paged attention decode."""
     head_size_pow2 = triton.next_power_of_2(head_size)
-
-    # Calculate QUERY_GROUP_SIZE_POW2 based on QUERY_SEQ_LEN and ONE_QUERY_GROUP_SIZE
     equi_query_group_size_pow2 = triton.next_power_of_2(
         query_seq_len
     ) * triton.next_power_of_2(one_query_group_size)
@@ -175,7 +169,6 @@ def compile_attention_kernel(
     global compile_reduce_kernel_count
     compile_reduce_kernel_count += 1
 
-    # if not_built(func_name):
     if compile_reduce_kernel_count == 1:
         # Convert compute_type from torch.dtype to tl.dtype for AOT compilation
         compute_type_tl = TORCH_TO_TL_DTYPE[compute_type]
@@ -827,8 +820,6 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     else:
         quantized_keys = key_cache
         quantized_values = value_cache
-        key_scale_factors_flat = None
-        value_scale_factors_flat = None
         key_scale_original = None
         value_scale_original = None
 
@@ -1081,12 +1072,12 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     # Test result
     if all_passed:
         print(
-            f"\n✅ OVERALL TEST PASSED: All comparisons within tolerance and no NaN values detected"
+            "\n✅ OVERALL TEST PASSED: All comparisons within tolerance and no NaN values detected"
         )
         return True
     else:
         print(
-            f"\n❌ OVERALL TEST FAILED: Some comparisons failed or NaN values detected"
+            "\n❌ OVERALL TEST FAILED: Some comparisons failed or NaN values detected"
         )
         return False
 

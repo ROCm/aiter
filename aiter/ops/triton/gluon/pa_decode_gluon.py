@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-# This code is derived from sglang and FLASHNN projects
-# https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
-from typing import Optional
 from functools import lru_cache
 import torch
 import aiter

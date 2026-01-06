@@ -8,7 +8,7 @@ import numpy as np
 import argparse
 
 from jinja2 import Template
-from aiter.test_common import perftest, run_perftest
+from aiter.test_common import perftest
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_reduce_kernel,
 )
@@ -21,7 +21,6 @@ from csrc.cpp_itfs.utils import (
     compile_template_op,
     AITER_CORE_DIR,
     get_default_func_name,
-    not_built,
     run_lib,
 )
 from op_tests.triton_tests.test_pa_decode_gluon import (
@@ -108,7 +107,6 @@ def compile_reduce_kernel(
     else:
         raise ValueError(f"Unsupported compute type: {compute_type_tl}")
 
-    # if not_built(func_name):
     if compile_reduce_kernel_count == 1:
         # Build signature based on kernel parameters
         signature_parts = [

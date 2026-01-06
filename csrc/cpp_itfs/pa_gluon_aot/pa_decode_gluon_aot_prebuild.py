@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
-import os
 import argparse
 import random
-from typing import List, Optional, Tuple, Union, Dict
-import shutil
+from typing import Optional, Tuple, Union, Dict
 import subprocess
 from multiprocessing import Pool, cpu_count
 
@@ -21,43 +18,14 @@ from csrc.cpp_itfs.utils import (
     BUILD_DIR,
     get_default_func_name,
 )
-
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    pa_decode_gluon,
-    get_cdna_version,
-)
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
 
-try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-except ImportError:
-    print(
-        "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, only pa_decode_gluon_aot can be used!"
-    )
-    pa_decode_gluon = None
-
-
-TRITON_VERSION = triton.__version__
 MD_NAME = "pa_decode_attention_reduce_kernel"
-
-# Global variables that will be set by command line arguments
-USE_TORCH_FLASH_REF = False
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
-
-# Global configuration
-UNIFORM_RANGE = (-1, 1)
-STR_DTYPE_TO_TORCH_DTYPE = {
-    "half": torch.half,
-    "bfloat16": torch.bfloat16,
-    "float": torch.float,
-    "fp8": torch.uint8,
-}
 
 # Triton to PyTorch dtype mapping
 TL_TO_TORCH_DTYPE = {
@@ -167,29 +135,6 @@ def run_gluon_kernel(
             run_compiled_kernel=True,
             sinks=sinks,
         )
-    else:
-        if pa_decode_gluon is not None:
-            pa_decode_gluon(
-                output,
-                query,
-                key_cache,
-                value_cache,
-                context_lengths,
-                block_tables,
-                softmax_scale,
-                query_length,
-                max_context_length,
-                context_partition_size,
-                compute_type,
-                query_scale,
-                key_scale,
-                value_scale,
-                exp_sums=exp_sums,
-                max_logits=max_logits,
-                temporary_output=temporary_output,
-                alibi_slopes=alibi_slopes,
-                sinks=sinks,
-            )
 
 
 @benchmark()
@@ -407,51 +352,8 @@ def run_pa_gluon_test(
             key_scale_original = None
             value_scale_original = None
 
-    # Prepare for Gluon kernel - create tensors with correct shapes
-    query_group_size = num_query_heads // num_kv_heads
-
-    if query_length > 1:
-        # Reshaped tensors for query_length > 1
-        # quantized_query_gluon: [batch_size, num_kv_heads * query_length * query_group_size, head_size]
-        query_transposed = torch.empty(
-            batch_size,
-            num_kv_heads * query_length * query_group_size,
-            head_size,
-            dtype=quantized_query.dtype,
-            device=device,
-        )
-
-        # output_gluon: [batch_size, num_kv_heads * query_length * query_group_size, head_size]
-        output_transposed = torch.empty(
-            batch_size,
-            num_kv_heads * query_length * query_group_size,
-            head_size,
-            dtype=data_type,
-            device=device,
-        )
-
-        # Handle query scale factors based on quantization mode
-        if query_scale_factors is not None and len(query_scale_factors.shape) > 1:
-            # Per-token quantization: [batch_size, num_kv_heads * query_length * query_group_size, 1]
-            query_scale_transposed = torch.empty(
-                batch_size,
-                num_kv_heads * query_length * query_group_size,
-                1,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            # Per-tensor quantization or no quantization
-            query_scale_transposed = query_scale_factors
-    else:
-        # query_length == 1: no reshape needed
-        query_transposed = quantized_query
-        query_scale_transposed = query_scale_factors
-        output_transposed = torch.empty(
-            total_queries, num_query_heads, head_size, dtype=data_type, device=device
-        )
-
     # Test Gluon
+    query_group_size = num_query_heads // num_kv_heads
     num_seqs = batch_size
     max_context_partition_num = (
         context_lengths.max().item() + context_partition_size - 1
@@ -500,7 +402,7 @@ def run_pa_gluon_test(
         use_aot_impl=use_aot_impl,
     )
 
-    results[f"us_gluon"] = 0
+    results["us_gluon"] = 0
 
     return results
 
@@ -738,14 +640,7 @@ def run_multi_pa_gluon_test(
     Returns:
         DataFrame containing all test results
     """
-    # Check CDNA version compatibility
-    # cdna_version = get_cdna_version()
     cdna_version = 3
-    assert cdna_version in [
-        3,
-        4,
-    ], f"run_multi_pa_gluon_test only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
-
     # Generate all test configurations
     test_configs = []
 
@@ -793,7 +688,6 @@ def run_multi_pa_gluon_test(
                                                             }
 
                                                             # Calculate func_name to filter duplicate configs
-                                                            # Extract parameters from test_config
                                                             (
                                                                 num_query_heads,
                                                                 num_kv_heads,
@@ -802,22 +696,8 @@ def run_multi_pa_gluon_test(
                                                                 num_query_heads
                                                                 // num_kv_heads
                                                             )
-                                                            equivalent_query_group_size = (
-                                                                ql * query_group_size
-                                                            )
 
                                                             # Calculate power of 2 values
-                                                            if (
-                                                                equivalent_query_group_size
-                                                                < 16
-                                                            ):
-                                                                equi_query_group_size_pow2 = (
-                                                                    16
-                                                                )
-                                                            else:
-                                                                equi_query_group_size_pow2 = triton.next_power_of_2(
-                                                                    equivalent_query_group_size
-                                                                )
                                                             head_size_pow2 = (
                                                                 triton.next_power_of_2(
                                                                     head_size
@@ -944,7 +824,7 @@ def parse_arg_and_run_test():
         context_partition_size_options,
     ) = process_arguments(args)
 
-    results_df = run_multi_pa_gluon_test(
+    run_multi_pa_gluon_test(
         compute_types,
         block_sizes,
         head_configs,
