@@ -187,7 +187,7 @@ def bench_mlp(
     # run layer
     fpath = Path(tempfile.mktemp())
     M, K = xg.shape
-    N, K = wg.shape
+    K, N = wg.shape
     # Reduce blocksize to prevent LDS out of resource limits
     config = _get_config(M, N, K)
     config["BLOCK_SIZE_M"] = 128 if config["BLOCK_SIZE_M"] > 128 else config["BLOCK_SIZE_M"]
