@@ -9,6 +9,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton._triton_kernels.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
+    _gemm_a16wfp4_preshuffle_kernel,
     _get_config,
 )
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
@@ -184,3 +185,190 @@ def gemm_a16wfp4(
 ) -> torch.Tensor:
     config_hashable = serialize_dict(config) if config else None
     return gemm_a16wfp4_(x, w, w_scales, atomic_add, dtype, y, config_hashable)
+
+
+def gemm_a16wfp4_preshuffle_fake_tensor(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+    skip_reduce: Optional[bool] = False,
+) -> torch.Tensor:
+    M, K = x.shape
+    N, _ = w.shape
+
+    config = deserialize_str(config)
+
+    num_ksplit = config["NUM_KSPLIT"]
+    block_size_k = config["BLOCK_SIZE_K"]
+
+    if num_ksplit > 1:
+        _, block_size_k, num_ksplit = get_splitk(K, block_size_k, num_ksplit)
+
+    if block_size_k >= 2 * K:
+        num_ksplit = 1
+
+    if num_ksplit > 1 and skip_reduce:
+        y_pp = torch.empty((num_ksplit, M, N), dtype=torch.float32, device=x.device)
+        return y_pp
+
+    return torch.empty((M, N), dtype=dtype, device=x.device)
+
+
+@torch_compile_guard(gen_fake=gemm_a16wfp4_preshuffle_fake_tensor)
+def gemm_a16wfp4_preshuffle_(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    prequant: Optional[bool] = True,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+    skip_reduce: Optional[bool] = False,
+) -> torch.Tensor:
+    """
+    Computes matrix multiplication Y = X @ W^T with BF16 activations and FP4 weights.
+
+    Key parameters:
+        x (torch.Tensor): BF16/FP16 input matrix X with shape (M, K).
+            Quantized to MXFP4 on-the-fly during GEMM.
+        w (torch.Tensor): FP4 E2M1 weight matrix W with shape (N, K//2).
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (M//32, K).
+            One scale per 32 elements in K dimension.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[str]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+        skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
+
+    Returns:
+        y (torch.Tensor): Output with shape (M, N).
+    """
+
+    _LOGGER.info(
+        f"GEMM_A16WFP4_PRESHUFFLE: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scales.shape)} "
+    )
+
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    assert prequant, "prequant == False is not supported yet"
+
+    M, K = x.shape
+    N, K = w.shape
+    N = N * 16
+    K = K // 16
+
+    if config is None:
+        config, _ = _get_config(M, N, K, True)
+    else:
+        config = deserialize_str(config)
+
+    if config["NUM_KSPLIT"] > 1:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
+
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT
+
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        config["NUM_KSPLIT"] = 1
+    config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
+
+    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
+
+    if config["NUM_KSPLIT"] > 1:
+        y_pp = torch.empty(
+            (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
+        )
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        y_pp = None
+
+    if y is None and not return_y_pp:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+    grid = lambda META: (  # noqa: E731
+        (
+            META["NUM_KSPLIT"]
+            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+        ),
+    )
+    _gemm_a16wfp4_preshuffle_kernel[grid](
+        x,
+        w,
+        y if y_pp is None else y_pp,
+        w_scales,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        0 if y_pp is None else y_pp.stride(0),
+        y.stride(0) if y_pp is None else y_pp.stride(1),
+        y.stride(1) if y_pp is None else y_pp.stride(2),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        PREQUANT=prequant,
+        **config,
+    )
+
+    if return_y_pp:
+        return y_pp
+    elif config["NUM_KSPLIT"] > 1:
+        REDUCE_BLOCK_SIZE_M = 16
+        REDUCE_BLOCK_SIZE_N = 64
+        # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
+        # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
+        # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
+        ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
+
+        grid_reduce = (
+            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        )
+        _gemm_afp4wfp4_reduce_kernel[grid_reduce](
+            y_pp,
+            y,
+            M,
+            N,
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(2),
+            y.stride(0),
+            y.stride(1),
+            REDUCE_BLOCK_SIZE_M,
+            REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),
+        )
+
+    return y
+
+
+def gemm_a16wfp4_preshuffle(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
+    prequant: Optional[bool] = True,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+    skip_reduce: Optional[bool] = False,
+) -> torch.Tensor:
+    if config is None:
+        config_hashable = None
+        M, _ = x.shape
+        N, K = w.shape
+        N = N * 16
+        K = K // 16
+        config, _ = _get_config(M, N, K, True)
+    config_hashable = serialize_dict(config)
+    return gemm_a16wfp4_preshuffle_(x, w, w_scales, prequant, dtype, y, config_hashable)
