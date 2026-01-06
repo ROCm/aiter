@@ -138,10 +138,6 @@ def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
     return ret
 
 
-l_dtype = ["fp16", "bf16", "fp32"]
-l_m = [1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840]
-l_n = [1024, 4096, 6400, 8192]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -149,48 +145,39 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    metavar="{fp16, bf16}",
+    default="fp16, bf16",
     help="""Data type.
     e.g.: -d bf16, -d fp32""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    choices=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840],
+    default=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840],
     help="""M of mnk.
     e.g.: -m 32""",
 )
 parser.add_argument(
     "-n",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    choices=[1024, 4096, 6400, 8192],
+    default=[1024, 4096, 6400, 8192],
     help="""N of mnk.
     e.g.: -n 1024""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.n is not None:
-    l_n = [args.n]
 
 df = []
-# Standard same-dtype tests
-for dtype in l_dtype:
-    for m in l_m:
-        for n in l_n:
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
             ret = test_scaled_silu_and_mul(m, n, dtype)
             df.append(ret)
 df = pd.DataFrame(df)
@@ -201,18 +188,15 @@ df_md = df.to_markdown(index=False)
 aiter.logger.info("scaled_silu_and_mul summary (markdown):\n%s", df_md)
 
 df = []
-# Standard same-dtype tests
-for dtype in l_dtype:
-    if dtype == torch.float32:
-        continue
-    for m in l_m:
-        for n in l_n:
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
             ret = test_silu_and_mul(m, n, dtype)
             df.append(ret)
 # Add fp32 input with fp16/bf16 output (bandwidth optimization)
 for output_dtype in [torch.float16, torch.bfloat16]:
-    for m in l_m:
-        for n in l_n:
+    for m in args.m:
+        for n in args.n:
             ret = test_silu_and_mul(m, n, torch.float32, output_dtype=output_dtype)
             df.append(ret)
 df = pd.DataFrame(df)

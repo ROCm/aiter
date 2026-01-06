@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_bf16gemm_configs.hpp"
 #include "py_itfs_common.h"
@@ -244,11 +244,21 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
     int gdz = split;
-
-    TORCH_CHECK(gdy <= 16, __func__, " gdy (", gdy, ") must be <= 16"); // 16 = 512/32
-
+    
+    if (split > 1)
+    {
+        TORCH_CHECK(gdy <= 16, __func__, " gdy (", gdy, ") must be <= 16"); // 16 = 512/32
+        TORCH_CHECK(gdx <= 64, __func__, " gdx (", gdx, ") must be <= 64");
+    }
     // semaphore.fill_(selectedksplit);
-    args.ptr_semaphore = (void*)semaphore.data_ptr<uint32_t>();
+    if (split > 1 && semaphore.numel() > 0)
+    {
+        args.ptr_semaphore = (void*)semaphore.data_ptr<uint32_t>();
+    }
+    else
+    {
+        args.ptr_semaphore = nullptr;
+    }
     // printf("KernelArgs Debug Info:\n");
     // printf("  ptr_D: %p\n", args.ptr_D);
     // printf("  ptr_C: %p\n", args.ptr_C);
