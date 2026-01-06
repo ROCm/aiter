@@ -173,8 +173,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         (cu_num, M, N, K) = info_keys
         kernels_num = len(candidate_kernels_dict_tile)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
-        ref_data_idx = [0, 1, 2, 3]
-        tasks_ck_legacy = []
+        ref_data_idx = [0, 1, 2, 3] if isBpreshuffled else [0, 5, 6, 3]
+        tasks_ck_tile = []
         for i in range(kernels_num):
             kernel = candidate_kernels_dict_tile[i]
             maxsplitK = (
@@ -191,7 +191,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             )
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "ck_tile", isBpreshuffled)
-                tasks_ck_legacy.append(
+                tasks_ck_tile.append(
                     (
                         info,
                         generate_data,
@@ -216,7 +216,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         0.01,
                     )
                 )
-        return tasks_ck_legacy
+        return tasks_ck_tile
 
     def get_ck_legacy_gemm_a8w8_blockscale_tune_task(
         self,
