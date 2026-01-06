@@ -288,6 +288,8 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
 
+    cu_num = get_cu_num()
+    
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
