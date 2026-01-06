@@ -101,16 +101,3 @@ def fused_rope_rms_set_kv(
     x: int,
 ) -> None: ...
 
-
-@compile_ops("module_fused_mrope_rms")
-def shuffle_kv_cache_cuda(
-    key: Tensor,          # [num_tokens, num_kv_heads, head_size]
-    value: Tensor,        # [num_tokens, num_kv_heads, head_size]
-    k_cache: Tensor,      # [num_blocks, num_kv_heads, head_size // x, block_size, x]
-    v_cache: Tensor,      # [num_blocks, num_kv_heads, block_size // x, head_size, x]
-    slot_mapping: Tensor, # [num_tokens]
-    block_size: int,
-    x: int,
-    k_scale: float,
-    v_scale: float,
-) -> None: ...
