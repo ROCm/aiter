@@ -43,9 +43,7 @@ def run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
 def run_triton(impl, x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
     m = x.shape[0]
 
-    return impl(
-        x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype
-    )
+    return impl(x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -193,16 +191,18 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout, imp
     S2 = S - S1
 
     dtype = str_to_torch_dtype[dtype]
-    x, w, w_triton, y, x_scale, x_scale_triton, w_scale = generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
-        M,
-        N,
-        K,
-        S3,
-        block_shape_n,
-        block_shape_k,
-        dtype=dtype,
-        layout=layout,
-        shuffle=("_shuffle" in impl),
+    x, w, w_triton, y, x_scale, x_scale_triton, w_scale = (
+        generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
+            M,
+            N,
+            K,
+            S3,
+            block_shape_n,
+            block_shape_k,
+            dtype=dtype,
+            layout=layout,
+            shuffle=("_shuffle" in impl),
+        )
     )
 
     if impl == "triton":
@@ -213,7 +213,9 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout, imp
         raise ValueError(f"Unknown implementation: {impl}")
 
     c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
-    c1_triton, c2_triton = run_triton(impl, x, w_triton, y, x_scale_triton, w_scale, S1, S2, D, dtype)
+    c1_triton, c2_triton = run_triton(
+        impl, x, w_triton, y, x_scale_triton, w_scale, S1, S2, D, dtype
+    )
 
     torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
     torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
