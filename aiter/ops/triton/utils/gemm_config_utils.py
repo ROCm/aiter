@@ -51,7 +51,7 @@ def get_gemm_config(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
-) -> dict:
+) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
 
@@ -141,16 +141,16 @@ def get_gemm_config(
     for bound in search_bounds:
         key = f"M_LEQ_{bound}"
         if M <= bound and key in config_dict:
-            return dict(config_dict[key])
+            return dict(config_dict[key]), config_dict_key != "default"
 
     # Search for M_GEQ_x keys
     for bound in reversed(search_bounds):
         key = f"M_GEQ_{bound}"
         if M >= bound and key in config_dict:
-            return dict(config_dict[key])
+            return dict(config_dict[key]), config_dict_key != "default"
 
     if "any" in config_dict:
-        return dict(config_dict["any"])
+        return dict(config_dict["any"]), False
 
     raise KeyError(
         f"No matching configuration found for M={M}, N={N}, K={K} in config '{config_name}'."
@@ -195,14 +195,12 @@ def compute_splitk_params(config: dict, K: int) -> dict:
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
-    if (
-        "BLOCK_SIZE_K" in config
-        and config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]
-    ):
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-
+    if "BLOCK_SIZE_K" in config:
         if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
+            config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+
+            if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+                config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
 
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 

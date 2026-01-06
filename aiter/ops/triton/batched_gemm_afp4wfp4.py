@@ -64,7 +64,7 @@ def batched_gemm_afp4wfp4(
     Batch = Bx
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     if config["NUM_KSPLIT"] > 1:
         if _USE_GEMM_SPLITK_BF16:

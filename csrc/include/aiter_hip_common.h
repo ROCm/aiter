@@ -3,6 +3,7 @@
 #pragma once
 #include "ck_tile/core.hpp"
 #include <hip/hip_runtime.h>
+#include <cstdint>
 #include <iostream>
 
 enum class GPUArch
@@ -10,6 +11,17 @@ enum class GPUArch
     gfx942,
     gfx950
 };
+
+
+#define CHECK_COND(x) \
+    do { \
+        if (!(x)) { \
+            std::cerr << "check failed, file=" \
+                << __FILE__ << ", line=" \
+                << __LINE__ << std::endl; \
+            std::terminate(); \
+        } \
+    } while(0)
 
 #define HIP_CALL(call)                                                       \
     do                                                                       \

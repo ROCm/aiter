@@ -211,7 +211,9 @@ class AITER_CONFIG(object):
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
-            keys.append("cu_num")
+            # Add "cu_num" if not already present
+            if "cu_num" not in keys:
+                keys.append("cu_num")
             merge_df = (
                 merge_df.sort_values("us")
                 .drop_duplicates(subset=keys, keep="first")
@@ -377,11 +379,15 @@ def validate_and_update_archs():
 def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
-    cmd = ["hipcc", flag_hip, "-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    cmd = (
+        ["hipcc"]
+        + flag_hip.split()
+        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    )
     try:
-        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
-        logger.warning(f"Current hipcc not support: {flag_hip}")
+        logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
     return True
 
@@ -887,7 +893,7 @@ def compile_ops(
                     pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
                     doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                     for el in enum_types:
-                        doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
+                        doc_str = re.sub(f" (module_)?aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
                         "Optional": Optional,
