@@ -173,7 +173,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         (cu_num, M, N, K) = info_keys
         kernels_num = len(candidate_kernels_dict_tile)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
-        ref_data_idx = [0, 1, 2, 3] if isBpreshuffled else [0, 5, 6, 3]
+        ref_data_idx = [0, 5, 6, 3] if isBpreshuffled else [0, 1, 2, 3]
         tasks_ck_tile = []
         for i in range(kernels_num):
             kernel = candidate_kernels_dict_tile[i]
