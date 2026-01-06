@@ -1,13 +1,40 @@
 {
     "gmm": {
-        "default": {
+        "default_trans_rhs": {
             "BLOCK_SIZE_M": 256,
             "BLOCK_SIZE_K": 64,
             "BLOCK_SIZE_N": 256,
             "GROUP_SIZE": 1,
             "GRID_DIM": 304,
             "num_warps": 8,
-            "num_stages": 1
+            "num_stages": 2
+        },
+        "trans_rhs_small_n_high_g": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 128,
+            "GROUP_SIZE": 16,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 2
+        },
+        "default_no_trans_rhs": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 8,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 2
+        },
+        "no_trans_rhs_small_n": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_N": 128,
+            "GROUP_SIZE": 4,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 2
         }
     },
     "ptgmm": {
@@ -15,7 +42,34 @@
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_K": 256,
             "BLOCK_SIZE_N": 256,
-            "GROUP_SIZE": 1,
+            "GROUP_SIZE": 4,
+            "GRID_DIM": 304,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "high_group_count": {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 4,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "small_n": {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_K": 256,
+            "BLOCK_SIZE_N": 128,
+            "GROUP_SIZE": 4,
+            "GRID_DIM": 304,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "small_n_high_group": {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 128,
+            "GROUP_SIZE": 4,
             "GRID_DIM": 304,
             "num_warps": 8,
             "num_stages": 1
@@ -35,6 +89,14 @@
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_K": 256,
             "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 1,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "small_n": {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_K": 256,
+            "BLOCK_SIZE_N": 128,
             "GROUP_SIZE": 1,
             "num_warps": 8,
             "num_stages": 1

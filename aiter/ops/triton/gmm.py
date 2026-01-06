@@ -159,7 +159,7 @@ def gmm(
     trans_rhs, _ = get_gmm_transposition(lhs, rhs, out)
 
     if config is None:
-        config = get_config("gmm", M, K, N, G)
+        config = get_config("gmm", M, K, N, G, accumulate=False, trans_rhs=trans_rhs)
 
     assert all(
         key in config

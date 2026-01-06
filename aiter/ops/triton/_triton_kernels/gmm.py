@@ -26,7 +26,13 @@ from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 @functools.lru_cache()
 def get_config(
-    gmm_type: str, M: int, K: int, N: int, G: int, accumulate: bool = False
+    gmm_type: str,
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    accumulate: bool = False,
+    trans_rhs: bool = False,
 ) -> dict[str, int]:
     assert gmm_type in {
         "gmm",
@@ -46,12 +52,71 @@ def get_config(
                 gmm_type in get_config._config_dict
                 for gmm_type in {"gmm", "ptgmm", "nptgmm"}
             ), "Not all GMM variants are present in the configuration file."
-    # TODO: Fine tune GMM kernels and use (M, K, N, G) shape to query the best
-    #       config in the dictionary.
+
+    # Heuristic-based config selection for gmm
+    if gmm_type == "gmm":
+        # GMM configuration depends heavily on trans_rhs
+        small_n = N <= 5120
+        high_g = G >= 64
+
+        if trans_rhs:
+            # Forward pass: TRANS_RHS=True
+            # Uses smaller K blocks (64 or 128), larger M blocks (128-256)
+            if small_n and high_g:
+                key = "trans_rhs_small_n_high_g"
+            else:
+                key = "default_trans_rhs"
+        else:
+            # Backward pass: TRANS_RHS=False
+            # Very consistent: mostly BLOCK_M=128, BLOCK_N=256, BLOCK_K=64
+            if N <= 1408 and M >= 300000:
+                key = "no_trans_rhs_small_n"
+            else:
+                key = "default_no_trans_rhs"
+
+    # Heuristic-based config selection for ptgmm
+    elif gmm_type == "ptgmm":
+        if accumulate:
+            key = "accumulate"
+        else:
+            # Pattern observed from benchmarks:
+            # - G >= 32: use smaller BLOCK_SIZE_K (128) with more warps (8)
+            # - N <= 1408: use smaller BLOCK_SIZE_N (128)
+            # - Otherwise: use larger blocks (256) with fewer warps (4)
+
+            high_group_count = G >= 32
+            small_n = N <= 1408
+
+            if high_group_count and small_n:
+                key = "small_n_high_group"
+            elif high_group_count:
+                key = "high_group_count"
+            elif small_n:
+                key = "small_n"
+            else:
+                key = "default"
+
+    # Heuristic-based config selection for nptgmm
+    elif gmm_type == "nptgmm":
+        if accumulate:
+            key = "accumulate"
+        else:
+            # Pattern observed from benchmarks:
+            # - N <= 1408: use BLOCK_SIZE_N=128 with num_warps=8
+            # - Otherwise: use default BLOCK_SIZE_K=256, BLOCK_SIZE_N=256, num_warps=4
+            # NPTGMM is simpler and less sensitive to G than PTGMM
+
+            small_n = N <= 1408
+
+            if small_n:
+                key = "small_n"
+            else:
+                key = "default"
+
     assert (
-        "default" in get_config._config_dict[gmm_type]
-    ), "Default configuration is absent."
-    key = "accumulate" if accumulate else "default"
+        key in get_config._config_dict[gmm_type]
+    ), f"Configuration key '{key}' is absent for {gmm_type}."
+
     return get_config._config_dict[gmm_type][key]
 
 
