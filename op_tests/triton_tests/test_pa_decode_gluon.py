@@ -1530,7 +1530,9 @@ def run_pa_gluon_test(
     elif ps:
         max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
     else:
-        max_context_partition_num = triton.cdiv(131072, context_partition_size)
+        max_context_partition_num = triton.cdiv(
+            max_context_length, context_partition_size
+        )
 
     equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
     intermediate_shape = (
