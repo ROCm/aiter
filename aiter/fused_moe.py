@@ -1614,8 +1614,8 @@ def cktile_moe_stage1(
         bias1,
         activation,
         block_m,
-        b_nt_type,
         split_k,
+        b_nt_type,
     )
 
     if split_k > 1:
@@ -1658,6 +1658,7 @@ def cktile_moe_stage2(
     # if zeros_out:
     #     out.fill_(0)
     # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
+    splitk_default = 1
     aiter.moe_cktile2stages_gemm2(
         a2,
         w2,
@@ -1674,6 +1675,7 @@ def cktile_moe_stage2(
         bias2,
         activation,
         block_m,
+        splitk_default,
         b_nt_type,
     )
     return out

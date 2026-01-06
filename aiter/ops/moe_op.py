@@ -360,8 +360,8 @@ def moe_cktile2stages_gemm1(
     exp_bias: Optional[Tensor] = None,
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
-    b_nt_type: Optional[int] = 0,
     split_k: Optional[int] = 1,
+    b_nt_type: Optional[int] = 0,
 ):
     return moe_cktile2stages_gemm1_ck(
         XQ,
@@ -422,8 +422,8 @@ def moe_cktile2stages_gemm2(
     exp_bias: Optional[Tensor] = None,
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
-    b_nt_type: Optional[int] = 0,
     split_k: Optional[int] = 1,
+    b_nt_type: Optional[int] = 0,
 ):
     return moe_cktile2stages_gemm2_ck(
         XQ,
