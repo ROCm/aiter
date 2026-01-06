@@ -797,17 +797,20 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
         )
-    if (
-        "ck2stages" in kernelName1
-        or (q_type == QuantType.per_1x128 and doweight_stage1)
-        or q_dtype_w
-        in [
-            dtypes.bf16,
-            dtypes.fp16,
-            torch.uint32,
-            dtypes.fp4x2,
-            dtypes.fp8,
-        ]
+
+    if (kernelName1 and "ck2stages" in kernelName1) or (
+        not kernelName1
+        and (
+            (q_type == QuantType.per_1x128 and doweight_stage1)
+            or q_dtype_w
+            in [
+                dtypes.bf16,
+                dtypes.fp16,
+                torch.uint32,
+                dtypes.fp4x2,
+                dtypes.fp8,
+            ]
+        )
     ):
         return MOEMetadata(
             functools.partial(
@@ -815,6 +818,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
+                dtype=dtype,
                 splitk=ksplit,
             ),
             functools.partial(
@@ -829,7 +833,7 @@ def get_2stage_cfgs(
         )
 
     # TODO: remove when stage2 support more size
-    tmpList = [32, 64, 128]
+    tmpList = [16, 32, 64, 128]
     if block_m not in tmpList:
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
@@ -1004,7 +1008,6 @@ def fused_moe_2stages(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
-        dtype=dtype,
         **extra_stage1_args,
     )
     if (
