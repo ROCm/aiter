@@ -1,4 +1,3 @@
-#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -125,13 +124,14 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         ck_tile::sequence<GemmConfig::M_Warp_Tile_v,
                           GemmConfig::N_Warp_Tile_v,
                           GemmConfig::K_Warp_Tile_v>>;
+
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
-    using GemmTraits = ck_tile::TileGemmQuantTraits<false, // kPadM_v,
+    using GemmTraits = ck_tile::TileGemmQuantTraits<false, // PadM
                                                     PadN,
                                                     PadK,
                                                     false, // PreshuffleQuant, not support yet
-                                                    isBpreshuffled, // PreshuffleB, not support yet
+                                                    isBpreshuffled,
                                                     ALayout,
                                                     BLayout,
                                                     CLayout,
