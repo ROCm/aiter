@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import itertools
 import math
@@ -13,6 +13,9 @@ from aiter import per_tensor_quant
 from einops import rearrange, repeat
 import argparse
 
+from aiter.test_common import (
+    perftest,
+)
 
 def construct_local_mask(
     seqlen_q,
@@ -313,6 +316,7 @@ def test_batch_prefill(
     kv_init_min,
     kv_init_max,
     seed,
+    profile=False,
 ):
     if seed is not None:
         torch.manual_seed(seed)
@@ -417,6 +421,8 @@ def test_batch_prefill(
         )
 
         out_fp8 = run_ck(
+            batch_size,
+            num_kv_heads,
             q_quant,
             k_cache_quant,
             v_cache_quant,
@@ -433,8 +439,12 @@ def test_batch_prefill(
             kv_last_page_lens=kv_last_page_len_gpu,
             block_table=block_table_gpu,
             seqlen_k=seqlen_k_gpu,
+            profile=profile,
         )
+        # Reference using FP16/BF16
         out_ref = run_ck(
+            batch_size,
+            num_kv_heads,
             q,
             k_cache_ref_layout,
             v_cache_ref_layout,
@@ -448,7 +458,9 @@ def test_batch_prefill(
             kv_last_page_lens=kv_last_page_len_gpu,
             block_table=block_table_gpu,
             seqlen_k=seqlen_k_gpu,
+            profile=profile,
         )
+
         o_ref = build_reference_output(
             q,
             q_indptr_cpu,
@@ -512,8 +524,42 @@ def test_batch_prefill(
         rtol, atol = (1e-3, 1e-3) if dtype == torch.float16 else (2e-2, 1e-2)
         assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
 
+@perftest()
+def profile_func(target_func, *args, **kwargs):
+    return target_func(*args, **kwargs)
+
+def flops(
+    batch,
+    seqlen_q,
+    seqlen_k,
+    headdim_q,
+    headdim_v,
+    nheads_q,
+    nheads_k,
+    causal,
+    mode="fwd",
+):
+    assert mode in ["fwd", "bwd", "fwd_bwd"]
+    mask_area = seqlen_q * seqlen_k // (2 if causal else 1)
+    qk = 2 * batch * mask_area * nheads_q * headdim_q
+    # Match CK's fmha_fwd_runner.hpp which always scales PV by nheads_q,
+    # even for MQA/GQA where KV heads are fewer than query heads.
+    pv = 2 * batch * mask_area * nheads_q * headdim_v
+    base = qk + pv
+    if mode == "fwd":
+        return base
+    if mode == "bwd":
+        return 2.5 * base
+    return 3.5 * base
+
+
+def efficiency(flop, time_in_us):
+    return flop / time_in_us / 10**6
+
 
 def run_ck(
+    batch_size,
+    num_kv_heads,
     q,
     k_cache,
     v_cache,
@@ -530,49 +576,56 @@ def run_ck(
     kv_last_page_lens=None,
     block_table=None,
     seqlen_k=None,
+    profile=False,
 ):
-    """Unified interface for running batch_prefill with or without FP8."""
-    if (
-        q.dtype == dtypes.fp8
-        and k_cache.dtype == dtypes.fp8
-        and v_cache.dtype == dtypes.fp8
-    ):
-        # FP8 path
-        return aiter.mha_batch_prefill_func(
-            q,
-            k_cache,
-            v_cache,
-            cu_seqlens_q,
-            kv_indptr,
-            kv_page_indices,
-            max_seqlen_q,
-            max_seqlen_k,
-            causal=causal,
-            logits_soft_cap=logits_soft_cap,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            kv_last_page_lens=kv_last_page_lens,
-            block_table=block_table,
-            seqlen_k=seqlen_k,
+    kernel_args = (
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        kv_indptr,
+        kv_page_indices,
+        max_seqlen_q,
+        max_seqlen_k,
+    )
+    kernel_kwargs = dict(
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        kv_last_page_lens=kv_last_page_lens,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+    )
+
+    if profile:
+        out, time_us = profile_func(
+            aiter.mha_batch_prefill_func, *kernel_args, **kernel_kwargs
         )
+        nheads_q = q.shape[1]
+        headdim = q.shape[2]
+        seqlen_q = max_seqlen_q
+        seqlen_k = max_seqlen_k
+        total_flops = flops(
+                batch_size,
+                seqlen_q,
+                seqlen_k,
+                headdim,
+                headdim,
+                nheads_q,
+                num_kv_heads,
+                causal,
+            )
+        tflops = efficiency(
+            total_flops,
+            time_us,
+        )
+        print(f"time: {time_us:.2f} us, {tflops:.2f} TFlops")
     else:
-        # Standard BF16/FP16 path
-        return aiter.mha_batch_prefill_func(
-            q,
-            k_cache,
-            v_cache,
-            cu_seqlens_q,
-            kv_indptr,
-            kv_page_indices,
-            max_seqlen_q,
-            max_seqlen_k,
-            causal=causal,
-            logits_soft_cap=logits_soft_cap,
-            kv_last_page_lens=kv_last_page_lens,
-            block_table=block_table,
-            seqlen_k=seqlen_k,
-        )
+        out = aiter.mha_batch_prefill_func(*kernel_args, **kernel_kwargs)
+
+    return out
 
 
 def vectorize_kv_cache(
@@ -954,6 +1007,11 @@ parser.add_argument(
     help="""input dtype.
     e.g.: -o bf16""",
 )
+parser.add_argument(
+    "--profile",
+    action="store_true",
+    help="Enable profiling mode",
+)
 
 
 if __name__ == "__main__":
@@ -1010,4 +1068,5 @@ if __name__ == "__main__":
             kv_init_min=-5,
             kv_init_max=5,
             seed=19378,
+            profile=args.profile,
         )
