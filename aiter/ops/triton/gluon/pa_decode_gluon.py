@@ -44,7 +44,9 @@ def get_occupancy():
 def get_recommended_splits(num_sequences, num_kv_heads):
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count * get_occupancy()
-    max_context_partition_num = triton.cdiv(num_sm, num_sequences * num_kv_heads)
+    max_context_partition_num = min(
+        16, triton.cdiv(num_sm, num_sequences * num_kv_heads)
+    )
     return max_context_partition_num
 
 
