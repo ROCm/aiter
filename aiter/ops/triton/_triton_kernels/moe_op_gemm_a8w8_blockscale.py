@@ -20,7 +20,10 @@ def matmul_launch_metadata(grid, kernel, args):
     else:
         n_tokens = None
         n_w_bytes = W.numel() * W.element_size()
-    repr = lambda s, x: f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
+
+    def repr(s, x):
+        return f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
+
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
     gindx = args.get("GatherIndx", None)
@@ -130,7 +133,6 @@ def _reduce_grouped(
     BLOCK_N: tl.constexpr,
     EVEN_N: tl.constexpr,
 ):
-
     pid_t = tl.program_id(1)
     pid_n = tl.program_id(0)
 
@@ -276,7 +278,9 @@ def _moe_gemm_a8w8_blockscale(
         tl.assume(stride_b_e >= 0)
     tl.assume(grid_m >= 0)
     tl.assume(grid_n >= 0)
-    tl.static_assert(BLOCKSCALE_K == BLOCK_K, "This kernel assumes one K-block per tile")
+    tl.static_assert(
+        BLOCKSCALE_K == BLOCK_K, "This kernel assumes one K-block per tile"
+    )
 
     is_x_blockscale: tl.constexpr = XBlockScale is not None
     is_w_blockscale: tl.constexpr = WBlockScale is not None

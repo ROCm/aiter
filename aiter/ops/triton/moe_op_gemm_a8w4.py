@@ -1,13 +1,9 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-from dataclasses import dataclass
 import itertools
-import sys
 import torch
 import triton
-from enum import Enum, auto
-import math
 from aiter.ops.triton.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4,

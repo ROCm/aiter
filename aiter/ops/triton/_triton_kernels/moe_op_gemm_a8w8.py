@@ -20,9 +20,13 @@ def matmul_launch_metadata(grid, kernel, args):
     else:
         n_tokens = None
         n_w_bytes = W.numel() * W.element_size()
-    repr = lambda s, x: f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
+
+    def repr(s, x):
+        return f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
+
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
+    gindx = args.get("GatherIndx", None)
     # sindx = args.get("WriteBackIndx", None)
     if gindx is not None:
         ret["name"] += "_moe1"
@@ -142,7 +146,6 @@ def _reduce_grouped(
     BLOCK_N: tl.constexpr,
     EVEN_N: tl.constexpr,
 ):
-
     pid_t = tl.program_id(1)
     pid_n = tl.program_id(0)
 
@@ -249,7 +252,6 @@ def _moe_gemm_a8w8(
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
 ):
-
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
     tl.assume(stride_y_n >= 0)

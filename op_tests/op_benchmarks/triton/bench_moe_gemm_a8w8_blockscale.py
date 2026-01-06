@@ -3,8 +3,6 @@
 
 from itertools import chain
 from pathlib import Path
-from copy import deepcopy
-import csv
 import triton.profiler as proton
 import torch
 import argparse
@@ -78,7 +76,7 @@ def compute_roofline(
     # collect performance data
     perfs = []
     print("=========================================")
-    print(f"{out_path   }...")
+    print(f"{out_path}...")
     print("=========================================")
     for val in intensity_proxy_values:
         perf = inject_proxy_and_call(val, args, kwargs)
@@ -90,9 +88,6 @@ def compute_roofline(
         print(
             f"{intensity_proxy_name}: {val:5d} | Total latency (us): {total_latency:.2f} | Kernel latency (us): {kernel_latency:.2f} | TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f}"
         )
-
-
-from aiter import dtypes
 
 
 def bench_mlp(
@@ -190,9 +185,15 @@ def bench_mlp(
     K, N = wg.shape
     # Reduce blocksize to prevent LDS out of resource limits
     config = _get_config(M, N, K)
-    config["BLOCK_SIZE_M"] = 128 if config["BLOCK_SIZE_M"] > 128 else config["BLOCK_SIZE_M"]
-    config["BLOCK_SIZE_N"] = 128 if config["BLOCK_SIZE_N"] > 128 else config["BLOCK_SIZE_N"]
-    config["BLOCK_SIZE_K"] = 128 if config["BLOCK_SIZE_K"] > 128 else config["BLOCK_SIZE_K"]
+    config["BLOCK_SIZE_M"] = (
+        128 if config["BLOCK_SIZE_M"] > 128 else config["BLOCK_SIZE_M"]
+    )
+    config["BLOCK_SIZE_N"] = (
+        128 if config["BLOCK_SIZE_N"] > 128 else config["BLOCK_SIZE_N"]
+    )
+    config["BLOCK_SIZE_K"] = (
+        128 if config["BLOCK_SIZE_K"] > 128 else config["BLOCK_SIZE_K"]
+    )
     proton.start(str(fpath), hook="triton")
     for i in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg, config=config)
@@ -331,7 +332,7 @@ def roofline_mlp(
 ):
     out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
     out_path.mkdir(parents=True, exist_ok=True)
-    csv_path = compute_roofline(
+    compute_roofline(
         dim1,
         dim2,
         n_expts_tot,

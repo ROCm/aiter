@@ -20,9 +20,6 @@ from aiter.ops.triton.quant_moe import (
     dequant_w_blockscale,
 )
 
-# target-specific utilities
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-
 # ---------------
 # initialize data
 # ---------------
@@ -259,7 +256,6 @@ def test_op(
     per_row_x_scale,
     device="cuda",
 ):
-
     torch.manual_seed(0)
 
     m, rdata, gindx, sindx = init_routing_data(
