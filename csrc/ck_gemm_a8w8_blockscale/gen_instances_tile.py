@@ -102,7 +102,6 @@ torch::Tensor
             {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
             {str(k.TiledMMAPermuteN).lower()},
             {str(k.TransposeC).lower()},
-            {str(k.DoubleSmemBuffer).lower()},
             {str(k.UsePersistentKernel).lower()},
             ck_tile::GemmPipelineScheduler::{k.Scheduler},
             {k.BlockPerCu}>;

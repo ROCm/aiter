@@ -56,7 +56,6 @@ template <ck_tile::index_t M_Tile,
           ck_tile::index_t K_Warp_Tile,
           bool TiledMMAPermuteN                    = false,
           bool TransposeC                          = false,
-          bool DoubleSmemBuffer                    = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
           int BlockPerCu                           = 1>
@@ -73,7 +72,6 @@ struct CreateTileGemmConfig
     static constexpr ck_tile::index_t K_Warp_Tile_v             = K_Warp_Tile;
     static constexpr bool TiledMMAPermuteN_v                    = TiledMMAPermuteN;
     static constexpr bool TransposeC_v                          = TransposeC;
-    static constexpr bool DoubleSmemBuffer_v                    = DoubleSmemBuffer;
     static constexpr bool UsePersistentKernel_v                 = UsePersistentKernel;
     static constexpr ck_tile::GemmPipelineScheduler Scheduler_v = Scheduler;
     static constexpr int BlockPerCu_v                           = BlockPerCu;
@@ -90,7 +88,6 @@ template <ck_tile::index_t M_Tile,
           ck_tile::index_t K_Warp_Tile,
           bool TiledMMAPermuteN                    = false,
           bool TransposeC                          = false,
-          bool DoubleSmemBuffer                    = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
           int BlockPerCu                           = 1>
@@ -105,7 +102,6 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             K_Warp_Tile,
                                             TiledMMAPermuteN,
                                             TransposeC,
-                                            DoubleSmemBuffer,
                                             UsePersistentKernel,
                                             Scheduler,
                                             BlockPerCu>;
@@ -127,6 +123,8 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
+    bool DoubleSmemBuffer = isBpreshuffled;
+
     using GemmTraits = ck_tile::TileGemmQuantTraits<false, // PadM
                                                     PadN,
                                                     PadK,
@@ -139,7 +137,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                     AQLayout,
                                                     BQLayout,
                                                     GemmConfig::TransposeC_v,
-                                                    GemmConfig::DoubleSmemBuffer_v>;
+                                                    DoubleSmemBuffer>;
 
     using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
                                                                  BDataType,
@@ -149,7 +147,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                  ComputeDataType>;
 
     using BaseGemmPipeline = std::conditional_t<
-        GemmConfig::DoubleSmemBuffer_v && isBpreshuffled,
+        DoubleSmemBuffer && isBpreshuffled,
         ck_tile::BaseWeightPreshufflePipelineAGmemBGmemCRegV2<GemmPipelineProblem>,
         ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>>;
 
@@ -179,7 +177,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                     tail_number_v>;
 
         using GemmPipeline =
-            std::conditional_t<GemmConfig::DoubleSmemBuffer_v && isBpreshuffled,
+            std::conditional_t<DoubleSmemBuffer && isBpreshuffled,
                                ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
                                ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>;
 
@@ -200,6 +198,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                              GemmConfig::N_Warp_Tile_v,
                                              GemmConfig::K_Warp_Tile_v,
                                              GemmConfig::TransposeC_v,
+                                             ck_tile::memory_operation_enum::set,
                                              1,
                                              false,
                                              1,
