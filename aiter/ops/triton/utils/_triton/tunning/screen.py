@@ -11,7 +11,7 @@ NUM_KSPLITs = [1]
 
 possible_split = [3, 4, 7, 8, 14, 16]
 if K == 7168:
-    possible_split = [7]
+    possible_split = [7, 14]
 if K == 1536:
     possible_split = []
 for a_possible_split in possible_split:
@@ -22,6 +22,8 @@ if M >= 1024:
     Ms = [32, 64, 128, 256]
 elif M >= 256:
     Ms = [32, 64, 128]
+elif M >= 64:
+    Ms = [32, 64]
 elif M >= 32:
     Ms = [32]
 else:
@@ -30,9 +32,9 @@ else:
 Ns = [32, 64, 128]
 
 if K == 7168:
-    Ks = [1024]
+    Ks = [256, 512, 1024]
 if K == 1536:
-    Ks = [128]
+    Ks = [256, 512]
 
 parms = {
     "BLOCK_SIZE_M": Ms,
@@ -40,7 +42,7 @@ parms = {
     "BLOCK_SIZE_K": Ks,
     "GROUP_SIZE_M": [1, 4, 8],
     "num_warps": [2, 4, 8],
-    "num_stages": [1, 2, 3],
+    "num_stages": [1, 2],
     "waves_per_eu": [1, 2, 4, 6, 8],
     "matrix_instr_nonkdim": [16],
     "cache_modifier": [0, 1],
@@ -65,7 +67,6 @@ filename = f"screen-{M}-{N}-{K}.txt"
 s = " ".join([str(v) for v in parms.keys()])
 os.popen(f"echo 'Number of combinations = {len(comb)}' > {filename}")
 os.popen(f"echo '{s}' >> {filename}")
-print(len(comb))
 i_comb_start = 0
 comb_max_batch = 100
 os.popen(f"date >> {filename}").read()

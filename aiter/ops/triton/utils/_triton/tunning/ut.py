@@ -3,7 +3,6 @@ import sys
 from triton.testing import runtime
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffle,
@@ -34,11 +33,12 @@ config_parms_key = [
 num_config_parms_key = len(config_parms_key)
 config_list = []
 while len(config_argv) >= num_config_parms_key:
-    print(len(config_argv))
     config_list.append({config_parms_key[i]: int(config_argv[i]) for i in range(num_config_parms_key)})
     config_list[-1]["cache_modifier"] = ".cg" if config_list[-1]["cache_modifier"] == 0 else None
-    print(config_list[-1])
     config_argv = config_argv[num_config_parms_key:]
+
+if len(config_list) == 0:
+    config_list = [None]
 
 di = runtime.driver.active.get_device_interface()
 cache = runtime.driver.active.get_empty_cache_for_benchmark()
@@ -62,7 +62,11 @@ for config in config_list:
                 x, w_triton, x_scales_triton, w_scales_triton, dtype, y, config=config
             )
         di.synchronize()
+    cache.zero_()
+    di.synchronize()
     split_dummy[(1,)]()
+    di.synchronize()
+
 # torch.testing.assert_close(torch_out, triton_out)
         
 
