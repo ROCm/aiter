@@ -79,7 +79,7 @@ jobs:
               - '.github/workflows/triton-test.yaml'
 
   triton:
-    runs-on: aiter-mi300-1gpu
+    runs-on: aiter-1gpu-runner
     needs: [check-signal, detect-changes]
     if: |
       needs.detect-changes.outputs.attention == 'true' ||

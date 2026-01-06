@@ -28,12 +28,34 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 {
     using QoState = QoState<Traits>;
 
+    const int32_t ori_seqlen_qo = [&]() {
+        if constexpr (Traits::kIsSparse)
+        {
+            return params.p_seqlens_qo_indptr[1] - params.p_seqlens_qo_indptr[0];
+        }
+        else
+        {
+            return params.ori_seqlen_qo;
+        }
+    }();
+
+    const int32_t num_batches = [&]() {
+        if constexpr (Traits::kIsSparse)
+        {
+            return params.num_batches * ori_seqlen_qo;
+        }
+        else
+        {
+            return params.num_batches;
+        }
+    }();
+
     extern __shared__ uint8_t p_smem[];
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
-    int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : params.num_batches);
+    int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : num_batches);
 
     QoState qo_state(
-        params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
 
     auto get_num_qo_tiles = [&](const int32_t batch_idx) {
         if constexpr(Traits::kQoSplits)
@@ -53,10 +75,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
     int32_t sum_blocks = 0;
-    for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
     {
         const int32_t bid_ori = Traits::kIsSparse
-                                    ? (bid / params.ori_seqlen_qo / params.qk_batch_ratio)
+                                    ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
                                     : (bid / params.qk_batch_ratio);
         const int32_t kv_end  = params.p_seqlens_kv_indptr[bid_ori + 1];
         const int32_t seqlen_kv =
@@ -119,7 +141,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     for(int32_t cid = 0; cid < params.num_cu; ++cid)
     {
         int32_t remain_payload = payload;
-        while(curr_batch < params.num_batches)
+        while(curr_batch < num_batches)
         {
             const int32_t num_qo_tiles = get_num_qo_tiles(curr_batch);
             const int32_t qo_tile_size =
@@ -143,9 +165,17 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
                                                     qo_state.get_end(curr_batch));
                     work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
+                    int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
+                    if constexpr(!Traits::kIsSparse)
+                    {
+                        if (params.qk_batch_ratio != 1)
+                        {
+                            batch_tail = num_qo_tiles - (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
+                        }
+                    }
                     work_info.kv_end   = ck_tile::min(
                         work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
-                        curr_kv_end - (num_qo_tiles - 1 - curr_qo_tile_idx));
+                        curr_kv_end - batch_tail);
                     work_info.kv_offset = curr_kv_end - work_info.kv_end;
 
                     // split related info
@@ -202,7 +232,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     curr_sub_head_idx = (curr_sub_head_idx == (params.qk_batch_ratio - 1))
                                             ? 0
                                             : (curr_sub_head_idx + 1);
-                    if(curr_batch < params.num_batches)
+                    if(curr_batch < num_batches)
                     {
                         if(curr_sub_head_idx == 0)
                         {
@@ -213,7 +243,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             else
                             {
                                 const int32_t bid_ori = Traits::kIsSparse
-                                                            ? (curr_batch / params.ori_seqlen_qo /
+                                                            ? (curr_batch / ori_seqlen_qo /
                                                                params.qk_batch_ratio)
                                                             : (curr_batch / params.qk_batch_ratio);
                                 curr_kv_seqlen        = params.p_seqlens_kv_indptr[bid_ori + 1] -
@@ -251,9 +281,17 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                                         qo_state.get_end(curr_batch));
                         work_info.kv_start =
                             curr_kv_begin + (curr_kv_block * params.kv_granularity);
+                        int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
+                        if constexpr(!Traits::kIsSparse)
+                        {
+                            if (params.qk_batch_ratio != 1)
+                            {
+                                batch_tail = num_qo_tiles - (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
+                            }
+                        }
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (consuming_blks * params.kv_granularity),
-                            curr_kv_end - (num_qo_tiles - 1 - curr_qo_tile_idx));
+                            curr_kv_end - batch_tail);
                         work_info.kv_offset        = curr_kv_end - work_info.kv_end;
                         work_info.partial_qo_loc   = partial_idx;
                         p_work_info_set[num_works] = work_info;
@@ -334,7 +372,6 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_partial_map)
 {
     constexpr int32_t kPackedQoLenPerWg = 128;
-
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
@@ -356,19 +393,15 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         (q_dtype == at::ScalarType::Float8_e4m3fnuz || q_dtype == at::ScalarType::Float8_e4m3fn);
     const bool kv_is_fp8 =
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
-    const bool natively_supported =
-        (num_heads == 16) || ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
+
+    const bool natively_supported = (num_heads == 16) ||
+                                    ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
+
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
         qk_batch_ratio = num_heads / 16;
         num_heads      = 16;
         num_batches *= qk_batch_ratio;
-    }
-
-    if(is_sparse)
-    {
-        num_batches *= uni_seqlen_qo;
-        uni_seqlen_qo = 1;
     }
 
     TORCH_CHECK((num_heads == 16) || (num_heads == 128),

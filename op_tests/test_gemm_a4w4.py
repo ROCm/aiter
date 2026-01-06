@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, benchmark, perftest, run_perftest
-from aiter import dtypes
-from aiter.utility import fp4_utils
-from aiter.ops.shuffle import shuffle_weight
 import argparse
+
 import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -98,13 +100,10 @@ def test_gemm(dtype, M, N, K):
     x, x_scales_shuffle = quant_func(x, shuffle=True)
     w, w_scales_shuffle = quant_func(w, shuffle=True)
     wshuffle = shuffle_weight(w, layout=(16, 16))
-    out1 = torch.empty(M, N, dtype=dtype)
-    out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
-    out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
-    bias_f32 = None
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
     a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
+    # out1 = torch.empty(M, N, dtype=dtype)
     # b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
     # b, avg_b = a, 0
     # err_b = checkAllclose(a, b, msg="triton        ")
@@ -115,23 +114,23 @@ def test_gemm(dtype, M, N, K):
         wshuffle,
         x_scales_shuffle,
         w_scales_shuffle,
-        out2,
         bpreshuffle=True,
     )
-    err = checkAllclose(a, c[:M], msg="unified api")
+    err = checkAllclose(a, c, msg="unified api")
     ret["us"] = us
     ret["TFLOPS"] = M * N * K * 2 / us / 1e6
     ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
     ret["err"] = err
 
-    # kernelName = ""  # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
+    # kernelName = "" # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
     # log2_k_split = 1
+    # out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     # d, us = run_gemm_asm(
     #     x,
     #     wshuffle,
     #     x_scales_shuffle,
     #     w_scales_shuffle,
-    #     out3,
+    #     out2,
     #     kernelName,
     #     bias_f32,
     #     bpreshuffle=True,
@@ -144,6 +143,7 @@ def test_gemm(dtype, M, N, K):
     # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
     # ret[f"err {tag}"] = err
 
+    # out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     # e, us = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
     # err = checkAllclose(a, e[:M], msg="ck            ")
     # tag = "ck"
@@ -272,4 +272,5 @@ for dtype in l_dtype:
         ret = test_gemm(dtype, m, n, k)
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)

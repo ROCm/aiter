@@ -10,16 +10,6 @@ import triton
 import aiter
 import torch
 
-GLUON_AOT_COMPILE_ENABLED = True
-try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-except ImportError:
-    print(
-        "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, transpose_query_gluon_aot cannot use compile mode!"
-    )
-    GLUON_AOT_COMPILE_ENABLED = False
-
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     compile_gluon_kernel,
     CompileGluonArgs,
@@ -35,6 +25,21 @@ from csrc.cpp_itfs.utils import (
     run_lib,
     logger,
 )
+
+GLUON_AOT_COMPILE_ENABLED = True
+try:
+    from triton.experimental import gluon  # noqa: F401
+    from triton.experimental.gluon import language as gl  # noqa: F401
+except ImportError:
+    print(
+        "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, transpose_query_gluon_aot cannot use compile mode!"
+    )
+    GLUON_AOT_COMPILE_ENABLED = False
+
+TORCH_TO_TL_DTYPE_SIG = {
+    torch.float8_e4m3fnuz: "fp8e4b8",
+    torch.float8_e4m3fn: "fp8e4nv",
+}
 
 MD_NAME_QUERY = "transpose_query_gluon_kernel"
 MD_NAME_OUTPUT = "transpose_output_gluon_kernel"
@@ -69,12 +74,13 @@ def compile_query(
         )
 
         # Determine signature based on data type
+        tl_fp8_type_sig = TORCH_TO_TL_DTYPE_SIG[aiter.dtypes.fp8]
         if data_type == torch.bfloat16:
             data_sig = "*bf16:16"
         elif data_type == torch.float16:
             data_sig = "*fp16:16"
         elif data_type == aiter.dtypes.fp8:
-            data_sig = "*fp8e4b8:16"
+            data_sig = f"*{tl_fp8_type_sig}:16"
         elif data_type == torch.float32:
             data_sig = "*fp32:16"
         else:
@@ -401,12 +407,13 @@ def compile_output(
         )
 
         # Determine signature based on data type
+        tl_fp8_type_sig = TORCH_TO_TL_DTYPE_SIG[aiter.dtypes.fp8]
         if data_type == torch.bfloat16:
             data_sig = "*bf16:16"
         elif data_type == torch.float16:
             data_sig = "*fp16:16"
         elif data_type == aiter.dtypes.fp8:
-            data_sig = "*fp8e4b8:16"
+            data_sig = f"*{tl_fp8_type_sig}:16"
         else:
             raise ValueError(f"Unsupported data type: {data_type}")
 

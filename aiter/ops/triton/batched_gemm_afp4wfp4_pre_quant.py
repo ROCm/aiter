@@ -3,8 +3,6 @@
 
 from typing import Optional
 import torch
-import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
@@ -22,13 +20,13 @@ def set_use_gemm_splitk_bf16(value: bool):
 
 
 def batched_gemm_afp4wfp4_pre_quant(
-    x,
-    w,
-    w_scales,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scales: torch.Tensor,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-):
+) -> torch.Tensor:
     _LOGGER.info(
         "batched_gemm_afp4wfp4_pre_quant will be deprecated in future AITER release, please switch to batched_gemm_a16wfp4"
     )

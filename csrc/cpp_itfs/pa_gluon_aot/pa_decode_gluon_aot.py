@@ -1,50 +1,59 @@
 import os
-import time
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from jinja2 import Template
-import torch
+
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+import torch
 import triton
 import triton.language as tl
+from jinja2 import Template
+
+from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from csrc.cpp_itfs.gluon_aot_tools.compile import (
+    CompileArgs,
+    compile_kernel,
+)
+from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
+    CompileGluonArgs,
+    compile_gluon_kernel,
+)
+from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
+    transpose_output_gluon_aot,
+    transpose_query_gluon_aot,
+)
+from csrc.cpp_itfs.torch_utils import torch_to_c_types
+from csrc.cpp_itfs.utils import (
+    AITER_CORE_DIR,
+    BUILD_DIR,
+    compile_template_op,
+    get_default_func_name,
+    logger,
+    mp_lock,
+    not_built,
+    run_lib,
+)
 
 GLUON_AOT_COMPILE_ENABLED = True
 try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
+    from triton.experimental import gluon  # noqa: F401
+    from triton.experimental.gluon import language as gl  # noqa: F401
 except ImportError:
     print(
         "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, pa_decode_gluon_aot cannot use compile mode!"
     )
     GLUON_AOT_COMPILE_ENABLED = False
 
-try:
-    from triton.tools.compile import compile_kernel, CompileArgs
-except ImportError:
-    print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
-
-from aiter.jit.utils.file_baton import FileBaton
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
-    compile_gluon_kernel,
-    CompileGluonArgs,
-)
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
-from csrc.cpp_itfs.utils import (
-    BUILD_DIR,
-    AITER_CORE_DIR,
-    get_default_func_name,
-    compile_template_op,
-    mp_lock,
-    not_built,
-    run_lib,
-    logger,
-)
-from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
-    transpose_query_gluon_aot,
-    transpose_output_gluon_aot,
-)
+TORCH_TO_TL_DTYPE = {
+    torch.float8_e4m3fnuz: tl.float8e4b8,
+    torch.float8_e4m3fn: tl.float8e4nv,
+}
+TORCH_TO_TL_DTYPE_SIG = {
+    torch.float8_e4m3fnuz: "fp8e4b8",
+    torch.float8_e4m3fn: "fp8e4nv",
+}
 
 MD_NAME = "pa_decode_attention_reduce_kernel"
 
@@ -113,6 +122,8 @@ def compile(
     fp8_max_value: float,
     value_transposed: int,
     is_causal: int,
+    use_sinks: int,
+    cdna_version: int,
     func_name: str = None,
 ):
     """Compile the combined attention and reduce kernel for paged attention decode."""
@@ -137,6 +148,8 @@ def compile(
                 fp8_max_value,
                 value_transposed,
                 is_causal,
+                use_sinks,
+                cdna_version,
             ),
         )
 
@@ -146,8 +159,8 @@ def compile(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
 
-        kv_compute_block_size = 256
         waves_per_eu = 1
+        kv_compute_block_size = context_partition_size
         # Select kernel implementation based on block size
         if kv_block_size > context_partition_size:
             # Use big block kernel for large block sizes
@@ -162,14 +175,16 @@ def compile(
             else:
                 waves_per_eu = 4
 
-        if compute_type == tl.float8e4b8 or compute_type == tl.bfloat16:
+        tl_fp8_type = TORCH_TO_TL_DTYPE[aiter.dtypes.fp8]
+        tl_fp8_type_sig = TORCH_TO_TL_DTYPE_SIG[aiter.dtypes.fp8]
+        if compute_type == tl_fp8_type or compute_type == tl.bfloat16:
             if query_quant_mode >= 0:
-                query_sig = "*fp8e4b8:16"
+                query_sig = f"*{tl_fp8_type_sig}:16"
             else:
                 query_sig = "*bf16:16"
             if kv_quant_mode >= 0:
-                key_cache_sig = "*fp8e4b8:16"
-                value_cache_sig = "*fp8e4b8:16"
+                key_cache_sig = f"*{tl_fp8_type_sig}:16"
+                value_cache_sig = f"*{tl_fp8_type_sig}:16"
             else:
                 key_cache_sig = "*bf16:16"
                 value_cache_sig = "*bf16:16"
@@ -177,12 +192,12 @@ def compile(
             output_sig = "*bf16:16"
         elif compute_type == tl.float16:
             if query_quant_mode >= 0:
-                query_sig = "*fp8e4b8:16"
+                query_sig = f"*{tl_fp8_type_sig}:16"
             else:
                 query_sig = "*fp16:16"
             if kv_quant_mode >= 0:
-                key_cache_sig = "*fp8e4b8:16"
-                value_cache_sig = "*fp8e4b8:16"
+                key_cache_sig = f"*{tl_fp8_type_sig}:16"
+                value_cache_sig = f"*{tl_fp8_type_sig}:16"
             else:
                 key_cache_sig = "*fp16:16"
                 value_cache_sig = "*fp16:16"
@@ -241,6 +256,7 @@ def compile(
             f"{fp8_max_value}",
             f"{value_transposed}",
             f"{is_causal}",
+            f"{cdna_version}",
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"
@@ -272,6 +288,7 @@ def compile(
             "*fp32:16",  # max_logits_ptr
             logits_sig,  # logits_ptr
             "*i32:16",  # context_lengths_ptr
+            "*fp32:16",  # sinks_ptr
             "i32:16",  # stride_output_seq
             "i32:16",  # stride_output_head
             "i32:16",  # stride_exp_sums_seq
@@ -288,6 +305,7 @@ def compile(
             f"{equi_query_group_size_pow2}",
             f"{head_size_pow2}",
             f"{context_partition_size}",
+            f"{use_sinks}",
         ]
         reduce_signature = ",".join(reduce_signature_parts)
         reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
@@ -369,11 +387,11 @@ def compile(
             )
             if result.returncode != 0 and result.stderr:
                 print(f"Warning: {result.stderr}")
-            print(f"Cleaning aot temporary files completed!")
+            print("Cleaning aot temporary files completed!")
             print(f"Cleaning aiter build cache directory: {BUILD_DIR}/{func_name}")
             clean_directory_except_so(f"{BUILD_DIR}/{func_name}")
             print(
-                f"Cleaning aiter build cache directory completed, only *.so files are left!"
+                "Cleaning aiter build cache directory completed, only *.so files are left!"
             )
             return main_func_result
         else:
@@ -407,6 +425,7 @@ def pa_decode_gluon_aot(
     temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
     run_compiled_kernel: bool = True,
+    sinks: torch.Tensor = None,
 ) -> None:
     """
     Paged Attention Decode with FP8/BF16/FP16 Support.
@@ -533,9 +552,11 @@ def pa_decode_gluon_aot(
     - For FP8 computation, query_scale and key_scale/value_scale are required
     - For BF16/FP16 computation, scales can be None
     """
-    assert arch_info.get_arch() in (
-        "gfx942",
-    ), f"pa_decode_gluon only supports gfx942 (CDNA3) now, but got {arch_info.get_arch()}"
+    cdna_version = get_cdna_version()
+    assert cdna_version in [
+        3,
+        4,
+    ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
 
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
@@ -706,9 +727,11 @@ def pa_decode_gluon_aot(
         fp8_max_value=fp8_max_value,
         value_transposed=int(value_transposed),
         is_causal=int(is_causal),
+        use_sinks=int(sinks is not None),
+        cdna_version=cdna_version,
     )
 
-    assert combined_func is not None, f"Combined function is not compiled"
+    assert combined_func is not None, "Combined function is not compiled"
     # Execute the combined kernel
     if run_compiled_kernel:
         combined_func(
@@ -722,6 +745,7 @@ def pa_decode_gluon_aot(
                 value_cache,
                 block_tables,
                 context_lengths,
+                sinks,
                 softmax_scale,
                 query_scale_gluon,
                 key_scale,

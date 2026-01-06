@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.gemm_a8w8_blockscale import (
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 
 _LOGGER = AiterTritonLogger()
 
@@ -61,7 +62,7 @@ def gemm_a8w8_blockscale(
     w_scale = w_scale.T  # (scale_k, scale_n)
 
     if config is None:
-        config = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -78,14 +79,7 @@ def gemm_a8w8_blockscale(
     else:
         y_pp = None
 
-    # If block size is greater than split k size, shrink the block size
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(
-        config["BLOCK_SIZE_K"], 16
-    )  # minimum block size is 16 for perf
+    compute_splitk_params(config, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around

@@ -420,7 +420,8 @@ __device__ void filter_and_histogram(T const* in_buf,
                                      IdxT* histogram,
                                      bool select_min,
                                      int pass,
-                                     bool early_stop)
+                                     bool early_stop,
+                                     IdxT k)
 {
     constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
     __shared__ IdxT histogram_smem[num_buckets];
@@ -893,9 +894,19 @@ __global__ void radix_kernel(T const* in,
                              int const pass)
 {
     const int64_t batch_id = blockIdx.y;
-    const IdxT row_len     = phase == Phase::Prefill
-                                 ? rowEnds[batch_id] - rowStarts[batch_id]
-                                 : rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+
+    IdxT row_len = len;
+    if(phase == Phase::Prefill)
+    {
+        if(rowStarts && rowEnds)
+        {
+            row_len = rowEnds[batch_id] - rowStarts[batch_id];
+        }
+    }
+    else
+    {
+        row_len = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+    }
 
     auto counter = counters + batch_id;
     IdxT current_k;
@@ -965,7 +976,8 @@ __global__ void radix_kernel(T const* in,
                                                                   histogram,
                                                                   select_min,
                                                                   pass,
-                                                                  early_stop);
+                                                                  early_stop,
+                                                                  k);
     __threadfence();
 
     bool isLastBlock = false;
@@ -1187,7 +1199,8 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
                                                    Counter<T, IdxT>* counter,
                                                    IdxT* histogram,
                                                    bool select_min,
-                                                   int pass)
+                                                   int pass,
+                                                   IdxT k)
 {
     constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
     for(int i = threadIdx.x; i < num_buckets * 2; i += blockDim.x)
@@ -1371,11 +1384,25 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     __shared__ IdxT histogram[num_buckets * 2];
 
     const int64_t batch_id = blockIdx.x;
-    const IdxT rowStart    = phase == Phase::Prefill ? rowStarts[batch_id] : 0;
-    const IdxT rowEnd      = phase == Phase::Prefill
-                                 ? rowEnds[batch_id]
-                                 : rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
-    const IdxT row_len     = rowEnd - rowStart;
+
+    IdxT rowStart = 0;
+    IdxT rowEnd   = len;
+    if(phase == Phase::Prefill)
+    {
+        if(rowStarts && rowEnds)
+        {
+            rowStart = rowStarts[batch_id];
+            rowEnd   = rowEnds[batch_id];
+        }
+    }
+    else
+    {
+        rowEnd   = rowEnds[batch_id / next_n] - next_n + (batch_id % next_n) + 1;
+        rowStart = 0;
+    }
+
+    const IdxT row_len = rowEnd - rowStart;
+
     if(threadIdx.x == 0)
     {
         counter.k              = k;
@@ -1448,7 +1475,8 @@ __global__ void radix_topk_one_block_kernel(T const* in,
                 &counter,
                 histogram,
                 select_min,
-                pass); //@TODO CHECK UPDATE CODE
+                pass,
+                k); //@TODO CHECK UPDATE CODE
         __syncthreads();
 
         scan<IdxT, BitsPerPass, BlockSize>(histogram + use_one_pass * num_buckets);
@@ -1810,6 +1838,35 @@ void standalone_stable_radix_11bits(void* buf,
         }
     }
 }
+
+// Explicit template instantiation for standalone_stable_radix_11bits
+template void standalone_stable_radix_11bits<float, int, true, true>(void* buf,
+                                                                     size_t& buf_size,
+                                                                     float const* in,
+                                                                     int batch_size,
+                                                                     int64_t len,
+                                                                     int* rowStarts,
+                                                                     int* rowEnds,
+                                                                     int k,
+                                                                     float* out,
+                                                                     int* out_idx,
+                                                                     bool greater,
+                                                                     hipStream_t stream,
+                                                                     int next_n);
+
+template void standalone_stable_radix_11bits<float, int, false, true>(void* buf,
+                                                                      size_t& buf_size,
+                                                                      float const* in,
+                                                                      int batch_size,
+                                                                      int64_t len,
+                                                                      int* rowStarts,
+                                                                      int* rowEnds,
+                                                                      int k,
+                                                                      float* out,
+                                                                      int* out_idx,
+                                                                      bool greater,
+                                                                      hipStream_t stream,
+                                                                      int next_n);
 
 // AIR TopK end
 
@@ -2409,6 +2466,9 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
     }
     return buf_size;
 }
+
+// Explicit template instantiation to ensure the symbol is available for linking
+template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows, int32_t stride0);
 
 void top_k_per_row_prefill(const torch::Tensor& logits,
                            const torch::Tensor& rowStarts,

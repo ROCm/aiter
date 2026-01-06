@@ -4,20 +4,17 @@
 import functools
 from typing import Optional
 
-from aiter.jit.utils.torch_guard import torch_compile_guard
 import pandas as pd
 import torch
 from torch import Tensor
 
 from aiter import logger
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from ..jit.core import (
-    AITER_CONFIGS,
-    AITER_LOG_TUNED_CONFIG,
-    compile_ops,
-)
+from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..ops.gemm_op_common import get_padded_m
+from ..utility import dtypes
 
 
 @functools.lru_cache(maxsize=1024)
@@ -66,12 +63,15 @@ def gemm_a4w4_fake(
     B: Tensor,  # B:[N, K/2] f4x2
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
-    out: Tensor,  # Out:[M, N] bf16
     bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    dtype: torch.dtype = dtypes.bf16,
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
 ) -> torch.Tensor:
+    m = A.numel() // A.shape[-1]
+    n = B.shape[0]
+    out = torch.empty((m, n), dtype=dtype, device=A.device)
     return out
 
 
@@ -81,8 +81,8 @@ def gemm_a4w4(
     B: Tensor,  # B:[N, K/2] f4x2
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
-    out: Tensor,  # Out:[M, N] bf16
     bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    dtype: torch.dtype = dtypes.bf16,
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
@@ -93,9 +93,10 @@ def gemm_a4w4(
     It is used to perform matrix multiplication with 4-bit quantization.
     """
     # Load the A4W4 GEMM kernel
-    m = A.shape[0]
+    m = A.numel() // A.shape[-1]
     n = B.shape[0]
     k = A.shape[-1] * 2
+    out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx942"]:
         raise RuntimeError(
@@ -114,12 +115,14 @@ def gemm_a4w4(
         # or bias is None
     ):
         splitK = 0 if splitK is None else splitK
-        return gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
+        return gemm_a4w4_blockscale(
+            A.view(m, k // 2), B, A_scale, B_scale, out, splitK=splitK
+        )[:m]
     assert (
         out.shape[0] % 32 == 0
     ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"
-    return gemm_a4w4_asm(
-        A,
+    gemm_a4w4_asm(
+        A.view(m, k // 2),
         B,
         A_scale,
         B_scale,
@@ -131,6 +134,7 @@ def gemm_a4w4(
         bpreshuffle,
         log2_k_split=splitK,
     )
+    return out[:m].view(*A.shape[:-1], n)
 
 
 def gen_gemm_a4w4_asm_fake_tensors(

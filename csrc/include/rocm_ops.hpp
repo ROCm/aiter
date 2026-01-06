@@ -3,6 +3,7 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
+
 namespace py = pybind11;
 
 #define ACTIVATION_PYBIND                               \
@@ -377,6 +378,12 @@ namespace py = pybind11;
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
           py::arg("out"));                                                                     \
+    m.def("reduce_scatter",                                                                    \
+          &aiter::reduce_scatter,                                                              \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"),                                                                      \
+          py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("all_reduce",                                                                        \
           &aiter::all_reduce,                                                                  \
           py::arg("_fa"),                                                                      \
@@ -455,6 +462,7 @@ namespace py = pybind11;
           py::arg("A"),                          \
           py::arg("B"),                          \
           py::arg("out"),                        \
+          py::arg("semaphore"),                  \
           py::arg("bias")        = std::nullopt, \
           py::arg("splitK")      = std::nullopt, \
           py::arg("kernelName")  = std::nullopt, \
@@ -658,6 +666,64 @@ namespace py = pybind11;
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
+#define ROCSOLGEMM_PYBIND                                                          \
+    m.def("rocb_create_extension", &rocb_create_extension, "create_extension");    \
+    m.def("rocb_destroy_extension", &rocb_destroy_extension, "destroy_extension"); \
+    m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
+    m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
+
+#define HIPBSOLGEMM_PYBIND                                                         \
+    m.def("hipb_create_extension", &hipb_create_extension, "create_extension");    \
+    m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension"); \
+    m.def("hipb_mm",                                                               \
+          &hipb_mm,                                                                \
+          "hipb_mm",                                                               \
+          py::arg("mat1"),                                                         \
+          py::arg("mat2"),                                                         \
+          py::arg("solution_index"),                                               \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleOut")    = std::nullopt,                                   \
+          py::arg("bpreshuffle") = std::nullopt);                                  \
+    m.def("hipb_findallsols",                                                      \
+          &hipb_findallsols,                                                       \
+          "hipb_findallsols",                                                      \
+          py::arg("mat1"),                                                         \
+          py::arg("mat2"),                                                         \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleC")      = std::nullopt,                                   \
+          py::arg("bpreshuffle") = false);                                         \
+    m.def("getHipblasltKernelName", &getHipblasltKernelName);
+
+#define LIBMHA_BWD_PYBIND                         \
+    m.def("libmha_bwd",                           \
+          &aiter::torch_itfs::mha_bwd,            \
+          py::arg("dout"),                        \
+          py::arg("q"),                           \
+          py::arg("k"),                           \
+          py::arg("v"),                           \
+          py::arg("out"),                         \
+          py::arg("softmax_lse"),                 \
+          py::arg("dropout_p"),                   \
+          py::arg("softmax_scale"),               \
+          py::arg("is_causal"),                   \
+          py::arg("window_size_left"),            \
+          py::arg("window_size_right"),           \
+          py::arg("deterministic"),               \
+          py::arg("dq")           = std::nullopt, \
+          py::arg("dk")           = std::nullopt, \
+          py::arg("dv")           = std::nullopt, \
+          py::arg("dbias")        = std::nullopt, \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alibi_slopes") = std::nullopt, \
+          py::arg("rng_state")    = std::nullopt, \
+          py::arg("gen")          = std::nullopt);
+
 #define MHA_VARLEN_BWD_ASM_PYBIND                        \
     m.def("fmha_v3_varlen_bwd",                          \
           &aiter::torch_itfs::fmha_v3_varlen_bwd,        \
@@ -756,32 +822,56 @@ namespace py = pybind11;
           py::arg("v_descale")     = std::nullopt, \
           py::arg("gen")           = std::nullopt);
 
-#define MHA_VARLEN_FWD_ASM_PYBIND                 \
-    m.def("fmha_v3_varlen_fwd",                   \
-          &aiter::torch_itfs::fmha_v3_varlen_fwd, \
-          py::arg("q"),                           \
-          py::arg("k"),                           \
-          py::arg("v"),                           \
-          py::arg("cu_seqlens_q"),                \
-          py::arg("cu_seqlens_k"),                \
-          py::arg("max_seqlen_q"),                \
-          py::arg("max_seqlen_k"),                \
-          py::arg("min_seqlen_q"),                \
-          py::arg("dropout_p"),                   \
-          py::arg("softmax_scale"),               \
-          py::arg("logits_soft_cap"),             \
-          py::arg("zero_tensors"),                \
-          py::arg("is_causal"),                   \
-          py::arg("window_size_left"),            \
-          py::arg("window_size_right"),           \
-          py::arg("return_softmax_lse"),          \
-          py::arg("return_dropout_randval"),      \
-          py::arg("how_v3_bf16_cvt"),             \
-          py::arg("out")          = std::nullopt, \
-          py::arg("block_table")  = std::nullopt, \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alibi_slopes") = std::nullopt, \
-          py::arg("gen")          = std::nullopt, \
+#define LIBMHA_FWD_PYBIND                          \
+    m.def("libmha_fwd",                            \
+          &aiter::torch_itfs::mha_fwd,             \
+          py::arg("q"),                            \
+          py::arg("k"),                            \
+          py::arg("v"),                            \
+          py::arg("dropout_p"),                    \
+          py::arg("softmax_scale"),                \
+          py::arg("is_causal"),                    \
+          py::arg("window_size_left"),             \
+          py::arg("window_size_right"),            \
+          py::arg("sink_size"),                    \
+          py::arg("return_softmax_lse"),           \
+          py::arg("return_dropout_randval"),       \
+          py::arg("cu_seqlens_q")  = std::nullopt, \
+          py::arg("cu_seqlens_kv") = std::nullopt, \
+          py::arg("out")           = std::nullopt, \
+          py::arg("bias")          = std::nullopt, \
+          py::arg("alibi_slopes")  = std::nullopt, \
+          py::arg("q_descale")     = std::nullopt, \
+          py::arg("k_descale")     = std::nullopt, \
+          py::arg("v_descale")     = std::nullopt, \
+          py::arg("gen")           = std::nullopt);
+
+#define MHA_VARLEN_FWD_ASM_PYBIND                        \
+    m.def("fmha_v3_varlen_fwd",                          \
+          &aiter::torch_itfs::fmha_v3_varlen_fwd,        \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("v"),                                  \
+          py::arg("cu_seqlens_q"),                       \
+          py::arg("cu_seqlens_k"),                       \
+          py::arg("max_seqlen_q"),                       \
+          py::arg("max_seqlen_k"),                       \
+          py::arg("min_seqlen_q"),                       \
+          py::arg("dropout_p"),                          \
+          py::arg("softmax_scale"),                      \
+          py::arg("logits_soft_cap"),                    \
+          py::arg("zero_tensors"),                       \
+          py::arg("is_causal"),                          \
+          py::arg("window_size_left"),                   \
+          py::arg("window_size_right"),                  \
+          py::arg("return_softmax_lse"),                 \
+          py::arg("return_dropout_randval"),             \
+          py::arg("how_v3_bf16_cvt"),                    \
+          py::arg("out")                 = std::nullopt, \
+          py::arg("block_table")         = std::nullopt, \
+          py::arg("bias")                = std::nullopt, \
+          py::arg("alibi_slopes")        = std::nullopt, \
+          py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
 
@@ -831,7 +921,9 @@ namespace py = pybind11;
           py::arg("block_m")        = 32,           \
           py::arg("sorted_weights") = std::nullopt, \
           py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0);               \
+          py::arg("activation")     = 0,            \
+          py::arg("splitk")         = 1,            \
+          py::arg("dst_type")       = std::nullopt);      \
                                                     \
     m.def("ck_moe_stage2",                          \
           &ck_moe_stage2,                           \
@@ -849,7 +941,9 @@ namespace py = pybind11;
           py::arg("block_m")        = 32,           \
           py::arg("sorted_weights") = std::nullopt, \
           py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0);
+          py::arg("activation")     = 0,            \
+          py::arg("splitk")         = 1,            \
+          py::arg("dst_type")       = std::nullopt);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \
@@ -868,7 +962,9 @@ namespace py = pybind11;
           py::arg("x_scale")        = std::nullopt, \
           py::arg("w_scale")        = std::nullopt, \
           py::arg("exp_bias")       = std::nullopt, \
-          py::arg("block_m")        = 32);                 \
+          py::arg("activation")     = 0,            \
+          py::arg("block_m")        = 32,           \
+          py::arg("split_k")        = 1);                 \
                                                     \
     m.def("cktile_moe_gemm2",                       \
           &cktile_moe_gemm2,                        \
@@ -886,7 +982,9 @@ namespace py = pybind11;
           py::arg("x_scale")        = std::nullopt, \
           py::arg("w_scale")        = std::nullopt, \
           py::arg("exp_bias")       = std::nullopt, \
-          py::arg("block_m")        = 32);
+          py::arg("activation")     = 0,            \
+          py::arg("block_m")        = 32,           \
+          py::arg("split_k")        = 1);
 
 #define MHA_VARLEN_FWD_PYBIND                            \
     m.def("mha_varlen_fwd",                              \
@@ -943,6 +1041,9 @@ namespace py = pybind11;
           py::arg("out")          = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
+          py::arg("q_descale")    = std::nullopt, \
+          py::arg("k_descale")    = std::nullopt, \
+          py::arg("v_descale")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
@@ -1357,6 +1458,9 @@ namespace py = pybind11;
     m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms); \
     m.def("fused_rope_rms", &fused_rope_rms);
 
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
@@ -1454,25 +1558,44 @@ namespace py = pybind11;
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
-#define TOP_K_PER_ROW_PYBIND       \
-    m.def("top_k_per_row_prefill", \
-          &top_k_per_row_prefill,  \
-          py::arg("logits"),       \
-          py::arg("rowStarts"),    \
-          py::arg("rowEnds"),      \
-          py::arg("indices"),      \
-          py::arg("values"),       \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
-          py::arg("stride1"));     \
-    m.def("top_k_per_row_decode",  \
-          &top_k_per_row_decode,   \
-          py::arg("logits"),       \
-          py::arg("next_n"),       \
-          py::arg("seqLens"),      \
-          py::arg("indices"),      \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
+#define TOP_K_PER_ROW_PYBIND           \
+    m.def("top_k_per_row_prefill",     \
+          &top_k_per_row_prefill,      \
+          py::arg("logits"),           \
+          py::arg("rowStarts"),        \
+          py::arg("rowEnds"),          \
+          py::arg("indices"),          \
+          py::arg("values"),           \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+      m.def("top_k_per_row_prefill_fast", \
+            &top_k_per_row_prefill_fast,  \
+            py::arg("logits"),       \
+            py::arg("rowStarts"),    \
+            py::arg("rowEnds"),      \
+            py::arg("indices"),      \
+            py::arg("values"),       \
+            py::arg("numRows"),      \
+            py::arg("stride0"),      \
+            py::arg("stride1"));     \
+    m.def("top_k_per_row_decode",      \
+          &top_k_per_row_decode,       \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+    m.def("top_k_per_row_decode_fast", \
+          &top_k_per_row_decode_fast,  \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
           py::arg("stride1"));
 
 #define MLA_METADATA_PYBIND                              \
@@ -1538,10 +1661,15 @@ namespace py = pybind11;
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
-#define TOPK_PLAIN_PYBIND      \
-    m.def("topk_plain",        \
-          &topk_plain,         \
-          py::arg("values"),   \
-          py::arg("topk_ids"), \
-          py::arg("topk"),     \
-          py::arg("largest"));
+#define TOPK_PLAIN_PYBIND                         \
+    m.def("topk_plain",                           \
+          &topk_plain,                            \
+          py::arg("values"),                      \
+          py::arg("topk_ids"),                    \
+          py::arg("topk_out"),                    \
+          py::arg("topk"),                        \
+          py::arg("largest")   = true,            \
+          py::arg("rowStarts") = torch::Tensor(), \
+          py::arg("rowEnds")   = torch::Tensor(), \
+          py::arg("stride0")   = -1,              \
+          py::arg("stride1")   = 1);

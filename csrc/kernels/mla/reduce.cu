@@ -318,7 +318,7 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_massive(
         else
         {
             const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
-            return MlaPartialTileInfo{tile_idx * qo_len, (tile_idx + 1) * qo_len};
+            return MlaPartialTileInfo{{tile_idx * qo_len, (tile_idx + 1) * qo_len}};
         }
     }();
 
@@ -606,6 +606,10 @@ __global__ void kn_mla_reduce_v1(
         NUM_HEAD,  16, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD,  16, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  32, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  64, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD, 128, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
