@@ -197,7 +197,6 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                              GemmConfig::N_Warp_Tile_v,
                                              GemmConfig::K_Warp_Tile_v,
                                              GemmConfig::TransposeC_v,
-                                             ck_tile::memory_operation_enum::set,
                                              1,
                                              false,
                                              1,
@@ -269,7 +268,7 @@ __forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
 
     // M, N, K
     const int M = XQ.size(0);
-    const int N = WQ.size(0);
+    const int N = Y.size(1);
     const int K = XQ.size(1);
 
     // prepare args

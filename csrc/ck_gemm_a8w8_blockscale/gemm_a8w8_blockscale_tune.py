@@ -81,10 +81,9 @@ def run_ck_gemm_a8w8_blockscale_legacy(
     )
 
 
-def generate_data(m, n, k, seed, isBpreshuffled=False, device="cuda"):
+def generate_data(m, n, k, seed, device="cuda"):
     """
     Generate random data for testing the gemm a8w8 blockscale kernel.
-    If isBpreshuffled is True, return shuffled weight and original weight for reference.
     """
 
     torch.manual_seed(seed)
@@ -98,12 +97,9 @@ def generate_data(m, n, k, seed, isBpreshuffled=False, device="cuda"):
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
-    
-    if isBpreshuffled:
-        # weight_shuffle = shuffle_weight(weight, layout=(16, 16)).clone()
-        return x, weight, x_scale, w_scale, out, weight
-    else:
-        return x, weight, x_scale, w_scale, out
+
+    return x, weight, x_scale, w_scale, out
+
 
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
@@ -172,7 +168,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         (cu_num, M, N, K) = info_keys
         kernels_num = len(candidate_kernels_dict_tile)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
-        ref_data_idx = [0, 5, 2, 3] if isBpreshuffled else [0, 1, 2, 3]
+        ref_data_idx = [0, 1, 2, 3]
         tasks_ck_tile = []
         for i in range(kernels_num):
             kernel = candidate_kernels_dict_tile[i]
@@ -194,7 +190,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     (
                         info,
                         generate_data,
-                        (M, N, K, seed, isBpreshuffled),
+                        (M, N, K, seed),
                         run_ck_gemm_a8w8_blockscale_tile,
                         (
                             gemm_a8w8_idx,
@@ -248,7 +244,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     (
                         info,
                         generate_data,
-                        (M, N, K, seed, False),
+                        (M, N, K, seed),
                         run_ck_gemm_a8w8_blockscale_legacy,
                         (
                             gemm_a8w8_idx,
