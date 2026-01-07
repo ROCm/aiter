@@ -20,18 +20,17 @@ import triton.language as tl
 import logging
 from typing import Optional, TYPE_CHECKING
 
+# Import shared implementations
+from aiter.ops.triton.comms.reduce_scatter import _reduce_scatter_impl
+from aiter.ops.triton.comms.all_gather import _all_gather_impl
+from aiter.ops.triton._triton_kernels.normalization.rmsnorm import _rms_norm_kernel
+
 if TYPE_CHECKING:
     from ..iris import IrisCommContext
 
-import iris
 
 # If we got here, iris is available
 IRIS_AVAILABLE = True
-
-# Import shared implementations
-from ..reduce_scatter import _reduce_scatter_impl
-from ..all_gather import _all_gather_impl
-from ..._triton_kernels.rmsnorm import _rms_norm_kernel
 
 logger = logging.getLogger("aiter")
 

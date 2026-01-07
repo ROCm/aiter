@@ -4,12 +4,12 @@ import warnings
 import argparse
 import itertools
 import triton
-from aiter.ops.triton.mha import (
+from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
 )
-from aiter.ops.triton.mha_v3 import (
+from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
