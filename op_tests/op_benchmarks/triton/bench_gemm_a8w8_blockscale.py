@@ -30,7 +30,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callab
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
-    x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+    x, weight, _, x_scale, _, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
         M, N, K, block_shape_n, block_shape_k, layout=layout, output=True
     )
     # flops

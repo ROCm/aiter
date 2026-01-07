@@ -2,17 +2,29 @@ from ..jit.core import compile_ops
 import torch
 from typing import Optional
 
+from torch import Tensor
 
-@compile_ops("module_groupnorm")
-def _groupnorm_run(
-    input: torch.Tensor,
+
+def gen_groupnorm_fake_tensors(
+    input: Tensor,
     num_groups: int,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
+    weight: Tensor,
+    bias: Tensor,
     eps: float,
-) -> torch.Tensor:
-    """Placeholder function, will be replaced by JIT."""
-    pass
+) -> Tensor:
+    return torch.empty_like(input)
+
+
+@compile_ops(
+    "module_groupnorm", fc_name="_groupnorm_run", gen_fake=gen_groupnorm_fake_tensors
+)
+def _groupnorm_run(
+    input: Tensor,
+    num_groups: int,
+    weight: Tensor,
+    bias: Tensor,
+    eps: float,
+) -> Tensor: ...
 
 
 class GroupNorm(torch.nn.Module):
