@@ -49,7 +49,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16, isBpreshuffled=False):
+def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16, isBpreshuffled=True):
     return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, isBpreshuffled=isBpreshuffled)
 
 
@@ -68,9 +68,6 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
 
-    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
-    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     b, avg_b = run_gemm_ck(x, gemm_weight, gemm_x_scale, w_scale, dtype, isBpreshuffled=ck_preshuffle)
 
     err_ck = checkAllclose(a, b, msg="ck")
