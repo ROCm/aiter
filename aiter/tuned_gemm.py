@@ -26,7 +26,7 @@ from torch import Tensor
 
 from aiter import (
     dtypes,
-    gemm_a16w16,
+    gemm_a16w16_asm,
     hipb_create_extension,
     hipb_mm,
     logger,
@@ -398,7 +398,7 @@ def asm_gemm(
     out_asm = torch.empty(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
-    return gemm_a16w16(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
+    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
 
 
 def triton_gemm(
