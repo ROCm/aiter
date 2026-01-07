@@ -267,13 +267,12 @@ def fav3_sage_forward_func(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, _ = sage_quant(
+    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
         q,
         k,
         v,
         fp8_dtype,
         FP8_MAX,
-        km=k_mean,
         sm_scale=softmax_scale,
         BLKQ=BLKQ,
         BLKK=BLKK,

@@ -2121,7 +2121,6 @@ def sage_quant(
     v,
     FP8_TYPE,
     FP8_MAX,
-    km=None,
     BLKQ=128,
     BLKK=64,
     sm_scale=None,
@@ -2152,14 +2151,8 @@ def sage_quant(
     k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
-    # Apply K tensor smoothing following SageAttention approach
-    k_smooth = None
-    if smooth_k:
-        if km is None:
-            # TOOD maybe we turn this into a kernel?
-            km = compute_k_smoothing_factors(k, layout)
-            k_smooth = km
-        k = k - km
+    k_smoothed = torch.empty_like(k, device=v.device)
+
 
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
@@ -2178,6 +2171,22 @@ def sage_quant(
         raise ValueError(f"Unknown tensor layout: {layout}")
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
+
+
+    # Apply K tensor smoothing following SageAttention approach
+    if smooth_k:
+        k_smoothing_kernel[(b * h_kv * head_dim, )](k,
+                                                    k_smoothed,
+                                                    stride_bz_k,
+                                                    stride_h_k,
+                                                    stride_seq_k,
+                                                    b,
+                                                    h_kv,
+                                                    head_dim,
+                                                    kv_len,
+                                                    triton.next_power_of_2(kv_len))
+        k = k_smoothed
+        
 
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
@@ -2242,7 +2251,36 @@ def sage_quant(
         V_QUANT_SCHEME=V_QUANT_SCHEME,
     )
 
-    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, k_smooth
+    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
+
+
+@triton.jit
+def k_smoothing_kernel(
+    K_Input,
+    K_Output,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    BATCH,
+    K_HEAD,
+    D: tl.constexpr,
+    SEQLEN_K,
+    SEQLEN_K_PADDED: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    off_d, off_h, off_b = pid_grid_3d(pid, D, K_HEAD, BATCH)
+    offs_k = tl.arange(0, SEQLEN_K_PADDED)
+
+    v_offs = off_b * stride_kz + off_h * stride_kh + offs_k * stride_kn + off_d
+
+    v_input_ptrs = K_Input + v_offs
+    v_output_ptrs = K_Output + v_offs
+
+    k_vals = tl.load(v_input_ptrs, mask=offs_k < SEQLEN_K, other=0.0)
+    k_mean = (tl.sum(k_vals, axis=0) / SEQLEN_K).to(K_Input.dtype.element_ty)
+    k_smoothed = (k_vals - k_mean).to(K_Input.dtype.element_ty)
+
+    k_vals = tl.store(v_output_ptrs, k_smoothed, mask=offs_k < SEQLEN_K)
 
 
 @triton.jit
