@@ -484,7 +484,8 @@ def use_nt(token, topk, e):
     use_nt = int(os.environ.get("AITER_USE_NT", "-1"))
     if use_nt != -1:
         return bool(use_nt)
-    return (token * topk // e) <= 64
+    return (token * topk // e) < 64
+
 
 @functools.lru_cache(maxsize=2048)
 def get_ksplit(token, topk, expert, inter_dim, model_dim):
@@ -729,7 +730,7 @@ def get_2stage_cfgs(
         )
         use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
-            f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}"
+            f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
     else:
         block_m = cfg["block_m"]
@@ -806,14 +807,14 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 dtype=dtype,
                 splitk=ksplit,
-                use_non_temporal_load=use_non_temporal_load
+                use_non_temporal_load=use_non_temporal_load,
             ),
             functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
-                use_non_temporal_load=use_non_temporal_load
+                use_non_temporal_load=use_non_temporal_load,
             ),
             block_m,
             int(ksplit),
