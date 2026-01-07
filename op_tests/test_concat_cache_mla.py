@@ -5,7 +5,6 @@ from aiter import dtypes
 import argparse
 import pandas as pd
 import random
-from typing_extensions import List
 
 # torch.set_printoptions(threshold=torch.inf)
 
