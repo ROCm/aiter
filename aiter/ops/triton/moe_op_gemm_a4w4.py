@@ -4,7 +4,7 @@
 import itertools
 import torch
 import triton
-from aiter.ops.triton.moe_routing.routing import RoutingData
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe_op_gemm_a4w4 import (
     _mxfp4_quant_kernel,
     _moe_gemm_a4w4,

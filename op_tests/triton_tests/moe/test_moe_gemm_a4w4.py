@@ -6,7 +6,7 @@ import pytest
 import torch
 
 # routing utilities
-from aiter.ops.triton.moe_routing.routing import routing
+from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe_op_gemm_a4w4 import (
@@ -17,7 +17,7 @@ from aiter.ops.triton.moe_op_gemm_a4w4 import (
 )
 
 # numerics utilities
-from aiter.ops.triton.quant_moe import (
+from aiter.ops.triton.moe.quant_moe import (
     downcast_to_mxfp,
     upcast_from_mxfp,
 )
