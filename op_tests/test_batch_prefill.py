@@ -321,7 +321,7 @@ def test_batch_prefill(
     if seed is not None:
         torch.manual_seed(seed)
 
-    if input_dtype == "fp8" and dtype != torch.bfloat16:
+    if input_dtype == dtypes.fp8 and dtype != torch.bfloat16:
         pytest.skip("FP8 tests use BF16 reference dtype only")
 
     if causal and kv_len < qo_len:
@@ -334,7 +334,7 @@ def test_batch_prefill(
             pytest.skip(
                 "Vectorized layout requires page/head dim divisible by vector size"
             )
-        if input_dtype == "fp8" and (
+        if input_dtype == dtypes.fp8 and (
             page_size % k_vector_size_fp8 != 0 or head_dim % k_vector_size_fp8 != 0
         ):
             pytest.skip(
@@ -343,12 +343,12 @@ def test_batch_prefill(
     else:
         if head_dim % k_vector_size != 0:
             pytest.skip("Linear layout requires head dim divisible by vector size")
-        if input_dtype == "fp8" and head_dim % k_vector_size_fp8 != 0:
+        if input_dtype == dtypes.fp8 and head_dim % k_vector_size_fp8 != 0:
             pytest.skip("FP8 linear layout requires head dim divisible by vector size")
 
     qo_lens = build_qo_lens(batch_size, qo_len, randomize=True)
     q_indptr_cpu = convert_lens_to_indptr(qo_lens)
-    if input_dtype == "fp8":
+    if input_dtype == dtypes.fp8:
         total_q_tokens = torch.sum(qo_lens).item()
         q = torch.rand(
             total_q_tokens, num_qo_heads, head_dim, device="cuda", dtype=dtype
@@ -359,8 +359,8 @@ def test_batch_prefill(
         )
 
     kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=True)
-    kv_init_min_use = None if input_dtype == "fp8" else kv_init_min
-    kv_init_max_use = None if input_dtype == "fp8" else kv_init_max
+    kv_init_min_use = None if input_dtype == dtypes.fp8 else kv_init_min
+    kv_init_max_use = None if input_dtype == dtypes.fp8 else kv_init_max
     kv_cache = build_paged_kv_cache(
         batch_size,
         kv_len,
@@ -371,7 +371,7 @@ def test_batch_prefill(
         kv_init_min_use,
         kv_init_max_use,
         dtype,
-        use_uniform=input_dtype == "fp8",
+        use_uniform=input_dtype == dtypes.fp8,
     )
 
     q_indptr_gpu = q_indptr_cpu.to(0)
@@ -393,7 +393,7 @@ def test_batch_prefill(
         block_table_gpu = block_table_cpu.to(0)
         seqlen_k_gpu = kv_lens.to(0).int()
 
-    if input_dtype == "fp8":
+    if input_dtype == dtypes.fp8:
         q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
         k_cache_quant, k_descale = per_tensor_quant(
             k_cache_ref.to(dtype), quant_dtype=dtypes.fp8
@@ -990,7 +990,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--input_dtype",
-    type=str,
+    type=dtypes.str2Dtype,
     const=None,
     choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
     default="bf16, fp8",
