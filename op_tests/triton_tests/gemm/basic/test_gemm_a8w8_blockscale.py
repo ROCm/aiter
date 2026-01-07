@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gemm_a8w8_blockscale import (
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
 )

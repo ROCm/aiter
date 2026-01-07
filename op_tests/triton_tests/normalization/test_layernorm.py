@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import pytest
 import aiter
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.triton.norm import (
+from aiter.ops.triton.normalization.norm import (
     layer_norm,
     layernorm2d_fwd_with_add,
     layernorm2d_fwd_with_dynamicquant,
