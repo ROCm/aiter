@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include "ck_tile/core.hpp"
@@ -67,13 +67,13 @@ struct MoeFlatmmConfig
 
 __host__ static constexpr int32_t GetBMemNTType(int32_t M, int32_t N, int32_t K)
 {
-	(void)N;
-	(void)K;
-	if(M <= 416)
-	{
-		return 2;
-	}
-	return 0;
+    (void)N;
+    (void)K;
+    if(M <= 416)
+    {
+        return 2;
+    }
+    return 0;
 }
 
 template <typename FlatmmConfig,
@@ -88,6 +88,7 @@ template <typename FlatmmConfig,
           typename ELayout,
           ck_tile::MoeFlatmmKind moe_kind,
           typename CDEElementWise,
+          int ActivationOp,
           typename MoeFlatmmHostArgs>
 void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 {
@@ -234,8 +235,9 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                 ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
+        // TODO: support more act type.
         using FusedAct =
-            std::conditional_t<BMXFP4_Pipeline, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
+            std::conditional_t<ActivationOp == 2, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
 
         using Kernel = ck_tile::MoeFlatmmKernel<TilePartitioner,
                                                 CodegenFlatmmPipeline,

@@ -897,13 +897,6 @@ def test_batch_prefill_vs_varlen_fp8(
     torch.testing.assert_close(out_batch_prefill, out_varlen, rtol=rtol, atol=atol)
 
 
-l_causal = [False, True]
-l_logits_soft_cap = [0.0, 30.0]
-l_dtype = ["fp16", "bf16"]
-l_lookup_table = ["sglang", "vllm"]
-l_kv_layout = ["vectorized", "linear"]
-l_input_dtype = ["bf16", "fp8"]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -912,9 +905,8 @@ parser.add_argument(
     "-c",
     "--causal",
     type=dtypes.str2bool,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[False, True],
     help="""Causal mask mode (False or True).
     e.g.: -c false""",
 )
@@ -922,21 +914,20 @@ parser.add_argument(
     "-l",
     "--logits_soft_cap",
     type=float,
-    choices=l_logits_soft_cap,
-    nargs="?",
-    const=None,
-    default=None,
+    choices=[0.0, 30.0],
+    nargs="*",
+    default=[0.0, 30.0],
     help="""Logits soft cap.
     e.g.: -l 30.0""",
 )
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default="fp16, bf16",
+    metavar="{fp16, bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -981,9 +972,9 @@ parser.add_argument(
     "--lookup_table",
     type=str,
     const=None,
-    choices=l_lookup_table,
-    default="sglang",
-    nargs="?",
+    choices=["sglang", "vllm"],
+    default=["sglang"],
+    nargs="*",
     help="""lookup table.
     e.g.: -t sglang""",
 )
@@ -991,9 +982,9 @@ parser.add_argument(
     "--kv_layout",
     type=str,
     const=None,
-    choices=l_kv_layout,
-    default="vectorized",
-    nargs="?",
+    choices=["vectorized", "linear"],
+    default=["vectorized"],
+    nargs="*",
     help="""kv cache table.
     e.g.: -o vectorized""",
 )
@@ -1001,9 +992,9 @@ parser.add_argument(
     "--input_dtype",
     type=str,
     const=None,
-    choices=l_input_dtype,
-    default="bf16",
-    nargs="?",
+    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+    default="bf16, fp8",
+    nargs="*",
     help="""input dtype.
     e.g.: -o bf16""",
 )
@@ -1016,20 +1007,6 @@ parser.add_argument(
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    if args.dtype is None:
-        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-    else:
-        l_dtype = [dtypes.d_dtypes[args.dtype]]
-    if args.causal is not None:
-        l_causal = [args.causal]
-    if args.logits_soft_cap is not None:
-        l_logits_soft_cap = [args.logits_soft_cap]
-    if args.lookup_table is not None:
-        l_lookup_table = [args.lookup_table]
-    if args.kv_layout is not None:
-        l_kv_layout = [args.kv_layout]
-    if args.input_dtype is not None:
-        l_input_dtype = [args.input_dtype]
 
     for (
         causal,
@@ -1039,12 +1016,12 @@ if __name__ == "__main__":
         kv_layout,
         input_dtype,
     ) in itertools.product(
-        l_causal,
-        l_logits_soft_cap,
-        l_dtype,
-        l_lookup_table,
-        l_kv_layout,
-        l_input_dtype,
+        args.causal,
+        args.logits_soft_cap,
+        args.dtype,
+        args.lookup_table,
+        args.kv_layout,
+        args.input_dtype,
     ):
         print(
             f"causal={causal}, logits_soft_cap={logits_soft_cap}, dtype={dtype}, lookup_table={lookup_table}, kv_layout={kv_layout}, input_dtype={input_dtype}"
