@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
-_gemm_a8w8_blockscale_repr = make_kernel_repr(
-    "_gemm_a8w8_blockscale_kernel",
+import triton
+
+_gemm_a8w8_per_token_scale_repr = make_kernel_repr(
+    "_gemm_a8w8_per_token_scale_kernel",
     [
-        "GROUP_K",
-        "GROUP_N",
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
@@ -25,8 +24,8 @@ _gemm_a8w8_blockscale_repr = make_kernel_repr(
 )
 
 
-_gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
-    "_gemm_a8w8_blockscale_reduce_kernel",
+_gemm_a8w8_per_token_scale_reduce_repr = make_kernel_repr(
+    "_gemm_a8w8_per_token_scale_reduce_kernel",
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
@@ -43,8 +42,8 @@ _gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit(repr=_gemm_a8w8_blockscale_repr)
-def _gemm_a8w8_blockscale_kernel(
+@triton.jit(repr=_gemm_a8w8_per_token_scale_repr)
+def _gemm_a8w8_per_token_scale_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -71,8 +70,6 @@ def _gemm_a8w8_blockscale_kernel(
     stride_bscale_k,
     stride_bscale_n,
     # Meta-parameters
-    GROUP_K: tl.constexpr,
-    GROUP_N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -98,8 +95,6 @@ def _gemm_a8w8_blockscale_kernel(
 
     *scale_k = (K + GROUP_K - 1) // GROUP_K
     **scale_n = (N + GROUP_N - 1) // GROUP_N
-
-    For this kernel implementation, GROUP_K must equal BLOCK_K.
     """
 
     tl.assume(stride_am > 0)
@@ -137,9 +132,7 @@ def _gemm_a8w8_blockscale_kernel(
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
 
-        # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
-        # ^ Number of K blocks within our split-K partition
 
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -154,17 +147,8 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         # Create pointers for the scales
-        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
-        a_scale_ptrs = (
-            a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
-        )
-        offs_b_scale_n = offs_bn // GROUP_N
-        b_scale_ptrs = (
-            b_scale_ptr
-            + offs_k_scale * stride_bscale_k
-            + offs_b_scale_n * stride_bscale_n
-        )
-        offs_ks_step = BLOCK_SIZE_K // GROUP_K
+        a_scale = tl.load(a_scale_ptr + offs_am * stride_ascale_m)
+        b_scale = tl.load(b_scale_ptr + offs_bn * stride_bscale_n)
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -183,20 +167,14 @@ def _gemm_a8w8_blockscale_kernel(
                     b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
-
             # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            accumulator += tl.dot(a, b, input_precision="ieee")
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
+<<<<<<<< HEAD:aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a8w8_blockscale.py
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
@@ -416,6 +394,9 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
 
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
+========
+        accumulator *= a_scale[:, None] * b_scale[None, :]
+>>>>>>>> main:aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a8w8_per_token_scale.py
 
         c = accumulator.to(c_ptr.type.element_ty)
 
@@ -432,8 +413,8 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit(repr=_gemm_a8w8_blockscale_reduce_repr)
-def _gemm_a8w8_blockscale_reduce_kernel(
+@triton.jit(repr=_gemm_a8w8_per_token_scale_reduce_repr)
+def _gemm_a8w8_per_token_scale_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
     M,
@@ -497,4 +478,8 @@ def _get_config(
     shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
     config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
 
+<<<<<<<< HEAD:aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a8w8_blockscale.py
     return get_gemm_config(config_name, M, N, K)
+========
+    return get_gemm_config("GEMM-A8W8_PER_TOKEN_SCALE", M, N, K)
+>>>>>>>> main:aiter/ops/triton/_triton_kernels/gemm/basic/gemm_a8w8_per_token_scale.py
