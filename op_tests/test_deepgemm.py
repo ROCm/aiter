@@ -94,29 +94,6 @@ def test_deepgemm(
     }
 
 
-l_dtype = ["bf16", "fp16"]
-l_num_groups = [
-    16,
-]
-l_expect_m = [
-    1,
-    2,
-    4,
-    8,
-    16,
-    32,
-    64,
-    128,
-    256,
-    512,
-    1024,
-]
-l_dim = [(7168, 4096)]
-l_quant = [
-    (aiter.QuantType.No, None, None),  # a16w16
-    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -125,38 +102,49 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default="fp16, bf16",
+    metavar="{fp16, bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
-    "-num_groups",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    "-g",
+    "--num_groups",
+    nargs="*",
+    type=int,
+    default=[16],
     help="""num of groups.
     e.g.: -num_groups 128""",
 )
 parser.add_argument(
-    "-expect_m",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    "-e",
+    "--expect_m",
+    type=int,
+    nargs="*",
+    default=[
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+    ],
     help="""expect m of each groups.
     e.g.: -expect_m 1024""",
 )
 parser.add_argument(
     "-dim",
     type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[(7168, 4096)],
     help="""k, n of gemm.
     e.g.: -dim 6144,4096""",
 )
@@ -164,38 +152,32 @@ parser.add_argument(
 parser.add_argument(
     "-q",
     "--quant",
-    type=int,
-    choices=range(len(l_quant)),
+    type=dtypes.str2Dtype,
+    nargs="*",
+    choices=[
+        (aiter.QuantType.No, None, None),  # a16w16
+        (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    ],
+    default=[
+        (aiter.QuantType.No, None, None),  # a16w16
+        (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    ],
+    metavar="{No,None,None}, {per_Token,fp8,fp8}",
     help="""select quantization type:
-    0 : aiter.QuantType.No, None, None),  # a16w16
-    1 : aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8""",
+    -q no,none,none,  # a16w16
+    or -q per_token,fp8,fp8  # a8w8""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-
-if args.dim is not None:
-    l_dim = [args.dim]
-
-if args.num_groups is not None:
-    l_num_groups = [args.num_groups]
-
-if args.expect_m is not None:
-    l_expect_m = [args.expect_m]
-
-l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
 for (
     dtype,
     num_groups,
     (quant_type, aq_dtype, wq_dtype),
     (k, n),
-) in itertools.product(l_dtype, l_num_groups, l_quant, l_dim):
+) in itertools.product(args.dtype, args.num_groups, args.quant, args.dim):
     df = []
-    for expect_m in l_expect_m:
+    for expect_m in args.expect_m:
         ret = test_deepgemm(
             num_groups,
             expect_m,

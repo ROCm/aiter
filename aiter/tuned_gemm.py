@@ -1,6 +1,6 @@
 """
 * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-* Copyright (C) 2024-2025, The vLLM team.
+* Copyright (C) 2024-2026, The vLLM team.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,7 +27,6 @@ from torch import Tensor
 from aiter import (
     dtypes,
     gemm_a16w16_asm,
-    get_semaphore_workspace,
     hipb_create_extension,
     hipb_mm,
     logger,
@@ -399,10 +398,7 @@ def asm_gemm(
     out_asm = torch.empty(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
-    sema = get_semaphore_workspace(out_asm.device)
-    return gemm_a16w16_asm(
-        inp, weights, out_asm, sema, bias, splitK, KernelName, bpreshuffle
-    )
+    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
 
 
 def triton_gemm(
@@ -416,7 +412,7 @@ def triton_gemm(
     scale_c: Optional[Tensor] = None,
     bpreshuffle: Optional[bool] = False,
 ):
-    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
     assert (
         scale_a is None and scale_b is None and scale_c is None
