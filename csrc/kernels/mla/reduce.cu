@@ -595,15 +595,20 @@ __global__ void kn_mla_reduce_v1(
         TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");    \
     }
 
+// WA:Add NUM_HEAD 4 & 32, HEAD_DIM 128 case to support mla_reduce_v1 used in pa_persistent_fwd for Qwen3-Omni (TP=8/TP=1)
 #define MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_SEQ, NAME, ...)    \
     MLA_REDUCE_CASE_IF(                                                     \
         NUM_HEAD,   1, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,   4, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD,   8, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD,  10, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD,  16, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  32, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD,  16, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
