@@ -1572,9 +1572,10 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
         const int64_t token_head = kv_cache_offset;
         cache_t* kv_cache_rot = kv_cache + token_head;
         if constexpr (std::is_same_v<cache_t, ck_tile::fp8_t>) {
-          kv_cache_rot[x_index] = ck_tile::type_convert<cache_t>((fp32_k_x * fp32_cos - fp32_k_y * fp32_sin) * inv_kscale);
-          kv_cache_rot[y_index] = ck_tile::type_convert<cache_t>((
-                fp32_k_y * fp32_cos + fp32_k_x * fp32_sin) * inv_kscale);
+          kv_cache_rot[x_index] = ck_tile::type_convert<cache_t>(
+               (fp32_k_x * fp32_cos - fp32_k_y * fp32_sin) * inv_kscale);
+          kv_cache_rot[y_index] = ck_tile::type_convert<cache_t>(
+               (fp32_k_y * fp32_cos + fp32_k_x * fp32_sin) * inv_kscale);
         } else {
           kv_cache_rot[x_index] = ck_tile::type_convert<cache_t>((fp32_k_x * fp32_cos - fp32_k_y * fp32_sin));
           kv_cache_rot[y_index] = ck_tile::type_convert<cache_t>((fp32_k_y * fp32_cos + fp32_k_x * fp32_sin));
