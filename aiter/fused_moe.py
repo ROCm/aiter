@@ -19,7 +19,6 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
-from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
 
@@ -40,14 +39,12 @@ def moe_sorting(
     max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=dtypes.i32, device=device)
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
-        (max_num_tokens_padded,), dtype=dtypes.fp32, device=device
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
-    sorted_expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=dtypes.i32, device=device
-    )
-    num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     aiter.moe_sorting_fwd(
@@ -948,7 +945,7 @@ def fused_moe_2stages(
                 quant_dtype=q_dtype_a,
                 num_rows=num_local_tokens,
             )
-            a1_scale = moe_mxfp4_sort(
+            a1_scale = fp4_utils.moe_mxfp4_sort(
                 a1_scale,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
@@ -1049,7 +1046,7 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
                 num_rows_factor=topk,
             )
-            a2_scale = moe_mxfp4_sort(
+            a2_scale = fp4_utils.moe_mxfp4_sort(
                 a2_scale[: token_num * topk, :].view(token_num, topk, -1),
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,

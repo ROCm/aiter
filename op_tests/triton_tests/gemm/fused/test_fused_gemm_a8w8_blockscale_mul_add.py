@@ -59,7 +59,9 @@ def test_fused_gemm_a8w8_blockscale_mul_add(
     (
         x,
         w,
+        _,
         x_scales,
+        _,
         w_scales,
         y,
     ) = generate_gemm_a8w8_blockscale_inputs(

@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import functools
+from typing import Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
-import torch
-from torch import Tensor
-from typing import Optional, Tuple
+
 from ..jit.core import compile_ops
-import torch.nn.functional as F
-import functools
-from .enum import QuantType, ActivationType
-from . import triton
 from ..utility import dtypes, fp4_utils
+from . import triton
+from .enum import ActivationType, QuantType
 
 
 @compile_ops("module_smoothquant")
@@ -420,12 +423,12 @@ def dynamic_per_token_scaled_quant(
 
 @compile_ops("module_quant")
 def dynamic_per_group_scaled_quant_fp4(
-    out: Tensor,
-    input: Tensor,
-    scales: Tensor,
-    group_size: Optional[int] = 32,
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int = 32,
     shuffle_scale: bool = True,
-    num_rows: Optional[Tensor] = None,
+    num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
 ) -> None:
     """
