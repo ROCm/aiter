@@ -29,16 +29,16 @@ aiter/ops/triton/
 aiter/ops/triton/
 ├── __init__.py (with backward compatibility)
 ├── gemm/
-│   ├── basic/          # Basic GEMM operations
-│   ├── batched/        # Batched GEMM operations
+│   ├── basic/          # Basic GEMM
+│   ├── batched/        # Batched GEMM
 │   ├── feed_forward/   # Feed-forward specific GEMMs
-│   └── fused/          # Fused GEMM operations
-├── attention/          # Attention mechanisms (MHA, MQA, etc.)
-├── moe/                # Mixture of Experts operations
-├── normalization/      # Normalization operations
-├── quant/              # Quantization operations
-├── rope/               # RoPE (Rotary Position Embedding)
-├── fusions/            # Other fusion operations
+│   └── fused/          # Fused GEMM
+├── attention/          # Attention (MHA, MQA, etc.)
+├── moe/                # MOE
+├── normalization/      # Normalization
+├── quant/              # Quantization
+├── rope/               # Rope
+├── fusions/            # Other fusion
 └── utils/              # Utility functions
 
 aiter/ops/triton/_triton_kernels/
