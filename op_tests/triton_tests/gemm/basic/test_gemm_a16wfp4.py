@@ -167,10 +167,24 @@ def run_torch(x, w, w_scales, dtype):
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
-    "atomic_add, shuffle", [(True, False), (False, False), (False, True)]
+    "atomic_add, shuffle, skip_reduce",
+    [
+        (True, False, False),
+        (False, False, False),
+        (False, True, False),
+        (False, True, True),
+    ],
 )
 def test_gemm_a16wfp4(
-    M: int, N: int, K: int, dtype, layout, output: bool, atomic_add: bool, shuffle: bool
+    M: int,
+    N: int,
+    K: int,
+    dtype,
+    layout,
+    output: bool,
+    atomic_add: bool,
+    shuffle: bool,
+    skip_reduce: bool,
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -196,12 +210,25 @@ def test_gemm_a16wfp4(
     if shuffle:
         if output:
             y = gemm_a16wfp4_preshuffle(
-                x, w_triton, w_scales_triton, prequant=True, dtype=y_dtype, y=y
+                x,
+                w_triton,
+                w_scales_triton,
+                prequant=True,
+                dtype=y_dtype,
+                y=y,
+                skip_reduce=skip_reduce,
             )
         else:
             y = gemm_a16wfp4_preshuffle(
-                x, w_triton, w_scales_triton, prequant=True, dtype=y_dtype
+                x,
+                w_triton,
+                w_scales_triton,
+                prequant=True,
+                dtype=y_dtype,
+                skip_reduce=skip_reduce,
             )
+        if y.dim() == 3:
+            y = torch.sum(y, dim=0).to(dtype=dtype)
     else:
         if output:
             y = gemm_a16wfp4(
