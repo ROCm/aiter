@@ -3,7 +3,7 @@ import torch
 import pytest
 from typing import Tuple
 from aiter.ops.triton.utils.types import get_fp8_dtypes
-from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 fp8_info = torch.finfo(e4m3_type)

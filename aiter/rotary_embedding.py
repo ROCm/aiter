@@ -347,7 +347,7 @@ class RotaryEmbedding(nn.Module):
         offsets: Optional[torch.Tensor] = None,
         is_nope_first=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        import aiter.ops.triton.rope as ops
+        import aiter.ops.triton.rope.rope as ops
 
         self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
         self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
