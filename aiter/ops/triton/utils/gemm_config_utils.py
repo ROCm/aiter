@@ -73,7 +73,8 @@ def get_gemm_config(
         specialized_filename: Custom specialized filename suffix (optional)
 
     Returns:
-        Dictionary with the config params
+        Dictionary with the config params,
+        bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -195,14 +196,12 @@ def compute_splitk_params(config: dict, K: int) -> dict:
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
-    if (
-        "BLOCK_SIZE_K" in config
-        and config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]
-    ):
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-
+    if "BLOCK_SIZE_K" in config:
         if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
+            config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+
+            if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+                config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
 
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
