@@ -59,3 +59,11 @@ def get_config_list(argv: list[str]) -> list[dict | None]:
 
 def get_input_shape(argv: list[str]) -> list[int]:
     return [int(v) for v in argv]
+
+
+def get_input_shape_and_config_list(
+    argv: list[str], shape_size: int = 3
+) -> tuple[list[int], list[dict | None]]:
+    input_shape = get_input_shape(argv[1 : shape_size + 1])
+    config_list = get_config_list(argv[shape_size + 1 :])
+    return input_shape, config_list
