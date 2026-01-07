@@ -675,6 +675,36 @@ def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[
         return []
 
 
+# Writing to GitHub environment file.
+# ------------------------------------------------------------------------------
+
+
+def write_env_file(env_var: str, env_file: str, tests_to_run: list[Path]) -> None:
+    if env_var is None or not (env_var := env_var.strip()):
+        logging.info(
+            "Environment variable is absent, environment file won't be written."
+        )
+        return
+    if env_file is None or not (env_file := env_file.strip()):
+        logging.info("Environment file is absent, it won't be written.")
+        return
+    if not tests_to_run:
+        logging.warning(
+            "List of tests to run is empty, enviroment file won't be written."
+        )
+        return
+    tests_to_run_joined_str = " ".join(str(t) for t in tests_to_run)
+    env_file_data = f"{env_var}={tests_to_run_joined_str}"
+    logging.debug("Writing [%s] to [%s]...", env_file_data, env_file)
+    try:
+        with open(env_file, "a") as env_file_fd:
+            env_file_fd.write(env_file_data + "\n")
+        logging.info("Wrote tests to run to [%s] environment file.", env_file)
+    except IOError:
+        logging.exception("I/O error while writing to [%s] environment file.", env_file)
+        logging.info("The entire Triton test suite will be executed.")
+
+
 # Command line interface parsing.
 # ------------------------------------------------------------------------------
 
@@ -688,6 +718,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "-t", "--target", default="main", help="target branch, defaults to main"
+    )
+    parser.add_argument(
+        "-v",
+        "--env-var",
+        default="TRITON_TEST",
+        help="environment variable to store which tests to run, defaults to TRITON_TEST",
+    )
+    parser.add_argument(
+        "-f",
+        "--env-file",
+        help="environment file to write, won't write anything if absent",
     )
     parser.add_argument(
         "-l",
@@ -733,6 +774,7 @@ def main_logic(args: argparse.Namespace) -> int:
         len(diff_inter_triton),
         "" if len(diff_inter_triton) == 1 else "s",
     )
+
     sorted_diff_inter_triton = sorted(diff_inter_triton)
     del diff_inter_triton
     log_file_list(logging.INFO, sorted_diff_inter_triton)
@@ -743,6 +785,7 @@ def main_logic(args: argparse.Namespace) -> int:
     if not tests_to_run:
         return 1
 
+    write_env_file(args.env_var, args.env_file, tests_to_run)
     return 0
 
 
