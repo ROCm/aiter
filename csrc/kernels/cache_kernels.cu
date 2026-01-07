@@ -1571,7 +1571,6 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
         kv_cache += kv_lora_rank;
         const int64_t token_head = kv_cache_offset;
         cache_t* kv_cache_rot = kv_cache + token_head;
-        
         if constexpr (std::is_same_v<cache_t, ck_tile::fp8_t>) {
           kv_cache_rot[x_index] = ck_tile::type_convert<cache_t>((fp32_k_x * fp32_cos - fp32_k_y * fp32_sin) * inv_kscale);
           kv_cache_rot[y_index] = ck_tile::type_convert<cache_t>((
@@ -1654,7 +1653,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       const int num_heads, const int num_kv_heads, const int head_size)
   {
     // Each thread block is responsible for one token.
-    const int token_idx = blockIdx.x; 
+    const int token_idx = blockIdx.x;
     int64_t pos = positions[token_idx];
 
     int64_t cos_sin_cache_offset = pos * rot_dim / 2;
@@ -2035,8 +2034,8 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
               q_out_rope[y_index] = ck_tile::type_convert<query_t>(
                       (f32_y * f32_cos + f32_x * f32_sin) * inverted_qscale);
           } else {
-              q_out_rope[x_index] = ck_tile::type_convert<query_t>((f32_x * f32_cos - f32_y * f32_sin) * inverted_qscale);
-              q_out_rope[y_index] = ck_tile::type_convert<query_t>((f32_y * f32_cos + f32_x * f32_sin) * inverted_qscale);
+              q_out_rope[x_index] = ck_tile::type_convert<query_t>(f32_x * f32_cos - f32_y * f32_sin);
+              q_out_rope[y_index] = ck_tile::type_convert<query_t>(f32_y * f32_cos + f32_x * f32_sin);
           }
       }
 
