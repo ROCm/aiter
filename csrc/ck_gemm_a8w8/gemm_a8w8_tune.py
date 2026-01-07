@@ -13,24 +13,31 @@ from aiter.utility.mp_tuner import mp_tuner
 import argparse
 
 
-def checkClose(a, b, rtol=1e-1, atol=0.1):
+def checkClose(a, b, rtol=1e-3, atol=0.01):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = ~isClose
     if isClose.all():
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.1:  # Allow 10% of elements to have larger errors
+        if percent > 0.01:
             return False
         else:
             return True
 
 
-def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    # Keep reference aligned with `op_tests/test_gemm_a8w8.py:test_gemm`
-    x = x.to(dtypes.fp32) * x_scale
-    weight = weight.to(dtypes.fp32) * w_scale
-    out = F.linear(x, weight)
+def run_torch(
+    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_dtype=dtypes.i8
+):
+    if quant_dtype == dtypes.i8:
+        x = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
+        scale = torch.matmul(x_scale, w_scale)
+        out = torch.mul(x, scale)
+    else:
+        x = x.to(dtypes.fp32) * x_scale
+        weight = weight.to(dtypes.fp32) * w_scale
+        out = F.linear(x, weight)
+
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
@@ -55,26 +62,20 @@ def get_tuned_gemm_list(tuned_gemm_file):
     return tunedf
 
 
-def generate_data(m, n, k, seed, ab_dtype: str = "i8", device="cuda"):
+def generate_data(m, n, k, seed, quant_dtype=dtypes.i8, device="cuda"):
     torch.manual_seed(seed)
-    # Generate fp16/bf16 source, then quantize per-token (same style as `test_gemm`)
-    x_fp = torch.randn((m, k), dtype=dtypes.bf16, device=device)
-    w_fp = torch.randn((n, k), dtype=dtypes.bf16, device=device)
 
-    if ab_dtype == "i8":
-        qdtype = dtypes.i8
-    elif ab_dtype == "fp8":
-        if dtypes.fp8 == torch.uint8:
-            raise RuntimeError(
-                "Requested fp8 tuning, but this environment has no real torch fp8 dtype "
-                "(aiter.dtypes.fp8 fell back to uint8)."
-            )
-        qdtype = dtypes.fp8
+    if quant_dtype == dtypes.i8:
+        x = torch.randint(-20, 20, (m, k), dtype=dtypes.i8, device=device)
+        weight = torch.randint(-20, 20, (n, k), dtype=dtypes.i8, device=device)
+        x_scale = torch.rand([m, 1], dtype=dtypes.bf16, device=device)
+        w_scale = torch.rand([1, n], dtype=dtypes.bf16, device=device)
     else:
-        raise ValueError(f"Unsupported {ab_dtype=}, expected 'i8' or 'fp8'")
+        x_fp = torch.randn((m, k), dtype=dtypes.bf16, device=device)
+        weight_fp = torch.randn((n, k), dtype=dtypes.bf16, device=device)
+        x, x_scale = aiter.pertoken_quant(x_fp, quant_dtype=quant_dtype)
+        weight, w_scale = aiter.pertoken_quant(weight_fp, quant_dtype=quant_dtype)
 
-    x, x_scale = aiter.pertoken_quant(x_fp, quant_dtype=qdtype)
-    weight, w_scale = aiter.pertoken_quant(w_fp, quant_dtype=qdtype)
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     # x.share_memory_()
     # weight.share_memory_()
@@ -83,33 +84,14 @@ def generate_data(m, n, k, seed, ab_dtype: str = "i8", device="cuda"):
     return x, weight, x_scale, w_scale, out
 
 
-def gemm_a8w8_ref(x, weight, x_scale, w_scale):
-    return run_torch(x, weight, x_scale, w_scale)
+def gemm_a8w8_ref(x, weight, x_scale, w_scale, quant_dtype=dtypes.i8):
+    return run_torch(x, weight, x_scale, w_scale, quant_dtype=quant_dtype)
 
 
 def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
-    print(f"[solin:run_gemm_a8w8] Received args: kernelId={kernelId}, splitK={splitK}")
-    try:
-        result = aiter.gemm_a8w8_tune(
-            XQ=x, 
-            WQ=weight, 
-            x_scale=x_scale, 
-            w_scale=w_scale, 
-            Out=out, 
-            kernelId=kernelId, 
-            splitK=splitK
-        )
-        print(f"[solin:run_gemm_a8w8] After call, returned successfully")
-        return result
-    except RuntimeError as e:
-        error_msg = str(e)
-        if "This GEMM is not supported" in error_msg or "not support" in error_msg.lower():
-            print(f"[solin:run_gemm_a8w8] kernel {kernelId} with splitK={splitK} not supported, skipping")
-            # Return output unchanged to trigger error in verification
-            return out
-        else:
-            # Re-raise other errors
-            raise
+
+    aiter.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernelId, splitK)
+    return out
 
 
 class GemmA8W8Tuner(GemmCommonTuner):
@@ -117,7 +99,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8}",
         "untune_file": "aiter/configs/a8w8_untuned_gemm.csv",
-        "errRatio": 0.2,  # Increased to 20% to allow splitK=2,3 for FP8
+        "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
     }
@@ -129,10 +111,11 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
-            "--ab_dtype",
+            "--quant_dtype",
+            type=str,
             choices=["i8", "fp8"],
             default="i8",
-            help="Datatype for XQ/WQ generated during tuning (default: i8).",
+            help="Quantization dtype: 'i8' (int8, default), 'fp8' (fp8)",
         )
 
     def calculate(self, results, bpes=(1, 1, 2)):
@@ -150,6 +133,14 @@ class GemmA8W8Tuner(GemmCommonTuner):
         shape_grouped = False
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+
+        if args.quant_dtype == "i8":
+            quant_dtype = dtypes.i8
+        elif args.quant_dtype == "fp8":
+            quant_dtype = dtypes.fp8
+        else:
+            raise ValueError(f"Unknown quant_dtype: {args.quant_dtype}")
+
         task = []
         tasks_data = []
         gemm_a8w8_data_idx = [0, 1, 2, 3, 4]  # input index in generate_data
@@ -177,19 +168,13 @@ class GemmA8W8Tuner(GemmCommonTuner):
                     if useSplitK
                     else 0
                 )
-
-                maxsplitK = min(maxsplitK, 4)
-                if args.verbose and i == 0:
-                    print(f"[tune] maxsplitK={maxsplitK} for kernel {i} (will test KBatch={[2**s for s in range(maxsplitK+1)]})")
                 for splitK in range(maxsplitK + 1):
                     info = ((cu_num, M, N, K), i, splitK, "")
-                    if args.verbose:
-                        print(f"[solin:tune] Creating task for M={M}, N={N}, K={K}, kernelId={i}, splitK={splitK}")
                     task.append(
                         (
                             info,
                             generate_data,
-                            (M, N, K, seed, args.ab_dtype),
+                            (M, N, K, seed, quant_dtype),
                             run_gemm_a8w8,
                             (gemm_a8w8_data_idx, i, splitK),
                             {
@@ -197,11 +182,11 @@ class GemmA8W8Tuner(GemmCommonTuner):
                                 "num_iters": args.iters,
                             },
                             gemm_a8w8_ref,
-                            (ref_data_idx,),
+                            (ref_data_idx, quant_dtype),
                             {},
                             None,
-                            1e-1,  # rtol = 0.1 (relative tolerance)
-                            1e-1,  # atol = 0.1 (absolute tolerance)
+                            1e-2,
+                            1e-2,
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1
@@ -220,7 +205,6 @@ class GemmA8W8Tuner(GemmCommonTuner):
                 timeout=args.timeout,
                 verbose=args.verbose,
             )
-        
         return ret
 
 
