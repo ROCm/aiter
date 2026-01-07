@@ -25,7 +25,7 @@ import torch.nn.functional as F
 import argparse
 
 import aiter
-from aiter import dtypes, get_semaphore_workspace, logger
+from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.shuffle import shuffle_weight
@@ -60,7 +60,7 @@ def call_hipb_mm(
 def run_gemm_bf16_asm(
     inp, w, out, bias=None, splitK=None, kernelName=None, bpreshuffle=False
 ):
-    return aiter.gemm_a16w16(
+    return aiter.gemm_a16w16_asm(
         inp,
         w,
         out,
