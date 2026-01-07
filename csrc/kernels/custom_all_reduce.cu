@@ -80,6 +80,7 @@ bool _is_weak_contiguous(torch::Tensor& t)
                                  t.numel() * t.element_size());
 }
 
+// interface: sdma_async
 void _all_reduce(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, hipStream_t stream, bool use_new, bool open_fp8_quant)
 {
@@ -88,10 +89,10 @@ void _all_reduce(
     switch(out.scalar_type())
     {
     case at::ScalarType::Float: {
-        fa->allreduce_sdma_impl<float>(stream,
+        fa->allreduce<float>(stream,
                                        reinterpret_cast<float*>(inp.data_ptr()),
                                        reinterpret_cast<float*>(out.data_ptr()),
-                                       out.numel());
+                                       out.numel(), use_new);
         break;
     }
     case at::ScalarType::Half: {
@@ -108,19 +109,19 @@ void _all_reduce(
         }
         else
         {
-            fa->allreduce_sdma_impl<half>(stream,
+            fa->allreduce<half>(stream,
                                           reinterpret_cast<half*>(inp.data_ptr()),
                                           reinterpret_cast<half*>(out.data_ptr()),
-                                          out.numel());
+                                          out.numel(), use_new);
         }
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
-        fa->allreduce_sdma_impl<__hip_bfloat16>(stream,
+        fa->allreduce<__hip_bfloat16>(stream,
                                                 reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
                                                 reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
-                                                out.numel());
+                                                out.numel(), use_new);
                                      /*
         fa->allreduce<__hip_bfloat16>(stream,
                                                 reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
@@ -133,6 +134,37 @@ void _all_reduce(
     default:
         throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
     }
+}
+
+// dispatch reg/unreg in framework
+// just a demo, support bf16 only
+void part_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, int inp_numel, int chunk_num, int chunk_id)
+{
+  auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+  int size = inp_numel / chunk_num;
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+  auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+  fa->allreduce_sdma_impl(stream, reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()), reinterpret_cast<__hip_bfloat16*>(out.data_ptr()), size, chunk_num, chunk_id);
+}
+
+void sdma_copy(fptr_t _fa, torch::Tensor& input, int chunk_num, int chunk_id, std::optional<torch::Tensor> reg_buf)
+{
+  auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+  auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+  int size = input.numel() * input.element_size();
+  if (reg_buf.has_value())
+  {
+    int copy_size = size / chunk_num;
+    void* dst = reinterpret_cast<void*>(reinterpret_cast<bool*>(reg_buf.value().data_ptr()) + chunk_id * copy_size);
+    void* src = reinterpret_cast<void*>(reinterpret_cast<bool*>(input.data_ptr()) + chunk_id * copy_size);
+    HIP_CALL(hipMemcpyAsync(dst, src, copy_size, hipMemcpyDeviceToDevice, stream));
+    fa->sdma_copy(stream, reinterpret_cast<void*>(reg_buf.value().data_ptr()), size, chunk_num, chunk_id);
+  }
+  else
+  {
+    fa->sdma_copy(stream, reinterpret_cast<void*>(input.data_ptr()), size, chunk_num, chunk_id);
+  }
 }
 
 void all_reduce(fptr_t _fa,

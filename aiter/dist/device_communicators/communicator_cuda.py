@@ -139,6 +139,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if value is not None:
             self._all2all_manager_created = True
 
+    def sdma_copy(self, input_, chunk_num, chunk_id):
+        ca_comm = self.ca_comm
+        ca_comm.sdma_copy(input_, chunk_num, chunk_id)
+
+    def part_reduce(self, input_, chunk_num, chunk_id) -> torch.Tensor:
+        ca_comm = self.ca_comm
+        return ca_comm.part_reduce(input_, chunk_num, chunk_id)
+
     def all_reduce(
         self, input_, use_new: bool = True, ca_fp8_quant: bool = False
     ) -> torch.Tensor:

@@ -152,6 +152,24 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         return group._all_gather_out_place(input)
 
+    def outplace_sdma_copy(
+        input: torch.Tensor, chunk_num: int, chunk_id: int, group_name: str
+    ) -> None:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        group._sdma_copy_out_place(input, chunk_num, chunk_id)
+
+    def outplace_part_reduce(
+        input: torch.Tensor, chunk_num: int, chunk_id: int, group_name: str
+    ) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._part_reduce(input, chunk_num, chunk_id)
+
 
 class GroupCoordinator:
     """
@@ -354,6 +372,28 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_, ca_use_new, ca_fp8_quant)
+
+    def _sdma_copy_out_place(
+        self, input_: torch.Tensor, chunk_num: int, chunk_id: int
+    ) -> None:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        self.device_communicator.sdma_copy(input_, chunk_num, chunk_id)
+
+    def _part_reduce(
+        self, inp: torch.Tensor, chunk_num: int, chunk_id: int
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.part_reduce(inp, chunk_num, chunk_id)
+
+    def sdma_copy(self, input_: torch.Tensor, chunk_num: int, chunk_id: int) -> None:
+        outplace_sdma_copy(input_, chunk_num, chunk_id, self.unique_name)
+
+    def part_reduce(
+        self, input_: torch.Tensor, chunk_num: int, chunk_id: int
+    ) -> torch.Tensor:
+        return outplace_part_reduce(input_, chunk_num, chunk_id, self.unique_name)
 
     def fused_allreduce_rmsnorm(
         self,

@@ -60,3 +60,15 @@ def broadcast_tensor_dict(
     if not torch.distributed.is_initialized():
         return tensor_dict
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
+
+
+def tensor_model_parallel_sdma_copy(
+    input_: torch.Tensor, chunk_num: int, chunk_id: int
+):
+    get_tp_group().sdma_copy(input_, chunk_num, chunk_id)
+
+
+def tensor_model_parallel_part_reduce(
+    input_: torch.Tensor, chunk_num: int, chunk_id: int
+) -> torch.Tensor:
+    return get_tp_group().part_reduce(input_, chunk_num, chunk_id)

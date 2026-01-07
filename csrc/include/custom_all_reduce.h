@@ -58,6 +58,11 @@ std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa);
 void register_graph_buffers(fptr_t _fa,
                             const std::vector<torch::Tensor>& handles,
                             const std::vector<torch::Tensor>& offsets);
+
+// ----- sdma interface -----
+void part_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, int inp_numel, int chunk_num, int chunk_id);
+void sdma_copy(fptr_t _fa, torch::Tensor& input, int chunk_num, int chunk_id, std::optional<torch::Tensor> reg_buf);
+// ----- sdma interface -----
 #ifdef USE_ROCM
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);

@@ -33,6 +33,27 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce")
+def sdma_copy(
+    _fa: int,
+    inp: torch.Tensor,
+    chunk_num: int,
+    chunk_id: int,
+    reg_buffer: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def part_reduce(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    input_numel: int,
+    chunk_num: int,
+    chunk_id: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
 def all_gather_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor) -> None: ...
 
 

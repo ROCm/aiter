@@ -315,6 +315,18 @@ class CustomAllreduce:
                 input, use_new=use_new, open_fp8_quant=open_fp8_quant, registered=False
             )
 
+    def sdma_copy(self, inp: torch.Tensor, chunk_num: int, chunk_id: int):
+        ops.sdma_copy(self._ptr, inp, chunk_num, chunk_id, self.buffer)
+
+    def part_reduce(
+        self, inp: torch.Tensor, chunk_num: int, chunk_id: int
+    ) -> Optional[torch.Tensor]:
+        out = torch.empty(
+            int(inp.numel() / chunk_num), dtype=inp.dtype, device=inp.device
+        )
+        ops.part_reduce(self._ptr, self.buffer, out, inp.numel(), chunk_num, chunk_id)
+        return out
+
     def all_gather_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
         if out is None:
             out = torch.empty(

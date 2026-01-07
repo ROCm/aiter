@@ -395,6 +395,21 @@ namespace py = pybind11;
           py::arg("w"),                                                                        \
           py::arg("eps"),                                                                      \
           py::arg("reg_buffer") = std::nullopt);                                               \
+    m.def("sdma_copy",\
+        &aiter::sdma_copy, \
+        py::arg("_fa"),\
+        py::arg("inp"),\
+        py::arg("chunk_num"),\
+        py::arg("chunk_id"),\
+        py::arg("reg_buffer") = std::nullopt);\
+    m.def("part_reduce",\
+        &aiter::part_reduce, \
+        py::arg("_fa"),\
+        py::arg("inp"),\
+        py::arg("out"),\
+        py::arg("inp_numel"),\
+        py::arg("chunk_num"),\
+        py::arg("chunk_id"));\
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \

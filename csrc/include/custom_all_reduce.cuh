@@ -1275,6 +1275,7 @@ namespace aiter
     }
   }
 
+  // size = input_tensor.numel() / chunk_num
   template <typename T, int ngpus>
   __global__ void __launch_bounds__(512, 1) part_reduce(
       T* __restrict__ input,
@@ -1282,7 +1283,9 @@ namespace aiter
       RankSignals sg,
       Signal* self_sg,
       int rank,
-      int size
+      int size,
+      int chunk_num,
+      int chunk_id
   )
   {
     constexpr int pack_size = packed_t<T>::P::size;
@@ -1290,13 +1293,13 @@ namespace aiter
     using A = packed_t<T>::A;
     int part = size / (ngpus * pack_size);
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    P* tmp_out = get_tmp_buf<P>(sg.signals[rank]);
+    P* tmp_out = get_tmp_buf<P>(sg.signals[rank]) + chunk_id * part * ngpus;
 
     P* tmps[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i)
     {
-      tmps[i] = get_tmp_buf<P>(sg.signals[(rank + i) % 8]);
+      tmps[i] = get_tmp_buf<P>(sg.signals[(rank + i) % 8]) + chunk_id * part * ngpus;
     }
 
     start_sync<ngpus>(sg, self_sg, rank);
@@ -1304,7 +1307,7 @@ namespace aiter
     for (int idx = index; idx < part; idx += gridDim.x * blockDim.x)
     {
       A add_reg;
-      P loc_inp_reg = *(reinterpret_cast<P*>(input) + rank * part + idx);
+      P loc_inp_reg = *(reinterpret_cast<P*>(input) + chunk_id * part * ngpus + rank * part + idx);
 #pragma unroll
       for (int i = 0; i < pack_size; ++i)
       {
@@ -1334,7 +1337,7 @@ namespace aiter
       for (int i = 0; i < 8; ++i)
       {
         int op_id = (rank + i) % ngpus;
-        *(reinterpret_cast<P*>(output) + op_id * part + idx) = tmps[i][op_id * part + idx];
+        *(reinterpret_cast<P*>(output) + chunk_id * part * ngpus + op_id * part + idx) = tmps[i][op_id * part + idx];
       }
     }
   }
@@ -1648,8 +1651,29 @@ namespace aiter
     }
 
     // support eager mode only
+    // size = byte num, tensor.numel() * tensor.element_size()
+    // input should be chunked
+    void sdma_copy(hipStream_t stream, void* input, int size, int chunk_num, int chunk_id)
+    {
+      constexpr int ngpus = 8;
+      int chunk_part = size / chunk_num;
+      int part = chunk_part / ngpus;
+      int buf_size = part * 2;
+      for (int i = 1; i < ngpus; ++i)
+      {
+        int device_id = (rank_ + i) % world_size_;
+        bool* dst_start = reinterpret_cast<bool*>(sg_.signals[device_id] + 1);
+        bool* src_start = reinterpret_cast<bool*>(input);
+        void* dst = reinterpret_cast<void*>(dst_start + chunk_part * chunk_id + rank_ * part);
+        void* src = reinterpret_cast<void*>(src_start + chunk_part * chunk_id + device_id * part);
+        HIP_CALL(hipMemcpyAsync(dst, src, buf_size, hipMemcpyDeviceToDevice, stream));
+      }
+    }
+
+    // size should be calculated by chunk
+    // size = input.numel() / chunk_num
     template <typename T>
-    void allreduce_sdma_impl(hipStream_t stream, T* input, T* output, int size)
+    void allreduce_sdma_impl(hipStream_t stream, T* input, T* output, int size, int chunk_num, int chunk_id)
     {
       auto d = packed_t<T>::P::size;
       RankData* ptrs = get_buffer_RD(stream, input);
@@ -1664,6 +1688,7 @@ namespace aiter
 
       int part = size / 8;
       int buf_size = sizeof(T) * part;
+      /*
       for (int i = 1; i < world_size_; ++i)
       {
         int device_id = (rank_ + i) % world_size_;
@@ -1673,6 +1698,7 @@ namespace aiter
         // HIP_CALL(hipMemcpyAsync(dst, inp, buf_size, hipMemcpyDeviceToDevice, streams[i - 1]));
         HIP_CALL(hipMemcpyAsync(dst, inp, buf_size, hipMemcpyDeviceToDevice, stream));
       }
+      */
       int g_num = (part / d + 512 - 1) / 512;
       dim3 block(512);
       dim3 grid;
@@ -1683,7 +1709,9 @@ namespace aiter
           sg_,
           self_sg_,
           rank_,
-          size
+          size,
+          chunk_num,
+          chunk_id
       );
       /*
       for (int i = 0; i < 8; ++i)
