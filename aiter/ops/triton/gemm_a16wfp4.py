@@ -371,4 +371,6 @@ def gemm_a16wfp4_preshuffle(
         K = K // 16
         config, _ = _get_config(M, N, K, True)
     config_hashable = serialize_dict(config)
-    return gemm_a16wfp4_preshuffle_(x, w, w_scales, prequant, dtype, y, config_hashable)
+    return gemm_a16wfp4_preshuffle_(
+        x, w, w_scales, prequant, dtype, y, config_hashable, skip_reduce
+    )
