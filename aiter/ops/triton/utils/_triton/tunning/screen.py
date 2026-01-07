@@ -1,4 +1,3 @@
-
 from itertools import product
 import os
 import sys
@@ -18,37 +17,37 @@ possible_split = [3, 4, 7, 8, 14, 16, 28]
 
 ############################################################
 # default settings
-# Ms = [4, 8]
-# possible_ms = [16, 32, 64, 128, 256]
-# Ms += [v for v in possible_ms if v <= M]
+Ms = [4, 8]
+possible_ms = [16, 32, 64, 128, 256]
+Ms += [v for v in possible_ms if v <= M]
 
-# Ns = [16]
-# possible_ns = [32, 64, 128, 256]
-# Ns += [v for v in possible_ns if v <= N]
+Ns = [16]
+possible_ns = [32, 64, 128, 256]
+Ns += [v for v in possible_ns if v <= N]
 
-# Ks = [128]
-# possible_ks = [256, 512, 1024]
-# Ks += [v for v in possible_ks if v <= K]
+Ks = [128]
+possible_ks = [256, 512, 1024]
+Ks += [v for v in possible_ks if v <= K]
 ############################################################
 
 ############################################################
 # # for AFP4WFP4_GEMM_preshuffe please use this
-if M >= 256:
-    Ms = [32, 64, 128, 256]
-elif M >= 128:
-    Ms = [32, 64, 128]
-elif M >= 64:
-    Ms = [32, 64]
-elif M >= 32:
-    Ms = [32]
-else:
-    Ms = [4, 8, 16]
-Ns = [32, 64, 128]
-Ks = [256, 512, 1024]
+# if M >= 256:
+#     Ms = [32, 64, 128, 256]
+# elif M >= 128:
+#     Ms = [32, 64, 128]
+# elif M >= 64:
+#     Ms = [32, 64]
+# elif M >= 32:
+#     Ms = [32]
+# else:
+#     Ms = [4, 8, 16]
+# Ns = [32, 64, 128]
+# Ks = [256, 512, 1024]
 ############################################################
 
 ############################################################
-# # for A8W8_GEMM_blockscale/A8W8_GEMM_blockscale_preshuffe, Ks can only be 128
+# # for a8w8_GEMM_blockscale/a8w8_GEMM_blockscale_preshuffe/a16w8_GEMM_blockscale/a16w8_GEMM_blockscale_preshuffe, Ks can only be 128
 # Ks = [128]
 ############################################################
 
@@ -71,15 +70,26 @@ parms = {
 comb = list(product(*parms.values()))
 comb_p = []
 for a_comb in comb:
-    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim, cache_modifier, NUM_KSPLIT = a_comb
+    (
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+        GROUP_SIZE_M,
+        num_warps,
+        num_stages,
+        waves_per_eu,
+        matrix_instr_nonkdim,
+        cache_modifier,
+        NUM_KSPLIT,
+    ) = a_comb
     # skip cases
     if NUM_KSPLIT > 1 and GROUP_SIZE_M > 1:
         continue
     if BLOCK_SIZE_K > K // NUM_KSPLIT:
         continue
-    if BLOCK_SIZE_K == K // NUM_KSPLIT and num_stages != 1: # k_itr == 1 case
+    if BLOCK_SIZE_K == K // NUM_KSPLIT and num_stages != 1:  # k_itr == 1 case
         continue
-    if BLOCK_SIZE_K < K // NUM_KSPLIT and num_stages == 1: # k_itr > 1 case
+    if BLOCK_SIZE_K < K // NUM_KSPLIT and num_stages == 1:  # k_itr > 1 case
         continue
     comb_p.append(a_comb)
 comb = comb_p
@@ -93,18 +103,24 @@ comb_max_batch = 100
 os.popen(f"date >> {filename}").read()
 while i_comb_start < len(comb):
     i_comb_end = i_comb_start + 1
-    while i_comb_end < len(comb) and i_comb_end - i_comb_start < comb_max_batch and comb[i_comb_start][0:3] == comb[i_comb_end][0:3]:
+    while (
+        i_comb_end < len(comb)
+        and i_comb_end - i_comb_start < comb_max_batch
+        and comb[i_comb_start][0:3] == comb[i_comb_end][0:3]
+    ):
         i_comb_end += 1
-    os.popen(f"echo 'running case {i_comb_start} ~ {i_comb_end - 1}' >> {filename}").read()
+    os.popen(
+        f"echo 'running case {i_comb_start} ~ {i_comb_end - 1}' >> {filename}"
+    ).read()
     s = ""
     for a_comb in comb[i_comb_start:i_comb_end]:
         s += " ".join([str(v) for v in a_comb])
         s += " "
     s = s.strip()
-    
-    cmd=f"""HIP_VISIBLE_DEVICES={G} rocprofv3 --kernel-trace -f csv -o res-{file_tag} -- python3 {ut_filename} {M} {N} {K} {s}"""
-    cmd_rprof=f"""python3 rprof.py res-{file_tag}_kernel_trace.csv -k gemm"""
-    
+
+    cmd = f"""HIP_VISIBLE_DEVICES={G} rocprofv3 --kernel-trace -f csv -o res-{file_tag} -- python3 {ut_filename} {M} {N} {K} {s}"""
+    cmd_rprof = f"""python3 rprof.py res-{file_tag}_kernel_trace.csv -k gemm"""
+
     os.popen(f"rm res-{file_tag}_kernel_trace.csv").read()
     os.popen(cmd).read()
     if os.path.isfile(f"res-{file_tag}_kernel_trace.csv") == True:
@@ -112,13 +128,16 @@ while i_comb_start < len(comb):
         if prof_output[-1].strip() == "":
             prof_output.pop()
         prof_output_i = 0
-        
+
         for a_comb in comb[i_comb_start:i_comb_end]:
             s = " ".join([str(v) for v in a_comb])
             os.popen(f"echo 'screencase {s}' >> {filename}").read()
             assert prof_output[prof_output_i] == "Kernel detected:"
             prof_output_i += 1
-            while prof_output_i < len(prof_output) and prof_output[prof_output_i] != "Kernel detected:":
+            while (
+                prof_output_i < len(prof_output)
+                and prof_output[prof_output_i] != "Kernel detected:"
+            ):
                 os.popen(f"echo '{prof_output[prof_output_i]}' >> {filename}").read()
                 prof_output_i += 1
 

@@ -1,7 +1,11 @@
 import os
 import sys
 
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_arch()
 from aiter.ops.triton.utils._triton.tunning._ut_common import config_parms_key
+
 
 def read_file(filename, case_data):
     err_lines_limit = 100000
@@ -28,21 +32,23 @@ def read_file(filename, case_data):
                     # if int(screencaseline[len("screencase")+1:].strip().split()[-1]) == 1: continue # remove this comment to consider only split-k case
                     # if int(screencaseline[len("screencase")+1:].strip().split()[-1]) != 1: continue # remove this comment to consider only split-k case
                     # if int(screencaseline[len("screencase")+1:].strip().split()[2]) != 128: continue # remove this comment to consider only BK=128
-                    case_data.append([r, screencaseline[len("screencase")+1:].strip()])
+                    case_data.append(
+                        [r, screencaseline[len("screencase") + 1 :].strip()]
+                    )
                 except:
                     break
-               
+
 
 TP = 8
 # DS-R1 TP8
 list_of_shapes = [
-    (2112, 7168), # fused_qkv_a_proj
-    (3072, 1536), # b_proj
-    (7168, 2048), # o_proj
+    (2112, 7168),  # fused_qkv_a_proj
+    (3072, 1536),  # b_proj
+    (7168, 2048),  # o_proj
     (256, 7168),  # moe gate
-    (4608, 7168), # dense layer1
-    (7168, 2304), # dense layer2
-    (4096, 512), # prefill kv_proj
+    (4608, 7168),  # dense layer1
+    (7168, 2304),  # dense layer2
+    (4096, 512),  # prefill kv_proj
 ]
 # # LL3-405B TP-n
 # list_of_shapes = [
@@ -90,7 +96,7 @@ list_of_shapes = [
 # ]
 
 ut_filename = sys.argv[1]
-filename_prefix = sys.argv[2] # example "gfx950-GEMM-A8W8_PRESHUFFLED"
+filename_prefix = f"{DEVICE_ARCH}-{sys.argv[2]}"  # example "GEMM-A8W8_BLOCKSCALE"
 m_config_map = {v: [f"M_LEQ_{v}"] for v in [8, 16, 32, 64, 128, 256]}
 m_config_map[16384] = ["any"]
 
@@ -131,24 +137,27 @@ for n, k in list_of_shapes:
             last_config_list = config_list
 
         for config_name in m_config_map[m]:
-            
-            fout.write("""  "%s": {\n"""%(config_name))
+
+            fout.write("""  "%s": {\n""" % (config_name))
             for i_parms_key, parms_key in enumerate(config_parms_key):
                 parm = config_list[i_parms_key]
 
                 if parms_key == "cache_modifier":
-                    fout.write("""    "%s": %s"""%(
-                        parms_key, 
-                        """".cg\"""" if parm == "0" else 'null',
-                    ))
+                    fout.write(
+                        """    "%s": %s"""
+                        % (
+                            parms_key,
+                            """".cg\"""" if parm == "0" else "null",
+                        )
+                    )
                 else:
-                    fout.write("""    "%s": %s"""%(parms_key, parm))
+                    fout.write("""    "%s": %s""" % (parms_key, parm))
 
                 if i_parms_key != len(config_parms_key) - 1:
                     fout.write(""",\n""")
                 else:
                     fout.write("""\n  }""")
-            
+
         if config_name == last_config_name:
             fout.write("\n")
         else:

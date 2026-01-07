@@ -5,9 +5,9 @@ import os
 
 parser = argparse.ArgumentParser(description="")
 parser.add_argument("filename", type=str, help="")
-parser.add_argument('-k', type = str, nargs = '+', help = 'list of keywords for kernel names')
-parser.add_argument("-m", type = float, help="Memory (GB)", default=0)
-parser.add_argument("-f", type = float, help="Operations (TFLOPS)", default=0)
+parser.add_argument("-k", type=str, nargs="+", help="list of keywords for kernel names")
+parser.add_argument("-m", type=float, help="Memory (GB)", default=0)
+parser.add_argument("-f", type=float, help="Operations (TFLOPS)", default=0)
 args = parser.parse_args()
 
 filename = args.filename
@@ -19,7 +19,7 @@ runtime_list = None
 df_raw = pd.read_csv(filename)
 
 df_split = []
-split_dummy_idx = (df_raw['Kernel_Name'] == "split_dummy").to_numpy().nonzero()[0]
+split_dummy_idx = (df_raw["Kernel_Name"] == "split_dummy").to_numpy().nonzero()[0]
 if len(split_dummy_idx) > 0:
     split_dummy_idx = np.insert(split_dummy_idx, 0, 0)
     for i in range(len(split_dummy_idx) - 1):
@@ -28,7 +28,7 @@ else:
     df_split = [df_raw]
 
 for df in df_split:
-    all_kernel_name = df['Kernel_Name']
+    all_kernel_name = df["Kernel_Name"]
     unique_kernel_name_list = list({v: 1 for v in all_kernel_name}.keys())
     target_kernel_list = []
     for a_unique_kernel_name in unique_kernel_name_list:
@@ -41,20 +41,20 @@ for df in df_split:
     print("Kernel detected:")
     for a_target_kernel_name in target_kernel_list:
         print(f"\t{a_target_kernel_name}")
-        df_tmp = df[df['Kernel_Name'] == a_target_kernel_name]
-        duration = (df_tmp['End_Timestamp'] - df_tmp['Start_Timestamp']).to_numpy()
+        df_tmp = df[df["Kernel_Name"] == a_target_kernel_name]
+        duration = (df_tmp["End_Timestamp"] - df_tmp["Start_Timestamp"]).to_numpy()
         kernel_runtime_list_list.append(duration)
 
     runtime_list = kernel_runtime_list_list[0]
     for i in range(1, len(kernel_runtime_list_list)):
         runtime_list = runtime_list + kernel_runtime_list_list[i]
 
-    runtime_list = runtime_list/1e3
+    runtime_list = runtime_list / 1e3
     sort_idx = np.argsort(runtime_list)
-    p50_idx = sort_idx[len(sort_idx)//2  ]
-    p25_idx = sort_idx[len(sort_idx)//4  ]
-    p75_idx = sort_idx[len(sort_idx)//4*3]
-    runtime    = runtime_list[p50_idx]
+    p50_idx = sort_idx[len(sort_idx) // 2]
+    p25_idx = sort_idx[len(sort_idx) // 4]
+    p75_idx = sort_idx[len(sort_idx) // 4 * 3]
+    runtime = runtime_list[p50_idx]
     runtime_25 = runtime_list[p25_idx]
     runtime_75 = runtime_list[p75_idx]
 

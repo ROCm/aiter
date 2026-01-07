@@ -8,9 +8,9 @@ from aiter.ops.triton.utils._triton.tunning._ut_common import (
 
 ############################################################
 # <import triton API and input API>
-from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    generate_gemm_afp4wfp4_inputs,
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
+    generate_gemm_a8w8_blockscale_inputs,
 )
 
 ############################################################
@@ -22,10 +22,17 @@ config_list = get_config_list(sys.argv[shape_size + 1 :])
 ############################################################
 # <generate input>
 dtype = torch.bfloat16
-shuffle = True
-x, w, w_triton, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
-    generate_gemm_afp4wfp4_inputs(
-        *input, dtype, output=True, shuffle_scales_fg=shuffle, shuffle_weight_fg=shuffle
+shuffle = False
+block_shape_n, block_shape_k = 128, 128
+x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
+    generate_gemm_a8w8_blockscale_inputs(
+        *input,
+        block_shape_n,
+        block_shape_k,
+        dtype=dtype,
+        layout="TN",
+        output=True,
+        shuffle=shuffle,
     )
 )
 ############################################################
@@ -35,8 +42,8 @@ for config in config_list:
     def fn():
         ############################################################
         # <run API>
-        gemm_afp4wfp4_preshuffle(
-            x, w_triton, x_scales_triton, w_scales_triton, dtype, y, config=config
+        gemm_a8w8_blockscale(
+            x, weight_triton, x_scale_shuffled, w_scale, dtype, y, config=config
         )
         ############################################################
 
