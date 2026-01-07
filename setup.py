@@ -11,12 +11,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
-this_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, f"{this_dir}/aiter/")
-
+sys.path.insert(0, f"{os.path.dirname(os.path.abspath(__file__))}/aiter/")
 from jit import core
 from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 from jit.utils.mha_recipes import get_mha_varlen_prebuild_variants_by_names
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "amd-aiter"
