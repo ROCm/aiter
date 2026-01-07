@@ -2,6 +2,63 @@
 
 This folder contains Triton-based kernels and wrappers used by AITER.
 
+# AITER Triton Ops Code Reorganization
+
+Reorganized the flat Triton files into categorized subdirectories. **All existing imports still work** via backward compatibility.
+
+## What Changed
+
+### Old Structure
+```
+aiter/ops/triton/
+├── __init__.py
+├── gemm_a16w16.py
+├── gemm_a8w8.py
+├── batched_gemm_a16wfp4.py
+├── mha.py
+├── fused_gemm_afp4wfp4_a16w16.py
+├── ... (other files in a flat structure)
+└── _triton_kernels/
+    ├── gemm_a16w16.py
+    ├── gemm_a8w8.py
+    └── ... (matching kernel files)
+```
+
+### New Structure
+```
+aiter/ops/triton/
+├── __init__.py (with backward compatibility)
+├── gemm/
+│   ├── basic/          # Basic GEMM operations
+│   ├── batched/        # Batched GEMM operations
+│   ├── feed_forward/   # Feed-forward specific GEMMs
+│   └── fused/          # Fused GEMM operations
+├── attention/          # Attention mechanisms (MHA, MQA, etc.)
+├── moe/                # Mixture of Experts operations
+├── normalization/      # Normalization operations
+├── quant/              # Quantization operations
+├── rope/               # RoPE (Rotary Position Embedding)
+├── fusions/            # Other fusion operations
+└── utils/              # Utility functions
+
+aiter/ops/triton/_triton_kernels/
+└── (uses the same new structure as above)
+```
+
+## Backward Compatibility
+
+Old imports **still work** - no changes needed:
+
+```python
+# Both work identically:
+ # Old (still works via backward compatibility (_BACKWARD_COMPAT_MAP) in `aiter/ops/triton/__init__.py`)
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+ # New
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+```
+
+For **Imports**: Use new structure in the wrapper
+
 ## GEMM config loading (single utility)
 
 GEMM kernels now use a single utility function instead of managing their own config loading.
