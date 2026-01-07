@@ -635,24 +635,32 @@ __global__ void fused_mrope_rms_neox_kv_kernel(T* qkv,
         return;
     }
 
-    // Warp allocation: Q+K first, then V
+    // Warp allocation: all Q first, then all K, then all V
     const int num_heads_qk   = num_heads_q + num_heads_k;
     const int num_heads      = num_heads_q + num_heads_k + num_heads_v;
-    const int total_qk_warps = num_tokens * num_heads_qk;
+    const int total_q_warps  = num_tokens * num_heads_q;
+    const int total_k_warps  = num_tokens * num_heads_k;
+    const int total_qk_warps = total_q_warps + total_k_warps;
 
-    // Determine if current warp processes Q/K or V
+    // Determine if current warp processes Q, K, or V
+    const bool is_q = global_warp_id < total_q_warps;
+    const bool is_k = !is_q && global_warp_id < total_qk_warps;
     const bool is_v = global_warp_id >= total_qk_warps;
 
     int token_id, head_id_in_token;
-    bool is_q, is_k;
 
-    if(!is_v)
+    if(is_q)
     {
-        // Q+K warps: global_warp_id in range [0, total_qk_warps)
-        token_id         = global_warp_id / num_heads_qk;
-        head_id_in_token = global_warp_id % num_heads_qk;
-        is_q             = head_id_in_token < num_heads_q;
-        is_k             = !is_q;
+        // Q warps: global_warp_id in range [0, total_q_warps)
+        token_id         = global_warp_id / num_heads_q;
+        head_id_in_token = global_warp_id % num_heads_q;
+    }
+    else if(is_k)
+    {
+        // K warps: global_warp_id in range [total_q_warps, total_qk_warps)
+        const int k_warp_id = global_warp_id - total_q_warps;
+        token_id            = k_warp_id / num_heads_k;
+        head_id_in_token    = num_heads_q + (k_warp_id % num_heads_k);
     }
     else
     {
@@ -660,8 +668,6 @@ __global__ void fused_mrope_rms_neox_kv_kernel(T* qkv,
         const int v_warp_id = global_warp_id - total_qk_warps;
         token_id            = v_warp_id / num_heads_v;
         head_id_in_token    = num_heads_qk + (v_warp_id % num_heads_v);
-        is_q                = false;
-        is_k                = false;
     }
 
     const int access_id_in_head = (threadIdx.x % WARP_SIZE) * VEC_SIZE;
@@ -947,22 +953,32 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(T* qkv,
     {
         return;
     }
+    // Warp allocation: all Q first, then all K, then all V
     const int num_heads_qk   = num_heads_q + num_heads_k;
     const int num_heads      = num_heads_q + num_heads_k + num_heads_v;
-    const int total_qk_warps = num_tokens * num_heads_qk;
+    const int total_q_warps  = num_tokens * num_heads_q;
+    const int total_k_warps  = num_tokens * num_heads_k;
+    const int total_qk_warps = total_q_warps + total_k_warps;
 
+    // Determine if current warp processes Q, K, or V
+    const bool is_q = global_warp_id < total_q_warps;
+    const bool is_k = !is_q && global_warp_id < total_qk_warps;
     const bool is_v = global_warp_id >= total_qk_warps;
 
     int token_id, head_id_in_token;
-    bool is_q, is_k;
 
-    if(!is_v)
+    if(is_q)
     {
-        // Q+K warps: global_warp_id in range [0, total_qk_warps)
-        token_id         = global_warp_id / num_heads_qk;
-        head_id_in_token = global_warp_id % num_heads_qk;
-        is_q             = head_id_in_token < num_heads_q;
-        is_k             = !is_q;
+        // Q warps: global_warp_id in range [0, total_q_warps)
+        token_id         = global_warp_id / num_heads_q;
+        head_id_in_token = global_warp_id % num_heads_q;
+    }
+    else if(is_k)
+    {
+        // K warps: global_warp_id in range [total_q_warps, total_qk_warps)
+        const int k_warp_id = global_warp_id - total_q_warps;
+        token_id            = k_warp_id / num_heads_k;
+        head_id_in_token    = num_heads_q + (k_warp_id % num_heads_k);
     }
     else
     {
@@ -970,8 +986,6 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(T* qkv,
         const int v_warp_id = global_warp_id - total_qk_warps;
         token_id            = v_warp_id / num_heads_v;
         head_id_in_token    = num_heads_qk + (v_warp_id % num_heads_v);
-        is_q                = false;
-        is_k                = false;
     }
 
     const int access_id_in_head = (threadIdx.x % WARP_SIZE) * VEC_SIZE;
