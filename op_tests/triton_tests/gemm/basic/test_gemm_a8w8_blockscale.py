@@ -181,9 +181,7 @@ def generate_gemm_a8w8_blockscale_inputs(
     [
         (dtype, *shape, layout, output)
         for output in [True]
-        for output in [True]
         for dtype in ["bf16"]
-        for layout in ["TN"]
         for layout in ["TN"]
         for shape in get_x_vals()
     ],
@@ -193,7 +191,6 @@ def generate_gemm_a8w8_blockscale_inputs(
     [
         # "gluon",
         "triton",
-        "triton_shuffle",
         "triton_shuffle",
     ],
 )
@@ -206,13 +203,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     if impl == "gluon" and DEVICE_ARCH not in ("gfx950",):
         pytest.skip(
             "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
-        )
-
-    if impl == "triton_shuffle":
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
         )
 
     if impl == "triton_shuffle":
@@ -234,6 +224,7 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             output=output,
             shuffle=("_shuffle" in impl),
         )
+    )
     x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
         generate_gemm_a8w8_blockscale_inputs(
             M,
@@ -250,19 +241,14 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
-
     if impl == "gluon":
         impl = gluon_gemm_a8w8_blockscale
     elif impl == "triton":
         impl = triton_gemm_a8w8_blockscale
     elif impl == "triton_shuffle":
         impl = triton_gemm_a8w8_blockscale_preshuffle
-    elif impl == "triton_shuffle":
-        impl = triton_gemm_a8w8_blockscale_preshuffle
     else:
         raise ValueError(f"Unknown implementation: {impl}")
-
-    b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
