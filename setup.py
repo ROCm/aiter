@@ -7,12 +7,12 @@ import sys
 import json
 
 from setuptools import Distribution, setup
+from concurrent.futures import ThreadPoolExecutor
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/aiter/")
-from concurrent.futures import ThreadPoolExecutor
 
 from jit import core
 from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
