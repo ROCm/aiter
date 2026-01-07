@@ -2,39 +2,59 @@
 from itertools import product
 import os
 import sys
+import triton
 
 M = int(sys.argv[1])
 N = int(sys.argv[2])
 K = int(sys.argv[3])
 G = int(sys.argv[4])
+ut_filename = sys.argv[5]
+
+assert M == triton.next_power_of_2(M), "M has to be power of 2"
+assert os.path.isfile(ut_filename), f"{ut_filename} not found"
+
 NUM_KSPLITs = [1]
+possible_split = [3, 4, 7, 8, 14, 16, 28]
 
-possible_split = [3, 4, 7, 8, 14, 16]
-if K == 7168:
-    possible_split = [7, 14]
-if K == 1536:
-    possible_split = []
-for a_possible_split in possible_split:
-    if K % a_possible_split == 0:
-        NUM_KSPLITs.append(a_possible_split)
+############################################################
+# default settings
+# Ms = [4, 8]
+# possible_ms = [16, 32, 64, 128, 256]
+# Ms += [v for v in possible_ms if v <= M]
 
-if M >= 1024:
+# Ns = [16]
+# possible_ns = [32, 64, 128, 256]
+# Ns += [v for v in possible_ns if v <= N]
+
+# Ks = [128]
+# possible_ks = [256, 512, 1024]
+# Ks += [v for v in possible_ks if v <= K]
+############################################################
+
+############################################################
+# # for AFP4WFP4_GEMM_preshuffe please use this
+if M >= 256:
     Ms = [32, 64, 128, 256]
-elif M >= 256:
+elif M >= 128:
     Ms = [32, 64, 128]
 elif M >= 64:
     Ms = [32, 64]
 elif M >= 32:
     Ms = [32]
 else:
-    Ms = [8, 16]
-
+    Ms = [4, 8, 16]
 Ns = [32, 64, 128]
+Ks = [256, 512, 1024]
+############################################################
 
-if K == 7168:
-    Ks = [256, 512, 1024]
-if K == 1536:
-    Ks = [256, 512]
+############################################################
+# # for A8W8_GEMM_blockscale/A8W8_GEMM_blockscale_preshuffe, Ks can only be 128
+# Ks = [128]
+############################################################
+
+for a_possible_split in possible_split:
+    if K % a_possible_split == 0:
+        NUM_KSPLITs.append(a_possible_split)
 
 parms = {
     "BLOCK_SIZE_M": Ms,
@@ -63,7 +83,8 @@ for a_comb in comb:
         continue
     comb_p.append(a_comb)
 comb = comb_p
-filename = f"screen-{M}-{N}-{K}.txt"
+file_tag = f"{ut_filename}-{M}-{N}-{K}"
+filename = f"screen-{file_tag}.txt"
 s = " ".join([str(v) for v in parms.keys()])
 os.popen(f"echo 'Number of combinations = {len(comb)}' > {filename}")
 os.popen(f"echo '{s}' >> {filename}")
@@ -81,12 +102,12 @@ while i_comb_start < len(comb):
         s += " "
     s = s.strip()
     
-    cmd=f"""HIP_VISIBLE_DEVICES={G} rocprofv3 --kernel-trace -f csv -o res-{M}-{N}-{K} -- python3 ut.py {M} {N} {K} {s}"""
-    cmd_rprof=f"""python3 rprof.py res-{M}-{N}-{K}_kernel_trace.csv -k gemm"""
+    cmd=f"""HIP_VISIBLE_DEVICES={G} rocprofv3 --kernel-trace -f csv -o res-{file_tag} -- python3 {ut_filename} {M} {N} {K} {s}"""
+    cmd_rprof=f"""python3 rprof.py res-{file_tag}_kernel_trace.csv -k gemm"""
     
-    os.popen(f"rm res-{M}-{N}-{K}_kernel_trace.csv").read()
+    os.popen(f"rm res-{file_tag}_kernel_trace.csv").read()
     os.popen(cmd).read()
-    if os.path.isfile(f"res-{M}-{N}-{K}_kernel_trace.csv") == True:
+    if os.path.isfile(f"res-{file_tag}_kernel_trace.csv") == True:
         prof_output = os.popen(cmd_rprof).read().split("\n")
         if prof_output[-1].strip() == "":
             prof_output.pop()

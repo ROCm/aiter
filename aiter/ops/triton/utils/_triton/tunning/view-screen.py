@@ -1,8 +1,10 @@
+import os
 import sys
+
+from aiter.ops.triton.utils._triton.tunning._ut_common import config_parms_key
 
 def read_file(filename, case_data):
     err_lines_limit = 100000
-    time_rec_map = {}
     if os.path.isfile(filename):
         with open(filename, "r") as f:
             for newline in f:
@@ -30,8 +32,65 @@ def read_file(filename, case_data):
                 except:
                     break
                
-import os
 
+TP = 8
+# DS-R1 TP8
+list_of_shapes = [
+    (2112, 7168), # fused_qkv_a_proj
+    (3072, 1536), # b_proj
+    (7168, 2048), # o_proj
+    (256, 7168),  # moe gate
+    (4608, 7168), # dense layer1
+    (7168, 2304), # dense layer2
+    (4096, 512), # prefill kv_proj
+]
+# # LL3-405B TP-n
+# list_of_shapes = [
+#     (106496//TP, 16384),
+#     (16384, 53248//TP),
+#     (18432//TP, 16384),
+#     (16384, 16384//TP),
+# ]
+# # LL3-70B TP-n
+# list_of_shapes = [
+#     (57344//TP, 8192),
+#     (8192, 28672//TP),
+#     (10240//TP, 8192),
+#     (8192, 8192//TP),
+# ]
+# # LL3-8B TP-n
+# list_of_shapes = [
+#     (28672//TP, 4096),
+#     (4096, 14336//TP),
+#     (6144//TP, 4096),
+#     (4096, 4096//TP),
+# ]
+# # LL4-Maverick TP8
+# list_of_shapes = [
+#     (4096, 5120),
+#     (5120, 2048),
+#     (128, 5120),
+#     (2048, 5120),
+#     (5120, 1024),
+#     (896, 5120),
+#     (5120, 640),
+# ]
+# # Qwen3 MoE TP8
+# list_of_shapes = [
+#     (128, 4096),
+#     (1152, 4096),
+#     (4096, 1024),
+# ]
+# # GPT-OSS-120B TP-n
+# list_of_shapes = [
+#     (10240//TP, 8192),
+#     (8192, 8192//TP),
+#     (57344//TP, 8192),
+#     (8192, 28672//TP),
+# ]
+
+ut_filename = sys.argv[1]
+filename_prefix = sys.argv[2] # example "gfx950-GEMM-A8W8_PRESHUFFLED"
 m_config_map = {v: [f"M_LEQ_{v}"] for v in [8, 16, 32, 64, 128, 256]}
 m_config_map[16384] = ["any"]
 
@@ -40,22 +99,21 @@ last_config_name = []
 for a_config_name in m_config_map.values():
     last_config_name += a_config_name
 last_config_name = last_config_name[-1]
-filename_prefix = "gfx950-GEMM-A8W8_PRESHUFFLED"
 print(f"M\tN\tK\tTriton (us)\tconfig")
-for n, k in [
-    (2112, 7168),
-    (3072, 1536),
-]:
+for n, k in list_of_shapes:
+    get_at_least_one_config = False
     fout = open(f"{filename_prefix}-N={n}-K={k}.json", "w")
     fout.write("{\n")
 
     last_config_list = None
     for m in mlist:
         case_data = []
-        read_file(f"screen-{m}-{n}-{k}.txt", case_data)
+        file_tag = f"{ut_filename}-{m}-{n}-{k}"
+        read_file(f"screen-{file_tag}.txt", case_data)
         case_data = sorted(case_data, key=lambda x: x[0])
 
         if len(case_data) > 0:
+            get_at_least_one_config = True
             triton_runtime = f"{case_data[0][0]:8.3f}"
             config_str = f"(config = {case_data[0][1]})"
         else:
@@ -73,36 +131,33 @@ for n, k in [
             last_config_list = config_list
 
         for config_name in m_config_map[m]:
-
-            fout.write("""  "%s": {
-    "BLOCK_SIZE_M": %s,
-    "BLOCK_SIZE_N": %s,
-    "BLOCK_SIZE_K": %s,
-    "GROUP_SIZE_M": %s,
-    "num_warps": %s,
-    "num_stages": %s,
-    "waves_per_eu": %s,
-    "matrix_instr_nonkdim": %s,
-    "cache_modifier": %s,
-    "NUM_KSPLIT": %s
-  }"""%(
-      config_name,
-      config_list[0],
-      config_list[1],
-      config_list[2],
-      config_list[3],
-      config_list[4],
-      config_list[5],
-      config_list[6],
-      config_list[7],
-      """".cg\"""" if config_list[8] == "0" else 'null',
-      config_list[9],
-  ))
             
-            if config_name == last_config_name:
-                fout.write("\n")
-            else:
-                fout.write(",\n")
+            fout.write("""  "%s": {\n"""%(config_name))
+            for i_parms_key, parms_key in enumerate(config_parms_key):
+                parm = config_list[i_parms_key]
+
+                if parms_key == "cache_modifier":
+                    fout.write("""    "%s": %s"""%(
+                        parms_key, 
+                        """".cg\"""" if parm == "0" else 'null',
+                    ))
+                else:
+                    fout.write("""    "%s": %s"""%(parms_key, parm))
+
+                if i_parms_key != len(config_parms_key) - 1:
+                    fout.write(""",\n""")
+                else:
+                    fout.write("""\n  }""")
+            
+        if config_name == last_config_name:
+            fout.write("\n")
+        else:
+            fout.write(",\n")
 
     fout.write("}\n")
     fout.close()
+    if get_at_least_one_config == False:
+        os.popen(f"rm {filename_prefix}-N={n}-K={k}.json").read()
+        print(f"No file is created")
+    else:
+        print(f"{filename_prefix}-N={n}-K={k}.json is created")
