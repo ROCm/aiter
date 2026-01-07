@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from jit import core
 from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
+from jit.utils.mha_recipes import get_mha_varlen_prebuild_variants_by_names
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "amd-aiter"
@@ -151,6 +152,32 @@ if IS_ROCM:
         else:
             all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
 
+            if PREBUILD_KERNELS == 1:
+                extra_args_build = []
+
+                req_md_names = [
+                    "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
+                    "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale",
+                ]
+                variants = get_mha_varlen_prebuild_variants_by_names(
+                    req_md_names, ck_dir
+                )
+                base_args = core.get_args_of_build("module_mha_varlen_fwd")
+                for v in variants:
+                    if not isinstance(base_args, dict) or not base_args.get("srcs"):
+                        continue
+                    extra_args_build.append(
+                        {
+                            "md_name": v["md_name"],
+                            "srcs": base_args["srcs"],
+                            "flags_extra_cc": base_args["flags_extra_cc"],
+                            "flags_extra_hip": base_args["flags_extra_hip"],
+                            "extra_include": base_args["extra_include"],
+                            "blob_gen_cmd": v["blob_gen_cmd"],
+                        }
+                    )
+                all_opts_args_build.extend(extra_args_build)
+
             bd = f"{core.get_user_jit_dir()}/build"
             import glob
 
@@ -161,24 +188,6 @@ if IS_ROCM:
                 except Exception:
                     pass
 
-            if PREBUILD_KERNELS == 1:
-                base_args = core.get_args_of_build("module_mha_varlen_fwd")
-                if isinstance(base_args, dict) and base_args.get("srcs"):
-
-                    from jit.utils.mha_recipes import (
-                        get_mha_varlen_prebuild_variants_by_names as get_variants_by_names,
-                    )
-
-                    md_names = [
-                        "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
-                        "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale",
-                    ]
-                    for v in get_variants_by_names(md_names, ck_dir):
-                        variant_args = dict(base_args)
-                        variant_args["md_name"] = v["md_name"]
-                        variant_args["blob_gen_cmd"] = v["blob_gen_cmd"]
-                        all_opts_args_build.append(variant_args)
-
             def build_one_module(one_opt_args):
                 flags_cc = list(one_opt_args["flags_extra_cc"]) + [
                     f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
@@ -187,13 +196,12 @@ if IS_ROCM:
                     f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
                 ]
 
-                blob_gen_cmd = one_opt_args["blob_gen_cmd"]
                 core.build_module(
                     md_name=one_opt_args["md_name"],
                     srcs=one_opt_args["srcs"],
                     flags_extra_cc=flags_cc,
                     flags_extra_hip=flags_hip,
-                    blob_gen_cmd=blob_gen_cmd,
+                    blob_gen_cmd=one_opt_args["blob_gen_cmd"],
                     extra_include=one_opt_args["extra_include"],
                     extra_ldflags=None,
                     verbose=False,
@@ -212,6 +220,7 @@ if IS_ROCM:
 
             with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
                 list(executor.map(build_one_module, all_opts_args_build))
+
 else:
     raise NotImplementedError("Only ROCM is supported")
 

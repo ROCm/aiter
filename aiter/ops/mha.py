@@ -5,14 +5,15 @@ from typing import Any, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
+
 from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
-from aiter.jit.utils.mha_recipes import compose_mha_fwd_variant_suffix_and_filter
+from ..jit.utils.mha_recipes import (
+    compose_mha_fwd_variant_suffix_and_filter,
+    get_mha_varlen_prebuild_variants_by_names,
+)
 from ..utility import dtypes
-
-
-# prebuild variants helpers are now sourced from aiter.jit.utils.mha_receipt
 
 
 def cmdGenFunc_mha_fwd(
@@ -293,50 +294,45 @@ def cmdGenFunc_mha_varlen_fwd(
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None:
         causal = False
-    md_name = "mha_varlen_fwd"
     if block_table is None:
         if q.dtype == dtypes.fp16:
-            dtype_tok = "fp16"
+            dtype_token = "fp16"
         elif q.dtype == dtypes.bf16:
-            dtype_tok = "bf16"
+            dtype_token = "bf16"
         elif q.dtype == dtypes.fp8:
             if out is None or out.dtype == dtypes.bf16:
-                dtype_tok = "fp8bf16"
+                dtype_token = "fp8bf16"
             else:
                 raise NotImplementedError("Unsupported output dtype for FP8 MHA")
         else:
-            raise NotImplementedError("Unsupported dtype")
-        if not causal and window_size_left == -1 and window_size_right == -1:
-            use_mask = False
-        else:
-            use_mask = True
+            raise NotImplementedError("Unsupported dtype for MHA")
+        logits_positive = 0.0 < logits_soft_cap
         has_bias = bias is not None
         has_alibi = alibi_slopes is not None
+        no_mask = (
+            (not causal) and (window_size_left == -1) and (window_size_right == -1)
+        )
+        use_mask = not no_mask
+        return_lse = return_softmax_lse
         dropout_zero = dropout_p == 0
         skip_zero = min_seqlen_q == 0
         has_qscale = q_descale is None or k_descale is None or v_descale is None
-        logits_positive = 0.0 < logits_soft_cap
         suffix, filter_fwd = compose_mha_fwd_variant_suffix_and_filter(
-            dtype=dtype_tok,
+            dtype=dtype_token,
             logits_positive=logits_positive,
             has_bias=has_bias,
             has_alibi=has_alibi,
             use_mask=use_mask,
-            return_lse=return_softmax_lse,
+            return_lse=return_lse,
             dropout_zero=dropout_zero,
             skip_zero=skip_zero,
             has_qscale=has_qscale,
         )
-        md_name += suffix
-        blob_gen_cmd = [
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
-        ]
-        blob_gen_cmd.append(
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --filter {} --output_dir {{}}".format('" @ "')
-        )
+        md_name = f"mha_varlen_fwd{suffix}"
+        variants = get_mha_varlen_prebuild_variants_by_names([md_name], CK_DIR)
+        blob_gen_cmd = variants[0]["blob_gen_cmd"]
     else:
+        md_name = "mha_varlen_fwd"
         filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
         filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
         if q.dtype == dtypes.fp16:
@@ -944,7 +940,11 @@ def cmdGenFunc_mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
     # causal=true is the same as causal=false in this case
@@ -959,6 +959,12 @@ def cmdGenFunc_mha_batch_prefill(
     elif q.dtype == torch.bfloat16:
         md_name += "_bf16"
         filter_fwd += "bf16*"
+    elif q.dtype == dtypes.fp8:
+        if out is None or out.dtype == dtypes.bf16:
+            md_name += "_fp8bf16"
+            filter_fwd += "fp8bf16*"
+        else:
+            raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if 0.0 < logits_soft_cap:
         md_name += "_logits"
         filter_fwd += "_logits*"
@@ -989,11 +995,17 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_dropout"
         filter_fwd += "_dropout*"
+    if q_descale is None or k_descale is None or v_descale is None:
+        md_name += "_nqscale"
+        filter_fwd += "_nqscale*"
+    else:
+        # only support per-tensor quantization for now
+        md_name += "_pertensor"
+        filter_fwd += "_pertensor*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
     ]
-
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
@@ -2560,6 +2572,9 @@ def mha_batch_prefill_fake_tensors(
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2624,7 +2639,11 @@ def mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
@@ -2644,11 +2663,15 @@ def _mha_batch_prefill(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
     zero_tensors: bool = False,
     out: torch.Tensor = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2671,8 +2694,11 @@ def _mha_batch_prefill(
         return_lse,
         return_softmax,
         out,
+        bias,
         alibi_slopes,
-        None,
+        q_descale,
+        k_descale,
+        v_descale,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
@@ -2697,6 +2723,9 @@ def mha_batch_prefill_func(
     return_lse=False,
     return_attn_probs=False,
     out=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -2726,6 +2755,9 @@ def mha_batch_prefill_func(
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
         out=out,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     out = out_padded[..., :head_size_v_og]
 
