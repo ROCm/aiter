@@ -29,9 +29,9 @@ def matmul_launch_metadata(grid, kernel, args):
     gindx = args.get("GatherIndx", None)
     # sindx = args.get("WriteBackIndx", None)
     if gindx is not None:
-        ret["name"] += "_moe1"
+        ret["name"] += "_layer1"
     else:
-        ret["name"] += "_moe2"
+        ret["name"] += "_layer2"
     if args["B"] is not None:
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
