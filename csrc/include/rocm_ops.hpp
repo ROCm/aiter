@@ -456,7 +456,7 @@ namespace py = pybind11;
           py::arg("splitK")      = std::nullopt);
 
 #define GEMM_A16W16_ASM_PYBIND                   \
-    m.def("_gemm_a16w16_asm",                    \
+    m.def("gemm_a16w16_asm",                     \
           &gemm_a16w16_asm,                      \
           "Asm gemm a16w16",                     \
           py::arg("A"),                          \

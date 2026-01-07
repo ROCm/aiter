@@ -31,7 +31,7 @@ def gen_gemm_a16w16_asm_fake_tensors(
 
 @compile_ops(
     "module_gemm_a16w16_asm",
-    fc_name="_gemm_a16w16_asm",
+    fc_name="gemm_a16w16_asm",
     gen_fake=gen_gemm_a16w16_asm_fake_tensors,
 )
 def _gemm_a16w16_asm(
