@@ -297,7 +297,7 @@ def ck_moe_stage1(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
-    splitk: int = 1,
+    splitk: Optional[int] = 1,
     dst_type: Optional[str] = None,
 ) -> None: ...
 
@@ -337,7 +337,9 @@ def moe_cktile2stages_gemm1_ck(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
+    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    split_k: Optional[int] = 1,
 ) -> Tensor: ...
 
 
@@ -355,7 +357,9 @@ def moe_cktile2stages_gemm1(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
+    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    split_k: Optional[int] = 1,
 ):
     return moe_cktile2stages_gemm1_ck(
         XQ,
@@ -371,7 +375,9 @@ def moe_cktile2stages_gemm1(
         x_scale,
         w_scale,
         exp_bias,
+        activation,
         block_m,
+        split_k,
     )
 
 
@@ -390,7 +396,9 @@ def moe_cktile2stages_gemm2_ck(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
+    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    split_k: Optional[int] = 1,
 ) -> Tensor: ...
 
 
@@ -408,7 +416,9 @@ def moe_cktile2stages_gemm2(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
+    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    split_k: Optional[int] = 1,
 ):
     return moe_cktile2stages_gemm2_ck(
         XQ,
@@ -424,7 +434,9 @@ def moe_cktile2stages_gemm2(
         x_scale,
         w_scale,
         exp_bias,
+        activation,
         block_m,
+        split_k,
     )
 
 
@@ -530,7 +542,7 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
-        splitk,
+        int(splitk) if splitk is not None else splitk,
         dtype2str_dict[dst_type],
     )
     return out
