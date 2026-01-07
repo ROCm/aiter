@@ -6,7 +6,7 @@ import pytest
 import torch
 
 # routing utilities
-from aiter.ops.triton.moe_routing.routing import routing
+from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe_op_gemm_a8w8_blockscale import (
@@ -15,7 +15,7 @@ from aiter.ops.triton.moe_op_gemm_a8w8_blockscale import (
 )
 
 # numerics utilities
-from aiter.ops.triton.quant_moe import (
+from aiter.ops.triton.moe.quant_moe import (
     dequant_x_blockscale,
     dequant_w_blockscale,
 )

@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton._triton_kernels.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 
 
 def matmul_launch_metadata(grid, kernel, args):
