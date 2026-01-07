@@ -970,7 +970,7 @@ __global__ void fused_mrope_rms_noneox_kv_kernel(T* qkv,
     if(is_q)
     {
         // Q warps: global_warp_id in range [0, total_q_warps)
-        token_id         = global_warp_id / num_heads_q;
+        token_id        = global_warp_id / num_heads_q;
         head_id_in_token = global_warp_id % num_heads_q;
     }
     else if(is_k)
