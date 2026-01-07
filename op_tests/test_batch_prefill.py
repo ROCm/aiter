@@ -17,6 +17,7 @@ from aiter.test_common import (
     perftest,
 )
 
+
 def construct_local_mask(
     seqlen_q,
     seqlen_k,
@@ -524,9 +525,11 @@ def test_batch_prefill(
         rtol, atol = (1e-3, 1e-3) if dtype == torch.float16 else (2e-2, 1e-2)
         assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
 
+
 @perftest()
 def profile_func(target_func, *args, **kwargs):
     return target_func(*args, **kwargs)
+
 
 def flops(
     batch,
@@ -608,15 +611,15 @@ def run_ck(
         seqlen_q = max_seqlen_q
         seqlen_k = max_seqlen_k
         total_flops = flops(
-                batch_size,
-                seqlen_q,
-                seqlen_k,
-                headdim,
-                headdim,
-                nheads_q,
-                num_kv_heads,
-                causal,
-            )
+            batch_size,
+            seqlen_q,
+            seqlen_k,
+            headdim,
+            headdim,
+            nheads_q,
+            num_kv_heads,
+            causal,
+        )
         tflops = efficiency(
             total_flops,
             time_us,
