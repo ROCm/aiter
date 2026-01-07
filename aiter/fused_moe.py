@@ -17,7 +17,7 @@ from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, PY, bd_dir, get_asm_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
