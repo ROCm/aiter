@@ -1654,7 +1654,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       const int num_heads, const int num_kv_heads, const int head_size)
   {
     // Each thread block is responsible for one token.
-    const int token_idx = blockIdx.x;
+    const int token_idx = blockIdx.x; 
     int64_t pos = positions[token_idx];
 
     int64_t cos_sin_cache_offset = pos * rot_dim / 2;
