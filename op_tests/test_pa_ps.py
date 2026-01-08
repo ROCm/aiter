@@ -687,21 +687,19 @@ def test_pa_mtp(
         )
 
         # Profile kernel breakdown for PA ASM (no reduce kernel)
-        _, _, reduce_ratio_asm, us_pa_kernel_asm, _ = (
-            profile_kernel_breakdown(
-                lambda: aiter.pa_fwd_asm(
-                    query,
-                    k_quant_,
-                    v_shuffled,
-                    block_tables,
-                    seq_lens_kv,
-                    block_tables.size(1),
-                    max_qlen,
-                    k_scale_asm,
-                    v_scale_asm,
-                    None,
-                    qo_indptr,
-                )
+        _, _, reduce_ratio_asm, us_pa_kernel_asm, _ = profile_kernel_breakdown(
+            lambda: aiter.pa_fwd_asm(
+                query,
+                k_quant_,
+                v_shuffled,
+                block_tables,
+                seq_lens_kv,
+                block_tables.size(1),
+                max_qlen,
+                k_scale_asm,
+                v_scale_asm,
+                None,
+                qo_indptr,
             )
         )
 
