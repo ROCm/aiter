@@ -80,6 +80,8 @@ struct HkMlaDecodeFwdTraits
     static constexpr int32_t kRoundMode     = 1; // 0: round to nearest even.
                                                  // 1: round to nearest away.
                                                  // 2: round to zero
+    static constexpr uint32_t kNopeLdsRowSz = (kQkNopeHeadDim + 8) * sizeof(kv_t_);
+    static constexpr uint32_t kRopeLdsRowSz = (kQkRopeHeadDim + 8) * sizeof(kv_t_);
 
     static_assert(kBlockM == kQoNumHead, "Only supports nhead=128!");
 
@@ -176,48 +178,51 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
                 : p_kv_indices[kv_indices_base + 3],
         };
 
-        // Load NOPE
-        constexpr int32_t kNumBytesPerThreadNope = T::kBlockN * T::kQkNopeHeadDim / T::kNumThreads;
-        uintptr_t p_lds_warp_nope_base =
-            p_lds_k_nope + warp_idx * kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t);
-#if defined(__gfx950__)
-        constexpr int32_t kNumBytesPerThreadPerRoundNope = kNumBytesPerThreadNope / 2;
-        static_assert(kNumBytesPerThreadPerRoundNope == 16);
-#elif defined(__gfx94__)
-        constexpr int32_t kNumBytesPerThreadPerRoundNope = kNumBytesPerThreadNope / 8;
-        static_assert(kNumBytesPerThreadPerRoundNope == 4);
-#endif
-        constexpr int32_t kNumBytesPerWarpPerRound =
-            kNumBytesPerThreadPerRoundNope * ckt::get_warp_size();
-        const int32_t offset_in_warp = lane_idx * kNumBytesPerThreadPerRoundNope;
+        ///
+        /// Load NoPE from VRAM to LDS directly
+        ///
+
+        constexpr uint32_t kNumBytesPerThrPerRnd =
+            4; // use buffer_load_dword which loads 4B each time.
+        constexpr uint32_t kNumBytesPerWarpPerRnd =
+            kNumBytesPerThrPerRnd * ckt::get_warp_size(); // 4*64=256
+        constexpr uint32_t kNumRndPerRowNope =
+            T::kQkHeadDim * sizeof(kv_t) / kNumBytesPerWarpPerRnd; // 512*1/256=2
+        static_assert(kNumRndPerRowNope == 2);
+
+        /// TODO: replace 512 with 512+8 for swizzle
+        const uintptr_t p_lds_warp_nope = p_lds_k_nope + warp_idx * kNumRowsPerWarp * 512;
+        const uint32_t lane_offset      = lane_idx * kNumBytesPerThrPerRnd;
 
 #pragma unroll
-        for(int32_t rid = 0; rid < kNumRowsPerWarp * T::kQkNopeHeadDim;
-            rid += kNumBytesPerWarpPerRound)
+        for(uint32_t row_idx = 0; row_idx < kNumRowsPerWarp; ++row_idx)
         {
-            const int32_t didx        = rid + lane_idx * kNumBytesPerThreadPerRoundNope;
-            const int32_t row         = rows[didx / T::kQkNopeHeadDim];
-            const int32_t col         = didx % T::kQkNopeHeadDim;
-            uintptr_t p_lds_warp_nope = p_lds_warp_nope_base + rid;
+            const int32_t kv_row_idx = rows[row_idx];
+            /// TODO: replace 512 with 512+8 for swizzle
+            const uintptr_t p_lds_row = p_lds_warp_nope + row_idx * 512 + lane_offset;
 
-            if(kCheckBoundary && (row == -1))
+            if(kCheckBoundary && (kv_row_idx == -1))
             {
-#if defined(__gfx950__)
-                *reinterpret_cast<uint4*>(p_lds_warp_nope + lane_idx * 4 * sizeof(uint32_t)) =
-                    uint4(0);
-#elif defined(__gfx94__)
-                *reinterpret_cast<uint32_t*>(p_lds_warp_nope + lane_idx * sizeof(uint32_t)) = 0u;
-#endif
+                hkm::ds_write_b32(p_lds_row, 0, 0u);
+                hkm::ds_write_b32(p_lds_row, kNumBytesPerWarpPerRnd, 0u);
             }
             else
             {
-                const int32_t voffset_nope = row * T::kQkHeadDim + col;
+                const int32_t col          = lane_idx * 4;
+                const int32_t voffset_nope = kv_row_idx * T::kQkHeadDim + col;
                 hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                    (as3_uint32_ptr)(p_lds_warp_nope),
-                                                    kNumBytesPerThreadPerRoundNope,
+                                                    (as3_uint32_ptr)(p_lds_row),
+                                                    kNumBytesPerThrPerRnd,
                                                     voffset_nope,
                                                     0,
                                                     0,
+                                                    0);
+                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                                    (as3_uint32_ptr)(p_lds_row),
+                                                    kNumBytesPerThrPerRnd,
+                                                    voffset_nope,
+                                                    0,
+                                                    kNumBytesPerWarpPerRnd,
                                                     0);
             }
         }
@@ -717,8 +722,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     // manually load data from VRAM to LDS. On loading LDS to GPR, HK function will be used.
     // constexpr int32_t kSzLdsKNope = T::kBlockN * (T::kQkNopeHeadDim + 1);
     // constexpr int32_t kSzLdsKRope = T::kBlockN * (T::kQkRopeHeadDim + 1);
-    constexpr int32_t kSzLdsKNope = T::kBlockN * T::kQkNopeHeadDim * sizeof(kv_t);
-    constexpr int32_t kSzLdsKRope = T::kBlockN * T::kQkRopeHeadDim * sizeof(kv_t);
+    constexpr int32_t kSzLdsKNope = T::kBlockN * T::kNopeLdsRowSz * sizeof(kv_t);
+    constexpr int32_t kSzLdsKRope = T::kBlockN * T::kRopeLdsRowSz * sizeof(kv_t);
     uintptr_t p_lds_k_nope        = reinterpret_cast<uintptr_t>(p_lds);
     uintptr_t p_lds_k_rope        = p_lds_k_nope + kSzLdsKNope;
 
