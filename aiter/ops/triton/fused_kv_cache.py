@@ -30,7 +30,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     decode_q_pe_out: torch.Tensor = None,
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
@@ -65,7 +65,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
             device=q_nope.device,
         )
 
-    return q_out, decode_q_pe_out, k_pe_out, kv_cache, q_nope_zeros_out
+    return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
 
 @torch_compile_guard(gen_fake=fused_qk_rope_cat_and_cache_mla_fake_tensor)
@@ -87,7 +87,7 @@ def fused_qk_rope_cat_and_cache_mla(
     decode_q_pe_out: torch.Tensor = None,
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
     the concatentaed k_nope and k_pe are copied to kv_cache inplace
@@ -238,7 +238,7 @@ def fused_qk_rope_cat_and_cache_mla(
             dtype=q_nope.dtype,
             device=q_nope.device,
         )
-    return q_out, decode_q_pe_out, k_pe_out, kv_cache, q_nope_zeros_out
+    return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
 
 def fused_qk_rope_reshape_and_cache(
