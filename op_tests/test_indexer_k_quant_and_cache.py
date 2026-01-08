@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
 from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter import dtypes
-from aiter import pertoken_quant, dtypes, indexer_k_quant_and_cache
+from aiter import pertoken_quant, indexer_k_quant_and_cache
 import argparse
 import pandas as pd
 
@@ -113,4 +113,5 @@ for m in args.m:
         ret = test_indexer_k_quant_and_cache(m, block_size, 128, 128)
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("indexer_k_quant_and_cache summary (markdown):\n%s", df_md)

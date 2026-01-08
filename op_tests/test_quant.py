@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from aiter.test_common import (
     checkAllclose,
@@ -141,4 +141,5 @@ for (
             ret = test_quant(m, n, q_type, q_dtype, h_dtype)
             df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("quant summary (markdown):\n%s", df_md)

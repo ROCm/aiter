@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import aiter
 from aiter.test_common import checkAllclose, benchmark, run_perftest, perftest
 from aiter.fused_moe import moe_sorting, fused_topk
-from aiter import get_torch_quant, dtypes
+from aiter import dtypes
 from aiter.utility import fp4_utils
 import pandas as pd
 import itertools
@@ -164,7 +164,8 @@ for dtype in l_dtype:
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage1")
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("moe_sorting_mxfp4_stage1 summary (markdown):\n%s", df_md)
 
 df = []
 for dtype in l_dtype:
@@ -177,4 +178,5 @@ for dtype in l_dtype:
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage2")
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("moe_sorting_mxfp4_stage2 summary (markdown):\n%s", df_md)

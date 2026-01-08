@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include "ck_tile/core.hpp"
@@ -88,6 +88,7 @@ template <typename FlatmmConfig,
           typename ELayout,
           ck_tile::MoeFlatmmKind moe_kind,
           typename CDEElementWise,
+          int ActivationOp,
           typename MoeFlatmmHostArgs>
 void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 {
@@ -234,8 +235,10 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                 ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
+
+        // TODO: support more act type.
         using FusedAct =
-            std::conditional_t<BMXFP4_Pipeline, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
+            std::conditional_t<ActivationOp == 2, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
 
         using Kernel = ck_tile::MoeFlatmmKernel<TilePartitioner,
                                                 CodegenFlatmmPipeline,

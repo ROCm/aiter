@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import triton
@@ -90,7 +90,7 @@ def get_x_vals():
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce):
     block_shape_n, block_shape_k = block_shape
 
-    x_fp8, w_fp8, x_fp8_scale, w_fp8_scale, y_fp8 = (
+    x_fp8, w_fp8, _, x_fp8_scale, _, w_fp8_scale, y_fp8 = (
         generate_gemm_a8w8_blockscale_inputs(
             M,
             N1,

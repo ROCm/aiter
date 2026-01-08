@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include <pybind11/pybind11.h>
@@ -378,6 +378,12 @@ namespace py = pybind11;
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
           py::arg("out"));                                                                     \
+    m.def("reduce_scatter",                                                                    \
+          &aiter::reduce_scatter,                                                              \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"),                                                                      \
+          py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("all_reduce",                                                                        \
           &aiter::all_reduce,                                                                  \
           py::arg("_fa"),                                                                      \
@@ -956,7 +962,9 @@ namespace py = pybind11;
           py::arg("x_scale")        = std::nullopt, \
           py::arg("w_scale")        = std::nullopt, \
           py::arg("exp_bias")       = std::nullopt, \
-          py::arg("block_m")        = 32);                 \
+          py::arg("activation")     = 0,            \
+          py::arg("block_m")        = 32,           \
+          py::arg("split_k")        = 1);                 \
                                                     \
     m.def("cktile_moe_gemm2",                       \
           &cktile_moe_gemm2,                        \
@@ -974,7 +982,9 @@ namespace py = pybind11;
           py::arg("x_scale")        = std::nullopt, \
           py::arg("w_scale")        = std::nullopt, \
           py::arg("exp_bias")       = std::nullopt, \
-          py::arg("block_m")        = 32);
+          py::arg("activation")     = 0,            \
+          py::arg("block_m")        = 32,           \
+          py::arg("split_k")        = 1);
 
 #define MHA_VARLEN_FWD_PYBIND                            \
     m.def("mha_varlen_fwd",                              \
@@ -1031,6 +1041,9 @@ namespace py = pybind11;
           py::arg("out")          = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
+          py::arg("q_descale")    = std::nullopt, \
+          py::arg("k_descale")    = std::nullopt, \
+          py::arg("v_descale")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
@@ -1556,6 +1569,16 @@ namespace py = pybind11;
           py::arg("numRows"),          \
           py::arg("stride0"),          \
           py::arg("stride1"));         \
+      m.def("top_k_per_row_prefill_fast", \
+            &top_k_per_row_prefill_fast,  \
+            py::arg("logits"),       \
+            py::arg("rowStarts"),    \
+            py::arg("rowEnds"),      \
+            py::arg("indices"),      \
+            py::arg("values"),       \
+            py::arg("numRows"),      \
+            py::arg("stride0"),      \
+            py::arg("stride1"));     \
     m.def("top_k_per_row_decode",      \
           &top_k_per_row_decode,       \
           py::arg("logits"),           \

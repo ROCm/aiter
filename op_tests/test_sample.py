@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
 from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter.ops.triton.topk import topk
 from aiter.ops.triton.softmax import softmax
-from aiter import dtypes, greedy_sample, random_sample
+from aiter import dtypes
 import argparse
 
 torch.set_default_device("cuda")
@@ -238,4 +238,5 @@ for test_func in list_sample_func:
                 ret = test_func(m, n, dtype)
                 df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("sample summary (markdown):\n%s", df_md)

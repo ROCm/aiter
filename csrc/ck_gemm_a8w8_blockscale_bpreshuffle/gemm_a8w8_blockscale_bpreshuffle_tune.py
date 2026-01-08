@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import argparse
-import os
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE
@@ -128,7 +125,10 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
                             i,
                             splitK,
                         ),
-                        {},
+                        {
+                            "num_warmup": args.warmup,
+                            "num_iters": args.iters,
+                        },
                         Gemma8W8BlockScaleBPreShuffleTuner.run_torch,
                         (ref_data_idx, None, dtypes.bf16),
                         {},
@@ -163,7 +163,15 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
             tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                mp_num,
+                False,
+                shape_grouped,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
         return ret
 
 

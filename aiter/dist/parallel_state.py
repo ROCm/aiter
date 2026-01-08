@@ -1,8 +1,8 @@
 # Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (C) 2023-2025 The vLLM team.
+# Copyright (C) 2023-2026 The vLLM team.
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
-# Copyright (C) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (C) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 """vLLM distributed state.
 It takes over the control of the distributed environment from PyTorch.
 The typical workflow is:
@@ -151,6 +151,15 @@ if supports_custom_op():
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
         return group._all_gather_out_place(input)
+
+    def outplace_reduce_scatter(
+        input: torch.Tensor, output: torch.Tensor, group_name: str, dim: int
+    ) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._reduce_scatter_out_place(input, output, dim)
 
 
 class GroupCoordinator:
@@ -390,10 +399,39 @@ class GroupCoordinator:
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
         return outplace_all_gather(input_, group_name=self.unique_name)
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+    # didn't support dim in custom reduce_scatter
+    def _reduce_scatter_out_place(
+        self, input_: torch.Tensor, output_: torch.Tensor, dim: int = 0
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.reduce_scatter(input_, dim)
+        return self.device_communicator.reduce_scatter(input_, output_, dim)
+
+    def reduce_scatter_tensor(
+        self, input_: torch.Tensor, use_custom: bool = True, dim: int = 0
+    ):
+        # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
+        world_size = self.world_size
+        assert world_size > 1, "error! world_size = 1"
+        assert (
+            input_.numel() % world_size == 0
+        ), "input shape error, input.numel() % world_size should equals to 0"
+        if input_.shape[0] % world_size == 0:
+            out_dim0 = input_.shape[0] // world_size
+            out_shape = (out_dim0,) + input_.shape[1:]
+        else:
+            out_shape = (input_.numel() // world_size,)
+
+        output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+        if use_custom:
+            outplace_reduce_scatter(
+                input_, output_, group_name=self.unique_name, dim=dim
+            )
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                output_, input_, group=self.device_group
+            )
+        return output_
 
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1

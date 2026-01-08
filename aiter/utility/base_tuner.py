@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import argparse
@@ -8,7 +8,6 @@ import pandas as pd
 
 from abc import abstractmethod
 from aiter import logger
-import traceback
 from operator import itemgetter
 import time
 from aiter import dtypes
@@ -24,6 +23,9 @@ class TunerCommon:
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",  # for all results
+        "timeout": None,  # 100s timeout for per test
+        "warmup": 5,  # 5 warmup iters for profiling
+        "iters": 101,  # 101 run iters for profiling
     }
     dtype2bpe_dict = {
         dtypes.fp16: 2,
@@ -42,7 +44,10 @@ class TunerCommon:
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
     }
-    INVALID_TIME = -1
+    INVALID_TIME = -1  # op not support or error
+
+    INF_TIME = float("inf")  # op time is too large
+    INVLAID_ERR_RATIO = 1.0  # err ratio is too large
 
     def __init__(self, name, key, resultList, description=None):
         self.parser = argparse.ArgumentParser(description=description)
@@ -60,6 +65,8 @@ class TunerCommon:
         self.remain_untuned = pd.DataFrame(columns=self.keys)
         self.sort_keys = key
         self.start_time = 0
+        self.num_warmup = 10
+        self.num_iters = 101
 
     def get_arg_defaults(self):
         """get default arguments"""
@@ -67,6 +74,10 @@ class TunerCommon:
 
     def get_bpe(self, dtype):
         return self.dtype2bpe_dict[dtype]
+
+    def set_run_iters(self, input, indtype):
+        """set warm iters and run iter for profiling"""
+        """suggest warm iters * time1_per_iter > 100us"""
 
     def _setup_common_arguments(self):
         """set common arguments"""
@@ -133,6 +144,24 @@ class TunerCommon:
             default=defaults["profile_file"],
             required=False,
             help="output: all tuning results stored in this file",
+        )
+        self.parser.add_argument(
+            "--warmup",
+            type=int,
+            default=defaults["warmup"],
+            help="warmup iters for profiling",
+        )
+        self.parser.add_argument(
+            "--iters",
+            type=int,
+            default=defaults["iters"],
+            help="run iters for profiling",
+        )
+        self.parser.add_argument(
+            "--timeout",
+            type=int,
+            default=defaults["timeout"],
+            help="timeout for task group",
         )
 
     def parse_args(self):
@@ -210,7 +239,7 @@ class TunerCommon:
     def get_out_file(self, tuned_file):
         """if there are multiple tuned file, then write tuning result to the first file"""
         path_list = tuned_file.split(os.pathsep) if tuned_file else []
-        assert path_list, f"output tuned file is empty"
+        assert path_list, "output tuned file is empty"
         return path_list[0]
 
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
@@ -318,7 +347,6 @@ class TunerCommon:
 
         if fast_mode or topk == -1:
             return rets
-        best_time = -1
         tol_err_ratio = args.errRatio
         from collections import defaultdict
 
@@ -337,7 +365,7 @@ class TunerCommon:
                 for info_ex, us, max_err_ratio in sorted_time
                 if max_err_ratio <= tol_err_ratio
                 and us != self.INVALID_TIME
-                and us != float("inf")
+                and us != self.INF_TIME
             ]
             if len(filtered_time) == 0:
                 logger.error(
@@ -502,7 +530,7 @@ class GemmCommonTuner(TunerCommon):
         ### gemm flops,bw
         info, time, err_ratio = results
         if time == -1:
-            return -1, -1
+            return 0, 0
         cu_num, m, n, k, *rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
@@ -520,7 +548,7 @@ class GemmCommonTuner(TunerCommon):
             keys, kernelId, splitK, kernelName = info
             kernelName = (
                 "None"
-                if time == self.INVALID_TIME
+                if time == self.INVALID_TIME or time == self.INF_TIME
                 else self.getKernelName(kernelId) if kernelName == "" else kernelName
             )
             tflops, bw = self.calculate(el)
@@ -552,14 +580,28 @@ class GemmCommonTuner(TunerCommon):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
         self.failed = pd.concat(
-            [self.failed, resultdf[resultdf["us"] == self.INVALID_TIME]],
+            [
+                self.failed,
+                resultdf[
+                    (resultdf["us"] == self.INVALID_TIME)
+                    | (resultdf["us"] == self.INF_TIME)
+                ],
+            ],
             ignore_index=True,
         )
         self.success = pd.concat(
-            [self.success, resultdf[resultdf["us"] != self.INVALID_TIME]],
+            [
+                self.success,
+                resultdf[
+                    (resultdf["us"] != self.INVALID_TIME)
+                    & (resultdf["us"] != self.INF_TIME)
+                ],
+            ],
             ignore_index=True,
         )
-        update_tunedf = resultdf[resultdf["us"] != self.INVALID_TIME]  # self.success
+        update_tunedf = resultdf[
+            (resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)
+        ]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:
@@ -590,3 +632,11 @@ class GemmCommonTuner(TunerCommon):
             resultdf.loc[i, "bw"] = bw
             resultdf.loc[i, "errRatio"] = 0
         resultdf.to_csv(file, index=False, na_rep="Null")
+
+    def set_run_iters(self, input, inputdtype):
+        cu_num, m, n, k, *rest = input
+        flops = m * n * k * 2
+        if flops < 256 * 5120 * 256 * 2:
+            self.num_warmup = 50
+        elif flops <= 1024 * 5120 * 256 * 2:
+            self.num_warmup = 30

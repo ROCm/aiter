@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import glob
@@ -37,8 +37,8 @@ if __name__ == "__main__":
         "--module",
         required=True,
         help="""module of ASM kernel,
-    e.g.: -m bf16gemm
-""",
+            e.g.: -m bf16gemm
+        """,
     )
     parser.add_argument(
         "-o",

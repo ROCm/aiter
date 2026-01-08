@@ -1,19 +1,13 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
 from typing import Optional
-from aiter import logger
 from ..jit.core import (
     compile_ops,
-    AITER_ROOT_DIR,
 )
-from ..jit.utils.chip_info import get_cu_num
-from ..jit.utils.chip_info import get_gfx
 import functools
-import pandas as pd
-from ..ops.gemm_op_common import get_padded_m
 
 
 def gen_gemm_a16w16_asm_fake_tensors(
@@ -58,6 +52,11 @@ def gemm_a16w16(
     bias: Optional[Tensor] = None,
     splitK: Optional[int] = None,
     kernelName: Optional[str] = None,
+    bpreshuffle: bool = False,
 ):
-    sema = get_semaphore_workspace(out.device)
-    return gemm_a16w16_asm(A, B, out, bias, sema, splitK, kernelName)
+    if splitK > 1:
+        sema = get_semaphore_workspace(out.device)
+    else:
+        sema = torch.empty((0,), dtype=torch.uint32, device=out.device)
+
+    return gemm_a16w16_asm(A, B, out, sema, bias, splitK, kernelName, bpreshuffle)
