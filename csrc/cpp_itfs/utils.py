@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
 import shutil
@@ -60,7 +60,7 @@ LOG_LEVEL = {
     2: logging.INFO,
     3: logging.DEBUG,
 }
-logger.setLevel(LOG_LEVEL[AITER_LOG_MORE])
+logger.setLevel(LOG_LEVEL[2])
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
