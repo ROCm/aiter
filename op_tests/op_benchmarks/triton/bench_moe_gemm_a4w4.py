@@ -246,12 +246,6 @@ def parse_args():
         default=".*moe_gemm.*",
         help="Regex to find perf for specific operation by its kernel name.",
     )
-    parser.add_argument(
-        "--act-dtype",
-        type=str,
-        default="mx4",
-        help="Activation dtype, fp4 or mx4.",
-    )
     args = parser.parse_args()
     return args
 
@@ -271,7 +265,7 @@ if __name__ == "__main__":
         (4096, 8200, 4096),
     ]
     batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
-    quantized_dtypes = [args.act_dtype, "mx4"]
+    quantized_dtypes = ["mx4", "mx4"]
 
     roofline_mlp(
         batch_sizes_moe,
