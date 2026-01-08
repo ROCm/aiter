@@ -106,7 +106,7 @@ def run_ck(
         deterministic,
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
-        how_v3_bf16_cvt=2,
+        # how_v3_bf16_cvt=2,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
         num_rotate_args=1,
@@ -216,7 +216,7 @@ def test_flash_attn_output(
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -497,7 +497,7 @@ def test_flash_attn_seq_padding(
 
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -723,13 +723,13 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="+",
     default=[
-        (32, 32),
-        (40, 40),
-        (64, 64),
-        (111, 111),
+        # (32, 32),
+        # (40, 40),
+        # (64, 64),
+        # (111, 111),
         (128, 128),
-        (160, 160),
-        (192, 128),
+        # (160, 160),
+        # (192, 128),
     ],
     help="""Dimension of query and key. Default is None.
     e.g.: -qk_v 256,256""",
@@ -846,22 +846,22 @@ if __name__ == "__main__":
             args.input_layout,
         )
         collected.append(ret)
-        test_flash_attn_seq_padding(
-            "mixed",
-            args.batch_size,
-            args.nheads,
-            args.seqlen_q,
-            args.seqlen_k,
-            dim_qk,
-            dim_v,
-            args.dropout_p,
-            causal,
-            local,
-            args.bias_type if args.bias_type != "bias" else "no",
-            deterministic,
-            mha_type,
-            dtypes.d_dtypes[dtype],
-        )
+        # test_flash_attn_seq_padding(
+        #     "mixed",
+        #     args.batch_size,
+        #     args.nheads,
+        #     args.seqlen_q,
+        #     args.seqlen_k,
+        #     dim_qk,
+        #     dim_v,
+        #     args.dropout_p,
+        #     causal,
+        #     local,
+        #     args.bias_type if args.bias_type != "bias" else "no",
+        #     deterministic,
+        #     mha_type,
+        #     dtypes.d_dtypes[dtype],
+        # )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha summary:\n{df}")

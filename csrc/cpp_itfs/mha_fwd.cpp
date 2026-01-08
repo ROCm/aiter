@@ -5,6 +5,7 @@
 #endif
 #include <memory>
 #include <string>
+#include <mutex>
 
 namespace aiter {
 #if FAV3_ON
@@ -148,7 +149,15 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
         {
             args.ptr_qseq = a.seqstart_q_ptr;
         }
-    }
+    }    
+    std::cout << "memin args.s_seq_len:" << args.s_seq_len << " args.s_Seqs:" << args.s_Seqs << " args.s_Ts:" << args.s_Ts <<
+                " args.s_Hs:" << args.s_Hs << " args.s_Bs:" << args.s_Bs << " args.s_gqa: " << args.s_gqa << 
+                " args.s_k_Seqs:" << args.s_k_Seqs << " args.s_k_Hs:" << args.s_k_Hs << " args.s_k_Bs:" << args.s_k_Bs <<
+                " args.s_opt:" << args.s_opt << " args.s_lse:" << args.s_lse << "args.s_kv_seq_len:" << args.s_kv_seq_len << 
+                " args.s_qk_head_dim: " << args.s_qk_head_dim << " args.s_v_head_dim:" << args.s_v_head_dim << 
+                " args.s_q_head_num:" << args.s_q_head_num << " args.s_v_Seqs:" << args.s_v_Seqs << " args.s_v_Hs:" << args.s_v_Hs <<
+                " args.s_v_Bs:" << args.s_v_Bs << " args.s_o_Seqs:" << args.s_o_Seqs << " args.s_o_Hs:" << args.s_o_Hs <<
+                " args.s_o_Bs:" << args.s_o_Bs << " args.s_lse_Hs:" << args.s_lse_Hs << std::endl;
 }
 
 std::tuple<int, int, int> get_grid_dim(const mha_fwd_args& a, int ts_qo, const std::string& arch_id)
@@ -216,16 +225,22 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     AiterAsmKernel* impl_ptr = nullptr;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static std::mutex impl_ptr_map_mutex;
+
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
-
-    auto result = impl_ptr_map.emplace(name, nullptr);
-    if(result.second)
     {
-        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
+        std::lock_guard<std::mutex> lock(impl_ptr_map_mutex);
+        auto result = impl_ptr_map.emplace(name, nullptr);
+        if(result.second)
+        {
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
+        }
+        impl_ptr = result.first->second.get();
     }
-    impl_ptr = result.first->second.get();
+    
+    // static thread_local AiterAsmKernel impl_ptr(name, co_name.c_str());
     fmha_fwd_v3_args args;
     int arg_size = sizeof(args);
     init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
@@ -233,6 +248,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     auto fwd_kernel_launch = [&]() {
         int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
         auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
+        std::cout << "memin impl_ptr->launch_kernel start!! impl_ptr ptr is" << impl_ptr <<". bdx:" << bdx << ", gdx: " << gdx << ",gdy:" << gdy << ",gdz:" << gdz << std::endl;
         impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
     };
     return ck_tile::launch_kernel(s,
