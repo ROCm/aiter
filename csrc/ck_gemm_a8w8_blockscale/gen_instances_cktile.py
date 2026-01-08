@@ -221,7 +221,8 @@ torch::Tensor
 """
 
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_manifest.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_manifest.h"),
+            "w",
         ) as f:
             f.write(MAINFEST_head)
             for _, k in kernels_dict.items():

@@ -68,9 +68,7 @@ def run_ck_gemm_a8w8_blockscale_tile(
     )
 
 
-def run_ck_gemm_a8w8_blockscale(
-    x, weight, x_scale, w_scale, out, kernel_id, splitK
-):
+def run_ck_gemm_a8w8_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
     """
     Run gemm a8w8 blockscale tuned kernel for ck type.
     """
