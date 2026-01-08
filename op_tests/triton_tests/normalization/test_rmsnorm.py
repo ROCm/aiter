@@ -5,7 +5,7 @@ import pytest
 import torch
 import aiter
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.triton.rmsnorm import (
+from aiter.ops.triton.normalization.rmsnorm import (
     rms_norm,
     rmsnorm2d_fwd_with_add,
     rmsnorm2d_fwd_with_smoothquant,
@@ -13,8 +13,6 @@ from aiter.ops.triton.rmsnorm import (
     rmsnorm2d_fwd_with_add_smoothquant,
     rmsnorm2d_fwd_with_add_dynamicquant,
 )
-
-import time
 
 
 def generate_rmsnorm_inputs(M, N, dtype):
