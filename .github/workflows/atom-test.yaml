@@ -32,6 +32,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_atom_image:
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: check-signal
     runs-on: aiter-k8s-build
     steps:
@@ -59,9 +60,11 @@ jobs:
 
       - name: Push the ATOM test image
         run: |
+          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           docker push rocm/aiter-ci:atom-test-${{ env.GITHUB_COMMIT_SHA }}
 
-  atom:
+  atom_benchmark:
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: build_atom_image
     runs-on: aiter-8gpu-runner
     strategy:
@@ -87,6 +90,7 @@ jobs:
 
       - name: Download the ATOM test image
         run: |
+          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           docker pull rocm/aiter-ci:atom-test-${{ env.GITHUB_COMMIT_SHA }}
         
       - name: Start CI container
@@ -182,3 +186,10 @@ jobs:
         run: |
           docker stop atom_test || true
           docker rm atom_test || true
+
+  skip-job:
+    if: ${{ github.event.pull_request.head.repo.fork }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip reason
+        run: echo "It's a fork repository, skipping tests."
