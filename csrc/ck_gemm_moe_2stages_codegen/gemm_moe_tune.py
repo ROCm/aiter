@@ -1315,7 +1315,6 @@ class FmoeTuner(TunerCommon):
                 quantDtype_1stage = "pertoken" + quantDtype
             return quantDtype_1stage, extraInfo_1stage
 
-
     def gen_1stage_asm_task(self, key):
         task_1stage = []
         info = key

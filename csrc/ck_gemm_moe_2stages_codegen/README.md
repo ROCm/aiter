@@ -12,7 +12,7 @@
 
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build moe 2-stages kernels via jit:
-`python3 csrc/ck_gemm_moe_2stages_codegen/tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv`
+`python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv`
 You can find the results of this tuning in `aiter/configs/tuned_fmoe.csv`, like this:
     |**cu_num**|**token**|**model_dim**|**inter_dim**|**expert**|**topk**|**act_type**|**dtype**|**q_dtype_a**|**q_dtype_w**|**q_type**|**use_g1u1**|**doweight_stage1**|**block_m**|**ksplit**|**us1**|**kernelName1**|**err1**|**us2**|**kernelName2**|**err2**|**us**|**run_1stage**|**tflops**|**bw**|
     |----------|---------|-------------|-------------|----------|--------|------------|---------|-------------|-------------|----------|------------|-------------------|-----------|----------|-------|---------------|--------|-------|---------------|--------|------|--------------|----------|------|
@@ -27,17 +27,119 @@ Test the performance, modify the test instance in `op_tests/test_moe.py` or `pyt
 If you have built moe kernels before tuning new MoE shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_moe.py`. It will rebuild kernels from `AITER_CONFIG_FMOE`, the default one will be results merged from `aiter/configs/tuned_fmoe.csv` and tuned fmoe csv under `aiter/configs/model_configs/xx_tuned_fmoe_xx.csv`, the merged result is store in `/tmp/aiter_configs/tuned_fmoe.csv`.
 
 ## More Options
-- Use `--last` flag to only tune the last kernel in the CSV file:
-  `python3 csrc/ck_gemm_moe_2stages_codegen/tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv --last`
-  
-- Use `--profile_file` to save all profiling results for analysis:
-  `python3 csrc/ck_gemm_moe_2stages_codegen/tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv --profile_file aiter/configs/profile_fmoe_all.csv`
 
-- Adjust error ratio threshold with `--errRatio` (default: 0.5):
-  `python3 csrc/ck_gemm_moe_2stages_codegen/tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv --errRatio 0.01`
+### Tuning Scope
 
-- Set number of parallel processes with `--mp` (default: number of GPU):
-  `python3 csrc/ck_gemm_moe_2stages_codegen/tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv --mp 8`
+#### `--last`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: Only tune the last kernel in the CSV file. Useful for quickly testing newly added shapes.
+
+**Example**:
+```bash
+--last
+```
+
+### Output Configuration
+
+#### `-o2, --profile_file`
+- **Type**: String
+- **Default**: `""` (empty string)
+- **Description**: Optional output file to store **all** tuning results (not just the best ones). Useful for profiling and analyzing all kernel candidates.
+
+**Example**:
+```bash
+--profile_file aiter/configs/profile_fmoe_all.csv
+```
+
+### Tuning Configuration
+
+#### `--errRatio`
+- **Type**: Float
+- **Default**: `0.5` (50%)
+- **Description**: Tolerable error ratio threshold. Only kernels with error ratios below this threshold will be considered valid candidates.
+
+**Example**:
+```bash
+--errRatio 0.01
+```
+
+#### `--mp`
+- **Type**: Integer
+- **Default**: Number of available GPUs
+- **Description**: Number of parallel processes to use for tuning across multiple GPUs.
+
+**Example**:
+```bash
+--mp 8
+```
+
+#### `--batch`
+- **Type**: Integer
+- **Default**: `100`
+- **Description**: Number of shapes to tune in each batch.
+
+**Example**:
+```bash
+--batch 50
+```
+
+#### `--all`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: Retune all shapes based on file relationship.
+- If `tune_file` == `untune_file`: Retune all shapes in the tune file
+- If `tune_file` != `untune_file`: Retune shapes that exist in untuned file
+
+
+**Example**:
+```bash
+--all
+```
+
+### Profiling Configuration
+
+#### `--warmup`
+- **Type**: Integer
+- **Default**: `5`
+- **Description**: Number of warmup iterations before profiling.
+
+**Example**:
+```bash
+--warmup 10
+```
+
+#### `--iters`
+- **Type**: Integer
+- **Default**: `101`
+- **Description**: Number of profiling iterations to run for performance measurement.
+
+**Example**:
+```bash
+--iters 200
+```
+
+#### `--timeout`
+- **Type**: Integer
+- **Default**: `None`
+- **Description**: Timeout in seconds for each task group.
+
+**Example**:
+```bash
+--timeout 300
+```
+
+### Debugging and Verbose Output
+
+#### `-v, --verbose`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: Enable verbose output with detailed logging information.
+
+**Example**:
+```bash
+-v
+```
 
 ## Notes
 - This tuner supports both 1-stage fused MoE kernels and 2-stages MoE kernels (stage1 and stage2)
