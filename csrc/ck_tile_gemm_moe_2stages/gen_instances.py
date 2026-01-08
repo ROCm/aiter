@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import argparse
 from pathlib import Path
@@ -229,7 +229,7 @@ template torch::Tensor
                 name=name, dtypes=f"{a_type}, {b_type}, {acc_type}, {c_type}"
             )
             if "fp4" in b_type:
-                body = "#if defined(__gfx950__)\n" + body + "\n#endif\n"
+                body = "#if defined(__Float4_e2m1fn_x2)\n" + body + "\n#endif\n"
             Path(
                 os.path.join(
                     self.instances_path,
