@@ -687,7 +687,7 @@ def test_pa_mtp(
         )
 
         # Profile kernel breakdown for PA ASM (no reduce kernel)
-        _, pa_ratio_asm, reduce_ratio_asm, us_pa_kernel_asm, _ = (
+        _, _, reduce_ratio_asm, us_pa_kernel_asm, _ = (
             profile_kernel_breakdown(
                 lambda: aiter.pa_fwd_asm(
                     query,
@@ -721,7 +721,7 @@ def test_pa_mtp(
             seq_lens=seq_lens_kv.tolist(),
             pa_ratio1=pa_ratio_ps,
             reduce_ratio1=reduce_ratio_ps,
-            pa_ratio2=pa_ratio_asm,
+            pa_ratio2=1,
             reduce_ratio2=reduce_ratio_asm,
             us_metadata=us_metadata,
             us_pa1=us_pa_kernel_ps,
@@ -740,9 +740,9 @@ def test_pa_mtp(
         ret["reduce_ratio_ps"] = reduce_ratio_ps
         ret["us_pa_kernel_ps"] = us_pa_kernel_ps
         ret["us_reduce_kernel_ps"] = us_reduce_kernel_ps
-        ret["pa_ratio_asm"] = pa_ratio_asm
-        ret["reduce_ratio_asm"] = reduce_ratio_asm
-        ret["us_pa_kernel_asm"] = us_pa_kernel_asm
+        # ret["pa_ratio_asm"] = pa_ratio_asm
+        # ret["reduce_ratio_asm"] = reduce_ratio_asm
+        # ret["us_pa_kernel_asm"] = us_pa_kernel_asm
         # ret["us_reduce_kernel_asm"] = us_reduce_kernel_asm
         ret["err fp8"] = err
     else:
