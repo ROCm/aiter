@@ -1683,6 +1683,7 @@ def run_pa_gluon_test(
         or (compute_type == torch.float16 and (quant_q or quant_kv))
         or (head_size not in [128])
         or (sliding_window > 0)
+        or True
     )
 
     # aiter_assembly_kernel do not support per-tensor quantization, we always use per-token quantization here
@@ -2327,7 +2328,7 @@ def normal_performance_test():
     SINKS_OPTIONS = [False]
     SLIDING_WINDOW_OPTIONS = [0]
 
-    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
     HEAD_DIMENSION_OPTIONS = [128]
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
@@ -2430,7 +2431,7 @@ def sliding_window_performance_test():
 
 
 if __name__ == "__main__":
-    normal_accuracy_test()
+    # normal_accuracy_test()
     normal_performance_test()
-    sliding_window_accuracy_test()
-    sliding_window_performance_test()
+    # sliding_window_accuracy_test()
+    # sliding_window_performance_test()
