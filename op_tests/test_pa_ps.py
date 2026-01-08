@@ -309,7 +309,7 @@ def asm_V_shuffle(VC):
     return VC
 
 
-def profile_kernel_breakdown(func, num_iters=10, num_warmup=3):
+def profile_kernel_breakdown(func, num_iters=100, num_warmup=10):
     """
     Profile a function and extract PA kernel and reduce kernel time breakdown.
     """
@@ -325,6 +325,7 @@ def profile_kernel_breakdown(func, num_iters=10, num_warmup=3):
         for _ in range(num_iters):
             func()
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     # Analyze kernel times
     pa_time = 0.0
@@ -344,8 +345,10 @@ def profile_kernel_breakdown(func, num_iters=10, num_warmup=3):
     avg_total = total_time / num_iters if num_iters > 0 else 0
     pa_ratio = pa_time / total_time if total_time > 0 else 0
     reduce_ratio = reduce_time / total_time if total_time > 0 else 0
+    avg_pa_time = pa_time / num_iters if num_iters > 0 else 0
+    avg_reduce_time = reduce_time / num_iters if num_iters > 0 else 0
 
-    return avg_total, pa_ratio, reduce_ratio
+    return avg_total, pa_ratio, reduce_ratio, avg_pa_time, avg_reduce_time
 
 
 def print_performance_comparison(
@@ -358,34 +361,47 @@ def print_performance_comparison(
     reduce_ratio1=None,
     pa_ratio2=None,
     reduce_ratio2=None,
+    us_metadata=None,
+    us_pa1=None,
+    us_reduce1=None,
+    us_pa2=None,
+    us_reduce2=None,
 ):
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 120)
     print("PERFORMANCE COMPARISON")
-    print("=" * 100)
+    print("=" * 120)
 
     if seq_lens is not None:
         print(f"Sequence Lengths: {seq_lens[0]}")
-        print("-" * 100)
+        print("-" * 120)
+
+    if us_metadata is not None:
+        print(f"{'Metadata (get_pa_metadata_v1)':<35} {us_metadata:>11.2f}us")
+        print("-" * 120)
 
     if pa_ratio1 is not None:
-        print(f"{'Method':<35} {'Time (us)':>12} {'PA Kernel':>12} {'Reduce':>12}")
-        print("-" * 100)
         print(
-            f"{name1:<35} {us1:>11.2f}us {pa_ratio1*100:>10.1f}% {reduce_ratio1*100:>10.1f}%"
+            f"{'Method':<35} {'Time (us)':>12} {'PA Kernel':>20} {'Reduce':>20}"
         )
-        print(
-            f"{name2:<35} {us2:>11.2f}us {pa_ratio2*100:>10.1f}% {reduce_ratio2*100:>10.1f}%"
-        )
+        print("-" * 120)
+        # Method 1 with time breakdown
+        pa_str1 = f"{us_pa1:>8.2f}us ({pa_ratio1*100:>5.1f}%)" if us_pa1 is not None else f"{pa_ratio1*100:>10.1f}%"
+        reduce_str1 = f"{us_reduce1:>8.2f}us ({reduce_ratio1*100:>5.1f}%)" if us_reduce1 is not None else f"{reduce_ratio1*100:>10.1f}%"
+        print(f"{name1:<35} {us1:>11.2f}us {pa_str1:>20} {reduce_str1:>20}")
+        # Method 2 with time breakdown
+        pa_str2 = f"{us_pa2:>8.2f}us ({pa_ratio2*100:>5.1f}%)" if us_pa2 is not None else f"{pa_ratio2*100:>10.1f}%"
+        reduce_str2 = f"{us_reduce2:>8.2f}us ({reduce_ratio2*100:>5.1f}%)" if us_reduce2 is not None else f"{reduce_ratio2*100:>10.1f}%"
+        print(f"{name2:<35} {us2:>11.2f}us {pa_str2:>20} {reduce_str2:>20}")
     else:
         print(f"{'Method':<35} {'Time (us)':>15}")
-        print("-" * 100)
+        print("-" * 120)
         print(f"{name1:<35} {us1:>14.2f}us")
         print(f"{name2:<35} {us2:>14.2f}us")
 
-    print("-" * 100)
+    print("-" * 120)
     speedup = us2 / us1 if us1 > 0 else 0
     print(f"{'Speedup':<35} {speedup:>14.2f}x")
-    print("=" * 100 + "\n")
+    print("=" * 120 + "\n")
 
 
 @benchmark()
@@ -537,6 +553,7 @@ def test_pa_mtp(
         "reduce_partial_map": reduce_partial_map,
     }
 
+    us_metadata = 0.0
     if load_metadata:
         for name, meta in metadata_map.items():
             file_name = f"{name}.bin"
@@ -546,6 +563,10 @@ def test_pa_mtp(
             torch.set_printoptions(threshold=999999, linewidth=120)
             print(f"==>load {name} from {file_name}:\n{meta}")
     else:
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
         aiter.get_pa_metadata_v1(
             qo_indptr,
             kv_indptr,
@@ -566,6 +587,9 @@ def test_pa_mtp(
             fast_mode=True,
             max_split_per_batch=-1,
         )
+        end_event.record()
+        end_event.synchronize()
+        us_metadata = start_event.elapsed_time(end_event) * 1000  # ms to us
 
     if dump_metadata:
         for name, meta in metadata_map.items():
@@ -616,7 +640,7 @@ def test_pa_mtp(
         )
 
         # Profile kernel breakdown for PA PS
-        _, pa_ratio_ps, reduce_ratio_ps = profile_kernel_breakdown(
+        _, pa_ratio_ps, reduce_ratio_ps, us_pa_kernel_ps, us_reduce_kernel_ps = profile_kernel_breakdown(
             lambda: aiter.pa_persistent_fwd(
                 Q=query,
                 K=k_quant_,
@@ -640,7 +664,7 @@ def test_pa_mtp(
         )
 
         # Profile kernel breakdown for PA ASM (no reduce kernel)
-        _, pa_ratio_asm, reduce_ratio_asm = profile_kernel_breakdown(
+        _, pa_ratio_asm, reduce_ratio_asm, us_pa_kernel_asm, us_reduce_kernel_asm = profile_kernel_breakdown(
             lambda: aiter.pa_fwd_asm(
                 query,
                 k_quant_,
@@ -674,16 +698,26 @@ def test_pa_mtp(
             reduce_ratio1=reduce_ratio_ps,
             pa_ratio2=pa_ratio_asm,
             reduce_ratio2=reduce_ratio_asm,
+            us_metadata=us_metadata,
+            us_pa1=us_pa_kernel_ps,
+            us_reduce1=us_reduce_kernel_ps,
+            us_pa2=us_pa_kernel_asm,
+            us_reduce2=us_reduce_kernel_asm,
         )
 
         # Store results
+        ret["us_metadata"] = us_metadata
         ret["us_pa_ps"] = us_pa_ps
         ret["us_pa_asm"] = us_pa_asm
         ret["speedup"] = us_pa_asm / us_pa_ps if us_pa_ps > 0 else 0
         ret["pa_ratio_ps"] = pa_ratio_ps
         ret["reduce_ratio_ps"] = reduce_ratio_ps
+        ret["us_pa_kernel_ps"] = us_pa_kernel_ps
+        ret["us_reduce_kernel_ps"] = us_reduce_kernel_ps
         ret["pa_ratio_asm"] = pa_ratio_asm
         ret["reduce_ratio_asm"] = reduce_ratio_asm
+        ret["us_pa_kernel_asm"] = us_pa_kernel_asm
+        ret["us_reduce_kernel_asm"] = us_reduce_kernel_asm
         ret["err fp8"] = err
     else:
         out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
@@ -739,6 +773,7 @@ def test_pa_mtp(
         #     f"Speedup: {us_asm_noquant / us_aiter_asm if us_aiter_asm > 0 else 0:.2f}x"
         # )
 
+        ret["us_metadata"] = us_metadata
         ret["us_asm_fp8"] = us_aiter_asm
         ret["err fp8"] = err
 
