@@ -9,7 +9,7 @@ import torch
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
-from aiter.ops.triton.moe_op_gemm_a4w4 import (
+from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
