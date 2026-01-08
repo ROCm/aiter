@@ -792,9 +792,7 @@ def main_logic(args: argparse.Namespace) -> int:
 def main() -> int:
     start_timestamp = time.perf_counter()
     args = parse_args()
-    logging.basicConfig(
-        format="%(asctime)s|%(levelname)s|%(message)s", level=args.log_level
-    )
+    logging.basicConfig(format="%(levelname)s|%(message)s", level=args.log_level)
     exit_code = main_logic(args)
     end_timestamp = time.perf_counter()
     elapsed_time_s = end_timestamp - start_timestamp
