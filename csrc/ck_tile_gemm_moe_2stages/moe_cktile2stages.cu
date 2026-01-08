@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages_common.cuh"
 #include "moe_cktile2stages_lookup.h"
 #include "moe_cktile2stages_manifest_common.h"
@@ -345,7 +345,7 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         // }
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock, 0, has_bias, k_batch)(
+            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
                 XQ,
                 WQ,
                 Y,
