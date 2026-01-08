@@ -6,6 +6,8 @@ from torch import Tensor
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter.utility.dtypes import get_dtype_fp8
+from aiter.utility import dtypes
+import argparse
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -278,44 +280,122 @@ def test_qk_norm_rope_cache_quant(
     checkAllclose(v_scale_ref, v_scale, msg="v_scale", rtol=1e-2, atol=0.05)
 
 
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-n",
+    "--is_neox_styles",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    e.g.: -n true   # for Neox-style
+          or -n false # for GPT-J-style""",
+)
+parser.add_argument(
+    "-t",
+    "--token",
+    type=int,
+    nargs="*",
+    default=[513, 1257, 127, 778, 1024, 3, 1],
+    help="""Number of tokens.
+    e.g.: -t 513""",
+)
+parser.add_argument(
+    "-hd",
+    "--head",
+    type=dtypes.str2tuple,
+    nargs="*",
+    default=[(32, 4), (64, 8), (4, 1)],
+    help="""Number of heads.
+    e.g.: -hd 32,4""",
+)
+parser.add_argument(
+    "-hs",
+    "--head_sizes",
+    type=int,
+    nargs="*",
+    default=[64, 128, 256],
+    help="""Head size.
+    e.g.: -hs 64""",
+)
+parser.add_argument(
+    "-m",
+    "--max_positions",
+    type=int,
+    default=10000,
+    help="""Max Positions.
+    e.g.: -m 10000""",
+)
+parser.add_argument(
+    "-b",
+    "--num_blocks",
+    type=int,
+    default=1000,
+    help="""Number of blocks.
+    e.g.: -b 1000""",
+)
+parser.add_argument(
+    "-p",
+    "--page_size",
+    type=int,
+    default=16,
+    help="""Page size.
+    e.g.: -p 16""",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=dtypes.str2Dtype,
+    default="bf16",
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-kvd",
+    "--kv_cache_dtypes",
+    type=str,
+    nargs="*",
+    choices=["fp8_e4m3", "auto"],
+    default=["fp8_e4m3", "auto"],
+    help="""KV cache data type.
+    e.g.: -kvd fp8_e4m3""",
+)
+
 if __name__ == "__main__":
+    args = parser.parse_args()
+    max_positions = args.max_positions
     # rope
-    is_neox_styles = [False, True]
-    num_tokens = [513, 1257, 127, 778, 1024, 3, 1]
-    num_heads = [(32, 4), (64, 8), (4, 1)]
-    head_sizes = [64, 128, 256]
-    max_positions = 10000
-    num_blocks = 1000
-    page_size = 16
-    kv_cache_dtypes = ["fp8_e4m3", "auto"]
-    dtype = torch.bfloat16
-    for is_neox_style in is_neox_styles:
-        for num_token in num_tokens:
-            for num_head, num_kv_head in num_heads:
+    for is_neox_style in args.is_neox_styles:
+        for num_token in args.token:
+            for num_head, num_kv_head in args.head:
                 k_scale = torch.zeros(
-                    [num_blocks, num_kv_head, page_size],
+                    [args.num_blocks, num_kv_head, args.page_size],
                     dtype=torch.float32,
                     device="cuda",
                 )
                 v_scale = torch.zeros(
-                    [num_blocks, num_kv_head, page_size],
+                    [args.num_blocks, num_kv_head, args.page_size],
                     dtype=torch.float32,
                     device="cuda",
                 )
-                for i, head_size in enumerate(head_sizes):
-                    for kv_cache_dtype in kv_cache_dtypes:
+                for i, head_size in enumerate(args.head_sizes):
+                    for kv_cache_dtype in args.kv_cache_dtypes:
                         if kv_cache_dtype == "fp8_e4m3":
                             cache_dtype = get_dtype_fp8()
                         else:
-                            cache_dtype = dtype
+                            cache_dtype = args.dtype
                         k_cache = torch.randn(
-                            [num_blocks, page_size, num_kv_head, head_size],
-                            dtype=dtype,
+                            [args.num_blocks, args.page_size, num_kv_head, head_size],
+                            dtype=args.dtype,
                             device="cuda",
                         ).to(cache_dtype)
                         v_cache = torch.randn(
-                            [num_blocks, page_size, num_kv_head, head_size],
-                            dtype=dtype,
+                            [args.num_blocks, args.page_size, num_kv_head, head_size],
+                            dtype=args.dtype,
                             device="cuda",
                         ).to(cache_dtype)
                         slot_mapping = torch.randperm(
@@ -324,7 +404,13 @@ if __name__ == "__main__":
                         x = 16 // k_cache.element_size()
                         k_cache = (
                             k_cache.view(
-                                [num_blocks, page_size, num_kv_head, head_size // x, x]
+                                [
+                                    args.num_blocks,
+                                    args.page_size,
+                                    num_kv_head,
+                                    head_size // x,
+                                    x,
+                                ]
                             )
                             .permute(0, 2, 3, 1, 4)
                             .contiguous()
@@ -332,7 +418,7 @@ if __name__ == "__main__":
                         v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
 
                         test_qk_norm_rope_cache_quant(
-                            dtype,
+                            args.dtype,
                             num_token,
                             num_head,
                             num_kv_head,

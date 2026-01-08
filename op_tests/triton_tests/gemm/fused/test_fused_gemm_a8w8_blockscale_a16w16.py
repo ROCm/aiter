@@ -4,7 +4,7 @@
 import torch
 import triton
 import pytest
-from aiter.ops.triton.fused_gemm_a8w8_blockscale_a16w16 import (
+from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     fused_gemm_a8w8_blockscale_a16w16,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
@@ -90,7 +90,7 @@ def get_x_vals():
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce):
     block_shape_n, block_shape_k = block_shape
 
-    x_fp8, w_fp8, x_fp8_scale, w_fp8_scale, y_fp8 = (
+    x_fp8, w_fp8, _, x_fp8_scale, _, w_fp8_scale, y_fp8 = (
         generate_gemm_a8w8_blockscale_inputs(
             M,
             N1,

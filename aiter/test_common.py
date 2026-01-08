@@ -98,6 +98,7 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+            avg = get_trace_perf(prof, num_iters)
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -113,7 +114,6 @@ def perftest(
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
 
-            avg = get_trace_perf(prof, num_iters)
             return data, avg
 
         return wrapper
