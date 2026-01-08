@@ -132,7 +132,12 @@ jobs:
 
       - name: Check shm size
         run: |
+          df -h /dev/shm
           docker exec atom_test df -h /dev/shm
+    
+      - name: Check version
+        run: |
+          docker exec atom_test bash -lc "pip show amd-aiter atom && pip list"
 
       - name: Run ATOM simple inference
         timeout-minutes: 30
