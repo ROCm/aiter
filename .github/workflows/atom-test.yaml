@@ -126,7 +126,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom_test \
-          atom_test:ci
+          rocm/aiter-ci:atom-test-${{ env.GITHUB_COMMIT_SHA }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
