@@ -519,48 +519,48 @@ namespace py = pybind11;
           py::arg("Out"),           \
           py::arg("splitK") = 0);
 
-#define GEMM_A8W8_BLOCKSCALE_PYBIND_LEGACY \
-    m.def("gemm_a8w8_blockscale_legacy",   \
-          &gemm_a8w8_blockscale_legacy,    \
-          "fp8 blockscale gemm legacy",    \
+#define GEMM_A8W8_BLOCKSCALE_PYBIND \
+    m.def("gemm_a8w8_blockscale",   \
+          &gemm_a8w8_blockscale,    \
+          "fp8 blockscale gemm",    \
           py::arg("XQ"),            \
           py::arg("WQ"),            \
           py::arg("x_scale"),       \
           py::arg("w_scale"),       \
-          py::arg("Out")); 
+          py::arg("Out"));
 
-#define GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND_LEGACY                                \
-    m.def("gemm_a8w8_blockscale_tune_legacy",                                  \
-          &gemm_a8w8_blockscale_tune_legacy,                                   \
-          "gemm_a8w8_blockscale_tune_legacy",                                  \
-          py::arg("XQ"),                                                \
-          py::arg("WQ"),                                                \
-          py::arg("x_scale"),                                           \
-          py::arg("w_scale"),                                           \
-          py::arg("Out"),                                               \
-          py::arg("kernelId") = 0,                                      \
+#define GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND \
+    m.def("gemm_a8w8_blockscale_tune",   \
+          &gemm_a8w8_blockscale_tune,    \
+          "gemm_a8w8_blockscale_tune",   \
+          py::arg("XQ"),                 \
+          py::arg("WQ"),                 \
+          py::arg("x_scale"),            \
+          py::arg("w_scale"),            \
+          py::arg("Out"),                \
+          py::arg("kernelId") = 0,       \
           py::arg("splitK")   = 0);
 
-#define GEMM_A8W8_BLOCKSCALE_PYBIND_TILE \
-    m.def("gemm_a8w8_blockscale_tile",   \
-          &gemm_a8w8_blockscale_tile,    \
-          "fp8 blockscale gemm tile",    \
-          py::arg("XQ"),            \
-          py::arg("WQ"),            \
-          py::arg("x_scale"),       \
-          py::arg("w_scale"),       \
-          py::arg("Out")); 
+#define GEMM_A8W8_BLOCKSCALE_CKTILE_PYBIND \
+    m.def("gemm_a8w8_blockscale_cktile",   \
+          &gemm_a8w8_blockscale_cktile,    \
+          "fp8 blockscale gemm cktile",    \
+          py::arg("XQ"),                   \
+          py::arg("WQ"),                   \
+          py::arg("x_scale"),              \
+          py::arg("w_scale"),              \
+          py::arg("Out"));
 
-#define GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND_TILE                                \
-    m.def("gemm_a8w8_blockscale_tune_tile",                                  \
-          &gemm_a8w8_blockscale_tune_tile,                                   \
-          "gemm_a8w8_blockscale_tune_tile",                                  \
-          py::arg("XQ"),                                                \
-          py::arg("WQ"),                                                \
-          py::arg("x_scale"),                                           \
-          py::arg("w_scale"),                                           \
-          py::arg("Out"),                                               \
-          py::arg("kernelId") = 0,                                      \
+#define GEMM_A8W8_BLOCKSCALE_CKTILE_TUNE_PYBIND \
+    m.def("gemm_a8w8_blockscale_cktile_tune",   \
+          &gemm_a8w8_blockscale_cktile_tune,    \
+          "gemm_a8w8_blockscale_cktile_tune",   \
+          py::arg("XQ"),                        \
+          py::arg("WQ"),                        \
+          py::arg("x_scale"),                   \
+          py::arg("w_scale"),                   \
+          py::arg("Out"),                       \
+          py::arg("kernelId") = 0,              \
           py::arg("splitK")   = 0);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
@@ -1576,44 +1576,44 @@ namespace py = pybind11;
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
-#define TOP_K_PER_ROW_PYBIND           \
-    m.def("top_k_per_row_prefill",     \
-          &top_k_per_row_prefill,      \
-          py::arg("logits"),           \
-          py::arg("rowStarts"),        \
-          py::arg("rowEnds"),          \
-          py::arg("indices"),          \
-          py::arg("values"),           \
-          py::arg("numRows"),          \
-          py::arg("stride0"),          \
-          py::arg("stride1"));         \
-      m.def("top_k_per_row_prefill_fast", \
-            &top_k_per_row_prefill_fast,  \
-            py::arg("logits"),       \
-            py::arg("rowStarts"),    \
-            py::arg("rowEnds"),      \
-            py::arg("indices"),      \
-            py::arg("values"),       \
-            py::arg("numRows"),      \
-            py::arg("stride0"),      \
-            py::arg("stride1"));     \
-    m.def("top_k_per_row_decode",      \
-          &top_k_per_row_decode,       \
-          py::arg("logits"),           \
-          py::arg("next_n"),           \
-          py::arg("seqLens"),          \
-          py::arg("indices"),          \
-          py::arg("numRows"),          \
-          py::arg("stride0"),          \
-          py::arg("stride1"));         \
-    m.def("top_k_per_row_decode_fast", \
-          &top_k_per_row_decode_fast,  \
-          py::arg("logits"),           \
-          py::arg("next_n"),           \
-          py::arg("seqLens"),          \
-          py::arg("indices"),          \
-          py::arg("numRows"),          \
-          py::arg("stride0"),          \
+#define TOP_K_PER_ROW_PYBIND            \
+    m.def("top_k_per_row_prefill",      \
+          &top_k_per_row_prefill,       \
+          py::arg("logits"),            \
+          py::arg("rowStarts"),         \
+          py::arg("rowEnds"),           \
+          py::arg("indices"),           \
+          py::arg("values"),            \
+          py::arg("numRows"),           \
+          py::arg("stride0"),           \
+          py::arg("stride1"));          \
+    m.def("top_k_per_row_prefill_fast", \
+          &top_k_per_row_prefill_fast,  \
+          py::arg("logits"),            \
+          py::arg("rowStarts"),         \
+          py::arg("rowEnds"),           \
+          py::arg("indices"),           \
+          py::arg("values"),            \
+          py::arg("numRows"),           \
+          py::arg("stride0"),           \
+          py::arg("stride1"));          \
+    m.def("top_k_per_row_decode",       \
+          &top_k_per_row_decode,        \
+          py::arg("logits"),            \
+          py::arg("next_n"),            \
+          py::arg("seqLens"),           \
+          py::arg("indices"),           \
+          py::arg("numRows"),           \
+          py::arg("stride0"),           \
+          py::arg("stride1"));          \
+    m.def("top_k_per_row_decode_fast",  \
+          &top_k_per_row_decode_fast,   \
+          py::arg("logits"),            \
+          py::arg("next_n"),            \
+          py::arg("seqLens"),           \
+          py::arg("indices"),           \
+          py::arg("numRows"),           \
+          py::arg("stride0"),           \
           py::arg("stride1"));
 
 #define MLA_METADATA_PYBIND                              \

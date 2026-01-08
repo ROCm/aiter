@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_blockscale_common_legacy.cuh"
+#include "gemm_a8w8_blockscale_common.cuh"
 #include "gemm_a8w8_blockscale_common_tune.h"
-#include "gemm_a8w8_blockscale_lookup_legacy.h"
-#include "gemm_a8w8_blockscale_manifest_legacy.h"
+#include "gemm_a8w8_blockscale_lookup.h"
+#include "gemm_a8w8_blockscale_manifest.h"
 
 template <typename DDataType, typename EDataType = DDataType>
-static BlockwiseKernel blockwise_dispatch_legacy(int id)
+static BlockwiseKernel blockwise_dispatch(int id)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
@@ -15,17 +15,17 @@ static BlockwiseKernel blockwise_dispatch_legacy(int id)
 
     // First check if this shape is available in the direct lookup.
     static const auto lookup = [] {
-        if constexpr(std::is_same_v<EDataType, LEGACY_FP16>)
+        if constexpr(std::is_same_v<EDataType, FP16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, LEGACY_FP16)};
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, FP16)};
         }
-        else if constexpr(std::is_same_v<EDataType, LEGACY_BF16>)
+        else if constexpr(std::is_same_v<EDataType, BF16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, LEGACY_BF16)};
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, BF16)};
         }
         else
         {
-            static_assert(false, "blockwise_dispatch_legacy used with unsupported dtype!");
+            static_assert(false, "blockwise_dispatch used with unsupported dtype!");
         }
     }();
 
@@ -40,13 +40,13 @@ static BlockwiseKernel blockwise_dispatch_legacy(int id)
     return lookup.find(0)->second;
 }
 
-torch::Tensor gemm_a8w8_blockscale_tune_legacy(torch::Tensor& XQ,
-                                               torch::Tensor& WQ,
-                                               torch::Tensor& x_scale,
-                                               torch::Tensor& w_scale,
-                                               torch::Tensor& Y,
-                                               int kernelId,
-                                               int splitK)
+torch::Tensor gemm_a8w8_blockscale_tune(torch::Tensor& XQ,
+                                        torch::Tensor& WQ,
+                                        torch::Tensor& x_scale,
+                                        torch::Tensor& w_scale,
+                                        torch::Tensor& Y,
+                                        int kernelId,
+                                        int splitK)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -59,11 +59,11 @@ torch::Tensor gemm_a8w8_blockscale_tune_legacy(torch::Tensor& XQ,
 
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockwise_dispatch_legacy<LEGACY_FP32, LEGACY_BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch<FP32, BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
-        blockwise_dispatch_legacy<LEGACY_FP32, LEGACY_FP16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch<FP32, FP16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
     }
     else
     {

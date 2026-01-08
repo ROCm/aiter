@@ -10,10 +10,10 @@ import torch
 
 from aiter.jit.core import AITER_LOG_TUNED_CONFIG
 from aiter import logger
-from gemm_a8w8_blockscale_instance_legacy import (
-    default_kernels_dict_legacy,
-    LegacyKernelInstance,
-    candidate_kernels_dict_legacy,
+from gemm_a8w8_blockscale_instance import (
+    default_kernels_dict,
+    KernelInstance,
+    candidate_kernels_dict,
 )
 
 
@@ -38,7 +38,7 @@ class gemm_a8w8_blockscale_codegen:
         Get tune dict from csv file
         """
 
-        tune_dict = default_kernels_dict_legacy
+        tune_dict = default_kernels_dict
 
         if os.path.exists(tune_dict_csv):
             tune_df = pd.read_csv(tune_dict_csv)
@@ -47,7 +47,7 @@ class gemm_a8w8_blockscale_codegen:
                 device_properties = torch.cuda.get_device_properties(gpu)
                 cu_num = device_properties.multi_processor_count
                 tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck_legacy")
+                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck")
                 ].reset_index()
 
             for i in range(len(tune_df)):
@@ -56,16 +56,16 @@ class gemm_a8w8_blockscale_codegen:
                 K = int(tune_df.loc[i, "K"])
                 kid = int(tune_df.loc[i, "kernelId"])
 
-                if kid in candidate_kernels_dict_legacy:
-                    tune_dict[(M, N, K)] = candidate_kernels_dict_legacy[kid]
+                if kid in candidate_kernels_dict:
+                    tune_dict[(M, N, K)] = candidate_kernels_dict[kid]
                 else:
                     print(
-                        f"Warning: kernelId {kid} not found in candidate_kernels_dict_legacy for shape ({M}, {N}, {K})"
+                        f"Warning: kernelId {kid} not found in candidate_kernels_dict for shape ({M}, {N}, {K})"
                     )
 
         return tune_dict
 
-    def gen_legacy_instance(self, k: LegacyKernelInstance):
+    def gen_legacy_instance(self, k: KernelInstance):
         """
         Generate kernel instance code for legacy gemm a8w8 blockscale
         """
@@ -73,7 +73,7 @@ class gemm_a8w8_blockscale_codegen:
         LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_blockscale_common_legacy.cuh"
+#include "gemm_a8w8_blockscale_common.cuh"
 
 enum class GemmSpecialization {{
     Default    = 0,
@@ -197,7 +197,7 @@ torch::Tensor
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
 
         // Run kernel instance.
-        return legacy_gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
 """
         INSTANCE_IMPL_str = (
             LEGACY_INSTANCE_IMPL.replace(
@@ -254,10 +254,10 @@ template torch::Tensor
 
 """
         INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="LEGACY_FP32, LEGACY_BF16"
+            name=k.name, dtypes="FP32, BF16"
         )
         INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="LEGACY_FP32, LEGACY_FP16"
+            name=k.name, dtypes="FP32, FP16"
         )
         # TODO: dFP8_eFP8
 
@@ -292,7 +292,7 @@ template torch::Tensor
 #endif // USE_ROCM
 """
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup_legacy.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h"), "w"
         ) as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
@@ -341,7 +341,7 @@ torch::Tensor
 """
 
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest_legacy.h"),
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest.h"),
             "w",
         ) as f:
             f.write(MAINFEST_head)
@@ -386,7 +386,7 @@ torch::Tensor
         # generate code for legacy and tile
         if self.istune:
             # generate code for default kernels
-            self.gen_code(candidate_kernels_dict_legacy)
+            self.gen_code(candidate_kernels_dict)
         else:
             # generate code for tuned kernels from tune_file
             self.gen_code(self.get_tune_dict(self.tune_file))

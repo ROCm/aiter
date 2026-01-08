@@ -139,11 +139,11 @@ def gen_gemm_a8w8_blockscale_ck_fake_tensors(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_legacy",
-    fc_name="gemm_a8w8_blockscale_legacy",
+    "module_gemm_a8w8_blockscale",
+    fc_name="gemm_a8w8_blockscale",
     gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
 )
-def gemm_a8w8_blockscale_ck_legacy(
+def gemm_a8w8_blockscale_ck(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -153,11 +153,11 @@ def gemm_a8w8_blockscale_ck_legacy(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_tile",
-    fc_name="gemm_a8w8_blockscale_tile",
+    "module_gemm_a8w8_blockscale_cktile",
+    fc_name="gemm_a8w8_blockscale_cktile",
     gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
 )
-def gemm_a8w8_blockscale_ck_tile(
+def gemm_a8w8_blockscale_cktile(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -562,13 +562,13 @@ def gemm_a8w8_blockscale(
         )
         if config is not None:
             libtype = config["libtype"]
-            if libtype == "ck_legacy":
-                return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
-            elif libtype == "ck_tile":
-                return gemm_a8w8_blockscale_ck_tile(XQ, WQ, x_scale, w_scale, Y)
+            if libtype == "ck":
+                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+            elif libtype == "cktile":
+                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-        return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
+        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def flatmm_a8w8_blockscale_ASM(
@@ -675,11 +675,11 @@ def gen_gemm_a8w8_blockscale_tune_fake_tensors(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_tune_legacy",
-    fc_name="gemm_a8w8_blockscale_tune_legacy",
+    "module_gemm_a8w8_blockscale_tune",
+    fc_name="gemm_a8w8_blockscale_tune",
     gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
 )
-def gemm_a8w8_blockscale_tune_legacy(
+def gemm_a8w8_blockscale_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -691,11 +691,11 @@ def gemm_a8w8_blockscale_tune_legacy(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_tune_tile",
-    fc_name="gemm_a8w8_blockscale_tune_tile",
+    "module_gemm_a8w8_blockscale_cktile_tune",
+    fc_name="gemm_a8w8_blockscale_cktile_tune",
     gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
 )
-def gemm_a8w8_blockscale_tune_tile(
+def gemm_a8w8_blockscale_cktile_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,

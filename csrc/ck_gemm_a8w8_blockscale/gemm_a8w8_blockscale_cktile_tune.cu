@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_blockscale_common_tile.cuh"
+#include "gemm_a8w8_blockscale_cktile_common.cuh"
+#include "gemm_a8w8_blockscale_cktile_lookup.h"
+#include "gemm_a8w8_blockscale_cktile_manifest.h"
 #include "gemm_a8w8_blockscale_common_tune.h"
-#include "gemm_a8w8_blockscale_lookup_tile.h"
-#include "gemm_a8w8_blockscale_manifest_tile.h"
 
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockwise_dispatch_tile(int id)
@@ -40,13 +40,13 @@ static BlockwiseKernel blockwise_dispatch_tile(int id)
     return lookup.find(0)->second;
 }
 
-torch::Tensor gemm_a8w8_blockscale_tune_tile(torch::Tensor& XQ,
-                                             torch::Tensor& WQ,
-                                             torch::Tensor& x_scale,
-                                             torch::Tensor& w_scale,
-                                             torch::Tensor& Y,
-                                             int kernelId,
-                                             int splitK)
+torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
+                                               torch::Tensor& WQ,
+                                               torch::Tensor& x_scale,
+                                               torch::Tensor& w_scale,
+                                               torch::Tensor& Y,
+                                               int kernelId,
+                                               int splitK)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");

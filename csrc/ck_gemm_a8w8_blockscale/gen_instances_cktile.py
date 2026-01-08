@@ -10,10 +10,10 @@ import torch
 
 from aiter.jit.core import AITER_LOG_TUNED_CONFIG
 from aiter import logger
-from gemm_a8w8_blockscale_instance_tile import (
-    default_kernels_dict_tile,
+from gemm_a8w8_blockscale_cktile_instance import (
+    default_kernels_cktile_dict,
     TileKernelInstance,
-    candidate_kernels_dict_tile,
+    candidate_kernels_cktile_dict,
 )
 
 
@@ -38,7 +38,7 @@ class gemm_a8w8_blockscale_codegen:
         Get tune dict from csv file
         """
 
-        tune_dict = default_kernels_dict_tile
+        tune_dict = default_kernels_cktile_dict
 
         if os.path.exists(tune_dict_csv):
             tune_df = pd.read_csv(tune_dict_csv)
@@ -47,7 +47,7 @@ class gemm_a8w8_blockscale_codegen:
                 device_properties = torch.cuda.get_device_properties(gpu)
                 cu_num = device_properties.multi_processor_count
                 tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck_tile")
+                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "cktile")
                 ].reset_index()
             for i in range(len(tune_df)):
                 M = int(tune_df.loc[i, "M"])
@@ -55,11 +55,11 @@ class gemm_a8w8_blockscale_codegen:
                 K = int(tune_df.loc[i, "K"])
                 kid = int(tune_df.loc[i, "kernelId"])
 
-                if kid in candidate_kernels_dict_tile:
-                    tune_dict[(M, N, K)] = candidate_kernels_dict_tile[kid]
+                if kid in candidate_kernels_cktile_dict:
+                    tune_dict[(M, N, K)] = candidate_kernels_cktile_dict[kid]
                 else:
                     print(
-                        f"Warning: kernelId {kid} not found in candidate_kernels_dict_tile for shape ({M}, {N}, {K})"
+                        f"Warning: kernelId {kid} not found in candidate_kernels_cktile_dict for shape ({M}, {N}, {K})"
                     )
 
         return tune_dict
@@ -72,7 +72,7 @@ class gemm_a8w8_blockscale_codegen:
         TILE_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_blockscale_common_tile.cuh"
+#include "gemm_a8w8_blockscale_cktile_common.cuh"
 
 template <typename DDataType, typename EDataType>
 torch::Tensor
@@ -107,7 +107,7 @@ torch::Tensor
             {k.BlockPerCu}>;
 
         // Run kernel instance.
-        return tile_gemm_a8w8_blockscale_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
 """
 
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
@@ -172,7 +172,7 @@ template torch::Tensor
 #endif // USE_ROCM
 """
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup_tile.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"), "w"
         ) as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
@@ -221,7 +221,7 @@ torch::Tensor
 """
 
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest_tile.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
             for _, k in kernels_dict.items():
@@ -265,7 +265,7 @@ torch::Tensor
         # generate code for legacy and tile
         if self.istune:
             # generate code for default kernels
-            self.gen_code(candidate_kernels_dict_tile)
+            self.gen_code(candidate_kernels_cktile_dict)
         else:
             # generate code for tuned kernels from tune_file
             self.gen_code(self.get_tune_dict(self.tune_file))

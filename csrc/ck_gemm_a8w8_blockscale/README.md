@@ -11,8 +11,8 @@
 
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_blockscale_tune via jit:
-`python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py -i aiter/configs/a8w8_blockscale_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_tuned_gemm.csv --libtype ck_tile`
-libtype can be `ck_legacy`, `ck_tile` or `both`. We recommend to tune together by setting `--libtype both` to get both legacy and tile implementations, then choose the best one, this will take more time but help to get better performance.
+`python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py -i aiter/configs/a8w8_blockscale_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_tuned_gemm.csv --libtype cktile`
+libtype can be `ck`, `cktile` or `both`. We recommend to tune together by setting `--libtype both` to get both legacy and tile implementations, then choose the best one, this will take more time but help to get better performance.
 You can find the results of the tuning in `aiter/configs/a8w8_blockscale_tuned_gemm.csv`.
     |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|
     |----------|-----|-----|-----|------------|----------|------|--------------|
