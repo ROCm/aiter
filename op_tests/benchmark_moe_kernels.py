@@ -47,6 +47,7 @@ sys.path.insert(0, str(aiter_root / "hsa/gfx942/fmoe_2stages"))
 
 import pandas as pd
 import torch
+from datetime import datetime
 
 # Now import aiter and tune modules
 import aiter
@@ -157,18 +158,28 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
         
         print("\nGenerating kernel tasks...")
         
-        # 1. ASM kernels for 2-stage (assembly-based implementations)
-        #    Only available for certain quantization types (FP8, INT8)
-        tasks_asm = tuner.gen_2stages_asm1_task(info, blockMs)
+        # Try to generate tasks - may fail if kernels don't exist or can't build
+        tasks_asm = []
+        tasks_ck = []
+        tasks_1stage = []
         
-        # 2. CK kernels for 2-stage (Composable Kernel library)
-        #    More widely available across configurations
-        #    Separate stage1 and stage2 kernels
-        tasks_ck = tuner.gen_2stages_task(info, blockMs)
+        try:
+            # 1. ASM kernels for 2-stage (assembly-based implementations)
+            tasks_asm = tuner.gen_2stages_asm1_task(info, blockMs)
+        except Exception as e:
+            print(f"  WARNING: ASM kernel generation failed: {str(e)[:100]}")
         
-        # 3. 1-stage kernels (fused approach combining both GEMMs)
-        #    Typically assembly-based fused implementations
-        tasks_1stage = tuner.gen_1stage_asm_task(info)
+        try:
+            # 2. CK kernels for 2-stage (Composable Kernel library)
+            tasks_ck = tuner.gen_2stages_task(info, blockMs)
+        except Exception as e:
+            print(f"  WARNING: CK kernel generation failed: {str(e)[:100]}")
+        
+        try:
+            # 3. 1-stage kernels (fused approach)
+            tasks_1stage = tuner.gen_1stage_asm_task(info)
+        except Exception as e:
+            print(f"  WARNING: 1-stage kernel generation failed: {str(e)[:100]}")
         
         total_tasks = len(tasks_asm) + len(tasks_ck) + len(tasks_1stage)
         print(f"Total kernels to test: {total_tasks}")
@@ -190,7 +201,14 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
         # Execute all kernel tasks using mp_tuner utility from tune.py
         # mp_num=1: Parameter for execution mode
         # shape_grouped=False: Returns individual results per kernel
-        results = mp_tuner(all_tasks, in_data, mp_num=1, shape_grouped=False)
+        try:
+            results = mp_tuner(all_tasks, in_data, mp_num=1, shape_grouped=False)
+        except Exception as e:
+            print(f"ERROR: Kernel crash for this configuration!")
+            print(f"  Error: {str(e)}")
+            print(f"  Skipping this configuration and continuing...")
+            # Skip this config and continue with next
+            continue
         
         # ========================================================================
         # QUANTIZATION OVERHEAD MEASUREMENT
@@ -257,6 +275,7 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
             
             # Build result record containing all information
             result_dict = {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'config_idx': idx,
                 'token': row['token'],
                 'model_dim': row['model_dim'],
@@ -289,8 +308,15 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
                   f"time={us:8.2f}us err={err:6.2%} "
                   f"TFLOPS={tflops:7.2f} BW={bw:7.2f}GB/s "
                   f"{kernel_name[:50]}")
+        
+        # Incremental save after each configuration
+        # This ensures results are preserved even if benchmarking is interrupted
+        if all_results:
+            temp_df = pd.DataFrame(all_results)
+            temp_df.to_csv(output_file, index=False)
+            print(f"  Saved {len(all_results)} results so far to {output_file}")
     
-    # Save all results to CSV
+    # Final save (already done incrementally, but ensures latest state)
     if all_results:
         results_df = pd.DataFrame(all_results)
         
