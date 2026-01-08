@@ -3329,13 +3329,16 @@ def pa_decode_gluon(
     batch_size = query.shape[0] // query_length
     num_kv_heads = key_cache.shape[1]
     query_group_size = num_query_heads // num_kv_heads
+    # Calculate equivalent group sizes for kernel configuration
+    equivalent_query_group_size = query_length * query_group_size
+
     one_shot = max_context_partition_num <= 1
     if exp_sums is None:
         exp_sums = torch.empty(
             batch_size,
             num_kv_heads,
             max_context_partition_num,
-            query_group_size,
+            equivalent_query_group_size,
             device=query.device,
             dtype=aiter.dtypes.fp32,
         )
@@ -3344,7 +3347,7 @@ def pa_decode_gluon(
             batch_size,
             num_kv_heads,
             max_context_partition_num,
-            query_group_size,
+            equivalent_query_group_size,
             device=query.device,
             dtype=aiter.dtypes.fp32,
         )
@@ -3353,15 +3356,13 @@ def pa_decode_gluon(
             batch_size,
             num_kv_heads,
             max_context_partition_num,
-            query_group_size,
+            equivalent_query_group_size,
             head_size,
             device=query.device,
             dtype=query.dtype,
         )
     kv_block_size = key_cache.shape[-2]
 
-    # Calculate equivalent group sizes for kernel configuration
-    equivalent_query_group_size = query_length * query_group_size
     # Determine if causal masking is needed
     is_causal = query_length > 1
     # Calculate elements per 16B load based on data type
