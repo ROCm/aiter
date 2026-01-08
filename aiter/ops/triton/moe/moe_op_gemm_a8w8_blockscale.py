@@ -5,7 +5,7 @@ import itertools
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton._triton_kernels.moe_op_gemm_a8w8_blockscale import (
+from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8_blockscale import (
     _moe_gemm_a8w8_blockscale,
     _reduce_grouped,
 )

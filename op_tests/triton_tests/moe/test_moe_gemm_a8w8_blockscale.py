@@ -9,7 +9,7 @@ import torch
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
-from aiter.ops.triton.moe_op_gemm_a8w8_blockscale import (
+from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
     moe_gemm_torch,
 )

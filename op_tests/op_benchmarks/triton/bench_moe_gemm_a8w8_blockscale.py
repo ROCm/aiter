@@ -8,7 +8,7 @@ import torch
 import argparse
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe_op_gemm_a8w8_blockscale import (
+from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
