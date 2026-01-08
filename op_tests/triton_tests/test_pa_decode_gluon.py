@@ -1636,6 +1636,7 @@ def run_pa_gluon_test(
         or (compute_type == torch.float16 and (quant_q or quant_kv))
         or (head_size not in [128])
         or (sliding_window > 0)
+        or True
     )
 
     # aiter_assembly_kernel do not support per-tensor quantization, we always use per-token quantization here

@@ -22,7 +22,7 @@ MD_NAME = "module_attention"
 direct_register_custom_op(
     "pa_decode_gluon",
     pa_decode_gluon,
-    ["output", "output_gluon", "exp_sums", "max_logits", "temporary_output"],
+    ["output", "exp_sums", "max_logits", "temporary_output"],
 )
 
 
