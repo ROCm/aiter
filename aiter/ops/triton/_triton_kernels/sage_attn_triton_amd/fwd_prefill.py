@@ -1936,37 +1936,6 @@ def fav3_sage_triton_impl(
     )
 
 
-def compute_k_smoothing_factors(
-    k: torch.Tensor, layout: str = "bshd"
-) -> torch.Tensor:
-    """
-    Compute per-channel smoothing factors for K tensor following SageAttention approach.
-
-    This computes the mean across the sequence dimension for each channel (head_dim)
-    to reduce outliers before quantization, improving INT8 accuracy.
-
-    Args:
-        k: Key tensor with shape (B, kv_len, H, head_dim) for bshd layout
-           or (B, H, kv_len, head_dim) for bhsd layout
-        layout: Either "bshd" or "bhsd"
-
-    Returns:
-        k_smooth: Smoothing factors with shape matching k, computed as per-channel mean
-    """
-    if layout == "bshd":
-        # k shape: [B, kv_len, H, head_dim]
-        # Compute mean across sequence dimension (dim=1), keep dims for broadcasting
-        k_mean = k.mean(dim=1, keepdim=True)  # [B, 1, H, head_dim]
-    elif layout == "bhsd":
-        # k shape: [B, H, kv_len, head_dim]
-        # Compute mean across sequence dimension (dim=2), keep dims for broadcasting
-        k_mean = k.mean(dim=2, keepdim=True)  # [B, H, 1, head_dim]
-    else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
-
-    return k_mean
-
-
 def sage_quant(
     q,
     k,
@@ -2024,7 +1993,7 @@ def sage_quant(
     # Apply K tensor smoothing following SageAttention approach
     if smooth_k:
         k = k - k.mean(dim=1 if layout=="bshd" else 2, keepdim=True)
-        
+
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
     if V_QUANT_SCHEME == 0:
@@ -2089,35 +2058,6 @@ def sage_quant(
 
 
 @triton.jit
-def k_smoothing_kernel(
-    K_Input,
-    K_Output,
-    stride_kz,
-    stride_kh,
-    stride_kn,
-    BATCH,
-    K_HEAD,
-    D: tl.constexpr,
-    SEQLEN_K,
-    SEQLEN_K_PADDED: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    off_d, off_h, off_b = pid_grid_3d(pid, D, K_HEAD, BATCH)
-    offs_k = tl.arange(0, SEQLEN_K_PADDED)
-
-    v_offs = off_b * stride_kz + off_h * stride_kh + offs_k * stride_kn + off_d
-
-    v_input_ptrs = K_Input + v_offs
-    v_output_ptrs = K_Output + v_offs
-
-    k_vals = tl.load(v_input_ptrs, mask=offs_k < SEQLEN_K, other=0.0)
-    k_mean = (tl.sum(k_vals, axis=0) / SEQLEN_K).to(K_Input.dtype.element_ty)
-    k_smoothed = (k_vals - k_mean).to(K_Input.dtype.element_ty)
-
-    k_vals = tl.store(v_output_ptrs, k_smoothed, mask=offs_k < SEQLEN_K)
-
-
-@triton.jit
 def sage_quant_kernel(
     Q_Input,
     Q_Output,
@@ -2167,7 +2107,7 @@ def sage_quant_kernel(
     if pid < q_task_count:
         # here we do Q
         off_blk, off_h, off_b = pid_grid_3d(pid, Q_NUM_BLKS, Q_HEAD, BATCH)
-        offs_qn = (off_blk * BLK_Q + offs_blk_q) % SEQLEN_Q
+        offs_qn = (off_blk * BLK_Q + offs_blk_q)
 
         q_offs = (
             off_b * stride_qz
@@ -2185,7 +2125,7 @@ def sage_quant_kernel(
             q_output_ptrs,
             q_scale_ptrs,
             INT8_MAX,
-            mask=None,
+            offs_qn[:, None] < SEQLEN_Q,
             sm_scale=sm_scale,
         )
     elif pid >= q_task_count and pid < q_task_count + k_task_count:
@@ -2193,7 +2133,7 @@ def sage_quant_kernel(
         _pid = pid - q_task_count
         off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
 
-        offs_kn = (off_blk * BLK_K + offs_blk_k) % SEQLEN_K
+        offs_kn = (off_blk * BLK_K + offs_blk_k)
 
         k_offs = (
             off_b * stride_kz
@@ -2211,13 +2151,13 @@ def sage_quant_kernel(
             k_output_ptrs,
             k_scale_ptrs,
             INT8_MAX,
-            mask=None,
+            offs_kn[:, None] < SEQLEN_K,
         )
     else:
         # V
         _pid = pid - (q_task_count + k_task_count)
         off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-        offs_kn = (off_blk * BLK_K + offs_blk_k) % SEQLEN_K
+        offs_kn = (off_blk * BLK_K + offs_blk_k)
 
         v_offs = (
             off_b * stride_kz
@@ -2235,17 +2175,17 @@ def sage_quant_kernel(
                 v_output_ptrs,
                 v_scale_ptrs,
                 FP8_MAX,
-                mask=None,
+                offs_kn[:, None] < SEQLEN_K,
             )
         else:
             # just apply the per channel v_scales that have been computed outside    
             v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
-            v = tl.load(v_input_ptrs)
+            v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
             v = v.to(tl.float32)
             v_scales = tl.load(v_scale_ptrs)
             v_quant = v / v_scales
             v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
-            tl.store(v_output_ptrs, v_quant)
+            tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 @triton.jit
 def _general_quant_kernel(
