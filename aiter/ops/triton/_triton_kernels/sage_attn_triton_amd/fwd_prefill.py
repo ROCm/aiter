@@ -24,8 +24,8 @@ def get_fwd_configs(autotune: bool):
         "BLOCK_M": 256,
         "BLOCK_N": 128,
         "waves_per_eu": 2,
-        "PRE_LOAD_V": True,
-        "num_stages": 1,
+        "PRE_LOAD_V": False,
+        "num_stages": 2,
         "num_warps": 8,
     }
 
