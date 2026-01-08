@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import pytest
-from aiter.ops.triton.fused_mxfp4_quant import (
+from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
     fused_rms_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,

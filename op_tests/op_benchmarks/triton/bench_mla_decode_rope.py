@@ -9,7 +9,7 @@ import sys
 import argparse
 import itertools
 
-from aiter.ops.triton.mla_decode_rope import (
+from aiter.ops.triton.attention.mla_decode_rope import (
     decode_attention_fwd_grouped_rope,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser

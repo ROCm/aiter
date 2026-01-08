@@ -17,7 +17,7 @@ from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, PY, bd_dir, get_asm_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
@@ -912,7 +912,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
-            or metadata.ksplit > 1
+            or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1)
         )
     ):
         a1 = hidden_states.to(dtype)
@@ -928,6 +928,7 @@ def fused_moe_2stages(
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
+
     elif quant_type == QuantType.per_1x32:
         if token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(

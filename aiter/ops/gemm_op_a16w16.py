@@ -34,7 +34,7 @@ def gen_gemm_a16w16_asm_fake_tensors(
     fc_name="gemm_a16w16_asm",
     gen_fake=gen_gemm_a16w16_asm_fake_tensors,
 )
-def gemm_a16w16_asm(
+def _gemm_a16w16_asm(
     A: Tensor,
     B: Tensor,
     out: Tensor,
@@ -51,7 +51,7 @@ def get_semaphore_workspace(device: torch.device) -> Tensor:
     return torch.zeros((16, 64), dtype=torch.uint32, device=device)
 
 
-def gemm_a16w16(
+def gemm_a16w16_asm(
     A: Tensor,
     B: Tensor,
     out: Tensor,
@@ -60,9 +60,9 @@ def gemm_a16w16(
     kernelName: Optional[str] = None,
     bpreshuffle: bool = False,
 ):
-    if splitK > 1:
+    if splitK is None or splitK > 1:
         sema = get_semaphore_workspace(out.device)
     else:
         sema = torch.empty((0,), dtype=torch.uint32, device=out.device)
 
-    return gemm_a16w16_asm(A, B, out, sema, bias, splitK, kernelName, bpreshuffle)
+    return _gemm_a16w16_asm(A, B, out, sema, bias, splitK, kernelName, bpreshuffle)
