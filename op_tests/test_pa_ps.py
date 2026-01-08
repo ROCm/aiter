@@ -313,25 +313,30 @@ def profile_kernel_breakdown(func, num_iters=100, num_warmup=10):
     """
     Profile a function and extract PA kernel and reduce kernel time breakdown.
     """
-    for _ in range(num_warmup):
-        func()
-    torch.cuda.synchronize()
+    schedule = tpf.schedule(
+        wait=0,
+        warmup=num_warmup,
+        active=num_iters,
+        repeat=1,
+    )
 
-    with tpf.profile(
-        activities=[tpf.ProfilerActivity.CUDA],
-        profile_memory=False,
-        with_stack=False,
-    ) as prof:
-        for _ in range(num_iters):
-            func()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    # Analyze kernel times
     pa_time = 0.0
     reduce_time = 0.0
     total_time = 0.0
 
+    with tpf.profile(
+        activities=[tpf.ProfilerActivity.CUDA],
+        schedule=schedule,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        for step in range(num_warmup + num_iters):
+            func()
+            prof.step()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    # Analyze kernel times
     for event in prof.events():
         if event.device_type.name == "CUDA":
             time_us = event.device_time_total
@@ -682,7 +687,7 @@ def test_pa_mtp(
         )
 
         # Profile kernel breakdown for PA ASM (no reduce kernel)
-        _, pa_ratio_asm, reduce_ratio_asm, us_pa_kernel_asm, us_reduce_kernel_asm = (
+        _, pa_ratio_asm, reduce_ratio_asm, us_pa_kernel_asm, _ = (
             profile_kernel_breakdown(
                 lambda: aiter.pa_fwd_asm(
                     query,
@@ -722,7 +727,7 @@ def test_pa_mtp(
             us_pa1=us_pa_kernel_ps,
             us_reduce1=us_reduce_kernel_ps,
             us_pa2=us_pa_kernel_asm,
-            us_reduce2=us_reduce_kernel_asm,
+            us_reduce2=0,
             batch_size=batch_size,
         )
 
@@ -738,7 +743,7 @@ def test_pa_mtp(
         ret["pa_ratio_asm"] = pa_ratio_asm
         ret["reduce_ratio_asm"] = reduce_ratio_asm
         ret["us_pa_kernel_asm"] = us_pa_kernel_asm
-        ret["us_reduce_kernel_asm"] = us_reduce_kernel_asm
+        # ret["us_reduce_kernel_asm"] = us_reduce_kernel_asm
         ret["err fp8"] = err
     else:
         out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
