@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import aiter
-import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter.jit.core import AITER_CONFIG_BF16_BATCHED_GEMM
