@@ -54,8 +54,8 @@ jobs:
             --build-arg BASE_IMAGE=${{ env.BASE_IMAGE }} \
             --build-arg PREBUILD_KERNELS=0 \
             --build-arg GPU_ARCH=gfx950 \
-            --build-arg ATITER_REPO=${{ env.GITHUB_REPO_URL }} \
-            --build-arg ATITER_COMMIT=${{ env.GITHUB_COMMIT_SHA }} \
+            --build-arg AITER_REPO=${{ env.GITHUB_REPO_URL }} \
+            --build-arg AITER_COMMIT=${{ env.GITHUB_COMMIT_SHA }} \
             -f docker/Dockerfile .
 
       - name: Push the ATOM test image
