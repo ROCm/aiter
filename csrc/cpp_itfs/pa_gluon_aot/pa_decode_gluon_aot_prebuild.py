@@ -72,7 +72,7 @@ def run_gluon_kernel(
     block_tables: torch.Tensor,
     softmax_scale: float,
     query_length: int,
-    max_context_length: int,
+    max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
     query_scale: torch.Tensor,
@@ -96,7 +96,7 @@ def run_gluon_kernel(
         block_tables: Mapping from sequences to physical cache blocks [num_seqs, max_num_blocks_per_seq]
         softmax_scale: Softmax scale (typically 1/sqrt(head_size))
         query_length: Query sequence length
-        max_context_length: Maximum sequence length supported
+        max_context_partition_num: Maximum number of context partitions
         context_partition_size: Context partition size
         compute_type: Compute data type (torch.dtype)
         query_scale: Query quantization scale
@@ -124,7 +124,7 @@ def run_gluon_kernel(
             block_tables,
             softmax_scale,
             query_length,
-            max_context_length,
+            max_context_partition_num,
             context_partition_size,
             compute_type,
             query_scale,
@@ -390,7 +390,7 @@ def run_pa_gluon_test(
         block_tables,
         softmax_scale,
         query_length,
-        context_lengths.max().item(),
+        max_context_partition_num,
         context_partition_size,
         compute_type,
         query_scale=query_scale_factors,

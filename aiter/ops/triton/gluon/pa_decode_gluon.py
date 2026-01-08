@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# This code is derived from sglang and FLASHNN projects
-# https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
 from functools import lru_cache
 import torch
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 import triton
 import triton.language as tl
@@ -3576,7 +3573,7 @@ def pa_decode_gluon(
         stride_query_scale_kv_head,
         key_scale_stride_0,
         key_scale_stride_1,
-        COMPUTE_TYPE=torch_to_triton_dtype[compute_type],
+        COMPUTE_TYPE=TORCH_TO_TL_DTYPE[compute_type],
         query_seq_len=query_length,
         HEAD_SIZE=head_size,
         query_group_size=query_group_size,

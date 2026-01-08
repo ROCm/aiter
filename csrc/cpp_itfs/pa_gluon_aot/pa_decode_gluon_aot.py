@@ -12,7 +12,6 @@ import triton.language as tl
 from jinja2 import Template
 
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
     compile_kernel,
@@ -550,13 +549,11 @@ def pa_decode_gluon_aot(
     - This function directly reshapes query and output to 5D format internally,
       avoiding extra transpose operations for better performance
     """
-
     cdna_version = get_cdna_version()
     assert cdna_version in [
         3,
         4,
     ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
-    compute_type = torch_to_triton_dtype[compute_type]
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
