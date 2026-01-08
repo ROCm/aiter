@@ -139,6 +139,14 @@ parser.add_argument(
     default=None,
     help="shape. e.g. -s 128,8192",
 )
+parser.add_argument(
+    "-m",
+    "--mode",
+    type=str,
+    choices=["eager", "graph", "both"],
+    default="graph",
+    help="execution mode: eager, graph, or both (default: graph)",
+)
 
 
 if __name__ == "__main__":
@@ -150,16 +158,30 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    
+    # Determine which modes to test
+    test_modes = []
+    if args.mode == "eager":
+        test_modes = [False]
+    elif args.mode == "graph":
+        test_modes = [True]
+    else:  # both
+        test_modes = [False, True]
+    
     for dtype in l_dtype:
         for shape in l_shape:
+            for withGraph in test_modes:
+                mode_str = "Graph" if withGraph else "Eager"
+                print(f"\n{'='*60}")
+                print(f"Testing mode: {mode_str}, dtype: {dtype}, shape: {shape}")
+                print(f"{'='*60}")
             test_allreduce_custom(
                 8,
                 1,
                 shape,
                 dtype,
-                withGraph=True,
+                    withGraph=withGraph,
                 distributed_init_method=get_distributed_init_method(
                     get_ip(), get_open_port()
                 ),
             )
-            # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)
