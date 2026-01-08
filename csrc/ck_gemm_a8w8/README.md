@@ -30,11 +30,11 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 #### `-k, --splitK`
 - **Type**: Flag (boolean)
 - **Default**: `False`
-- **Description**: Enable split K kernels. Note that when using split K, you should change `bias` to `bias/(2^k)`.
-
+- **Description**: Enable split K kernels.
 **Example**:
 ```bash
 -k
+--splitK
 ```
 
 ### Output Configuration

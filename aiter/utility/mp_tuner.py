@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import multiprocessing as mp
 import time
@@ -37,7 +37,7 @@ def worker(
             us = round(us, 4)
 
         except RuntimeError as e:
-            print(f"run gpu func error: info:{info}\t {e}")
+            print(f"run gpu func warning: info:{info}\t {e}")
             us = -1  # not support or error
             max_err_ratio = 1.0
         max_retries = 3

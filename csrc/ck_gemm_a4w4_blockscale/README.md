@@ -82,6 +82,17 @@ If you have built gemm_a4w4 kernels before tuning new GEMM shapes, please add `A
 --batch 50
 ```
 
+#### `-k, --splitK`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: Enable split-K optimization for GEMM kernels. Split-K divides the K dimension across multiple workgroups to improve parallelism and performance for certain shapes.
+
+**Example**:
+```bash
+-k
+--splitK
+```
+
 #### `--all`
 - **Type**: Flag (boolean)
 - **Default**: `False`
