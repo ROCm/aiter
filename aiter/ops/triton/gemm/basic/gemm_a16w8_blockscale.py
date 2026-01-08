@@ -150,7 +150,7 @@ def gemm_a16w8_blockscale_preshuffle(
     w_scale: torch.Tensor,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    prequant: Optional[bool] = True,
+    prequant: Optional[bool] = False,
     config: Optional[dict] = None,
     skip_reduce: Optional[bool] = False,
 ):
@@ -181,7 +181,7 @@ def gemm_a16w8_blockscale_preshuffle(
     assert x.shape[1] == w.shape[1] // 16, "Incompatible dimensions!!!"
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K, True)
 
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
