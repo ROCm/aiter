@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import triton
 import pytest
-from aiter.ops.triton.gemm_a16w8_blockscale import gemm_a16w8_blockscale
+from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import gemm_a16w8_blockscale
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
