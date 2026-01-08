@@ -37,7 +37,7 @@ def worker(
             us = round(us, 4)
 
         except RuntimeError as e:
-            print(f"run gpu func warning: info:{info}\t {e}")
+            print(f"run gpu func warning: info:{info}\t {e}", flush=True)
             us = -1  # not support or error
             max_err_ratio = 1.0
         max_retries = 3
@@ -82,24 +82,28 @@ def worker(
                     max_err_ratio = max(max_err_ratio, err_ratio)
     except RuntimeError as e:
         if "CUDA" in str(e) or "HIP" in str(e) or "out of memory" in str(e).lower():
-            print(f"GPU Runtime Error in process:{pid} info:{info}: {e}")
+            if printLog:
+                print(f"GPU Runtime Error in process:{pid} info:{info}: {e}")
             # Try to recover GPU state
             try:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
             except Exception as e:
-                print(f"Error in process:{pid} info:{info}: {e}")
+                if printLog:
+                    print(f"Error in process:{pid} info:{info}: {e}")
                 pass
         else:
             print(f"Runtime Error in process:{pid} info:{info}: {e}")
         us = -1  # float("inf")
         max_err_ratio = 1.0
     except TimeoutError as e:
-        print(f"Timeout in process:{pid} info:{info}: {e}")
+        if printLog:
+            print(f"Timeout in process:{pid} info:{info}: {e}")
         us = float("inf")
         max_err_ratio = 1.0
     except Exception as e:
-        print(f"Unexpected Error in process:{pid} info:{info}: {e}")
+        if printLog:
+            print(f"Unexpected Error in process:{pid} info:{info}: {e}")
         # import traceback
 
         # traceback.print_exc()
@@ -109,7 +113,7 @@ def worker(
     return info, us, round(max_err_ratio, 4)
 
 
-def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, printLog=False):
+def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
     """Work group that processes a batch of related tasks."""
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
@@ -204,7 +208,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, printLog=False):
             )
 
             # Run worker with explicit GPU ID
-            ret = worker(*work_args, tol_err_ratio=err_ratio)
+            ret = worker(*work_args, printLog=verbose, tol_err_ratio=err_ratio)
             rets.append(ret)
         return rets
 
