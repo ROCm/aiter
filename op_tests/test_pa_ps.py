@@ -366,6 +366,7 @@ def print_performance_comparison(
     us_reduce1=None,
     us_pa2=None,
     us_reduce2=None,
+    batch_size=None,
 ):
     print("\n" + "=" * 120)
     print("PERFORMANCE COMPARISON")
@@ -374,6 +375,8 @@ def print_performance_comparison(
     if seq_lens is not None:
         print(f"Sequence Lengths: {seq_lens[0]}")
         print("-" * 120)
+    if batch_size is not None:
+        print(f"Batch Size: {batch_size}")
 
     if us_metadata is not None:
         print(f"{'Metadata (get_pa_metadata_v1)':<35} {us_metadata:>11.2f}us")
@@ -720,6 +723,7 @@ def test_pa_mtp(
             us_reduce1=us_reduce_kernel_ps,
             us_pa2=us_pa_kernel_asm,
             us_reduce2=us_reduce_kernel_asm,
+            batch_size=batch_size,
         )
 
         # Store results
