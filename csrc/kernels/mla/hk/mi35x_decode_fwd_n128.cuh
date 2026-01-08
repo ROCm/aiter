@@ -199,12 +199,13 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
         {
             const int32_t kv_row_idx = rows[row_idx];
             /// TODO: replace 512 with 512+8 for swizzle
-            const uintptr_t p_lds_row = p_lds_warp_nope + row_idx * 512 + lane_offset;
+            const uintptr_t p_lds_row = p_lds_warp_nope + row_idx * 512;
 
             if(kCheckBoundary && (kv_row_idx == -1))
             {
-                hkm::ds_write_b32(p_lds_row, 0, 0u);
-                hkm::ds_write_b32(p_lds_row, kNumBytesPerWarpPerRnd, 0u);
+                const uintptr_t p_lds_row_lane = p_lds_row + lane_offset;
+                hkm::ds_write_b32(p_lds_row_lane, 0, 0u);
+                hkm::ds_write_b32(p_lds_row_lane, kNumBytesPerWarpPerRnd, 0u);
             }
             else
             {
