@@ -4,7 +4,9 @@ This repo contains multiple PA (Paged Attention) implementations. The file
 `op_tests/test_pa_merged.py` is a **focused** test module whose only goal is to:
 
 - **Compare correctness**: HIP (`paged_attention_v1_core`) vs ASM (`pa_fwd_asm`)
-- **Use ASM-compatible KV-cache layouts** (5D KV layouts expected by the ASM path)
+- **Use ASM-compatible KV-cache layouts for BOTH paths**
+  - HIP is exercised through the **5D-cache** codepath that can consume these layouts
+  - ASM is exercised directly via `pa_fwd_asm` on the same layouts
 - Optionally **measure performance** using AITER’s standard `@perftest()` harness
 
 The tests are **opt-in** (they skip by default) to avoid running long GPU workloads in CI.
