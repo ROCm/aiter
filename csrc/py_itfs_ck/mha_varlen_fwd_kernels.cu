@@ -45,7 +45,8 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           std::optional<const at::Tensor> &cu_seqlens_k_padded_,
                                           const std::string& data_type,
                                           bias_enum bias_type,
-                                          quant_scale_enum qscale_type)
+                                          quant_scale_enum qscale_type,
+                                          std::optional<const at::Tensor> &sink_ptr_)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -106,6 +107,7 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     const void *q_descale_ptr = q_descale_.has_value() ? q_descale_.value().data_ptr() : nullptr;
     const void *k_descale_ptr = k_descale_.has_value() ? k_descale_.value().data_ptr() : nullptr;
     const void *v_descale_ptr = v_descale_.has_value() ? v_descale_.value().data_ptr() : nullptr;
+    const void *sink_ptr = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
 
     const void* seqstart_k_ptr = nullptr;
     const void* seqstart_q_ptr = nullptr;
@@ -151,6 +153,7 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr (per-sequence logical K lengths)
                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr
+                        sink_ptr,
                         total_q,
                         total_k,
                         b,
@@ -216,7 +219,8 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
                                                           at::Tensor out,
                                                           at::Tensor lse,
                                                           at::Tensor lse_acc,
-                                                          at::Tensor out_acc)
+                                                          at::Tensor out_acc,
+                                                          std::optional<const at::Tensor> &sink_ptr_)
 {
     // q: (total_q, nheads, d)
     // k: (num_blocks, page_block_size, num_heads_k, d)
@@ -270,7 +274,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     else {
         args.seqlen_k_ptr = nullptr;
     }
-
+    args.sink_ptr = (sink_ptr_.has_value()) ? sink_ptr_.value().data_ptr() : nullptr;
     args.batch = b;
     args.max_seqlen_q = max_seqlen_q;
     args.hdim_q = d;
@@ -369,7 +373,8 @@ mha_varlen_fwd(
     std::optional<const at::Tensor> v_descale_,    // [1]
     std::optional<at::Generator> gen_,
     std::optional<const at::Tensor> cu_seqlens_q_padded_, // [b+1] physical starts with PAD
-    std::optional<const at::Tensor> cu_seqlens_k_padded_) // [b+1]
+    std::optional<const at::Tensor> cu_seqlens_k_padded_, // [b+1]
+    std::optional<const at::Tensor> sink_ptr)
 {
     auto q_dtype = q.scalar_type();
     bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
@@ -600,8 +605,8 @@ mha_varlen_fwd(
                     out,
                     softmax_lse,
                     softmax_lse_accum,
-                    out_accum);
-
+                    out_accum,
+                    sink_ptr);
             float t = aiter::mha_fwd_splitkv(args,
                                              stream_config,
                                              dtype_str,
@@ -650,7 +655,8 @@ mha_varlen_fwd(
                     const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_),
                     dtype_str,
                     bias_type,
-                    qscale_type);
+                    qscale_type,
+                    sink_ptr);
             float t = aiter::mha_fwd(args, stream_config);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
