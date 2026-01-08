@@ -1684,8 +1684,8 @@ def run_pa_gluon_test(
 
     return results
 
-def create_argument_parser() -> argparse.ArgumentParser:
 
+def create_argument_parser() -> argparse.ArgumentParser:
     """Create command line argument parser."""
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1972,9 +1972,7 @@ def run_multi_pa_gluon_test(
                                                             for (
                                                                 sliding_window
                                                             ) in sliding_window_options:
-                                                                for (
-                                                                    ps
-                                                                ) in ps_options:
+                                                                for ps in ps_options:
                                                                     test_config = {
                                                                         "use_torch_flash_ref": use_torch_flash_ref,
                                                                         "compute_type": ct,
@@ -2286,7 +2284,7 @@ def sliding_window_accuracy_test():
     BATCH_SIZE_OPTIONS = [1, 4, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, True]]
-    QUANT_MODE_OPTIONS = ["per_tensor"]
+    QUANT_MODE_OPTIONS = ["per_token"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [True]
     HEAD_CONFIGURATIONS = [(64, 8)]
@@ -2337,7 +2335,6 @@ def sliding_window_performance_test():
     parse_arg_and_run_test()
 
 
-
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
 def test_multi_case_set(case_set_name):
     if case_set_name == "normal_accuracy":
@@ -2351,7 +2348,7 @@ def test_multi_case_set(case_set_name):
 
 
 if __name__ == "__main__":
-    # normal_accuracy_test()
-    # normal_performance_test()
-    sliding_window_accuracy_test()
+    normal_accuracy_test()
+    normal_performance_test()
+    # sliding_window_accuracy_test()
     # sliding_window_performance_test()
