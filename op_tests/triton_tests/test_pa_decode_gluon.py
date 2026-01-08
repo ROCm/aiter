@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union, Dict
 import hashlib
 import pandas as pd
 import numpy as np
+import pytest
 import torch
 import triton
 import aiter
@@ -15,6 +16,8 @@ from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.ops.attention import pa_decode_gluon
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
 )
@@ -33,12 +36,8 @@ except ImportError:
 
 
 TRITON_VERSION = triton.__version__
-# TEST_NAME = "temp"
-# TEST_NAME = "pa_gluon_opt_bf16.ali_test.aot"
-# TEST_NAME = "pa_gluon_opt_bf16_v2.ali_test.aot"
-# TEST_NAME = "fix_mi350_fp8_aot_DDD_opt_mtp.ali_test.jit"
-TEST_NAME = "fix_mi350_fp8_aot_DDD_opt_mtp.normal_accuracy_performance.jit"
-# TEST_NAME = "fix_mi350_fp8_aot_DDD_opt_mtp.normal_accuracy_performance.aot"
+TEST_NAME = "main.normal_accuracy_performance.jit"
+# TEST_NAME = "main.normal_accuracy_performance.aot"
 
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
@@ -65,7 +64,6 @@ CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
 QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
 HEAD_DIMENSION_OPTIONS = [128]
-
 BLOCK_SIZE_OPTIONS = [16, 64, 1024]
 HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 4)]
 QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
@@ -81,6 +79,8 @@ PS_OPTIONS = [True, False]
 # CONTEXT_LENGTH_OPTIONS = [4096]
 # BATCH_SIZE_OPTIONS = [4, 128]
 # COMPUTE_TYPE_OPTIONS = [dtypes.d_dtypes[key] for key in COMPUTE_TYPE_OPTIONS]
+
+CASE_SET_NAME_OPTIONS = ["normal_accuracy", "sliding_window_accuracy"]
 
 
 def setup_seed(seed: int) -> None:
@@ -269,8 +269,6 @@ def create_kv_cache(
             # key_cache.uniform_(-28, 28)
         else:
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
-        # key_cache = torch.randn(size=key_cache_shape, dtype=torch_dtype, device=device)
-        # # key_cache *= 10.0
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
@@ -285,10 +283,6 @@ def create_kv_cache(
             # value_cache.uniform_(-56, 56)
         else:
             raise ValueError(f"Does not support value cache of type {cache_dtype}")
-        # value_cache = torch.randn(
-        #     size=value_cache_shape, dtype=torch_dtype, device=device
-        # )
-        # # value_cache *= 10.0
         value_caches.append(value_cache)
 
     return key_caches, value_caches
@@ -1427,8 +1421,6 @@ def run_pa_gluon_test(
         2 * sum(kv_len_list) * num_kv_heads * quantized_keys.dtype.itemsize
         + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
     )
-    # print(f"quantized_keys[0, 0, 1, 0]([batch_id, kv_head_id, seq_id, hd_id])={quantized_keys[block_tables[0, 0], 0, 0, 1, 0].to(torch.float32)}")
-    # print(f"quantized_keys[0, 0, 1, 1]([batch_id, kv_head_id, seq_id, hd_id])={quantized_keys[block_tables[0, 0], 0, 0, 1, 1].to(torch.float32)}")
 
     if trans_v:
         quantized_values = shuffle_value_cache_layout(quantized_values)
@@ -1648,6 +1640,7 @@ def run_pa_gluon_test(
     query_group_size = num_query_heads // num_kv_heads
     skip_assembly = (
         (block_size == 1024 and num_heads != (10, 1))
+        or (block_size == 1024 and arch_info.get_arch() in ["gfx950"])
         or (block_size == 16 and query_group_size == 8 and query_length == 3)
         or (query_group_size == 5 and query_length == 3)
         or (block_size == 64)
@@ -1679,11 +1672,6 @@ def run_pa_gluon_test(
             assembly_output.to(torch.float32).detach().cpu().numpy(),
             reference_output_quant.to(torch.float32).detach().cpu().numpy(),
         )
-        # print("\nAIT_Assembly vs FlashAttn-style Ref:")
-        # compare_arrays(
-        #     assembly_output.to(torch.float32).detach().cpu().numpy(),
-        #     reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
-        # )
         assembly_md5 = hashlib.md5(
             assembly_output.contiguous()
             .view(torch.uint8)
@@ -2049,7 +2037,12 @@ def parse_arg_and_run_test(sample_rate0: float = None):
     print(f"Triton version: {triton.__version__}")
 
     parser = create_argument_parser()
-    args = parser.parse_args()
+    # When running via pytest, use empty args to avoid conflict with pytest's argv
+    running_via_pytest = "pytest" in sys.argv[0] or sys.argv[0].endswith("py.test")
+    if running_via_pytest:
+        args = parser.parse_args([])
+    else:
+        args = parser.parse_args()
     (
         block_sizes,
         head_configs,
@@ -2183,59 +2176,9 @@ def parse_arg_and_run_test(sample_rate0: float = None):
             f"\nTests failed! {total_errors} test case(s) exceeded the error threshold. "
         )
         print(f"Please check rows with non-zero err_gluon in {output_file}.")
+        assert False, f"{total_errors} test case(s) exceeded the error threshold"
     else:
         print("\nAll tests passed!")
-
-
-# @pytest.mark.parametrize("block_size", BLOCK_SIZE_OPTIONS)
-# @pytest.mark.parametrize("num_heads", HEAD_CONFIGURATIONS)
-# @pytest.mark.parametrize("head_size", HEAD_DIMENSION_OPTIONS)
-# @pytest.mark.parametrize("data_type_str", COMPUTE_TYPE_OPTIONS)
-# @pytest.mark.parametrize("query_length", QUERY_LENGTH_OPTIONS)
-# @pytest.mark.parametrize("context_length", CONTEXT_LENGTH_OPTIONS)
-# @pytest.mark.parametrize("batch_size", BATCH_SIZE_OPTIONS)
-# @pytest.mark.parametrize("quant_mode", QUANT_MODE_OPTIONS)
-# @pytest.mark.parametrize("trans_v", TRANS_V_OPTIONS)
-# @pytest.mark.parametrize("kv_varlen", KV_VARLEN_OPTIONS)
-# def test_pa_gluon(
-#     block_size: int,
-#     num_heads: Tuple[int, int],
-#     head_size: int,
-#     data_type_str: str,
-#     query_length: int,
-#     context_length: int,
-#     batch_size: int,
-#     quant_mode: str,
-#     trans_v: int,
-#     kv_varlen: int,
-# ):
-#     """
-#     Pytest-compatible version of run_pa_gluon_test.
-
-#     This function uses the same default parameters as the main function
-#     but is designed to work with pytest for automated testing.
-#     """
-#     # Convert data type string to torch dtype
-#     data_type = dtypes.d_dtypes[data_type_str]
-
-#     # Call the original test function with all parameters
-#     results = run_pa_gluon_test(
-#         context_length=context_length,
-#         batch_size=batch_size,
-#         num_heads=num_heads,
-#         head_size=head_size,
-#         block_size=block_size,
-#         data_type=data_type,
-#         query_length=query_length,
-#         quant_mode=quant_mode,
-#         trans_v=trans_v,
-#         kv_varlen=kv_varlen,
-#     )
-
-#     # Assert that the test completed successfully
-#     # Check if gluon implementation passed
-#     gluon_error = results.get("err_gluon", 0)
-#     assert gluon_error == 0, f"gluon implementation test FAILED!"
 
 
 def normal_accuracy_test():
@@ -2325,7 +2268,7 @@ def normal_performance_test():
     # parse_arg_and_run_test()
 
 
-def sliding_window_test():
+def sliding_window_accuracy_test():
     """Run simple test."""
     global BLOCK_SIZE_OPTIONS
     global QUERY_LENGTH_OPTIONS
@@ -2406,8 +2349,20 @@ def sliding_window_performance_test():
     parse_arg_and_run_test()
 
 
+@pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
+def test_multi_case_set(case_set_name):
+    if case_set_name == "normal_accuracy":
+        normal_accuracy_test()
+    elif case_set_name == "normal_performance":
+        normal_performance_test()
+    elif case_set_name == "sliding_window_accuracy":
+        sliding_window_accuracy_test()
+    elif case_set_name == "sliding_window_performance":
+        sliding_window_performance_test()
+
+
 if __name__ == "__main__":
-    # normal_accuracy_test()
-    # normal_performance_test()
-    sliding_window_test()
-    # sliding_window_performance_test()
+    normal_accuracy_test()
+    normal_performance_test()
+    sliding_window_accuracy_test()
+    sliding_window_performance_test()

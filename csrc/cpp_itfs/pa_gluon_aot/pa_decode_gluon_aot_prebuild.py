@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import random
 from typing import Optional, Tuple, Union, Dict
@@ -557,7 +557,9 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         compute_types_quant_q_and_kv = COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
         for idx in range(len(compute_types_quant_q_and_kv)):
             if not isinstance(compute_types_quant_q_and_kv[idx][0], torch.dtype):
-                compute_types_quant_q_and_kv[idx][0] = dtypes.d_dtypes[compute_types_quant_q_and_kv[idx][0]]
+                compute_types_quant_q_and_kv[idx][0] = dtypes.d_dtypes[
+                    compute_types_quant_q_and_kv[idx][0]
+                ]
 
     return (
         block_sizes,
@@ -663,9 +665,7 @@ def run_multi_pa_gluon_test(
             for ct, quant_q, quant_kv in compute_types_quant_q_and_kv:
                 for trans_v_mode in trans_v:
                     for kv_varlen_mode in kv_varlen:
-                        for (
-                            context_partition_size
-                        ) in context_partition_size_options:
+                        for context_partition_size in context_partition_size_options:
                             qm_cnt = 0
                             for qm in quant_mode:
                                 qm_cnt += 1
@@ -714,36 +714,48 @@ def run_multi_pa_gluon_test(
                                                                 )
 
                                                                 # Calculate power of 2 values
-                                                                head_size_pow2 = (
-                                                                    triton.next_power_of_2(
-                                                                        head_size
-                                                                    )
+                                                                head_size_pow2 = triton.next_power_of_2(
+                                                                    head_size
                                                                 )
 
                                                                 # Determine quantization modes
                                                                 if quant_q:
-                                                                    if qm == "per_tensor":
-                                                                        query_quant_mode = 0
+                                                                    if (
+                                                                        qm
+                                                                        == "per_tensor"
+                                                                    ):
+                                                                        query_quant_mode = (
+                                                                            0
+                                                                        )
                                                                     else:  # per_token
-                                                                        query_quant_mode = 1
+                                                                        query_quant_mode = (
+                                                                            1
+                                                                        )
                                                                 else:
-                                                                    query_quant_mode = -1
+                                                                    query_quant_mode = (
+                                                                        -1
+                                                                    )
 
                                                                 if quant_kv:
-                                                                    if qm == "per_tensor":
-                                                                        kv_quant_mode = 0
+                                                                    if (
+                                                                        qm
+                                                                        == "per_tensor"
+                                                                    ):
+                                                                        kv_quant_mode = (
+                                                                            0
+                                                                        )
                                                                     else:  # per_token
-                                                                        kv_quant_mode = 1
+                                                                        kv_quant_mode = (
+                                                                            1
+                                                                        )
                                                                 else:
                                                                     kv_quant_mode = -1
 
                                                                 # Determine fp8_max_value
                                                                 if kv_quant_mode >= 0:
-                                                                    fp8_max_value = (
-                                                                        torch.finfo(
-                                                                            aiter.dtypes.fp8
-                                                                        ).max
-                                                                    )
+                                                                    fp8_max_value = torch.finfo(
+                                                                        aiter.dtypes.fp8
+                                                                    ).max
                                                                 else:
                                                                     fp8_max_value = 1.0
 
@@ -751,9 +763,7 @@ def run_multi_pa_gluon_test(
                                                                 is_causal = int(ql > 1)
 
                                                                 # use_sinks for func_name (cdna_version already set at function start)
-                                                                use_sinks = (
-                                                                    0  # Default: no sinks
-                                                                )
+                                                                use_sinks = 0  # Default: no sinks
 
                                                                 # Calculate func_name
                                                                 func_name = get_default_func_name(
@@ -777,9 +787,9 @@ def run_multi_pa_gluon_test(
                                                                     ),
                                                                 )
                                                                 # Store func_name in test_config for deduplication
-                                                                test_config["func_name"] = (
-                                                                    func_name
-                                                                )
+                                                                test_config[
+                                                                    "func_name"
+                                                                ] = func_name
                                                                 test_configs.append(
                                                                     test_config
                                                                 )
@@ -976,5 +986,5 @@ def prebuild_normal_performance_cases_aot_so():
 
 if __name__ == "__main__":
     prebuild_normal_accuracy_cases_aot_so()
-    # prebuild_normal_performance_cases_aot_so()
+    prebuild_normal_performance_cases_aot_so()
     get_so_files_size_and_count()
