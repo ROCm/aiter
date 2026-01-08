@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import itertools
@@ -14,6 +14,7 @@ import aiter
 from aiter import dtypes
 from aiter import pertoken_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
+import torch.profiler as tpf
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -308,76 +309,71 @@ def asm_V_shuffle(VC):
     return VC
 
 
-def benchmark_with_percentile(func, num_runs=20, warmup=5):
+def profile_kernel_breakdown(func, num_iters=10, num_warmup=3):
     """
-    Run a function multiple times and compute performance statistics.
-
-    Args:
-        func: Function to benchmark (should return (output, time_in_us))
-        num_runs: Number of runs for statistics (default: 20)
-        warmup: Number of warmup runs (default: 5)
-
-    Returns:
-        output: Function output from last run
-        stats: Dict with p50, p95, p99, mean, min, max (all in microseconds)
+    Profile a function and extract PA kernel and reduce kernel time breakdown.
     """
-    import numpy as np
+    for _ in range(num_warmup):
+        func()
+    torch.cuda.synchronize()
 
-    # Warmup
-    for _ in range(warmup):
-        output, _ = func()
+    with tpf.profile(
+        activities=[tpf.ProfilerActivity.CUDA],
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        for _ in range(num_iters):
+            func()
+        torch.cuda.synchronize()
 
-    # Collect timing data
-    times = []
-    for _ in range(num_runs):
-        output, time_us = func()
-        if isinstance(time_us, torch.Tensor):
-            time_us = time_us.item()
-        times.append(time_us)
+    # Analyze kernel times
+    pa_time = 0.0
+    reduce_time = 0.0
+    total_time = 0.0
 
-    times = np.array(times)
-    stats = {
-        "p50": np.percentile(times, 50),
-        "p95": np.percentile(times, 95),
-        "p99": np.percentile(times, 99),
-        "mean": np.mean(times),
-        "min": np.min(times),
-        "max": np.max(times),
-    }
+    for event in prof.events():
+        if event.device_type.name == "CUDA":
+            time_us = event.device_time_total
+            total_time += time_us
+            name = event.name.lower()
+            if "reduce" in name:
+                reduce_time += time_us
+            elif "pa_" in name or "pa " in name:
+                pa_time += time_us
 
-    return output, stats
+    avg_total = total_time / num_iters if num_iters > 0 else 0
+    pa_ratio = pa_time / total_time if total_time > 0 else 0
+    reduce_ratio = reduce_time / total_time if total_time > 0 else 0
+
+    return avg_total, pa_ratio, reduce_ratio
 
 
-def print_performance_comparison(name1, stats1, name2, stats2, seq_lens=None):
-    print("\n" + "=" * 80)
+def print_performance_comparison(name1, us1, name2, us2, seq_lens=None,
+                                  pa_ratio1=None, reduce_ratio1=None,
+                                  pa_ratio2=None, reduce_ratio2=None):
+    print("\n" + "=" * 100)
     print("PERFORMANCE COMPARISON")
-    print("=" * 80)
+    print("=" * 100)
 
     if seq_lens is not None:
         print(f"Sequence Lengths: {seq_lens[0]}")
-        print("-" * 80)
+        print("-" * 100)
 
-    # Header
-    print(
-        f"{'Method':<30} {'Mean':>10} {'P50':>10} {'P95':>10} {'P99':>10} {'Min':>10} {'Max':>10}"
-    )
-    print("-" * 80)
+    if pa_ratio1 is not None:
+        print(f"{'Method':<35} {'Time (us)':>12} {'PA Kernel':>12} {'Reduce':>12}")
+        print("-" * 100)
+        print(f"{name1:<35} {us1:>11.2f}us {pa_ratio1*100:>10.1f}% {reduce_ratio1*100:>10.1f}%")
+        print(f"{name2:<35} {us2:>11.2f}us {pa_ratio2*100:>10.1f}% {reduce_ratio2*100:>10.1f}%")
+    else:
+        print(f"{'Method':<35} {'Time (us)':>15}")
+        print("-" * 100)
+        print(f"{name1:<35} {us1:>14.2f}us")
+        print(f"{name2:<35} {us2:>14.2f}us")
 
-    # Method 1
-    print(
-        f"{name1:<30} {stats1['mean']:>9.2f}ms {stats1['p50']:>9.2f}ms {stats1['p95']:>9.2f}ms {stats1['p99']:>9.2f}ms {stats1['min']:>9.2f}ms {stats1['max']:>9.2f}ms"
-    )
-
-    # Method 2
-    print(
-        f"{name2:<30} {stats2['mean']:>9.2f}ms {stats2['p50']:>9.2f}ms {stats2['p95']:>9.2f}ms {stats2['p99']:>9.2f}ms {stats2['min']:>9.2f}ms {stats2['max']:>9.2f}ms"
-    )
-
-    # Speedup
-    print("-" * 80)
-    speedup = stats2["p99"] / stats1["p99"] if stats1["p99"] > 0 else 0
-    print(f"{'Speedup (P99)':<30} {speedup:>9.2f}x")
-    print("=" * 80 + "\n")
+    print("-" * 100)
+    speedup = us2 / us1 if us1 > 0 else 0
+    print(f"{'Speedup':<35} {speedup:>14.2f}x")
+    print("=" * 100 + "\n")
 
 
 @benchmark()
@@ -570,11 +566,49 @@ def test_pa_mtp(
     output = torch.empty_like(query)
 
     if use_p99:
-        out_aiter_asm, stats_ps = benchmark_with_percentile(
-            lambda: run_aiter_asm_ps(
+        # Prepare V cache for both methods
+        v_shuffled = asm_V_shuffle(v_quant_)
+
+        out_aiter_asm, us_pa_ps = run_aiter_asm_ps(
+            Q=query,
+            K=k_quant_,
+            V=v_shuffled,
+            output=output,
+            max_qlen=max_qlen,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            context_lens=seq_lens_kv,
+            K_QScale=k_scale_asm,
+            V_QScale=v_scale_asm,
+            work_indptr=work_indptr,
+            work_info=work_info,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            softmax_scale=scale,
+            mask=1,
+        )
+
+        _, us_pa_asm = run_aiter_asm(
+            query,
+            k_quant_,
+            v_shuffled,
+            block_tables,
+            seq_lens_kv,
+            block_tables.size(1),
+            max_qlen,
+            k_scale=k_scale_asm,
+            v_scale=v_scale_asm,
+            qo_indptr=qo_indptr,
+        )
+
+        # Profile kernel breakdown for PA PS
+        _, pa_ratio_ps, reduce_ratio_ps = profile_kernel_breakdown(
+            lambda: aiter.pa_persistent_fwd(
                 Q=query,
                 K=k_quant_,
-                V=asm_V_shuffle(v_quant_),
+                V=v_shuffled,
                 output=output,
                 max_qlen=max_qlen,
                 qo_indptr=qo_indptr,
@@ -590,26 +624,24 @@ def test_pa_mtp(
                 reduce_partial_map=reduce_partial_map,
                 softmax_scale=scale,
                 mask=1,
-            ),
-            num_runs=10,
-            warmup=3,
+            )
         )
 
-        _, stats_no_ps = benchmark_with_percentile(
-            lambda: run_aiter_asm(
+        # Profile kernel breakdown for PA ASM (no reduce kernel)
+        _, pa_ratio_asm, reduce_ratio_asm = profile_kernel_breakdown(
+            lambda: aiter.pa_fwd_asm(
                 query,
                 k_quant_,
-                asm_V_shuffle(v_quant_),
+                v_shuffled,
                 block_tables,
                 seq_lens_kv,
                 block_tables.size(1),
                 max_qlen,
-                k_scale=k_scale_asm,
-                v_scale=v_scale_asm,
-                qo_indptr=qo_indptr,
-            ),
-            num_runs=10,
-            warmup=3,
+                k_scale_asm,
+                v_scale_asm,
+                None,
+                qo_indptr,
+            )
         )
 
         # Verify correctness
@@ -622,22 +654,24 @@ def test_pa_mtp(
         # Print performance comparison
         print_performance_comparison(
             "PA with Persistent Scheduling",
-            stats_ps,
+            us_pa_ps,
             "PA without Persistent Scheduling",
-            stats_no_ps,
+            us_pa_asm,
             seq_lens=seq_lens_kv.tolist(),
+            pa_ratio1=pa_ratio_ps,
+            reduce_ratio1=reduce_ratio_ps,
+            pa_ratio2=pa_ratio_asm,
+            reduce_ratio2=reduce_ratio_asm,
         )
 
         # Store results
-        ret["us_asm_fp8"] = stats_ps["p99"]
-        ret["us_asm_fp8_mean"] = stats_ps["mean"]
-        ret["us_asm_fp8_p50"] = stats_ps["p50"]
-        ret["us_asm_fp8_p95"] = stats_ps["p95"]
-        ret["us_asm_noquant_p99"] = stats_no_ps["p99"]
-        ret["us_asm_noquant_mean"] = stats_no_ps["mean"]
-        ret["speedup_p99"] = (
-            stats_no_ps["p99"] / stats_ps["p99"] if stats_ps["p99"] > 0 else 0
-        )
+        ret["us_pa_ps"] = us_pa_ps
+        ret["us_pa_asm"] = us_pa_asm
+        ret["speedup"] = us_pa_asm / us_pa_ps if us_pa_ps > 0 else 0
+        ret["pa_ratio_ps"] = pa_ratio_ps
+        ret["reduce_ratio_ps"] = reduce_ratio_ps
+        ret["pa_ratio_asm"] = pa_ratio_asm
+        ret["reduce_ratio_asm"] = reduce_ratio_asm
         ret["err fp8"] = err
     else:
         out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
@@ -814,10 +848,10 @@ parser.add_argument(
     --dump_metadata # True""",
 )
 parser.add_argument(
-    "--use_p99",
+    "--profile",
     action="store_true",
-    help="""Enable P99 performance benchmarking (10 runs). Default: False (single run).
-    --use_p99 # Enable detailed performance stats""",
+    help="""Enable performance profiling. Default: False (single run).
+    --profile # Enable detailed performance stats""",
 )
 args = parser.parse_args()
 if args.dtype is None:
@@ -851,7 +885,7 @@ for dtype in l_dtype:
             l_varlen,
             args.load_metadata,
             args.dump_metadata,
-            args.use_p99,
+            args.profile,
         )
         df.append(ret)
     df = pd.DataFrame(df)
