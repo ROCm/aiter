@@ -356,75 +356,6 @@ def profile_kernel_breakdown(func, num_iters=100, num_warmup=10):
     return avg_total, pa_ratio, reduce_ratio, avg_pa_time, avg_reduce_time
 
 
-def print_performance_comparison(
-    name1,
-    us1,
-    name2,
-    us2,
-    seq_lens=None,
-    pa_ratio1=None,
-    reduce_ratio1=None,
-    pa_ratio2=None,
-    reduce_ratio2=None,
-    us_metadata=None,
-    us_pa1=None,
-    us_reduce1=None,
-    us_pa2=None,
-    us_reduce2=None,
-    batch_size=None,
-):
-    print("\n" + "=" * 120)
-    print("PERFORMANCE COMPARISON")
-    print("=" * 120)
-
-    if seq_lens is not None:
-        print(f"Sequence Lengths: {seq_lens[0]}")
-        print("-" * 120)
-    if batch_size is not None:
-        print(f"Batch Size: {batch_size}")
-
-    if us_metadata is not None:
-        print(f"{'Metadata (get_pa_metadata_v1)':<35} {us_metadata:>11.2f}us")
-        print("-" * 120)
-
-    if pa_ratio1 is not None:
-        print(f"{'Method':<35} {'Time (us)':>12} {'PA Kernel':>20} {'Reduce':>20}")
-        print("-" * 120)
-        pa_str1 = (
-            f"{us_pa1:>8.2f}us ({pa_ratio1*100:>5.1f}%)"
-            if us_pa1 is not None
-            else f"{pa_ratio1*100:>10.1f}%"
-        )
-        reduce_str1 = (
-            f"{us_reduce1:>8.2f}us ({reduce_ratio1*100:>5.1f}%)"
-            if us_reduce1 is not None
-            else f"{reduce_ratio1*100:>10.1f}%"
-        )
-        print(f"{name1:<35} {us1:>11.2f}us {pa_str1:>20} {reduce_str1:>20}")
-        pa_str2 = (
-            f"{us_pa2:>8.2f}us ({pa_ratio2*100:>5.1f}%)"
-            if us_pa2 is not None
-            else f"{pa_ratio2*100:>10.1f}%"
-        )
-
-        reduce_str2 = (
-            f"{us_reduce2:>8.2f}us ({reduce_ratio2*100:>5.1f}%)"
-            if us_reduce2 is not None
-            else f"{reduce_ratio2*100:>10.1f}%"
-        )
-        print(f"{name2:<35} {us2:>11.2f}us {pa_str2:>20} {reduce_str2:>20}")
-    else:
-        print(f"{'Method':<35} {'Time (us)':>15}")
-        print("-" * 120)
-        print(f"{name1:<35} {us1:>14.2f}us")
-        print(f"{name2:<35} {us2:>14.2f}us")
-
-    print("-" * 120)
-    speedup = us2 / us1 if us1 > 0 else 0
-    print(f"{'Speedup':<35} {speedup:>14.2f}x")
-    print("=" * 120 + "\n")
-
-
 @benchmark()
 def test_pa_mtp(
     ctx_lens: int,
@@ -437,7 +368,7 @@ def test_pa_mtp(
     varlen: bool = False,
     load_metadata: bool = False,
     dump_metadata: bool = False,
-    use_p99: bool = False,
+    profile_ps: bool = False,
 ) -> dict:
     ret = {}
     seed = 0
@@ -584,6 +515,27 @@ def test_pa_mtp(
             torch.set_printoptions(threshold=999999, linewidth=120)
             print(f"==>load {name} from {file_name}:\n{meta}")
     else:
+        # warmup for get_pa_metadata_v1
+        aiter.get_pa_metadata_v1(
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            1,
+            1,
+            True,
+            work_metadata_ptrs,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            kv_granularity=max(block_size, 16),
+            block_size=block_size,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+            max_split_per_batch=-1,
+        )
         torch.cuda.synchronize()
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -622,7 +574,7 @@ def test_pa_mtp(
     # Benchmark PA Persistent Scheduling
     output = torch.empty_like(query)
 
-    if use_p99:
+    if profile_ps:
         # Prepare V cache for both methods
         v_shuffled = asm_V_shuffle(v_quant_)
 
@@ -647,7 +599,7 @@ def test_pa_mtp(
             mask=1,
         )
 
-        _, us_pa_asm = run_aiter_asm(
+        _, us_pa_nops = run_aiter_asm(
             query,
             k_quant_,
             v_shuffled,
@@ -661,7 +613,7 @@ def test_pa_mtp(
         )
 
         # Profile kernel breakdown for PA PS
-        _, pa_ratio_ps, reduce_ratio_ps, us_pa_kernel_ps, us_reduce_kernel_ps = (
+        _, pa_ps_ratio, reduce_ratio, us_pa_ps_kernel, us_reduce_kernel = (
             profile_kernel_breakdown(
                 lambda: aiter.pa_persistent_fwd(
                     Q=query,
@@ -686,8 +638,8 @@ def test_pa_mtp(
             )
         )
 
-        # Profile kernel breakdown for PA ASM (no reduce kernel)
-        _, _, reduce_ratio_asm, us_pa_kernel_asm, _ = profile_kernel_breakdown(
+        # Profile kernel breakdown for PA NOPS (no reduce kernel)
+        _, _, _, us_pa_nops_kernel, _ = profile_kernel_breakdown(
             lambda: aiter.pa_fwd_asm(
                 query,
                 k_quant_,
@@ -710,38 +662,18 @@ def test_pa_mtp(
             msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
         )
 
-        # Print performance comparison
-        print_performance_comparison(
-            "PA with Persistent Scheduling",
-            us_pa_ps,
-            "PA without Persistent Scheduling",
-            us_pa_asm,
-            seq_lens=seq_lens_kv.tolist(),
-            pa_ratio1=pa_ratio_ps,
-            reduce_ratio1=reduce_ratio_ps,
-            pa_ratio2=1,
-            reduce_ratio2=reduce_ratio_asm,
-            us_metadata=us_metadata,
-            us_pa1=us_pa_kernel_ps,
-            us_reduce1=us_reduce_kernel_ps,
-            us_pa2=us_pa_kernel_asm,
-            us_reduce2=0,
-            batch_size=batch_size,
-        )
-
         # Store results
         ret["us_metadata"] = us_metadata
+        ret["us_pa_nops"] = us_pa_nops
         ret["us_pa_ps"] = us_pa_ps
-        ret["us_pa_asm"] = us_pa_asm
-        ret["speedup"] = us_pa_asm / us_pa_ps if us_pa_ps > 0 else 0
-        ret["pa_ratio_ps"] = pa_ratio_ps
-        ret["reduce_ratio_ps"] = reduce_ratio_ps
-        ret["us_pa_kernel_ps"] = us_pa_kernel_ps
-        ret["us_reduce_kernel_ps"] = us_reduce_kernel_ps
-        # ret["pa_ratio_asm"] = pa_ratio_asm
-        # ret["reduce_ratio_asm"] = reduce_ratio_asm
-        # ret["us_pa_kernel_asm"] = us_pa_kernel_asm
-        # ret["us_reduce_kernel_asm"] = us_reduce_kernel_asm
+        ret["us_pa_ps_kernel"] = us_pa_ps_kernel
+        ret["pa_ps_ratio"] = pa_ps_ratio
+        ret["us_reduce_kernel"] = us_reduce_kernel
+        ret["reduce_ratio"] = reduce_ratio
+        ret["speedup"] = us_pa_nops / us_pa_ps if us_pa_ps > 0 else 0
+        ret["speedup(pa)"] = (
+            us_pa_nops_kernel / us_pa_ps_kernel if us_pa_ps_kernel > 0 else 0
+        )
         ret["err fp8"] = err
     else:
         out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
@@ -810,39 +742,29 @@ l_dtype = ["bf16"]
 l_num_heads = [
     (10, 1),
     # (16, 1),
-]  # num_query_heads must be multiple of 16 for get_mla_metadata_info_v1
+]
 l_qlen = [1, 2, 3, 4]
 # l_qlen = [4]
-# q_Tile is [max_qlen * num_query_heads // num_kv_heads]
-kv_lens_list0 = [i * 256 for i in range(1, 10)]
-kv_lens_list1 = [i - 1 for i in kv_lens_list0]
-kv_lens_list3 = [i + 10 for i in kv_lens_list0]
-kv_lens_list = [
+l_ctx_len = [
     7,
-    26,
-    57,
-    66,
     109,
-    128,
-    257,
+    256,
     282,
-    3460,
-    16700,
-    7900,
+    1024,
     2580,
-    4140,
-    6360,
     4097,
-    16384,
-    90002,
-    90004,
+    8192,
+    10240,
 ]
-# l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
-# l_ctx_len = kv_lens_list0 + kv_lens_list1 + kv_lens_list3 + kv_lens_list
-l_ctx_len = kv_lens_list
-# l_ctx_len = [3460, 16700, 7900, 2580, 4140, 6360, 2270]
-# l_ctx_len = [16000]
-l_batch_size = [32, 64, 80]
+gpu = torch.cuda.current_device()
+device_properties = torch.cuda.get_device_properties(gpu)
+cu_num = device_properties.multi_processor_count
+l_batch_size = [
+    64,
+    158,
+    cu_num // 2 # even split
+]
+l_batch_size.sort()
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -963,3 +885,5 @@ for dtype in l_dtype:
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
     df.to_csv("pa_ps.csv")
+    pd.set_option ('display.max_columns', None)
+    print(df)
