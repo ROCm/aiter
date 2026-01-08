@@ -15,7 +15,7 @@ env:
   ATOM_BRANCH: "main"
   ATOM_REPOSITORY_URL: "https:/github.com/ROCM/ATOM"
   BASE_IMAGE: "rocm/pytorch:latest"
-  GITHUB_REPO_NAME: ${{ github.event.pull_request.head.repo.full_name || 'ROCm/FlyDSL' }}
+  GITHUB_REPO_NAME: ${{ github.event.pull_request.head.repo.full_name || 'ROCm/ATOM' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
 jobs:
