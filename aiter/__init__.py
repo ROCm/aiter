@@ -19,7 +19,8 @@ def getLogger():
 
         if log_level_str not in valid_levels:
             print(
-                f"[aiter] Warning: Invalid AITER_LOG_LEVEL '{log_level_str}', using 'INFO'. Valid values: {', '.join(valid_levels)}"
+                f"\033[93m[aiter] Warning: Invalid AITER_LOG_LEVEL '{log_level_str}', "
+                f"using 'INFO'. Valid values: {', '.join(valid_levels)}\033[0m"
             )
             log_level_str = "INFO"
 
