@@ -311,6 +311,67 @@ def _gemm_afp4wfp4_kernel(
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         gl.store(c_ptrs, c, mask=c_mask)
 
+@gluon.jit
+def _gemm_afp4wfp4_reduce_kernel(
+    c_in_ptr,
+    c_out_ptr,
+    M,
+    N,
+    stride_c_in_k,
+    stride_c_in_m,
+    stride_c_in_n,
+    stride_c_out_m,
+    stride_c_out_n,
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
+    ACTUAL_KSPLIT: gl.constexpr,
+    MAX_KSPLIT: gl.constexpr,
+):
+
+    pid_m = gl.program_id(axis=0)
+    pid_n = gl.program_id(axis=1)
+
+    blocked_kmn: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1, 4],
+        threads_per_warp=[2, 2, 16],
+        warps_per_cta=[1, 4, 1],
+        order=[2, 0, 1],
+    )
+
+    blocked_mn: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[4, 16],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+
+    offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_kmn)))) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_kmn)))) % N
+    offs_k = gl.arange(0, MAX_KSPLIT, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_kmn)))
+    c_in_ptrs = (
+        c_in_ptr
+        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_m[None, :, None] * stride_c_in_m)
+        + (offs_n[None, None, :] * stride_c_in_n)
+    )
+
+    if ACTUAL_KSPLIT == MAX_KSPLIT:
+        c = gl.load(c_in_ptrs)
+    else:
+        c = gl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT)
+    c = gl.sum(c, axis=0)
+
+    c = c.to(c_out_ptr.type.element_ty)
+    offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mn))) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_mn))) % N
+    c_out_ptrs = (
+        c_out_ptr
+        + (offs_m[:, None] * stride_c_out_m)
+        + (offs_n[None, :] * stride_c_out_n)
+    )
+    c = gl.convert_layout(c, layout=blocked_mn, assert_trivial=False)
+    gl.store(c_out_ptrs, c)
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -330,6 +391,42 @@ def _get_config(
         _get_config._config_dict = config
 
     return _get_config._config_dict["any"]
+
+def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
+    # heuristics for make "EVEN_K == True" as much as possible
+    NUM_KSPLIT_STEP = 2
+    BLOCK_SIZE_K_STEP = 2
+    SPLITK_BLOCK_SIZE = (
+        triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+    )
+    while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
+        if (
+            K % (SPLITK_BLOCK_SIZE // 2) == 0
+            and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
+            and K % (BLOCK_SIZE_K // 2) == 0
+        ):
+            break
+        elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
+            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+        elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
+            if NUM_KSPLIT > 1:
+                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            elif BLOCK_SIZE_K > 16:
+                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+        elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
+            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+        else:
+            break
+
+        SPLITK_BLOCK_SIZE = (
+            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        )
+
+    # re-ensuring NUM_KSPLIT is the correct value
+    NUM_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE // 2))
+
+    return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
+
 
 def gemm_afp4wfp4(
     x: torch.Tensor,
@@ -375,35 +472,33 @@ def gemm_afp4wfp4(
     if config is None:
         config = _get_config(M, N, K)
 
-    # if config["NUM_KSPLIT"] > 1:
-    #     SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-    #         K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-    #     )
+    if config["NUM_KSPLIT"] > 1:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
 
-    #     config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-    #     config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-    #     config["NUM_KSPLIT"] = NUM_KSPLIT
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT
 
-    # if config["BLOCK_SIZE_K"] >= 2 * K:
-    #     config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-    #     config["SPLITK_BLOCK_SIZE"] = 2 * K
-    #     config["NUM_KSPLIT"] = 1
-    # config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        config["NUM_KSPLIT"] = 1
+    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
 
-    # if config["NUM_KSPLIT"] > 1:
-    #     if _USE_GEMM_SPLITK_BF16:
-    #         y_pp = torch.empty(
-    #             (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=x.device
-    #         )
-    #     else:
-    #         y_pp = torch.empty(
-    #             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
-    #         )
-    # else:
-    #     config["SPLITK_BLOCK_SIZE"] = 2 * K
-    #     y_pp = None
-    config["SPLITK_BLOCK_SIZE"] = 2 * K
-    y_pp = None
+    if config["NUM_KSPLIT"] > 1:
+        if _USE_GEMM_SPLITK_BF16:
+            y_pp = torch.empty(
+                (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=x.device
+            )
+        else:
+            y_pp = torch.empty(
+                (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
+            )
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        y_pp = None
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -439,35 +534,35 @@ def gemm_afp4wfp4(
         **config,
     )
 
-    # if config["NUM_KSPLIT"] > 1:
-    #     if skip_reduce:
-    #         return y_pp
+    if config["NUM_KSPLIT"] > 1:
+        if skip_reduce:
+            return y_pp
 
-    #     REDUCE_BLOCK_SIZE_M = 16
-    #     # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
-    #     # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
-    #     # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
-    #     REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
-    #     ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
+        REDUCE_BLOCK_SIZE_M = 16
+        # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
+        # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
+        # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
+        REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
+        ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
 
-    #     grid_reduce = (
-    #         triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
-    #         triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
-    #     )
-    #     _gemm_afp4wfp4_reduce_kernel[grid_reduce](
-    #         y_pp,
-    #         y,
-    #         M,
-    #         N,
-    #         y_pp.stride(0),
-    #         y_pp.stride(1),
-    #         y_pp.stride(2),
-    #         y.stride(0),
-    #         y.stride(1),
-    #         REDUCE_BLOCK_SIZE_M,
-    #         REDUCE_BLOCK_SIZE_N,
-    #         ACTUAL_KSPLIT,
-    #         triton.next_power_of_2(config["NUM_KSPLIT"]),
-    #     )
+        grid_reduce = (
+            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        )
+        _gemm_afp4wfp4_reduce_kernel[grid_reduce](
+            y_pp,
+            y,
+            M,
+            N,
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(2),
+            y.stride(0),
+            y.stride(1),
+            REDUCE_BLOCK_SIZE_M,
+            REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),
+        )
 
     return y
