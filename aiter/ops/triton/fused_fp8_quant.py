@@ -519,6 +519,7 @@ def fused_reduce_rms_fp8_group_quant(
     res1=None,
     output_unquantized_inp1=False,
     out3=None,
+    transpose_scale=False,
 ):
     """
     This op contains several steps:
@@ -582,15 +583,29 @@ def fused_reduce_rms_fp8_group_quant(
         BLOCK_SIZE_N3 = 1
 
     out1_fp8 = torch.empty((M, N1), dtype=dtype_quant, device=inp1.device)
-    out1_bs = torch.empty(
-        (M, (N1 + group_size - 1) // group_size),
-        dtype=torch.float32,
-        device=inp1.device,
-    )
+    num_bs_cols = (N1 + group_size - 1) // group_size
+    if transpose_scale:
+        # Create with transposed shape for direct transposed storage
+        out1_bs = torch.empty(
+            (num_bs_cols, M),
+            dtype=torch.float32,
+            device=inp1.device,
+        )
+    else:
+        out1_bs = torch.empty(
+            (M, num_bs_cols),
+            dtype=torch.float32,
+            device=inp1.device,
+        )
     out1_fp8_row_stride = out1_fp8.stride(0)
     out1_fp8_col_stride = out1_fp8.stride(1)
-    out1_bs_row_stride = out1_bs.stride(0)
-    out1_bs_col_stride = out1_bs.stride(1)
+    # When transpose_scale=True, swap the strides to write directly in transposed layout
+    if transpose_scale:
+        out1_bs_row_stride = out1_bs.stride(1)
+        out1_bs_col_stride = out1_bs.stride(0)
+    else:
+        out1_bs_row_stride = out1_bs.stride(0)
+        out1_bs_col_stride = out1_bs.stride(1)
 
     out2 = None
     inp2_spk_stride = 0
@@ -722,6 +737,10 @@ def fused_reduce_rms_fp8_group_quant(
         NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
         num_warps=num_warps,
     )
+    # When transpose_scale=True, view the transposed buffer back to original shape
+    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    if transpose_scale:
+        out1_bs = out1_bs.view(M, num_bs_cols)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
 
