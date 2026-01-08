@@ -348,9 +348,17 @@ def profile_kernel_breakdown(func, num_iters=10, num_warmup=3):
     return avg_total, pa_ratio, reduce_ratio
 
 
-def print_performance_comparison(name1, us1, name2, us2, seq_lens=None,
-                                  pa_ratio1=None, reduce_ratio1=None,
-                                  pa_ratio2=None, reduce_ratio2=None):
+def print_performance_comparison(
+    name1,
+    us1,
+    name2,
+    us2,
+    seq_lens=None,
+    pa_ratio1=None,
+    reduce_ratio1=None,
+    pa_ratio2=None,
+    reduce_ratio2=None,
+):
     print("\n" + "=" * 100)
     print("PERFORMANCE COMPARISON")
     print("=" * 100)
@@ -362,8 +370,12 @@ def print_performance_comparison(name1, us1, name2, us2, seq_lens=None,
     if pa_ratio1 is not None:
         print(f"{'Method':<35} {'Time (us)':>12} {'PA Kernel':>12} {'Reduce':>12}")
         print("-" * 100)
-        print(f"{name1:<35} {us1:>11.2f}us {pa_ratio1*100:>10.1f}% {reduce_ratio1*100:>10.1f}%")
-        print(f"{name2:<35} {us2:>11.2f}us {pa_ratio2*100:>10.1f}% {reduce_ratio2*100:>10.1f}%")
+        print(
+            f"{name1:<35} {us1:>11.2f}us {pa_ratio1*100:>10.1f}% {reduce_ratio1*100:>10.1f}%"
+        )
+        print(
+            f"{name2:<35} {us2:>11.2f}us {pa_ratio2*100:>10.1f}% {reduce_ratio2*100:>10.1f}%"
+        )
     else:
         print(f"{'Method':<35} {'Time (us)':>15}")
         print("-" * 100)
