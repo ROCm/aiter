@@ -29,154 +29,6 @@ def get_fwd_configs(autotune: bool):
         "num_warps": 8,
     }
 
-    configs = []
-    keys = [
-        "IS_CAUSAL",
-        "dropout_p",
-        "MAX_SEQLENS_Q",
-        "MAX_SEQLENS_K",
-        "ACTUAL_BLOCK_DMODEL_QK",
-        "ACTUAL_BLOCK_DMODEL_V",
-        "IS_VARLEN",
-        "HQ",
-        "HK",
-    ]
-
-    # get best config for the architecture
-    if not autotune:
-        arch = get_arch()
-        if arch == "gfx950":
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 128,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                )
-            )
-        elif arch == "gfx942":
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": True,
-                    },
-                    num_warps=4,
-                    num_stages=1,
-                )
-            )
-            # if get_cu_count() < 304:
-            #    configs.extend(
-            #        [
-            #            # best fp8 config
-            #            triton.Config(
-            #                {
-            #                    "BLOCK_M": 128,
-            #                    "BLOCK_N": 64,
-            #                    "waves_per_eu": 2,
-            #                    "PRE_LOAD_V": False,
-            #                },
-            #                num_stages=1,
-            #                num_warps=4,
-            #            ),
-            #            ## best f16 config
-            #            #triton.Config(
-            #            #    {
-            #            #        "BLOCK_M": 128,
-            #            #        "BLOCK_N": 32,
-            #            #        "waves_per_eu": 2,
-            #            #        "PRE_LOAD_V": False,
-            #            #    },
-            #            #    num_stages=2,
-            #            #    num_warps=4,
-            #            #),
-            #        ]
-            #    )
-            # else:
-            #    configs.append(
-            #        triton.Config(
-            #            {
-            #                "BLOCK_M": 128,
-            #                "BLOCK_N": 64,
-            #                "waves_per_eu": 2,
-            #                "PRE_LOAD_V": False,
-            #            },
-            #            num_stages=1,
-            #            num_warps=4,
-            #        )
-            #    )
-        elif arch in (
-            "gfx1030",
-            "gfx1100",
-            "gfx1101",
-            "gfx1102",
-            "gfx1200",
-            "gfx1201",
-        ):  # RDNA architectures
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 32,
-                        "BLOCK_N": 32,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=2,
-                )
-            )
-        else:
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 64,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                )
-            )
-
-        return configs, keys
-
-    # ===================== Autotune Sweep =====================
-    BLOCK_M_OPTIONS = [128, 64, 32]
-    BLOCK_N_OPTIONS = [128, 64, 32]
-    NUM_WARPS_OPTIONS = [2, 4, 8]
-    NUM_STAGES_OPTIONS = [1, 2]
-    WAVES_PER_EU_OPTIONS = [4, 2, 1]
-    PRE_LOAD_V_OPTIONS = [False]
-    for bm in BLOCK_M_OPTIONS:
-        for bn in BLOCK_N_OPTIONS:
-            for waves in WAVES_PER_EU_OPTIONS:
-                for nw in NUM_WARPS_OPTIONS:
-                    for ns in NUM_STAGES_OPTIONS:
-                        for preload_v in PRE_LOAD_V_OPTIONS:
-                            configs.append(
-                                triton.Config(
-                                    {
-                                        "BLOCK_M": bm,
-                                        "BLOCK_N": bn,
-                                        "waves_per_eu": waves,
-                                        "PRE_LOAD_V": preload_v,
-                                    },
-                                    num_stages=ns,
-                                    num_warps=nw,
-                                )
-                            )
-
-    return configs, keys
-
-
-# fwd_prefill_autotune_configs, fwd_prefill_autotune_keys = get_fwd_configs(AUTOTUNE)
 
 
 @triton.jit
@@ -2151,9 +2003,6 @@ def sage_quant(
     k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
-    k_smoothed = torch.empty_like(k, device=v.device)
-
-
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = k.shape
@@ -2172,22 +2021,10 @@ def sage_quant(
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
-
     # Apply K tensor smoothing following SageAttention approach
     if smooth_k:
-        k_smoothing_kernel[(b * h_kv * head_dim, )](k,
-                                                    k_smoothed,
-                                                    stride_bz_k,
-                                                    stride_h_k,
-                                                    stride_seq_k,
-                                                    b,
-                                                    h_kv,
-                                                    head_dim,
-                                                    kv_len,
-                                                    triton.next_power_of_2(kv_len))
-        k = k_smoothed
+        k = k - k.mean(dim=1 if layout=="bshd" else 2, keepdim=True)
         
-
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
     if V_QUANT_SCHEME == 0:
@@ -2195,17 +2032,14 @@ def sage_quant(
             (b, h_kv, K_NUM_BLKS), device=v.device, dtype=torch.float32
         )
     else:
-        v_scale = torch.empty((b, h_kv, head_dim), device=v.device, dtype=torch.float32)
+        v_scale = v.abs().amax(dim=1 if layout=="bshd" else 2).to(torch.float32) / FP8_MAX
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
     q_task_count = b * h_qo * Q_NUM_BLKS
     k_task_count = b * h_kv * K_NUM_BLKS
-    if V_QUANT_SCHEME == 0:
-        v_task_count = b * h_kv * K_NUM_BLKS
-    else:
-        v_task_count = b * h_kv * head_dim
+    v_task_count = b * h_kv * K_NUM_BLKS
 
     grid = (q_task_count + k_task_count + v_task_count,)
 
@@ -2333,7 +2167,7 @@ def sage_quant_kernel(
     if pid < q_task_count:
         # here we do Q
         off_blk, off_h, off_b = pid_grid_3d(pid, Q_NUM_BLKS, Q_HEAD, BATCH)
-        offs_qn = off_blk * BLK_Q + offs_blk_q
+        offs_qn = (off_blk * BLK_Q + offs_blk_q) % SEQLEN_Q
 
         q_offs = (
             off_b * stride_qz
@@ -2351,15 +2185,15 @@ def sage_quant_kernel(
             q_output_ptrs,
             q_scale_ptrs,
             INT8_MAX,
-            offs_qn[:, None] < SEQLEN_Q,
-            sm_scale,
+            mask=None,
+            sm_scale=sm_scale,
         )
     elif pid >= q_task_count and pid < q_task_count + k_task_count:
         # here we do K
         _pid = pid - q_task_count
         off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
 
-        offs_kn = off_blk * BLK_K + offs_blk_k
+        offs_kn = (off_blk * BLK_K + offs_blk_k) % SEQLEN_K
 
         k_offs = (
             off_b * stride_kz
@@ -2377,24 +2211,24 @@ def sage_quant_kernel(
             k_output_ptrs,
             k_scale_ptrs,
             INT8_MAX,
-            offs_kn[:, None] < SEQLEN_K,
+            mask=None,
         )
     else:
         # V
         _pid = pid - (q_task_count + k_task_count)
+        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
+        offs_kn = (off_blk * BLK_K + offs_blk_k) % SEQLEN_K
+
+        v_offs = (
+            off_b * stride_kz
+            + off_h * stride_kh
+            + offs_kn[:, None] * stride_kn
+            + offs_d[None, :]
+        )
+
+        v_input_ptrs = V_Input + v_offs
+        v_output_ptrs = V_Output + v_offs
         if V_QUANT_SCHEME == 0:
-            off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-            offs_kn = off_blk * BLK_K + offs_blk_k
-
-            v_offs = (
-                off_b * stride_kz
-                + off_h * stride_kh
-                + offs_kn[:, None] * stride_kn
-                + offs_d[None, :]
-            )
-
-            v_input_ptrs = V_Input + v_offs
-            v_output_ptrs = V_Output + v_offs
             v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_blk
             _general_quant_kernel(
                 v_input_ptrs,
@@ -2404,20 +2238,14 @@ def sage_quant_kernel(
                 mask=None,
             )
         else:
-            # TODO Blocked access for the SEQLEN_K_PADDED
-            off_d, off_h, off_b = pid_grid_3d(_pid, D, K_HEAD, BATCH)
-            offs_k = tl.arange(0, SEQLEN_K_PADDED)
-
-            v_offs = off_b * stride_kz + off_h * stride_kh + offs_k * stride_kn + off_d
-
-            v_input_ptrs = V_Input + v_offs
-            v_output_ptrs = V_Output + v_offs
-
-            v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_d
-            _general_quant_kernel(
-                v_input_ptrs, v_output_ptrs, v_scale_ptrs, FP8_MAX, offs_k < SEQLEN_K
-            )
-
+            # just apply the per channel v_scales that have been computed outside    
+            v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
+            v = tl.load(v_input_ptrs)
+            v = v.to(tl.float32)
+            v_scales = tl.load(v_scale_ptrs)
+            v_quant = v / v_scales
+            v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+            tl.store(v_output_ptrs, v_quant)
 
 @triton.jit
 def _general_quant_kernel(
