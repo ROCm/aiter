@@ -2,9 +2,9 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages_common.cuh"
 #include "moe_cktile2stages_lookup.h"
-#include "moe_cktile2stages_manifest.h"
+#include "moe_cktile2stages_manifest_common.h"
 #include "py_itfs_common.h"
-#include "moe_cktile2stages_heuristic_dispatch.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 #include <cmath>
 
 template <typename ADataType,
@@ -12,7 +12,7 @@ template <typename ADataType,
           typename AccDataType,
           typename CDataType,
           int stage = 1>
-MoeKernel moe_dispatch(int M, int N, int K, int block_m)
+MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool has_bias, int split_k)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
@@ -52,17 +52,112 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m)
     //   return it->second;
     // }
     // Otherwise, use heuristics.
-    if(stage == 1)
+    if (split_k > 1)
     {
-        return moe_gemm1_heuristic_dispatch<ADataType, BDataType, AccDataType, CDataType>(
-            M, N, K, block_m);
+        if (activation == 2 && has_bias) 
+        {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, true, true>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, true, true>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 2 && !has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, false, true>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, false, true>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 0 && has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 0, true, true>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 0, true, true>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 0 && !has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 0, false, true>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 0, false, true>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
     }
     else
     {
-        return moe_gemm2_heuristic_dispatch<ADataType, BDataType, AccDataType, CDataType>(
-            M, N, K, block_m);
+        if (activation == 2 && has_bias) 
+        {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, true, false>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, true, false>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 2 && !has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, false, false>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, false, false>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 0 && has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 0, true, false>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 0, true, false>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 0 && !has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 0, false, false>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 0, false, false>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
     }
 }
+    
 
 torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                                torch::Tensor& WQ,
@@ -77,19 +172,26 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                                std::optional<torch::Tensor> x_scale,
                                std::optional<torch::Tensor> w_scale,
                                std::optional<torch::Tensor> exp_bias,
-                               std::optional<int> block_m)
+                               std::optional<int> activation,
+                               std::optional<int> block_m,
+                               std::optional<int> split_k)
 {
     TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16 || Y.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!");
-    if(x_scale != std::nullopt && w_scale != std::nullopt)
+    if(x_scale.has_value() && w_scale.has_value())
     {
         TORCH_CHECK(x_scale.value().dtype() == w_scale.value().dtype(),
                     "Scales should have the same dtype!");
     }
-    int M         = sorted_ids.size(0);
+    int64_t token     = XQ.size(0);
+    int M         = std::min(sorted_ids.size(0), token * topk * block_m.value());
     int N         = WQ.size(1);
     int K         = XQ.size(-1);
-    int MPerBlock = block_m.value();
+    int MPerBlock = block_m.has_value() ? block_m.value() : 32;
+
+    bool has_bias = exp_bias.has_value();
+    int act_op    = activation.has_value() ? activation.value() : -1;
+    int k_batch   = split_k.has_value() ? split_k.value() : 1;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
     at::hip::getCurrentHIPStream();
@@ -113,19 +215,22 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         // }
         if (WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<fp8, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock)(XQ,
-                                                                          WQ,
-                                                                          Y,
-                                                                          sorted_ids,
-                                                                          sorted_expert_ids,
-                                                                          max_token_ids,
-                                                                          topk,
-                                                                          n_padded_zeros,
-                                                                          k_padded_zeros,
-                                                                          topk_weight,
-                                                                          x_scale,
-                                                                          w_scale,
-                                                                          exp_bias);
+            moe_dispatch<fp8, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
         }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
@@ -138,19 +243,22 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         // }
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<bf16, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock)(XQ,
-                                                                           WQ,
-                                                                           Y,
-                                                                           sorted_ids,
-                                                                           sorted_expert_ids,
-                                                                           max_token_ids,
-                                                                           topk,
-                                                                           n_padded_zeros,
-                                                                           k_padded_zeros,
-                                                                           topk_weight,
-                                                                           x_scale,
-                                                                           w_scale,
-                                                                           exp_bias);
+            moe_dispatch<bf16, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
         }
     }
     else
@@ -173,12 +281,19 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                                std::optional<torch::Tensor> x_scale,
                                std::optional<torch::Tensor> w_scale,
                                std::optional<torch::Tensor> exp_bias,
-                               std::optional<int> block_m)
+                               std::optional<int> activation,
+                               std::optional<int> block_m,
+                               std::optional<int> split_k)
 {
-    int M         = sorted_ids.size(0);
+    int64_t token     = XQ.size(0);
+    int MPerBlock = block_m.has_value() ? block_m.value() : 32;
+    int M         = std::min(sorted_ids.size(0), token * topk * MPerBlock);
     int N         = WQ.size(1);
     int K         = XQ.size(-1);
-    int MPerBlock = block_m.value();
+    
+    bool has_bias = exp_bias.has_value();
+    int act_op    = activation.has_value() ? activation.value() : -1;
+    int k_batch   = split_k.has_value() ? split_k.value() : 1;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
     at::hip::getCurrentHIPStream();
@@ -202,19 +317,22 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         // }
         if (WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<fp8, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock)(XQ,
-                                                                          WQ,
-                                                                          Y,
-                                                                          sorted_ids,
-                                                                          sorted_expert_ids,
-                                                                          max_token_ids,
-                                                                          topk,
-                                                                          n_padded_zeros,
-                                                                          k_padded_zeros,
-                                                                          topk_weight,
-                                                                          x_scale,
-                                                                          w_scale,
-                                                                          exp_bias);
+            moe_dispatch<fp8, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
         }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
@@ -227,19 +345,22 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         // }
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock)(XQ,
-                                                                           WQ,
-                                                                           Y,
-                                                                           sorted_ids,
-                                                                           sorted_expert_ids,
-                                                                           max_token_ids,
-                                                                           topk,
-                                                                           n_padded_zeros,
-                                                                           k_padded_zeros,
-                                                                           topk_weight,
-                                                                           x_scale,
-                                                                           w_scale,
-                                                                           exp_bias);
+            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock, 0, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
         }
     }
     else
