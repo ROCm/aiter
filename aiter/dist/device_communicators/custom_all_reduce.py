@@ -155,6 +155,9 @@ class CustomAllreduce:
         # This is a pre-registered IPC buffer. In eager mode, input tensors
         # are first copied into this buffer before allreduce is performed
         self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
+        # This is a pre-registered IPC buffer for output. In eager mode, kernel
+        # writes results to this buffer, then it's copied to the actual output
+        self.output_buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -177,7 +180,10 @@ class CustomAllreduce:
         self._ptr = ops.init_custom_ar(
             self.meta, self.rank_data, handles, offsets, rank, self.fully_connected
         )
+        # Register both input and output buffers
         self.register_buffer(self.buffer)
+        handles, offsets = self._get_ipc_meta(self.output_buffer)
+        ops.register_output_buffer(self._ptr, self.output_buffer, handles, offsets)
 
     @contextmanager
     def capture(self):
@@ -285,6 +291,7 @@ class CustomAllreduce:
             use_new,
             open_fp8_quant,
             None if registered else self.buffer,
+            None if registered else self.output_buffer,
         )
         return out
 

@@ -134,7 +134,8 @@ void all_reduce(fptr_t _fa,
                 torch::Tensor& out,
                 bool use_new,
                 bool open_fp8_quant,
-                std::optional<torch::Tensor> reg_buffer)
+                std::optional<torch::Tensor> reg_buffer,
+                std::optional<torch::Tensor> reg_output_buffer)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
@@ -143,18 +144,60 @@ void all_reduce(fptr_t _fa,
 
     if(reg_buffer.has_value())
     {
+        // Eager mode: use pre-registered buffers for both input and output
         auto input_size = inp.numel() * inp.element_size();
         TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
                     "registered buffer is too small to contain the input");
+        
+        // Copy input to registered input buffer
         HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
                                 inp.data_ptr(),
                                 input_size,
                                 hipMemcpyDeviceToDevice,
                                 stream));
-        _all_reduce(_fa, reg_buffer.value(), out, stream, use_new, open_fp8_quant);
+        
+        if(reg_output_buffer.has_value())
+        {
+            // Use registered output buffer, kernel writes directly to it
+            auto output_size = out.numel() * out.element_size();
+            TORCH_CHECK(output_size <= reg_output_buffer.value().numel() * reg_output_buffer.value().element_size(),
+                        "registered output buffer is too small to contain the output");
+            
+            // Create typed views of the buffers with correct dtype and shape
+            auto typed_input_buffer = torch::from_blob(
+                reg_buffer.value().data_ptr(),
+                {inp.numel()},
+                torch::TensorOptions().dtype(inp.dtype()).device(inp.device())
+            );
+            auto typed_output_buffer = torch::from_blob(
+                reg_output_buffer.value().data_ptr(),
+                {out.numel()},
+                torch::TensorOptions().dtype(out.dtype()).device(out.device())
+            );
+            
+            _all_reduce(_fa, typed_input_buffer, typed_output_buffer, stream, use_new, open_fp8_quant);
+            
+            // Copy result from registered output buffer to actual output
+            HIP_CALL(hipMemcpyAsync(out.data_ptr(),
+                                    reg_output_buffer.value().data_ptr(),
+                                    output_size,
+                                    hipMemcpyDeviceToDevice,
+                                    stream));
+        }
+        else
+        {
+            // Fallback: write directly to out (old behavior)
+            auto typed_input_buffer = torch::from_blob(
+                reg_buffer.value().data_ptr(),
+                {inp.numel()},
+                torch::TensorOptions().dtype(inp.dtype()).device(inp.device())
+            );
+            _all_reduce(_fa, typed_input_buffer, out, stream, use_new, open_fp8_quant);
+        }
     }
     else
     {
+        // Graph mode: input and output are already registered, use directly
         _all_reduce(_fa, inp, out, stream, use_new, open_fp8_quant);
     }
     
@@ -373,6 +416,15 @@ void register_buffer(fptr_t _fa,
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     fa->register_buffer(handles, offsets, t.data_ptr());
+}
+
+void register_output_buffer(fptr_t _fa,
+                            torch::Tensor& t,
+                            const std::vector<torch::Tensor>& handles,
+                            const std::vector<int64_t>& offsets)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->register_output_buffer(handles, offsets, t.data_ptr());
 }
 
 std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa)

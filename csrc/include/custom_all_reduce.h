@@ -33,7 +33,8 @@ void all_reduce(fptr_t _fa,
                 torch::Tensor& out,
                 bool use_new,
                 bool open_fp8_quant,
-                std::optional<torch::Tensor> reg_buffer);
+                std::optional<torch::Tensor> reg_buffer,
+                std::optional<torch::Tensor> reg_output_buffer);
 void reduce_scatter(fptr_t _fa,
                 torch::Tensor& inp,
                 torch::Tensor& out,
@@ -58,6 +59,10 @@ void register_buffer(fptr_t _fa,
                      torch::Tensor& t,
                      const std::vector<torch::Tensor>& handles,
                      const std::vector<int64_t>& offsets);
+void register_output_buffer(fptr_t _fa,
+                            torch::Tensor& t,
+                            const std::vector<torch::Tensor>& handles,
+                            const std::vector<int64_t>& offsets);
 std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa);
 void register_graph_buffers(fptr_t _fa,
                             const std::vector<torch::Tensor>& handles,
