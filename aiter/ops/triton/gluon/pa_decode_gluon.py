@@ -776,10 +776,12 @@ def paged_attention_decode_sliding_window(
     stride_max_logits_seq: int,
     stride_max_logits_head: int,
     stride_max_logits_part: int,
+    # 5D output strides for [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     stride_output_bs: int,
     stride_output_len: int,
     stride_output_kv_head: int,
     stride_output_group_size: int,
+    # 5D query strides for [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     stride_query_bs: int,
     stride_query_qlen: int,
     stride_query_kv_head: int,
@@ -1622,8 +1624,6 @@ def paged_attention_decode_sliding_window(
             offsets=output_offsets,
             mask=output_mask,
         )
-
-
 
 
 # @triton.autotune(
@@ -2627,7 +2627,6 @@ def paged_attention_decode_ps_reduce_kernel(
         final_output.to(output_ptr.dtype.element_ty),
         mask=output_mask,
     )
-
 
 
 @triton.jit
