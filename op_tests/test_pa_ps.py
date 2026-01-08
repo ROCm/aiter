@@ -380,17 +380,30 @@ def print_performance_comparison(
         print("-" * 120)
 
     if pa_ratio1 is not None:
-        print(
-            f"{'Method':<35} {'Time (us)':>12} {'PA Kernel':>20} {'Reduce':>20}"
-        )
+        print(f"{'Method':<35} {'Time (us)':>12} {'PA Kernel':>20} {'Reduce':>20}")
         print("-" * 120)
-        # Method 1 with time breakdown
-        pa_str1 = f"{us_pa1:>8.2f}us ({pa_ratio1*100:>5.1f}%)" if us_pa1 is not None else f"{pa_ratio1*100:>10.1f}%"
-        reduce_str1 = f"{us_reduce1:>8.2f}us ({reduce_ratio1*100:>5.1f}%)" if us_reduce1 is not None else f"{reduce_ratio1*100:>10.1f}%"
+        pa_str1 = (
+            f"{us_pa1:>8.2f}us ({pa_ratio1*100:>5.1f}%)"
+            if us_pa1 is not None
+            else f"{pa_ratio1*100:>10.1f}%"
+        )
+        reduce_str1 = (
+            f"{us_reduce1:>8.2f}us ({reduce_ratio1*100:>5.1f}%)"
+            if us_reduce1 is not None
+            else f"{reduce_ratio1*100:>10.1f}%"
+        )
         print(f"{name1:<35} {us1:>11.2f}us {pa_str1:>20} {reduce_str1:>20}")
-        # Method 2 with time breakdown
-        pa_str2 = f"{us_pa2:>8.2f}us ({pa_ratio2*100:>5.1f}%)" if us_pa2 is not None else f"{pa_ratio2*100:>10.1f}%"
-        reduce_str2 = f"{us_reduce2:>8.2f}us ({reduce_ratio2*100:>5.1f}%)" if us_reduce2 is not None else f"{reduce_ratio2*100:>10.1f}%"
+        pa_str2 = (
+            f"{us_pa2:>8.2f}us ({pa_ratio2*100:>5.1f}%)"
+            if us_pa2 is not None
+            else f"{pa_ratio2*100:>10.1f}%"
+        )
+
+        reduce_str2 = (
+            f"{us_reduce2:>8.2f}us ({reduce_ratio2*100:>5.1f}%)"
+            if us_reduce2 is not None
+            else f"{reduce_ratio2*100:>10.1f}%"
+        )
         print(f"{name2:<35} {us2:>11.2f}us {pa_str2:>20} {reduce_str2:>20}")
     else:
         print(f"{'Method':<35} {'Time (us)':>15}")
@@ -490,7 +503,7 @@ def test_pa_mtp(
     )
     k_cache, v_cache = k_caches[0], v_caches[0]
 
-    out_ref_noquant = torch_mha_extend(
+    torch_mha_extend(
         query,
         k_cache,
         v_cache,
@@ -640,43 +653,47 @@ def test_pa_mtp(
         )
 
         # Profile kernel breakdown for PA PS
-        _, pa_ratio_ps, reduce_ratio_ps, us_pa_kernel_ps, us_reduce_kernel_ps = profile_kernel_breakdown(
-            lambda: aiter.pa_persistent_fwd(
-                Q=query,
-                K=k_quant_,
-                V=v_shuffled,
-                output=output,
-                max_qlen=max_qlen,
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                kv_indices=kv_indices,
-                context_lens=seq_lens_kv,
-                K_QScale=k_scale_asm,
-                V_QScale=v_scale_asm,
-                work_indptr=work_indptr,
-                work_info=work_info,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                softmax_scale=scale,
-                mask=1,
+        _, pa_ratio_ps, reduce_ratio_ps, us_pa_kernel_ps, us_reduce_kernel_ps = (
+            profile_kernel_breakdown(
+                lambda: aiter.pa_persistent_fwd(
+                    Q=query,
+                    K=k_quant_,
+                    V=v_shuffled,
+                    output=output,
+                    max_qlen=max_qlen,
+                    qo_indptr=qo_indptr,
+                    kv_indptr=kv_indptr,
+                    kv_indices=kv_indices,
+                    context_lens=seq_lens_kv,
+                    K_QScale=k_scale_asm,
+                    V_QScale=v_scale_asm,
+                    work_indptr=work_indptr,
+                    work_info=work_info,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    softmax_scale=scale,
+                    mask=1,
+                )
             )
         )
 
         # Profile kernel breakdown for PA ASM (no reduce kernel)
-        _, pa_ratio_asm, reduce_ratio_asm, us_pa_kernel_asm, us_reduce_kernel_asm = profile_kernel_breakdown(
-            lambda: aiter.pa_fwd_asm(
-                query,
-                k_quant_,
-                v_shuffled,
-                block_tables,
-                seq_lens_kv,
-                block_tables.size(1),
-                max_qlen,
-                k_scale_asm,
-                v_scale_asm,
-                None,
-                qo_indptr,
+        _, pa_ratio_asm, reduce_ratio_asm, us_pa_kernel_asm, us_reduce_kernel_asm = (
+            profile_kernel_breakdown(
+                lambda: aiter.pa_fwd_asm(
+                    query,
+                    k_quant_,
+                    v_shuffled,
+                    block_tables,
+                    seq_lens_kv,
+                    block_tables.size(1),
+                    max_qlen,
+                    k_scale_asm,
+                    v_scale_asm,
+                    None,
+                    qo_indptr,
+                )
             )
         )
 
