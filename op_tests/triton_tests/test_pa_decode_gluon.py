@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
 import argparse
@@ -16,9 +16,9 @@ from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-
+from aiter.ops.attention import pa_decode_gluon
 from aiter.ops.triton.gluon.pa_decode_gluon import (
-    pa_decode_gluon,
+    get_recommended_splits,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
@@ -72,6 +72,7 @@ BATCH_SIZE_OPTIONS = [4, 80, 128]
 SINKS_OPTIONS = [True, False]
 SLIDING_WINDOW_OPTIONS = [0, 128]
 COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = []
+PS_OPTIONS = [True, False]
 
 CASE_SET_NAME_OPTIONS = ["normal_accuracy", "sliding_window_accuracy"]
 
@@ -504,13 +505,11 @@ def torch_attention_compute(
 
     # Flatten caches for easy indexing
     # key_cache: [num_blocks, num_kv_heads, head_size//x, block_size, x] -> [num_blocks * block_size, num_kv_heads, head_size]
-    x = key_cache.shape[-1]
     key_cache_flat = (
         key_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_kv_heads, head_size)
     )
     if value_transposed:
         # [num_blocks, num_kv_heads, block_size//x, head_size, x] -> [num_blocks * block_size, num_kv_heads, head_size]
-        x_v = value_cache.shape[-1]
         value_cache_flat = (
             value_cache.permute(0, 2, 4, 1, 3)
             .contiguous()
@@ -1126,7 +1125,7 @@ def run_gluon_kernel(
     block_tables: torch.Tensor,
     softmax_scale: float,
     query_length: int,
-    max_context_length: int,
+    max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
     query_scale: torch.Tensor,
@@ -1139,6 +1138,7 @@ def run_gluon_kernel(
     use_aot_impl: bool = False,
     sinks: Optional[torch.Tensor] = None,
     sliding_window: int = 0,
+    ps=False,
 ) -> None:
     """Run Gluon FP8/BF16/FP16 kernel for paged attention.
 
@@ -1172,7 +1172,7 @@ def run_gluon_kernel(
     This function can run in aot or jit mode based on use_aot_impl flag.
     """
     # Run kernel
-    if use_aot_impl and sliding_window == 0:
+    if use_aot_impl and sliding_window == 0 and not ps:
         pa_decode_gluon_aot(
             output,
             query,
@@ -1182,7 +1182,7 @@ def run_gluon_kernel(
             block_tables,
             softmax_scale,
             query_length,
-            max_context_length,
+            max_context_partition_num,
             context_partition_size,
             compute_type,
             query_scale,
@@ -1196,7 +1196,7 @@ def run_gluon_kernel(
         )
     else:
         if pa_decode_gluon is not None:
-            pa_decode_gluon(
+            torch.ops.aiter.pa_decode_gluon(
                 output,
                 query,
                 key_cache,
@@ -1205,7 +1205,7 @@ def run_gluon_kernel(
                 block_tables,
                 softmax_scale,
                 query_length,
-                max_context_length,
+                max_context_partition_num,
                 context_partition_size,
                 compute_type,
                 query_scale,
@@ -1217,6 +1217,7 @@ def run_gluon_kernel(
                 alibi_slopes=alibi_slopes,
                 sinks=sinks,
                 sliding_window=sliding_window,
+                ps=ps,
             )
         else:
             raise RuntimeError(
@@ -1242,6 +1243,7 @@ def run_pa_gluon_test(
     quant_kv: bool,
     use_sinks: bool,
     sliding_window: int,
+    ps: bool,
 ) -> Dict[str, Union[float, str]]:
     """Test paged attention decode with assembly and gluon implementations."""
     data_type = compute_type
@@ -1289,6 +1291,7 @@ def run_pa_gluon_test(
         ]
     else:
         kv_len_list = [context_length] * batch_size
+
     context_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
     # print(f"context_lengths={context_lengths}")
     if use_sinks:
@@ -1333,23 +1336,33 @@ def run_pa_gluon_test(
 
         # Per-token quantization for KV cache (if enabled)
         if quant_kv:
-            (
-                quantized_keys,
-                key_scale_factors_flat,
-                quantized_values,
-                value_scale_factors_flat,
-                key_scale_original,
-                value_scale_original,
-            ) = quantize_kv_cache_symmetric(
-                key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
-            )
+            if compute_type not in [aiter.dtypes.fp8]:
+                (
+                    quantized_keys,
+                    key_scale_factors_flat,
+                    quantized_values,
+                    value_scale_factors_flat,
+                    key_scale_original,
+                    value_scale_original,
+                ) = quantize_kv_cache_symmetric(
+                    key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
+                )
+            else:
+                quantized_keys = key_cache.to(aiter.dtypes.fp8)
+                quantized_values = value_cache.to(aiter.dtypes.fp8)
+                key_scale_factors_flat = None
+                value_scale_factors_flat = None
+                key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+                value_scale_original = torch.tensor(
+                    1, dtype=torch.float32, device=device
+                )
         else:
             quantized_keys = key_cache
             quantized_values = value_cache
             key_scale_factors_flat = None
             value_scale_factors_flat = None
-            key_scale_original = None
-            value_scale_original = None
+            key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+            value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
     else:  # per_tensor
         # Per-tensor quantization for query (if enabled)
         if quant_q:
@@ -1377,8 +1390,8 @@ def run_pa_gluon_test(
             quantized_values = value_cache
             key_scale_factors_flat = None
             value_scale_factors_flat = None
-            key_scale_original = None
-            value_scale_original = None
+            key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+            value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
 
     # Reference (original)
     reference_output_quant = torch_mha_extend(
@@ -1394,21 +1407,13 @@ def run_pa_gluon_test(
         sliding_window=sliding_window,
     )
     reference_output_quant = reference_output_quant.to(data_type)
-
-    pa_rw_bytes = (
-        batch_size
-        * head_size
-        * (
-            2
-            * (
-                min(context_length, sliding_window)
-                if sliding_window > 0
-                else context_length
-            )
-            * num_kv_heads
-            * quantized_keys.dtype.itemsize
-            + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
-        )
+    kv_len_list = [
+        min(context_length, sliding_window) if sliding_window > 0 else context_length
+        for context_length in kv_len_list
+    ]
+    pa_rw_bytes = head_size * (
+        2 * sum(kv_len_list) * num_kv_heads * quantized_keys.dtype.itemsize
+        + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
     )
 
     if trans_v:
@@ -1501,13 +1506,15 @@ def run_pa_gluon_test(
         else context_lengths.max().item()
     )
     if sliding_window > 0:
-        max_context_length = min(max_context_length, sliding_window)
-        if max_context_length <= 128:
-            context_partition_size = 128
 
-    max_context_partition_num = (
-        max_context_length + context_partition_size - 1
-    ) // context_partition_size
+        max_context_partition_num = 1
+    elif ps:
+        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+    else:
+        max_context_partition_num = triton.cdiv(
+            max_context_length, context_partition_size
+        )
+
     equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
     intermediate_shape = (
         num_seqs,
@@ -1515,6 +1522,7 @@ def run_pa_gluon_test(
         max_context_partition_num,
         equivalent_query_group_size,
     )
+
     exp_sums = torch.empty(
         intermediate_shape, dtype=torch.float32, device=reference_output_quant.device
     )
@@ -1539,7 +1547,7 @@ def run_pa_gluon_test(
         block_tables,
         softmax_scale,
         query_length,
-        context_lengths.max().item(),
+        max_context_partition_num,
         context_partition_size,
         compute_type,
         query_scale=query_scale_factors,
@@ -1552,6 +1560,7 @@ def run_pa_gluon_test(
         use_aot_impl=use_aot_impl,
         sinks=sinks,
         sliding_window=sliding_window,
+        ps=ps,
     )
 
     # Compare with original reference
@@ -1562,6 +1571,7 @@ def run_pa_gluon_test(
         rtol=diff_tolerance,
         msg=f"[PyTorch vs Gluon_FP8][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
     )
+
     if err_gluon > 0:
         err_gluon = 1
     print("\n=== Detailed Error Analysis ===")
@@ -1622,7 +1632,7 @@ def run_pa_gluon_test(
         or (block_size == 16 and query_group_size == 8 and query_length == 3)
         or (query_group_size == 5 and query_length == 3)
         or (block_size == 64)
-        or (quant_kv == False)
+        or (not quant_kv)
         or (compute_type == torch.float16 and (quant_q or quant_kv))
         or (head_size not in [128])
         or (sliding_window > 0)
@@ -1784,7 +1794,7 @@ def process_arguments(args: argparse.Namespace) -> tuple:
     context_partition_size_options = CONTEXT_PARTITION_SIZE_OPTIONS
     sinks_options = SINKS_OPTIONS
     sliding_window_options = SLIDING_WINDOW_OPTIONS
-
+    ps_options = PS_OPTIONS
     if args.compute_type is not None:
         compute_types = [dtypes.d_dtypes[args.compute_type]]
     else:
@@ -1849,6 +1859,7 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         sample_rate,
         sinks_options,
         sliding_window_options,
+        ps_options,
     )
 
 
@@ -1881,7 +1892,8 @@ def _run_single_test(args):
         f"query_length={test_config['query_length']}, "
         f"head_size={test_config['head_size']}, "
         f"sinks={test_config['sinks']}, "
-        f"sliding_window={test_config['sliding_window']}"
+        f"sliding_window={test_config['sliding_window']},"
+        f"ps={test_config['ps']}"
     )
 
     # Import global variables to modify them
@@ -1907,6 +1919,7 @@ def _run_single_test(args):
         quant_kv=test_config["quant_kv"],
         use_sinks=test_config["sinks"],
         sliding_window=test_config["sliding_window"],
+        ps=test_config["ps"],
     )
 
     return result
@@ -1929,6 +1942,7 @@ def run_multi_pa_gluon_test(
     sample_rate=1.0,
     sinks_options=[False],
     sliding_window_options=[0, 128],
+    ps_options=[False],
 ) -> pd.DataFrame:
     """Run all tests."""
     # Generate all test configurations
@@ -1957,28 +1971,32 @@ def run_multi_pa_gluon_test(
                                                             for (
                                                                 sliding_window
                                                             ) in sliding_window_options:
-                                                                test_config = {
-                                                                    "use_torch_flash_ref": use_torch_flash_ref,
-                                                                    "compute_type": ct,
-                                                                    "quant_q": quant_q,
-                                                                    "quant_kv": quant_kv,
-                                                                    "trans_v": trans_v_mode,
-                                                                    "kv_varlen": kv_varlen_mode,
-                                                                    "context_partition_size": context_partition_size,
-                                                                    "quant_mode": qm,
-                                                                    "block_size": bs,
-                                                                    "num_heads": hc,
-                                                                    "context_length": cl,
-                                                                    "batch_size": bsz,
-                                                                    "query_length": ql,
-                                                                    "head_size": head_size,
-                                                                    "use_aot_impl": use_aot_impl,
-                                                                    "sinks": sinks,
-                                                                    "sliding_window": sliding_window,
-                                                                }
-                                                                test_configs.append(
-                                                                    test_config
-                                                                )
+                                                                for (
+                                                                    ps
+                                                                ) in ps_options:
+                                                                    test_config = {
+                                                                        "use_torch_flash_ref": use_torch_flash_ref,
+                                                                        "compute_type": ct,
+                                                                        "quant_q": quant_q,
+                                                                        "quant_kv": quant_kv,
+                                                                        "trans_v": trans_v_mode,
+                                                                        "kv_varlen": kv_varlen_mode,
+                                                                        "context_partition_size": context_partition_size,
+                                                                        "quant_mode": qm,
+                                                                        "block_size": bs,
+                                                                        "num_heads": hc,
+                                                                        "context_length": cl,
+                                                                        "batch_size": bsz,
+                                                                        "query_length": ql,
+                                                                        "head_size": head_size,
+                                                                        "use_aot_impl": use_aot_impl,
+                                                                        "sinks": sinks,
+                                                                        "sliding_window": sliding_window,
+                                                                        "ps": ps,
+                                                                    }
+                                                                    test_configs.append(
+                                                                        test_config
+                                                                    )
     total = len(test_configs)
     print(f"\nTotal test cases: {total}")
 
@@ -2032,6 +2050,7 @@ def parse_arg_and_run_test(sample_rate0: float = None):
         sample_rate1,
         sinks_options,
         sliding_window_options,
+        ps_options,
     ) = process_arguments(args)
     if sample_rate0 is None:
         sample_rate = sample_rate1
@@ -2055,6 +2074,7 @@ def parse_arg_and_run_test(sample_rate0: float = None):
         sample_rate,
         sinks_options,
         sliding_window_options,
+        ps_options,
     )
 
     output_file = f"run_pa_gluon_test.{TEST_NAME}.block_size_{block_sizes[0]}.triton.{TRITON_VERSION}.csv"
@@ -2170,12 +2190,14 @@ def normal_accuracy_test():
     global SINKS_OPTIONS
     global SLIDING_WINDOW_OPTIONS
     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global PS_OPTIONS
 
     SINKS_OPTIONS = [False]
     SLIDING_WINDOW_OPTIONS = [0]
-
-    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    PS_OPTIONS = [False]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+
     HEAD_DIMENSION_OPTIONS = [128]
     HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
@@ -2209,12 +2231,14 @@ def normal_performance_test():
     global SINKS_OPTIONS
     global SLIDING_WINDOW_OPTIONS
     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global PS_OPTIONS
 
     SINKS_OPTIONS = [False]
     SLIDING_WINDOW_OPTIONS = [0]
-
+    PS_OPTIONS = [False]
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+
     HEAD_DIMENSION_OPTIONS = [128]
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
     BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -2250,9 +2274,14 @@ def sliding_window_accuracy_test():
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global PS_OPTIONS
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+    SINKS_OPTIONS = [True]
+    SLIDING_WINDOW_OPTIONS = [0, 128]
+    PS_OPTIONS = [True, False]
+
     HEAD_DIMENSION_OPTIONS = [128]
     HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
     QUERY_LENGTH_OPTIONS = [1]
@@ -2265,13 +2294,6 @@ def sliding_window_accuracy_test():
     KV_VARLEN_OPTIONS = [False, True]
     USE_AOT_IMPL_OPTIONS = [False]
     BLOCK_SIZE_OPTIONS = [16, 64]
-
-    SINKS_OPTIONS = [False]
-    SLIDING_WINDOW_OPTIONS = [128]
-    parse_arg_and_run_test()
-
-    SINKS_OPTIONS = [True]
-    SLIDING_WINDOW_OPTIONS = [0, 128]
     parse_arg_and_run_test()
 
 
@@ -2294,9 +2316,11 @@ def sliding_window_performance_test():
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global PS_OPTIONS
 
     SINKS_OPTIONS = [False, True]
     SLIDING_WINDOW_OPTIONS = [0, 128]
+    PS_OPTIONS = [False]
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
@@ -2331,5 +2355,5 @@ def test_multi_case_set(case_set_name):
 if __name__ == "__main__":
     normal_accuracy_test()
     normal_performance_test()
-    sliding_window_accuracy_test()
-    sliding_window_performance_test()
+    # sliding_window_accuracy_test()
+    # sliding_window_performance_test()

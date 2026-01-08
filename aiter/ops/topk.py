@@ -210,6 +210,19 @@ def top_k_per_row_prefill(
 
 
 @compile_ops("module_top_k_per_row")
+def top_k_per_row_prefill_fast(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: Optional[torch.Tensor],
+    numRows: int,
+    stride0: int,
+    stride1: int,
+) -> None: ...
+
+
+@compile_ops("module_top_k_per_row")
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,

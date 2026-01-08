@@ -12,6 +12,7 @@ import triton.language as tl
 from jinja2 import Template
 
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
     compile_kernel,
@@ -422,7 +423,7 @@ def pa_decode_gluon_aot(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_length: int,
-    max_context_length: int,
+    max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
     query_scale: torch.Tensor,  # [num_seqs * query_length, num_query_heads, 1] or [1]
@@ -487,8 +488,8 @@ def pa_decode_gluon_aot(
     query_length : int
         Length of query sequences. Must be <= 4.
 
-    max_context_length : int
-        Maximum sequence length supported in the KV cache.
+    max_context_partition_num : int
+        Maximum number of context partitions.
 
     context_partition_size : int
         Size of each context partition for partitioned attention computation.
@@ -549,21 +550,19 @@ def pa_decode_gluon_aot(
     - This function directly reshapes query and output to 5D format internally,
       avoiding extra transpose operations for better performance
     """
+
     cdna_version = get_cdna_version()
     assert cdna_version in [
         3,
         4,
     ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
-
+    compute_type = torch_to_triton_dtype[compute_type]
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
     batch_size = query.shape[0] // query_length
     num_kv_heads = key_cache.shape[1]
     query_group_size = num_query_heads // num_kv_heads
-    max_context_partition_num = int(
-        (max_context_length + context_partition_size - 1) // context_partition_size
-    )
     kv_block_size = key_cache.shape[-2]
 
     # Calculate equivalent group sizes for kernel configuration
