@@ -2210,6 +2210,15 @@ def normal_accuracy_test():
     BLOCK_SIZE_OPTIONS = [16, 64, 1024]
     parse_arg_and_run_test()
 
+    # Test for different head dimensions
+    HEAD_DIMENSION_OPTIONS = [64, 192, 256]
+    HEAD_CONFIGURATIONS = [(8, 1)]
+    QUERY_LENGTH_OPTIONS = [1, 3]
+    QUANT_MODE_OPTIONS = ["per_token"]
+    BATCH_SIZE_OPTIONS = [81]
+    KV_VARLEN_OPTIONS = [True]
+    parse_arg_and_run_test()
+
 
 def normal_performance_test():
     """Run normal performance test."""
@@ -2235,7 +2244,7 @@ def normal_performance_test():
     SINKS_OPTIONS = [False]
     SLIDING_WINDOW_OPTIONS = [0]
     PS_OPTIONS = [False]
-    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
     HEAD_DIMENSION_OPTIONS = [128]
@@ -2318,7 +2327,7 @@ def sliding_window_performance_test():
     SINKS_OPTIONS = [False, True]
     SLIDING_WINDOW_OPTIONS = [0, 128]
 
-    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
     HEAD_DIMENSION_OPTIONS = [64]
     HEAD_CONFIGURATIONS = [(64, 8)]
@@ -2350,5 +2359,5 @@ def test_multi_case_set(case_set_name):
 if __name__ == "__main__":
     normal_accuracy_test()
     normal_performance_test()
-    # sliding_window_accuracy_test()
-    # sliding_window_performance_test()
+    sliding_window_accuracy_test()
+    sliding_window_performance_test()
