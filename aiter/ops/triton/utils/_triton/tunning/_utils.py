@@ -1,3 +1,4 @@
+import os
 import triton
 from triton.testing import runtime
 
@@ -67,3 +68,35 @@ def get_input_shape_and_config_list(
     input_shape = get_input_shape(argv[1 : shape_size + 1])
     config_list = get_config_list(argv[shape_size + 1 :])
     return input_shape, config_list
+
+
+def read_screen_file(filename, case_data):
+    err_lines_limit = 100000
+    if os.path.isfile(filename):
+        with open(filename, "r") as f:
+            for newline in f:
+                try:
+                    err_lines = 0
+                    while not newline.startswith("screencase"):
+                        newline = f.readline()
+                        err_lines += 1
+                        if err_lines >= err_lines_limit:
+                            break
+                    screencaseline = newline[:]
+                    err_lines = 0
+                    while not newline.strip().endswith("(us)"):
+                        if newline.startswith("screencase"):
+                            screencaseline = newline[:]
+                        newline = f.readline()
+                        err_lines += 1
+                        if err_lines >= err_lines_limit:
+                            break
+                    r = float(newline.strip().split()[0])
+                    # if int(screencaseline[len("screencase")+1:].strip().split()[-1]) == 1: continue # remove this comment to consider only split-k case
+                    # if int(screencaseline[len("screencase")+1:].strip().split()[-1]) != 1: continue # remove this comment to consider only split-k case
+                    # if int(screencaseline[len("screencase")+1:].strip().split()[2]) != 128: continue # remove this comment to consider only BK=128
+                    case_data.append(
+                        [r, screencaseline[len("screencase") + 1 :].strip()]
+                    )
+                except:
+                    break

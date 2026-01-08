@@ -1,43 +1,13 @@
 import os
 import sys
+from aiter.ops.triton.utils._triton.tunning._utils import (
+    config_parms_key,
+    read_screen_file,
+)
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
-from aiter.ops.triton.utils._triton.tunning._ut_common import config_parms_key
-
-
-def read_file(filename, case_data):
-    err_lines_limit = 100000
-    if os.path.isfile(filename):
-        with open(filename, "r") as f:
-            for newline in f:
-                try:
-                    err_lines = 0
-                    while not newline.startswith("screencase"):
-                        newline = f.readline()
-                        err_lines += 1
-                        if err_lines >= err_lines_limit:
-                            break
-                    screencaseline = newline[:]
-                    err_lines = 0
-                    while not newline.strip().endswith("(us)"):
-                        if newline.startswith("screencase"):
-                            screencaseline = newline[:]
-                        newline = f.readline()
-                        err_lines += 1
-                        if err_lines >= err_lines_limit:
-                            break
-                    r = float(newline.strip().split()[0])
-                    # if int(screencaseline[len("screencase")+1:].strip().split()[-1]) == 1: continue # remove this comment to consider only split-k case
-                    # if int(screencaseline[len("screencase")+1:].strip().split()[-1]) != 1: continue # remove this comment to consider only split-k case
-                    # if int(screencaseline[len("screencase")+1:].strip().split()[2]) != 128: continue # remove this comment to consider only BK=128
-                    case_data.append(
-                        [r, screencaseline[len("screencase") + 1 :].strip()]
-                    )
-                except:
-                    break
-
 
 TP = 8
 # DS-R1 TP8
@@ -115,7 +85,7 @@ for n, k in list_of_shapes:
     for m in mlist:
         case_data = []
         file_tag = f"{ut_filename}-{m}-{n}-{k}"
-        read_file(f"screen-{file_tag}.txt", case_data)
+        read_screen_file(f"screen-{file_tag}.txt", case_data)
         case_data = sorted(case_data, key=lambda x: x[0])
 
         if len(case_data) > 0:

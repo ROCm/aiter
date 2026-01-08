@@ -1,5 +1,5 @@
 import sys
-from aiter.ops.triton.utils._triton.tunning._ut_common import (
+from aiter.ops.triton.utils._triton.tunning._utils import (
     run_profile,
     get_input_shape_and_config_list,
 )
