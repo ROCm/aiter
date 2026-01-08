@@ -60,7 +60,7 @@ LOG_LEVEL = {
     2: logging.INFO,
     3: logging.DEBUG,
 }
-logger.setLevel(AITER_LOG_LEVEL)
+logger.setLevel(LOG_LEVEL[AITER_LOG_LEVEL])
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
