@@ -188,11 +188,12 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                              GemmConfig::N_Warp_Tile_v,
                                              GemmConfig::K_Warp_Tile_v,
                                              GemmConfig::TransposeC_v,
-                                             ck_tile::memory_operation_enum::set,
                                              1,
                                              false,
                                              1,
-                                             GemmConfig::TiledMMAPermuteN_v>>;
+                                             GemmConfig::TiledMMAPermuteN_v,
+                                             1,
+                                             GemmConfig::DoubleSmemBuffer_v>>;
 
         using Kernel = ck_tile::QuantGemmKernel<TilePartitioner,
                                                 GemmPipeline,
