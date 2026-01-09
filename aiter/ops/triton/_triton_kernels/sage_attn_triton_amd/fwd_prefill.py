@@ -12,7 +12,7 @@ from .utils import (
     get_arch,
     map_dims,
 )
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d, remap_xcd
 
 # 0 for per block quantization, 1 for per channel quantization
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
@@ -227,11 +227,11 @@ def _attn_fwd_no_mask(
 
         if V_QUANT_SCHEME == 0:
             acc += (
-                tl.dot((p * FP8_MAX).to(v.type.element_ty), v, out_dtype=tl.float32)
+                tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
                 * v_descale
             )
         else:
-            acc += tl.dot((p * FP8_MAX).to(v.type.element_ty), v, out_dtype=tl.float32)
+            acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
 
@@ -607,11 +607,11 @@ def _attn_fwd_mask(
         m_i = m_ij
         if V_QUANT_SCHEME == 0:
             acc += (
-                tl.dot((p * FP8_MAX).to(v.type.element_ty), v, out_dtype=tl.float32)
+                tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
                 * v_descale
             )
         else:
-            acc += tl.dot((p * FP8_MAX).to(v.type.element_ty), v, out_dtype=tl.float32)
+            acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
 
@@ -1425,9 +1425,9 @@ def attn_fwd(
         invalid_mask = None
         l_recip = 1 / l_i[:, None]
     if V_QUANT_SCHEME == 0:
-        acc = (acc * l_recip) / FP8_MAX
+        acc = (acc * l_recip)
     else:
-        acc = (acc * l_recip * v_descale) / FP8_MAX
+        acc = (acc * l_recip * v_descale)
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
