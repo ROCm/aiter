@@ -41,9 +41,7 @@ def get_occupancy():
 def get_recommended_splits(num_sequences, num_kv_heads):
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count * get_occupancy()
-    max_context_partition_num = min(
-        16, triton.cdiv(num_sm, num_sequences * num_kv_heads)
-    )
+    max_context_partition_num = triton.cdiv(num_sm, num_sequences * num_kv_heads)
     return max_context_partition_num
 
 
@@ -1134,7 +1132,42 @@ def paged_attention_decode_sliding_window(
     sequence_split_idx = gl.program_id(2)
 
     context_length = gl.load(context_lengths_ptr + sequence_idx)
-
+    if SLIDING_WINDOW > 0:
+        sequence_start_idx = context_length - SLIDING_WINDOW
+        sequence_end_idx = context_length
+        sequence_partition_start_idx = gl.maximum(
+            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
+        )
+        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+    else:
+        page_size = gl.cdiv(context_length, gl.num_programs(2))
+        sequence_start_idx = page_size * sequence_split_idx
+        if sequence_start_idx >= context_length:
+            # if not ONE_SHOT:
+            #     gl.amd.cdna3.buffer_store(
+            #         stored_value=max_logits,
+            #         ptr=max_logits_ptr,
+            #         offsets=max_logits_offsets,
+            #         mask=max_logits_group_mask,
+            #     )
+            #     gl.amd.cdna3.buffer_store(
+            #         stored_value=exp_sums,
+            #         ptr=exp_sums_ptr,
+            #         offsets=max_logits_offsets,
+            #         mask=max_logits_group_mask,
+            #     )
+            #     gl.amd.cdna3.buffer_store(
+            #         stored_value=attention_accumulator.to(OUTPUT_DTYPE),
+            #         ptr=output_ptr,
+            #         offsets=output_offsets,
+            #         mask=output_mask,
+            #     )
+            return  # No computation needed for this partition
+        sequence_end_idx = gl.minimum(
+            context_length, page_size * (sequence_split_idx + 1)
+        )
+        sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
+        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     mtp_query_offsets = (
@@ -1245,42 +1278,15 @@ def paged_attention_decode_sliding_window(
 
     # ==================== SEQUENCE PROCESSING ====================
     query_converted = query_shared.load(qk_lhs_operand_layout)
-    if SLIDING_WINDOW > 0:
-        sequence_start_idx = context_length - SLIDING_WINDOW
-        sequence_end_idx = context_length
-        sequence_partition_start_idx = gl.maximum(
-            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
-        )
-        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
-    else:
-        page_size = gl.cdiv(context_length, gl.num_programs(2))
-        sequence_start_idx = page_size * sequence_split_idx
-        if sequence_start_idx >= context_length:
-            if not ONE_SHOT:
-                gl.amd.cdna3.buffer_store(
-                    stored_value=max_logits,
-                    ptr=max_logits_ptr,
-                    offsets=max_logits_offsets,
-                    mask=max_logits_group_mask,
-                )
-                gl.amd.cdna3.buffer_store(
-                    stored_value=exp_sums,
-                    ptr=exp_sums_ptr,
-                    offsets=max_logits_offsets,
-                    mask=max_logits_group_mask,
-                )
-                gl.amd.cdna3.buffer_store(
-                    stored_value=attention_accumulator.to(OUTPUT_DTYPE),
-                    ptr=output_ptr,
-                    offsets=output_offsets,
-                    mask=output_mask,
-                )
-            return  # No computation needed for this partition
-        sequence_end_idx = gl.minimum(
-            context_length, page_size * (sequence_split_idx + 1)
-        )
-        sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
-        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+    if ONE_SHOT and sinks_ptr is not None:
+        # sinks_ptr is per-query-head: [num_query_heads] where
+        # num_query_heads = num_kv_heads * query_group_size.
+        # It is shared across query positions (query_seq_len).
+        sinks_values = gl.load(
+            sinks_ptr + kv_head_idx * query_group_size + max_logits_group_idx_in_len,
+            mask=qk_row_mask,
+            other=float("-inf"),
+        ).to(gl.float32)
 
     max_num_kv_blocks = gl.cdiv(context_length, KV_BLOCK_SIZE)
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
@@ -1555,14 +1561,6 @@ def paged_attention_decode_sliding_window(
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
     if ONE_SHOT and sinks_ptr is not None:
-        # sinks_ptr is per-query-head: [num_query_heads] where
-        # num_query_heads = num_kv_heads * query_group_size.
-        # It is shared across query positions (query_seq_len).
-        sinks_values = gl.load(
-            sinks_ptr + kv_head_idx * query_group_size + max_logits_group_idx_in_len,
-            mask=qk_row_mask,
-            other=float("-inf"),
-        ).to(gl.float32)
         exp_sums += tl.math.exp2((sinks_values - max_logits) * LOG2_E)
 
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
@@ -2474,6 +2472,16 @@ def paged_attention_decode_ps_reduce_kernel(
         output_group_offsets[None, :] < query_group_size
     )
     query_group_mask = tl.reshape(query_group_mask, [QUERY_GROUP_SIZE_POW2])
+    if USE_SINKS:
+        sink_token_values = gl.load(
+            # sink_token_ptr is per-query-head: [num_query_heads] where
+            # num_query_heads = num_kv_heads * query_group_size. It is shared across
+            # query positions, so we only index by (kv_head_idx, group_idx_in_len).
+            sink_token_ptr + kv_head_idx * query_group_size + group_idx_in_len,
+            mask=query_group_mask,
+            other=float("-inf"),
+        ).to(gl.float32)
+
     # ==================== FIRST PASS: FIND GLOBAL MAX ====================
     # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM
     for iter_idx in range(num_iterations):
@@ -2514,14 +2522,6 @@ def paged_attention_decode_ps_reduce_kernel(
         global_max_prev = global_max
 
     if USE_SINKS:
-        sink_token_values = gl.load(
-            # sink_token_ptr is per-query-head: [num_query_heads] where
-            # num_query_heads = num_kv_heads * query_group_size. It is shared across
-            # query positions, so we only index by (kv_head_idx, group_idx_in_len).
-            sink_token_ptr + kv_head_idx * query_group_size + group_idx_in_len,
-            mask=query_group_mask,
-            other=float("-inf"),
-        ).to(gl.float32)
         global_exp_sum += gl.exp(sink_token_values - global_max)
 
     # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
@@ -3137,9 +3137,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
             HEAD_SIZE_POW2=triton.next_power_of_2(HEAD_SIZE),
             USE_SINKS=sink_token_ptr is not None,
-            MAX_CONTEXT_PARTITION_NUM=min(
-                triton.next_power_of_2(context_partition_num), 16
-            ),
+            MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
         )
     else:
         paged_attention_decode_v2_reduce_kernel[grid](
