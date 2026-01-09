@@ -48,8 +48,11 @@ Ks += [v for v in possible_ks if v <= K]
 
 ############################################################
 # # for a8w8_GEMM_blockscale/a8w8_GEMM_blockscale_preshuffe/a16w8_GEMM_blockscale/a16w8_GEMM_blockscale_preshuffe, Ks can only be 128
-# Ks = [128]
+Ks = [128]
 ############################################################
+
+Ms = [256]
+Ns = [256]
 
 for a_possible_split in possible_split:
     if K % a_possible_split == 0:
@@ -94,7 +97,7 @@ for a_comb in comb:
     comb_p.append(a_comb)
 comb = comb_p
 file_tag = f"{ut_filename}-{M}-{N}-{K}"
-filename = f"screen-{file_tag}.txt"
+filename = f"screen-{file_tag}.log"
 s = " ".join([str(v) for v in parms.keys()])
 os.popen(f"echo 'Number of combinations = {len(comb)}' > {filename}")
 os.popen(f"echo '{s}' >> {filename}")

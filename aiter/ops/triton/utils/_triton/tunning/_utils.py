@@ -1,10 +1,16 @@
 import os
 import triton
 from triton.testing import runtime
+import torch
+import triton.language as tl
 
 
 @triton.jit
-def split_dummy():
+def split_dummy(d_ptr):
+    pid = tl.program_id(axis=0)
+    x = tl.load(d_ptr + pid)
+    x = x + 1
+    tl.store(d_ptr + pid, x)
     return
 
 
@@ -16,9 +22,10 @@ def run_profile(fn: callable, n_run: int = 250):
         di.synchronize()
         fn()
         di.synchronize()
+    d = torch.empty(128, dtype=torch.float32, device="cuda")
     cache.zero_()
     di.synchronize()
-    split_dummy[(1,)]()
+    split_dummy[(128,)](d)
     di.synchronize()
 
 

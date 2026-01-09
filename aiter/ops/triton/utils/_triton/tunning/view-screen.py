@@ -85,7 +85,7 @@ for n, k in list_of_shapes:
     for m in mlist:
         case_data = []
         file_tag = f"{ut_filename}-{m}-{n}-{k}"
-        read_screen_file(f"screen-{file_tag}.txt", case_data)
+        read_screen_file(f"screen-{file_tag}.log", case_data)
         case_data = sorted(case_data, key=lambda x: x[0])
 
         if len(case_data) > 0:
