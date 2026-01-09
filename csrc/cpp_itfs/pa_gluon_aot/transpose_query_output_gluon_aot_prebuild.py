@@ -213,11 +213,11 @@ def _run_single_test_wrapper(test_args):
                 head_dim=head_dim,
             )
 
-        print(f"  ? [{idx}/{total}] {kernel_type} test passed")
+        print(f"  ✓ [{idx}/{total}] {kernel_type} test passed")
         return {"status": "success", "config": test_config}
 
     except Exception as e:
-        print(f"  ? [{idx}/{total}] {kernel_type} test failed: {e}")
+        print(f"  ✗ [{idx}/{total}] {kernel_type} test failed: {e}")
         return {"status": "failed", "config": test_config, "error": str(e)}
 
 

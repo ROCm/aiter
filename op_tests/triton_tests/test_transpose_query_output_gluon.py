@@ -795,10 +795,10 @@ if __name__ == "__main__":
 
     # Check if Gluon is available
     if GLUON_JIT_KERNEL_ENABLED:
-        print("? Gluon JIT kernel is enabled")
+        print("✓ Gluon JIT kernel is enabled")
     else:
         print(
-            "? Gluon JIT kernel is NOT enabled, so the kernel can only run in AOT mode"
+            "⚠ Gluon JIT kernel is NOT enabled, so the kernel can only run in AOT mode"
         )
 
     # Format: (batch_size, seq_len, num_kv_heads, query_group_size, head_size, dtype, include_scale, test_aot)
@@ -860,8 +860,8 @@ if __name__ == "__main__":
             include_scale,
             test_aot,
         )
-        print("? Passed")
+        print("✓ Passed")
 
     print("\n" + "=" * 80)
-    print("? All tests passed!")
+    print("✓ All tests passed!")
     print("=" * 80)
