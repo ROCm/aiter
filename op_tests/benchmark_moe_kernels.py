@@ -48,6 +48,7 @@ sys.path.insert(0, str(aiter_root / "hsa/gfx942/fmoe_2stages"))
 import pandas as pd
 import torch
 from datetime import datetime
+import re
 
 # Now import aiter and tune modules
 import aiter
@@ -55,6 +56,65 @@ from aiter import QuantType, ActivationType
 from aiter import dtypes
 import tune
 from tune import FmoeTuner
+
+
+def parse_kernel_parameters(kernel_name, kernel_type, stage):
+    """
+    Parse kernel parameters from kernel name.
+    
+    Returns dict with: tile_m, tile_n, tile_k, block_size, waves_m, waves_n, version
+    """
+    params = {
+        'tile_m': None,
+        'tile_n': None, 
+        'tile_k': None,
+        'block_size': None,
+        'waves_m': None,
+        'waves_n': None,
+        'version': None,
+    }
+    
+    # Parse CK kernel names
+    if 'moe_ck2stages' in kernel_name:
+        # Example: moe_ck2stages_gemm1_256x32x64x128_1x4_TypeCast_v3_Nswizzle0_Quant2_MulRoutedWeight1_silu_B16_B16_B16
+        parts = kernel_name.split('_')
+        
+        # Extract tile sizes: 256x32x64x128 = block_size x M x N x K
+        for part in parts:
+            if 'x' in part and part[0].isdigit():
+                tiles = part.split('x')
+                if len(tiles) == 4:
+                    params['block_size'] = int(tiles[0])
+                    params['tile_m'] = int(tiles[1])
+                    params['tile_n'] = int(tiles[2])
+                    params['tile_k'] = int(tiles[3])
+                elif len(tiles) == 2:  # Waves: 1x4
+                    params['waves_m'] = int(tiles[0])
+                    params['waves_n'] = int(tiles[1])
+        
+        # Extract version: v1, v2, v3
+        for part in parts:
+            if part.startswith('v') and part[1:].isdigit():
+                params['version'] = int(part[1:])
+    
+    # Parse ASM kernel names - extract tile sizes from name
+    elif '_ZN' in kernel_name or 'fmoe_' in kernel_name:
+        # ASM 2-stage: fmoe_stage1_bf16_pertokenFp8_doweight_g1u1_64x128_2tg_pf3
+        # ASM 1-stage: fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256
+        
+        # Look for pattern like 32x256 or 64x128
+        tile_match = re.search(r'_(\d+)x(\d+)', kernel_name)
+        if tile_match:
+            params['tile_m'] = int(tile_match.group(1))
+            params['tile_n'] = int(tile_match.group(2))
+        
+        # Extract version from pf2, pf3
+        if 'pf2' in kernel_name:
+            params['version'] = 2
+        elif 'pf3' in kernel_name:
+            params['version'] = 3
+    
+    return params
 
 
 def run_all_kernel_tests(config_file="trace_moe_config.csv", 
@@ -128,7 +188,7 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
         q_type = eval(row['q_type'])        # QuantType.No, per_Token, per_1x128, etc.
         act_type = eval(row['act_type'])    # ActivationType.Silu, Gelu, etc.
         
-        cu_num = tuner.get_cu_num()  # Get GPU compute unit count
+        cu_num = tuner.get_cu_num()  # Get GPU compute unit count per config
         
         # Package configuration into tuple format expected by tune.py functions
         info = (
@@ -205,9 +265,8 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
             results = mp_tuner(all_tasks, in_data, mp_num=1, shape_grouped=False)
         except Exception as e:
             print(f"ERROR: Kernel crash for this configuration!")
-            print(f"  Error: {str(e)}")
+            print(f"  Error: {str(e)[:100]}")
             print(f"  Skipping this configuration and continuing...")
-            # Skip this config and continue with next
             continue
         
         # ========================================================================
@@ -265,13 +324,21 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
             # Calculate performance metrics from timing
             tflops, bw = tuner.calculate((key_info, stage, kernel_name, block_m, us, err))
             
-            # Categorize kernel implementation type from stage name
-            if "asm" in stage:
+            # Categorize kernel implementation type from kernel name and stage
+            # ASM kernels have mangled names starting with _ZN or contain aiter::
+            # CK kernels start with moe_ck2stages
+            if stage == "asm_1stage" or "_ZN" in kernel_name or "aiter::" in kernel_name or "fmoe_" in kernel_name:
                 kernel_type = "asm"
-            elif stage in ["stage1", "stage2"]:
+            elif "moe_ck2stages" in kernel_name or "ck_moe" in kernel_name:
                 kernel_type = "ck"
+            elif stage in ["stage1", "stage2"]:
+                # Fallback: if stage1/stage2 but not CK name, likely ASM
+                kernel_type = "asm" if "_ZN" in kernel_name else "ck"
             else:
                 kernel_type = "1stage"
+            
+            # Parse kernel parameters from kernel name
+            kernel_params = parse_kernel_parameters(kernel_name, kernel_type, stage)
             
             # Build result record containing all information
             result_dict = {
@@ -293,6 +360,15 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
                 'stage': stage,
                 'block_m': block_m,
                 'kernel_name': kernel_name,
+                # Kernel parameters parsed from name
+                'tile_m': kernel_params.get('tile_m'),
+                'tile_n': kernel_params.get('tile_n'),
+                'tile_k': kernel_params.get('tile_k'),
+                'block_size': kernel_params.get('block_size'),
+                'waves_m': kernel_params.get('waves_m'),
+                'waves_n': kernel_params.get('waves_n'),
+                'kernel_version': kernel_params.get('version'),
+                # Performance metrics
                 'time_us': us,
                 'quant_time_us': quant_time_us if stage in ['stage1', 'stage2'] else 0,
                 'error': f"{err:.2%}" if err < 1.0 else "failed",
@@ -463,11 +539,12 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
                     slower = max(candidates, key=lambda x: x[1])
                     speedup = slower[1] / fastest[1]
                     print(f"  Speedup vs {slower[0]}: {speedup:.2f}x faster")
-        
-    else:
+    
+    if not all_results:
         print("No results collected!")
+        return None
         
-    return results_df if all_results else None
+    return results_df
 
 
 def main():
