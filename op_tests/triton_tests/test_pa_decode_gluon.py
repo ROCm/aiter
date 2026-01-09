@@ -23,10 +23,15 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
+from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot_prebuild import (
+    prebuild_normal_accuracy_cases_aot_so,
+    prebuild_normal_performance_cases_aot_so,
+    get_so_files_size_and_count,
+)
 
 try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
+    from triton.experimental import gluon  # noqa: F401
+    from triton.experimental.gluon import language as gl  # noqa: F401
 except ImportError:
     print(
         "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, only pa_decode_gluon_aot can be used!"
@@ -36,7 +41,6 @@ except ImportError:
 
 TRITON_VERSION = triton.__version__
 TEST_NAME = "main.normal_accuracy_performance.jit"
-# TEST_NAME = "fix_mi350_fp8_aot_DDD_opt_mtp.rocm6.4.1.normal_accuracy_performance.aot"
 
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
@@ -74,7 +78,12 @@ SLIDING_WINDOW_OPTIONS = [0, 128]
 COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = []
 PS_OPTIONS = [True, False]
 
-CASE_SET_NAME_OPTIONS = ["normal_accuracy", "sliding_window_accuracy"]
+CASE_SET_NAME_OPTIONS = [
+    "normal_accuracy",
+    "normal_accuracy_aot",
+    "sliding_window_accuracy",
+    "sliding_window_performance",
+]
 
 
 def setup_seed(seed: int) -> None:
@@ -2196,6 +2205,7 @@ def normal_accuracy_test():
     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
     global PS_OPTIONS
 
+    USE_AOT_IMPL_OPTIONS = [False]
     SINKS_OPTIONS = [False]
     SLIDING_WINDOW_OPTIONS = [0]
     PS_OPTIONS = [False]
@@ -2211,7 +2221,59 @@ def normal_accuracy_test():
     BATCH_SIZE_OPTIONS = [3, 81]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False, True]
-    USE_AOT_IMPL_OPTIONS = [False]
+    BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+    parse_arg_and_run_test()
+
+    # Test for different head dimensions
+    HEAD_DIMENSION_OPTIONS = [64, 192, 256]
+    HEAD_CONFIGURATIONS = [(8, 1)]
+    QUERY_LENGTH_OPTIONS = [1, 3]
+    QUANT_MODE_OPTIONS = ["per_token"]
+    BATCH_SIZE_OPTIONS = [81]
+    KV_VARLEN_OPTIONS = [True]
+    parse_arg_and_run_test()
+
+
+def normal_accuracy_aot_test():
+    """Run normal accuracy aot test."""
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global COMPUTE_TYPE_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global QUANT_Q_AND_KV_OPTIONS
+    global USE_TORCH_FLASH_REF_OPTIONS
+    global USE_AOT_IMPL_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+    global SINKS_OPTIONS
+    global SLIDING_WINDOW_OPTIONS
+    global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global PS_OPTIONS
+
+    prebuild_normal_accuracy_cases_aot_so()
+    get_so_files_size_and_count()
+    USE_AOT_IMPL_OPTIONS = [True]
+
+    SINKS_OPTIONS = [False]
+    SLIDING_WINDOW_OPTIONS = [0]
+    PS_OPTIONS = [False]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+
+    HEAD_DIMENSION_OPTIONS = [128]
+    HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
+    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
+    CONTEXT_LENGTH_OPTIONS = [1027]
+    BATCH_SIZE_OPTIONS = [3, 81]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False, True]
     BLOCK_SIZE_OPTIONS = [16, 64, 1024]
     parse_arg_and_run_test()
 
@@ -2246,6 +2308,7 @@ def normal_performance_test():
     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
     global PS_OPTIONS
 
+    USE_AOT_IMPL_OPTIONS = [False]
     SINKS_OPTIONS = [False]
     SLIDING_WINDOW_OPTIONS = [0]
     PS_OPTIONS = [False]
@@ -2261,7 +2324,52 @@ def normal_performance_test():
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
     HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
-    USE_AOT_IMPL_OPTIONS = [False]
+    BLOCK_SIZE_OPTIONS = [16]
+    parse_arg_and_run_test()
+    BLOCK_SIZE_OPTIONS = [64]
+    parse_arg_and_run_test()
+
+
+def normal_performance_aot_test():
+    """Run normal performance aot test."""
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global COMPUTE_TYPE_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global QUANT_Q_AND_KV_OPTIONS
+    global USE_TORCH_FLASH_REF_OPTIONS
+    global USE_AOT_IMPL_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+    global SINKS_OPTIONS
+    global SLIDING_WINDOW_OPTIONS
+    global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global PS_OPTIONS
+
+    prebuild_normal_performance_cases_aot_so()
+    get_so_files_size_and_count()
+    USE_AOT_IMPL_OPTIONS = [True]
+
+    SINKS_OPTIONS = [False]
+    SLIDING_WINDOW_OPTIONS = [0]
+    PS_OPTIONS = [False]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+
+    HEAD_DIMENSION_OPTIONS = [128]
+    CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
+    BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
+    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False]
+    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     BLOCK_SIZE_OPTIONS = [64]
@@ -2269,7 +2377,7 @@ def normal_performance_test():
 
 
 def sliding_window_accuracy_test():
-    """Run simple test."""
+    """Run sliding window accuracy test."""
     global BLOCK_SIZE_OPTIONS
     global QUERY_LENGTH_OPTIONS
     global BATCH_SIZE_OPTIONS
@@ -2353,8 +2461,12 @@ def sliding_window_performance_test():
 def test_multi_case_set(case_set_name):
     if case_set_name == "normal_accuracy":
         normal_accuracy_test()
+    elif case_set_name == "normal_accuracy_aot":
+        normal_accuracy_aot_test()
     elif case_set_name == "normal_performance":
         normal_performance_test()
+    elif case_set_name == "normal_performance_aot":
+        normal_performance_aot_test()
     elif case_set_name == "sliding_window_accuracy":
         sliding_window_accuracy_test()
     elif case_set_name == "sliding_window_performance":
@@ -2363,6 +2475,8 @@ def test_multi_case_set(case_set_name):
 
 if __name__ == "__main__":
     normal_accuracy_test()
+    normal_accuracy_aot_test()
     normal_performance_test()
+    normal_performance_aot_test()
     sliding_window_accuracy_test()
     sliding_window_performance_test()

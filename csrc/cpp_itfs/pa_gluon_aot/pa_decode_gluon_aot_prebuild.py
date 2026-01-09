@@ -4,7 +4,9 @@ import argparse
 import random
 from typing import Optional, Tuple, Union, Dict
 import subprocess
-from multiprocessing import Pool, cpu_count
+import multiprocessing
+import concurrent.futures
+from multiprocessing import cpu_count
 
 import pandas as pd
 import torch
@@ -821,9 +823,12 @@ def run_multi_pa_gluon_test(
         num_processes = min(total, num_processes)
     print(f"Using {num_processes} parallel processes\n")
 
-    # Run tests in parallel
-    with Pool(processes=num_processes) as pool:
-        results = pool.map(_run_single_test, test_args)
+    # Run tests in parallel using spawn context to avoid CUDA reinitialization issues
+    mp_context = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=num_processes, mp_context=mp_context
+    ) as executor:
+        results = list(executor.map(_run_single_test, test_args))
 
     return pd.DataFrame(results)
 
@@ -926,6 +931,7 @@ def prebuild_normal_accuracy_cases_aot_so():
     global SLIDING_WINDOW_OPTIONS
     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
 
+    USE_AOT_IMPL_OPTIONS = [True]
     SINKS_OPTIONS = [False]
     SLIDING_WINDOW_OPTIONS = [0]
 
@@ -940,8 +946,16 @@ def prebuild_normal_accuracy_cases_aot_so():
     BATCH_SIZE_OPTIONS = [3, 81]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False, True]
-    USE_AOT_IMPL_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+    parse_arg_and_run_test()
+
+    # Test for different head dimensions
+    HEAD_DIMENSION_OPTIONS = [64, 192, 256]
+    HEAD_CONFIGURATIONS = [(8, 1)]
+    QUERY_LENGTH_OPTIONS = [1, 3]
+    QUANT_MODE_OPTIONS = ["per_token"]
+    BATCH_SIZE_OPTIONS = [81]
+    KV_VARLEN_OPTIONS = [True]
     parse_arg_and_run_test()
 
 
@@ -965,6 +979,7 @@ def prebuild_normal_performance_cases_aot_so():
     global SLIDING_WINDOW_OPTIONS
     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
 
+    USE_AOT_IMPL_OPTIONS = [True]
     SINKS_OPTIONS = [False]
     SLIDING_WINDOW_OPTIONS = [0]
 
@@ -979,12 +994,11 @@ def prebuild_normal_performance_cases_aot_so():
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
     HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
-    USE_AOT_IMPL_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16, 64]
     parse_arg_and_run_test()
 
 
 if __name__ == "__main__":
-    # prebuild_normal_accuracy_cases_aot_so()
+    prebuild_normal_accuracy_cases_aot_so()
     prebuild_normal_performance_cases_aot_so()
     get_so_files_size_and_count()

@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 from jinja2 import Template
 
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
@@ -42,12 +43,7 @@ except ImportError:
     )
     GLUON_AOT_COMPILE_ENABLED = False
 
-TORCH_TO_TL_DTYPE = {
-    torch.float8_e4m3fnuz: tl.float8e4b8,
-    torch.float8_e4m3fn: tl.float8e4nv,
-    torch.bfloat16: tl.bfloat16,
-    torch.float16: tl.float16,
-}
+
 TORCH_TO_TL_DTYPE_SIG = {
     torch.float8_e4m3fnuz: "fp8e4b8",
     torch.float8_e4m3fn: "fp8e4nv",
@@ -160,7 +156,7 @@ def compile(
             )
 
         # Convert compute_type from torch.dtype to tl.dtype for AOT compilation
-        compute_type_tl = TORCH_TO_TL_DTYPE[compute_type]
+        compute_type_tl = torch_to_triton_dtype[compute_type]
 
         waves_per_eu = 1
         kv_compute_block_size = context_partition_size
@@ -178,7 +174,7 @@ def compile(
             else:
                 waves_per_eu = 4
 
-        tl_fp8_type = TORCH_TO_TL_DTYPE[aiter.dtypes.fp8]
+        tl_fp8_type = torch_to_triton_dtype[aiter.dtypes.fp8]
         tl_fp8_type_sig = TORCH_TO_TL_DTYPE_SIG[aiter.dtypes.fp8]
         if compute_type_tl == tl_fp8_type or compute_type_tl == tl.bfloat16:
             if query_quant_mode >= 0:

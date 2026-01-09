@@ -5,6 +5,7 @@ from functools import lru_cache
 import torch
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 import triton
 import triton.language as tl
@@ -20,14 +21,6 @@ except ImportError:
     gluon = triton
     gl = tl
     GLUON_JIT_KERNEL_ENABLED = False
-
-
-TORCH_TO_TL_DTYPE = {
-    torch.float8_e4m3fnuz: tl.float8e4b8,
-    torch.float8_e4m3fn: tl.float8e4nv,
-    torch.bfloat16: tl.bfloat16,
-    torch.float16: tl.float16,
-}
 
 
 @lru_cache(maxsize=1)
@@ -3630,7 +3623,7 @@ def pa_decode_gluon(
         stride_query_scale_kv_head,
         key_scale_stride_0,
         key_scale_stride_1,
-        COMPUTE_TYPE=TORCH_TO_TL_DTYPE[compute_type],
+        COMPUTE_TYPE=torch_to_triton_dtype[compute_type],
         query_seq_len=query_length,
         HEAD_SIZE=head_size,
         query_group_size=query_group_size,
