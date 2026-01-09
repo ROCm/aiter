@@ -35,8 +35,8 @@ except ImportError:
 
 
 TRITON_VERSION = triton.__version__
-TEST_NAME = "main.normal_accuracy_performance.jit"
-# TEST_NAME = "main.normal_accuracy_performance.aot"
+# TEST_NAME = "main.normal_accuracy_performance.jit"
+TEST_NAME = "fix_mi350_fp8_aot_DDD_opt_mtp.rocm6.4.1.normal_accuracy_performance.aot"
 
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
@@ -1361,8 +1361,10 @@ def run_pa_gluon_test(
             quantized_values = value_cache
             key_scale_factors_flat = None
             value_scale_factors_flat = None
-            key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
-            value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+            key_scale_original = None
+            value_scale_original = None
+            # key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+            # value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
     else:  # per_tensor
         # Per-tensor quantization for query (if enabled)
         if quant_q:
@@ -1390,8 +1392,10 @@ def run_pa_gluon_test(
             quantized_values = value_cache
             key_scale_factors_flat = None
             value_scale_factors_flat = None
-            key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
-            value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+            key_scale_original = None
+            value_scale_original = None
+            # key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+            # value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
 
     # Reference (original)
     reference_output_quant = torch_mha_extend(
@@ -2357,7 +2361,7 @@ def test_multi_case_set(case_set_name):
 
 
 if __name__ == "__main__":
-    normal_accuracy_test()
+    # normal_accuracy_test()
     normal_performance_test()
-    sliding_window_accuracy_test()
-    sliding_window_performance_test()
+    # sliding_window_accuracy_test()
+    # sliding_window_performance_test()

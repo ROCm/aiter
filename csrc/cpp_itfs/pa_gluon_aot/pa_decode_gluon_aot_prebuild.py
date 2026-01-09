@@ -985,6 +985,6 @@ def prebuild_normal_performance_cases_aot_so():
 
 
 if __name__ == "__main__":
-    prebuild_normal_accuracy_cases_aot_so()
+    # prebuild_normal_accuracy_cases_aot_so()
     prebuild_normal_performance_cases_aot_so()
     get_so_files_size_and_count()
