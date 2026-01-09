@@ -118,13 +118,15 @@ def parse_kernel_parameters(kernel_name, kernel_type, stage):
 
 
 def run_all_kernel_tests(config_file="trace_moe_config.csv", 
-                         output_file="all_kernel_results.csv"):
+                         output_file="all_kernel_results.csv",
+                         error_log_file="benchmark_errors.log"):
     """
     Run all kernel combinations for configurations in the input file.
     
     Args:
         config_file: Path to input CSV with configuration
         output_file: Path to output CSV with all results
+        error_log_file: Path to error log file
     """
     
     # Read configuration
@@ -134,6 +136,14 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
         
     config_df = pd.read_csv(config_file)
     print(f"Loaded {len(config_df)} configurations from {config_file}")
+    
+    # Open error log file
+    error_log = open(error_log_file, 'w')
+    error_log.write(f"MOE Kernel Benchmark Error Log\n")
+    error_log.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    error_log.write(f"Config file: {config_file}\n")
+    error_log.write(f"="*80 + "\n\n")
+    error_log.flush()
     
     # Initialize tuner
     key = [
@@ -227,19 +237,34 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
             # 1. ASM kernels for 2-stage (assembly-based implementations)
             tasks_asm = tuner.gen_2stages_asm1_task(info, blockMs)
         except Exception as e:
-            print(f"  WARNING: ASM kernel generation failed: {str(e)[:100]}")
+            error_msg = str(e)
+            print(f"  WARNING: ASM kernel generation failed: {error_msg[:100]}")
+            error_log.write(f"[{datetime.now().strftime('%H:%M:%S')}] ASM Generation Failed\n")
+            error_log.write(f"  Config#{idx}: token={row['token']}, model_dim={row['model_dim']}, expert={row['expert']}, topk={row['topk']}\n")
+            error_log.write(f"  Error: {error_msg}\n\n")
+            error_log.flush()
         
         try:
             # 2. CK kernels for 2-stage (Composable Kernel library)
             tasks_ck = tuner.gen_2stages_task(info, blockMs)
         except Exception as e:
-            print(f"  WARNING: CK kernel generation failed: {str(e)[:100]}")
+            error_msg = str(e)
+            print(f"  WARNING: CK kernel generation failed: {error_msg[:100]}")
+            error_log.write(f"[{datetime.now().strftime('%H:%M:%S')}] CK Generation Failed\n")
+            error_log.write(f"  Config#{idx}: token={row['token']}, model_dim={row['model_dim']}, expert={row['expert']}, topk={row['topk']}\n")
+            error_log.write(f"  Error: {error_msg}\n\n")
+            error_log.flush()
         
         try:
             # 3. 1-stage kernels (fused approach)
             tasks_1stage = tuner.gen_1stage_asm_task(info)
         except Exception as e:
-            print(f"  WARNING: 1-stage kernel generation failed: {str(e)[:100]}")
+            error_msg = str(e)
+            print(f"  WARNING: 1-stage kernel generation failed: {error_msg[:100]}")
+            error_log.write(f"[{datetime.now().strftime('%H:%M:%S')}] 1-Stage Generation Failed\n")
+            error_log.write(f"  Config#{idx}: token={row['token']}, model_dim={row['model_dim']}, expert={row['expert']}, topk={row['topk']}\n")
+            error_log.write(f"  Error: {error_msg}\n\n")
+            error_log.flush()
         
         total_tasks = len(tasks_asm) + len(tasks_ck) + len(tasks_1stage)
         print(f"Total kernels to test: {total_tasks}")
@@ -264,9 +289,19 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
         try:
             results = mp_tuner(all_tasks, in_data, mp_num=1, shape_grouped=False)
         except Exception as e:
-            print(f"ERROR: Kernel crash for this configuration!")
-            print(f"  Error: {str(e)[:100]}")
+            error_msg = str(e)
+            print(f"ERROR: Kernel execution crash for this configuration!")
+            print(f"  Error: {error_msg[:100]}")
             print(f"  Skipping this configuration and continuing...")
+            
+            # Log execution crash with details
+            error_log.write(f"[{datetime.now().strftime('%H:%M:%S')}] EXECUTION CRASH\n")
+            error_log.write(f"  Config#{idx}: token={row['token']}, model_dim={row['model_dim']}, inter_dim={row['inter_dim']}\n")
+            error_log.write(f"  expert={row['expert']}, topk={row['topk']}, q_type={q_type}, act={act_type}\n")
+            error_log.write(f"  Tasks: ASM={len(tasks_asm)}, CK={len(tasks_ck)}, 1-stage={len(tasks_1stage)}\n")
+            error_log.write(f"  Error: {error_msg}\n")
+            error_log.write(f"-"*80 + "\n\n")
+            error_log.flush()
             continue
         
         # ========================================================================
@@ -540,10 +575,15 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
                     speedup = slower[1] / fastest[1]
                     print(f"  Speedup vs {slower[0]}: {speedup:.2f}x faster")
     
+    # Close error log file
+    error_log.write(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    error_log.close()
+    
     if not all_results:
         print("No results collected!")
         return None
-        
+    
+    print(f"\nError log saved to: {error_log_file}")    
     return results_df
 
 
