@@ -36,6 +36,7 @@ aiter.hipb_create_extension()
 
 @lru_cache(maxsize=1)
 def init_hipblas():
+    print("=====")
     aiter.hipb_create_extension()
 
 

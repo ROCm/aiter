@@ -624,12 +624,18 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
   void *bias_ptr =
       bias.has_value() ? static_cast<void *>(bias.value().data_ptr()) : nullptr;
 
-  CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(
+  // CHECK_HIPBLAS_ERROR(
+  auto error = hipblasLtMatmul_sol_wrapper(
       hipblaslt_handle, transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
       mat1_ld, d_scaleA, ptrB, mat2_ld, d_scaleB, &zero, ptrC, result_ld,
       d_scaleOut, bias_ptr, hipblasInType, hipblasOutType, current_stream,
-      solution_index, bpreshuffle_flag, use_rowwise));
+      solution_index, bpreshuffle_flag, use_rowwise);
+    if (error != HIPBLAS_STATUS_SUCCESS)                              
+    fprintf(stderr, "hipBLAS error: '%s'(%d) at %s:%d\n",             
+            hipblasStatusToString(error), error, __FILE__, __LINE__); 
+    
+    // );
 
   return result;
 }
@@ -651,7 +657,7 @@ std::vector<int> hipb_findallsols(
   TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
   TORCH_CHECK(mat1.dtype() == mat2.dtype(),
               "expected mat1 and mat2 to have the same dtype, but got: ",
-              mat1.dtype(), " != ", mat2.dtype());
+            mat1.dtype(), " != ", mat2.dtype());
   TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0],
               "mat1 dim 1 must match mat2 dim 0");
 
