@@ -257,39 +257,48 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     return splitK
 
 
-_CKGEMM_CONFIG_CACHE = None
-
-
 @functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
-    if tuned_file is None:
-        tuned_file = "a8w8_tuned_gemm.csv"
-    global _CKGEMM_CONFIG_CACHE
+def get_CKGEMM_config(
+    M: int,
+    N: int,
+    K: int,
+    q_dtype_w=None,
+    tuned_file=f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
+):
+    # Use dict to cache configs for different files
+    if not hasattr(get_CKGEMM_config, "file_cache"):
+        get_CKGEMM_config.file_cache = {}
 
-    if _CKGEMM_CONFIG_CACHE is None:
-        _CKGEMM_CONFIG_CACHE = {}
-    if tuned_file not in _CKGEMM_CONFIG_CACHE:
-        ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
-        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
-            ["cu_num", "M", "N", "K"]
+    # Load file if not cached
+    if tuned_file not in get_CKGEMM_config.file_cache:
+        ckgemm_dict = pd.read_csv(tuned_file).drop_duplicates()
+        get_CKGEMM_config.file_cache[tuned_file] = ckgemm_dict.set_index(
+            ["cu_num", "M", "N", "K", "q_dtype_w"]
         ).to_dict("index")
 
     cu_num = get_cu_num()
-
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = _CKGEMM_CONFIG_CACHE[tuned_file].get((cu_num, padded_M, N, K), None)
+        # Try to get config with q_dtype_w if provided
+        if q_dtype_w is not None:
+            config = get_CKGEMM_config.file_cache[tuned_file].get(
+                (cu_num, padded_M, N, K, q_dtype_w), None
+            )
+        if config is None:
+            config = get_CKGEMM_config.file_cache[tuned_file].get(
+                (cu_num, padded_M, N, K), None
+            )
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
-                    f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {tuned_file} , kernel name is {config['kernelName']}!"
+                    f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}, kernel name is {config['kernelName']}!"
                 )
             break
     if config is None:
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
+            f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
         )
     return config
 
