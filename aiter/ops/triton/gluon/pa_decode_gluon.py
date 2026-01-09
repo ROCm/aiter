@@ -54,6 +54,26 @@ def get_recommended_splits(num_sequences, num_kv_heads):
     return max_context_partition_num
 
 
+def parse_triton_version(version_str):
+    """Parse version string into comparable tuple format, handling possible development version suffixes"""
+    # Remove potential suffixes like .dev, +git etc.
+    version_str = version_str.split("+")[0].split("-")[0]
+
+    # Split version number and convert to integers
+    parts = []
+    for part in version_str.split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            break
+    return tuple(parts)
+
+
+TRITON_VERSION = parse_triton_version(triton.__version__)
+# Pre-compute version check as constexpr for use in JIT kernels
+TRITON_VERSION_GE_3_6_0 = tl.constexpr(TRITON_VERSION >= (3, 6, 0))
+
+
 @gluon.jit
 def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -127,10 +147,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     Args:
         Various pointers to tensors and configuration parameters as described above.
     """
-    if KV_QUANT_MODE >= 0:
-        KV_16B_ELEMENT_COUNT: gl.constexpr = 16
-    else:
-        KV_16B_ELEMENT_COUNT: gl.constexpr = 8
     # ==================== Validation Checks ====================
     gl.static_assert(
         CONTEXT_PARTITION_SIZE == 256,
@@ -140,7 +156,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         KV_BLOCK_SIZE == 1024,
         f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE == 1024",
     )
-
     # Data type validation
     gl.static_assert(
         query_ptr.dtype.is_fp8()
@@ -165,6 +180,20 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== Constants and Configuration ====================
+    if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
+        MFMA_INSTR_K: gl.constexpr = 32
+    else:
+        MFMA_INSTR_K: gl.constexpr = 16
+    if TRITON_VERSION_GE_3_6_0:
+        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
+    else:
+        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
+
+    if KV_QUANT_MODE >= 0:
+        KV_16B_ELEMENT_COUNT: gl.constexpr = 16
+    else:
+        KV_16B_ELEMENT_COUNT: gl.constexpr = 8
+
     if COMPUTE_TYPE.is_fp8():
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
     else:
@@ -223,7 +252,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     # QK matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=CDNA_VERSION,
-        instr_shape=[16, 16],
+        instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
     )
@@ -309,7 +338,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     # PV matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=CDNA_VERSION,
-        instr_shape=[16, 16],
+        instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
     )
@@ -841,17 +870,11 @@ def paged_attention_decode_sliding_window(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-
-    if KV_QUANT_MODE >= 0:
-        KV_16B_ELEMENT_COUNT: gl.constexpr = 16
-    else:
-        KV_16B_ELEMENT_COUNT: gl.constexpr = 8
     # ==================== VALIDATION CHECKS ====================
     gl.static_assert(
         KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64,
         f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64]",
     )
-
     # Data type validation
     gl.static_assert(
         query_ptr.dtype.is_fp8()
@@ -876,6 +899,20 @@ def paged_attention_decode_sliding_window(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
+    if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
+        MFMA_INSTR_K: gl.constexpr = 32
+    else:
+        MFMA_INSTR_K: gl.constexpr = 16
+    if TRITON_VERSION_GE_3_6_0:
+        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
+    else:
+        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
+
+    if KV_QUANT_MODE >= 0:
+        KV_16B_ELEMENT_COUNT: gl.constexpr = 16
+    else:
+        KV_16B_ELEMENT_COUNT: gl.constexpr = 8
+
     if COMPUTE_TYPE.is_fp8():
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
     else:
@@ -937,7 +974,7 @@ def paged_attention_decode_sliding_window(
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=CDNA_VERSION,
-        instr_shape=[16, 16],
+        instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
     )
@@ -1051,7 +1088,7 @@ def paged_attention_decode_sliding_window(
     # PV Matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=CDNA_VERSION,
-        instr_shape=[16, 16],
+        instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
     )
@@ -1716,17 +1753,11 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-
-    if KV_QUANT_MODE >= 0:
-        KV_16B_ELEMENT_COUNT: gl.constexpr = 16
-    else:
-        KV_16B_ELEMENT_COUNT: gl.constexpr = 8
     # ==================== VALIDATION CHECKS ====================
     gl.static_assert(
         KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64,
         f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64]",
     )
-
     # Data type validation
     gl.static_assert(
         query_ptr.dtype.is_fp8()
@@ -1751,6 +1782,20 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
+    if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
+        MFMA_INSTR_K: gl.constexpr = 32
+    else:
+        MFMA_INSTR_K: gl.constexpr = 16
+    if TRITON_VERSION_GE_3_6_0:
+        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
+    else:
+        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
+
+    if KV_QUANT_MODE >= 0:
+        KV_16B_ELEMENT_COUNT: gl.constexpr = 16
+    else:
+        KV_16B_ELEMENT_COUNT: gl.constexpr = 8
+
     if COMPUTE_TYPE.is_fp8():
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
     else:
@@ -1822,7 +1867,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=CDNA_VERSION,
-        instr_shape=[16, 16],
+        instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
     )
@@ -1936,7 +1981,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     # PV Matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=CDNA_VERSION,
-        instr_shape=[16, 16],
+        instr_shape=QK_PV_MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, 4],
     )

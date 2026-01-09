@@ -1363,8 +1363,6 @@ def run_pa_gluon_test(
             value_scale_factors_flat = None
             key_scale_original = None
             value_scale_original = None
-            # key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
-            # value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
     else:  # per_tensor
         # Per-tensor quantization for query (if enabled)
         if quant_q:
@@ -1394,8 +1392,6 @@ def run_pa_gluon_test(
             value_scale_factors_flat = None
             key_scale_original = None
             value_scale_original = None
-            # key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
-            # value_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
 
     # Reference (original)
     reference_output_quant = torch_mha_extend(
@@ -2361,7 +2357,7 @@ def test_multi_case_set(case_set_name):
 
 
 if __name__ == "__main__":
-    # normal_accuracy_test()
+    normal_accuracy_test()
     normal_performance_test()
-    # sliding_window_accuracy_test()
-    # sliding_window_performance_test()
+    sliding_window_accuracy_test()
+    sliding_window_performance_test()
