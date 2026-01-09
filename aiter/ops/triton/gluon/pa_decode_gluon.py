@@ -3524,7 +3524,6 @@ def pa_decode_gluon(
         batch_size, query_length, num_kv_heads, query_group_size, head_size
     )
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
-    ps = ps or one_shot
     # Determine output tensor and strides based on one_shot mode
     output_for_kernel = output_5d if one_shot else temporary_output
     ps = ps or one_shot
