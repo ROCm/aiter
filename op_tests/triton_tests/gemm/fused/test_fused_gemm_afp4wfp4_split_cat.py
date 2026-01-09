@@ -3,19 +3,20 @@
 
 import torch
 import pytest
-from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import fused_gemm_afp4wfp4_split_cat
+from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+    fused_gemm_afp4wfp4_split_cat,
+    fused_gemm_afp4wfp4_preshuffle_split_cat,
+)
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     mxfp4_to_f32,
     e8m0_to_f32,
 )
 
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
-import torch.nn.functional as F
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-
-
-DEVICE_ARCH = arch_info.get_arch()
+from aiter.ops.shuffle import shuffle_weight
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales
 
 SCALE_GROUP_SIZE = 32
 
@@ -40,81 +41,46 @@ def run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
     return c1.to(dtype), c2.to(dtype)
 
 
-def run_triton(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
+def run_triton(
+    x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16, shuffle=False
+):
     m = x.shape[0]
-
-    return fused_gemm_afp4wfp4_split_cat(
-        x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype
+    fn = (
+        fused_gemm_afp4wfp4_preshuffle_split_cat
+        if shuffle
+        else fused_gemm_afp4wfp4_split_cat
     )
-
-
-e5m2_type, e4m3_type = get_fp8_dtypes()
+    return fn(x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype)
 
 
 def get_shapes():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 4)]
     x_vals += [
         (1, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
         (128, 1280, 8192),
         (192, 1280, 8192),
-        (256, 1280, 8192),
         (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
         (8192, 1280, 8192),
-        (16384, 1280, 8192),
         (1, 8192, 1024),
         (32, 8192, 1024),
         (64, 8192, 1024),
         (128, 8192, 1024),
         (192, 8192, 1024),
-        (256, 8192, 1024),
         (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
         (8192, 8192, 1024),
-        (16384, 8192, 1024),
         (2048, 2048, 2049),
         (159, 17389, 597),
         (16, 576, 7168),
     ]
     x_vals += [
-        (256, 8192, 1024),
-        (256, 1024, 8192),
-        (256, 32768, 8192),
-        (256, 8192, 32768),
-    ]
-    x_vals += [
-        (16, 2112, 7168),
-        (32, 2112, 7168),
-        (64, 2112, 7168),
-        (128, 2112, 7168),
-        (16, 3072, 1536),
-        (32, 3072, 1536),
-        (64, 3072, 1536),
-        (128, 3072, 1536),
-        (16, 7168, 2048),
-        (32, 7168, 2048),
-        (64, 7168, 2048),
-        (128, 7168, 2048),
-        (16, 4096, 7168),
-        (32, 4096, 7168),
-        (64, 4096, 7168),
-        (128, 4096, 7168),
-        (16, 7168, 256),
-        (32, 7168, 256),
-        (64, 7168, 256),
-        (128, 7168, 256),
-    ]
-    x_vals = [
-        (4096, 256, 512),
+        (16, 4096, 512),
+        (32, 4096, 512),
+        (64, 4096, 512),
+        (128, 4096, 512),
+        (256, 4096, 512),
+        (1024, 4096, 512),
     ]
     return x_vals
 
@@ -126,6 +92,7 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     S3: int,
     dtype=torch.bfloat16,
     layout: str = "TN",
+    shuffle: bool = False,
 ):
     """
     The GEMM kernel expects:
@@ -169,24 +136,52 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     )
     x_scale = x_scale.T
     w_scale = w_scale.T
+    if shuffle:
+        if M >= 32:
+            x_scales_shuffled = shuffle_scales(x_scale)
+        else:
+            x_scales_shuffled = x_scale.contiguous()
+        w_scales_shuffled = shuffle_scales(w_scale)
+        use_int4 = False
+        weight_shuffle_layout = (16, 16)
+        w_shuffed = shuffle_weight(
+            w, layout=weight_shuffle_layout, use_int4=use_int4
+        ).reshape(
+            w.shape[0] // weight_shuffle_layout[0],
+            w.shape[1] * weight_shuffle_layout[0],
+        )
+    else:
+        x_scales_shuffled = x_scale
+        w_scales_shuffled = w_scale
+        w_shuffed = w
 
     y = torch.rand((M, S3), dtype=torch.bfloat16, device="cuda").unsqueeze(1)
 
-    return x, w, y, x_scale[:M], w_scale
+    return (
+        x,
+        w,
+        w_shuffed,
+        y,
+        x_scale[:M],
+        w_scale,
+        x_scales_shuffled[:M],
+        w_scales_shuffled,
+    )
 
 
 @pytest.mark.parametrize(
-    "dtype, M, N, K, D, S3, layout",
+    "dtype, M, N, K, D, S3, layout, shuffle",
     [
-        (dtype, *shape, d, s3, layout)
+        (dtype, *shape, d, s3, layout, shuffle)
         for dtype in ["bf16"]
         for shape in get_shapes()
         for d in [16]
         for s3 in [64]
         for layout in ["TN", "TT", "NN", "NT"]
+        for shuffle in [True, False]
     ],
 )
-def test_fused_gemm_afp4wfp4_split_cat(dtype, M, N, K, D, S3, layout):
+def test_fused_gemm_afp4wfp4_split_cat(dtype, M, N, K, D, S3, layout, shuffle):
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -203,17 +198,22 @@ def test_fused_gemm_afp4wfp4_split_cat(dtype, M, N, K, D, S3, layout):
     S2 = S - S1
 
     dtype = str_to_torch_dtype[dtype]
-    x, w, y, x_scale, w_scale = generate_fused_gemm_afp4wfp4_split_cat_inputs(
-        M,
-        N,
-        K,
-        S3,
-        dtype=dtype,
-        layout=layout,
+    x, w, w_triton, y, x_scale, w_scale, x_scales_triton, w_scales_triton = (
+        generate_fused_gemm_afp4wfp4_split_cat_inputs(
+            M,
+            N,
+            K,
+            S3,
+            dtype=dtype,
+            layout=layout,
+            shuffle=shuffle,
+        )
     )
 
     c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
-    c1_triton, c2_triton = run_triton(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
+    c1_triton, c2_triton = run_triton(
+        x, w_triton, y, x_scales_triton, w_scales_triton, S1, S2, D, dtype, shuffle
+    )
 
     torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
     torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
