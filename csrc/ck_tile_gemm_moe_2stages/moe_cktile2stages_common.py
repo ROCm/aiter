@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 import os
 import sys
@@ -51,6 +51,7 @@ class kernelInstance:
     HasBias: bool = False
     ActOP: str = "silu"
     QuantType: str = "per_tensor"
+    b_nt_type: int = 0
 
     @property
     def name(self) -> str:
@@ -82,6 +83,7 @@ class kernelInstance:
                 "HasBias" if self.HasBias else "",
                 "" if (self.stage == 2) else self.ActOP,
                 "SplitK" if self.SplitK else "",
+                f"bnt{self.b_nt_type}" if self.b_nt_type != 0 else "",
             ]
             if element != ""
         )
@@ -97,6 +99,7 @@ class kernelInstance:
                 "Bias" if self.HasBias else "NoBias",
                 "" if (self.stage == 2) else self.ActOP,
                 "SplitK" if self.SplitK else "",
+                f"bnt{self.b_nt_type}" if self.b_nt_type != 0 else "",
             ]
             if element != ""
         )
@@ -241,7 +244,7 @@ a8w8_gfx950_heuristic_dispatch = """#pragma once
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
 
 template <>
-struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}, {(b_nt_type)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
@@ -273,7 +276,7 @@ struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
 }};
 
 template <>
-struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}, {(b_nt_type)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
@@ -312,7 +315,7 @@ a16w4_gfx950_heuristic_dispatch = """#pragma once
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
 
 template <>
-struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}, {(b_nt_type)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
@@ -340,7 +343,7 @@ struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
 }};
 
 template <>
-struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}, {(b_nt_type)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
@@ -375,7 +378,7 @@ a16w4_heuristic_dispatch = """#pragma once
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
 
 template <>
-struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}, {(b_nt_type)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
@@ -403,7 +406,7 @@ struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
 }};
 
 template <>
-struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}, {(b_nt_type)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
@@ -438,7 +441,7 @@ a8w4_gfx950_heuristic_dispatch = """#pragma once
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
 
 template <>
-struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}, {(b_nt_type)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
@@ -462,7 +465,7 @@ struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
 }};
 
 template <>
-struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}, {(b_nt_type)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
@@ -509,6 +512,7 @@ def get_gemm1_kernels_list(
     MulRoutedWeight: bool = False,
     HasBias: bool = False,
     IsSplitK: bool = False,
+    b_nt_type: int = 0,
 ) -> list:
     arch = get_gfx()
     if Adtype.lower() in bit8_list and Bdtype.lower() in bit8_list and Adtype == Bdtype:
@@ -537,6 +541,7 @@ def get_gemm1_kernels_list(
         kernel.QuantType = QuantType
         kernel.HasBias = HasBias
         kernel.SplitK = IsSplitK
+        kernel.b_nt_type = b_nt_type
         # if tag == "a8w4":
         # kernel.CDEElementOp = "MulABScaleWint4"
         # elif tag == "a8w8blkscale":
@@ -558,6 +563,7 @@ def get_gemm2_kernels_list(
     ActOP: str = "",
     MulRoutedWeight: bool = True,
     HasBias: bool = False,
+    b_nt_type: int = 0,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit8_list and Bdtype in bit8_list and Adtype == Bdtype:
@@ -587,6 +593,7 @@ def get_gemm2_kernels_list(
         kernel.HasBias = HasBias
         # TODO: support splitk in stage2
         kernel.SplitK = False
+        kernel.b_nt_type = b_nt_type
         # if tag == "a8w4":
         #     kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         # elif tag == "a8w8blkscale":

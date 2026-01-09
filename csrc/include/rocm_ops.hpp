@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include <pybind11/pybind11.h>
@@ -964,7 +964,8 @@ namespace py = pybind11;
           py::arg("exp_bias")       = std::nullopt, \
           py::arg("activation")     = 0,            \
           py::arg("block_m")        = 32,           \
-          py::arg("split_k")        = 1);                  \
+          py::arg("split_k")        = 1,            \
+          py::arg("b_nt_type")      = 0);           \
                                                     \
     m.def("cktile_moe_gemm2",                       \
           &cktile_moe_gemm2,                        \
@@ -984,7 +985,8 @@ namespace py = pybind11;
           py::arg("exp_bias")       = std::nullopt, \
           py::arg("activation")     = 0,            \
           py::arg("block_m")        = 32,           \
-          py::arg("split_k")        = 1);
+          py::arg("split_k")        = 1,            \
+          py::arg("b_nt_type")      = 0);
 
 #define MHA_VARLEN_FWD_PYBIND                            \
     m.def("mha_varlen_fwd",                              \

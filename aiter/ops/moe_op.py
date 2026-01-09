@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
@@ -340,6 +340,7 @@ def moe_cktile2stages_gemm1_ck(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    b_nt_type: Optional[int] = 0,
 ) -> Tensor: ...
 
 
@@ -360,6 +361,7 @@ def moe_cktile2stages_gemm1(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    b_nt_type: Optional[int] = 0,
 ):
     return moe_cktile2stages_gemm1_ck(
         XQ,
@@ -378,6 +380,7 @@ def moe_cktile2stages_gemm1(
         activation,
         block_m,
         split_k,
+        b_nt_type,
     )
 
 
@@ -399,6 +402,7 @@ def moe_cktile2stages_gemm2_ck(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    b_nt_type: Optional[int] = 0,
 ) -> Tensor: ...
 
 
@@ -419,6 +423,7 @@ def moe_cktile2stages_gemm2(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    b_nt_type: Optional[int] = 0,
 ):
     return moe_cktile2stages_gemm2_ck(
         XQ,
@@ -437,6 +442,7 @@ def moe_cktile2stages_gemm2(
         activation,
         block_m,
         split_k,
+        b_nt_type,
     )
 
 

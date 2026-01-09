@@ -16,6 +16,10 @@ from moe_cktile2stages_common import (
 )
 import sys
 from chip_info import get_gfx
+from aiter.utility.amd_buffer_coherence import (
+    BufferCoherenceType,
+    BufferCoherenceMapper,
+)
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -39,6 +43,7 @@ class cktile_moe_2stage_gemm_codegen:
         activation,
         mul_routed_weight_stage,
         is_split_k,
+        b_nt_type,
         istune=False,
     ):
         self.working_path = working_path
@@ -55,6 +60,7 @@ class cktile_moe_2stage_gemm_codegen:
         self.quant_type = quant_type
         self.is_split_k = is_split_k
         self.activation = act_dict[activation]
+        self.b_nt_type = b_nt_type
         self.mul_routed_weight_stage = mul_routed_weight_stage
 
     def get_suffix(self, stage: int) -> str:
@@ -193,7 +199,8 @@ torch::Tensor
                 "ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up" if k.stage == 1 else
                 "ck_tile::MoeFlatmmKind::kFFN_gemm2"},
                 ck_tile::element_wise::PassThrough,
-                {act_dict[k.ActOP]}
+                {act_dict[k.ActOP]},
+                {k.b_nt_type}
                 >(kernel_args, stream_config);
 """
 
@@ -280,6 +287,7 @@ template torch::Tensor
                 "(activation)": self.activation,
                 "(has_bias)": "true" if self.activation == 2 else "false",
                 "(split_k)": "true" if self.is_split_k else "false",
+                "(b_nt_type)": str(self.b_nt_type),
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
             str_mapping.update(format_args)
@@ -618,6 +626,11 @@ if __name__ == "__main__":
     c_dtypes = ["bf16"]
     is_split_k_l = [True, False]
 
+    b_nt_type_l = [
+        BufferCoherenceMapper.map_to_arch_value(BufferCoherenceType.DEFAULT),
+        BufferCoherenceMapper.map_to_arch_value(BufferCoherenceType.WAVE_NT),
+    ]
+
     impl_path = os.path.join(args.working_path, "impl")
     instances_path = os.path.join(args.working_path, "instances")
     dispatchers_path = os.path.join(args.working_path, "dispatchers")
@@ -639,8 +652,8 @@ if __name__ == "__main__":
     gen_dispatch_files = []
     gen_manifest_files = []
 
-    for a_type, c_dtype, act_type, is_split_k in itertools.product(
-        a_types, c_dtypes, act_types, is_split_k_l
+    for a_type, c_dtype, act_type, is_split_k, b_nt_type in itertools.product(
+        a_types, c_dtypes, act_types, is_split_k_l, b_nt_type_l
     ):
         has_bias = True if act_type == "swiglu" else False
 
@@ -656,6 +669,7 @@ if __name__ == "__main__":
             act_type,
             2,
             is_split_k,
+            b_nt_type,
             False,
         )
         # gen all instances for gemm1 and gemm2
@@ -667,6 +681,7 @@ if __name__ == "__main__":
             False,
             has_bias,
             is_split_k,
+            b_nt_type,
         )
         tag, gemm2_kernel_list = get_gemm2_kernels_list(
             a_type,
@@ -675,6 +690,7 @@ if __name__ == "__main__":
             "no",
             True,
             has_bias,
+            b_nt_type,
         )
         # merge gemm1/gemm2 dict with key = {stage, key}
         kernel_dict_merge = {

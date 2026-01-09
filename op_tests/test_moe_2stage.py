@@ -287,6 +287,8 @@ l_tokenNum = [
     1024,
     4096,
     163840,
+    # 8192,
+    # 163840,
 ]
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
@@ -301,7 +303,7 @@ l_quant = [
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
 # l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
-l_hidden_intermediate_pad = [(0, 0), (192, 128), (129, 191)][1:2]
+l_hidden_intermediate_pad = [(0, 0), (192, 128), (129, 191)][0:1]
 l_preshuffle = [False, True]
 
 

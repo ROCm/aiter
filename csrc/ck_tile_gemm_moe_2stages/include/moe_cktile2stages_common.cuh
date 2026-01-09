@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include "ck_tile/core.hpp"
@@ -89,6 +89,7 @@ template <typename FlatmmConfig,
           ck_tile::MoeFlatmmKind moe_kind,
           typename CDEElementWise,
           int ActivationOp,
+          int BNTType,
           typename MoeFlatmmHostArgs>
 void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 {
@@ -152,18 +153,16 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
 
-    const int32_t b_mem_nt_type = GetBMemNTType(args.NumTokens, args.N, args.K);
-
     float ave_time{0};
 
     const auto Run = [&](const auto has_hot_loop_,
                          const auto tail_number_,
-                         const auto b_mem_nt_type_) {
+                         const auto memory_operation_) {
         constexpr bool has_hot_loop_v   = has_hot_loop_.value;
         constexpr auto tail_number_v    = tail_number_.value;
         constexpr auto scheduler        = FlatmmConfig::Scheduler;
         constexpr auto b_mem_nt_type_v =
-            static_cast<ck_tile::amd_buffer_coherence_enum>(b_mem_nt_type_.value);
+            static_cast<ck_tile::amd_buffer_coherence_enum>(BNTType);
 
         using CodegenPipelineProblem = std::conditional_t<
             BMXFP4_Pipeline,
@@ -322,32 +321,31 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         // return ave_time;
     };
 
-    const auto RunBMem =
-        [&](const auto has_hot_loop_, const auto tail_number_) {
-            switch(b_mem_nt_type)
-            {
-            case 2: {
-                Run(has_hot_loop_,
-                    tail_number_,
-                    ck_tile::integral_constant<int32_t, 2>{});
-            }
-            break;
-            default: {
-                Run(has_hot_loop_,
-                    tail_number_,
-                    ck_tile::integral_constant<int32_t, 0>{});
-            }
-            }
-        };
+    const auto RunSplitk = [&](const auto has_hot_loop_, const auto tail_number_) {
+        if(args.k_batch == 1)
+        {
+            Run(has_hot_loop_,
+                tail_number_,
+                ck_tile::integral_constant<ck_tile::memory_operation_enum,
+                                           ck_tile::memory_operation_enum::set>{});
+        }
+        else
+        {
+            Run(has_hot_loop_,
+                tail_number_,
+                ck_tile::integral_constant<ck_tile::memory_operation_enum,
+                                           ck_tile::memory_operation_enum::atomic_add>{});
+        }
+    };
 
     if(tail_num == ck_tile::TailNumber::Odd)
     {
-        RunBMem(ck_tile::bool_constant<true>{},
+        RunSplitk(ck_tile::bool_constant<true>{},
                   ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Odd>{});
     }
     else if(tail_num == ck_tile::TailNumber::Even)
     {
-        RunBMem(ck_tile::bool_constant<true>{},
+        RunSplitk(ck_tile::bool_constant<true>{},
                   ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Even>{});
     }
     else
