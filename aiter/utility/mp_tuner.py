@@ -520,7 +520,7 @@ def mp_tuner(
     # Reconstruct results in original task order
     result = []
     for k in range(len(rets)):
-        task_result = result_dict[k]
+        task_result = result_dict.get(k, [])
         if shape_grouped:
             result.extend(task_result)
         else:
