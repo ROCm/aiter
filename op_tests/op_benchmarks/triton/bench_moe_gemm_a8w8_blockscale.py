@@ -90,7 +90,7 @@ def compute_roofline(
         )
 
 
-def bench_mlp(
+def bench_mlp_single_weight_init(
     batch,
     dim1,
     dim2,
@@ -317,6 +317,47 @@ def bench_mlp(
     )
 
 
+def bench_mlp(
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    x_dtype,
+    w_dtype,
+    per_row_act_quant,
+    TP,
+    op_regex,
+    num_weight_inits=1,
+):
+    all_results = []
+    for i in range(num_weight_inits):
+        result = bench_mlp_single_weight_init(
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            x_dtype,
+            w_dtype,
+            per_row_act_quant,
+            TP,
+            op_regex,
+        )
+        all_results.append(result)
+
+    num_runs = len(all_results)
+    aggregated = {
+        "total_time_ns": sum(r["total_time_ns"] for r in all_results) / num_runs,
+        "kernel_time_ns": sum(r["kernel_time_ns"] for r in all_results) / num_runs,
+        "flops": sum(r["flops"] for r in all_results) / num_runs,
+        "bytes": sum(r["bytes"] for r in all_results) / num_runs,
+        "reps": all_results[0]["reps"],
+    }
+
+    return aggregated
+
+
 def roofline_mlp(
     batch_sizes,
     dim1,
@@ -328,6 +369,7 @@ def roofline_mlp(
     per_row_act_quant,
     TP,
     op_regex,
+    num_weight_inits=1,
     name="",
 ):
     out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
@@ -342,6 +384,7 @@ def roofline_mlp(
         per_row_act_quant,
         TP,
         op_regex,  # fixed args
+        num_weight_inits,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -389,6 +432,13 @@ def parse_args():
         default="False",
         help="Use per-row blockscale (True) or per-M-block (False) if act-dtype is bs8.",
     )
+    parser.add_argument(
+        "--num-weight-inits",
+        type=int,
+        default=1,
+        help="Number of different weight initializations to run for more stable results (default: 1). "
+        "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
+    )
     args = parser.parse_args()
     return args
 
@@ -422,5 +472,6 @@ if __name__ == "__main__":
         per_row_act_quant,
         TP=1,
         op_regex=args.op_regex,
+        num_weight_inits=args.num_weight_inits,
         name="gpt-oss-x2",
     )
