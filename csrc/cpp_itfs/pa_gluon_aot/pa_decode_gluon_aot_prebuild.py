@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+import sys
 import argparse
 import random
 from typing import Optional, Tuple, Union, Dict
@@ -839,7 +841,12 @@ def parse_arg_and_run_test():
     print(f"Triton version: {triton.__version__}")
 
     parser = create_argument_parser()
-    args = parser.parse_args()
+    # When running via pytest, use empty args to avoid conflict with pytest's argv
+    running_via_pytest = "pytest" in sys.argv[0] or sys.argv[0].endswith("py.test")
+    if running_via_pytest:
+        args = parser.parse_args([])
+    else:
+        args = parser.parse_args()
     (
         block_sizes,
         head_configs,
