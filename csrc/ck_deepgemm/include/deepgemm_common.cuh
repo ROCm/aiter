@@ -169,7 +169,6 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
                                              FlatmmConfig::N_Warp_Tile,
                                              FlatmmConfig::K_Warp_Tile,
                                              CodegenPipelineProblem::TransposeC,
-                                             memory_operation,
                                              FlatmmConfig::NumWaveGroups>>;
 
         // ToDo: Will add the codegen part to test different pipeline policies in GEMM.
