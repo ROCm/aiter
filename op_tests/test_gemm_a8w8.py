@@ -133,7 +133,15 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
 
     shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(m, n, k, quantDtype)
     if shape_is_tuned:
-        err_b = checkAllclose(a, b, msg="ck (tuned): ", rtol=1e-1, atol=1e-1, tol_err_ratio=1.0, printLog=False)
+        err_b = checkAllclose(
+            a,
+            b,
+            msg="ck (tuned): ",
+            rtol=1e-1,
+            atol=1e-1,
+            tol_err_ratio=1.0,
+            printLog=False,
+        )
     else:
         err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
     if quantDtype != dtypes.i8:
