@@ -392,7 +392,9 @@ for data_generation in args.data_generation:
                     )
                     df.append(ret)
                     if get_gfx() == "gfx942":
-                        ret = test_top_k_per_row_decode(m, ctx, k, n, data_generation, True)
+                        ret = test_top_k_per_row_decode(
+                            m, ctx, k, n, data_generation, True
+                        )
                         df.append(ret)
 
 df = pd.DataFrame(df)

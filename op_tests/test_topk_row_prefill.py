@@ -426,7 +426,7 @@ def test_top_k_per_row_prefill(
     print(f"\n{'='*80}")
     print("Running Fast Kernel performance test (101 iterations)...")
     print(f"{'='*80}")
-    us_fast=1e6  # Default large value
+    us_fast = 1e6  # Default large value
     if get_gfx() == "gfx942":
         _, us_fast = run_top_k_per_row_prefill_fast(
             logits,
