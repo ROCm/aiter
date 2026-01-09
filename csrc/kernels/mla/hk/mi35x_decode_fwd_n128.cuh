@@ -160,11 +160,28 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
     constexpr int32_t kNumRowsPerWarp = T::kBlockN / T::kNumWarps;
     static_assert(kNumRowsPerWarp == 4);
 
-    const hk::i32x4 srsrc = hk::make_srsrc(&kv_buffer[{0, 0, 0, 0}], 0xffffffff);
+    const kv_t* p_kv_buffer = &kv_buffer[{0, 0, 0, 0}];
+    const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
 
     const int32_t kv_indices_base = kv_start + warp_idx * kNumRowsPerWarp;
     if((kCheckBoundary == false) || (kv_indices_base < kv_end))
     {
+        // Although gfx950 supports buffer_load_dwordx4 lds:1, it cannot support swizzle well
+        // becasue
+        // 1. Cannot add a skip a block of LDS since LDS dest addr is calculated automatically by hw
+        // while
+        //    buffer_load_dwordx4 write multiple row by a warp in the same time.
+        // 2. Src addess points to 16 bytes by buffer_load_dwordx4 but we need to shift 8 bytes for
+        // each row.
+        //     We cannot load adjacent 16 bytes to two 8 bytes fields in LDS.
+        // Additionally we don't use dense method and pad 8 bytes for eash row instead due to
+        // additional vgpr for loading.
+
+        constexpr uint32_t kNumBytesPerThrPerRnd =
+            4; // use buffer_load_dword which loads 4B each time.
+        constexpr uint32_t kNumBytesPerWarpPerRnd =
+            kNumBytesPerThrPerRnd * ckt::get_warp_size(); // 4*64=256
+
         const int32_t rows[kNumRowsPerWarp] = {
             p_kv_indices[kv_indices_base + 0],
             kCheckBoundary
@@ -178,14 +195,7 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
                 : p_kv_indices[kv_indices_base + 3],
         };
 
-        ///
-        /// Load NoPE from VRAM to LDS directly
-        ///
-
-        constexpr uint32_t kNumBytesPerThrPerRnd =
-            4; // use buffer_load_dword which loads 4B each time.
-        constexpr uint32_t kNumBytesPerWarpPerRnd =
-            kNumBytesPerThrPerRnd * ckt::get_warp_size(); // 4*64=256
+        // Load NOPE
         constexpr uint32_t kNumRndPerRowNope =
             T::kQkHeadDim * sizeof(kv_t) / kNumBytesPerWarpPerRnd; // 512*1/256=2
         static_assert(kNumRndPerRowNope == 2);
@@ -229,12 +239,10 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
         }
 
         // Load ROPE
-        const int32_t sub_warp_rope_idx          = lane_idx >> 0x4;
-        const int32_t sub_lane_rope_idx          = lane_idx & 0xf;
-        constexpr int32_t kNumBytesPerThreadRope = T::kBlockN * T::kQkRopeHeadDim / T::kNumThreads;
-        static_assert(kNumBytesPerThreadRope == 4);
-        const int32_t row_rope = rows[sub_warp_rope_idx];
-        const int32_t col_rope = sub_lane_rope_idx * kNumBytesPerThreadRope;
+        const int32_t sub_warp_rope_idx = lane_idx >> 0x4;
+        const int32_t sub_lane_rope_idx = lane_idx & 0xf;
+        const int32_t row_rope          = rows[sub_warp_rope_idx];
+        const int32_t col_rope          = sub_lane_rope_idx * kNumBytesPerThrPerRnd;
         uintptr_t p_lds_warp_rope =
             p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
 
@@ -248,7 +256,7 @@ __device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
                 (row_rope * T::kQkHeadDim + col_rope + T::kQkNopeHeadDim) * sizeof(kv_t);
             hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
                                                 (as3_uint32_ptr)(p_lds_warp_rope),
-                                                kNumBytesPerThreadRope,
+                                                kNumBytesPerThrPerRnd,
                                                 voffset_rope,
                                                 0,
                                                 0,
