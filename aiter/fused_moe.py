@@ -19,7 +19,6 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
-from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.amd_buffer_coherence import (
     BufferCoherenceType,
     BufferCoherenceMapper,
@@ -245,8 +244,6 @@ def fused_moe_(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
-        bias1,
-        bias2,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -489,31 +486,6 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     if aiter_ksplit != 0:
         return aiter_ksplit
     # only for moe_blk gemm1 a8w8 decode scenario
-    cu_num = get_cu_num() * 2  # a4w4 blkperCU = 2
-    tileN = 128
-
-    tgM = token * topk  # decode tile num
-    tgN = (inter_dim * 2 + tileN - 1) // tileN
-
-    tg_num = tgN * tgM
-    # if all cu already active
-    if tg_num >= cu_num:
-        return 1
-    tilek = 256
-    split_max = (cu_num + tg_num - 1) // tg_num
-    # at least split = 2
-    for i in reversed(range(2, split_max + 1)):
-        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
-            return i
-    return 1
-
-
-@functools.lru_cache(maxsize=2048)
-def get_ksplit(token, topk, expert, inter_dim, model_dim):
-    aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
-    if aiter_ksplit != 0:
-        return aiter_ksplit
-    # only for moe_blk gemm1 a8w8 decode scenario
     if token * topk > expert:
         return 0
     cu_num = get_cu_num()
@@ -623,8 +595,6 @@ def get_2stage_cfgs(
     doweight_stage1,
     hidden_pad,
     intermediate_pad,
-    bias1,
-    bias2,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -826,33 +796,6 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                bias1=bias1,
-                split_k=ksplit * 2,  # multiple with blkperCU.
-            ),
-            functools.partial(
-                cktile_moe_stage2,
-                n_pad_zeros=hidden_pad // 64 * 64,
-                k_pad_zeros=intermediate_pad // 128 * 128,
-                activation=activation,
-                bias2=bias2,
-            ),
-            16 if token < 2048 else 32 if token < 16384 else 64,
-            ksplit,
-            run_1stage,
-            get_b_nt_type(token),
-        )
-    elif (
-        dtype in [dtypes.bf16, dtypes.fp16]
-        and q_type == QuantType.per_1x32
-        and q_dtype_w in [dtypes.fp4x2]
-        and ksplit > 1
-    ):
-        return MOEMetadata(
-            functools.partial(
-                cktile_moe_stage1,
-                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
-                k_pad_zeros=hidden_pad // 128 * 128,
-                activation=activation,
                 split_k=ksplit,
             ),
             functools.partial(
@@ -864,6 +807,7 @@ def get_2stage_cfgs(
             16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
             run_1stage,
+            get_b_nt_type(token),
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (
@@ -975,8 +919,6 @@ def fused_moe_2stages(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
-        bias1,
-        bias2,
     )
     if (
         quant_type == QuantType.per_1x32
