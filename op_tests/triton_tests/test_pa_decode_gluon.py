@@ -35,8 +35,8 @@ except ImportError:
 
 
 TRITON_VERSION = triton.__version__
-# TEST_NAME = "main.normal_accuracy_performance.jit"
-TEST_NAME = "fix_mi350_fp8_aot_DDD_opt_mtp.rocm6.4.1.normal_accuracy_performance.aot"
+TEST_NAME = "main.normal_accuracy_performance.jit"
+# TEST_NAME = "fix_mi350_fp8_aot_DDD_opt_mtp.rocm6.4.1.normal_accuracy_performance.aot"
 
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
@@ -2111,6 +2111,11 @@ def parse_arg_and_run_test(sample_rate0: float = None):
                 return numeric_vals.mean(), is_percentage
             except (ValueError, AttributeError):
                 return None, False
+
+    # Check if DataFrame is empty or missing required column
+    if results_df.empty or "compute_type" not in results_df.columns:
+        print("\nNo test results to analyze (empty DataFrame).")
+        return
 
     # Get unique compute_types
     compute_types = results_df["compute_type"].unique()

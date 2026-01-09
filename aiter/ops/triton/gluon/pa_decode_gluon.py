@@ -2853,19 +2853,29 @@ def paged_attention_decode_v2_reduce_kernel(
             attention_probs, (MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, 1)
         )
 
-        # Calculate offsets for loading partial logits
-        logits_offsets = (
-            sequence_idx * stride_logits_seq
-            + kv_head_idx * stride_logits_head
-            + partition_offsets[None, :, None] * stride_logits_part
-            + query_group_offsets[:, None, None] * stride_logits_group
-            + head_size_offsets[None, None, :]
-        )
-
-        # Create mask for valid logits access
-        logits_mask = (
-            partition_offsets[None, :] < context_partition_num
-        ) & query_group_mask[:, None]
+        # Calculate offsets and mask for loading partial logits
+        if TRITON_VERSION_GE_3_6_0:
+            logits_offsets = (
+                sequence_idx * stride_logits_seq
+                + kv_head_idx * stride_logits_head
+                + partition_offsets[:, None, None] * stride_logits_part
+                + query_group_offsets[None, :, None] * stride_logits_group
+                + head_size_offsets[None, None, :]
+            )
+            logits_mask = (
+                partition_offsets[:, None] < context_partition_num
+            ) & query_group_mask[None, :]
+        else:
+            logits_offsets = (
+                sequence_idx * stride_logits_seq
+                + kv_head_idx * stride_logits_head
+                + partition_offsets[None, :, None] * stride_logits_part
+                + query_group_offsets[:, None, None] * stride_logits_group
+                + head_size_offsets[None, None, :]
+            )
+            logits_mask = (
+                partition_offsets[None, :] < context_partition_num
+            ) & query_group_mask[:, None]
 
         # Load partial logits from current chunk of partitions
         partial_logits = tl.load(
@@ -2873,7 +2883,9 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Permute to match the expected dimension order
-        partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
+        if not TRITON_VERSION_GE_3_6_0:
+            partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
+
         updated_output = partial_logits * attention_probs
 
         # Accumulate weighted sum of logits
