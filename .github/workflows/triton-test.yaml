@@ -38,17 +38,33 @@ jobs:
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
+      - name: Run a step only if it's from a fork
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: echo "This PR is from a fork."
+
+      - name: Run a step only if it's from the same repo (not a fork)
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: echo "This PR is from an internal branch."
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.head_ref }}
           fetch-depth: 1
           submodules: 'recursive'
 
-      - name: Fetch target branch
+      - name: Fetch target branch from upstream
         run: |
-          git fetch origin --no-tags \
-            +refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+          if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            echo "Forked PR detected - adding upstream remote"
+          else
+            echo "Same-repo PR detected - using origin as upstream"
+          fi
+          git remote add upstream \
+            https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+          git fetch upstream --no-tags \
+            +refs/heads/${{ github.base_ref }}:refs/remotes/upstream/${{ github.base_ref }}
 
       # TODO: Evaluate if this step should be removed before merging.
       - name: Show repos and branches
@@ -132,7 +148,7 @@ jobs:
           docker exec -w /workspace triton_test \
             python .github/scripts/select_triton_tests.py \
               --source '${{ github.head_ref }}' \
-              --target 'remotes/origin/${{ github.base_ref }}' \
+              --target 'remotes/upstream/${{ github.base_ref }}' \
               --env-var TRITON_TEST --env-file "${ENV_FILE}"
           # TODO: Comment the follwing command before merging.
           docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
