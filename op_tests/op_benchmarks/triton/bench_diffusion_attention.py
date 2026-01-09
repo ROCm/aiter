@@ -44,7 +44,7 @@ layout_converter = {
     "bhsd": "HND",
 }
 
-reversed_tensor_converter = {v: k for k, v in layout_converter.items()}
+reversed_layout_converter = {v: k for k, v in layout_converter.items()}
 
 # test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
 import logging
@@ -205,7 +205,7 @@ def sagev1_forward_func(q, k, v, sm_scale, layout, dtype, k_smooth=True):
         BLKQ=config["BLOCK_SIZE_M"],
         BLKK=config["BLOCK_SIZE_N"],
         sm_scale=sm_scale,
-        layout=reversed_tensor_converter[layout],
+        tensor_layout=layout_converter[layout],
         smooth_k=k_smooth,
     )
     q_scale = q_scale.to(torch.float32).unsqueeze(-1).contiguous()
@@ -216,7 +216,7 @@ def sagev1_forward_func(q, k, v, sm_scale, layout, dtype, k_smooth=True):
         v,
         q_scale,
         k_scale,
-        layout=reversed_tensor_converter[layout],
+        tensor_layout=layout_converter[layout],
         output_dtype=dtype,
         config=config,
     )

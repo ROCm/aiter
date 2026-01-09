@@ -80,7 +80,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             acc = acc * alpha[:, None]
             
             v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n), cache_modifier=cache_modifier)
-            p = p.to(tl.float16)
+            p = p.to(v.dtype)
             
             acc += tl.dot(p, v, out_dtype=tl.float16)   
             m_i = m_ij
