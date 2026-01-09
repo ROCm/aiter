@@ -8,8 +8,6 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from aiter.jit.core import AITER_LOG_TUNED_CONFIG
-from aiter import logger
 from gemm_a8w8_blockscale_instance import (
     default_kernels_dict,
     KernelInstance,
@@ -355,13 +353,7 @@ torch::Tensor
         """
 
         # generate instances code
-        if AITER_LOG_TUNED_CONFIG:
-            logger.info(
-                f"Generating {len(kernels_dict)} instances for legacy gemm a8w8 blockscale..."
-            )
         for _, k in kernels_dict.items():
-            if AITER_LOG_TUNED_CONFIG:
-                logger.info(f"Generating legacy instance: {k.name}")
             self.gen_legacy_instance(k)
 
         # generate lookup dict for kernel instances
