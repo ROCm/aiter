@@ -68,3 +68,4 @@ aiter/install_mode
 captured_inputs/*
 *.pt
 *.png
+results*
