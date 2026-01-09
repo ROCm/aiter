@@ -46,7 +46,7 @@ def run_gemm_ck(x, weight, x_scale, w_scale, out):
 
 @perftest()
 def run_triton(x, w, x_scales, w_scales, out, dtype=dtypes.bf16):
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
 
     gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
     return out
@@ -272,4 +272,5 @@ for dtype in l_dtype:
         ret = test_gemm(dtype, m, n, k)
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)

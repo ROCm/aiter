@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 import importlib
@@ -200,7 +200,11 @@ class AITER_CONFIG(object):
                 df_list.append(df)
             else:
                 logger.info(f"path {i+1}: {path} (not exist)")
-        merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+        merge_df = (
+            pd.concat([df for df in df_list if not df.empty], ignore_index=True)
+            if df_list
+            else pd.DataFrame()
+        )
         ## get keys from untuned file to drop_duplicates
         untuned_name = (
             re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
@@ -211,7 +215,9 @@ class AITER_CONFIG(object):
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
-            keys.append("cu_num")
+            # Add "cu_num" if not already present
+            if "cu_num" not in keys:
+                keys.append("cu_num")
             merge_df = (
                 merge_df.sort_values("us")
                 .drop_duplicates(subset=keys, keep="first")

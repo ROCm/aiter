@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include "ck_tile/core.hpp"
@@ -64,6 +64,17 @@ struct MoeFlatmmConfig
     static constexpr int N_Repeat          = N_Tile / N_Warp_Tile / N_Warp;
     static constexpr bool TiledMMAPermuteN = false;
 };
+
+__host__ static constexpr int32_t GetBMemNTType(int32_t M, int32_t N, int32_t K)
+{
+	(void)N;
+	(void)K;
+	if(M <= 416)
+	{
+		return 2;
+	}
+	return 0;
+}
 
 template <typename FlatmmConfig,
           typename ADataType,
@@ -150,7 +161,6 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         constexpr bool has_hot_loop_v   = has_hot_loop_.value;
         constexpr auto tail_number_v    = tail_number_.value;
         constexpr auto scheduler        = FlatmmConfig::Scheduler;
-        constexpr auto memory_operation = memory_operation_.value;
         constexpr auto b_mem_nt_type_v =
             static_cast<ck_tile::amd_buffer_coherence_enum>(BNTType);
 
@@ -207,7 +217,6 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                              FlatmmConfig::N_Warp_Tile,
                                              FlatmmConfig::K_Warp_Tile,
                                              CodegenPipelineProblem::TransposeC,
-                                             memory_operation,
                                              FlatmmConfig::NumWaveGroups,
                                              false,
                                              1,

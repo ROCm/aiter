@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import argparse
 import itertools
@@ -122,7 +122,7 @@ torch::Tensor
         xptr = "nullptr"
         wptr = "nullptr"
         biasptr = "nullptr"
-        if k.QuantType == "per_tenser":
+        if k.QuantType == "per_tensor":
             scaleGranA = "0"
             scaleGranB = "0"
             xptr = "static_cast<float>(x_scale.value().data_ptr()[0])"
@@ -141,7 +141,7 @@ torch::Tensor
             wptr = "static_cast<ck_tile::e8m0_t*>(w_scale.value().data_ptr())"
             biasptr = "static_cast<float*>(exp_bias.has_value() ? exp_bias.value().data_ptr() : nullptr)"
 
-        if act_dict[k.ActOP] != 2:
+        if not k.HasBias:
             biasGran = "-1"
 
         INSTANCE_CONTENT = f"""auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranA}>{{{xptr}}};
@@ -649,11 +649,8 @@ if __name__ == "__main__":
         shutil.rmtree(manifests_path)
     os.mkdir(manifests_path)
 
-
     gen_dispatch_files = []
     gen_manifest_files = []
-    tags = []
-    kernel_list = []
 
     for a_type, c_dtype, act_type, is_split_k, b_nt_type in itertools.product(
         a_types, c_dtypes, act_types, is_split_k_l, b_nt_type_l
