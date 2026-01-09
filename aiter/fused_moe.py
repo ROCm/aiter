@@ -106,6 +106,43 @@ def fused_moe(
     bias1=None,
     bias2=None,
 ):
+    # fast path for small batches
+    if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
+        ((quant_type == QuantType.No and w1.dtype == torch.bfloat16) or (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
+        B = hidden_states.shape[0]
+        E, N1, K1 = w1.shape
+        N2, K2 = w2.shape[1], w2.shape[2]
+        TOPK = topk_ids.shape[1]
+        assert N1 == 2 * K2
+        gemm1_out = torch.empty([B, TOPK, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
+        from aiter.ops.moe_op import moe_stage1_g1u1_small_batch1, moe_stage2_g1u1_small_batch1, moe_stage1_g1u1_small_batch, moe_stage2_g1u1_small_batch
+        if B == 1:
+            assert N1 == 2 * K2
+            gemm2_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+            moe_stage1_g1u1_small_batch1(hidden_states, w1, gemm1_out, topk_ids, topk_weight, w1_scale if w1_scale is not None else torch.empty((0, 1), dtype=torch.bfloat16))
+            moe_stage2_g1u1_small_batch1(gemm1_out, w2, gemm2_out, topk_ids, topk_weight, w2_scale if w2_scale is not None else torch.empty((0, 1), dtype=torch.bfloat16))
+            return gemm2_out
+        else:
+            BLOCK_M = 16
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                K1,     # reduce dim is same with output dim
+                hidden_states.dtype,
+                BLOCK_M,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+            )
+
+            moe_stage1_g1u1_small_batch(hidden_states, w1, gemm1_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                                        w1_scale if w1_scale is not None else torch.empty((0, 1), dtype=torch.bfloat16))
+            moe_stage2_g1u1_small_batch(gemm1_out, w2, moe_buf, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+                                        w2_scale if w2_scale is not None else torch.empty((0, 1), dtype=torch.bfloat16))
+
+            return moe_buf
+
     if not block_size_M:
         block_size_M = -1
     return fused_moe_(

@@ -166,6 +166,38 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> w1_scale, // [expert, 1, inter_dim], gate(up) scale
     std::optional<torch::Tensor> sorted_weights);
 
+void moe_stage1_g1u1_small_batch1(torch::Tensor& hidden_states,             // [token_cnt, dim] M,K
+                                  torch::Tensor& w1,                        // [expert, inter_dim*2, dim] N,K
+                                  torch::Tensor& gemm1_out,                 // [token_cnt, dim]
+                                  torch::Tensor& topk_ids,                  // [token_cnt, topk]
+                                  torch::Tensor& topk_weight,               // [token_cnt, topk]
+                                  torch::Tensor& w1_scale);                 // [expert, inter_dim*2, 1]
+
+void moe_stage2_g1u1_small_batch1(torch::Tensor& gemm1_out,
+                                  torch::Tensor& w2,
+                                  torch::Tensor& gemm2_out,
+                                  torch::Tensor& topk_ids,
+                                  torch::Tensor& topk_weight,
+                                  torch::Tensor& w2_scale);
+
+void moe_stage1_g1u1_small_batch(torch::Tensor& hidden_states,             // [token_cnt, dim] M,K
+                                 torch::Tensor& w1,                        // [expert, inter_dim*2, dim] N,K
+                                 torch::Tensor& gemm1_out,                 // [token_cnt, dim]
+                                 torch::Tensor& sorted_ids,                // [max_num_tokens_padded]
+                                 torch::Tensor& sorted_weights,            // [max_num_tokens_padded]
+                                 torch::Tensor& sorted_expert_ids,         // [max_num_m_blocks]
+                                 torch::Tensor& num_valid_ids,             // [1]
+                                 torch::Tensor& w1_scale);                 // [expert, inter_dim*2, 1]
+
+void moe_stage2_g1u1_small_batch(torch::Tensor& gemm1_out,
+                                 torch::Tensor& w2,
+                                 torch::Tensor& moe_buf,
+                                 torch::Tensor& sorted_ids,
+                                 torch::Tensor& sorted_weights,
+                                 torch::Tensor& sorted_expert_ids,
+                                 torch::Tensor& num_valid_ids,
+                                 torch::Tensor& w2_scale);
+
 void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
                       torch::Tensor& topk_indices,         // [num_tokens, topk]
                       torch::Tensor& token_expert_indices, // [num_tokens, topk]
