@@ -192,6 +192,8 @@ std::tuple<int, int, int> get_grid_dim(const mha_fwd_args& a, int ts_qo, const s
 
 float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 {
+    std::cout << "[DEBUG] Thread ID: " << std::this_thread::get_id() 
+    << " executing fmha_fwd_v3" << std::endl;
     std::string arch_id = get_gpu_arch();
 
     if((!a.use_asm_v3) || (a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
@@ -224,14 +226,12 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     };
 
     AiterAsmKernel* impl_ptr = nullptr;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    static std::mutex impl_ptr_map_mutex;
+    static thread_local std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
     {
-        std::lock_guard<std::mutex> lock(impl_ptr_map_mutex);
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
