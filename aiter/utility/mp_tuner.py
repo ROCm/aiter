@@ -462,7 +462,8 @@ def mp_tuner(
                     # pool_restart_needed = True
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
-                    # pool_restart_needed = True
+                    failed_tasks.append((k, "timeout"))
+                    completed_this_round.append((k, async_result))
 
                 # Only log error once per error type
                 if error_type not in logged_error_types:
