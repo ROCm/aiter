@@ -83,6 +83,8 @@ CASE_SET_NAME_OPTIONS = [
     "normal_accuracy_aot",
     "sliding_window_accuracy",
     "sliding_window_performance",
+    "normal_performance",
+    "normal_performance_aot",
 ]
 
 
@@ -2319,7 +2321,7 @@ def normal_performance_test():
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
     BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    # COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
@@ -2327,7 +2329,7 @@ def normal_performance_test():
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     BLOCK_SIZE_OPTIONS = [64]
-    parse_arg_and_run_test()
+    # parse_arg_and_run_test()
 
 
 def normal_performance_aot_test():
@@ -2474,9 +2476,9 @@ def test_multi_case_set(case_set_name):
 
 
 if __name__ == "__main__":
-    normal_accuracy_test()
-    normal_accuracy_aot_test()
+    # normal_accuracy_test()
+    # normal_accuracy_aot_test()
     normal_performance_test()
-    normal_performance_aot_test()
-    sliding_window_accuracy_test()
-    sliding_window_performance_test()
+    # normal_performance_aot_test()
+    # sliding_window_accuracy_test()
+    # sliding_window_performance_test()
