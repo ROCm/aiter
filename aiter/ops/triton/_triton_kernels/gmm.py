@@ -54,25 +54,53 @@ def get_config(
             ), "Not all GMM variants are present in the configuration file."
 
     # Heuristic-based config selection for gmm
-    if gmm_type == "gmm":
-        # GMM configuration depends heavily on trans_rhs
-        small_n = N <= 5120
-        high_g = G >= 64
-
-        if trans_rhs:
-            # Forward pass: TRANS_RHS=True
-            # Uses smaller K blocks (64 or 128), larger M blocks (128-256)
-            if small_n and high_g:
-                key = "trans_rhs_small_n_high_g"
-            else:
-                key = "default_trans_rhs"
+    fwd = gmm_type == "gmm" and trans_rhs
+    if fwd:
+        k_n_ratio = K / N if N > 0 else 1.0
+        n_k_ratio = N / K if K > 0 else 1.0
+        
+        # Very large M with small N (e.g., 3M+ x 1408)
+        if M >= 300000 and N <= 2048:
+            key = "very_large_m"
+        # Small shapes (M < 50k, small N)
+        elif M < 50000 and N <= 2816:
+            key = "small_shapes"
+        # Small M with moderate N (e.g., 49k x 2048)
+        elif M < 100000 and N <= 2048:
+            key = "small_m_moderate_n"
+        # K-heavy: K >> N (e.g., 32768x16384x6144)
+        elif k_n_ratio > 2.0:
+            key = "k_heavy"
+        # N-heavy: N >> K (e.g., 32768x4096x14336)
+        elif n_k_ratio > 2.0:
+            key = "n_heavy"
+        # Balanced with large N (e.g., 32768x6144x16384)
+        elif K < 8192 and N >= 10000:
+            key = "balanced_large_n"
         else:
-            # Backward pass: TRANS_RHS=False
-            # Very consistent: mostly BLOCK_M=128, BLOCK_N=256, BLOCK_K=64
-            if N <= 1408 and M >= 300000:
-                key = "no_trans_rhs_small_n"
-            else:
-                key = "default_no_trans_rhs"
+            key = "default"
+    
+    bwd = gmm_type == "gmm" and not trans_rhs
+    if bwd:
+        k_n_ratio = K / N if N > 0 else 1.0
+
+        # Very large M with small N (e.g., 393k x 1408)
+        if M >= 300000 and N <= 2048:
+            key = "very_large_m_small_n_bwd"
+        # K >> N (e.g., 32768x16384x6144, 32768x14336x4096)
+        elif k_n_ratio > 2.5:
+            key = "k_heavy_bwd"
+        # N >> K with high G (e.g., 32768x5120x20480, G=16-64)
+        elif N / K > 3.0 and G >= 16:
+            key = "n_very_heavy_bwd"
+        # Balanced or slightly N-heavy with large N (e.g., 32768x6144x16384)
+        elif N >= 14000 and k_n_ratio < 2.0:
+            key = "balanced_large_n_bwd"
+        # Very small K relative to N (e.g., 32768x4096x14336)
+        elif K < 5000 and N > 10000:
+            key = "small_k_large_n_bwd"
+        else:
+            key = "default" 
 
     # Heuristic-based config selection for ptgmm
     elif gmm_type == "ptgmm":
@@ -116,7 +144,6 @@ def get_config(
     assert (
         key in get_config._config_dict[gmm_type]
     ), f"Configuration key '{key}' is absent for {gmm_type}."
-
     return get_config._config_dict[gmm_type][key]
 
 

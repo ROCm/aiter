@@ -1,41 +1,123 @@
 {
     "gmm": {
-        "default_trans_rhs": {
-            "BLOCK_SIZE_M": 256,
-            "BLOCK_SIZE_K": 64,
-            "BLOCK_SIZE_N": 256,
-            "GROUP_SIZE": 1,
-            "GRID_DIM": 304,
-            "num_warps": 8,
-            "num_stages": 2
-        },
-        "trans_rhs_small_n_high_g": {
+        "default": {
             "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_K": 128,
-            "BLOCK_SIZE_N": 128,
-            "GROUP_SIZE": 16,
-            "GRID_DIM": 304,
-            "num_warps": 8,
-            "num_stages": 2
-        },
-        "default_no_trans_rhs": {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_K": 64,
             "BLOCK_SIZE_N": 256,
             "GROUP_SIZE": 8,
             "GRID_DIM": 304,
             "num_warps": 8,
-            "num_stages": 2
+            "num_stages": 1
         },
-        "no_trans_rhs_small_n": {
+        "k_heavy": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 128,
+            "GROUP_SIZE": 8,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "n_heavy": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 16,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "balanced_large_n": {
             "BLOCK_SIZE_M": 256,
             "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 4,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "very_large_m": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 128,
+            "GROUP_SIZE": 1,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "small_shapes": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 16,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "small_m_moderate_n": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 8,
+            "GRID_DIM": 304,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "default_no_trans_rhs": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 16,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "k_heavy_bwd": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 128,
+            "GROUP_SIZE": 8,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "very_large_m_small_n_bwd": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 128,
             "BLOCK_SIZE_N": 128,
             "GROUP_SIZE": 4,
             "GRID_DIM": 304,
             "num_warps": 8,
-            "num_stages": 2
+            "num_stages": 1
+        },
+        "balanced_large_n_bwd": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 64,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 8,
+            "GRID_DIM": 304,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "n_very_heavy_bwd": {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 16,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "small_k_large_n_bwd": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_K": 32,
+            "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 4,
+            "GRID_DIM": 304,
+            "num_warps": 8,
+            "num_stages": 1
         }
+        
     },
     "ptgmm": {
         "default": {
