@@ -5,7 +5,7 @@ import triton.language as tl
 import torch
 import pytest
 import random
-from aiter.ops.triton.pa_decode import paged_attention_decode
+from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter import pertoken_quant
 
 DEBUG_MODE = False
