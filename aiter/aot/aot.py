@@ -122,6 +122,7 @@ def main():
         "module_mla_metadata",
         "module_mla_reduce",
         "module_mla_asm",
+        "module_gemm_a8w8_blockscale",
         # "module_moe_ck2stages",
     ]
     print(f"modules_to_build: {modules_to_build}")
