@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import os
@@ -12,7 +12,20 @@ logger = logging.getLogger("aiter")
 def getLogger():
     global logger
     if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
+        # Configure log level from environment variable
+        # Valid values: DEBUG, INFO (default), WARNING, ERROR
+        log_level_str = os.getenv("AITER_LOG_LEVEL", "INFO").upper()
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR"]
+
+        if log_level_str not in valid_levels:
+            print(
+                f"\033[93m[aiter] Warning: Invalid AITER_LOG_LEVEL '{log_level_str}', "
+                f"using 'INFO'. Valid values: {', '.join(valid_levels)}\033[0m"
+            )
+            log_level_str = "INFO"
+
+        log_level = getattr(logging, log_level_str)
+        logger.setLevel(log_level)
 
         console_handler = logging.StreamHandler()
         if int(os.environ.get("AITER_LOG_MORE", 0)):
@@ -25,7 +38,7 @@ def getLogger():
                 fmt="[%(name)s] %(message)s",
             )
         console_handler.setFormatter(formatter)
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(log_level)
 
         logger.addHandler(console_handler)
         if hasattr(torch._dynamo.config, "ignore_logger_methods"):

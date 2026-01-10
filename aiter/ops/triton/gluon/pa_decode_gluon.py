@@ -1657,12 +1657,8 @@ def paged_attention_decode_sliding_window(
                     + block_element_offsets[None, None, :, None]
                 )
                 # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
-                key_scale_value_blocked = gl.amd.cdna3.buffer_load(
-                    ptr=key_scale, offsets=key_scale_offsets
-                )
-                value_scale_value_blocked = gl.amd.cdna3.buffer_load(
-                    ptr=value_scale, offsets=key_scale_offsets
-                )
+                key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
+                value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
 
                 # Convert to required distributed layout for computation
                 key_scale_value_blocked = gl.reshape(
