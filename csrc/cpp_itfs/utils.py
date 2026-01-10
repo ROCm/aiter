@@ -54,13 +54,15 @@ AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+# Fix: AITER_LOG_MORE=1 should enable more logging, not less
+# Original mapping was inverted - higher values meant less logging
 LOG_LEVEL = {
-    0: logging.ERROR,
-    1: logging.WARNING,
-    2: logging.INFO,
-    3: logging.DEBUG,
+    0: logging.WARNING,  # Default: only warnings and errors
+    1: logging.INFO,     # AITER_LOG_MORE=1: enable info level
+    2: logging.DEBUG,    # AITER_LOG_MORE=2: enable debug level
+    3: logging.DEBUG,    # AITER_LOG_MORE=3: same as 2
 }
-logger.setLevel(LOG_LEVEL[AITER_LOG_MORE])
+logger.setLevel(LOG_LEVEL.get(AITER_LOG_MORE, logging.INFO))
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
