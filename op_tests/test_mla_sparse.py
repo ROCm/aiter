@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -10,18 +10,30 @@ import itertools
 import argparse
 import triton
 import triton.language as tl
+import pandas as pd
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
+# sparse mla ut
+# using persistent mla kernel as default
+# using non-persistent mla kernel when setting non_persistent_mode
+
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
-# qdtype fp8, kdtype bf16: nhead16
+# qdtype bf16, kdtype fp8: nhead16
 
 
-def check_support(dtype, kv_dtype, nhead):
+def check_support(dtype, kv_dtype, nhead, non_persistent_mode):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    if (
+        non_persistent_mode
+        and dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and nhead not in [16, 128]
+    ):
         return False
     return True
 
@@ -190,6 +202,17 @@ def sparse_kv_indptr_to_dense(
     )
 
 
+# can be calculated in metadata prepare time
+def sparse_kv_indptr_to_dense_nps(
+    kv_indptr: torch.Tensor,
+):
+    kv_len = torch.diff(kv_indptr)
+    sparse_kv_len = torch.clamp(kv_len, max=2048)
+    new_kv_indptr = torch.zeros_like(kv_indptr)
+    new_kv_indptr[1 : kv_indptr.shape[0]] = torch.cumsum(sparse_kv_len, dim=0)
+    return new_kv_indptr
+
+
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
     kv_indptr,  # int32 [num_requests]
@@ -318,6 +341,103 @@ def triton_convert_req_index_to_global_index(
     return out
 
 
+@triton.jit
+def _convert_req_index_to_global_index_kernel_nps(
+    dsa_qo_indptr,  # int32 [num_tokens + 1]
+    ori_kv_indptr,  # int32 [num_tokens + 1]
+    dsa_kv_indptr,  # int32 [num_tokens + 1]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    kv_indices,  # int32 [num_req, max_num_blocks_per_req]
+    out_kv_indices,  # int32
+    # shapes (compile-time where possible)
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,  # tile width along columns
+    # strides (in elements)
+    ti_stride0: tl.int64,  # topk_indices stride 0
+    ti_stride1: tl.constexpr,  # topk_indices stride 1
+):
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+
+    col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    kv_start_ori = tl.load(ori_kv_indptr + token_id)
+
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_end = tl.load(dsa_kv_indptr + token_id + 1)
+    kv_len = kv_end - kv_start
+
+    if tile_id * BLOCK_N > kv_len:
+        return
+
+    # Load token indices for this tile
+    indice = tl.load(
+        topk_indices + token_id * ti_stride0 + col_id * ti_stride1
+    )  # int32
+
+    # Guard block_table access
+    valid_mask = col_id < kv_len
+    out_val = tl.load(
+        kv_indices + kv_start_ori + indice,
+        mask=valid_mask,
+        other=0,
+    )
+
+    # Store results
+    out_ptr_ij = out_kv_indices + kv_start + col_id
+    tl.store(
+        out_ptr_ij,
+        out_val,
+        mask=valid_mask,
+    )
+
+
+def triton_convert_req_index_to_global_index_nps(
+    qo_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    new_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]
+    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    BLOCK_SIZE: int = 1,  # page_block_size = 1 for now
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,  # tile width along columns
+):
+    assert topk_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"BLOCK_N ({BLOCK_N})"
+    )
+
+    num_tokens = qo_indptr.shape[0] - 1
+    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+
+    new_kv_indices = torch.empty(
+        num_tokens * NUM_TOPK_TOKENS, dtype=torch.int32, device=topk_indices.device
+    )
+
+    # Strides in elements
+    ti_stride0, ti_stride1 = topk_indices.stride()
+
+    grid = (num_tokens, tiles_per_row)
+
+
+    _convert_req_index_to_global_index_kernel_nps[grid](
+        qo_indptr,
+        kv_indptr,
+        new_kv_indptr,
+        topk_indices,
+        kv_indices,
+        new_kv_indices,
+        # shapes / constexprs
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        # strides
+        ti_stride0,
+        ti_stride1,
+    )
+    return new_kv_indices
+
+
 @benchmark()
 def test_mla(
     ctx_lens,
@@ -333,6 +453,7 @@ def test_mla(
     varlen,
     decode_qlen,
     max_split_per_batch,
+    non_persistent_mode,
 ):
     ret = {}
 
@@ -342,8 +463,12 @@ def test_mla(
     )  # calculated by rest of mem after weight loaded in frameworks
     num_page = (kv_max_sz + page_size - 1) // page_size
 
-    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
-    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    batch_size_ext = batch_size
+    if non_persistent_mode:
+        batch_size_ext = batch_size * decode_qlen
+
+    qo_indptr = torch.zeros(batch_size_ext + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size_ext + 1, dtype=torch.int)
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int)
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -358,9 +483,18 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
 
-    kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
-    kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
+    seq_lens_kv_ext = seq_lens_kv
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+
+    if non_persistent_mode:
+        seq_lens_kv_ext = torch.cat([seq_lens_kv] * decode_qlen)
+        seq_lens_kv_ext = seq_lens_kv_ext.reshape(batch_size, decode_qlen)
+        seq_lens_kv_ext.permute(1, 0)
+        seq_lens_kv_ext = seq_lens_kv_ext.view(-1)
+
+    kv_indptr[1 : batch_size_ext + 1] = torch.cumsum(seq_lens_kv_ext, dim=0)
+    kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
+
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
     total_qo = qo_indptr[-1].item()
@@ -386,24 +520,15 @@ def test_mla(
     seq_lens_qo.fill_(decode_qlen)
 
     max_seqlen_qo = seq_lens_qo.max().item()
-    qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    if non_persistent_mode:
+        qo_indptr = torch.arange(0, batch_size_ext + 1, dtype=torch.int)
+    else:
+        qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
+
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
     # troch implementation
-    out_ref, lse_ref = torch_mla_extend(
-        q,
-        kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        is_causal=True,
-        dtype=dtype,
-    )
-
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),
@@ -443,50 +568,67 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-    meta = aiter.get_mla_metadata_v1(
-        qo_indptr,
-        kv_indptr,
-        nhead // nhead_kv,
-        nhead_kv,
-        True,
-        work_meta_data,
-        work_info_set,
-        work_indptr,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        kv_granularity=max(page_size, 16),
-        max_seqlen_qo=1,
-        uni_seqlen_qo=1,
-        fast_mode=True,
-        max_split_per_batch=max_split_per_batch,
-        topk=2048,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
-    )
-
+    token_indices = generate_topk_kv(kv_indptr,
+                                     1 if non_persistent_mode else decode_qlen)
     # generate kv topk per token & convert indices into per token
-    token_indices = generate_topk_kv(kv_indptr, decode_qlen)
-    converted_indices = triton_convert_req_index_to_global_index(
-        kv_indptr,
-        kv_indices,
-        token_indices,
-        decode_qlen,
-    )
+    if non_persistent_mode:
+        new_qo_indptr = qo_indptr
+        new_kv_indptr = sparse_kv_indptr_to_dense_nps(kv_indptr)
 
-    # convert kv indptr perbatch into pertoken and calc ref
-    new_qo_indptr, new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
-        kv_indptr,
-        converted_indices,
-        decode_qlen,
-    )
+        converted_indices = triton_convert_req_index_to_global_index_nps(
+            new_qo_indptr,
+            kv_indptr,
+            new_kv_indptr,
+            kv_indices,
+            token_indices,
+        )
+
+        new_indices = converted_indices
+
+    else:
+        meta = aiter.get_mla_metadata_v1(
+            qo_indptr,
+            kv_indptr,
+            nhead // nhead_kv,
+            nhead_kv,
+            True,
+            work_meta_data,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            kv_granularity=max(page_size, 16),
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+            max_split_per_batch=max_split_per_batch,
+            topk=2048,
+            dtype_q=dtype,
+            dtype_kv=kvtype,
+        )
+
+        converted_indices = triton_convert_req_index_to_global_index(
+            kv_indptr,
+            kv_indices,
+            token_indices,
+            decode_qlen,
+        )
+
+        # convert kv indptr perbatch into pertoken and calc ref
+        new_qo_indptr, new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
+            kv_indptr,
+            converted_indices,
+            decode_qlen,
+        )
+
     total_kv = new_kv_indptr[-1].item()  # change into pertoken total_kv
     out_ref, lse_ref = torch_mla_extend(
         q,
         kv_buffer,
         new_qo_indptr,
         new_kv_indptr,
-        new_indices,
+        new_indices[:new_kv_indptr[-1]],
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
@@ -498,26 +640,40 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
-            q,
-            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            # new_kv_indptr,
-            converted_indices.view(-1),
-            kv_last_page_lens,
-            1,
-            sm_scale,
-            num_kv_splits=max_split_per_batch,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-        )
+        if non_persistent_mode:
+            (attn_logits, attn_lse), us_asm_decode = run_perftest(
+                aiter.mla.mla_decode_fwd,
+                q,
+                kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+                out_asm,
+                new_qo_indptr,
+                new_kv_indptr,
+                converted_indices.view(-1),
+                kv_last_page_lens,
+                1,
+                sm_scale,
+            )
+        else:
+            (attn_logits, attn_lse), us_asm_decode = run_perftest(
+                aiter.mla.mla_decode_fwd,
+                q,
+                kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+                out_asm,
+                qo_indptr,
+                kv_indptr,
+                # new_kv_indptr,
+                converted_indices.view(-1),
+                kv_last_page_lens,
+                1,
+                sm_scale,
+                num_kv_splits=max_split_per_batch,
+                work_meta_data=work_meta_data,
+                work_indptr=work_indptr,
+                work_info_set=work_info_set,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+            )
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
@@ -550,7 +706,7 @@ def test_mla(
             kv_buffer_fp8,
             new_qo_indptr,
             new_kv_indptr,
-            new_indices,
+            new_indices[:new_kv_indptr[-1]],
             sm_scale,
             kv_lora_rank,
             qk_rope_head_dim,
@@ -560,27 +716,44 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
-            q_fp8 if dtype == dtypes.fp8 else q,
-            kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            converted_indices.view(-1),
-            kv_last_page_lens,
-            1,
-            sm_scale,
-            num_kv_splits=max_split_per_batch,
-            q_scale=q_scale,
-            kv_scale=kv_scale,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-        )
+        if non_persistent_mode:
+            (attn_logits, attn_lse), us_asm_decode = run_perftest(
+                aiter.mla.mla_decode_fwd,
+                q_fp8 if dtype == dtypes.fp8 else q,
+                kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
+                out_asm,
+                new_qo_indptr,
+                new_kv_indptr,
+                converted_indices.view(-1),
+                kv_last_page_lens,
+                1,
+                sm_scale,
+                num_kv_splits=max_split_per_batch,
+                q_scale=q_scale,
+                kv_scale=kv_scale,
+            )
+        else:
+            (attn_logits, attn_lse), us_asm_decode = run_perftest(
+                aiter.mla.mla_decode_fwd,
+                q_fp8 if dtype == dtypes.fp8 else q,
+                kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
+                out_asm,
+                qo_indptr,
+                kv_indptr,
+                converted_indices.view(-1),
+                kv_last_page_lens,
+                1,
+                sm_scale,
+                num_kv_splits=max_split_per_batch,
+                q_scale=q_scale,
+                kv_scale=kv_scale,
+                work_meta_data=work_meta_data,
+                work_indptr=work_indptr,
+                work_info_set=work_info_set,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+            )
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
@@ -741,8 +914,13 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
-
-import pandas as pd
+parser.add_argument(
+    "-nps",
+    "--non_persistent_mode",
+    action="store_true",
+    help="""variable kv seqlens per batch. Default: False.
+    --varlen # True""",
+)
 
 args = parser.parse_args()
 list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
@@ -755,7 +933,7 @@ for nhead, decode_qlen in list_nhead:
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
         list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
-        if check_support(dtype, kvtype, nhead):
+        if check_support(dtype, kvtype, nhead, args.non_persistent_mode):
             ret = test_mla(
                 ctx_len,
                 batch_size,
@@ -770,6 +948,7 @@ for nhead, decode_qlen in list_nhead:
                 varlen=args.varlen,
                 decode_qlen=decode_qlen,
                 max_split_per_batch=max_split_per_batch,
+                non_persistent_mode=args.non_persistent_mode,
             )
             df.append(ret)
     df = pd.DataFrame(df)
