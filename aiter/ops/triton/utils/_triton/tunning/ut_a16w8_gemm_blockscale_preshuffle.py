@@ -9,7 +9,9 @@ input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=
 ############################################################
 # <import and generate input>
 import torch
-from aiter.ops.triton.gemm_a16w8_blockscale import gemm_a16w8_blockscale_preshuffle
+from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
+    gemm_a16w8_blockscale_preshuffle,
+)
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
     generate_gemm_a16w8_blockscale_inputs,
 )
@@ -28,6 +30,7 @@ x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
 ############################################################
 
 for config in config_list:
+    assert config["BLOCK_SIZE_K"] == 128
 
     def fn():
         ############################################################

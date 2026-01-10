@@ -31,6 +31,7 @@ x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
 ############################################################
 
 for config in config_list:
+    assert config["BLOCK_SIZE_K"] == 128
 
     def fn():
         ############################################################

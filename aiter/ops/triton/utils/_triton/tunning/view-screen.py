@@ -13,12 +13,12 @@ TP = 8
 # DS-R1 TP8
 list_of_shapes = [
     (2112, 7168),  # fused_qkv_a_proj
-    (3072, 1536),  # b_proj
-    (7168, 2048),  # o_proj
-    (256, 7168),  # moe gate
-    (4608, 7168),  # dense layer1
-    (7168, 2304),  # dense layer2
-    (4096, 512),  # prefill kv_proj
+    # (3072, 1536),  # b_proj
+    # (7168, 2048),  # o_proj
+    # (256, 7168),  # moe gate
+    # (4608, 7168),  # dense layer1
+    # (7168, 2304),  # dense layer2
+    # (4096, 512),  # prefill kv_proj
 ]
 # # LL3-405B TP-n
 # list_of_shapes = [
