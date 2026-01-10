@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Any, Optional, Tuple
 
@@ -2613,10 +2613,11 @@ def mha_batch_prefill_fake_tensors(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     is_vectorized = k.dim() == 5 and v.dim() == 5
-    is_linear = k.dim() == 4 and v.dim() == 4
+    is_linear = (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
     if not (is_vectorized or is_linear):
         raise ValueError(
-            "Batch prefill requires 5D vectorized or 4D linear K/V tensors"
+            "Batch prefill requires 5D vectorized, 4D linear, or 3D linear (page_size=1) K/V"
+            " tensors"
         )
     num_heads = q.size(1)  # num_heads = q.sizes()[1]
     head_size_v = v.size(-2) if is_vectorized else v.size(-1)
@@ -2785,10 +2786,11 @@ def mha_batch_prefill_func(
     # 16 bytes = 128-bit (dwordx4) vector width assumed by CK kernels.
     k_vector_size = 16 // k.element_size()
     is_vectorized = k.dim() == 5 and v.dim() == 5
-    is_linear = k.dim() == 4 and v.dim() == 4
+    is_linear = (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
     if not (is_vectorized or is_linear):
         raise ValueError(
-            "Batch prefill requires 5D vectorized or 4D linear K/V tensors"
+            "Batch prefill requires 5D vectorized, 4D linear, or 3D linear (page_size=1) K/V"
+            " tensors"
         )
     head_size_v_og = v.size(-2) if is_vectorized else v.size(-1)
     if head_size_q_og % k_vector_size != 0 or head_size_v_og % k_vector_size != 0:
@@ -2807,8 +2809,8 @@ def mha_batch_prefill_func(
             raise ValueError("K linear layout does not match Q head size")
         if k.size(1) != v.size(1) or k.size(2) != v.size(2):
             raise ValueError("K/V linear layout must match page size and head count")
-    if not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError("Batch prefill requires contiguous K/V")
+    if k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError("Batch prefill requires K/V with contiguous last dimension")
     out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
         q,
         k,
