@@ -178,20 +178,19 @@ def _gemm_afp4wfp4_kernel(
         )
         
         # Create pointers for the first block of A and B scales
-        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + gl.arange(
+        offs_ks = gl.arange(
             0, BLOCK_SIZE_K // SCALE_GROUP_SIZE, layout=gl.SliceLayout(0, blocked_scales)
         )
-
+        offs_ks_split = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + offs_ks
         offs_as = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_scales))) % M
         offs_bs = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, blocked_scales))) % N
 
-        
         a_scale_ptrs = (
-            a_scales_ptr + offs_as[:, None] * stride_asm + offs_ks[None, :] * stride_ask
+            a_scales_ptr + offs_as[:, None] * stride_asm + offs_ks_split[None, :] * stride_ask
         )
         # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
-            b_scales_ptr + offs_bs[:, None] * stride_bsn + offs_ks[None, :] * stride_bsk
+            b_scales_ptr + offs_bs[:, None] * stride_bsn + offs_ks_split[None, :] * stride_bsk
         )
 
         # Create shared memories
@@ -207,10 +206,14 @@ def _gemm_afp4wfp4_kernel(
         )
         smem_bs = gl.allocate_shared_memory(
             b_scales_ptr.type.element_ty, [BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE], layout=shared_scales
-        )        
+        ) 
 
-        a_scales = gl.load(a_scale_ptrs)
-        b_scales = gl.load(b_scale_ptrs, cache_modifier=cache_modifier)
+        if EVEN_K:
+            a_scales = gl.load(a_scale_ptrs)
+            b_scales = gl.load(b_scale_ptrs, cache_modifier=cache_modifier)
+        else:
+            a_scales = gl.load(a_scale_ptrs, mask=offs_ks[None, :] < (2*K//SCALE_GROUP_SIZE) - pid_k * (SPLITK_BLOCK_SIZE//SCALE_GROUP_SIZE), other=1)
+            b_scales = gl.load(b_scale_ptrs, mask=offs_ks[None, :] < (2*K//SCALE_GROUP_SIZE) - pid_k * (SPLITK_BLOCK_SIZE//SCALE_GROUP_SIZE), other=1, cache_modifier=cache_modifier)
 
         if EVEN_K:
                 a = gl.load(a_ptrs)
@@ -241,10 +244,16 @@ def _gemm_afp4wfp4_kernel(
             a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
             b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
             
-            a_scales = gl.load(a_scale_ptrs)
+            if EVEN_K:
+                a_scales = gl.load(a_scale_ptrs)
+            else:
+                a_scales = gl.load(a_scale_ptrs, mask=offs_ks[None, :] < (2*K//SCALE_GROUP_SIZE) - (k+1) * (BLOCK_SIZE_K//SCALE_GROUP_SIZE), other=1)
             curr_a_scales = smem_as.load(layout=linear_as)
             
-            b_scales = gl.load(b_scale_ptrs, cache_modifier=cache_modifier)
+            if EVEN_K:
+                b_scales = gl.load(b_scale_ptrs, cache_modifier=cache_modifier)
+            else:
+                b_scales = gl.load(b_scale_ptrs, mask=offs_ks[None, :] < (2*K//SCALE_GROUP_SIZE) - (k+1) * (BLOCK_SIZE_K//SCALE_GROUP_SIZE), other=1, cache_modifier=cache_modifier)
             curr_b_scales = smem_bs.load(layout=linear_bs)
 
             if EVEN_K:
@@ -297,7 +306,6 @@ def _gemm_afp4wfp4_kernel(
         )
 
         c = accumulator.to(c_ptr.type.element_ty)
-        c = gl.convert_layout(c, layout=linear_mn, assert_trivial=False)
 
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, linear_mn)).to(gl.int64)
@@ -309,6 +317,8 @@ def _gemm_afp4wfp4_kernel(
             + pid_k * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        
+        c = gl.convert_layout(c, layout=linear_mn, assert_trivial=False)
         gl.store(c_ptrs, c, mask=c_mask)
 
 @gluon.jit
@@ -392,42 +402,6 @@ def _get_config(
 
     return _get_config._config_dict["any"]
 
-def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
-    # heuristics for make "EVEN_K == True" as much as possible
-    NUM_KSPLIT_STEP = 2
-    BLOCK_SIZE_K_STEP = 2
-    SPLITK_BLOCK_SIZE = (
-        triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
-    )
-    while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
-        if (
-            K % (SPLITK_BLOCK_SIZE // 2) == 0
-            and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
-            and K % (BLOCK_SIZE_K // 2) == 0
-        ):
-            break
-        elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
-        elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
-            if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
-            elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
-        elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
-        else:
-            break
-
-        SPLITK_BLOCK_SIZE = (
-            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
-        )
-
-    # re-ensuring NUM_KSPLIT is the correct value
-    NUM_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE // 2))
-
-    return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
-
-
 def gemm_afp4wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -472,20 +446,17 @@ def gemm_afp4wfp4(
     if config is None:
         config = _get_config(M, N, K)
 
-    if config["NUM_KSPLIT"] > 1:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
+    if config["BLOCK_SIZE_K"] >= K * 2:
         config["NUM_KSPLIT"] = 1
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
+    
+    if config["NUM_KSPLIT"] > 1:
+        SPLITK_BLOCK_SIZE = (
+            triton.cdiv((2 * triton.cdiv(K, config["NUM_KSPLIT"])), config["BLOCK_SIZE_K"]) * config["BLOCK_SIZE_K"]
+        )
+    else:
+        SPLITK_BLOCK_SIZE = 2 * K
+
+    config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
 
     if config["NUM_KSPLIT"] > 1:
         if _USE_GEMM_SPLITK_BF16:
@@ -497,7 +468,6 @@ def gemm_afp4wfp4(
                 (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
             )
     else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
@@ -539,9 +509,6 @@ def gemm_afp4wfp4(
             return y_pp
 
         REDUCE_BLOCK_SIZE_M = 16
-        # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
-        # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
-        # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
         REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
         ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
 
