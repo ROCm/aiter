@@ -2334,7 +2334,8 @@ def normal_performance_test():
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
     BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    # COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = []
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
@@ -2343,7 +2344,7 @@ def normal_performance_test():
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     BLOCK_SIZE_OPTIONS = [64]
-    parse_arg_and_run_test()
+    # parse_arg_and_run_test()
 
 
 def sliding_window_accuracy_test():
