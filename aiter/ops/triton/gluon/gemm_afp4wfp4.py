@@ -102,7 +102,7 @@ def _gemm_afp4wfp4_kernel(
     )
 
     blocked_scales: gl.constexpr = gl.BlockedLayout(
-        size_per_thread= [4, 1],
+        size_per_thread=[4, 1],
         threads_per_warp=[8, 8],
         warps_per_cta=[1, num_warps],
         order=[0, 1],
@@ -113,7 +113,7 @@ def _gemm_afp4wfp4_kernel(
         lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]],
         warp_bases=[[0, 0], [0, 0], [32, 0]],
         block_bases=[],
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE],        
+        shape=[BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE],
     )
 
     linear_bs: gl.constexpr = gl.DistributedLinearLayout(
@@ -121,7 +121,7 @@ def _gemm_afp4wfp4_kernel(
         lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1]],
         warp_bases=[[32, 0], [64, 0], [0, 0]],
         block_bases=[],
-        shape=[BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE],        
+        shape=[BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE],
     )
 
     linear_mn: gl.constexpr = gl.DistributedLinearLayout(
@@ -129,7 +129,7 @@ def _gemm_afp4wfp4_kernel(
         lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 8]],
         warp_bases=[[0, 32], [0, 64], [32, 0]],
         block_bases=[],
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],    
+        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
     )
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
@@ -143,12 +143,12 @@ def _gemm_afp4wfp4_kernel(
     shared_scales: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[0, 1]
     )
-    
+
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[32, 32],
         transposed=True,
-        warps_per_cta=[2, num_warps//2],
+        warps_per_cta=[2, num_warps // 2],
     )
 
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
@@ -168,158 +168,226 @@ def _gemm_afp4wfp4_kernel(
         offs_ak_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_ak
         offs_bk = gl.arange(0, BLOCK_SIZE_K // 2, layout=gl.SliceLayout(1, blocked_kn))
         offs_bk_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_bk
-        offs_am = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk))) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))) % N
-        a_ptrs = a_ptr + (
-            offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
-        )
-        b_ptrs = b_ptr + (
-            offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        )
-        
+        offs_am = (
+            pid_m * BLOCK_SIZE_M
+            + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk))
+        ) % M
+        offs_bn = (
+            pid_n * BLOCK_SIZE_N
+            + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))
+        ) % N
+        offs_a = offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
+        offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+
         # Create pointers for the first block of A and B scales
         offs_ks = gl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE, layout=gl.SliceLayout(0, blocked_scales)
+            0,
+            BLOCK_SIZE_K // SCALE_GROUP_SIZE,
+            layout=gl.SliceLayout(0, blocked_scales),
         )
         offs_ks_split = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + offs_ks
-        offs_as = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_scales))) % M
-        offs_bs = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, blocked_scales))) % N
+        offs_asm = (
+            pid_m * BLOCK_SIZE_M
+            + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_scales))
+        ) % M
+        offs_bsn = (
+            pid_n * BLOCK_SIZE_N
+            + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, blocked_scales))
+        ) % N
 
-        a_scale_ptrs = (
-            a_scales_ptr + offs_as[:, None] * stride_asm + offs_ks_split[None, :] * stride_ask
-        )
+        offs_as = offs_asm[:, None] * stride_asm + offs_ks_split[None, :] * stride_ask
         # B scales are N x K even though B operand is K x N.
-        b_scale_ptrs = (
-            b_scales_ptr + offs_bs[:, None] * stride_bsn + offs_ks_split[None, :] * stride_bsk
-        )
+        offs_bs = offs_bsn[:, None] * stride_bsn + offs_ks_split[None, :] * stride_bsk
 
         # Create shared memories
         smem_a = gl.allocate_shared_memory(
-            a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K//2], layout=shared_a
+            a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K // 2], layout=shared_a
         )
         smem_b = gl.allocate_shared_memory(
-            b_ptr.type.element_ty, [BLOCK_SIZE_K//2, BLOCK_SIZE_N], layout=shared_b
+            b_ptr.type.element_ty, [BLOCK_SIZE_K // 2, BLOCK_SIZE_N], layout=shared_b
         )
 
         smem_as = gl.allocate_shared_memory(
-            a_scales_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE], layout=shared_scales
+            a_scales_ptr.type.element_ty,
+            [BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE],
+            layout=shared_scales,
         )
         smem_bs = gl.allocate_shared_memory(
-            b_scales_ptr.type.element_ty, [BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE], layout=shared_scales
-        ) 
+            b_scales_ptr.type.element_ty,
+            [BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE],
+            layout=shared_scales,
+        )
 
         if EVEN_K:
-            a_scales = gl.load(a_scale_ptrs)
-            b_scales = gl.load(b_scale_ptrs, cache_modifier=cache_modifier)
-        else:
-            a_scales = gl.load(a_scale_ptrs, mask=offs_ks[None, :] < (2*K//SCALE_GROUP_SIZE) - pid_k * (SPLITK_BLOCK_SIZE//SCALE_GROUP_SIZE), other=1)
-            b_scales = gl.load(b_scale_ptrs, mask=offs_ks[None, :] < (2*K//SCALE_GROUP_SIZE) - pid_k * (SPLITK_BLOCK_SIZE//SCALE_GROUP_SIZE), other=1, cache_modifier=cache_modifier)
-
-        if EVEN_K:
-                a = gl.load(a_ptrs)
-                b = gl.load(b_ptrs, cache_modifier=cache_modifier)
-        else:
-            a = gl.load(
-                a_ptrs, mask=offs_ak[None, :] < K - pid_k * SPLITK_BLOCK_SIZE // 2, other=0
+            a = gl.amd.cdna4.buffer_load(
+                ptr=a_ptr,
+                offsets=offs_a,
             )
-            b = gl.load(
-                b_ptrs,
+            a_scales = gl.amd.cdna4.buffer_load(
+                ptr=a_scales_ptr,
+                offsets=offs_as,
+            )
+        else:
+            a = gl.amd.cdna4.buffer_load(
+                ptr=a_ptr,
+                offsets=offs_a,
+                mask=offs_ak[None, :] < K - pid_k * SPLITK_BLOCK_SIZE // 2,
+            )
+            a_scales = gl.amd.cdna4.buffer_load(
+                ptr=a_scales_ptr,
+                offsets=offs_as,
+                mask=offs_ks[None, :]
+                < (2 * K // SCALE_GROUP_SIZE)
+                - pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE),
+            )
+
+        if EVEN_K:
+            b = gl.amd.cdna4.buffer_load(
+                ptr=b_ptr,
+                offsets=offs_b,
+                cache=cache_modifier,
+            )
+            b_scales = gl.amd.cdna4.buffer_load(
+                ptr=b_scales_ptr, offsets=offs_bs, cache=cache_modifier
+            )
+        else:
+            b = gl.amd.cdna4.buffer_load(
+                ptr=b_ptr,
+                offsets=offs_b,
                 mask=offs_bk[:, None] < K - pid_k * SPLITK_BLOCK_SIZE // 2,
-                other=0,
-                cache_modifier=cache_modifier,
+                cache=cache_modifier,
+            )
+            b_scales = gl.amd.cdna4.buffer_load(
+                ptr=b_scales_ptr,
+                offsets=offs_bs,
+                mask=offs_ks[None, :]
+                < (2 * K // SCALE_GROUP_SIZE)
+                - pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE),
+                cache=cache_modifier,
             )
 
         smem_as.store(a_scales)
-        smem_bs.store(b_scales)
         smem_a.store(a)
-        smem_b.store(b)
 
-        accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=mfma_layout)
+        accumulator = gl.zeros(
+            (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=mfma_layout
+        )
 
+        # num_stages:2
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter - 1):
-            
-            #advance pointers
-            a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
-            b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
-            a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
-            b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
-            
-            if EVEN_K:
-                a_scales = gl.load(a_scale_ptrs)
-            else:
-                a_scales = gl.load(a_scale_ptrs, mask=offs_ks[None, :] < (2*K//SCALE_GROUP_SIZE) - (k+1) * (BLOCK_SIZE_K//SCALE_GROUP_SIZE), other=1)
-            curr_a_scales = smem_as.load(layout=linear_as)
-            
-            if EVEN_K:
-                b_scales = gl.load(b_scale_ptrs, cache_modifier=cache_modifier)
-            else:
-                b_scales = gl.load(b_scale_ptrs, mask=offs_ks[None, :] < (2*K//SCALE_GROUP_SIZE) - (k+1) * (BLOCK_SIZE_K//SCALE_GROUP_SIZE), other=1, cache_modifier=cache_modifier)
-            curr_b_scales = smem_bs.load(layout=linear_bs)
+
+            # advance pointers
+            a_ptr += (BLOCK_SIZE_K // 2) * stride_ak
+            b_ptr += (BLOCK_SIZE_K // 2) * stride_bk
+            a_scales_ptr += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
+            b_scales_ptr += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
 
             if EVEN_K:
-                a = gl.load(a_ptrs)
-            else:
-                a = gl.load(
-                    a_ptrs, mask=offs_ak[None, :] < K - (k+1) * (BLOCK_SIZE_K // 2), other=0
+                a = gl.amd.cdna4.buffer_load(
+                    ptr=a_ptr,
+                    offsets=offs_a,
                 )
+            else:
+                a = gl.amd.cdna4.buffer_load(
+                    ptr=a_ptr,
+                    offsets=offs_a,
+                    mask=offs_ak[None, :] < K - (k + 1) * (BLOCK_SIZE_K // 2),
+                )
+            smem_b.store(b)
+            smem_bs.store(b_scales)
             curr_a = smem_a.load(layout=dot_a_layout)
+            curr_a_scales = smem_as.load(layout=linear_as)
 
             if EVEN_K:
-                b = gl.load(b_ptrs, cache_modifier=cache_modifier)
+                a_scales = gl.amd.cdna4.buffer_load(
+                    ptr=a_scales_ptr,
+                    offsets=offs_as,
+                )
             else:
-                b = gl.load(
-                    b_ptrs,
-                    mask=offs_bk[:, None] < K - (k+1) * (BLOCK_SIZE_K // 2),
-                    other=0,
-                    cache_modifier=cache_modifier,
+                a_scales = gl.amd.cdna4.buffer_load(
+                    ptr=a_scales_ptr,
+                    offsets=offs_as,
+                    mask=offs_ks[None, :]
+                    < (2 * K // SCALE_GROUP_SIZE)
+                    - (k + 1) * (BLOCK_SIZE_K // SCALE_GROUP_SIZE),
+                )
+
+            curr_b_scales = smem_bs.load(layout=linear_bs)
+            if EVEN_K:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=b_ptr,
+                    offsets=offs_b,
+                    cache=cache_modifier,
+                )
+                b_scales = gl.amd.cdna4.buffer_load(
+                    ptr=b_scales_ptr, offsets=offs_bs, cache=cache_modifier
+                )
+            else:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=b_ptr,
+                    offsets=offs_b,
+                    mask=offs_bk[:, None] < K - (k + 1) * (BLOCK_SIZE_K // 2),
+                    cache=cache_modifier,
+                )
+                b_scales = gl.amd.cdna4.buffer_load(
+                    ptr=b_scales_ptr,
+                    offsets=offs_bs,
+                    mask=offs_ks[None, :]
+                    < (2 * K // SCALE_GROUP_SIZE)
+                    - (k + 1) * (BLOCK_SIZE_K // SCALE_GROUP_SIZE),
+                    cache=cache_modifier,
                 )
             curr_b = smem_b.load(layout=dot_b_layout)
 
             accumulator = gl.amd.cdna4.mfma_scaled(
                 a=curr_a,
                 a_scale=curr_a_scales,
-                a_format='e2m1',
+                a_format="e2m1",
                 b=curr_b,
                 b_scale=curr_b_scales,
-                b_format='e2m1',
+                b_format="e2m1",
                 acc=accumulator,
             )
 
-            smem_as.store(a_scales)
-            smem_bs.store(b_scales)
             smem_a.store(a)
-            smem_b.store(b)
+            smem_as.store(a_scales)
 
-        curr_a_scales = smem_as.load(layout=linear_as)
-        curr_b_scales = smem_bs.load(layout=linear_bs)
+        # ======= Epilogue ========
+        smem_b.store(b)
+        smem_bs.store(b_scales)
         curr_a = smem_a.load(layout=dot_a_layout)
         curr_b = smem_b.load(layout=dot_b_layout)
+        curr_a_scales = smem_as.load(layout=linear_as)
+        curr_b_scales = smem_bs.load(layout=linear_bs)
 
         accumulator = gl.amd.cdna4.mfma_scaled(
             a=curr_a,
             a_scale=curr_a_scales,
-            a_format='e2m1',
+            a_format="e2m1",
             b=curr_b,
             b_scale=curr_b_scales,
-            b_format='e2m1',
+            b_format="e2m1",
             acc=accumulator,
         )
 
         c = accumulator.to(c_ptr.type.element_ty)
 
-        # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, linear_mn)).to(gl.int64)
-        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, linear_mn)).to(gl.int64)
-        c_ptrs = (
-            c_ptr
-            + stride_cm * offs_cm[:, None]
+        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, linear_mn)
+        )
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, linear_mn)
+        )
+        offs_c = (
+            stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
             + pid_k * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        
+
         c = gl.convert_layout(c, layout=linear_mn, assert_trivial=False)
-        gl.store(c_ptrs, c, mask=c_mask)
+        gl.amd.cdna4.buffer_store(c, c_ptr, offs_c, c_mask)
+
 
 @gluon.jit
 def _gemm_afp4wfp4_reduce_kernel(
@@ -355,9 +423,21 @@ def _gemm_afp4wfp4_reduce_kernel(
         order=[1, 0],
     )
 
-    offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_kmn)))) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_kmn)))) % N
-    offs_k = gl.arange(0, MAX_KSPLIT, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_kmn)))
+    offs_m = (
+        pid_m * BLOCK_SIZE_M
+        + gl.arange(
+            0, BLOCK_SIZE_M, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_kmn))
+        )
+    ) % M
+    offs_n = (
+        pid_n * BLOCK_SIZE_N
+        + gl.arange(
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_kmn))
+        )
+    ) % N
+    offs_k = gl.arange(
+        0, MAX_KSPLIT, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_kmn))
+    )
     c_in_ptrs = (
         c_in_ptr
         + (offs_k[:, None, None] * stride_c_in_k)
@@ -372,8 +452,14 @@ def _gemm_afp4wfp4_reduce_kernel(
     c = gl.sum(c, axis=0)
 
     c = c.to(c_out_ptr.type.element_ty)
-    offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mn))) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_mn))) % N
+    offs_m = (
+        pid_m * BLOCK_SIZE_M
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mn))
+    ) % M
+    offs_n = (
+        pid_n * BLOCK_SIZE_N
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_mn))
+    ) % N
     c_out_ptrs = (
         c_out_ptr
         + (offs_m[:, None] * stride_c_out_m)
@@ -381,6 +467,7 @@ def _gemm_afp4wfp4_reduce_kernel(
     )
     c = gl.convert_layout(c, layout=blocked_mn, assert_trivial=False)
     gl.store(c_out_ptrs, c)
+
 
 @functools.lru_cache(maxsize=1024)
 def _get_config(
@@ -401,6 +488,7 @@ def _get_config(
         _get_config._config_dict = config
 
     return _get_config._config_dict["any"]
+
 
 def gemm_afp4wfp4(
     x: torch.Tensor,
@@ -448,10 +536,13 @@ def gemm_afp4wfp4(
 
     if config["BLOCK_SIZE_K"] >= K * 2:
         config["NUM_KSPLIT"] = 1
-    
+
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE = (
-            triton.cdiv((2 * triton.cdiv(K, config["NUM_KSPLIT"])), config["BLOCK_SIZE_K"]) * config["BLOCK_SIZE_K"]
+            triton.cdiv(
+                (2 * triton.cdiv(K, config["NUM_KSPLIT"])), config["BLOCK_SIZE_K"]
+            )
+            * config["BLOCK_SIZE_K"]
         )
     else:
         SPLITK_BLOCK_SIZE = 2 * K
@@ -461,7 +552,7 @@ def gemm_afp4wfp4(
     if config["NUM_KSPLIT"] > 1:
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
-                (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=x.device
+                (config["NUM_KSPLIT"], M, N), dtype=dtype, device=x.device
             )
         else:
             y_pp = torch.empty(
