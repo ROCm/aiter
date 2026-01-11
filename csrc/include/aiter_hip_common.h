@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck_tile/core.hpp"
 #include <hip/hip_runtime.h>
@@ -74,12 +74,21 @@ class AiterAsmKernel
     hipFunction_t kernel_func;
 
     public:
-    AiterAsmKernel(const char* name, const char* hsaco)
+    AiterAsmKernel(const char* name, const char* hsaco, const char* arch_id=nullptr)
     {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-        std::cout << "[aiter] hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str()
-                  << " GetFunction: " << name;
-        HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
+        std::string module_path;
+        if (AITER_ASM_DIR != nullptr) {
+            module_path = std::string(AITER_ASM_DIR) + hsaco;
+        } else if (arch_id != nullptr)
+        {
+            AITER_ASM_DIR = std::getenv("AITER_ASM_ROOT");
+            module_path = std::string(AITER_ASM_DIR ? AITER_ASM_DIR : "") + arch_id + "/" + hsaco;
+        } else {
+            module_path = hsaco;
+        }
+        std::cout << "[aiter] hipModuleLoad: " << module_path << " GetFunction: " << name;
+        HIP_CALL(hipModuleLoad(&module, module_path.c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
     };

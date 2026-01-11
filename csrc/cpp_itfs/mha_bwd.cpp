@@ -315,7 +315,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name, arch_id.c_str());
         }
 
         impl_ptr_pre = result.first->second.get();
@@ -336,7 +336,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name, arch_id.c_str());
         }
 
         impl_ptr_dqdkdv = result.first->second.get();
@@ -359,7 +359,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             auto result = impl_ptr_map.emplace(name, nullptr);
             if(result.second)
             {
-                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name, arch_id.c_str());
             }
 
             impl_ptr_post = result.first->second.get();
