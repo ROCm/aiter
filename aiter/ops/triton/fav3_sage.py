@@ -11,10 +11,6 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs,
 )
 
-from aiter.ops.triton.attn_qk_int8_per_block import (
-    per_block_int8,
-)
-
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import (
     map_dims,
 )
