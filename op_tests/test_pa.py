@@ -824,6 +824,28 @@ def test_paged_attention(
                 msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
             )
 
+            # Test paged_attention_common with quantized cache
+            out_aiter_common, time_aiter_common = run_aiter_common(
+                query.contiguous(),
+                k_quant_,
+                asm_V_shuffle(v_quant_),
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                kv_cache_dtype,
+                num_kv_heads,
+                scale,
+                alibi_slopes,
+                block_tables.stride(0),
+                k_scale_asm,
+                v_scale_asm,
+            )
+            checkAllclose(
+                out_golden,
+                out_aiter_common,
+                msg=f"golden vs aiter_common:{time_aiter_common:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+            )
+
             if (
                 dtype in [dtypes.bf16, dtypes.fp16]
                 and quant_algo_ == 2
