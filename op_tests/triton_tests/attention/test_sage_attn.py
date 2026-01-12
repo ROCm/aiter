@@ -239,6 +239,7 @@ def test_sage(
         causal=False,
         inference_mode=True,
         layout=layout,
+        config=config,
     )
 
     if DEBUG_MODE:
