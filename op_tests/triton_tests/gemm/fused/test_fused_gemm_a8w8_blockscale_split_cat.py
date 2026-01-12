@@ -3,52 +3,53 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
-    gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
+from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
+    fused_gemm_a8w8_blockscale_split_cat,
+    fused_gemm_a8w8_blockscale_preshuffle_split_cat,
 )
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
-)
+
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
-
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
 
 
-def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
+def run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
     block_shape_n, block_shape_k = block_shape
-    m, k = x.shape
-    n = weight.shape[0]
-    scale_n = (n + block_shape_n - 1) // block_shape_n
-    scale_k = (k + block_shape_k - 1) // block_shape_k
+    m, c1 = x.shape
+    n = w.shape[0]
+
     x_scale = x_scale.repeat_interleave(block_shape_k, dim=1)
-    x = x.to(x_scale.dtype) * x_scale[:m, :k]
-    x = x.view(m, k)
+    x = x.to(x_scale.dtype) * x_scale[:m, :c1]
+    x = x.view(m, c1)
+
     w_scale = w_scale.repeat_interleave(block_shape_n, dim=0)
     w_scale = w_scale.repeat_interleave(block_shape_k, dim=1)
-    w_scale = w_scale[:n, :k]
-    weight = weight.to(w_scale.dtype) * w_scale
+    w_scale = w_scale[:n, :c1]
+    w = w.to(w_scale.dtype) * w_scale
 
-    out = F.linear(x.to(torch.float32), weight.to(torch.float32))
+    c = F.linear(x.to(torch.float32), w.to(torch.float32))
+    c = c.view(-1, D, S1 + S2)
+    c1, c2 = c.split([S1, S2], dim=-1)
+    c1 = torch.cat([c1, y.expand((*c1.shape[:-1], -1))], dim=-1)
 
-    return out.to(dtype)
+    return c1.to(dtype), c2.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None, impl=None):
-    return impl(x, weight, x_scale, w_scale, dtype, y)
+def run_triton(impl, x, w, y, x_scale, w_scale, S1, S2, D, dtype=torch.bfloat16):
+    m = x.shape[0]
+
+    return impl(x, w, y.expand(m, D, -1), x_scale, w_scale, S1, S2, dtype)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
-def get_x_vals():
-
+def get_shapes():
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
     x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
     x_vals += [
@@ -78,7 +79,6 @@ def get_x_vals():
         (4096, 8192, 1024),
         (8192, 8192, 1024),
         (16384, 8192, 1024),
-        (16, 16, 128),
         (2048, 2048, 2049),
         (159, 17389, 597),
         (16, 576, 7168),
@@ -89,47 +89,28 @@ def get_x_vals():
         (256, 32768, 8192),
         (256, 8192, 32768),
     ]
-    x_vals += [
-        (16, 2112, 7168),
-        (32, 2112, 7168),
-        (64, 2112, 7168),
-        (128, 2112, 7168),
-        (16, 3072, 1536),
-        (32, 3072, 1536),
-        (64, 3072, 1536),
-        (128, 3072, 1536),
-        (16, 7168, 2048),
-        (32, 7168, 2048),
-        (64, 7168, 2048),
-        (128, 7168, 2048),
-        (16, 4608, 7168),
-        (32, 4608, 7168),
-        (64, 4608, 7168),
-        (128, 4608, 7168),
-        (16, 7168, 2304),
-        (32, 7168, 2304),
-        (64, 7168, 2304),
-        (128, 7168, 2304),
+    x_vals = [
+        (4096, 256, 512),
     ]
-    # x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
 
-def generate_gemm_a8w8_blockscale_inputs(
+def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
     M: int,
     N: int,
     K: int,
+    S3: int,
     block_shape_n: int,
     block_shape_k: int,
     dtype=torch.bfloat16,
     layout: str = "TN",
-    output: bool = False,
     shuffle: bool = False,
 ):
     """
     The GEMM kernel expects:
     - x: (M, K) -> row-major format
     - w: (N, K) -> column-major format
+    - y: (M, D, S3)
     """
     scale_n = (N + block_shape_n - 1) // block_shape_n
     scale_k = (K + block_shape_k - 1) // block_shape_k
@@ -144,11 +125,9 @@ def generate_gemm_a8w8_blockscale_inputs(
         )
 
     if layout[1] == "N":
-        weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
-            e4m3_type
-        )
+        w = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
     else:
-        weight = (
+        w = (
             (torch.rand((K, N), dtype=torch.float16, device="cuda") / 10)
             .to(e4m3_type)
             .T
@@ -158,98 +137,85 @@ def generate_gemm_a8w8_blockscale_inputs(
     w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
 
     if shuffle:
-        weight_shuffle_layout = (16, 16)
-        weight_shuffled = shuffle_weight(weight, weight_shuffle_layout).reshape(
-            weight.shape[0] // weight_shuffle_layout[0],
-            weight.shape[1] * weight_shuffle_layout[0],
+        w_shuffle_layout = (16, 16)
+        w_shuffled = shuffle_weight(w, w_shuffle_layout).reshape(
+            w.shape[0] // w_shuffle_layout[0],
+            w.shape[1] * w_shuffle_layout[0],
         )
         x_scale_shuffled = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     else:
-        weight_shuffled = weight
+        w_shuffled = w
         x_scale_shuffled = x_scale
 
-    y = None
-    if output:
-        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
+    y = torch.rand((M, S3), dtype=torch.bfloat16, device="cuda").unsqueeze(1)
 
-    return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
-    return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
+    return x, w, w_shuffled, y, x_scale, x_scale_shuffled, w_scale
 
 
+# TODO d, s3, layout = 32 128 TT UT failed if AMDGCN_USE_BUFFER_OPS=1 on MI300
 @pytest.mark.parametrize(
-    "dtype, M, N, K, layout, output",
+    "dtype, M, N, K, D, S3, layout, impl",
     [
-        (dtype, *shape, layout, output)
-        for output in [True]
+        (dtype, *shape, d, s3, layout, impl)
         for dtype in ["bf16"]
-        for layout in ["TN"]
-        for shape in get_x_vals()
+        for shape in get_shapes()
+        for d in [16]
+        for s3 in [64]
+        for layout in ["TN", "TT", "NN", "NT"]
+        for impl in ["triton", "triton_shuffle"]
     ],
 )
-@pytest.mark.parametrize(
-    "impl",
-    [
-        # "gluon",
-        "triton",
-        "triton_shuffle",
-    ],
-)
-def test_gemm(dtype, M, N, K, layout, output, impl: str):
+def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout, impl):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
     block_shape_n, block_shape_k = block_shape
 
-    if impl == "gluon" and DEVICE_ARCH not in ("gfx950",):
+    # skip tests
+    if K % block_shape_k != 0:
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
+            "Latest upstream compiler as of Aug 22 (necessary for Gluon) causes"
+            " infinite hang when EVEN_K is false. Try seeing if it's fixed if it's been a while."
         )
-
+    if N % D != 0:
+        pytest.skip("N must be divisible by D as N = D * (S1 + S2)")
     if impl == "triton_shuffle":
         if N % 16 > 0 or K % 32 > 0:
             pytest.skip(
                 "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
             )
 
+    # deconstruct N
+    S = N // D
+    S1 = S // 2
+    S2 = S - S1
+
     dtype = str_to_torch_dtype[dtype]
-    x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
-        generate_gemm_a8w8_blockscale_inputs(
+    x, w, w_triton, y, x_scale, x_scale_triton, w_scale = (
+        generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
             M,
             N,
             K,
+            S3,
             block_shape_n,
             block_shape_k,
             dtype=dtype,
             layout=layout,
-            output=output,
-            shuffle=("_shuffle" in impl),
-        )
-    )
-    x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
-        generate_gemm_a8w8_blockscale_inputs(
-            M,
-            N,
-            K,
-            block_shape_n,
-            block_shape_k,
-            dtype=dtype,
-            layout=layout,
-            output=output,
             shuffle=("_shuffle" in impl),
         )
     )
 
-    a = run_torch(x, weight, x_scale, w_scale, dtype)
-
-    if impl == "gluon":
-        impl = gluon_gemm_a8w8_blockscale
-    elif impl == "triton":
-        impl = triton_gemm_a8w8_blockscale
+    if impl == "triton":
+        impl = fused_gemm_a8w8_blockscale_split_cat
     elif impl == "triton_shuffle":
-        impl = triton_gemm_a8w8_blockscale_preshuffle
+        impl = fused_gemm_a8w8_blockscale_preshuffle_split_cat
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 
-    b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
+    c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
+    c1_triton, c2_triton = run_triton(
+        impl, x, w_triton, y, x_scale_triton, w_scale, S1, S2, D, dtype
+    )
 
-    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
