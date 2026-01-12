@@ -131,9 +131,15 @@ def main():
         "cache_modifier": [0, 1],
         "NUM_KSPLIT": spk_range,
     }
+    print("Raw tunning space:", flush=True)
+    for k, v in parms.items():
+        print(f"\t{k} = {v}", flush=True)
 
     comb = list(product(*parms.values()))
     comb_p = []
+    print()
+    print(f"Pre-pruning cases...")
+    n_case_remove = 0
     for a_comb in comb:
         (
             BLOCK_SIZE_M,
@@ -147,16 +153,27 @@ def main():
             cache_modifier,
             NUM_KSPLIT,
         ) = a_comb
-        # skip cases
-        if NUM_KSPLIT > 1 and GROUP_SIZE_M > 1:
+        # remove cases
+        if NUM_KSPLIT > 1 and BLOCK_SIZE_K > K // NUM_KSPLIT:
+            n_case_remove += 1
+            # print(f"Remove case {a_comb} because NUM_KSPLIT > 1 and BLOCK_SIZE_K > K // NUM_KSPLIT")
             continue
-        if BLOCK_SIZE_K > K // NUM_KSPLIT:
+        if NUM_KSPLIT > 1 and GROUP_SIZE_M > 1:
+            n_case_remove += 1
+            # print(f"Remove case {a_comb} because NUM_KSPLIT > 1 and GROUP_SIZE_M > 1")
             continue
         if BLOCK_SIZE_K == K // NUM_KSPLIT and num_stages != 1:  # k_itr == 1 case
+            n_case_remove += 1
+            # print(f"Remove case {a_comb} because BLOCK_SIZE_K == K // NUM_KSPLIT and num_stages != 1")
             continue
         if BLOCK_SIZE_K < K // NUM_KSPLIT and num_stages == 1:  # k_itr > 1 case
+            n_case_remove += 1
+            # print(f"Remove case {a_comb} because BLOCK_SIZE_K < K // NUM_KSPLIT and num_stages == 1")
             continue
         comb_p.append(a_comb)
+    print(f"{n_case_remove} cases are removed during pre-pruning")
+    print(f"Total number of cases to run: {len(comb_p)}")
+    print()
     comb = comb_p
     file_tag = f"{ut_filename}-{M}-{N}-{K}"
     log_filename = f"screen-{file_tag}.log"
