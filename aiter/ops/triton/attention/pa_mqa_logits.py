@@ -486,7 +486,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 weights,
                 weights.stride(0),
                 out_logits,
-                out_logits.stride(0),
+                out_logits.stride(1),  # stride for batch dimension, not heads
                 max_model_len,
                 max_block_len,
                 SplitKV if not VarCtxOpt else VarCtxSchedule,
@@ -521,7 +521,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 weights,
                 weights.stride(0),
                 out_logits,
-                out_logits.stride(0),
+                out_logits.stride(1),  # stride for batch dimension, not heads
                 max_model_len,
                 max_block_len,
                 SplitKV if not VarCtxOpt else VarCtxSchedule,
@@ -552,7 +552,7 @@ def deepgemm_fp8_paged_mqa_logits(
             weights,
             weights.stride(0),
             out_logits,
-            out_logits.stride(0),
+            out_logits.stride(1),  # stride for batch dimension, not heads
             max_model_len,
             max_block_len,
             waves_per_eu=WavePerEU,
