@@ -1307,6 +1307,11 @@ def paged_attention_decode_sliding_window(
     else:
         query_converted = query_converted.to(COMPUTE_TYPE)
 
+    if KV_QUANT_MODE == 0:
+        # Per-tensor quantization
+        key_scale_value = gl.load(key_scale)
+        value_scale_value = gl.load(value_scale)
+
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
@@ -1348,37 +1353,32 @@ def paged_attention_decode_sliding_window(
             layout=qk_mfma_layout,
         )
         # Load key quantization scales if needed (overlaps with key tensor load)
-        if KV_QUANT_MODE >= 0:
-            if KV_QUANT_MODE == 0:
-                # Per-tensor quantization
-                key_scale_value = tl.load(key_scale)
-                value_scale_value = tl.load(value_scale)
-            elif KV_QUANT_MODE == 1:
-                # Per-token quantization - prepare offsets while key loads
-                key_scale_offsets = (
-                    kv_block_numbers[:, None, None, None] * kv_scale_stride_0
-                    + kv_head_idx * kv_scale_stride_1
-                    + block_element_offsets[None, None, :, None]
-                )
-                # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
-                key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
-                value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
+        if KV_QUANT_MODE == 1:
+            # Per-token quantization - prepare offsets while key loads
+            key_scale_offsets = (
+                kv_block_numbers[:, None, None, None] * kv_scale_stride_0
+                + kv_head_idx * kv_scale_stride_1
+                + block_element_offsets[None, None, :, None]
+            )
+            # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
+            key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
+            value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
 
-                # Convert to required distributed layout for computation
-                key_scale_value_blocked = gl.reshape(
-                    key_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
-                )
-                key_scale_value = gl.convert_layout(
-                    key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
-                )
-                key_scale_value = key_scale_value[None, :]
-                value_scale_value_blocked = gl.reshape(
-                    value_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
-                )
-                value_scale_value = gl.convert_layout(
-                    value_scale_value_blocked,
-                    layout=gl.SliceLayout(0, qk_linear_layout),
-                )
+            # Convert to required distributed layout for computation
+            key_scale_value_blocked = gl.reshape(
+                key_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
+            )
+            key_scale_value = gl.convert_layout(
+                key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
+            )
+            key_scale_value = key_scale_value[None, :]
+            value_scale_value_blocked = gl.reshape(
+                value_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
+            )
+            value_scale_value = gl.convert_layout(
+                value_scale_value_blocked,
+                layout=gl.SliceLayout(0, qk_linear_layout),
+            )
 
         # Reshape key tensor for matrix multiplication
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
