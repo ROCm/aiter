@@ -427,12 +427,14 @@ def run_aiter_common(
     """
     Test paged_attention_common which automatically switches between ASM and HIP kernels.
     """
-    
+
     num_seqs, num_heads, head_size = query.shape
     # Create workspace buffer for HIP kernel path
     # Workspace buffer size calculation from test_pa_v1.py
     _PARTITION_SIZE_ROCM = 256
-    max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM - 1) // _PARTITION_SIZE_ROCM
+    max_num_partitions = (
+        max_seq_len + _PARTITION_SIZE_ROCM - 1
+    ) // _PARTITION_SIZE_ROCM
     nbyes_per_qo_elem = torch.finfo(query.dtype).bits // 8
     workspace_buffer = torch.empty(
         (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
@@ -440,7 +442,7 @@ def run_aiter_common(
         dtype=torch.uint8,
         device=query.device,
     )
-       
+
     def _normalize_scale(s):
         if s is None:
             return None
@@ -451,20 +453,27 @@ def run_aiter_common(
 
     k_scale_tensor = _normalize_scale(k_scale)
     v_scale_tensor = _normalize_scale(v_scale)
-    
+
     # Determine kv_cache_dtype string.
     def _is_fp8_storage(dt: torch.dtype) -> bool:
         if dt == torch.int8 or dt == torch.uint8:
             return True
         # torch float8 dtypes (guard for older torch builds)
-        for name in ("float8_e4m3fnuz", "float8_e4m3fn", "float8_e5m2fnuz", "float8_e5m2"):
+        for name in (
+            "float8_e4m3fnuz",
+            "float8_e4m3fn",
+            "float8_e5m2fnuz",
+            "float8_e5m2",
+        ):
             if hasattr(torch, name) and dt == getattr(torch, name):
                 return True
         return False
 
-    cache_dt = kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else k_cache.dtype
+    cache_dt = (
+        kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else k_cache.dtype
+    )
     kv_cache_dtype_str = "fp8" if _is_fp8_storage(cache_dt) else "auto"
-    
+
     return attention.paged_attention_common(
         Q=query.contiguous(),
         K=k_cache,

@@ -112,7 +112,7 @@ def paged_attention_v1(
 
     # Handle both 4D and 5D layouts (key and value cache always have same layout)
     is_5d_cache = value_cache.dim() == 5
-    
+
     if is_5d_cache:
         # 5D V cache layout: [num_blocks, num_kv_heads, block_size/x, head_size, x]
         # K cache is kept in ASM layout: [num_blocks, num_kv_heads, head_size/x, block_size, x]
@@ -123,20 +123,26 @@ def paged_attention_v1(
 
         # K uses ASM layout strides; V uses its own 5D strides.
         kv_block_stride = value_cache.stride(0)  # stride over blocks for V cache
-        kv_head_stride = value_cache.stride(1)   # stride over heads for V cache
-        kv_seq_stride = key_cache.stride(3)      # stride of block_size dimension in ASM K layout
+        kv_head_stride = value_cache.stride(1)  # stride over heads for V cache
+        kv_seq_stride = key_cache.stride(
+            3
+        )  # stride of block_size dimension in ASM K layout
     else:
         # 4D layout: [num_blocks, num_heads, block_size, head_size] or [num_blocks, block_size, num_heads, head_size]
-        num_kv_heads = key_cache.size(1) if kv_cache_layout == "HND" else key_cache.size(2)
-        block_size = key_cache.size(2) if kv_cache_layout == "HND" else key_cache.size(1)
+        num_kv_heads = (
+            key_cache.size(1) if kv_cache_layout == "HND" else key_cache.size(2)
+        )
+        block_size = (
+            key_cache.size(2) if kv_cache_layout == "HND" else key_cache.size(1)
+        )
         kv_block_stride = key_cache.stride(0)
         kv_head_stride = (
             key_cache.stride(1) if kv_cache_layout == "HND" else key_cache.stride(2)
         )
         kv_seq_stride = (
-            key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
-        )
-    
+              key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
+          )
+
     num_seqs = block_tables.size(0)
     num_heads = query.size(1)
     head_size = query.size(2)
@@ -242,7 +248,6 @@ def paged_attention_v1(
         if v_scale is not None
         else ctypes.POINTER(ctypes.c_float)()
     )
-
 
     func(
         out_ptr,
