@@ -664,18 +664,15 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def use_cfg():
-        # problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
-        # bypass_type = (
-        #     ActivationType.Silu,
-        #     dtypes.bf16,
-        #     dtypes.fp8,
-        #     dtypes.fp8,
-        #     QuantType.per_1x128,
-        # )
-        # if problem_type == bypass_type and (token * topk) <= 512:  # bypass tuned
-        #     aiter.logger.info("bypass tuned results for fp8 blockscale")
-        #     return False
-        return True
+        problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
+        bypass_type = (
+            ActivationType.Silu,
+            dtypes.bf16,
+            dtypes.fp8,
+            dtypes.fp8,
+            QuantType.per_1x128,
+        )
+        return problem_type != bypass_type
 
     # cfg = cfg_2stages.get(keys, None)
     cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
@@ -687,6 +684,7 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+    use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
         kernelName1 = ""
@@ -702,7 +700,8 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                run_1stage = token > 64 and (inter_dim % 256 == 0) and False
+                # for fp8 blockscale, ck has better performance so disable assembly kernel
+                run_1stage = False
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
