@@ -4,7 +4,6 @@
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
 #include <memory>
-#include <mutex>
 #include <string>
 
 namespace aiter {
@@ -184,8 +183,6 @@ std::tuple<int, int, int> get_grid_dim(const mha_fwd_args& a, int ts_qo, const s
 
 float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 {
-    std::cout << "[DEBUG] Thread ID: " << std::this_thread::get_id() << " executing fmha_fwd_v3"
-              << std::endl;
     std::string arch_id = get_gpu_arch();
 
     if((!a.use_asm_v3) || (a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
@@ -224,14 +221,13 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
+
+    auto result = impl_ptr_map.emplace(name, nullptr);
+    if(result.second)
     {
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
-        }
-        impl_ptr = result.first->second.get();
+        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
     }
+    impl_ptr = result.first->second.get();
 
     fmha_fwd_v3_args args;
     int arg_size = sizeof(args);
@@ -241,8 +237,8 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
-        // Explicit assignment forces evaluation order and prevents compiler from reordering
-        // operations
+        // Explicit assignment forces evaluation order and prevents compiler from
+        // reordering operations that could lead to accessing uninitialized args
         void* args_ptr     = &args;
         void* arg_size_ptr = &arg_size;
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
