@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-    _fused_gemm_afp4wfp4_split_cat,
-    _fused_gemm_afp4wfp4_preshuffle_split_cat,
-    _fused_gemm_afp4wfp4_split_cat_reduce,
+from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
+    _fused_gemm_a8w8_blockscale_split_cat,
+    _fused_gemm_a8w8_blockscale_split_cat_reduce,
+    _fused_gemm_a8w8_blockscale_preshuffle_split_cat,
+    _get_config,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
-from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 
-def fused_gemm_afp4wfp4_split_cat(
+def fused_gemm_a8w8_blockscale_split_cat(
     x: torch.Tensor,
     w: torch.Tensor,
     y: torch.Tensor,
@@ -28,7 +27,7 @@ def fused_gemm_afp4wfp4_split_cat(
     config: Optional[dict] = None,
 ):
     """
-    Computes the 4 bit matmul C = X @ W^T using the block-scale quantization approach.
+    Computes the 8 bit matmul C = X @ W^T using the block-scale quantization approach.
     Then split the product C into C1 and C2 with sizes S1 and S2 at the last dimension respectively.
     Finally concatenate Y to C1 at the last dimension.
 
@@ -39,8 +38,8 @@ def fused_gemm_afp4wfp4_split_cat(
     return c1, c2
 
     Key parameters:
-    - x: Matrix X with shape (M, K // 2).
-    - w: Matrix W with shape (N, K // 2).
+    - x: Matrix X with shape (M, K).
+    - w: Matrix W with shape (N, K).
     - y: Tensor Y with shape (M, D, S3).
     - x_scale: Scale tensor for X with shape (M, *scale_k).
     - w_scale: Scale tensor for W with shape (**scale_n, *scale_k).
@@ -55,7 +54,7 @@ def fused_gemm_afp4wfp4_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_AFP4WFP4_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        f"FUSED_GEMM_A8W8_BLOCKSCALE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
     )
 
     M, K = x.shape
@@ -72,7 +71,7 @@ def fused_gemm_afp4wfp4_split_cat(
     w_scale = w_scale.T  # (scale_k, scale_n)
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K, False)
 
     c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
     c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)
@@ -81,34 +80,42 @@ def fused_gemm_afp4wfp4_split_cat(
         K, config["NUM_KSPLIT"]
     )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
-        config["NUM_KSPLIT"] = 1
-
-    if config["NUM_KSPLIT"] > 1:
         c_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
             dtype=torch.float32,
             device=x.device,
         )
     else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
         c_pp = None
+
+    # If block size is greater than split k size, shrink the block size
+    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
+    config["BLOCK_SIZE_K"] = max(
+        config["BLOCK_SIZE_K"], 16
+    )  # minimum block size is 16 for perf
+
+    # Scale block sizes
+    # TODO: need a better way to pass scale block sizes around
+    config["GROUP_K"] = triton.next_power_of_2(
+        triton.cdiv(K, w_scale.shape[0])
+    )  # scale_block_size_k
+    config["GROUP_N"] = triton.next_power_of_2(
+        triton.cdiv(N, w_scale.shape[1])
+    )  # scale_block_size_n
 
     # S3 block sizes
     config["BLOCK_SIZE_S3"] = triton.next_power_of_2(
         triton.cdiv(D * S3, triton.cdiv(N, config["BLOCK_SIZE_N"]))
     )
 
+    assert (
+        config["GROUP_K"] == config["BLOCK_SIZE_K"]
+    ), "GROUP_K must equal BLOCK_SIZE_K"
+
+    # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]
@@ -116,7 +123,7 @@ def fused_gemm_afp4wfp4_split_cat(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _fused_gemm_afp4wfp4_split_cat[grid](
+    _fused_gemm_a8w8_blockscale_split_cat[grid](
         x,
         w,
         y,
@@ -157,13 +164,13 @@ def fused_gemm_afp4wfp4_split_cat(
         REDUCE_BLOCK_SIZE_S3 = triton.next_power_of_2(
             triton.cdiv(D * S3, triton.cdiv(N, REDUCE_BLOCK_SIZE_N))
         )
-        ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
+        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _fused_gemm_afp4wfp4_split_cat_reduce[grid_reduce](
+        _fused_gemm_a8w8_blockscale_split_cat_reduce[grid_reduce](
             c_pp,
             c1,
             c2,
@@ -196,7 +203,7 @@ def fused_gemm_afp4wfp4_split_cat(
     return c1, c2
 
 
-def fused_gemm_afp4wfp4_preshuffle_split_cat(
+def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     x: torch.Tensor,
     w: torch.Tensor,
     y: torch.Tensor,
@@ -206,9 +213,10 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     S2: int,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     config: Optional[dict] = None,
+    is_x_scale_transposed: bool = True,
 ):
     """
-    Computes the 4 bit matmul C = X @ W^T using the block-scale quantization approach.
+    Computes the 8 bit matmul C = X @ W^T using the block-scale quantization approach.
     Then split the product C into C1 and C2 with sizes S1 and S2 at the last dimension respectively.
     Finally concatenate Y to C1 at the last dimension.
 
@@ -219,11 +227,11 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     return c1, c2
 
     Key parameters:
-    - x: Matrix X with shape (M, K // 2).
-    - w: Matrix W with shape (N // 16, K // 2 * 16).
+    - x: Matrix X with shape (M, K).
+    - w: Matrix W with shape (N, K), internally transposed.
     - y: Tensor Y with shape (M, D, S3).
-    - x_scale: Scale tensor for X with shape (M // 32, *scale_k * 32).
-    - w_scale: Scale tensor for W with shape (**scale_n // 32, *scale_k * 32).
+    - x_scale: Scale tensor for X with shape (M, *scale_k).
+    - w_scale: Scale tensor for W with shape (**scale_n, *scale_k).
 
     Returns:
     - c1: The output matrix with shape (M, D, S1 + S3).
@@ -235,7 +243,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"FUSED_GEMM_AFP4WFP4_PRESHUFFLE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        f"FUSED_GEMM_A8W8_BLOCKSCALE_PRESHUFFLE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
     )
 
     M, K = x.shape
@@ -249,6 +257,10 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     assert y.shape[0] == x.shape[0], "Incompatible dimensions!!!"
     assert N == D * (S1 + S2), "N is not D * (S1 + S2)"
 
+    # Transpose w and w_scale
+    # w = w.T  # (K, N)
+    w_scale = w_scale.T  # (scale_k, scale_n)
+
     if config is None:
         config, _ = _get_config(M, N, K, True)
 
@@ -259,35 +271,42 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         K, config["NUM_KSPLIT"]
     )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
-        config["NUM_KSPLIT"] = 1
-    config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
-
-    if config["NUM_KSPLIT"] > 1:
         c_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
             dtype=torch.float32,
             device=x.device,
         )
     else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
         c_pp = None
+
+    # If block size is greater than split k size, shrink the block size
+    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
+    config["BLOCK_SIZE_K"] = max(
+        config["BLOCK_SIZE_K"], 16
+    )  # minimum block size is 16 for perf
+
+    # Scale block sizes
+    # TODO: need a better way to pass scale block sizes around
+    config["GROUP_K"] = triton.next_power_of_2(
+        triton.cdiv(K, w_scale.shape[0])
+    )  # scale_block_size_k
+    config["GROUP_N"] = triton.next_power_of_2(
+        triton.cdiv(N, w_scale.shape[1])
+    )  # scale_block_size_n
 
     # S3 block sizes
     config["BLOCK_SIZE_S3"] = triton.next_power_of_2(
         triton.cdiv(D * S3, triton.cdiv(N, config["BLOCK_SIZE_N"]))
     )
 
+    assert (
+        config["GROUP_K"] == config["BLOCK_SIZE_K"]
+    ), "GROUP_K must equal BLOCK_SIZE_K"
+
+    # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]
@@ -295,7 +314,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _fused_gemm_afp4wfp4_preshuffle_split_cat[grid](
+    _fused_gemm_a8w8_blockscale_preshuffle_split_cat[grid](
         x,
         w,
         y,
@@ -323,8 +342,12 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         c2.stride(0),
         c2.stride(1),
         c2.stride(2),
-        x_scale.stride(0),
-        x_scale.stride(1),
+        x_scale.stride(1) if is_x_scale_transposed else x_scale.stride(0),
+        (
+            (x_scale.numel() // x_scale.stride(0))
+            if is_x_scale_transposed
+            else x_scale.stride(1)
+        ),
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
@@ -336,13 +359,13 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         REDUCE_BLOCK_SIZE_S3 = triton.next_power_of_2(
             triton.cdiv(D * S3, triton.cdiv(N, REDUCE_BLOCK_SIZE_N))
         )
-        ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
+        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _fused_gemm_afp4wfp4_split_cat_reduce[grid_reduce](
+        _fused_gemm_a8w8_blockscale_split_cat_reduce[grid_reduce](
             c_pp,
             c1,
             c2,

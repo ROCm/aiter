@@ -91,7 +91,7 @@ def fused_gemm_afp4wfp4_a16w16(
     w_bf16 = w_bf16.T
 
     if config is None:
-        config = _get_config(M, N_fp4, N_bf16, K, is_fp4_preshuffled)
+        config, _ = _get_config(M, N_fp4, N_bf16, K, is_fp4_preshuffled)
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
