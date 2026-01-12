@@ -18,14 +18,27 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d, remap_
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
 
 
-def get_fwd_configs(autotune: bool):
+def get_fwd_configs(autotune: bool, seqlen_k: int = None):
     assert not autotune, "Autotuning is not supported."
+
+    # Config for short K sequences (prefill/context encoding with small KV cache)
+    if seqlen_k is not None and seqlen_k <= 512:
+        return {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+            "PRE_LOAD_V": True,
+            "num_stages": 3,
+            "waves_per_eu": 2
+        }
+
+    # Default config for long K sequences
     return {
         "BLOCK_M": 256,
         "BLOCK_N": 128,
-        "waves_per_eu": 2,
+        "waves_per_eu": 0,
         "PRE_LOAD_V": False,
-        "num_stages": 2,
+        "num_stages": 5,
         "num_warps": 8,
     }
 
@@ -1854,7 +1867,7 @@ def fav3_sage_triton_impl(
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     if config is None:
-        config = get_fwd_configs(False)
+        config = get_fwd_configs(False, seqlen_k=max_seqlens_k)
     attn_fwd[grid](
         q,
         k,

@@ -252,7 +252,7 @@ def fav3_sage_forward_func(
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
 ):
-    config = get_fwd_configs(False)
+    config = get_fwd_configs(False, seqlen_k=k.shape[1])
     # assert (
     #     len(config) == 1
     # ), f"Number of best config is expected to be 1, got {len(config)}"

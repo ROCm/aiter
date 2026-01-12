@@ -89,7 +89,7 @@ def setup_attention(args):
     else:
         # No permute needed for sagev1/fav3_sage
         # Disable torch.compile for these custom triton kernels to avoid incorrect outputs
-        @torch.compiler.disable
+        # @torch.compiler.disable
         def usp_attention_wrapper(query, key, value, dropout_p, is_causal):
             return attn_fn(query, key, value)
     
