@@ -25,8 +25,9 @@ x, w, bias, _, y = generate_gemm_a16w16_inputs(
 ############################################################
 
 for config in config_list:
-    config = config.copy()
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(input_shape[2], config["NUM_KSPLIT"])
+    if config is not None:
+        config = config.copy()
+        config["SPLITK_BLOCK_SIZE"] = triton.cdiv(input_shape[2], config["NUM_KSPLIT"])
 
     def fn():
         ############################################################

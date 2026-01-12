@@ -98,7 +98,7 @@ def main():
             spk_range.append(spk)
 
     ############################################################
-    # # for AFP4WFP4_GEMM_preshuffe please use this
+    # # for AFP4WFP4_GEMM_preshuffe
     # if M >= 256:
     #     Ms = [32, 64, 128, 256]
     # elif M >= 128:
@@ -239,10 +239,9 @@ def main():
             )
             process.communicate()
 
-        # print(cmd_list)env={"HIP_VISIBLE_DEVICES": f"{G}"}
         process = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )  # .read()
+        )
         stdout_data, stderr_data = process.communicate()
 
         if process.returncode == 0:
