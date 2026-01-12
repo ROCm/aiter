@@ -131,163 +131,125 @@ struct HkMlaDecodeFwdParams
     void* p_dbg;
 };
 
-template <typename T, bool kCheckBoundary = true>
-__device__ __forceinline__ void async_load_k(uintptr_t p_lds_k_nope,
-                                             uintptr_t p_lds_k_rope,
-                                             typename T::gl_kv& kv_buffer,
+// Load 32x64 elements from VRAM to LDS
+// Each warp loads 32x8 elements. Padding 2DW between 32x8 blocks.
+// After loading, the elements are in the following layout:
+// [0, 0-7], [1, 0-7], ..., [31, 0-7], 2 DW padding (by warp 0)
+// [0, 8-15], [1, 8-15], ..., [31, 8-15], 2 DW padding (by warp 1)
+// ...
+// [0, 56-63], [1, 56-63], ..., [31, 56-63], 2 DW padding (by warp 7)
+// ...
+// [0, 504-511], [1, 504-511], ..., [31, 504-511], 2 DW padding (by warp 7)
+// ...
+// [0, 568-575], [1, 568-575], ..., [31, 568-575]  (by warp 7)
+//
+// Note: p_lds_kv_warp_fixed here is expected to be the start address of the warp: p_lds_kv +
+// warp_idx * kWarpOffset.
+template <typename T, uint32_t kColOffset, bool kCheckBoundary = true>
+__device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv_warp_fixed,
+                                             const typename T::gl_kv& kv_buffer,
                                              const int32_t* p_kv_indices,
                                              const int32_t kv_start,
                                              const int32_t kv_end)
 {
-#if defined(__HIP_DEVICE_COMPILE__)
-    // Note: always assumes assert((kv_end - kv_start) <= T::kBlockN);
-
-    /// TODO: LDS back conflict
-
     using kv_t = T::kv_t;
 
-    // Restrictions of this function
-    static_assert(sizeof(kv_t) == 1, "Only fp8 is supported!");
-    static_assert((T::kQkNopeHeadDim == 512) && (T::kQkRopeHeadDim == 64) && (T::kBlockN == 32),
-                  "Unsupported layout!");
-    static_assert(T::kPageSize == 1, "Only supports page size 1 for now!");
+    /// TODO: These parameters should reside in Traits.
+    // In the view of thread block
+    constexpr uint32_t kNumRows = 32;
+    constexpr uint32_t kNumCols = 64;
+    // In the view of warp
+    constexpr uint32_t kNumColsPerWarp = kNumCols / T::kNumWarps;    // 64/8=8
+    constexpr uint32_t kNumElemPerWarp = kNumRows * kNumColsPerWarp; // 32*8=256
+    constexpr uint32_t kNumPaddingDw   = 2;                          // Skip 2 banks.
+    constexpr uint32_t kWarpOffset =
+        kNumElemPerWarp * sizeof(kv_t) + kNumPaddingDw * sizeof(uint32_t); // 256*1+2*4=264
+    constexpr uint32_t kNumRowThreads = 32; // #threads handle the same column.
+    constexpr uint32_t kNumColThreads =
+        ckt::get_warp_size() / kNumRowThreads;    // #threads handle the same row. 64/32=2
+    constexpr uint32_t kNumBytesPerThrPerRnd = 4; // use buffer_load_dword which loads 4B each time.
 
-    const int32_t warp_idx = ckt::get_warp_id();
-    const int32_t lane_idx = ckt::get_lane_id();
+    static_assert(((kColOffset % 64) == 0) && (kColOffset < 576),
+                  "async_load_k(): Unsupported column offset!");
 
-    // Warp is divided to 4 sub-warps. Each sub-warp contains 16 threads and solely responsible to a
-    // row.
-    constexpr int32_t kNumRowsPerWarp = T::kBlockN / T::kNumWarps;
-    static_assert(kNumRowsPerWarp == 4);
+    const uint32_t warp_idx = ckt::get_warp_id();
+    const uint32_t lane_idx = ckt::get_lane_id();
+
+    const uintptr_t p_lds_kv_warp =
+        p_lds_kv_warp_fixed + kColOffset / kNumColsPerWarp * kWarpOffset;
 
     const kv_t* p_kv_buffer = &kv_buffer[{0, 0, 0, 0}];
     const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
 
-    const int32_t kv_indices_base = kv_start + warp_idx * kNumRowsPerWarp;
-    if((kCheckBoundary == false) || (kv_indices_base < kv_end))
+    /// TODO: We may can store the row indices loaded from p_kv_indices in LDS.
+    const uint32_t row_idx = lane_idx / kNumColThreads; // 8 elements per row handled by 2 threads.
+    const uint32_t cow     = kColOffset / sizeof(kv_t) + warp_idx * kNumColsPerWarp +
+                         lane_idx % kNumColThreads * kNumBytesPerThrPerRnd;
+    if((row_idx + kv_start) < kv_end)
     {
-        // Although gfx950 supports buffer_load_dwordx4 lds:1, it cannot support swizzle well
-        // becasue
-        // 1. Cannot add a skip a block of LDS since LDS dest addr is calculated automatically by hw
-        // while
-        //    buffer_load_dwordx4 write multiple row by a warp in the same time.
-        // 2. Src addess points to 16 bytes by buffer_load_dwordx4 but we need to shift 8 bytes for
-        // each row.
-        //     We cannot load adjacent 16 bytes to two 8 bytes fields in LDS.
-        // Additionally we don't use dense method and pad 8 bytes for eash row instead due to
-        // additional vgpr for loading.
-
-        constexpr uint32_t kNumBytesPerThrPerRnd =
-            4; // use buffer_load_dword which loads 4B each time.
-        constexpr uint32_t kNumBytesPerWarpPerRnd =
-            kNumBytesPerThrPerRnd * ckt::get_warp_size(); // 4*64=256
-
-        const int32_t rows[kNumRowsPerWarp] = {
-            p_kv_indices[kv_indices_base + 0],
-            kCheckBoundary
-                ? (((kv_indices_base + 1) < kv_end) ? p_kv_indices[kv_indices_base + 1] : -1)
-                : p_kv_indices[kv_indices_base + 1],
-            kCheckBoundary
-                ? (((kv_indices_base + 2) < kv_end) ? p_kv_indices[kv_indices_base + 2] : -1)
-                : p_kv_indices[kv_indices_base + 2],
-            kCheckBoundary
-                ? (((kv_indices_base + 3) < kv_end) ? p_kv_indices[kv_indices_base + 3] : -1)
-                : p_kv_indices[kv_indices_base + 3],
-        };
-
-        // Load NOPE
-        constexpr uint32_t kNumRndPerRowNope =
-            T::kQkHeadDim * sizeof(kv_t) / kNumBytesPerWarpPerRnd; // 512*1/256=2
-        static_assert(kNumRndPerRowNope == 2);
-
-        /// TODO: replace 512 with 512+8 for swizzle
-        const uintptr_t p_lds_warp_nope = p_lds_k_nope + warp_idx * kNumRowsPerWarp * 512;
-        const uint32_t lane_offset      = lane_idx * kNumBytesPerThrPerRnd;
-
-#pragma unroll
-        for(uint32_t row_idx = 0; row_idx < kNumRowsPerWarp; ++row_idx)
-        {
-            const int32_t kv_row_idx = rows[row_idx];
-            /// TODO: replace 512 with 512+8 for swizzle
-            const uintptr_t p_lds_row = p_lds_warp_nope + row_idx * 512;
-
-            if(kCheckBoundary && (kv_row_idx == -1))
-            {
-                const uintptr_t p_lds_row_lane = p_lds_row + lane_offset;
-                hkm::ds_write_b32(p_lds_row_lane, 0, 0u);
-                hkm::ds_write_b32(p_lds_row_lane, kNumBytesPerWarpPerRnd, 0u);
-            }
-            else
-            {
-                const int32_t col          = lane_idx * 4;
-                const int32_t voffset_nope = kv_row_idx * T::kQkHeadDim + col;
-                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                    (as3_uint32_ptr)(p_lds_row),
-                                                    kNumBytesPerThrPerRnd,
-                                                    voffset_nope,
-                                                    0,
-                                                    0,
-                                                    0);
-                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                    (as3_uint32_ptr)(p_lds_row),
-                                                    kNumBytesPerThrPerRnd,
-                                                    voffset_nope,
-                                                    0,
-                                                    kNumBytesPerWarpPerRnd,
-                                                    0);
-            }
-        }
-
-        // Load ROPE
-        const int32_t sub_warp_rope_idx = lane_idx >> 0x4;
-        const int32_t sub_lane_rope_idx = lane_idx & 0xf;
-        const int32_t row_rope          = rows[sub_warp_rope_idx];
-        const int32_t col_rope          = sub_lane_rope_idx * kNumBytesPerThrPerRnd;
-        uintptr_t p_lds_warp_rope =
-            p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
-
-        if(kCheckBoundary && (row_rope == -1))
-        {
-            *reinterpret_cast<uint32_t*>(p_lds_warp_rope + lane_idx * sizeof(uint32_t)) = 0u;
-        }
-        else
-        {
-            const int32_t voffset_rope =
-                (row_rope * T::kQkHeadDim + col_rope + T::kQkNopeHeadDim) * sizeof(kv_t);
-            hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                (as3_uint32_ptr)(p_lds_warp_rope),
-                                                kNumBytesPerThrPerRnd,
-                                                voffset_rope,
-                                                0,
-                                                0,
-                                                0);
-        }
+        const uint32_t row     = p_kv_indices[row_idx + kv_start];
+        const uint32_t voffset = row * T::kQkHeadDim + cow;
+        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                            (as3_uint32_ptr)(p_lds_kv_warp),
+                                            kNumBytesPerThrPerRnd,
+                                            voffset,
+                                            0,
+                                            0, /// TODO: try to use instruction offset to save gpr.
+                                            0);
     }
     else
     {
-        uintptr_t p_lds_warp_nope =
-            p_lds_k_nope + warp_idx * kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t);
-        uint4* p_lds_nope                    = reinterpret_cast<uint4*>(p_lds_warp_nope);
-        constexpr uint32_t kNumDw4PerThrNope = kNumRowsPerWarp * T::kQkNopeHeadDim * sizeof(kv_t) /
-                                               ckt::get_warp_size() / sizeof(uint4);
-#pragma unroll
-        for(uint32_t rid = 0; rid < kNumDw4PerThrNope; ++rid)
-        {
-            p_lds_nope[lane_idx + rid * ckt::get_warp_size()] = uint4(0u);
-        }
-
-        uintptr_t p_lds_warp_rope =
-            p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
-        uint32_t* p_lds_rope                = reinterpret_cast<uint32_t*>(p_lds_warp_rope);
-        constexpr uint32_t kNumDwPerThrRope = kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t) /
-                                              ckt::get_warp_size() / sizeof(uint32_t);
-#pragma unroll
-        for(uint32_t rid = 0; rid < kNumDwPerThrRope; ++rid)
-        {
-            p_lds_rope[lane_idx + rid * ckt::get_warp_size()] = 0u;
-        }
+        const uintptr_t p_lds_kv_lane = p_lds_kv_warp + lane_idx * kNumBytesPerThrPerRnd;
+        hkm::ds_write_b32(p_lds_kv_lane, 0, 0u);
     }
-#endif
+}
+
+// Load 16x32 blocks from LDS to GPR. Each thread takes contiguous 8 elements.
+template <typename T, uint32_t kRowOffset, uint32_t kColOffset, hkdart::all RT>
+__device__ __forceinline__ void load_k_to_gpr(RT& dst, const uintptr_t p_lds_kv)
+{
+    using kv_t = T::kv_t;
+
+    /// TODO: These parameters should reside in Traits.
+    // In the view of thread block
+    constexpr uint32_t kNumRows = 32;
+    constexpr uint32_t kNumCols = 64;
+    // In the view of warp
+    constexpr uint32_t kNumColsPerWarp = kNumCols / T::kNumWarps;    // 64/8=8
+    constexpr uint32_t kNumElemPerWarp = kNumRows * kNumColsPerWarp; // 32*8=256
+    constexpr uint32_t kNumPaddingDw   = 2;                          // Skip 2 banks.
+    constexpr uint32_t kWarpOffset =
+        kNumElemPerWarp * sizeof(kv_t) + kNumPaddingDw * sizeof(uint32_t); // 256*1+2*4=264
+    constexpr uint32_t kMfmaRows       = 16; // 16 refers to mfma_f32_16x16x32_fp8_fp8.
+    constexpr uint32_t kMfmaCols       = 32; // 32 refers to mfma_f32_16x16x32_fp8_fp8.
+    constexpr uint32_t kMfmaElemPerThr = kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*32/64=8
+
+    static_assert(((kRowOffset % 16) == 0) && (kRowOffset < 32),
+                  "load_k_to_gpr(): Unsupported row offset!");
+    static_assert(((kColOffset % 32) == 0) && (kColOffset < 576),
+                  "load_k_to_gpr(): Unsupported column offset!");
+
+    const uint32_t warp_idx = ckt::get_warp_id();
+    const uint32_t lane_idx = ckt::get_lane_id();
+
+    // // equivalent with kFixedOffset=0
+    // const uint32_t row = kRowOffset + lane_idx % kMfmaRows;
+    // const uint32_t col = kColOffset + lane_idx / kMfmaRows * kMfmaElemPerThr;
+    // const uintptr_t p_lds_kv_lane =
+    //     p_lds_kv + row * kMfmaElemPerThr * sizeof(kv_t) + (col / kNumColsPerWarp) * kWarpOffset;
+    // constexpr uint32_t kFixedOffset = 0;
+
+    const uint32_t row = lane_idx % kMfmaRows;
+    const uint32_t col = lane_idx / kMfmaRows * kMfmaElemPerThr;
+    const uintptr_t p_lds_kv_lane =
+        p_lds_kv + row * kMfmaElemPerThr * sizeof(kv_t) + (col / kNumColsPerWarp) * kWarpOffset;
+    constexpr uint32_t kFixedOffset =
+        kRowOffset * kMfmaElemPerThr * sizeof(kv_t) + kColOffset / kNumColsPerWarp * kWarpOffset;
+
+    using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, kRowOffset / 16>;
+    static_assert(range_type::lo + 1 == range_type::hi,
+                  "ds_read_b64 requires 2 consecutive registers");
+    hkm::ds_read_b64<range_type::lo>(p_lds_kv_lane, kFixedOffset);
 }
 
 template <typename T,
