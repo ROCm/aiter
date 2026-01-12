@@ -65,7 +65,7 @@ def main():
             ut_filename.index("_gemm") + 5 : ut_filename.index(".py")
         ]
         variation = f"{variation.upper()}" if len(variation) > 0 else ""
-        variation.replace("PRESHUFFLE", "PRESHUFFLED")
+        variation = variation.replace("PRESHUFFLE", "PRESHUFFLED")
         config_json_file_prefix = f"{DEVICE_ARCH}-GEMM-{a_and_w}{variation}"
         print(
             f"Guesing the output JSON filename to be {config_json_file_prefix}-N=<N>-K=<K>.json"
