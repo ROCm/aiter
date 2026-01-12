@@ -6,7 +6,6 @@ from .fwd_prefill import fav3_sage_triton_impl
 from .utils import (
     DEBUG,
     USE_EXP2,
-    BWD_MODE,
     PHILOX_SEED,
     PHILOX_OFFSET,
 )
