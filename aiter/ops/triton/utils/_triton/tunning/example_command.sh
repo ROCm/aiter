@@ -18,10 +18,12 @@ for M_G in "8 0" "16 1" "32 2" "64 3" "128 4" "256 5" "8192 6"; do
     set -- $M_G
     M=$1
     G=$2
-    nohup python3 screen.py $M 2112 7168 0 ut_a8w8_gemm_blockscale.py --k-range 128 --overwrite > output-M=$M-N=$N-K=$K-G=$G.out &
+    nohup python3 screen.py $M $N $K 0 ut_a8w8_gemm_blockscale.py --k-range 128 --overwrite > output-M=$M-N=$N-K=$K-G=$G.out &
 done
 # run view-screen.py to view results and generate JSON files
-python view-screen.py ut_a8w8_gemm_blockscale.py --n-list 2112 --k-list 7168
+N=2112
+K=7168
+python view-screen.py ut_a8w8_gemm_blockscale.py --n-list $N --k-list $K
 
 # example 3:
 #   Tunning for AFP4WFP4 GEMM using specific BLOCK_SIZE_M ranges to meet BLOCK_SIZE_M requirements:
