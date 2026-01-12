@@ -150,18 +150,6 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
             args.ptr_qseq = a.seqstart_q_ptr;
         }
     }
-    std::cout << "memin args.s_seq_len:" << args.s_seq_len << " args.s_Seqs:" << args.s_Seqs
-              << " args.s_Ts:" << args.s_Ts << " args.s_Hs:" << args.s_Hs
-              << " args.s_Bs:" << args.s_Bs << " args.s_gqa: " << args.s_gqa
-              << " args.s_k_Seqs:" << args.s_k_Seqs << " args.s_k_Hs:" << args.s_k_Hs
-              << " args.s_k_Bs:" << args.s_k_Bs << " args.s_opt:" << args.s_opt
-              << " args.s_lse:" << args.s_lse << "args.s_kv_seq_len:" << args.s_kv_seq_len
-              << " args.s_qk_head_dim: " << args.s_qk_head_dim
-              << " args.s_v_head_dim:" << args.s_v_head_dim
-              << " args.s_q_head_num:" << args.s_q_head_num << " args.s_v_Seqs:" << args.s_v_Seqs
-              << " args.s_v_Hs:" << args.s_v_Hs << " args.s_v_Bs:" << args.s_v_Bs
-              << " args.s_o_Seqs:" << args.s_o_Seqs << " args.s_o_Hs:" << args.s_o_Hs
-              << " args.s_o_Bs:" << args.s_o_Bs << " args.s_lse_Hs:" << args.s_lse_Hs << std::endl;
 }
 
 std::tuple<int, int, int> get_grid_dim(const mha_fwd_args& a, int ts_qo, const std::string& arch_id)
@@ -252,9 +240,12 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
     auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
 
-    // Fix: Value capture args to extend lifetime in torch.compile reduce-overhead mode
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
-        impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
+        // Explicit assignment forces evaluation order and prevents compiler from reordering
+        // operations
+        void* args_ptr     = &args;
+        void* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
     });
 }
 #endif
