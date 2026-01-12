@@ -90,7 +90,8 @@ def gemm_afp4wfp4_fake_tensor(
     if block_size_k >= 2 * K:
         num_ksplit = 1
 
-    if num_ksplit > 1 and skip_reduce:
+    return_y_pp = num_ksplit > 1 and skip_reduce
+    if return_y_pp:
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty((num_ksplit, M, N), dtype=y.dtype, device=x.device)
         else:
@@ -162,6 +163,8 @@ def gemm_afp4wfp4_(
         config["NUM_KSPLIT"] = 1
     config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 128)
 
+    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
+
     if config["NUM_KSPLIT"] > 1:
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
@@ -175,7 +178,7 @@ def gemm_afp4wfp4_(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+    if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     # config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
@@ -211,10 +214,9 @@ def gemm_afp4wfp4_(
         **config,
     )
 
-    if config["NUM_KSPLIT"] > 1:
-        if skip_reduce:
-            return y_pp
-
+    if return_y_pp:
+        return y_pp
+    elif config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 16
         # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
@@ -442,6 +444,8 @@ def gemm_afp4wfp4_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K, True)
 
+    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
+
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -463,7 +467,7 @@ def gemm_afp4wfp4_preshuffle(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+    if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config["BLOCK_SIZE_K"] >= 2 * K:
@@ -543,10 +547,9 @@ def gemm_afp4wfp4_preshuffle(
             **config,
         )
 
-    if config["NUM_KSPLIT"] > 1:
-        if skip_reduce:
-            return y_pp
-
+    if return_y_pp:
+        return y_pp
+    elif config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 16
         # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
