@@ -600,6 +600,10 @@ struct AllReduceTwoshot
         uint8_t* rank_buffer = buffer_list[rank];
         Codec codec(thread, rank);
         int block_id = blockIdx.x;
+        uint8_t* buffer_ptr[kWorldSize];
+        for (int i = 0; i < kWorldSize; ++i) {
+            buffer_ptr[i] = buffer_list[i];
+        }
         // --------------------------------------------------------
         // Read input into registers
         int32x4_t tA[kAtoms];
@@ -637,7 +641,7 @@ struct AllReduceTwoshot
         for(int r = 0; r < kWorldSize; r++)
         {
             int32x4_t* send_buffer = reinterpret_cast<int32x4_t*>(
-                buffer_list[r] + comm_data0_offset + rank * Codec::kRankTransmittedTileSize);
+                buffer_ptr[r] + comm_data0_offset + rank * Codec::kRankTransmittedTileSize);
             codec.send(send_buffer, &tA[r * Codec::kRankAtoms]);
         }
 
@@ -645,7 +649,7 @@ struct AllReduceTwoshot
         if(thread < kWorldSize)
         {
             int r              = thread;
-            uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(buffer_list[r] + comm_flags0_offset +
+            uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(buffer_ptr[r] + comm_flags0_offset +
                                                              rank * sizeof(uint32_t));
             set_sync_flag(flag_ptr, flag_color);
         }
@@ -680,7 +684,7 @@ struct AllReduceTwoshot
         for(int r = 0; r < kWorldSize; r++)
         {
             int32x4_t* send_buffer = reinterpret_cast<int32x4_t*>(
-                buffer_list[r] + comm_data1_offset + rank * Codec::kRankTransmittedTileSize);
+                buffer_ptr[r] + comm_data1_offset + rank * Codec::kRankTransmittedTileSize);
             codec.send(send_buffer, tR);
         }
 
@@ -688,7 +692,7 @@ struct AllReduceTwoshot
         if(thread < kWorldSize)
         {
             int r              = thread;
-            uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(buffer_list[r] + comm_flags1_offset +
+            uint32_t* flag_ptr = reinterpret_cast<uint32_t*>(buffer_ptr[r] + comm_flags1_offset +
                                                              rank * sizeof(uint32_t));
             set_sync_flag(flag_ptr, flag_color);
         }
