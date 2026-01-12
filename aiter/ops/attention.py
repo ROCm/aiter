@@ -122,9 +122,14 @@ def _should_use_asm_kernel(
 ) -> bool:
     if kv_cache_tensor_dtype == torch.int8:
         return True
-        
+
+    # Get GPU compute units (CUs)
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    # ASM kernel becomes relevant, once the total_heads is sufficiently large compared to CUs
     total_heads = num_seqs * num_heads
-    return total_heads > 256
+    return total_heads > 2 * cu_num
 
 
 def paged_attention_common(
