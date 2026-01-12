@@ -4,11 +4,7 @@ import triton
 import triton.language as tl
 from typing import Literal, Optional
 from .utils import (
-    DEBUG,
-    AUTOTUNE,
-    FP8_AUTO_DESCALE,
     compute_alibi_block,
-    get_arch,
     map_dims,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid_3d 
