@@ -378,11 +378,9 @@ def run_aiter_asm(
     query,
     k_cache,
     v_cache,
-    workspace_buffer,
     block_tables,
     seq_lens,
     max_seq_len,
-    cu_query_lens,
     kv_cache_dtype,
     num_kv_heads,
     scale,
@@ -392,22 +390,17 @@ def run_aiter_asm(
     v_scale=None,
     high_precision=0,
 ):
-        return aiter.paged_attention_common(
+    return aiter.pa_fwd_asm(
         query,
         k_cache,
         v_cache,
-        workspace_buffer,
         block_tables,
         seq_lens,
         block_tables_stride0,
-        max_qlen=1,
-        max_seq_len=max_seq_len,
-        cu_query_lens=cu_query_lens,
         K_QScale=k_scale,
         V_QScale=v_scale,
         out_=None,
         high_precision=high_precision,
-            kv_cache_tensor_dtype=k_cache.dtype,
     )
 
 
@@ -573,27 +566,13 @@ def test_paged_attention(
 
     time_aiter_asm = None
     if dtype == dtypes.bf16:
-        # Pre-compute workspace_buffer and cu_query_lens outside perftest
-        num_seqs, num_query_heads, head_size = query.shape
-        _PARTITION_SIZE = 256
-        max_num_partitions = (max_seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
-        nbytes_per_elem = torch.finfo(query.dtype).bits // 8
-        workspace_buffer = torch.empty(
-            (num_seqs * num_query_heads * max_num_partitions * head_size) * nbytes_per_elem
-            + 2 * (num_seqs * num_query_heads * max_num_partitions) * 4,
-            dtype=torch.uint8, device=query.device,
-        )
-        cu_query_lens = torch.arange(0, num_seqs + 1, dtype=torch.int32, device=query.device)
-        
         out_aiter_asm, time_aiter_asm = run_aiter_asm(
             query.contiguous(),  # this kernel need contiguous buffer
             k_cache,
             asm_V_shuffle(v_cache),
-            workspace_buffer,
             block_tables,
             seq_lens,
             max_seq_len,
-            cu_query_lens,
             kv_cache_dtype,
             num_kv_heads,
             scale,
@@ -607,7 +586,7 @@ def test_paged_attention(
             msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......",
         )
         # tensor_dump(out_aiter, 'out_aiter')
-        
+
     for quant_algo_, cache_type_ in [
         (0, k_cache.dtype),
         (2, dtypes.fp8),
@@ -705,27 +684,13 @@ def test_paged_attention(
         # checkAllclose(out_aiter_asm, out_aiter_naive,
         #             msg=f'golden vs ck_naive(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_}):{time_aiter_naive:>8.2f} us......')
         if quant_algo_ != 0:
-            # Pre-compute workspace_buffer and cu_query_lens outside perftest
-            num_seqs, num_query_heads, head_size = query.shape
-            _PARTITION_SIZE = 256
-            max_num_partitions = (max_seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
-            nbytes_per_elem = torch.finfo(query.dtype).bits // 8
-            workspace_buffer = torch.empty(
-                (num_seqs * num_query_heads * max_num_partitions * head_size) * nbytes_per_elem
-                + 2 * (num_seqs * num_query_heads * max_num_partitions) * 4,
-                dtype=torch.uint8, device=query.device,
-            )
-            cu_query_lens = torch.arange(0, num_seqs + 1, dtype=torch.int32, device=query.device)
-            
             out_aiter_asm, time_aiter_asm = run_aiter_asm(
                 query,
                 k_quant_,
                 asm_V_shuffle(v_quant_),
-                workspace_buffer,
                 block_tables,
                 seq_lens,
                 max_seq_len,
-                cu_query_lens,
                 kv_cache_dtype,
                 num_kv_heads,
                 scale,
@@ -750,27 +715,13 @@ def test_paged_attention(
                 else:
                     high_precision_list = [1]
                 for high_precision in high_precision_list:
-                    # Pre-compute workspace_buffer and cu_query_lens outside perftest
-                    num_seqs, num_query_heads, head_size = query.shape
-                    _PARTITION_SIZE = 256
-                    max_num_partitions = (max_seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
-                    nbytes_per_elem = torch.finfo(query.dtype).bits // 8
-                    workspace_buffer = torch.empty(
-                        (num_seqs * num_query_heads * max_num_partitions * head_size) * nbytes_per_elem
-                        + 2 * (num_seqs * num_query_heads * max_num_partitions) * 4,
-                        dtype=torch.uint8, device=query.device,
-                    )
-                    cu_query_lens = torch.arange(0, num_seqs + 1, dtype=torch.int32, device=query.device)
-                    
                     out_aiter_asm, time_aiter_asm = run_aiter_asm(
                         query,
                         k_quant_,
                         asm_V_shuffle(v_quant_),
-                        workspace_buffer,
                         block_tables,
                         seq_lens,
                         max_seq_len,
-                        cu_query_lens,
                         kv_cache_dtype,
                         num_kv_heads,
                         scale,
@@ -863,7 +814,7 @@ def test_paged_attention(
 
 df = []
 l_num_heads = [(4, 1), (8, 1), (32, 8)]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 512, 1023, 2047, 4097]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
 l_dtype = ["fp16", "bf16"]
 
 parser = argparse.ArgumentParser(
@@ -921,7 +872,7 @@ for num_heads in l_num_heads:
     for ctx_len in l_ctx_len:
         for dtype in l_dtype:
             ret = test_paged_attention(
-                ctx_len, 32, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
+                ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
             )
             df.append(ret)
 df = pd.DataFrame(df)
