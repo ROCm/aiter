@@ -1,5 +1,5 @@
 import torch
-from typing import Optional, Union, Tuple
+from typing import Optional, Tuple
 from .fwd_prefill import fav3_sage_triton_impl
 
 from .utils import (
