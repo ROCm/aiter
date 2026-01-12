@@ -1819,7 +1819,7 @@ def fav3_sage_triton_impl(
         assert (
             sd_mask.shape[3] >= max_seqlens_k
         ), f"sd_mask.shape[3]={sd_mask.shape[3]} must be >= max_seqlens_k={max_seqlens_k}"
-        assert sd_mask.device == q.device, f"sd_mask must be on same device as q"
+        assert sd_mask.device == q.device, "sd_mask must be on same device as q"
 
         stride_sz, stride_sh, stride_sm, stride_sn = (
             sd_mask.stride(0),
