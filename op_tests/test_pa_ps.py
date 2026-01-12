@@ -885,5 +885,5 @@ for dtype in l_dtype:
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
     df.to_csv("pa_ps.csv")
-    pd.set_option ('display.max_columns', None)
+    pd.set_option ("display.max_columns", None)
     print(df)
