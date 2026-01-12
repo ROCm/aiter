@@ -160,7 +160,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         # Save tensors needed for backward
         ctx.save_for_backward(
-            q_int8, k_int8, v_fp16, out, softmax_lse, q_descale, k_descale
+            q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
         )
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
