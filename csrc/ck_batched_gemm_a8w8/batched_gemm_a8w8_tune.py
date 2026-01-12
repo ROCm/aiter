@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import aiter
-import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
@@ -123,7 +121,6 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                 kernel = kernels_list[i]
                 maxsplitK = (
                     aiter.compute_batched_gemm_SplitK(
-                        B,
                         M,
                         N,
                         K,
