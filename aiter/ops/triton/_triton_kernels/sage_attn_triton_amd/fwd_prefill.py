@@ -5,6 +5,7 @@ import triton.language as tl
 from typing import Literal, Optional
 from .utils import (
     compute_alibi_block,
+    get_arch,
     map_dims,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid_3d
@@ -27,7 +28,6 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
                 "waves_per_eu": 2
             }
 
-        # Default config for long K sequences
         return {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
@@ -38,22 +38,22 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
         }
     elif arch == "gfx942":
         return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 64,
-            "num_warps": 4,
-            "PRE_LOAD_V": True,
-            "num_stages": 3,
-            "waves_per_eu": 2,
-        }
+        "BLOCK_M": 256,
+        "BLOCK_N": 128,
+        "waves_per_eu": 2,
+        "PRE_LOAD_V": False,
+        "num_stages": 2,
+        "num_warps": 8,
+    }
     else:
         # return tuned config for MI300X by default
         return {
             "BLOCK_M": 256,
-            "BLOCK_N": 64,
-            "num_warps": 4,
-            "PRE_LOAD_V": True,
-            "num_stages": 3,
+            "BLOCK_N": 128,
             "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 2,
+            "num_warps": 8,
         }
 
 
