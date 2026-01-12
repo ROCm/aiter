@@ -140,8 +140,8 @@ def paged_attention_v1(
             key_cache.stride(1) if kv_cache_layout == "HND" else key_cache.stride(2)
         )
         kv_seq_stride = (
-              key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
-          )
+            key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
+        )
 
     num_seqs = block_tables.size(0)
     num_heads = query.size(1)
