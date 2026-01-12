@@ -372,7 +372,6 @@ def generate_bhsd_kv_packed(
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
-        og_fp8_dtype = dtype
         dtype = torch.float32
 
     # gen tensor
