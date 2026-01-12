@@ -120,7 +120,7 @@ jobs:
             python .github/scripts/select_triton_tests.py \
               --source pr-merge --target target \
               --env-var TRITON_TEST --env-file "${ENV_FILE}"
-          docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
+          # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
           docker exec -w /workspace triton_test rm "${ENV_FILE}"
 
       - name: Triton Tests
