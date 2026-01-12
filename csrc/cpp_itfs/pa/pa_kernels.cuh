@@ -221,22 +221,21 @@ _paged_attention_kernel(const int* block_table_seq,
         {
             for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
             {
-            const int head_elem =
-                row_head_elem + qkhe_depth * QKHE_PER_FETCH + head_loop * HEAD_SIZE_PER_LOOP;
-            const int offset1          = head_elem / KX;
-            const int offset2          = head_elem % KX;
-
-            const cache_t* k_fetch_ptr = [&] {
-                if constexpr(USE_5D_VCACHE)
-                {
-                    const int head_stride = BLOCK_SIZE * kv_seq_stride;
-                    return k_ptr3 + offset1 * head_stride + offset2;
-                }
-                else
-                {
-                    return k_ptr3 + offset1 * KX + offset2;
-                }
-            }();
+                const int head_elem =
+                        row_head_elem + qkhe_depth * QKHE_PER_FETCH + head_loop * HEAD_SIZE_PER_LOOP;
+                const int offset1          = head_elem / KX;
+                const int offset2          = head_elem % KX;
+                const cache_t* k_fetch_ptr = [&] {
+                    if constexpr(USE_5D_VCACHE)
+                    {
+                        const int head_stride = BLOCK_SIZE * kv_seq_stride;
+                        return k_ptr3 + offset1 * head_stride + offset2;
+                    }
+                    else
+                    {
+                        return k_ptr3 + offset1 * KX + offset2;
+                    }
+                }();
                 const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
                 if constexpr(NT_KV_LOAD)
                 {
