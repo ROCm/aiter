@@ -4,7 +4,6 @@ import sys
 import triton
 import argparse
 import subprocess
-from aiter.ops.triton.utils._triton.tunning._utils import get_config_list
 
 
 def echo_to_file(msg: str, filename: str, clear: bool = False):

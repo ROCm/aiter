@@ -1,7 +1,7 @@
 import os
 import sys
 import argparse
-from aiter.ops.triton.utils._triton.tunning._utils import (
+from _utils import (
     config_parms_key,
     read_screen_file,
 )
