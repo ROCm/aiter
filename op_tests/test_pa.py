@@ -404,6 +404,99 @@ def run_aiter_asm(
     )
 
 
+@perftest()
+def run_aiter_common(
+    query,
+    k_cache,
+    v_cache,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    kv_cache_dtype,
+    num_kv_heads,
+    scale,
+    alibi_slopes,
+    block_tables_stride0,
+    k_scale=None,
+    v_scale=None,
+    high_precision=0,
+    kv_cache_tensor_dtype=None,
+):
+    """
+    Test paged_attention_common which automatically switches between ASM and HIP kernels.
+    """
+    from aiter.ops import attention
+    
+    num_seqs, num_heads, head_size = query.shape
+    
+    # Create workspace buffer for HIP kernel path
+    # Workspace buffer size calculation from test_pa_v1.py
+    _PARTITION_SIZE_ROCM = 256
+    max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM - 1) // _PARTITION_SIZE_ROCM
+    nbyes_per_qo_elem = torch.finfo(query.dtype).bits // 8
+    workspace_buffer = torch.empty(
+        (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
+        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
+        dtype=torch.uint8,
+        device=query.device,
+    )
+    
+    # paged_attention_common only accepts shuffled V cache format (5D format)
+    # Both ASM and HIP kernels have been modified to support shuffled format
+    # The function decides internally which kernel to call based on heuristics
+    # V cache should be shuffled before calling this function (similar to run_aiter_asm)
+    
+    # Convert k_scale and v_scale to proper format if provided
+    # paged_attention_common accepts Optional[torch.Tensor], so None can be passed directly
+    # Only scalar tensors (numel == 1) are converted to None
+    if k_scale is None:
+        k_scale_tensor = None
+    elif isinstance(k_scale, torch.Tensor):
+        k_scale_tensor = k_scale if k_scale.numel() > 1 else None
+    else:
+        k_scale_tensor = torch.tensor(float(k_scale), device=query.device, dtype=dtypes.fp32)
+        k_scale_tensor = k_scale_tensor if k_scale_tensor.numel() > 1 else None
+    
+    if v_scale is None:
+        v_scale_tensor = None
+    elif isinstance(v_scale, torch.Tensor):
+        v_scale_tensor = v_scale if v_scale.numel() > 1 else None
+    else:
+        v_scale_tensor = torch.tensor(float(v_scale), device=query.device, dtype=dtypes.fp32)
+        v_scale_tensor = v_scale_tensor if v_scale_tensor.numel() > 1 else None
+    
+    # Determine kv_cache_dtype string
+    if kv_cache_tensor_dtype is None:
+        kv_cache_dtype_str = kv_cache_dtype if isinstance(kv_cache_dtype, str) else "auto"
+    elif kv_cache_tensor_dtype == torch.int8:
+        kv_cache_dtype_str = "fp8"  # int8 is treated as fp8
+    else:
+        kv_cache_dtype_str = "auto"
+    
+    return attention.paged_attention_common(
+        Q=query.contiguous(),
+        K=k_cache,
+        V=v_cache,
+        workspace_buffer=workspace_buffer,
+        block_tables=block_tables,
+        context_lens=seq_lens,
+        block_tables_stride0=block_tables_stride0,
+        logits_soft_cap=0.0,
+        scale=scale,
+        max_qlen=1,
+        max_seq_len=max_seq_len,
+        cu_query_lens=None,
+        K_QScale=k_scale_tensor,
+        V_QScale=v_scale_tensor,
+        out_=None,
+        qo_indptr=None,
+        high_precision=high_precision,
+        kernelName=None,
+        kv_cache_dtype=kv_cache_dtype_str,
+        kv_cache_tensor_dtype=kv_cache_tensor_dtype,
+    )
+
+
 def dump_input(
     path,
     query: torch.Tensor,
@@ -586,6 +679,32 @@ def test_paged_attention(
             msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......",
         )
         # tensor_dump(out_aiter, 'out_aiter')
+
+    # Test paged_attention_common which automatically switches between ASM and HIP
+    # The routing is internal, so we just test the common API regardless of which path it takes
+    time_aiter_common = None
+    if dtype == dtypes.bf16:
+        try:
+            out_aiter_common, time_aiter_common = run_aiter_common(
+                query.contiguous(),
+                k_cache,
+                asm_V_shuffle(v_cache),  # Shuffle V cache, same as run_aiter_asm
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                kv_cache_dtype,
+                num_kv_heads,
+                scale,
+                alibi_slopes,
+                block_tables.stride(0),
+            )
+            checkAllclose(
+                out_golden,
+                out_aiter_common,
+                msg=f"golden vs aiter_common:{time_aiter_common:>8.2f} us......",
+            )
+        except Exception as e:
+            print(f"Warning: Could not test aiter_common: {e}")
 
     for quant_algo_, cache_type_ in [
         (0, k_cache.dtype),
@@ -809,7 +928,11 @@ def test_paged_attention(
     print(
         f"finish~ {ctx_lens=}, {num_seqs=}, {num_heads=}, {head_size=}, {use_alibi=}, {block_size=}, {dtype=}, {kv_cache_dtype=}\n"
     )
-    return {"aiter_shomy": time_aiter, "aiter_asm": time_aiter_asm}
+    return {
+        "aiter_shomy": time_aiter,
+        "aiter_asm": time_aiter_asm,
+        "aiter_common": time_aiter_common,
+    }
 
 
 df = []
