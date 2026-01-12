@@ -13,16 +13,48 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
 
 
-def get_fwd_configs(autotune: bool):
+def get_fwd_configs(autotune: bool, seqlen_k: int = None):
     assert not autotune, "Autotuning is not supported."
-    return {
-        "BLOCK_M": 256,
-        "BLOCK_N": 128,
-        "waves_per_eu": 2,
-        "PRE_LOAD_V": False,
-        "num_stages": 2,
-        "num_warps": 8,
-    }
+    arch = get_arch()
+    if arch == "gfx950":
+        if seqlen_k is not None and seqlen_k <= 512:
+            return {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "num_warps": 4,
+                "PRE_LOAD_V": True,
+                "num_stages": 3,
+                "waves_per_eu": 2
+            }
+
+        # Default config for long K sequences
+        return {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 0,
+            "PRE_LOAD_V": False,
+            "num_stages": 5,
+            "num_warps": 8,
+        }
+    elif arch == "gfx942":
+        return {
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+            "PRE_LOAD_V": True,
+            "num_stages": 3,
+            "waves_per_eu": 2,
+        }
+    else:
+        # return tuned config for MI300X by default
+        return {
+            "BLOCK_M": 256,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+            "PRE_LOAD_V": True,
+            "num_stages": 3,
+            "waves_per_eu": 2,
+        }
 
 
 @triton.jit
@@ -1569,6 +1601,7 @@ def fav3_sage_triton_impl(
     rotary_sin: Optional[torch.Tensor] = None,
     rotary_interleaved: bool = False,
     seqlens_rotary: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1844,7 +1877,8 @@ def fav3_sage_triton_impl(
 
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
-    config = get_fwd_configs(False)
+    if config is None:
+        config = get_fwd_configs(False, seqlen_k=max_seqlens_k)
     attn_fwd[grid](
         q,
         k,

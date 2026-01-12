@@ -48,6 +48,7 @@ def fwd(
     sm_margin: int = 0,
     return_lse: bool = True,
     layout: str = "bshd",
+    config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sage Attention v1 forward pass compatible interface for AMD Triton implementation.
@@ -336,6 +337,7 @@ def fwd(
         rotary_sin=rotary_sin,
         rotary_interleaved=rotary_interleaved,
         seqlens_rotary=seqlens_rotary,
+        config=config,
     )
 
     if DEBUG:
