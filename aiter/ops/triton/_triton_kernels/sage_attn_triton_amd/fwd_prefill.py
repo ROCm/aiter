@@ -20,20 +20,28 @@ V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
 
 def get_fwd_configs(autotune: bool, seqlen_k: int = None):
     assert not autotune, "Autotuning is not supported."
+    arch = get_arch()
+    if arch == "gfx950":
+        if seqlen_k is not None and seqlen_k <= 512:
+            return {
+                "BLOCK_M": 128,
+                "BLOCK_N": 64,
+                "num_warps": 4,
+                "PRE_LOAD_V": True,
+                "num_stages": 3,
+                "waves_per_eu": 2
+            }
 
-    # Config for short K sequences (prefill/context encoding with small KV cache)
-    if seqlen_k is not None and seqlen_k <= 512:
         return {
-            "BLOCK_M": 128,
-            "BLOCK_N": 64,
-            "num_warps": 4,
-            "PRE_LOAD_V": True,
-            "num_stages": 3,
-            "waves_per_eu": 2
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 0,
+            "PRE_LOAD_V": False,
+            "num_stages": 5,
+            "num_warps": 8,
         }
-
-    # Default config for long K sequences
-    return {
+    elif arch == "gfx942":
+        return {
         "BLOCK_M": 256,
         "BLOCK_N": 128,
         "waves_per_eu": 0,
@@ -41,6 +49,16 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
         "num_stages": 5,
         "num_warps": 8,
     }
+    else:
+        # return tuned config for MI300X by default
+        return {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 2,
+            "num_warps": 8,
+        }
 
 
 
