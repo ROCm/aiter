@@ -795,14 +795,7 @@ def cast_to_fp8(
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if False:
-        print()
-        print("cast_to_fp8")
-        print("x:", x, x.shape)
-        print("fp8_dtype:", fp8_dtype)
-        print("cu_seqlens:", cu_seqlens)
-        print("max_seqlen:", max_seqlen)
-        print("clamp_val:", clamp_val)
+    # Note: removed unreachable debug prints that were guarded by `if False:`.
 
     # check types are valid
     assert x.dtype in {
