@@ -110,9 +110,6 @@ jobs:
             kv_cache_dtype: 'fp8_kvcache'
         
     steps:
-      - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
-
       - name: Download the vLLM image
         run: |
           docker pull rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
