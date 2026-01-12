@@ -7,7 +7,7 @@ from .utils import (
     compute_alibi_block,
     map_dims,
 )
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid_3d 
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid_3d
 
 # 0 for per block quantization, 1 for per channel quantization
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
@@ -23,7 +23,6 @@ def get_fwd_configs(autotune: bool):
         "num_stages": 2,
         "num_warps": 8,
     }
-
 
 
 @triton.jit
@@ -222,8 +221,7 @@ def _attn_fwd_no_mask(
 
         if V_QUANT_SCHEME == 0:
             acc += (
-                tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
-                * v_descale
+                tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32) * v_descale
             )
         else:
             acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
@@ -602,8 +600,7 @@ def _attn_fwd_mask(
         m_i = m_ij
         if V_QUANT_SCHEME == 0:
             acc += (
-                tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
-                * v_descale
+                tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32) * v_descale
             )
         else:
             acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
@@ -1420,9 +1417,9 @@ def attn_fwd(
         invalid_mask = None
         l_recip = 1 / l_i[:, None]
     if V_QUANT_SCHEME == 0:
-        acc = (acc * l_recip)
+        acc = acc * l_recip
     else:
-        acc = (acc * l_recip * v_descale)
+        acc = acc * l_recip * v_descale
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
@@ -1987,7 +1984,7 @@ def sage_quant(
 
     # Apply K tensor smoothing following SageAttention approach
     if smooth_k:
-        k = k - k.mean(dim=1 if layout=="bshd" else 2, keepdim=True)
+        k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
@@ -1996,7 +1993,9 @@ def sage_quant(
             (b, h_kv, K_NUM_BLKS), device=v.device, dtype=torch.float32
         )
     else:
-        v_scale = v.abs().amax(dim=1 if layout=="bshd" else 2).to(torch.float32) / FP8_MAX
+        v_scale = (
+            v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+        )
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -2102,7 +2101,7 @@ def sage_quant_kernel(
     if pid < q_task_count:
         # here we do Q
         off_blk, off_h, off_b = pid_grid_3d(pid, Q_NUM_BLKS, Q_HEAD, BATCH)
-        offs_qn = (off_blk * BLK_Q + offs_blk_q)
+        offs_qn = off_blk * BLK_Q + offs_blk_q
 
         q_offs = (
             off_b * stride_qz
@@ -2128,7 +2127,7 @@ def sage_quant_kernel(
         _pid = pid - q_task_count
         off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
 
-        offs_kn = (off_blk * BLK_K + offs_blk_k)
+        offs_kn = off_blk * BLK_K + offs_blk_k
 
         k_offs = (
             off_b * stride_kz
@@ -2152,7 +2151,7 @@ def sage_quant_kernel(
         # V
         _pid = pid - (q_task_count + k_task_count)
         off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-        offs_kn = (off_blk * BLK_K + offs_blk_k)
+        offs_kn = off_blk * BLK_K + offs_blk_k
 
         v_offs = (
             off_b * stride_kz
@@ -2173,14 +2172,17 @@ def sage_quant_kernel(
                 offs_kn[:, None] < SEQLEN_K,
             )
         else:
-            # just apply the per channel v_scales that have been computed outside    
-            v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
+            # just apply the per channel v_scales that have been computed outside
+            v_scale_ptrs = (
+                V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
+            )
             v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
             v = v.to(tl.float32)
             v_scales = tl.load(v_scale_ptrs)
             v_quant = v / v_scales
             v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
             tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
+
 
 @triton.jit
 def _general_quant_kernel(

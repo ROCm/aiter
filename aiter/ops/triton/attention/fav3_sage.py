@@ -15,9 +15,7 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import (
     map_dims,
 )
 
-from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    sage_quant
-)
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import sage_quant
 
 
 class _FAv3SageWrapperFunc(torch.autograd.Function):
@@ -31,6 +29,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
     Forward: BF16/FP32 -> Int8 (Q & K) + FP16 V -> sage_attn -> FP32 output
     Backward: not supported yet
     """
+
     @staticmethod
     def forward(
         ctx,
@@ -63,7 +62,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         BLKK = config["BLOCK_N"]
 
         softmax_scale = head_dim**-0.5
-        ## following quantization already considered softmax scale and RCP_LN2 
+        ## following quantization already considered softmax scale and RCP_LN2
         fp8_dtype = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(fp8_dtype).max
 
@@ -80,9 +79,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         )
 
         # For GQA/MQA: quantize query with grouped scaling
-        #group_size = (
+        # group_size = (
         #    num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
-        #)
+        # )
 
         # Verify descale shapes for GQA/MQA
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
@@ -112,7 +111,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             )
 
         if q.requires_grad or k.requires_grad or v.requires_grad:
-            assert return_lse, f"in train mode, return_lse is expected to be True, got {return_lse}"
+            assert (
+                return_lse
+            ), f"in train mode, return_lse is expected to be True, got {return_lse}"
 
         # Call flash attention forward
         out, softmax_lse = fav3_sage.fwd(
@@ -138,7 +139,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # rotary_cos, rotary_sin, seqlens_rotary
             q_descale,
             k_descale,
-            v_descale, # v_descale
+            v_descale,  # v_descale
             FP8_MAX,
             softmax_scale,
             causal,
@@ -261,9 +262,11 @@ def fav3_sage_wrapper_func(
         f"sage_attn_v1_func expects high-precision inputs (fp16/bf16/fp32), got k.dtype={k.dtype}. "
         f"If you already have Int8 tensors, use sage_attn_v1_func() with q_descale/k_descale parameters instead."
     )
-    assert v.dtype in [torch.float16, torch.bfloat16, torch.float32], (
-        f"sage_attn_v1_func expects high-precision inputs (fp16/bf16/fp32), got v.dtype={v.dtype}. "
-    )
+    assert v.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], f"sage_attn_v1_func expects high-precision inputs (fp16/bf16/fp32), got v.dtype={v.dtype}. "
 
     if qv is not None:
         raise NotImplementedError("qv not supported in Sage Attention v1 API")
@@ -280,7 +283,7 @@ def fav3_sage_wrapper_func(
             "sm_margin != 0 not supported in Sage Attention v1 API"
         )
 
-    return_lse = (not inference_mode)
+    return_lse = not inference_mode
     return _FAv3SageWrapperFunc.apply(
         q,
         k,
@@ -385,15 +388,13 @@ def fav3_sage_func(
     if attention_chunk not in (0, 1):
         raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
     if softcap != 0.0:
-        raise NotImplementedError(
-            "softcap not implemented in FP8 high-precision API"
-        )
+        raise NotImplementedError("softcap not implemented in FP8 high-precision API")
     if sm_margin != 0:
         raise NotImplementedError(
             "sm_margin != 0 not supported in FP8 high-precision API"
         )
 
-    return_lse = (not inference_mode)
+    return_lse = not inference_mode
     # Call flash attention forward
     out, _ = fav3_sage.fwd(
         q,
@@ -418,7 +419,7 @@ def fav3_sage_func(
         None,  # rotary_cos, rotary_sin, seqlens_rotary
         q_descale,
         k_descale,
-        v_descale, # v_descale
+        v_descale,  # v_descale
         FP8_MAX,
         softmax_scale,
         causal,
