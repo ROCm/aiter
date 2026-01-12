@@ -12,7 +12,7 @@ from .utils import (
     get_arch,
     map_dims,
 )
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d, remap_xcd
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid_3d 
 
 # 0 for per block quantization, 1 for per channel quantization
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
