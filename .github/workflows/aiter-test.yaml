@@ -65,7 +65,7 @@ jobs:
           echo "Multiple: ${{ steps.machines.outputs.multigpu_runners }}"
 
   build_aiter_image:
-    runs-on: aiter-k8s-build.test
+    runs-on: aiter-build-runner
     needs: [define-runners]
     steps:
       - name: Checkout code
