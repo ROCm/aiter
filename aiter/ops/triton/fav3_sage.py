@@ -54,13 +54,17 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         sm_margin: int,
         return_lse: bool = True,
         layout: str = "bshd",
+        config: Optional[dict] = None,
     ):
         bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
         _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
 
         # Quantize K, V to int8, and convert v to float16
-        config = get_fwd_configs(False)
+
+        # Use provided config or get default config
+        if config is None:
+            config = get_fwd_configs(False)
         # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
         # config = config[0].all_kwargs()
         BLKQ = config["BLOCK_M"]
@@ -157,6 +161,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
             return_lse,
             layout,
+            config,
         )
 
         if not return_lse:
@@ -164,7 +169,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         # Save tensors needed for backward
         ctx.save_for_backward(
-            q_int8, k_int8, v_fp16, out, softmax_lse, q_descale, k_descale
+            q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
         )
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -216,6 +221,7 @@ def fav3_sage_wrapper_func(
     sm_margin: int = 0,
     inference_mode: bool = True,
     layout: str = "bshd",
+    config: Optional[dict] = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -245,6 +251,8 @@ def fav3_sage_wrapper_func(
         sm_margin: SM margin parameter (not yet supported)
         inference_mode: do not return softmax_lse
         layout: bshd or bhsd layout for the inputs
+        config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
+                waves_per_eu, PRE_LOAD_V, num_stages, num_warps
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -302,6 +310,7 @@ def fav3_sage_wrapper_func(
         sm_margin,
         return_lse,
         layout,
+        config,
     )
 
 
@@ -326,6 +335,7 @@ def fav3_sage_func(
     sm_margin: int = 0,
     inference_mode: bool = True,
     layout: str = "bshd",
+    config: Optional[dict] = None,
 ):
     """
     SageAttention v1.
@@ -347,6 +357,8 @@ def fav3_sage_func(
         sm_margin: SM margin parameter (not yet supported)
         inference_model: do not return softmax_lse
         layout: bshd or bhsd layout for the inputs
+        config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N, 
+                waves_per_eu, PRE_LOAD_V, num_stages, num_warps
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -355,9 +367,11 @@ def fav3_sage_func(
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
     _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
-
     # Quantize K, V to int8, and convert v to float16
-    config = get_fwd_configs(False)
+
+    # Use provided config or get default config
+    if config is None:
+        config = get_fwd_configs(False)
     # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
     # config = config[0].all_kwargs()
     BLKQ = config["BLOCK_M"]
@@ -437,6 +451,7 @@ def fav3_sage_func(
         sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
         return_lse,
         layout,
+        config,
     )
 
     return out

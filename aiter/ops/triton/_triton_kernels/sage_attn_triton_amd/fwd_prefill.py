@@ -1577,6 +1577,7 @@ def fav3_sage_triton_impl(
     rotary_sin: Optional[torch.Tensor] = None,
     rotary_interleaved: bool = False,
     seqlens_rotary: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1852,7 +1853,8 @@ def fav3_sage_triton_impl(
 
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
-    config = get_fwd_configs(False)
+    if config is None:
+        config = get_fwd_configs(False)
     attn_fwd[grid](
         q,
         k,
