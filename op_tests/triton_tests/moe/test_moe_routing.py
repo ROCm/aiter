@@ -1,6 +1,6 @@
 import pytest
 import torch
-from aiter.ops.triton.moe_routing.routing import routing, routing_torch
+from aiter.ops.triton.moe.moe_routing.routing import routing, routing_torch
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 

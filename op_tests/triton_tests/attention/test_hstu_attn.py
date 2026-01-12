@@ -2,7 +2,7 @@ import pytest
 import torch
 from typing import Optional
 
-from aiter.ops.triton.hstu_attention import (
+from aiter.ops.triton.attention.hstu_attention import (
     _AttentionFunction,
 )
 from op_tests.triton_tests.utils.hstu_attention_ref import (

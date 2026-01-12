@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 
@@ -46,7 +46,7 @@ def run_gemm_ck(x, weight, x_scale, w_scale, out):
 
 @perftest()
 def run_triton(x, w, x_scales, w_scales, out, dtype=dtypes.bf16):
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
 
     gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
     return out

@@ -2,12 +2,9 @@ import torch
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark, run_perftest
 from aiter import dtypes
-from typing import Tuple
 import argparse
-import itertools
 import pandas as pd
 import random
-from typing_extensions import List
 
 # torch.set_printoptions(threshold=torch.inf)
 
@@ -341,7 +338,6 @@ def test_fused_rope_concat_and_cache_mla(
         is_nope_first,
         q_out_dtype,
     )
-    from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 
     #### triton test
     # reshaped_kv_c = kv_c.unsqueeze(1)
