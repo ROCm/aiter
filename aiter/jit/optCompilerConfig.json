@@ -1012,7 +1012,9 @@
         "srcs": ["f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'"],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 0)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 0)}'",
+            "f'-DUSE_AITER_ASM_DIR={os.environ.get(\"AITER_USE_AITER_ASM_DIR\", 1)}'",
+            "f'-DREL_PATH_LIB_TO_HSA=\"{os.environ.get(\"AITER_REL_PATH_LIB_TO_HSA\", \"./\")}\"'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
