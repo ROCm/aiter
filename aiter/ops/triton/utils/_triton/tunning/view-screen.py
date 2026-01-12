@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 from aiter.ops.triton.utils._triton.tunning._utils import (
     config_parms_key,
     read_screen_file,
@@ -9,104 +10,125 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 
-TP = 8
-# DS-R1 TP8
-list_of_shapes = [
-    (2112, 7168),  # fused_qkv_a_proj
-    # (3072, 1536),  # b_proj
-    # (7168, 2048),  # o_proj
-    # (256, 7168),  # moe gate
-    # (4608, 7168),  # dense layer1
-    # (7168, 2304),  # dense layer2
-    # (4096, 512),  # prefill kv_proj
-]
-# # LL3-405B TP-n
-# list_of_shapes = [
-#     (106496//TP, 16384),
-#     (16384, 53248//TP),
-#     (18432//TP, 16384),
-#     (16384, 16384//TP),
-# ]
-# # LL3-70B TP-n
-# list_of_shapes = [
-#     (57344//TP, 8192),
-#     (8192, 28672//TP),
-#     (10240//TP, 8192),
-#     (8192, 8192//TP),
-# ]
-# # LL3-8B TP-n
-# list_of_shapes = [
-#     (28672//TP, 4096),
-#     (4096, 14336//TP),
-#     (6144//TP, 4096),
-#     (4096, 4096//TP),
-# ]
-# # LL4-Maverick TP8
-# list_of_shapes = [
-#     (4096, 5120),
-#     (5120, 2048),
-#     (128, 5120),
-#     (2048, 5120),
-#     (5120, 1024),
-#     (896, 5120),
-#     (5120, 640),
-# ]
-# # Qwen3 MoE TP8
-# list_of_shapes = [
-#     (128, 4096),
-#     (1152, 4096),
-#     (4096, 1024),
-# ]
-# # GPT-OSS-120B TP-n
-# list_of_shapes = [
-#     (10240//TP, 8192),
-#     (8192, 8192//TP),
-#     (57344//TP, 8192),
-#     (8192, 28672//TP),
-# ]
 
-ut_filename = sys.argv[1]
-filename_prefix = f"{DEVICE_ARCH}-{sys.argv[2]}"  # example "GEMM-A8W8_BLOCKSCALE"
-m_config_map = {v: [f"M_LEQ_{v}"] for v in [8, 16, 32, 64, 128, 256]}
-m_config_map[16384] = ["any"]
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("F", type=str, help="Unit test filename")
+    parser.add_argument(
+        "--n-list", nargs="+", type=int, help="List of N dim", default=[]
+    )
+    parser.add_argument(
+        "--k-list", nargs="+", type=int, help="List of K dim", default=[]
+    )
+    parser.add_argument(
+        "--json-prefix",
+        type=str,
+        help="Specify JSON filename prefix, otherwise will gess",
+        default=None,
+    )
+    parser.add_argument(
+        "--last-m-any",
+        action="store_false",
+        help='Set configs with largest M to "any"',
+        default=True,
+    )
+    parser.add_argument(
+        "--max-m",
+        type=int,
+        help="Maximum M to search for screen*.log files",
+        default=131072,
+    )
 
-mlist = list(m_config_map.keys())
-last_config_name = []
-for a_config_name in m_config_map.values():
-    last_config_name += a_config_name
-last_config_name = last_config_name[-1]
-print(f"M\tN\tK\tTriton (us)\tconfig")
-for n, k in list_of_shapes:
-    get_at_least_one_config = False
-    fout = open(f"{filename_prefix}-N={n}-K={k}.json", "w")
-    fout.write("{\n")
+    args = parser.parse_args()
+    return args
 
-    last_config_list = None
-    for m in mlist:
-        case_data = []
-        file_tag = f"{ut_filename}-{m}-{n}-{k}"
-        read_screen_file(f"screen-{file_tag}.log", case_data)
-        case_data = sorted(case_data, key=lambda x: x[0])
 
-        if len(case_data) > 0:
-            get_at_least_one_config = True
-            triton_runtime = f"{case_data[0][0]:8.3f}"
-            config_str = f"(config = {case_data[0][1]})"
-        else:
-            triton_runtime = "     N/A"
-            config_str = "Warning: your config files is not complete!"
+def main():
+    args = parse_args()
+    ut_filename = args.F
+    nlist = args.n_list
+    klist = args.k_list
+    config_json_file_prefix = args.json_prefix
+    last_m_any = args.last_m_any
+    max_m = args.max_m
 
-        print(f"{m}\t{n}\t{k}\t{triton_runtime}\t{config_str}")
+    assert len(nlist) == len(klist), "Number of N and K must be the same"
+    assert len(nlist) > 0, "No N and K dim specified"
 
-        if len(case_data) == 0:
-            if last_config_list is None:
-                continue
-            config_list = last_config_list
-        else:
-            config_list = case_data[0][1].split()
-            last_config_list = config_list
+    list_of_shapes = [(nlist[i], klist[i]) for i in range(len(nlist))]
 
-        for config_name in m_config_map[m]:
+    if config_json_file_prefix == None:
+        a_and_w = ut_filename[
+            ut_filename.index("ut_") + 3 : ut_filename.index("_gemm")
+        ].upper()
+        variation = ut_filename[
+            ut_filename.index("_gemm") + 5 : ut_filename.index(".py")
+        ]
+        variation = f"{variation.upper()}" if len(variation) > 0 else ""
+        variation.replace("PRESHUFFLE", "PRESHUFFLED")
+        config_json_file_prefix = f"{DEVICE_ARCH}-GEMM-{a_and_w}{variation}"
+        print(
+            f"Guesing the output JSON filename to be {config_json_file_prefix}-N=<N>-K=<K>.json"
+        )
+    else:
+        print(
+            f"Set output JSON filename to be {config_json_file_prefix}-N=<N>-K=<K>.json"
+        )
+
+    for n, k in list_of_shapes:
+        print()
+        print(f"Parsing N={n}, K={k} tunning results generated by {ut_filename}...")
+        m = 1
+        mlist = []
+        m_config_map = {}
+        while m <= max_m:
+            screen_filename = f"screen-{ut_filename}-{m}-{n}-{k}.log"
+            if os.path.isfile(screen_filename):
+                print(f"\tFound {screen_filename}")
+                m_config_map[m] = f"M_LEQ_{m}"
+                mlist.append(m)
+            m *= 2
+        if last_m_any:
+            m_config_map[mlist[-1]] = "any"
+            print(f'Setting last M = {mlist[-1]} config name to "any"')
+            print()
+        print()
+        last_config_name = m_config_map[mlist[-1]]
+
+        if len(mlist) == 0:
+            continue
+
+        print(f"M\tN\tK\tTriton (us)\tconfig")
+        last_config_list = None
+        get_at_least_one_config = False
+        fout = open(f"{config_json_file_prefix}-N={n}-K={k}.json", "w")
+        fout.write("{\n")
+
+        for m in mlist:
+            case_data = []
+            screen_filename = f"screen-{ut_filename}-{m}-{n}-{k}.log"
+            read_screen_file(screen_filename, case_data)
+            case_data = sorted(case_data, key=lambda x: x[0])
+
+            if len(case_data) > 0:
+                get_at_least_one_config = True
+                triton_runtime = f"{case_data[0][0]:8.3f}"
+                config_str = f"(config = {case_data[0][1]})"
+            else:
+                triton_runtime = "     N/A"
+                config_str = "Warning: your config files is not complete!"
+
+            print(f"{m}\t{n}\t{k}\t{triton_runtime}\t{config_str}")
+
+            if len(case_data) == 0:
+                if last_config_list is None:
+                    continue
+                config_list = last_config_list
+            else:
+                config_list = case_data[0][1].split()
+                last_config_list = config_list
+
+            config_name = m_config_map[m]
 
             fout.write("""  "%s": {\n""" % (config_name))
             for i_parms_key, parms_key in enumerate(config_parms_key):
@@ -128,15 +150,23 @@ for n, k in list_of_shapes:
                 else:
                     fout.write("""\n  }""")
 
-        if config_name == last_config_name:
-            fout.write("\n")
-        else:
-            fout.write(",\n")
+            if config_name == last_config_name:
+                fout.write("\n")
+            else:
+                fout.write(",\n")
 
-    fout.write("}\n")
-    fout.close()
-    if get_at_least_one_config == False:
-        os.popen(f"rm {filename_prefix}-N={n}-K={k}.json").read()
-        print(f"No file is created")
-    else:
-        print(f"{filename_prefix}-N={n}-K={k}.json is created")
+        fout.write("}\n")
+        fout.close()
+        if get_at_least_one_config == False:
+            os.popen(f"rm {config_json_file_prefix}-N={n}-K={k}.json").read()
+            print(f"No file is created")
+        else:
+            print(f"{config_json_file_prefix}-N={n}-K={k}.json is created")
+
+    print(
+        f"Warning! Please make sure the output JSON filenames are correct for each GEMM"
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
