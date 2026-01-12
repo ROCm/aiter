@@ -47,8 +47,12 @@ jobs:
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
 
-      - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+      - name: Prepare docker config
+        run: |
+          export DOCKER_CONFIG="$HOME/.docker"
+          mkdir -p "$DOCKER_CONFIG" || true
+          cp /docker-config/config.json "$DOCKER_CONFIG/config.json"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
 
       - name: Download the vLLM base image
         run: |
