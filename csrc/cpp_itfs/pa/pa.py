@@ -187,6 +187,16 @@ def paged_attention_rocm(
         if q_scale is not None
         else ctypes.POINTER(ctypes.c_float)()
     )
+    k_scale_ptr = (
+        ctypes.cast(k_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if k_scale is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+    v_scale_ptr = (
+        ctypes.cast(v_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if v_scale is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
     func(
         out_ptr,
         exp_sums_ptr,
@@ -208,8 +218,8 @@ def paged_attention_rocm(
         kv_head_stride,
         alibi_slopes_ptr,
         q_scale_ptr,
-        ctypes.cast(k_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
-        ctypes.cast(v_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        k_scale_ptr,
+        v_scale_ptr,
         fp8_out_scale_ptr,
         stream,
     )
