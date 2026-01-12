@@ -759,11 +759,7 @@ l_ctx_len = [
 gpu = torch.cuda.current_device()
 device_properties = torch.cuda.get_device_properties(gpu)
 cu_num = device_properties.multi_processor_count
-l_batch_size = [
-    64,
-    158,
-    cu_num // 2 # even split
-]
+l_batch_size = [64, 158, cu_num // 2]
 l_batch_size.sort()
 
 parser = argparse.ArgumentParser(
