@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
@@ -346,9 +346,7 @@ def moe_cktile2stages_gemm1_ck(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
-    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
-    split_k: Optional[int] = 1,
 ) -> Tensor: ...
 
 
@@ -366,9 +364,7 @@ def moe_cktile2stages_gemm1(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
-    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
-    split_k: Optional[int] = 1,
 ):
     return moe_cktile2stages_gemm1_ck(
         XQ,
@@ -384,9 +380,7 @@ def moe_cktile2stages_gemm1(
         x_scale,
         w_scale,
         exp_bias,
-        activation,
         block_m,
-        split_k,
     )
 
 
@@ -405,9 +399,7 @@ def moe_cktile2stages_gemm2_ck(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
-    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
-    split_k: Optional[int] = 1,
 ) -> Tensor: ...
 
 
@@ -425,9 +417,7 @@ def moe_cktile2stages_gemm2(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
-    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
-    split_k: Optional[int] = 1,
 ):
     return moe_cktile2stages_gemm2_ck(
         XQ,
@@ -443,9 +433,7 @@ def moe_cktile2stages_gemm2(
         x_scale,
         w_scale,
         exp_bias,
-        activation,
         block_m,
-        split_k,
     )
 
 
@@ -578,6 +566,7 @@ def ck_moe_stage2_fwd(
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
     use_non_temporal_load: Optional[bool] = False,
+
 ):
     ck_moe_stage2(
         inter_states,
@@ -595,6 +584,6 @@ def ck_moe_stage2_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
-        use_non_temporal_load=use_non_temporal_load,
+        use_non_temporal_load = use_non_temporal_load
     )
     return out

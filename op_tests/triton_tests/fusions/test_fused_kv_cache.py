@@ -3,7 +3,7 @@ import pytest
 
 from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
-from aiter.ops.triton.fusions.fused_kv_cache import (
+from aiter.ops.triton.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
     fused_qk_rope_reshape_and_cache,
     fused_qk_rope_cosine_cache_llama,
@@ -136,7 +136,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     triton_kv_cache = kv_cache.clone()
     if cache_dtype == torch.uint8:
         triton_kv_cache = triton_kv_cache.view(cache_dtype_actual)
-    triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
+    triton_q, triton_decode_q_pe, triton_k_pe, triton_kv_cache, triton_zeros = (
         fused_qk_rope_cat_and_cache_mla(
             q_nope,
             q_pe,
@@ -374,15 +374,16 @@ def test_fused_qk_rope_reshape_and_cache(
             triton_key_cache[slot_t, slot_b],
             atol=1e-1,
             rtol=1e-1,
-            equal_nan=arch_info.get_arch()
-            not in ["gfx950"],  # TODO: investigate nan elements for non-gfx950 arch
+            equal_nan=not (
+                arch_info.get_arch() in ["gfx950"]
+            ),  # TODO: investigate nan elements for non-gfx950 arch
         )
         torch.testing.assert_close(
             torch_value_cache[slot_t, slot_b],
             triton_value_cache[slot_t, slot_b],
             atol=1e-1,
             rtol=1e-1,
-            equal_nan=arch_info.get_arch() not in ["gfx950"],
+            equal_nan=not (arch_info.get_arch() in ["gfx950"]),
         )
     else:
         torch.testing.assert_close(
@@ -390,14 +391,14 @@ def test_fused_qk_rope_reshape_and_cache(
             triton_key_cache[slot_t, :, :, slot_b, :],
             atol=1e-1,
             rtol=1e-1,
-            equal_nan=arch_info.get_arch() not in ["gfx950"],
+            equal_nan=not (arch_info.get_arch() in ["gfx950"]),
         )
         torch.testing.assert_close(
             torch_value_cache[slot_t, :, :, slot_b],
             triton_value_cache[slot_t, :, :, slot_b],
             atol=1e-1,
             rtol=1e-1,
-            equal_nan=arch_info.get_arch() not in ["gfx950"],
+            equal_nan=not (arch_info.get_arch() in ["gfx950"]),
         )
 
     torch.testing.assert_close(
@@ -405,14 +406,14 @@ def test_fused_qk_rope_reshape_and_cache(
         triton_key_cache,
         atol=1e-1,
         rtol=1e-1,
-        equal_nan=arch_info.get_arch() not in ["gfx950"],
+        equal_nan=not (arch_info.get_arch() in ["gfx950"]),
     )
     torch.testing.assert_close(
         torch_value_cache,
         triton_value_cache,
         atol=1e-1,
         rtol=1e-1,
-        equal_nan=arch_info.get_arch() not in ["gfx950"],
+        equal_nan=not (arch_info.get_arch() in ["gfx950"]),
     )
 
 

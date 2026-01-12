@@ -2,7 +2,7 @@ import sys
 import torch
 import triton
 import math
-from aiter.ops.triton.gemm.basic.gemm_afp4wfp4_pre_quant_atomic import (
+from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
     gemm_afp4wfp4_pre_quant,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4_pre_quant_atomic import (

@@ -4,7 +4,7 @@ import math
 import random
 import triton
 
-from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
+from aiter.ops.triton.pa_prefill import context_attention_fwd
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_dtype_bytes,

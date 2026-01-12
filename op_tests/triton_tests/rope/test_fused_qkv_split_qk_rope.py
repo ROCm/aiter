@@ -1,6 +1,6 @@
 import torch
 import pytest
-from aiter.ops.triton.rope.fused_qkv_split_qk_rope import fused_qkv_split_qk_rope
+from aiter.ops.triton.fused_qkv_split_qk_rope import fused_qkv_split_qk_rope
 from op_tests.triton_tests.fusions.test_fused_qk_concat import (
     generate_rope_cached_freqs,
 )

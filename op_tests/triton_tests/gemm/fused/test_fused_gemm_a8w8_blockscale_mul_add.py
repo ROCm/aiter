@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
+import os
 import torch
-from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
+from aiter.ops.triton.fused_gemm_a8w8_blockscale_mul_add import (
     fused_gemm_a8w8_blockscale_mul_add,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
@@ -58,9 +59,7 @@ def test_fused_gemm_a8w8_blockscale_mul_add(
     (
         x,
         w,
-        _,
         x_scales,
-        _,
         w_scales,
         y,
     ) = generate_gemm_a8w8_blockscale_inputs(

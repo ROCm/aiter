@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
@@ -11,7 +11,7 @@ from op_tests.test_rope import (
     RotateStyle,
     ref_rope_2d_fwd,
 )
-from aiter.ops.triton.rope.rope import (
+from aiter.ops.triton.rope import (
     rope_fwd,
     rope_fwd_inplace,
     rope_bwd,

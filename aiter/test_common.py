@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import torch.profiler as tpf
 import os
@@ -98,7 +98,6 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            avg = get_trace_perf(prof, num_iters)
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -114,6 +113,7 @@ def perftest(
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
 
+            avg = get_trace_perf(prof, num_iters)
             return data, avg
 
         return wrapper

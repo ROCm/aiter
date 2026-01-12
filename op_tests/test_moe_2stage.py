@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import itertools
@@ -510,8 +510,6 @@ for (
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
                         preshuffle=preshuffle,
-                        hidden_pad=0,
-                        intermediate_pad=0,
                     )
                     df.append(ret)
     else:

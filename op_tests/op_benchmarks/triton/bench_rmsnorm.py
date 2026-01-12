@@ -2,7 +2,7 @@ import argparse
 import sys
 import torch
 import triton
-from aiter.ops.triton.normalization.rmsnorm import rms_norm
+from aiter.ops.triton.rmsnorm import rms_norm
 from op_tests.triton_tests.normalization.test_rmsnorm import (
     generate_rmsnorm_inputs,
 )

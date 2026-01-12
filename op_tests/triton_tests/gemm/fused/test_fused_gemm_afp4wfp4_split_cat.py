@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
-from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import (
     fused_gemm_afp4wfp4_split_cat,
     fused_gemm_afp4wfp4_preshuffle_split_cat,
 )
@@ -11,9 +11,7 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     mxfp4_to_f32,
     e8m0_to_f32,
 )
-
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.shuffle import shuffle_weight
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales

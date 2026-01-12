@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter.utility import dtypes
 from typing import List
-import argparse
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -265,96 +263,20 @@ def test_mrope_3d_rms(
     checkAllclose(v_ref, v, msg=msg, rtol=1e-2, atol=0.05)
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-n",
-    "--neox_style",
-    type=dtypes.str2bool,
-    nargs="*",
-    default=[True, False],
-    help="""Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    e.g.: -n true   # for Neox-style
-          or -n false # for GPT-J-style""",
-)
-parser.add_argument(
-    "-t",
-    "--token",
-    type=int,
-    nargs="*",
-    default=[513, 1257, 127, 778, 10024, 3],
-    help="""Number of tokens.
-    e.g.: -t 513""",
-)
-parser.add_argument(
-    "-hd",
-    "--head",
-    type=int,
-    nargs="*",
-    default=[32, 64],
-    help="""Number of heads.
-    e.g.: -hd 32""",
-)
-parser.add_argument(
-    "-hs",
-    "--head_sizes",
-    type=int,
-    nargs="*",
-    default=[64, 128, 256],
-    help="""Head size.
-    e.g.: -hs 64""",
-)
-parser.add_argument(
-    "-m",
-    "--max_positions",
-    type=int,
-    default=10000,
-    help="""Max Positions.
-    e.g.: -m 10000""",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=dtypes.str2Dtype,
-    default="bf16",
-    help="""Data type.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-i",
-    "--is_interleaved",
-    type=dtypes.str2bool,
-    nargs="*",
-    default=[True, False],
-    help="""Whether to use the interleaved MRoPE.
-    e.g.: -i true   # for interleaved MRoPE
-          or -i false # for non-interleaved MRoPE""",
-)
-
-parser.add_argument(
-    "-ms",
-    "--mrope_sections",
-    type=dtypes.str2tuple,
-    nargs="*",
-    default=[[12, 10, 10], [24, 20, 20], [48, 40, 40]],
-    help="""Mrope section.
-    e.g.: -m 12,10,10""",
-)
-
-
 if __name__ == "__main__":
-    args = parser.parse_args()
     # rope
-    max_positions = args.max_positions
-    for is_neox_style in args.neox_style:
-        for num_token in args.token:
-            for num_head in args.head:
-                for i, head_size in enumerate(args.head_sizes):
+    is_neox_styles = [True, False]
+    num_tokens = [513, 1257, 127, 778, 10024, 3]
+    num_heads = [32, 64]
+    head_sizes = [64, 128, 256]
+    max_positions = 10000
+    dtype = torch.bfloat16
+    for is_neox_style in is_neox_styles:
+        for num_token in num_tokens:
+            for num_head in num_heads:
+                for i, head_size in enumerate(head_sizes):
                     test_mrope_3d_rms(
-                        args.dtype,
+                        dtype,
                         num_token,
                         num_head,
                         num_head,
@@ -368,14 +290,22 @@ if __name__ == "__main__":
                     )
 
     # mrope
-    for is_neox_style in args.neox_style:
-        for num_token in args.token:
-            for num_head in args.head:
-                for i, head_size in enumerate(args.head_sizes):
-                    ms = args.mrope_sections[i]
-                    for is_interleaved in args.is_interleaved:
+    is_neox_styles = [True, False]
+    num_tokens = [513, 1257, 127, 778, 10024, 3]
+    num_heads = [32, 64]
+    head_sizes = [64, 128, 256]
+    mrope_sections = [[12, 10, 10], [24, 20, 20], [48, 40, 40]]
+    is_interleaveds = [True, False]
+    max_positions = 10000
+    dtype = torch.bfloat16
+    for is_neox_style in is_neox_styles:
+        for num_token in num_tokens:
+            for num_head in num_heads:
+                for i, head_size in enumerate(head_sizes):
+                    ms = mrope_sections[i]
+                    for is_interleaved in is_interleaveds:
                         test_mrope_3d_rms(
-                            args.dtype,
+                            dtype,
                             num_token,
                             num_head,
                             num_head,

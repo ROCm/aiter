@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
 import aiter
@@ -256,9 +256,9 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     M,
                     N,
                     K,
-                    kernel.MTile,
-                    kernel.NTile,
-                    kernel.KTile,
+                    kernel.MPerBLOCK,
+                    kernel.NPerBLOCK,
+                    kernel.KPerBLOCK,
                 )
                 if useSplitK
                 else 0

@@ -5,7 +5,6 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, perftest
 
 
@@ -391,11 +390,8 @@ for data_generation in args.data_generation:
                         m, ctx, k, n, data_generation, False
                     )
                     df.append(ret)
-                    if get_gfx() == "gfx942":
-                        ret = test_top_k_per_row_decode(
-                            m, ctx, k, n, data_generation, True
-                        )
-                        df.append(ret)
+                    ret = test_top_k_per_row_decode(m, ctx, k, n, data_generation, True)
+                    df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)

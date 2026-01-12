@@ -101,11 +101,11 @@ class PyNcclCommunicator:
         self.available = True
         self.disabled = False
 
-        self.nccl_version = self.nccl.ncclGetVersion()
+        self.nccl_version = self.nccl.ncclGetRawVersion()
         if self.rank == 0:
             # get the unique id from NCCL
             self.unique_id = self.nccl.ncclGetUniqueId()
-            logger.info(f"load RCCL version: {self.nccl_version}")
+            logger.info(f"load NCCL version: {self.nccl_version}")
         else:
             # construct an empty unique id
             self.unique_id = ncclUniqueId()

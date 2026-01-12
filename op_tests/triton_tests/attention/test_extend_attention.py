@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
-from aiter.ops.triton.attention.extend_attention import extend_attention_fwd
+from aiter.ops.triton.extend_attention import extend_attention_fwd
 
 
 def input_helper(

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include "ck_tile/core.hpp"
@@ -67,13 +67,13 @@ struct MoeFlatmmConfig
 
 __host__ static constexpr int32_t GetBMemNTType(int32_t M, int32_t N, int32_t K)
 {
-    (void)N;
-    (void)K;
-    if(M <= 416)
-    {
-        return 2;
-    }
-    return 0;
+	(void)N;
+	(void)K;
+	if(M <= 416)
+	{
+		return 2;
+	}
+	return 0;
 }
 
 template <typename FlatmmConfig,
@@ -88,7 +88,6 @@ template <typename FlatmmConfig,
           typename ELayout,
           ck_tile::MoeFlatmmKind moe_kind,
           typename CDEElementWise,
-          int ActivationOp,
           typename MoeFlatmmHostArgs>
 void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 {
@@ -158,10 +157,12 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 
     const auto Run = [&](const auto has_hot_loop_,
                          const auto tail_number_,
+                         const auto memory_operation_,
                          const auto b_mem_nt_type_) {
-        constexpr bool has_hot_loop_v = has_hot_loop_.value;
-        constexpr auto tail_number_v  = tail_number_.value;
-        constexpr auto scheduler      = FlatmmConfig::Scheduler;
+        constexpr bool has_hot_loop_v   = has_hot_loop_.value;
+        constexpr auto tail_number_v    = tail_number_.value;
+        constexpr auto scheduler        = FlatmmConfig::Scheduler;
+        constexpr auto memory_operation = memory_operation_.value;
         constexpr auto b_mem_nt_type_v =
             static_cast<ck_tile::amd_buffer_coherence_enum>(b_mem_nt_type_.value);
 
@@ -218,6 +219,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                              FlatmmConfig::N_Warp_Tile,
                                              FlatmmConfig::K_Warp_Tile,
                                              CodegenPipelineProblem::TransposeC,
+                                             memory_operation,
                                              FlatmmConfig::NumWaveGroups,
                                              false,
                                              1,
@@ -232,9 +234,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                 ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
-        // TODO: support more act type.
         using FusedAct =
-            std::conditional_t<ActivationOp == 2, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
+            std::conditional_t<BMXFP4_Pipeline, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
 
         using Kernel = ck_tile::MoeFlatmmKernel<TilePartitioner,
                                                 CodegenFlatmmPipeline,
@@ -321,28 +322,52 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         // return ave_time;
     };
 
-    const auto RunBMem = [&](const auto has_hot_loop_, const auto tail_number_) {
-        switch(b_mem_nt_type)
+    const auto RunBMem =
+        [&](const auto has_hot_loop_, const auto tail_number_, const auto memory_operation_) {
+            switch(b_mem_nt_type)
+            {
+            case 2: {
+                Run(has_hot_loop_,
+                    tail_number_,
+                    memory_operation_,
+                    ck_tile::integral_constant<int32_t, 2>{});
+            }
+            break;
+            default: {
+                Run(has_hot_loop_,
+                    tail_number_,
+                    memory_operation_,
+                    ck_tile::integral_constant<int32_t, 0>{});
+            }
+            }
+        };
+
+    const auto RunSplitk = [&](const auto has_hot_loop_, const auto tail_number_) {
+        if(args.k_batch == 1)
         {
-        case 2: {
-            Run(has_hot_loop_, tail_number_, ck_tile::integral_constant<int32_t, 2>{});
+            RunBMem(has_hot_loop_,
+                    tail_number_,
+                    ck_tile::integral_constant<ck_tile::memory_operation_enum,
+                                               ck_tile::memory_operation_enum::set>{});
         }
-        break;
-        default: {
-            Run(has_hot_loop_, tail_number_, ck_tile::integral_constant<int32_t, 0>{});
-        }
+        else
+        {
+            RunBMem(has_hot_loop_,
+                    tail_number_,
+                    ck_tile::integral_constant<ck_tile::memory_operation_enum,
+                                               ck_tile::memory_operation_enum::atomic_add>{});
         }
     };
 
     if(tail_num == ck_tile::TailNumber::Odd)
     {
-        RunBMem(ck_tile::bool_constant<true>{},
-                ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Odd>{});
+        RunSplitk(ck_tile::bool_constant<true>{},
+                  ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Odd>{});
     }
     else if(tail_num == ck_tile::TailNumber::Even)
     {
-        RunBMem(ck_tile::bool_constant<true>{},
-                ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Even>{});
+        RunSplitk(ck_tile::bool_constant<true>{},
+                  ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Even>{});
     }
     else
     {

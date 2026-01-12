@@ -73,8 +73,7 @@ def get_gemm_config(
         specialized_filename: Custom specialized filename suffix (optional)
 
     Returns:
-        Dictionary with the config params,
-        bool indicating if the config is tuned.(True if tuned, False otherwise)
+        Dictionary with the config params
     """
     # Input validation
     assert M >= 0, "M must be positive."

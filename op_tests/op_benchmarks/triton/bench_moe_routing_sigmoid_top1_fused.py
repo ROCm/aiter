@@ -3,7 +3,7 @@ from functools import partial
 import torch
 import triton
 
-from aiter.ops.triton.moe.moe_routing_sigmoid_top1_fused import (
+from aiter.ops.triton.moe_routing_sigmoid_top1_fused import (
     _routing_sigmoid_top1_kernel,
     routing_sigmoid_top1,
 )

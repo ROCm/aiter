@@ -1,6 +1,6 @@
 import torch
 import pytest
-from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 import torch.nn.functional as F
 
 

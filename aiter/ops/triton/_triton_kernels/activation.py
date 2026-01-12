@@ -1,5 +1,5 @@
-from .quant.quant import _mxfp4_quant_op
-from .quant.fused_fp8_quant import _fp8_quant_op
+from .quant import _mxfp4_quant_op
+from .fused_fp8_quant import _fp8_quant_op
 import triton
 import triton.language as tl
 

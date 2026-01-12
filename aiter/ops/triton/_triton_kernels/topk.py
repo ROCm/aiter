@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # The kernel in this file is adapted from FlagGems' topk:
 # https://github.com/FlagOpen/FlagGems/blob/master/src/flag_gems/ops/topk.py
@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 import triton.language.core as core
 from triton.language.standard import _log2, zeros_like
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 _topk_kernel_repr = make_kernel_repr(

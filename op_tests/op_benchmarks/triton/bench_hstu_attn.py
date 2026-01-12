@@ -2,7 +2,7 @@ import argparse
 import sys
 import triton
 import torch
-from aiter.ops.triton.attention.hstu_attention import _AttentionFunction
+from aiter.ops.triton.hstu_attention import _AttentionFunction
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.attention.test_hstu_attn import (
     switch_to_contiguous_if_needed,

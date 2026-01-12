@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+import os
 import aiter
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter.jit.core import AITER_CONFIG_BF16_BATCHED_GEMM
@@ -8,6 +10,7 @@ from aiter.utility.base_tuner import GemmCommonTuner
 from aiter import dtypes
 from batched_gemm_bf16_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
+import argparse
 
 
 def run_torch(x, weight, bias=None, dtype=dtypes.bf16):
@@ -99,6 +102,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                 kernel = kernels_list[i]
                 maxsplitK = (
                     aiter.compute_batched_gemm_SplitK(
+                        B,
                         M,
                         N,
                         K,

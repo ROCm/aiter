@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import partial
 
 import pytest
 import torch
-from aiter.ops.triton.moe.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1
+from aiter.ops.triton.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1
 
 
 def torch_routing_sigmoid_top1(

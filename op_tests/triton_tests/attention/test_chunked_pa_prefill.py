@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
 import random
 import pytest
 import torch
-from aiter.ops.triton.attention.chunked_pa_prefill import chunked_prefill_paged_decode
+from aiter.ops.triton.chunked_pa_prefill import chunked_prefill_paged_decode
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 NUM_HEADS = [64]

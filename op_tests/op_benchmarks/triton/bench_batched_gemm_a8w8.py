@@ -17,7 +17,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.gemm.batched.batched_gemm_a8w8 import (
+from aiter.ops.triton.batched_gemm_a8w8 import (
     batched_gemm_a8w8 as batched_gemm_a8w8,
 )
 

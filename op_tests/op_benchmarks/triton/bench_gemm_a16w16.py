@@ -2,8 +2,8 @@ import sys
 import torch
 import triton
 import math
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )

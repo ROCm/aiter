@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include <pybind11/pybind11.h>
@@ -904,48 +904,48 @@ namespace py = pybind11;
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
 
-#define MOE_CK_2STAGES_PYBIND                          \
-    m.def("ck_moe_stage1",                             \
-          &ck_moe_stage1,                              \
-          py::arg("hidden_states"),                    \
-          py::arg("w1"),                               \
-          py::arg("w2"),                               \
-          py::arg("sorted_token_ids"),                 \
-          py::arg("sorted_expert_ids"),                \
-          py::arg("num_valid_ids"),                    \
-          py::arg("out"),                              \
-          py::arg("topk"),                             \
-          py::arg("kernelName")        = std::nullopt, \
-          py::arg("w1_scale")          = std::nullopt, \
-          py::arg("a1_scale")          = std::nullopt, \
-          py::arg("block_m")           = 32,           \
-          py::arg("sorted_weights")    = std::nullopt, \
-          py::arg("quant_type")        = 0,            \
-          py::arg("activation")        = 0,            \
-          py::arg("splitk")            = 1,            \
-          py::arg("non_temporal_load") = false,        \
-          py::arg("dst_type")          = std::nullopt);         \
-                                                       \
-    m.def("ck_moe_stage2",                             \
-          &ck_moe_stage2,                              \
-          py::arg("inter_states"),                     \
-          py::arg("w1"),                               \
-          py::arg("w2"),                               \
-          py::arg("sorted_token_ids"),                 \
-          py::arg("sorted_expert_ids"),                \
-          py::arg("num_valid_ids"),                    \
-          py::arg("out"),                              \
-          py::arg("topk"),                             \
-          py::arg("kernelName")        = std::nullopt, \
-          py::arg("w2_scale")          = std::nullopt, \
-          py::arg("a2_scale")          = std::nullopt, \
-          py::arg("block_m")           = 32,           \
-          py::arg("sorted_weights")    = std::nullopt, \
-          py::arg("quant_type")        = 0,            \
-          py::arg("activation")        = 0,            \
-          py::arg("splitk")            = 1,            \
-          py::arg("non_temporal_load") = false,        \
-          py::arg("dst_type")          = std::nullopt);
+#define MOE_CK_2STAGES_PYBIND                       \
+    m.def("ck_moe_stage1",                          \
+          &ck_moe_stage1,                           \
+          py::arg("hidden_states"),                 \
+          py::arg("w1"),                            \
+          py::arg("w2"),                            \
+          py::arg("sorted_token_ids"),              \
+          py::arg("sorted_expert_ids"),             \
+          py::arg("num_valid_ids"),                 \
+          py::arg("out"),                           \
+          py::arg("topk"),                          \
+          py::arg("kernelName")     = std::nullopt, \
+          py::arg("w1_scale")       = std::nullopt, \
+          py::arg("a1_scale")       = std::nullopt, \
+          py::arg("block_m")        = 32,           \
+          py::arg("sorted_weights") = std::nullopt, \
+          py::arg("quant_type")     = 0,            \
+          py::arg("activation")     = 0,            \
+          py::arg("splitk")         = 1,            \
+          py::arg("non_temporal_load") = false,     \
+          py::arg("dst_type")       = std::nullopt);      \
+                                                    \
+    m.def("ck_moe_stage2",                          \
+          &ck_moe_stage2,                           \
+          py::arg("inter_states"),                  \
+          py::arg("w1"),                            \
+          py::arg("w2"),                            \
+          py::arg("sorted_token_ids"),              \
+          py::arg("sorted_expert_ids"),             \
+          py::arg("num_valid_ids"),                 \
+          py::arg("out"),                           \
+          py::arg("topk"),                          \
+          py::arg("kernelName")     = std::nullopt, \
+          py::arg("w2_scale")       = std::nullopt, \
+          py::arg("a2_scale")       = std::nullopt, \
+          py::arg("block_m")        = 32,           \
+          py::arg("sorted_weights") = std::nullopt, \
+          py::arg("quant_type")     = 0,            \
+          py::arg("activation")     = 0,            \
+          py::arg("splitk")         = 1,            \
+          py::arg("non_temporal_load") = false,     \
+          py::arg("dst_type")       = std::nullopt);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \
@@ -964,9 +964,7 @@ namespace py = pybind11;
           py::arg("x_scale")        = std::nullopt, \
           py::arg("w_scale")        = std::nullopt, \
           py::arg("exp_bias")       = std::nullopt, \
-          py::arg("activation")     = 0,            \
-          py::arg("block_m")        = 32,           \
-          py::arg("split_k")        = 1);                  \
+          py::arg("block_m")        = 32);                 \
                                                     \
     m.def("cktile_moe_gemm2",                       \
           &cktile_moe_gemm2,                        \
@@ -984,9 +982,7 @@ namespace py = pybind11;
           py::arg("x_scale")        = std::nullopt, \
           py::arg("w_scale")        = std::nullopt, \
           py::arg("exp_bias")       = std::nullopt, \
-          py::arg("activation")     = 0,            \
-          py::arg("block_m")        = 32,           \
-          py::arg("split_k")        = 1);
+          py::arg("block_m")        = 32);
 
 #define MHA_VARLEN_FWD_PYBIND                            \
     m.def("mha_varlen_fwd",                              \
@@ -1560,44 +1556,44 @@ namespace py = pybind11;
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
-#define TOP_K_PER_ROW_PYBIND            \
-    m.def("top_k_per_row_prefill",      \
-          &top_k_per_row_prefill,       \
-          py::arg("logits"),            \
-          py::arg("rowStarts"),         \
-          py::arg("rowEnds"),           \
-          py::arg("indices"),           \
-          py::arg("values"),            \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
-          py::arg("stride1"));          \
-    m.def("top_k_per_row_prefill_fast", \
-          &top_k_per_row_prefill_fast,  \
-          py::arg("logits"),            \
-          py::arg("rowStarts"),         \
-          py::arg("rowEnds"),           \
-          py::arg("indices"),           \
-          py::arg("values"),            \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
-          py::arg("stride1"));          \
-    m.def("top_k_per_row_decode",       \
-          &top_k_per_row_decode,        \
-          py::arg("logits"),            \
-          py::arg("next_n"),            \
-          py::arg("seqLens"),           \
-          py::arg("indices"),           \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
-          py::arg("stride1"));          \
-    m.def("top_k_per_row_decode_fast",  \
-          &top_k_per_row_decode_fast,   \
-          py::arg("logits"),            \
-          py::arg("next_n"),            \
-          py::arg("seqLens"),           \
-          py::arg("indices"),           \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
+#define TOP_K_PER_ROW_PYBIND           \
+    m.def("top_k_per_row_prefill",     \
+          &top_k_per_row_prefill,      \
+          py::arg("logits"),           \
+          py::arg("rowStarts"),        \
+          py::arg("rowEnds"),          \
+          py::arg("indices"),          \
+          py::arg("values"),           \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+      m.def("top_k_per_row_prefill_fast", \
+            &top_k_per_row_prefill_fast,  \
+            py::arg("logits"),       \
+            py::arg("rowStarts"),    \
+            py::arg("rowEnds"),      \
+            py::arg("indices"),      \
+            py::arg("values"),       \
+            py::arg("numRows"),      \
+            py::arg("stride0"),      \
+            py::arg("stride1"));     \
+    m.def("top_k_per_row_decode",      \
+          &top_k_per_row_decode,       \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
+          py::arg("stride1"));         \
+    m.def("top_k_per_row_decode_fast", \
+          &top_k_per_row_decode_fast,  \
+          py::arg("logits"),           \
+          py::arg("next_n"),           \
+          py::arg("seqLens"),          \
+          py::arg("indices"),          \
+          py::arg("numRows"),          \
+          py::arg("stride0"),          \
           py::arg("stride1"));
 
 #define MLA_METADATA_PYBIND                              \
