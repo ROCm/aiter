@@ -120,7 +120,8 @@ def _should_use_asm_kernel(
     num_heads: int,
     kv_cache_tensor_dtype: torch.dtype,
 ) -> bool:
-    if kv_cache_tensor_dtype == torch.int8:
+    #TODO: HIP kernel yet isn't supporting fp8 scales in asm layout.
+    if kv_cache_tensor_dtype == torch.int8 or kv_cache_tensor_dtype == torch.float8_e4m3fnuz:
         return True
 
     # Get GPU compute units (CUs)
@@ -168,6 +169,7 @@ def paged_attention_common(
     use_asm_kernel = _should_use_asm_kernel(
         num_seqs, num_heads, kv_cache_tensor_dtype
     )
+
     if use_asm_kernel:
         output = pa_fwd_asm(
             Q, K, V, block_tables, context_lens, block_tables_stride0,

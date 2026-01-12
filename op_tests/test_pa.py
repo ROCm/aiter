@@ -15,6 +15,8 @@ from aiter.test_common import (
     benchmark,
 )
 from aiter import pertoken_quant
+from aiter.ops import attention
+
 import argparse
 import pandas as pd
 
@@ -425,10 +427,8 @@ def run_aiter_common(
     """
     Test paged_attention_common which automatically switches between ASM and HIP kernels.
     """
-    from aiter.ops import attention
     
     num_seqs, num_heads, head_size = query.shape
-    
     # Create workspace buffer for HIP kernel path
     # Workspace buffer size calculation from test_pa_v1.py
     _PARTITION_SIZE_ROCM = 256
@@ -440,38 +440,30 @@ def run_aiter_common(
         dtype=torch.uint8,
         device=query.device,
     )
+       
+    def _normalize_scale(s):
+        if s is None:
+            return None
+        if isinstance(s, torch.Tensor):
+            return s.to(device=query.device, dtype=dtypes.fp32)
+        # python scalar
+        return torch.tensor(float(s), device=query.device, dtype=dtypes.fp32)
+
+    k_scale_tensor = _normalize_scale(k_scale)
+    v_scale_tensor = _normalize_scale(v_scale)
     
-    # paged_attention_common only accepts shuffled V cache format (5D format)
-    # Both ASM and HIP kernels have been modified to support shuffled format
-    # The function decides internally which kernel to call based on heuristics
-    # V cache should be shuffled before calling this function (similar to run_aiter_asm)
-    
-    # Convert k_scale and v_scale to proper format if provided
-    # paged_attention_common accepts Optional[torch.Tensor], so None can be passed directly
-    # Only scalar tensors (numel == 1) are converted to None
-    if k_scale is None:
-        k_scale_tensor = None
-    elif isinstance(k_scale, torch.Tensor):
-        k_scale_tensor = k_scale if k_scale.numel() > 1 else None
-    else:
-        k_scale_tensor = torch.tensor(float(k_scale), device=query.device, dtype=dtypes.fp32)
-        k_scale_tensor = k_scale_tensor if k_scale_tensor.numel() > 1 else None
-    
-    if v_scale is None:
-        v_scale_tensor = None
-    elif isinstance(v_scale, torch.Tensor):
-        v_scale_tensor = v_scale if v_scale.numel() > 1 else None
-    else:
-        v_scale_tensor = torch.tensor(float(v_scale), device=query.device, dtype=dtypes.fp32)
-        v_scale_tensor = v_scale_tensor if v_scale_tensor.numel() > 1 else None
-    
-    # Determine kv_cache_dtype string
-    if kv_cache_tensor_dtype is None:
-        kv_cache_dtype_str = kv_cache_dtype if isinstance(kv_cache_dtype, str) else "auto"
-    elif kv_cache_tensor_dtype == torch.int8:
-        kv_cache_dtype_str = "fp8"  # int8 is treated as fp8
-    else:
-        kv_cache_dtype_str = "auto"
+    # Determine kv_cache_dtype string.
+    def _is_fp8_storage(dt: torch.dtype) -> bool:
+        if dt == torch.int8 or dt == torch.uint8:
+            return True
+        # torch float8 dtypes (guard for older torch builds)
+        for name in ("float8_e4m3fnuz", "float8_e4m3fn", "float8_e5m2fnuz", "float8_e5m2"):
+            if hasattr(torch, name) and dt == getattr(torch, name):
+                return True
+        return False
+
+    cache_dt = kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else k_cache.dtype
+    kv_cache_dtype_str = "fp8" if _is_fp8_storage(cache_dt) else "auto"
     
     return attention.paged_attention_common(
         Q=query.contiguous(),
