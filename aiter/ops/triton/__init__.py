@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import importlib.util
 import sys
@@ -42,7 +42,7 @@ if _COMMS_AVAILABLE:
     )
 
 """
-These following help implement backward-compatibility 
+These following help implement backward-compatibility
 for modules that were reorganized so that external repos (like sglang for example),
 which depend on the old module names, can still import it the old "way" of importing.
 """
