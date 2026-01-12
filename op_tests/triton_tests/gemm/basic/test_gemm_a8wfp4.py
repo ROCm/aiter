@@ -4,7 +4,7 @@
 import torch
 import pytest
 from enum import Enum
-from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
+from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils import types
 from typing import Union
