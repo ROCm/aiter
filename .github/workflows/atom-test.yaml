@@ -34,13 +34,20 @@ jobs:
   build_atom_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: check-signal
-    runs-on: aiter-k8s-build
+    runs-on: aiter-build-runner
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           repository: ${{ env.ATOM_REPOSITORY_URL }}
           branch: ${{ env.ATOM_BRANCH }}
+
+      - name: Prepare docker config
+        run: |
+          export DOCKER_CONFIG="$HOME/.docker"
+          mkdir -p "$DOCKER_CONFIG" || true
+          cp /docker-config/config.json "$DOCKER_CONFIG/config.json"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
 
       - name: Download the ATOM base image
         run: |
@@ -60,7 +67,6 @@ jobs:
 
       - name: Push the ATOM test image
         run: |
-          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           docker push rocm/aiter-ci:atom-test-${{ env.GITHUB_COMMIT_SHA }}
 
   atom_benchmark:
