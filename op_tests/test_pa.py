@@ -431,7 +431,9 @@ def run_aiter_common(
     num_seqs, num_heads, head_size = query.shape
     # Client-side allocations required by ROCm paged attention path.
     _PARTITION_SIZE_ROCM = 256
-    max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM - 1) // _PARTITION_SIZE_ROCM
+    max_num_partitions = (
+        max_seq_len + _PARTITION_SIZE_ROCM - 1
+    ) // _PARTITION_SIZE_ROCM
     tmp_out = torch.empty(
         (num_seqs, num_heads, max_num_partitions, head_size),
         dtype=query.dtype,
