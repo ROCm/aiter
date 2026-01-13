@@ -345,9 +345,10 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         offs_k_shuffle = pid_k * SPLITK_BLOCK_SIZE * 16 + offs_k_shuffle_arr
 
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % (
-            N // 16
-        )
+        # because weight has to be padded to multiple of 16, so that % (N // 16) is no longer required for weight
+        offs_bn = pid_n * (BLOCK_SIZE_N // 16) + tl.arange(
+            0, BLOCK_SIZE_N // 16
+        )  # % (N // 16)
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )

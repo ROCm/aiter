@@ -243,7 +243,7 @@ def test_gemm_afp4_wfp4(
             pytest.skip(
                 f"N = {N} is not divisible by 32, skip this test for preshuffled weight/scales tests"
             )
-        elif K % 256 > 0:
+        if K % 256 > 0:
             pytest.skip(
                 f"K = {K} is not divisible by 256, skip this test for preshuffled weight/scales tests"
             )
@@ -293,15 +293,6 @@ def test_gemm_afp4_wfp4(
                 use_aot=(dtype == torch.bfloat16 and layout == "TN"),
                 skip_reduce=skip_reduce,
             )
-        # TODO: remove in the future
-        # if output:
-        #     triton_out = gemm_afp4wfp4_preshuffled_scales(
-        #         x, w_triton, x_scales_triton, w_scales_triton, dtype, y
-        #     )
-        # else:
-        #     triton_out = gemm_afp4wfp4_preshuffled_scales(
-        #         x, w_triton, x_scales_triton, w_scales_triton, dtype
-        #     )
     else:
         if output:
             triton_out = gemm_afp4wfp4(
