@@ -105,7 +105,7 @@ def read_screen_file(filename, case_data):
                     case_data.append(
                         [r, screencaseline[len("screencase") + 1 :].strip()]
                     )
-                except:
+                except IndexError:
                     break
 
 

@@ -4,16 +4,20 @@ from _utils import (
     get_input_shape_and_config_list,
 )
 
-input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
-
 ############################################################
-# <import and generate input>
+# <import>
 import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     generate_gemm_afp4wfp4_inputs,
 )
 
+############################################################
+
+input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
+
+############################################################
+# <generate input>
 dtype = torch.bfloat16
 shuffle = True
 x, w, w_triton, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (

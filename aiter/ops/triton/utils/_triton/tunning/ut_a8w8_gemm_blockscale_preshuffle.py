@@ -4,10 +4,8 @@ from _utils import (
     get_input_shape_and_config_list,
 )
 
-input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
-
 ############################################################
-# <import and generate input>
+# <import>
 import torch
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale_preshuffle,
@@ -16,6 +14,12 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
 )
 
+############################################################
+
+input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
+
+############################################################
+# <generate input>
 dtype = torch.bfloat16
 shuffle = True
 block_shape_n, block_shape_k = 128, 128

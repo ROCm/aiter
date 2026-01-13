@@ -4,6 +4,13 @@ from _utils import (
     get_input_shape_and_config_list,
 )
 
+############################################################
+# <import>
+"""
+This block of code includes APIs you need for generating input and executing GEMMs
+"""
+############################################################
+
 input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
 
 ############################################################

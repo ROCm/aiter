@@ -4,10 +4,8 @@ from _utils import (
     get_input_shape_and_config_list,
 )
 
-input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
-
 ############################################################
-# <import and generate input>
+# <import>
 import torch
 import triton
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
@@ -15,6 +13,12 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
 
+############################################################
+
+input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
+
+############################################################
+# <generate input>
 dtype = torch.bfloat16
 x, w, bias, _, y = generate_gemm_a16w16_inputs(
     *input_shape,
