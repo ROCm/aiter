@@ -38,12 +38,12 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
         }
     elif arch == "gfx942":
         return {
-        "BLOCK_M": 256,
-        "BLOCK_N": 128,
+        "BLOCK_M": 512,
+        "BLOCK_N": 256,
         "waves_per_eu": 2,
         "PRE_LOAD_V": False,
         "num_stages": 2,
-        "num_warps": 8,
+        "num_warps": 4,
     }
     else:
         # return tuned config for MI300X by default

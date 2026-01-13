@@ -40,7 +40,7 @@ layout_converter = {
 }
 
 reversed_layout_converter = {v: k for k, v in layout_converter.items()}
-
+time_quant =  True
 # test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
 import logging
 
@@ -295,6 +295,21 @@ def fav3_sage_forward_func(
         BLKK=BLKK,
         layout=layout,
     )
+
+    fn = lambda: sage_quant(
+        q,
+        k,
+        v,
+        fp8_dtype,
+        FP8_MAX,
+        sm_scale=softmax_scale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        layout=layout,
+    )
+    if time_quant:
+        return fn
+
     return lambda: fav3_sage_func(
         q_int8,
         k_int8,
@@ -570,6 +585,12 @@ def bench_kernel(q, k, v, args, provider):
     elif "TFLOPS" in provider:
         return total_flops / ms * 1e-9
     elif "GB/s" in provider:  # GB/s
+        if time_quant:
+            mem_read = 3 * total_num_tokens_q * HQ * D_HEAD * 2
+            mem_write = total_num_tokens_q / 256 * HQ * 4 + total_num_tokens_q / 128 * HQ * 4 + D_HEAD * HQ * BATCH
+            mem_write += 3 * total_num_tokens_q * HQ * D_HEAD * 1
+            mem = mem_read + mem_write
+        
         return mem / ms * 1e-6
     elif "arithmetic_intensity" in provider:
         return total_flops / mem
