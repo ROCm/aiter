@@ -127,11 +127,8 @@ def _should_use_asm_kernel(
     num_heads: int,
     kv_cache_tensor_dtype: torch.dtype,
 ) -> bool:
-    # TODO: HIP kernel yet isn't supporting fp8 scales in asm layout.
-    if (
-        kv_cache_tensor_dtype == torch.int8
-        or kv_cache_tensor_dtype == torch.float8_e4m3fnuz
-    ):
+
+    if kv_cache_tensor_dtype == torch.int8:
         return True
 
     # Get GPU compute units (CUs)
@@ -158,8 +155,10 @@ def paged_attention_common(
     max_qlen: int = 1,
     max_seq_len: int = 1,
     cu_query_lens: Optional[torch.Tensor] = None,
-    K_QScale: Optional[torch.Tensor] = None,
-    V_QScale: Optional[torch.Tensor] = None,
+    K_QScale_hip: Optional[torch.Tensor] = None, # [num_seqs, num_heads]
+    V_QScale_hip: Optional[torch.Tensor] = None,
+    K_QScale_asm: Optional[torch.Tensor] = None, # [num_blocks, num_kv_heads, block_size]
+    V_QScale_asm: Optional[torch.Tensor] = None,
     out_: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     high_precision: Optional[
@@ -173,14 +172,18 @@ def paged_attention_common(
     Paged attention forward pass with automatic kernel selection.
     ASM is favored for int8 kv caches, for short ctx_len, or when the workload exceeds
     the heuristic thresholds for larger ctx_len values.
+    PA is normally using per tensor quant and this is what has been tested, however, 
+    per head quant can be supported as well in principle, but not tested.
     """
     kv_cache_tensor_dtype = (
         kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else K.dtype
     )
     num_seqs, num_heads, head_size = Q.shape
 
-    # Route to ASM kernel based on the heuristic above.
-    use_asm_kernel = _should_use_asm_kernel(num_seqs, num_heads, kv_cache_tensor_dtype)
+    use_asm_kernel = (
+        _should_use_asm_kernel(num_seqs, num_heads, kv_cache_tensor_dtype)
+        or high_precision == 2
+    )
 
     if use_asm_kernel:
         output = pa_fwd_asm(
@@ -191,8 +194,8 @@ def paged_attention_common(
             context_lens,
             block_tables_stride0,
             max_qlen,
-            K_QScale,
-            V_QScale,
+            K_QScale_asm,
+            V_QScale_asm,
             out_,
             qo_indptr,
             high_precision,
@@ -219,8 +222,8 @@ def paged_attention_common(
         max_context_len=max_seq_len,
         alibi_slopes=None,
         kv_cache_dtype=kv_cache_dtype,
-        k_scale=K_QScale,
-        v_scale=V_QScale,
+        k_scale=K_QScale_hip,
+        v_scale=V_QScale_hip,
         fp8_out_scale=None,
         partition_size=256,
         mtp=1,

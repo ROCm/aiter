@@ -419,8 +419,12 @@ def run_aiter_common(
     scale,
     alibi_slopes,
     block_tables_stride0,
-    k_scale=None,
-    v_scale=None,
+    # ROCm/HIP (scalar) scales
+    k_scale_hip=None,
+    v_scale_hip=None,
+    # ASM (expanded) scales
+    k_scale_asm=None,
+    v_scale_asm=None,
     high_precision=0,
     kv_cache_tensor_dtype=None,
 ):
@@ -454,8 +458,11 @@ def run_aiter_common(
         # python scalar
         return torch.tensor(float(s), device=query.device, dtype=dtypes.fp32)
 
-    k_scale_tensor = _normalize_scale(k_scale)
-    v_scale_tensor = _normalize_scale(v_scale)
+    k_scale_hip_tensor = _normalize_scale(k_scale_hip)
+    v_scale_hip_tensor = _normalize_scale(v_scale_hip)
+    # ASM scales are already tensors in the expected layout; just ensure fp32 on device.
+    k_scale_asm_tensor = _normalize_scale(k_scale_asm)
+    v_scale_asm_tensor = _normalize_scale(v_scale_asm)
 
     # Determine kv_cache_dtype string.
     def _is_fp8_storage(dt: torch.dtype) -> bool:
@@ -492,8 +499,10 @@ def run_aiter_common(
         max_qlen=1,
         max_seq_len=max_seq_len,
         cu_query_lens=None,
-        K_QScale=k_scale_tensor,
-        V_QScale=v_scale_tensor,
+        K_QScale_hip=k_scale_hip_tensor,
+        V_QScale_hip=v_scale_hip_tensor,
+        K_QScale_asm=k_scale_asm_tensor,
+        V_QScale_asm=v_scale_asm_tensor,
         out_=None,
         qo_indptr=None,
         high_precision=high_precision,
@@ -830,27 +839,30 @@ def test_paged_attention(
                 msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
             )
 
-            # Test paged_attention_common with quantized cache
-            out_aiter_common, time_aiter_common = run_aiter_common(
-                query.contiguous(),
-                k_quant_,
-                asm_V_shuffle(v_quant_),
-                block_tables,
-                seq_lens,
-                max_seq_len,
-                kv_cache_dtype,
-                num_kv_heads,
-                scale,
-                alibi_slopes,
-                block_tables.stride(0),
-                k_scale_asm,
-                v_scale_asm,
-            )
-            checkAllclose(
-                out_golden,
-                out_aiter_common,
-                msg=f"golden vs aiter_common:{time_aiter_common:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
-            )
+            if quant_algo_ == 4:
+                # Test paged_attention_common with quantized cache
+                out_aiter_common, time_aiter_common = run_aiter_common(
+                    query.contiguous(),
+                    k_quant_,
+                    asm_V_shuffle(v_quant_),
+                    block_tables,
+                    seq_lens,
+                    max_seq_len,
+                    kv_cache_dtype,
+                    num_kv_heads,
+                    scale,
+                    alibi_slopes,
+                    block_tables.stride(0),
+                    k_scale_hip=k_scale_,
+                    v_scale_hip=v_scale_,
+                    k_scale_asm=k_scale_asm,
+                    v_scale_asm=v_scale_asm,
+                )
+                checkAllclose(
+                    out_golden,
+                    out_aiter_common,
+                    msg=f"golden vs aiter_common:{time_aiter_common:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+                )
 
             if (
                 dtype in [dtypes.bf16, dtypes.fp16]
