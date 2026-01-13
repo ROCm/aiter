@@ -209,7 +209,7 @@ def test_sage(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    config = sage_fwd_configs(False)
+    config = sage_fwd_configs(False, seqlen_q=SEQLEN_Q, seqlen_k=SEQLEN_K)
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
