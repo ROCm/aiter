@@ -221,7 +221,6 @@ def fav3_sage_forward_func(
     layout: Literal["bshd", "bhsd"],
 ):
     config = get_fwd_configs(False, seqlen_k=k.shape[1])
-    print("config", config)
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
@@ -378,7 +377,6 @@ def primary_output(result):
 
 
 def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
-    print(func_name)
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
