@@ -100,6 +100,60 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
     return inputs
 
 
+def fp8_quantize(q, k, v, scale=None):
+    quant_dtype = aiter.dtypes.fp8
+    # Computing "dynamic" scale before quantization improves thpt a small amount (~1-2%) for the (1, 75352, 5, 128) shape
+    quant_q, q_descale = aiter.per_tensor_quant(q, scale=torch.abs(q).max() if scale is None else scale, quant_dtype=quant_dtype, dtypeMax=torch.finfo(quant_dtype).max)
+    quant_k, k_descale = aiter.per_tensor_quant(k, scale=torch.abs(k).max() if scale is None else scale, quant_dtype=quant_dtype, dtypeMax=torch.finfo(quant_dtype).max)
+    quant_v, v_descale = aiter.per_tensor_quant(v, scale=torch.abs(v).max() if scale is None else scale, quant_dtype=quant_dtype, dtypeMax=torch.finfo(quant_dtype).max)
+    return quant_q, quant_k, quant_v, q_descale, k_descale, v_descale
+
+def run_aiter_fp8_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, has_descale: bool = False, scale: Optional[torch.Tensor] = None):
+    scale = scale
+    q, k, v, q_descale, k_descale, v_descale = fp8_quantize(q, k, v, scale=scale)
+    attn_kwargs = {}
+    if has_descale:
+        attn_kwargs = {
+            "q_descale": q_descale,
+            "k_descale": k_descale,
+            "v_descale": v_descale,
+        }
+    fn = lambda: aiter.flash_attn_fp8_pertensor_func(
+        q,
+        k,
+        v,
+        **attn_kwargs,
+    )
+    return fn
+    # torch.cuda.synchronize()
+    #return output
+
+def run_aiter_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, has_round_mode: bool = False):
+    # Note this will JIT compile on first invocation
+    # [aiter] start build [module_fmha_v3_fwd] under /opt/aiter/aiter/jit/build/module_fmha_v3_fwd
+    # Successfully preprocessed all matching files.
+    # [aiter] finish build [module_fmha_v3_fwd], cost 53.76911977s
+    # [aiter] type hints mismatch, override to --> fmha_v3_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float, softmax_scale: float, is_causal: bool, window_size_left: int, window_size_right: int, return_softmax_lse: bool, return_dropout_randval: bool, out: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> list[torch.Tensor]
+
+    if has_round_mode:
+        fn = lambda: aiter.ops.mha.flash_attn_func(
+            q, k, v,
+            dropout_p=0.0,
+            causal=False,
+            return_attn_probs=False,
+            how_v3_bf16_cvt=2
+        )
+    else:
+        fn = lambda: aiter.ops.mha.flash_attn_func(
+            q, k, v,
+            dropout_p=0.0,
+            causal=False,
+            return_attn_probs=False
+    )
+    return fn
+
+
+
 # taken from mha_v3.py
 def fav3_fp8_forward_func(
     q: torch.Tensor,  # High precision (BF16/FP32)
@@ -388,8 +442,11 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
-
-        if func_name == "fav2":  # fav2 (no quantization)
+        if func_name == "aiter_bf16":
+            fn = run_aiter_flash_attn(q, k, v)
+        elif func_name == "aiter_fp8":
+            fn = run_aiter_fp8_flash_attn(q, k, v, has_descale=True)
+        elif func_name == "fav2":  # fav2 (no quantization)
             fn = fav2_forward_func(
                 q,
                 k,
@@ -437,12 +494,12 @@ def bench_kernel(q, k, v, args, provider):
     bench_func_name = ""
     if args.fav3_fp8:
         bench_func_name = "fav3_fp8"
-    elif args.fav3_sage:
-        bench_func_name = "fav3_sage"
+    elif args.aiter_fp8:
+        bench_func_name = "aiter_fp8"
+    elif args.aiter_bf16:
+        bench_func_name = "aiter_bf16"
     else:
-        assert (
-            False
-        ), "One of -fav3_fp8, or -fav3_sage must be specified for diffusion attention benchmark."
+        bench_func_name = "fav3_sage"
 
     fn = attn_forward_func(
         q,
@@ -644,6 +701,18 @@ def parse_args():
         default=False,
         help="Use fav3 fp8 kernel (instead of default fav3_sage): per tensor quantization, QK and PV in fp8, accumulation in fp32",
     )
+    parser.add_argument(
+        "-aiter_fp8",
+        action="store_true",
+        default=False,
+        help="Use ck tile fmhav2 fp8 kernel (instead of default fav3_sage)",
+    )
+    parser.add_argument(
+        "-aiter_bf16",
+        action="store_true",
+        default=False,
+        help="Use asm fav3 bf16 kernel (instead of default fav3_sage)",
+    )
     # parser.add_argument(
     #     "-fav3_sage",
     #     action="store_true",
@@ -713,7 +782,7 @@ arg_to_torch_dtype = {
 def main():
     args = parse_args()
 
-    args.fav3_sage = not args.fav3_fp8
+    args.fav3_sage = not args.fav3_fp8 and not args.aiter_fp8 and not args.aiter_bf16
 
     # Handle captured input mode separately
     if args.load_captured:
