@@ -99,7 +99,7 @@ def calculate_theoretical_time(row, efficiency=0.7):
 
 # Load all_kernel_combinations.csv
 print("Loading all_kernel_combinations.csv...")
-df = pd.read_csv('all_kernel_combinations.csv')
+df = pd.read_csv('results/all_kernel_combinations.csv')
 
 print(f"Loaded {len(df)} kernel combinations")
 
@@ -154,7 +154,7 @@ keep_cols = [col for col in keep_cols if col in best_per_config.columns]
 best_per_config = best_per_config[keep_cols]
 
 # Save best per config only
-output_file = 'best_kernels_with_reference.csv'
+output_file = 'results/best_kernels_with_reference.csv'
 best_per_config.to_csv(output_file, index=False)
 
 print(f"\nSaved {len(best_per_config)} best kernels to: {output_file}")

@@ -11,7 +11,7 @@ For each config:
 import pandas as pd
 
 print("Loading results.csv...")
-df = pd.read_csv('results.csv')
+df = pd.read_csv('results/results.csv')
 
 # Filter valid results
 valid_df = df[df['error'] != 'failed'].copy()
@@ -80,7 +80,6 @@ for config_idx in unique_configs:
                 'stage2_tflops': s2['tflops'],
                 
                 'total_time_us': total_time,
-                'total_tflops': s1['tflops'] + s2['tflops'],
             })
     
     # 1-stage kernels
@@ -118,7 +117,6 @@ for config_idx in unique_configs:
             'stage2_tflops': 0,
             
             'total_time_us': ks['time_us'],
-            'total_tflops': ks['tflops'],
         })
 
 # Create dataframe
@@ -128,7 +126,7 @@ result_df = pd.DataFrame(all_combinations)
 result_df = result_df.sort_values(['config_idx', 'total_time_us'])
 
 # Save to CSV
-output_file = 'all_kernel_combinations.csv'
+output_file = 'results/all_kernel_combinations.csv'
 result_df.to_csv(output_file, index=False)
 
 print(f"\nGenerated {len(result_df)} kernel combinations")
