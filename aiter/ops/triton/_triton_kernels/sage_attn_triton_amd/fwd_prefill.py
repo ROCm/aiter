@@ -85,22 +85,22 @@ def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None):
                     "waves_per_eu": 2
                 }
             elif seqlen_q <= 75600:
-                return {
-                    "BLOCK_M": 256,
-                    "BLOCK_N": 128,
-                    "num_warps": 8,
-                    "PRE_LOAD_V": True,
-                    "num_stages": 1,
-                    "waves_per_eu": 0
-                }
                 # return {
                 #     "BLOCK_M": 256,
                 #     "BLOCK_N": 128,
-                #     "waves_per_eu": 0,
-                #     "PRE_LOAD_V": False,
-                #     "num_stages": 5,
                 #     "num_warps": 8,
+                #     "PRE_LOAD_V": True,
+                #     "num_stages": 1,
+                #     "waves_per_eu": 0
                 # }
+                return {
+                    "BLOCK_M": 256,
+                    "BLOCK_N": 128,
+                    "waves_per_eu": 0,
+                    "PRE_LOAD_V": False,
+                    "num_stages": 5,
+                    "num_warps": 8,
+                }
             else:
                 # return tuned config for seqlen_q == 118808
                 return {
