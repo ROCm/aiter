@@ -147,7 +147,9 @@ def paged_attention_common(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
-    workspace_buffer: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
     block_tables_stride0: int,
@@ -198,25 +200,31 @@ def paged_attention_common(
         )
         return output
 
-    # Use HIP kernel for smaller workloads (5D V cache)
+    # Use ROCm paged attention kernel for smaller workloads / common path.
     output = out_ if out_ is not None else torch.empty_like(Q)
-    paged_attention_v1(
-        output,
-        workspace_buffer,
-        Q,
-        K,
-        V,
-        scale,
-        block_tables,
-        cu_query_lens,
-        context_lens,
-        max_seq_len,
-        None,  # alibi_slopes
-        kv_cache_dtype,
-        "HND",
-        logits_soft_cap,
-        K_QScale,
-        V_QScale,
+
+    paged_attention_rocm(
+        out=output,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        tmp_out=tmp_out,
+        query=Q,
+        key_cache=K,
+        value_cache=V,
+        num_kv_heads=int(K.size(1)),
+        scale=scale,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        block_size=int(K.size(3)),
+        max_context_len=max_seq_len,
+        alibi_slopes=None,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=K_QScale,
+        v_scale=V_QScale,
+        fp8_out_scale=None,
+        partition_size=256,
+        mtp=1,
+        q_scale=None,
     )
     return output
 

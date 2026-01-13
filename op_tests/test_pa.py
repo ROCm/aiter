@@ -429,19 +429,20 @@ def run_aiter_common(
     """
 
     num_seqs, num_heads, head_size = query.shape
-    # Create workspace buffer for HIP kernel path
-    # Workspace buffer size calculation from test_pa_v1.py
+    # Client-side allocations required by ROCm paged attention path.
     _PARTITION_SIZE_ROCM = 256
-    max_num_partitions = (
-        max_seq_len + _PARTITION_SIZE_ROCM - 1
-    ) // _PARTITION_SIZE_ROCM
-    nbyes_per_qo_elem = torch.finfo(query.dtype).bits // 8
-    workspace_buffer = torch.empty(
-        (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
-        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
-        dtype=torch.uint8,
+    max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM - 1) // _PARTITION_SIZE_ROCM
+    tmp_out = torch.empty(
+        (num_seqs, num_heads, max_num_partitions, head_size),
+        dtype=query.dtype,
         device=query.device,
     )
+    exp_sums = torch.empty(
+        (num_seqs, num_heads, max_num_partitions),
+        dtype=dtypes.fp32,
+        device=query.device,
+    )
+    max_logits = torch.empty_like(exp_sums)
 
     def _normalize_scale(s):
         if s is None:
@@ -478,7 +479,9 @@ def run_aiter_common(
         Q=query.contiguous(),
         K=k_cache,
         V=v_cache,
-        workspace_buffer=workspace_buffer,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        tmp_out=tmp_out,
         block_tables=block_tables,
         context_lens=seq_lens,
         block_tables_stride0=block_tables_stride0,
