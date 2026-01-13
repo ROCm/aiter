@@ -67,6 +67,7 @@ struct AiterAsmKernelArgs
     const hipStream_t stream;
 };
 
+static const std::string get_gpu_arch();
 class AiterAsmKernel
 {
     private:
@@ -77,9 +78,11 @@ class AiterAsmKernel
     AiterAsmKernel(const char* name, const char* hsaco)
     {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-        std::cout << "[aiter] hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str()
+        std::string arch_name = get_gpu_arch();
+        std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
+        std::cout << "[aiter] hipModuleLoad: " << hsa_path
                   << " GetFunction: " << name;
-        HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
+        HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
     };
