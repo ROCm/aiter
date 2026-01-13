@@ -22,6 +22,7 @@ declare -a tune_jobs=(
   "ck_gemm_a8w8_blockscale:csrc/ck_gemm_a8w8_blockscale:op_tests/test_gemm_a8w8_blockscale.py:python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py -i aiter/configs/a8w8_blockscale_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_tuned_gemm.csv"
   "ck_gemm_a8w8_blockscale_bpreshuffle:csrc/ck_gemm_a8w8_blockscale_bpreshuffle:op_tests/test_gemm_a8w8_blockscale.py:python3 csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py -i aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv"
   "ck_gemm_a8w8_bpreshuffle:csrc/ck_gemm_a8w8_bpreshuffle:op_tests/test_gemm_a8w8.py:python3 csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py -i aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv"
+  "ck_gemm_moe_2stages_codegen:csrc/ck_gemm_moe_2stages_codegen:op_tests/test_moe.py:python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i aiter/configs/untuned_fmoe.csv -o aiter/configs/tuned_fmoe.csv"
   #"ck_gemm_a4w4_blockscale:csrc/ck_gemm_a4w4_blockscale:op_tests/test_gemm_a4w4_blockscale.py:python3 csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py -i aiter/configs/a4w4_blockscale_untuned_gemm.csv -o aiter/configs/a4w4_blockscale_tuned_gemm.csv"
 )
 
