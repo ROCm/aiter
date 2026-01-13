@@ -23,11 +23,11 @@ Example 2: Background tunning for A8W8 GEMM blockscale using specific `BLOCK_SIZ
         nohup python3 screen.py \
             $M $N $K $G \
             ut_a8w8_gemm_blockscale.py \
-            --k-range 128 \
+            --block-size-k-range 128 \
             > example2-M=$M-N=$N-K=$K-G=$G.out &
     done
 
-Example 3: Background tunning for AFP4WFP4 GEMM. In this case `BLOCK_SZIE_M` has to meet the following requirements: `1) BLOCK_SIZE_M < 32 for M < 32, 2) BLOCK_SIZE_M >= 32 for M >= 32`. `BLOCK_SIZE_K` has to meet the following requirements: `BLOCK_SIZE_K >= 256`. If we still use the default settings, GEMM will give assertion errors, screen.py will skip those cases first time it hits assert errors and skip all other cases that shares the same BLOCK_SIZE. See the generated *.log files and termeinal output (example3.out) for more details. It will take a few minutes for screen.py to skip through those failed configs, so if you want to save those few minutes, you have to set dedicated `--m-range` for each `M` to skip invalid `BLOCK_SZIE_M`
+Example 3: Background tunning for AFP4WFP4 GEMM. In this case `BLOCK_SZIE_M` has to meet the following requirements: `1) BLOCK_SIZE_M < 32 for M < 32, 2) BLOCK_SIZE_M >= 32 for M >= 32`. `BLOCK_SIZE_K` has to meet the following requirements: `BLOCK_SIZE_K >= 256`. If we still use the default settings, GEMM will give assertion errors, screen.py will skip those cases first time it hits assert errors and skip all other cases that shares the same BLOCK_SIZE. See the generated *.log files and termeinal output (example3.out) for more details. It will take a few minutes for screen.py to skip through those failed configs, so if you want to save those few minutes, you have to set dedicated `--block-size-m-range` for each `M` to skip invalid `BLOCK_SZIE_M`. This example also enables verbose printout that shows the pre-pruned cases and the error messages that triggers exclusions of cases on-the-fly.
 
     N=7168
     K=2048
@@ -35,7 +35,9 @@ Example 3: Background tunning for AFP4WFP4 GEMM. In this case `BLOCK_SZIE_M` has
     python3 screen.py \
         64 $N $K $G \
         ut_afp4wfp4_gemm_preshuffle.py \
-        --k-range 256 512 1024 \
+        --block-size-k-range 256 512 1024 \
+        --overwrite \
+        --verbose \
         > example3.out
     
 **Viewing results and generate JSON config files**
@@ -54,7 +56,7 @@ Example 3:
 
     N=2112
     K=7168
-    python view-screen.py ut_afp4wfp4_gemm_preshuffle.py --n-list 2112 --k-list 7168
+    python view-screen.py ut_afp4wfp4_gemm_preshuffle.py --n-list $N --k-list $K
 
 **Verify performance**
 

@@ -107,3 +107,44 @@ def read_screen_file(filename, case_data):
                     )
                 except:
                     break
+
+
+def pre_pruning_rules(M: int, N: int, K: int, config_list: list[int], verbose: bool):
+    (
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+        GROUP_SIZE_M,
+        num_warps,
+        num_stages,
+        waves_per_eu,
+        matrix_instr_nonkdim,
+        cache_modifier,
+        NUM_KSPLIT,
+    ) = config_list
+    # remove cases
+    if BLOCK_SIZE_K >= 2 * (K // NUM_KSPLIT):
+        if verbose:
+            print(
+                f"Remove case {config_list} because BLOCK_SIZE_K >= 2 * (K // NUM_KSPLIT)"
+            )
+        return True
+    if NUM_KSPLIT > 1 and GROUP_SIZE_M > 1:
+        if verbose:
+            print(
+                f"Remove case {config_list} because NUM_KSPLIT > 1 and GROUP_SIZE_M > 1"
+            )
+        return True
+    if BLOCK_SIZE_K == K // NUM_KSPLIT and num_stages > 1:  # k_itr == 1 case
+        if verbose:
+            print(
+                f"Remove case {config_list} because BLOCK_SIZE_K == K // NUM_KSPLIT and num_stages > 1"
+            )
+        return True
+    if BLOCK_SIZE_K < K // NUM_KSPLIT and num_stages == 1:  # k_itr > 1 case
+        if verbose:
+            print(
+                f"Remove case {config_list} because BLOCK_SIZE_K < K // NUM_KSPLIT and num_stages == 1"
+            )
+        return True
+    return False
