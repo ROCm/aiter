@@ -59,7 +59,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         # Use provided config or get default config
         if config is None:
-            config = get_fwd_configs(False, seqlen_k=seqlen_k)
+            config = get_fwd_configs(False, seqlen_q=seqlen_q, seqlen_k=seqlen_k, num_heads=num_q_heads)
         # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
         # config = config[0].all_kwargs()
         BLKQ = config["BLOCK_M"]
@@ -370,7 +370,7 @@ def fav3_sage_func(
 
     # Use provided config or get default config
     if config is None:
-        config = get_fwd_configs(False, seqlen_k=seqlen_k)
+        config = get_fwd_configs(False, seqlen_q=seqlen_q, seqlen_k=seqlen_k, num_heads=num_q_heads)
     # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
     # config = config[0].all_kwargs()
     BLKQ = config["BLOCK_M"]
