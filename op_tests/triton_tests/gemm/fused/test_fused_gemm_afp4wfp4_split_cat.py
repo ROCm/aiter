@@ -186,6 +186,16 @@ def test_fused_gemm_afp4wfp4_split_cat(dtype, M, N, K, D, S3, layout, shuffle):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
+    if shuffle:
+        if N % 32 > 0:
+            pytest.skip(
+                f"N = {N} is not divisible by 32, skip this test for preshuffled weight/scales tests"
+            )
+        if K % 256 > 0:
+            pytest.skip(
+                f"K = {K} is not divisible by 256, skip this test for preshuffled weight/scales tests"
+            )
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
     # skip tests

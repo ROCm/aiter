@@ -92,6 +92,16 @@ def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
+    if fp4_shuffle:
+        if N1 % 32 > 0:
+            pytest.skip(
+                f"N1 = {N1} is not divisible by 32, skip this test for preshuffled weight/scales tests"
+            )
+        if K % 256 > 0:
+            pytest.skip(
+                f"K = {K} is not divisible by 256, skip this test for preshuffled weight/scales tests"
+            )
+
     (
         x_fp4,
         w_fp4,

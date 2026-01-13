@@ -68,7 +68,7 @@ def test_fused_gemm_afp4wfp4_mul_add(
             pytest.skip(
                 f"N = {N} is not divisible by 32, skip this test for preshuffled weight/scales tests"
             )
-        elif K % 256 > 0:
+        if K % 256 > 0:
             pytest.skip(
                 f"K = {K} is not divisible by 256, skip this test for preshuffled weight/scales tests"
             )

@@ -356,7 +356,10 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
         offs_k_shuffle = pid_k * SPLITK_BLOCK_SIZE * 16 + offs_k_shuffle_arr
 
         offs_a_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_b_n = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % N
+        # because weight has to be padded to multiple of 16, so that % (N // 16) is no longer required for weight
+        offs_b_n = pid_n * (BLOCK_SIZE_N // 16) + tl.arange(
+            0, BLOCK_SIZE_N // 16
+        )  # % (N // 16)
         a_ptrs = a_ptr + (
             offs_a_m[:, None] * stride_a_m + offs_k_split[None, :] * stride_a_k
         )
