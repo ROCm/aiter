@@ -14,7 +14,7 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
 
 
-def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None):
+def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None, num_heads: int = None):
     assert not autotune, "Autotuning is not supported."
     arch = get_arch()
     if arch == "gfx950":
@@ -64,14 +64,24 @@ def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None):
                     "waves_per_eu": 2
                 }
             elif seqlen_q <= 29760:
-                return {
-                    "BLOCK_M": 256,
-                    "BLOCK_N": 128,
-                    "num_warps": 8,
-                    "num_stages": 3,
-                    "waves_per_eu": 2,
-                    "PRE_LOAD_V": False
-                }
+                if num_heads >= 3:
+                    return {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 128,
+                        "PRE_LOAD_V": False,
+                        "num_warps": 4,
+                        "num_stages": 1,
+                        "waves_per_eu": 2
+                    }
+                else:
+                    return {
+                        "BLOCK_M": 256,
+                        "BLOCK_N": 128,
+                        "num_warps": 8,
+                        "num_stages": 3,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False
+                    }
             elif seqlen_q <= 75600:
                 return {
                     "BLOCK_M": 256,
@@ -1933,7 +1943,7 @@ def fav3_sage_triton_impl(
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     if config is None:
-        config = get_fwd_configs(False, seqlen_q=max_seqlens_q, seqlen_k=max_seqlens_k)
+        config = get_fwd_configs(False, seqlen_q=max_seqlens_q, seqlen_k=max_seqlens_k, num_heads=nheads_q)
     attn_fwd[grid](
         q,
         k,

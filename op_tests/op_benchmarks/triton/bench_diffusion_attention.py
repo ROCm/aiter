@@ -274,7 +274,8 @@ def fav3_sage_forward_func(
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
 ):
-    config = get_fwd_configs(False, seqlen_q=q.shape[1], seqlen_k=k.shape[1])
+    num_heads = q.shape[2] if layout == "bshd" else q.shape[1]
+    config = get_fwd_configs(False, seqlen_q=q.shape[1], seqlen_k=k.shape[1], num_heads=num_heads)
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
