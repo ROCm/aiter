@@ -206,7 +206,7 @@ def main():
     parms_comb_list = list(product(*parms.values()))
     parms_comb_list_pruned = []
     print()
-    print(f"Pre-pruning cases...", flush=True)
+    print("Pre-pruning cases...", flush=True)
     n_case_remove = 0
     for config_list in parms_comb_list:
         if pre_pruning_rules(M, N, K, config_list, verbose=verbose):
@@ -221,8 +221,8 @@ def main():
     log_filename = f"screen-{file_tag}.log"
     print(f"Screening results will be output to {log_filename}", flush=True)
     print()
-    assert (
-        force_overwrite == True or os.path.isfile(log_filename) == False
+    assert force_overwrite or not os.path.isfile(
+        log_filename
     ), f"{log_filename} exists, please save your file somewhere else or use --overwrite to force overwrite log files"
     s = " ".join([str(v) for v in parms.keys()])
     echo_to_file(f"Number of combinations = {len(parms_comb_list)}", log_filename, True)
@@ -274,7 +274,7 @@ def main():
 
         rocprof_filename = f"res-{file_tag}_kernel_trace.csv"
 
-        if os.path.isfile(rocprof_filename) == True:
+        if os.path.isfile(rocprof_filename):
             process = subprocess.Popen(
                 ["rm", rocprof_filename],
                 stdout=subprocess.PIPE,
@@ -289,7 +289,7 @@ def main():
         stdout_data, stderr_data = process.communicate()
 
         if process.returncode == 0:
-            if os.path.isfile(rocprof_filename) == True:
+            if os.path.isfile(rocprof_filename):
                 cmd_rprof = f"""python3 rprof.py {rocprof_filename} -k gemm"""
                 cmd_rprof = cmd_rprof.split(" ")
                 process = subprocess.Popen(
@@ -319,15 +319,15 @@ def main():
                 else:
                     if verbose:
                         print(f"[Error]: {rocprof_filename} reading error:", flush=True)
-                        for l in stderr_data:
-                            print(f"\t{l}", flush=True)
+                        for stderr_str in stderr_data:
+                            print(f"\t{stderr_str}", flush=True)
             else:
                 if verbose:
                     print(f"[Error]: {rocprof_filename} not found", flush=True)
         else:
             stderr_data = stderr_data.split("\n")
             if verbose:
-                print(f"[Error]: when running rocprof, error message:", flush=True)
+                print("[Error]: when running rocprof, error message:", flush=True)
             for i_line, aline in enumerate(stderr_data):
                 if (
                     "exceeds triton maximum tensor numel" in aline
@@ -335,24 +335,24 @@ def main():
                     or "AssertionError" in aline
                 ):
                     if verbose:
-                        print(f"\t...", flush=True)
+                        print("\t...", flush=True)
                         for j_line in range(
                             max(0, i_line - 5), min(len(stderr_data), i_line + 5)
                         ):
                             print(f"\t{stderr_data[j_line]}", flush=True)
-                        print(f"\t...", flush=True)
+                        print("\t...", flush=True)
                     break
             else:
                 if verbose:
-                    print(f"\tUn-identified error:", flush=True)
-                    for l in stderr_data:
-                        print(f"\t{l}", flush=True)
+                    print("\tUn-identified error:", flush=True)
+                    for stderr_str in stderr_data:
+                        print(f"\t{stderr_str}", flush=True)
 
             exclude_mnk[tuple(parms_comb_list[i_comb_start][:3])] = 1
 
             if verbose:
                 print(f"Excluding all {mnk_str} cases", flush=True)
-                print(f"", flush=True)
+                print()
 
         i_comb_start = i_comb_end
         date_to_file(log_filename)

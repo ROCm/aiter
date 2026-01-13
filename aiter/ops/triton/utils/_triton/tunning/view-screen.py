@@ -57,7 +57,7 @@ def main():
 
     list_of_shapes = [(nlist[i], klist[i]) for i in range(len(nlist))]
 
-    if config_json_file_prefix == None:
+    if config_json_file_prefix is None:
         a_and_w = ut_filename[
             ut_filename.index("ut_") + 3 : ut_filename.index("_gemm")
         ].upper()
@@ -98,7 +98,7 @@ def main():
         if len(mlist) == 0:
             continue
 
-        print(f"M\tN\tK\tTriton (us)\tconfig")
+        print("M\tN\tK\tTriton (us)\tconfig")
         last_config_list = None
         get_at_least_one_config = False
         fout = open(f"{config_json_file_prefix}-N={n}-K={k}.json", "w")
@@ -157,14 +157,14 @@ def main():
 
         fout.write("}\n")
         fout.close()
-        if get_at_least_one_config == False:
+        if not get_at_least_one_config:
             os.popen(f"rm {config_json_file_prefix}-N={n}-K={k}.json").read()
-            print(f"No file is created")
+            print("No file is created")
         else:
             print(f"{config_json_file_prefix}-N={n}-K={k}.json is created")
 
     print(
-        f"Warning! Please make sure the output JSON filenames are correct for each GEMM"
+        "Warning! Please make sure the output JSON filenames are correct for each GEMM"
     )
 
 

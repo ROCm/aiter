@@ -1,7 +1,5 @@
-from itertools import product
 import os
 import sys
-import triton
 import argparse
 import subprocess
 
@@ -30,7 +28,7 @@ def main():
 
     rocprof_filename = f"verf_{file_tag}_kernel_trace.csv"
 
-    if os.path.isfile(rocprof_filename) == True:
+    if os.path.isfile(rocprof_filename):
         process = subprocess.Popen(
             ["rm", rocprof_filename],
             stdout=subprocess.PIPE,
@@ -46,7 +44,7 @@ def main():
     stdout_data, stderr_data = process.communicate()
 
     if process.returncode == 0:
-        if os.path.isfile(rocprof_filename) == True:
+        if os.path.isfile(rocprof_filename):
             cmd_rprof = f"""python3 rprof.py {rocprof_filename} -k gemm"""
             cmd_rprof = cmd_rprof.split(" ")
             process = subprocess.Popen(
@@ -68,15 +66,15 @@ def main():
                     print(prof_output[prof_output_i], flush=True)
                     prof_output_i += 1
             else:
-                for l in stderr_data:
-                    print(f"\t{l}")
+                for stderr_str in stderr_data:
+                    print(f"\t{stderr_str}")
         else:
             print(f"[Error]: {rocprof_filename} not found")
     else:
         stderr_data = stderr_data.split("\n")
-        print(f"[Error]: when running rocprof, error message:")
-        for l in stderr_data:
-            print(f"\t{l}")
+        print("[Error]: when running rocprof, error message:")
+        for stderr_str in stderr_data:
+            print(f"\t{stderr_str}")
 
 
 if __name__ == "__main__":
