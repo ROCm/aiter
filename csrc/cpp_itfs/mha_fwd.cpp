@@ -225,7 +225,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     auto result = impl_ptr_map.emplace(name, nullptr);
     if(result.second)
     {
-        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
+        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str(), arch_id.c_str());
     }
     impl_ptr = result.first->second.get();
 
