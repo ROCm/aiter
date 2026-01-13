@@ -155,9 +155,11 @@ def paged_attention_common(
     max_qlen: int = 1,
     max_seq_len: int = 1,
     cu_query_lens: Optional[torch.Tensor] = None,
-    K_QScale_hip: Optional[torch.Tensor] = None, # [num_seqs, num_heads]
+    K_QScale_hip: Optional[torch.Tensor] = None,  # [num_seqs, num_heads]
     V_QScale_hip: Optional[torch.Tensor] = None,
-    K_QScale_asm: Optional[torch.Tensor] = None, # [num_blocks, num_kv_heads, block_size]
+    K_QScale_asm: Optional[
+        torch.Tensor
+    ] = None,  # [num_blocks, num_kv_heads, block_size]
     V_QScale_asm: Optional[torch.Tensor] = None,
     out_: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
@@ -172,7 +174,7 @@ def paged_attention_common(
     Paged attention forward pass with automatic kernel selection.
     ASM is favored for int8 kv caches, for short ctx_len, or when the workload exceeds
     the heuristic thresholds for larger ctx_len values.
-    PA is normally using per tensor quant and this is what has been tested, however, 
+    PA is normally using per tensor quant and this is what has been tested, however,
     per head quant can be supported as well in principle, but not tested.
     """
     kv_cache_tensor_dtype = (
