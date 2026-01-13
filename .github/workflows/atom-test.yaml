@@ -72,7 +72,7 @@ jobs:
   atom_benchmark:
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: build_atom_image
-    runs-on: aiter-8gpu-runner
+    runs-on: aiter-mi355-8gpu
     strategy:
       fail-fast: false
       matrix:
