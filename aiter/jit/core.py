@@ -818,7 +818,7 @@ def compile_ops(
                 if module is None:
                     try:
                         module = get_module(md_name)
-                    except Exception as e:
+                    except Exception:
                         md = custom_build_args.get("md_name", md_name)
                         module = get_module(md)
             except ModuleNotFoundError:
