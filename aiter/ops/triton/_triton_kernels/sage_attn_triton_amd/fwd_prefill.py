@@ -64,22 +64,13 @@ def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None):
                     "waves_per_eu": 2
                 }
             elif seqlen_q <= 29760:
-                # if num_heads >=24:
-                #     return {
-                #         "BLOCK_M": 256,
-                #             "BLOCK_N": 128,
-                #             "num_warps": 8,
-                #             "num_stages": 1,
-                #             "waves_per_eu": 1,
-                #             "PRE_LOAD_V": False
-                #     }
                 return {
-                    "BLOCK_M": 128,
+                    "BLOCK_M": 256,
                     "BLOCK_N": 128,
-                    "PRE_LOAD_V": False,
-                    "num_warps": 4,
-                    "num_stages": 1,
-                    "waves_per_eu": 2
+                    "num_warps": 8,
+                    "num_stages": 5,
+                    "waves_per_eu": 2,
+                    "PRE_LOAD_V": False
                 }
             elif seqlen_q <= 75600:
                 return {
