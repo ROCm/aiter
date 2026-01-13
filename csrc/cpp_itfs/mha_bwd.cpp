@@ -391,12 +391,19 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto pre_kernel_launch = [&]() {
+        // Use thread_local storage to ensure lifetime extends beyond kernel launch
+        static thread_local fmha_bwd_odo_args odo_args_tls;
+        static thread_local int arg_size_tls;
+
+        odo_args_tls = odo_args;
+        arg_size_tls = sizeof(odo_args_tls);
+
         int bdx = 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
-        impl_ptr_pre->launch_kernel({&odo_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        impl_ptr_pre->launch_kernel({&odo_args_tls, &arg_size_tls, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
     };
 
     fmha_bwd_dqdkdv_args dqdkdv_args;
@@ -480,6 +487,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     arg_size                  = sizeof(dqdkdv_args);
     auto dqdkdv_kernel_launch = [&]() {
+        // Use thread_local storage to ensure lifetime extends beyond kernel launch
+        static thread_local fmha_bwd_dqdkdv_args dqdkdv_args_tls;
+        static thread_local int arg_size_tls;
+
+        dqdkdv_args_tls = dqdkdv_args;
+        arg_size_tls = sizeof(dqdkdv_args_tls);
+
         int bdx = 256;
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         int gdy = a.nhead_q;
@@ -491,7 +505,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         }
 
         impl_ptr_dqdkdv->launch_kernel(
-            {&dqdkdv_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+            {&dqdkdv_args_tls, &arg_size_tls, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
     };
 
     if(!need_post_processing)
@@ -520,13 +534,20 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto post_kernel_launch = [&]() {
+        // Use thread_local storage to ensure lifetime extends beyond kernel launch
+        static thread_local fmha_bwd_post_kernel_args post_args_tls;
+        static thread_local int arg_size_tls;
+
+        post_args_tls = post_args;
+        arg_size_tls = sizeof(post_args_tls);
+
         int bdx = 256;
         int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
         impl_ptr_post->launch_kernel(
-            {&post_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+            {&post_args_tls, &arg_size_tls, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
     };
     return ck_tile::launch_kernel(
         s,
