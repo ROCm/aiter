@@ -391,9 +391,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto pre_kernel_launch = [&]() {
-        // Use thread_local storage to ensure lifetime extends beyond kernel launch
-        static thread_local fmha_bwd_odo_args odo_args_tls;
-        static thread_local int arg_size_tls;
+        fmha_bwd_odo_args odo_args_tls;
+        int arg_size_tls;
 
         odo_args_tls = odo_args;
         arg_size_tls = sizeof(odo_args_tls);
@@ -487,9 +486,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     arg_size                  = sizeof(dqdkdv_args);
     auto dqdkdv_kernel_launch = [&]() {
-        // Use thread_local storage to ensure lifetime extends beyond kernel launch
-        static thread_local fmha_bwd_dqdkdv_args dqdkdv_args_tls;
-        static thread_local int arg_size_tls;
+        fmha_bwd_dqdkdv_args dqdkdv_args_tls;
+        int arg_size_tls;
 
         dqdkdv_args_tls = dqdkdv_args;
         arg_size_tls = sizeof(dqdkdv_args_tls);
@@ -534,9 +532,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto post_kernel_launch = [&]() {
-        // Use thread_local storage to ensure lifetime extends beyond kernel launch
-        static thread_local fmha_bwd_post_kernel_args post_args_tls;
-        static thread_local int arg_size_tls;
+        fmha_bwd_post_kernel_args post_args_tls;
+        int arg_size_tls;
 
         post_args_tls = post_args;
         arg_size_tls = sizeof(post_args_tls);
