@@ -68,7 +68,7 @@ def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None):
                     "BLOCK_M": 256,
                     "BLOCK_N": 128,
                     "num_warps": 8,
-                    "num_stages": 5,
+                    "num_stages": 3,
                     "waves_per_eu": 2,
                     "PRE_LOAD_V": False
                 }
