@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "quick_all_reduce_base.h"
 #include <vector>
 #define caltime
@@ -601,7 +601,8 @@ struct AllReduceTwoshot
         Codec codec(thread, rank);
         int block_id = blockIdx.x;
         uint8_t* buffer_ptr[kWorldSize];
-        for (int i = 0; i < kWorldSize; ++i) {
+        for(int i = 0; i < kWorldSize; ++i)
+        {
             buffer_ptr[i] = buffer_list[i];
         }
         // --------------------------------------------------------
