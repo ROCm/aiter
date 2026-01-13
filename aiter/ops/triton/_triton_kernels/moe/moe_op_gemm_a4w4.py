@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -194,8 +195,70 @@ def _reduce_grouped(
         tl.store(out_ptr, acc, mask=out_n_mask)
 
 
+@triton.jit
+def _mxfp4_quant_kernel(
+    x_ptr,
+    x_fp4_ptr,
+    bs_ptr,
+    stride_x_m,
+    stride_x_n,
+    stride_fp4_m,
+    stride_fp4_n,
+    stride_bs_m,
+    stride_bs_n,
+    M,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    EVEN_M_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask = mask_m[:, None] & mask_n[None, :]
+    x_offs = offs_m[:, None] * stride_x_m + offs_n[None, :] * stride_x_n
+    x = tl.load(x_ptr + x_offs, mask=mask, other=0).to(tl.float32)
+
+    out_tensor, bs_e8m0 = _mxfp4_quant_op(
+        x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+    )
+
+    # Store quantized x blocks
+    out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
+    out_offs = offs_m[:, None] * stride_fp4_m + out_offs_n[None, :] * stride_fp4_n
+
+    if EVEN_M_N:
+        tl.store(x_fp4_ptr + out_offs, out_tensor)
+    else:
+        out_mask = (offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
+        tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
+
+    # Store scale blocks
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    num_blocks_total = N // MXFP4_QUANT_BLOCK_SIZE
+    bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+
+    bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+    bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < num_blocks_total)[None, :]
+
+    if EVEN_M_N:
+        tl.store(bs_ptr + bs_offs, bs_e8m0)
+    else:
+        tl.store(
+            bs_ptr + bs_offs,
+            bs_e8m0,
+            mask=bs_mask,
+        )
+
+
 @triton.jit(launch_metadata=matmul_launch_metadata)
-def _moe_gemm_a8w8(
+def _moe_gemm_a4w4(
     Y,
     stride_y_k,
     stride_y_m,
@@ -215,7 +278,6 @@ def _moe_gemm_a8w8(
     stride_w_mx_k,
     stride_w_mx_n,
     X_static_scale,
-    W_static_scale,
     Quant_static_scale,
     B,
     stride_b_e,  # Bias
@@ -276,21 +338,18 @@ def _moe_gemm_a8w8(
     tl.assume(grid_n >= 0)
 
     is_x_microscaled: tl.constexpr = XMxScale is not None
-    is_w_microscaled: tl.constexpr = WMxScale is not None
     MX_PACK_DIVISOR: tl.constexpr = 32
     w_type: tl.constexpr = W.dtype.element_ty
-    if is_w_microscaled:
-        tl.static_assert(w_type == tl.float8e4nv, "mx_weight_ptr must be float8e4nv")
-        tl.static_assert(
-            WMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
-        )
-        tl.static_assert(
-            BLOCK_K % MX_PACK_DIVISOR == 0,
-            "BLOCK_K must be a multiple of MX_PACK_DIVISOR",
-        )
+    tl.static_assert(w_type == tl.uint8, "mx_weight_ptr must be uint8 or fp8")
+    tl.static_assert(
+        WMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
+    )
+    tl.static_assert(
+        BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
+    )
     x_type: tl.constexpr = X.dtype.element_ty
     if is_x_microscaled:
-        tl.static_assert(x_type == tl.float8e4nv, "mx_act_ptr must be float8e4nv")
+        tl.static_assert(x_type == tl.uint8, "mx_act_ptr must be uint8")
         tl.static_assert(
             XMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
         )
@@ -338,53 +397,64 @@ def _moe_gemm_a8w8(
     start_m = start_m.to(index_type)
     pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
 
+    X_M_DIVISOR: tl.constexpr = 1
+    X_K_DIVISOR: tl.constexpr = 2
+    W_K_DIVISOR: tl.constexpr = 2
+    W_N_DIVISOR: tl.constexpr = 1
+    PACKED_BLOCK_M_X: tl.constexpr = BLOCK_M // X_M_DIVISOR
+    PACKED_BLOCK_K_X: tl.constexpr = BLOCK_K // X_K_DIVISOR
+    PACKED_BLOCK_K_W: tl.constexpr = BLOCK_K // W_K_DIVISOR
+    PACKED_BLOCK_N_W: tl.constexpr = BLOCK_N // W_N_DIVISOR
+    MX_SCALE_BLOCK_K: tl.constexpr = BLOCK_K // MX_PACK_DIVISOR
+
     # A pointers
-    offs_x_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
-    offs_x_m = tl.max_contiguous(tl.multiple_of(offs_x_m % M, BLOCK_M), BLOCK_M)
+    offs_x_m = PACKED_BLOCK_M_X * block_id + tl.arange(0, PACKED_BLOCK_M_X)
+    offs_x_m = tl.max_contiguous(
+        tl.multiple_of(offs_x_m % (M // X_M_DIVISOR), PACKED_BLOCK_M_X),
+        PACKED_BLOCK_M_X,
+    )
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
         GatherIndx += start_m
         # no needs to bounds-check here because `offs_x_m` wraps around M dim
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
-    offs_x_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
+    offs_x_k = PACKED_BLOCK_K_X * pid_k + tl.arange(0, PACKED_BLOCK_K_X)
     XPtrs = (
         X
         + offs_x_m.to(index_type)[:, None] * stride_x_m
         + offs_x_k.to(index_type)[None, :] * stride_x_k
     )
 
-    MX_SCALE_BLOCK_K: tl.constexpr = BLOCK_K // MX_PACK_DIVISOR
-
-    if is_w_microscaled:
-        WMxScale += expt_id * stride_w_mx_e
-        if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-            NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
-            PACKED_MX_BLOCK: tl.constexpr = (
-                MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
-            )
-            SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
-        else:
-            PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
-            SCALE_BLOCK_N: tl.constexpr = BLOCK_N
-        offs_w_n_scale = (pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)) % N
-        offs_w_n_scale = tl.max_contiguous(
-            tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
-        )
-        offs_w_k_scale = PACKED_MX_BLOCK * pid_k + tl.arange(0, PACKED_MX_BLOCK)
-        WMxScalePtrs = (
-            WMxScale
-            + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
-            + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
-        )
+    WMxScale += expt_id * stride_w_mx_e
+    if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+        tl.static_assert(stride_w_mx_k is not None)
+        tl.static_assert(stride_w_mx_n is not None)
+        NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
+        PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
+        SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
+    else:
+        PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
+        SCALE_BLOCK_N: tl.constexpr = BLOCK_N
+    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)) % N
+    offs_w_n_scale = tl.max_contiguous(
+        tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
+    )
+    # K dimension must be the last dimension for the scales
+    offs_w_k_scale = PACKED_MX_BLOCK * pid_k + tl.arange(0, PACKED_MX_BLOCK)
+    WMxScalePtrs = (
+        WMxScale
+        + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
+        + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
+    )
 
     # B pointers
-    offs_w_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_w_n = pid_n * PACKED_BLOCK_N_W + tl.arange(0, PACKED_BLOCK_N_W)
     offs_w_n = tl.max_contiguous(
-        tl.multiple_of(offs_w_n % N, BLOCK_N),
-        BLOCK_N,
+        tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
+        PACKED_BLOCK_N_W,
     )
-    offs_w_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
+    offs_w_k = PACKED_BLOCK_K_W * pid_k + tl.arange(0, PACKED_BLOCK_K_W)
     W += expt_id * stride_w_e
     WPtrs = W + (
         offs_w_k.to(index_type)[:, None] * stride_w_k
@@ -415,69 +485,64 @@ def _moe_gemm_a8w8(
             x_scales = tl.load(XMxScalePtrs)
         else:
             x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
-        if is_w_microscaled:
-            if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-                w_scales = unswizzle_mx_scale_cdna4(
-                    tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
-                    BLOCK_N,
-                    MX_SCALE_BLOCK_K,
-                )
-            else:
-                w_scales = tl.load(WMxScalePtrs)
+        if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+            w_scales = unswizzle_mx_scale_cdna4(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+            )
         else:
-            w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
+            w_scales = tl.load(WMxScalePtrs)
 
         acc = tl.dot_scaled(
-            x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
+            x, x_scales, "e2m1", w, w_scales, "e2m1", acc=acc, fast_math=True
         )
 
-        if is_w_microscaled:
-            WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
+        WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
         if is_x_microscaled:
             XMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_x_mx_k
 
-        XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
-        WPtrs += (BLOCK_K * SPLIT_K) * stride_w_k
+        XPtrs += (PACKED_BLOCK_K_X * SPLIT_K) * stride_x_k
+        WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
 
     if not EVEN_K:
-        mask_x_k = offs_x_k < MASK_K_LIMIT
-        mask_w_k = offs_w_k < (MASK_K_LIMIT)
-        if is_w_microscaled:
-            if SWIZZLE_MX_SCALE is None:
-                mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
+        mask_x_k = offs_x_k < (MASK_K_LIMIT // X_K_DIVISOR)
+        mask_w_k = offs_w_k < (MASK_K_LIMIT // W_K_DIVISOR)
+        if SWIZZLE_MX_SCALE is None:
+            mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
         if is_x_microscaled:
             mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
 
-        x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
+        x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0)
         w = tl.load(
-            WPtrs, mask=mask_w_k[:, None], other=0.0, cache_modifier=W_CACHE_MODIFIER
+            WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
         )
 
         if is_x_microscaled:
             x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
         else:
             x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
-        if is_w_microscaled:
-            if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-                w_scales = unswizzle_mx_scale_cdna4(
-                    tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
-                    BLOCK_N,
-                    MX_SCALE_BLOCK_K,
-                )
-            else:
-                w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
+        if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+            w_scales = unswizzle_mx_scale_cdna4(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+            )
         else:
-            w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
+            w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
 
         acc = tl.dot_scaled(
-            x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
+            x, x_scales, "e2m1", w, w_scales, "e2m1", acc=acc, fast_math=True
         )
 
     # scalar fp8 scale
     if X_static_scale is not None:
-        acc = acc * tl.load(X_static_scale)
-    if W_static_scale is not None:
-        acc = acc * tl.load(W_static_scale)
+        # should not go in here since static scale fp4 is disabled
+        tl.static_assert(
+            X_static_scale is None,
+            f"Static scale is disabled for fp4 precision. got {X_static_scale}",
+        )
+
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)

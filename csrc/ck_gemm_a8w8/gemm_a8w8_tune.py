@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import aiter
 import pandas as pd
@@ -25,10 +25,18 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
             return True
 
 
-def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    x = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
-    scale = torch.matmul(x_scale, w_scale)
-    out = torch.mul(x, scale)
+def run_torch(
+    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_dtype=dtypes.i8
+):
+    if quant_dtype == dtypes.i8:
+        x = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
+        scale = torch.matmul(x_scale, w_scale)
+        out = torch.mul(x, scale)
+    else:
+        x = x.to(dtypes.fp32) * x_scale
+        weight = weight.to(dtypes.fp32) * w_scale
+        out = F.linear(x, weight)
+
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
@@ -53,22 +61,28 @@ def get_tuned_gemm_list(tuned_gemm_file):
     return tunedf
 
 
-def generate_data(m, n, k, seed, device="cuda"):
+def generate_data(
+    m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, device="cuda"
+):
     torch.manual_seed(seed)
-    x = torch.randint(-20, 20, (m, k), dtype=dtypes.i8, device=device)
-    weight = torch.randint(-20, 20, (n, k), dtype=dtypes.i8, device=device)
-    x_scale = torch.rand([m, 1], dtype=dtypes.bf16, device=device)
-    w_scale = torch.rand([1, n], dtype=dtypes.bf16, device=device)
-    out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
-    # x.share_memory_()
-    # weight.share_memory_()
-    # x_scale.share_memory_()
-    # w_scale.share_memory_()
+
+    if q_dtype_w == dtypes.i8:
+        x = torch.randint(-20, 20, (m, k), dtype=dtypes.i8, device=device)
+        weight = torch.randint(-20, 20, (n, k), dtype=dtypes.i8, device=device)
+        x_scale = torch.rand([m, 1], dtype=dtypes.bf16, device=device)
+        w_scale = torch.rand([1, n], dtype=dtypes.bf16, device=device)
+    else:
+        x_fp = torch.randn((m, k), dtype=dtype, device=device)
+        weight_fp = torch.randn((n, k), dtype=dtype, device=device)
+        x, x_scale = aiter.pertoken_quant(x_fp, quant_dtype=q_dtype_w)
+        weight, w_scale = aiter.pertoken_quant(weight_fp, quant_dtype=q_dtype_w)
+
+    out = torch.empty(m, n, dtype=dtype, device=device)
     return x, weight, x_scale, w_scale, out
 
 
-def gemm_a8w8_ref(x, weight, x_scale, w_scale):
-    return run_torch(x, weight, x_scale, w_scale)
+def gemm_a8w8_ref(x, weight, x_scale, w_scale, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8):
+    return run_torch(x, weight, x_scale, w_scale, dtype=dtype, quant_dtype=q_dtype_w)
 
 
 def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
@@ -93,7 +107,6 @@ class GemmA8W8Tuner(GemmCommonTuner):
         return kernels_list[kernelId].name
 
     def _setup_specific_arguments(self):
-        # self.parser.add_argument()
         pass
 
     def calculate(self, results, bpes=(1, 1, 2)):
@@ -111,21 +124,26 @@ class GemmA8W8Tuner(GemmCommonTuner):
         shape_grouped = False
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+
         task = []
         tasks_data = []
         gemm_a8w8_data_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 1, 2, 3]
         seed = 0
+
         for i in range(len(untunedf)):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
-            kernels_num = len(kernels_list)
+            q_dtype_w = untunedf.loc[i, "q_dtype_w"]
             seed = seed + 1
 
+            kernels_num = len(kernels_list)
             total_kernel_nums = 0
-            for i in range(kernels_num):
-                kernel = kernels_list[i]
+            info_keys = (cu_num, M, N, K, q_dtype_w)
+
+            for j in range(kernels_num):
+                kernel = kernels_list[j]
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(
                         M,
@@ -139,20 +157,20 @@ class GemmA8W8Tuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, M, N, K), i, splitK, "")
+                    info = (info_keys, j, splitK, "")
                     task.append(
                         (
                             info,
                             generate_data,
-                            (M, N, K, seed),
+                            (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
                             run_gemm_a8w8,
-                            (gemm_a8w8_data_idx, i, splitK),
+                            (gemm_a8w8_data_idx, j, splitK),
                             {
                                 "num_warmup": args.warmup,
                                 "num_iters": args.iters,
                             },
                             gemm_a8w8_ref,
-                            (ref_data_idx,),
+                            (ref_data_idx, dtypes.bf16, eval(q_dtype_w)),
                             {},
                             None,
                             1e-2,
@@ -180,10 +198,21 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
 if __name__ == "__main__":
 
-    ## tuner =GemmA8W8Tuner("GemmA8W8Tuner", key, resultList,"gen API for CK gemm a8w8 kernel")
-    ## use default key and resultList
+    ## use default key and resultList with q_dtype_w support
+    key = ["cu_num", "M", "N", "K", "q_dtype_w"]
+    resultList = [
+        "kernelId",
+        "splitK",
+        "us",
+        "kernelName",
+        "tflops",
+        "bw",
+        "errRatio",
+    ]
     tuner = GemmA8W8Tuner(
-        "GemmA8W8Tuner",  # key, resultList,
+        "GemmA8W8Tuner",
+        key=key,
+        resultList=resultList,
         description="gen API for CK gemm a8w8 kernel",
     )
 
