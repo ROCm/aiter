@@ -251,7 +251,7 @@ Avoid product-name parsing like:
 
 ```python
 # Don't do this
-if impl == "gluon" and int(DEVICE_ARCH.split("MI")[1].replace("X", "")) < 350:
+if impl == "gluon" and int(DEVICE_ARCH.split("MI")[1].replace("X", "")) < mi_chip_number:
     ...
 ```
 
