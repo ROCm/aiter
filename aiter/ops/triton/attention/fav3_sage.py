@@ -15,7 +15,7 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import (
     map_dims,
 )
 
-from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import sage_quant
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import sage_quant, sage_quant_v2
 
 
 class _FAv3SageWrapperFunc(torch.autograd.Function):
@@ -50,10 +50,13 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         return_lse: bool = True,
         layout: str = "bshd",
         config: Optional[dict] = None,
+        sage_version: fav3_sage.Sage_version = fav3_sage.Sage_version.V1
     ):
         bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
         _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
+        if sage_version == fav3_sage.Sage_version.V2:
+            head_dim *= 2
 
         # Quantize K, V to int8, and convert v to float16
 
@@ -70,17 +73,30 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         fp8_dtype = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(fp8_dtype).max
 
-        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
-            q,
-            k,
-            v,
-            fp8_dtype,
-            FP8_MAX,
-            sm_scale=softmax_scale,
-            BLKQ=BLKQ,
-            BLKK=BLKK,
-            layout=layout,
-        )
+        if sage_version == fav3_sage.Sage_version.V1:
+            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant(
+                q,
+                k,
+                v,
+                fp8_dtype,
+                FP8_MAX,
+                sm_scale=softmax_scale,
+                BLKQ=BLKQ,
+                BLKK=BLKK,
+                layout=layout,
+            )
+        elif sage_version == fav3_sage.Sage_version.V2:
+            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant_v2(
+                q,
+                k,
+                v,
+                fp8_dtype,
+                FP8_MAX,
+                sm_scale=softmax_scale,
+                BLKQ=BLKQ,
+                BLKK=BLKK,
+                layout=layout,
+            )
 
         # For GQA/MQA: quantize query with grouped scaling
         # group_size = (
@@ -91,16 +107,31 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
         num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-        assert q_descale.shape == (
-            batch,
-            num_q_heads,
-            num_q_blocks,
-        ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, num_q_blocks)}"
-        assert k_descale.shape == (
-            batch,
-            num_kv_heads,
-            num_k_blocks,
-        ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
+        if sage_version == fav3_sage.Sage_version.V1:
+            assert q_descale.shape == (
+                batch,
+                num_q_heads,
+                num_q_blocks,
+            ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, num_q_blocks)}"
+            assert k_descale.shape == (
+                batch,
+                num_kv_heads,
+                num_k_blocks,
+            ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
+        elif sage_version == fav3_sage.Sage_version.V2:
+            assert q_descale.shape == (
+                batch,
+                num_q_heads,
+                seqlen_q,
+                head_dim // 32
+            ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, seqlen_q, head_dim // 32)}"
+            assert k_descale.shape == (
+                batch,
+                num_kv_heads,
+                seqlen_k,
+                head_dim // 32
+            ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, seqlen_k, head_dim // 32)}"
+
 
         # Validate unsupported features
         if attention_chunk not in (0, 1):
@@ -121,9 +152,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         # Call flash attention forward
         out, softmax_lse = fav3_sage.fwd(
-            q_int8,
-            k_int8,
-            v_fp8,
+            q_quantized,
+            k_quantized,
+            v_quantized,
             None,
             None,
             None,
@@ -159,6 +190,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse,
             layout,
             config,
+            sage_version=sage_version
         )
 
         if not return_lse:
@@ -166,7 +198,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         # Save tensors needed for backward
         ctx.save_for_backward(
-            q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
+            q_quantized, k_quantized, v_quantized, out, softmax_lse, q_descale, k_descale
         )
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -219,6 +251,7 @@ def fav3_sage_wrapper_func(
     inference_mode: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    sage_version: fav3_sage.Sage_version = fav3_sage.Sage_version.V1
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -310,6 +343,7 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
+        sage_version=sage_version
     )
 
 
@@ -335,6 +369,7 @@ def fav3_sage_func(
     inference_mode: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    sage_version: fav3_sage.Sage_version = fav3_sage.Sage_version.V1
 ):
     """
     SageAttention v1.
@@ -365,6 +400,10 @@ def fav3_sage_func(
 
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
+
+    if sage_version == fav3_sage.Sage_version.V2:
+        head_dim *= 2
+
     _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
     # Quantize K, V to int8, and convert v to float16
 
@@ -376,27 +415,42 @@ def fav3_sage_func(
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
-    # Check that inputs are high precision
-    assert q.dtype == torch.int8, f"expected dtype of q to be int8, got {q.dtype}"
-    assert k.dtype == torch.int8, f"expected dtype of k to be int8, got {k.dtype}"
-    # assert v.dtype in [torch.float16, torch.bfloat16], (
-    #     f"sage_attn_v1_func expects high-precision inputs (fp16/bf16), got v.dtype={v.dtype}. "
-    # )
+    if sage_version == fav3_sage.Sage_version.V1:
+        assert q.dtype == torch.int8, f"expected dtype of q to be int8, got {q.dtype}"
+        assert k.dtype == torch.int8, f"expected dtype of k to be int8, got {k.dtype}"
+    elif sage_version == fav3_sage.Sage_version.V2:
+        assert q.dtype == torch.uint8, f"expected dtype of q to be uint8, got {q.dtype}"
+        assert k.dtype == torch.uint8, f"expected dtype of k to be uint8, got {k.dtype}"
+
 
     # Verify descale shapes for GQA/MQA
     num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
     num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-    assert q_descale.shape == (
-        batch,
-        num_q_heads,
-        num_q_blocks,
-    ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, num_q_blocks)}"
-    assert k_descale.shape == (
-        batch,
-        num_kv_heads,
-        num_k_blocks,
-    ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
+    if sage_version == fav3_sage.Sage_version.V1:
+        assert q_descale.shape == (
+            batch,
+            num_q_heads,
+            num_q_blocks,
+        ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, num_q_blocks)}"
+        assert k_descale.shape == (
+            batch,
+            num_kv_heads,
+            num_k_blocks,
+        ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
+    elif sage_version == fav3_sage.Sage_version.V2:
+        assert q_descale.shape == (
+            batch,
+            num_q_heads,
+            seqlen_q,
+            head_dim // 32
+        ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, seqlen_q, head_dim // 32)}"
+        assert k_descale.shape == (
+            batch,
+            num_kv_heads,
+            seqlen_k,
+            head_dim // 32
+        ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, seqlen_k, head_dim // 32)}"
 
     # Validate unsupported features
     if attention_chunk not in (0, 1):
@@ -449,6 +503,7 @@ def fav3_sage_func(
         return_lse,
         layout,
         config,
+        sage_version=sage_version
     )
 
     return out

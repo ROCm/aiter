@@ -12,11 +12,16 @@ from aiter.test_mha_common import (
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs as sage_fwd_configs,
     sage_quant,
+    sage_quant_v2,
 )
 
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.interface_v1 import (
+    Sage_version
+)
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
 )
+
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -133,6 +138,35 @@ def check_attention_outputs(
         )
 
 
+def input_generation(
+    BATCH,
+    HQ,
+    HK,
+    N_CTX_Q,
+    N_CTX_K,
+    D_HEAD,
+    D_HEAD_V,
+    dtype,
+    layout,
+    ):
+    if layout == "bhsd":
+        q_shape = (BATCH, HQ, N_CTX_Q, D_HEAD)
+        k_shape = (BATCH, HK, N_CTX_K, D_HEAD)
+        v_shape = (BATCH, HK, N_CTX_K, D_HEAD_V)
+    else:  # bshd
+        q_shape = (BATCH, N_CTX_Q, HQ, D_HEAD)
+        k_shape = (BATCH, N_CTX_K, HK, D_HEAD)
+        v_shape = (BATCH, N_CTX_K, HK, D_HEAD_V)
+
+    q = torch.randn(q_shape, device="cuda", dtype=dtype)
+    k = torch.randn(k_shape, device="cuda", dtype=dtype)
+    v = torch.randn(v_shape, device="cuda", dtype=dtype)
+    q.requires_grad = False
+    k.requires_grad = False
+    v.requires_grad = False
+
+    return q, k, v
+
 def input_helper(
     BATCH,
     HQ,
@@ -149,21 +183,17 @@ def input_helper(
 ):
     # Generate base inputs in BHSD layout which is the layout used in wan model.
     # Set up tensor shapes based on layout
-    if layout == "bhsd":
-        q_shape = (BATCH, HQ, N_CTX_Q, D_HEAD)
-        k_shape = (BATCH, HK, N_CTX_K, D_HEAD)
-        v_shape = (BATCH, HK, N_CTX_K, D_HEAD_V)
-    else:  # bshd
-        q_shape = (BATCH, N_CTX_Q, HQ, D_HEAD)
-        k_shape = (BATCH, N_CTX_K, HK, D_HEAD)
-        v_shape = (BATCH, N_CTX_K, HK, D_HEAD_V)
-
-    q = torch.randn(q_shape, device="cuda", dtype=dtype)
-    k = torch.randn(k_shape, device="cuda", dtype=dtype)
-    v = torch.randn(v_shape, device="cuda", dtype=dtype)
-    q.requires_grad = False
-    k.requires_grad = False
-    v.requires_grad = False
+    q, k, v = input_generation(
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        dtype,
+        layout,
+    )
 
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
@@ -183,10 +213,53 @@ def input_helper(
     return q, k, v, q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale
 
 
+def input_helper_v2(
+    BATCH,
+    HQ,
+    HK,
+    N_CTX_Q,
+    N_CTX_K,
+    D_HEAD,
+    D_HEAD_V,
+    dtype,
+    softmax_scale,
+    layout,
+    BLKQ,
+    BLKK,
+):
+    # Generate base inputs in BHSD layout which is the layout used in wan model.
+    # Set up tensor shapes based on layout
+    q, k, v = input_generation(
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        dtype,
+        layout,
+    )
+    fp8_dtype = aiter.dtypes.fp8
+    FP8_MAX = torch.finfo(fp8_dtype).max
+    q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale = sage_quant_v2(
+        q,
+        k,
+        v,
+        fp8_dtype,
+        FP8_MAX,
+        sm_scale=softmax_scale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        layout=layout,
+    )
+
+    return q, k, v, q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale
+
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128), (512, 1024), (1024, 512)],
 )
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
@@ -240,6 +313,98 @@ def test_sage(
         inference_mode=True,
         layout=layout,
         config=config,
+    )
+
+    if DEBUG_MODE:
+        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+    if layout == "bhsd":
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
+    torch_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=False)
+    torch_out, attention_scores, _ = torch_out
+
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
+
+    assert torch_out.shape == triton_out.shape
+
+    if DEBUG_MODE:
+        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+        print(
+            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+        )
+
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+)
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_v2(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    torch.cuda.empty_cache()
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    fp8_dtype = aiter.dtypes.fp8
+    FP8_MAX = torch.finfo(fp8_dtype).max
+
+    config = sage_fwd_configs(False)
+    BLKQ = config["BLOCK_M"]
+    BLKK = config["BLOCK_N"]
+
+    q, k, v, q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale = input_helper_v2(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        softmax_scale,
+        layout,
+        BLKQ,
+        BLKK,
+    )
+
+    triton_out = fav3_sage_func(
+        q_fp4,
+        k_fp4,
+        v_fp8,
+        q_descale,
+        k_descale,
+        v_descale,
+        FP8_MAX,
+        causal=False,
+        inference_mode=True,
+        layout=layout,
+        config=config,
+        sage_version=Sage_version.V2
     )
 
     if DEBUG_MODE:

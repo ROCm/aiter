@@ -1,6 +1,7 @@
 import torch
 from typing import Optional, Tuple
 from .fwd_prefill import fav3_sage_triton_impl
+from .fwd_prefill_v2 import fav3_sage_triton_impl_v2
 
 from .utils import (
     DEBUG,
@@ -8,7 +9,12 @@ from .utils import (
     PHILOX_SEED,
     PHILOX_OFFSET,
 )
+from enum import Enum
 
+class Sage_version(Enum):
+    V1 = 1
+    V2 = 2
+    V3 = 3 # full fp4 supported in the future
 
 def fwd(
     q: torch.Tensor,
@@ -49,6 +55,7 @@ def fwd(
     return_lse: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    sage_version: Sage_version = Sage_version.V1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sage Attention v1 forward pass compatible interface for AMD Triton implementation.
@@ -304,7 +311,9 @@ def fwd(
     # sd_mask is not returned in v3 interface
     sd_mask = None
 
-    fav3_sage_triton_impl(
+    sage_func = fav3_sage_triton_impl if sage_version == Sage_version.V1 else fav3_sage_triton_impl_v2
+
+    sage_func(
         q,
         k,
         v,
