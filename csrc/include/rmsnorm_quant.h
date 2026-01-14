@@ -16,4 +16,13 @@ void add_rmsnorm_quant(
     double epsilon
 );
 
+void add_rmsnorm(
+    torch::Tensor& out,
+    torch::Tensor& input,
+    torch::Tensor& residual_in,
+    torch::Tensor& residual_out,
+    torch::Tensor& weight,
+    double epsilon
+);
+
 }

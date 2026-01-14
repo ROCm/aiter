@@ -15,7 +15,7 @@ using FP8_TYPE = ck_tile::fp8_t;
 
 namespace aiter {
 
-template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size>
+template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool FUSE_QUANT=true>
 __global__ void add_rmsnorm_quant_kernel(
     DTYPE_O* out,
     DTYPE_I* residual_out,
@@ -35,6 +35,7 @@ __global__ void add_rmsnorm_quant_kernel(
         using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
         using vec_o = opus::vector_t<DTYPE_O, thread_data_size>;
         using vec_f = opus::vector_t<float, thread_data_size>;
+        using vec_ix2 = opus::vector_t<DTYPE_I, thread_data_size * 2>;
         static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
         static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
         const float inverted_DTYPE_MAX = (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
@@ -52,99 +53,97 @@ __global__ void add_rmsnorm_quant_kernel(
         auto buffer_out = opus::make_gmem<DTYPE_O>(out_ptr, oob_o * sizeof(DTYPE_O));
 
         int row_offset = tid * thread_data_size;
-        
-        vec_i thread_data_i = buffer_i.template load<thread_data_size>(row_offset);
-        vec_i thread_data_residual_in = buffer_residual_in.template load<thread_data_size>(row_offset);
-        vec_i thread_data_weight = weight_buffer.template load<thread_data_size>(row_offset);
+        vec_i thread_data_ix2[2];
+        thread_data_ix2[0] = buffer_i.template load<thread_data_size>(row_offset);
+        auto& thread_data_i = thread_data_ix2[0];
+        thread_data_ix2[1] = buffer_residual_in.template load<thread_data_size>(row_offset);
+        auto& thread_data_residual_in = thread_data_ix2[1];
 
-        vec_f thread_data;
+        vec_f thread_data_float;
         for(int i = 0; i < thread_data_size; i++)
         {
-            thread_data[i] = ck_tile::type_convert<float>(thread_data_i[i]) + ck_tile::type_convert<float>(thread_data_residual_in[i]);
+            thread_data_float[i] = ck_tile::type_convert<float>(thread_data_i[i]) + ck_tile::type_convert<float>(thread_data_residual_in[i]);
         }
+
+        thread_data_ix2[0] = weight_buffer.template load<thread_data_size>(row_offset);
+        auto& thread_data_weight = thread_data_ix2[0];
+
         for(int i = 0; i < thread_data_size; i++)
         {
-            thread_data_residual_in[i] = ck_tile::type_convert<DTYPE_I>(thread_data[i]);
+            thread_data_residual_in[i] = ck_tile::type_convert<DTYPE_I>(thread_data_float[i]);
         }
         buffer_residual_out.template store<thread_data_size, vec_i>(thread_data_residual_in, row_offset);
 
         float square_sum = 0.0f;
         for(int i = 0; i < thread_data_size; i++)
         {
-            square_sum += (thread_data[i] * thread_data[i]);
+            square_sum += (thread_data_float[i] * thread_data_float[i]);
         }
         auto sum_f = [](float a, float b) { return a + b; };
         float rcp = block_reduce<float, decltype(sum_f), BlockSize, true>(square_sum, sum_f);
         rcp = rsqrtf(rcp / n + epsilon);
         for(int i = 0; i < thread_data_size; i++)
         {
-            thread_data[i] = thread_data[i] * rcp * ck_tile::type_convert<float>(thread_data_weight[i]);
+            thread_data_float[i] = thread_data_float[i] * rcp * ck_tile::type_convert<float>(thread_data_weight[i]);
         }
-
-        float thread_max = 0.0f;
-        if constexpr(thread_data_size % 2 == 0)
+        if constexpr(FUSE_QUANT)
         {
-            for(int i = 0; i < thread_data_size; i += 2)
+            float thread_max = 0.0f;
+            if constexpr(thread_data_size % 2 == 0)
             {
-                asm volatile("v_max3_f32 %0, %1, %2, %3\n"
-                            : "=v"(thread_max)
-                            : "v"(thread_max),
-                            "v"(fabsf(thread_data[i])),
-                            "v"(fabsf(thread_data[i + 1])));
+                for(int i = 0; i < thread_data_size; i += 2)
+                {
+                    asm volatile("v_max3_f32 %0, %1, %2, %3\n"
+                                : "=v"(thread_max)
+                                : "v"(thread_max),
+                                "v"(fabsf(thread_data_float[i])),
+                                "v"(fabsf(thread_data_float[i + 1])));
+                }
             }
+            else
+            {
+                for(int i = 0; i < thread_data_size; i++)
+                {
+                    thread_max = fmaxf(thread_max, fabsf(ck_tile::type_convert<float>(thread_data_float[i])));
+                }
+            }
+            float max = block_reduce<float, hipcub::Max, BlockSize, true>(thread_max, hipcub::Max());
+            float inverted_scale = max * inverted_DTYPE_MAX;
+
+            if(threadIdx.x == 0)
+            {
+                scale[idx] = inverted_scale;
+            }
+            inverted_scale = 1.0f / inverted_scale;
+
+            using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
+            auto& thread_data_ck = reinterpret_cast<ck_tile::vec_t<float, thread_data_size>&>(thread_data_float);
+            auto& out_s = reinterpret_cast<ck_tile::vec_t<DTYPE_O, thread_data_size>&>(thread_data_ix2);
+            out_s =
+                ck_tile::vec_convert<DTYPE_O, float, thread_data_size>(thread_data_ck, inverted_scale)
+                    .template get_as<DTYPE_STORE>();
+
+            auto& out_vec = reinterpret_cast<vec_o&>(out_s);
+            buffer_out.template store<thread_data_size, vec_o>(out_vec, row_offset);
         }
         else
         {
+            auto& out_s = reinterpret_cast<vec_o&>(thread_data_ix2);
             for(int i = 0; i < thread_data_size; i++)
             {
-                thread_max = fmaxf(thread_max, fabsf(ck_tile::type_convert<float>(thread_data[i])));
+                out_s[i] = ck_tile::type_convert<DTYPE_O>(thread_data_float[i]);
             }
+            buffer_out.template store<thread_data_size, vec_o>(out_s, row_offset);
         }
-        float max = block_reduce<float, hipcub::Max, BlockSize, true>(thread_max, hipcub::Max());
-        float inverted_scale = max * inverted_DTYPE_MAX;
-
-        if(threadIdx.x == 0)
-        {
-            scale[idx] = inverted_scale;
-        }
-        inverted_scale = 1.0f / inverted_scale;
-
-        using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
-        auto& thread_data_ck = reinterpret_cast<ck_tile::vec_t<float, thread_data_size>&>(thread_data);
-        auto out_s =
-            ck_tile::vec_convert<DTYPE_O, float, thread_data_size>(thread_data_ck, inverted_scale)
-                .template get_as<DTYPE_STORE>();
-
-        auto& out_vec = reinterpret_cast<vec_o&>(out_s);
-        buffer_out.template store<thread_data_size, vec_o>(out_vec, row_offset);
-
-
-        // if constexpr(thread_data_size <= 16)
-        // {
-        //     auto& out_vec = reinterpret_cast<vec_o&>(out_s);
-        //     buffer_out.template store<thread_data_size, vec_o>(out_vec, row_offset);
-        // }
-        // else
-        // {
-        //     static constexpr int32_t o_step = 16;
-        //     assert(thread_data_size % 16 == 0);
-        //     using vecT                        = opus::vector_t<DTYPE_STORE, o_step>;
-        //     auto vec                          = out_s.template get_as<vecT>();
-        //     static constexpr int32_t num_iter = thread_data_size / 16;
-    
-        //     for(size_t j = 0; j < num_iter; j++)
-        //     {
-        //         buffer_out.template store<o_step, vecT>(vec[j], row_offset + j * o_step);
-        //     }
-        // }
     }
 
-#define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size) \
+#define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, FUSE_QUANT) \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                    \
     using DTYPE_I = typename t2ck<scalar_t>::type;                                        \
     dim3 grid(m); \
     dim3 block(BlockSize); \
-    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_O, BlockSize, thread_data_size><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_O*>(out.data_ptr()), \
+    using DTYPE_OO = std::conditional_t<FUSE_QUANT, DTYPE_O, DTYPE_I>; \
+    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, FUSE_QUANT><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()), \
                                                                                                      reinterpret_cast<float*>(scale.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
@@ -154,15 +153,15 @@ __global__ void add_rmsnorm_quant_kernel(
                                                                                                      });
 
 
-#define ADD_RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O) \
+#define ADD_RMSNORM_QUANT_KERNEL_DISPATCH(DTYPE_O, FUSE_QUANT) \
     if (n <= 1024) { \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 4); \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 4, FUSE_QUANT); \
     } else if (n <= 2048) { \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 8); \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 8, FUSE_QUANT); \
     } else if (n <= 4096){ \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 16); \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 16, FUSE_QUANT); \
     } else if (n <= 8192){ \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 512, 16); \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 512, 16, FUSE_QUANT); \
     } else { \
         TORCH_CHECK(false, __func__, " not support n: ", n); \
     }
@@ -190,18 +189,62 @@ __global__ void add_rmsnorm_quant_kernel(
 
         if(out.dtype() == torch_fp8)
         {
-            ADD_RMSNORM_QUANT_KERNEL_DISPATCH(FP8_TYPE);
+            ADD_RMSNORM_QUANT_KERNEL_DISPATCH(FP8_TYPE, true);
         }
         else if(out.dtype() == torch::kInt8)
         {
-            ADD_RMSNORM_QUANT_KERNEL_DISPATCH(ck_tile::int8_t);
+            ADD_RMSNORM_QUANT_KERNEL_DISPATCH(ck_tile::int8_t, true);
         }
-    #if defined(__Float4_e2m1fn_x2)
-        else if(out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
+        else
         {
-            ADD_RMSNORM_QUANT_KERNEL_DISPATCH(ck_tile::fp4x2_t);
+            TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
         }
-    #endif
+    }
+
+    
+#define ADD_RMSNORM_KERNEL_DISPATCH(DTYPE_O, FUSE_QUANT) \
+    if (n <= 1024) { \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 4, FUSE_QUANT); \
+    } else if (n <= 2048) { \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 8, FUSE_QUANT); \
+    } else if (n <= 4096){ \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 512, 8, FUSE_QUANT); \
+    } else if (n <= 8192){ \
+        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 1024, 8, FUSE_QUANT); \
+    } else { \
+        TORCH_CHECK(false, __func__, " not support n: ", n); \
+    }
+
+    void add_rmsnorm(
+        torch::Tensor& out,
+        torch::Tensor& input,
+        torch::Tensor& residual_in,
+        torch::Tensor& residual_out,
+        torch::Tensor& weight,
+        double epsilon
+    )
+    {
+        int m = input.size(0);
+        int n = input.size(1);
+        int input_stride = input.stride(0);
+        int residual_in_stride = residual_in.stride(0);
+        int residual_out_stride = residual_out.stride(0);
+        int out_stride = out.stride(0);
+
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+        // Create a dummy scale tensor for macro compatibility (not used when FUSE_QUANT is false)
+        torch::Tensor scale = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+
+        if(out.dtype() == torch::kBFloat16)
+        {
+            ADD_RMSNORM_KERNEL_DISPATCH(ck_tile::bf16_t, false);
+        }
+        else if(out.dtype() == torch::kFloat16)
+        {
+            ADD_RMSNORM_KERNEL_DISPATCH(ck_tile::fp16_t, false);
+        }
         else
         {
             TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());

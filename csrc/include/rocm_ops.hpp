@@ -1682,4 +1682,11 @@ namespace py = pybind11;
         py::arg("residual_out"), \
         py::arg("scale"), \
         py::arg("weight"), \
+        py::arg("epsilon")); \
+    m.def("add_rmsnorm", &aiter::add_rmsnorm, \
+        py::arg("out"), \
+        py::arg("input"), \
+        py::arg("residual_in"), \
+        py::arg("residual_out"), \
+        py::arg("weight"), \
         py::arg("epsilon"));

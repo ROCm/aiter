@@ -109,16 +109,31 @@ def run_ck(
 
     return output, residual_out, y_scale, out_before_quant
 
+
 @perftest()
-def run_hip(input, weight, eps, residual, x_scale=None, y_scale_dtype=torch.float32, q_dtype="i8"):
-    q_dtype = quant_dtype_map[q_dtype]
-    output = torch.empty(input.shape, dtype=q_dtype, device="cuda")
+def run_hip(
+    input,
+    weight,
+    eps,
+    residual,
+    x_scale=None,
+    y_scale_dtype=torch.float32,
+    q_dtype="i8",
+):
     residual_out = torch.empty_like(input)
-    scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
-    aiter.add_rmsnorm_quant(
-        output, input, residual, residual_out, scale, weight, eps
-    )
+    if q_dtype is None:
+        scale = None
+        output = torch.empty_like(input)
+        aiter.add_rmsnorm(output, input, residual, residual_out, weight, eps)
+    else:
+        q_dtype = quant_dtype_map[q_dtype]
+        output = torch.empty(input.shape, dtype=q_dtype, device="cuda")
+        scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
+        aiter.add_rmsnorm_quant(
+            output, input, residual, residual_out, scale, weight, eps
+        )
     return output, residual_out, scale
+
 
 def test_rmsnorm2d_instance(dtype, m, n):
     dim = (m, n)
@@ -141,11 +156,15 @@ def test_rmsnorm2d_fuseAdd_instance(dtype, m, n):
     (a, res_a, *_), avg_a = run_torch(input, weight, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, 1e-5, residual=res)
 
+    (c, res_c, yscale_c), avg_c = run_hip(input, weight, 1e-5, res, q_dtype=None)
+    bw = ((m * n * 4 + n) * (dtype.itemsize)) / (1024.0 * 1024 * 1024) / avg_c * 1e6
     print(
-        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, hip avg: {avg_c:<8.2f} us, hip bw: {bw:<8.2f} TB/s"
     )
-    checkAllclose(a, b, rtol=1e-2, atol=1e-1)
+    checkAllclose(a.to(dtypes.fp32), b.to(dtypes.fp32), rtol=0, atol=1)
     checkAllclose(res_a, res_b)
+    checkAllclose(res_a, res_c, msg="check res_c")
+    checkAllclose(a.to(dtypes.fp32), c.to(dtypes.fp32), rtol=0, atol=1, msg="check c")
     print(" [passed~]")
 
 
@@ -251,14 +270,21 @@ def test_rmsnorm2d_fuseAdd_Dynamicquant_instance(
         input, weight, 1e-5, residual=res, y_scale_dtype=yscaleType, q_dtype=quant_dtype
     )
 
-    (c, res_c, yscale_c), avg_c = run_hip(input, weight, 1e-5, res, y_scale_dtype=yscaleType, q_dtype=quant_dtype)
+    (c, res_c, yscale_c), avg_c = run_hip(input, weight, 1e-5, res, q_dtype=quant_dtype)
     q_dtype = quant_dtype_map[quant_dtype]
-    bw = ((m * n * 3 + n) * (dtype.itemsize) + m * n * q_dtype.itemsize + m * yscaleType.itemsize) / (1024.0 * 1024 * 1024) / avg_c * 1e6
+    bw = (
+        (
+            (m * n * 3 + n) * (dtype.itemsize)
+            + m * n * q_dtype.itemsize
+            + m * yscaleType.itemsize
+        )
+        / (1024.0 * 1024 * 1024)
+        / avg_c
+        * 1e6
+    )
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, quant_dtype: {quant_dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, hip avg: {avg_c:<8.2f} us, hip bw: {bw:<8.2f} TB/s"
     )
-    # print(yscale_a)
-    # print(yscale_c)
     checkAllclose(a.to(dtypes.fp32), b.to(dtypes.fp32), rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b)
@@ -333,7 +359,7 @@ def test_rmsnorm2d_fuseDynamicquant(l_m: list, l_n: list, quant_dtypes: list):
 def test_rmsnorm2d_fuseAdd_Dynamicquant(l_m: list, l_n: list, quant_dtypes: list):
     print("\nstart rmsnorm2d fuse add Dynamicquant test")
     for scaleType in [dtypes.fp32]:
-        for dtype in [ dtypes.bf16]:
+        for dtype in [dtypes.bf16]:
             for m in l_m:
                 for n in l_n:
                     for q_type in quant_dtypes:

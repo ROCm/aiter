@@ -141,3 +141,14 @@ def add_rmsnorm_quant(
     weight: Tensor,
     epsilon: float,
 ) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant")
+def add_rmsnorm(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None: ...
