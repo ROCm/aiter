@@ -283,6 +283,7 @@ setup(
         "pandas",
         "einops",
         "psutil",
+        "packaging",
     ],
     extras_require={
         # Triton-based communication using Iris
