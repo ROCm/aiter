@@ -511,6 +511,7 @@ def parse_source_file_recursively(
     graph: nx.DiGraph,
     source_file: Path,
     visited: set[Path],
+    deps_to_ignore: set[Path] = set(),
 ) -> None:
     stack = [source_file]
 
@@ -543,7 +544,11 @@ def parse_source_file_recursively(
             graph.add_edge(c_str, current_str)
             logging.debug("Added graph edge [%s]->[%s].", c_str, current_str)
 
-        stack.extend(d for d in dependencies if (root_dir() / d).is_file())
+        stack.extend(
+            d
+            for d in dependencies
+            if (rd := root_dir() / d).is_file() and rd not in deps_to_ignore
+        )
         visited.add(current)
 
 
@@ -569,9 +574,10 @@ def add_files_to_dependency_graph(
     files: list[Path],
     file_type: str,
     visited: set[Path],
+    deps_to_ignore: set[Path] = set(),
 ) -> None:
     for f in files:
-        parse_source_file_recursively(graph, f, visited)
+        parse_source_file_recursively(graph, f, visited, deps_to_ignore=deps_to_ignore)
         tag_node(graph, f, file_type)
 
 
@@ -583,10 +589,24 @@ def build_dependency_graph(
 ) -> nx.DiGraph:
     graph: nx.DiGraph = nx.DiGraph()
     visited: set[Path] = set()
+    # These source files have dependencies that are hard to track and can be safely ignored for
+    # Triton test selection purposes:
+    deps_to_ignore: set[Path] = {
+        root_dir() / "aiter" / "jit" / "core.py",
+        root_dir() / "aiter" / "dist" / "utils.py",
+        root_dir() / "csrc" / "cpp_itfs" / "hsaco_launcher.py",
+    }
+    assert all(
+        d.is_file() and d.exists() for d in deps_to_ignore
+    ), "All ignored source file dependencies must exist in the filesystem."
     # Add files that tests depends on.
-    add_files_to_dependency_graph(graph, test_files, "test", visited)
+    add_files_to_dependency_graph(
+        graph, test_files, "test", visited, deps_to_ignore=deps_to_ignore
+    )
     # Add files that benchmarks depends on.
-    add_files_to_dependency_graph(graph, bench_files, "bench", visited)
+    add_files_to_dependency_graph(
+        graph, bench_files, "bench", visited, deps_to_ignore=deps_to_ignore
+    )
     logging.debug(
         "Built dependency graph of Triton source files with %d nodes and %d edges.",
         graph.number_of_nodes(),
