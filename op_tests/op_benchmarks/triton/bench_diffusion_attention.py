@@ -517,6 +517,11 @@ def bench_kernel(q, k, v, args, provider):
     else:
         bench_func_name = "fav3_sage"
 
+    # Build inputs once (must stay alive for the life of the graph and keep same shapes)
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+
     fn = attn_forward_func(
         q,
         k,
@@ -527,6 +532,29 @@ def bench_kernel(q, k, v, args, provider):
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
     )
+
+    # 1) Warmup on a side stream so the graph capture sees the steady-state workload
+    warmup_stream = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(5):
+            fn()
+    torch.cuda.synchronize()
+
+    # 2) Capture the graph on the current stream
+    g = torch.cuda.CUDAGraph()
+
+    torch.cuda.synchronize()
+    with torch.cuda.graph(g):
+        # Everything launched in here (including Triton kernels called by fn)
+        # becomes part of the CUDA graph
+        fn()
+    torch.cuda.synchronize()
+
+    # 3) Benchmark: replay the captured graph
+    def graph_fn():
+        g.replay()
+
     ms = triton.testing.do_bench(fn)
 
     if args.compare_to_ref:

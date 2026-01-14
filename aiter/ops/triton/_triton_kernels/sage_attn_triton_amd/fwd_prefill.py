@@ -2027,21 +2027,147 @@ def sage_quant(
             (b, h_kv, K_NUM_BLKS), device=v.device, dtype=torch.float32
         )
     else:
-        v_scale = (
-            v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+        v_scale = torch.empty(
+            (b, h_kv, head_dim), device=v.device, dtype=torch.float32
         )
+        # v_scale = (
+        #     v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+        # )
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
     q_task_count = b * h_qo * Q_NUM_BLKS
     k_task_count = b * h_kv * K_NUM_BLKS
-    v_task_count = b * h_kv * K_NUM_BLKS
+    # v_task_count = b * h_kv * K_NUM_BLKS
+    v_task_count = b * h_kv * head_dim
 
-    grid = (q_task_count + k_task_count + v_task_count,)
-    print("grid size", q_task_count + k_task_count + v_task_count)
+    # grid = (q_task_count + k_task_count + v_task_count,)
+    grid_q = (q_task_count,)
+    grid_k = (k_task_count,)
+    grid_v = (v_task_count,)
     # call sage_quant_kernel
-    sage_quant_kernel[grid](
+    q_quant_kernel[grid_q](
+        q,
+        q_int8,
+        q_scale,
+        k,
+        k_int8,
+        k_scale,
+        v,
+        v_fp8,
+        v_scale,
+        stride_bz_q,
+        stride_h_q,
+        stride_seq_q,
+        stride_bz_k,
+        stride_h_k,
+        stride_seq_k,
+        q_scale.stride(0),
+        q_scale.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        (sm_scale * 1.4426950408889634),
+        q_task_count,
+        k_task_count,
+        b,
+        h_qo,
+        h_kv,
+        Q_NUM_BLKS,
+        K_NUM_BLKS,
+        qo_len,
+        kv_len,
+        triton.next_power_of_2(kv_len),
+        FP8_MAX=FP8_MAX,
+        INT8_MAX=torch.iinfo(q_int8.dtype).max,
+        D=head_dim,
+        BLK_Q=BLKQ,
+        BLK_K=BLKK,
+        V_QUANT_SCHEME=V_QUANT_SCHEME,
+    )
+    k_quant_kernel[grid_k](
+        q,
+        q_int8,
+        q_scale,
+        k,
+        k_int8,
+        k_scale,
+        v,
+        v_fp8,
+        v_scale,
+        stride_bz_q,
+        stride_h_q,
+        stride_seq_q,
+        stride_bz_k,
+        stride_h_k,
+        stride_seq_k,
+        q_scale.stride(0),
+        q_scale.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        (sm_scale * 1.4426950408889634),
+        q_task_count,
+        k_task_count,
+        b,
+        h_qo,
+        h_kv,
+        Q_NUM_BLKS,
+        K_NUM_BLKS,
+        qo_len,
+        kv_len,
+        triton.next_power_of_2(kv_len),
+        FP8_MAX=FP8_MAX,
+        INT8_MAX=torch.iinfo(q_int8.dtype).max,
+        D=head_dim,
+        BLK_Q=BLKQ,
+        BLK_K=BLKK,
+        V_QUANT_SCHEME=V_QUANT_SCHEME,
+    )
+    # v_quant_kernel[grid_v](
+    #     q,
+    #     q_int8,
+    #     q_scale,
+    #     k,
+    #     k_int8,
+    #     k_scale,
+    #     v,
+    #     v_fp8,
+    #     v_scale,
+    #     stride_bz_q,
+    #     stride_h_q,
+    #     stride_seq_q,
+    #     stride_bz_k,
+    #     stride_h_k,
+    #     stride_seq_k,
+    #     q_scale.stride(0),
+    #     q_scale.stride(1),
+    #     k_scale.stride(0),
+    #     k_scale.stride(1),
+    #     v_scale.stride(0),
+    #     v_scale.stride(1),
+    #     (sm_scale * 1.4426950408889634),
+    #     q_task_count,
+    #     k_task_count,
+    #     b,
+    #     h_qo,
+    #     h_kv,
+    #     Q_NUM_BLKS,
+    #     K_NUM_BLKS,
+    #     qo_len,
+    #     kv_len,
+    #     triton.next_power_of_2(kv_len),
+    #     FP8_MAX=FP8_MAX,
+    #     INT8_MAX=torch.iinfo(q_int8.dtype).max,
+    #     D=head_dim,
+    #     BLK_Q=BLKQ,
+    #     BLK_K=BLKK,
+    #     V_QUANT_SCHEME=V_QUANT_SCHEME,
+    # )
+    v_perchannel_quant[grid_v](
         q,
         q_int8,
         q_scale,
@@ -2083,6 +2209,304 @@ def sage_quant(
     )
 
     return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
+
+@triton.jit
+def q_quant_kernel(
+    Q_Input,
+    Q_Output,
+    Q_Scale,
+    K_Input,
+    K_Output,
+    K_Scale,
+    V_Input,
+    V_Output,
+    V_Scale,
+    stride_qz,
+    stride_qh,
+    stride_qn,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_qsz,
+    stride_qsh,
+    stride_ksz,
+    stride_ksh,
+    stride_vsz,
+    stride_vsh,
+    sm_scale,
+    q_task_count,
+    k_task_count,
+    BATCH,
+    Q_HEAD,
+    K_HEAD,
+    Q_NUM_BLKS,
+    K_NUM_BLKS,
+    SEQLEN_Q,
+    SEQLEN_K,
+    SEQLEN_K_PADDED: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    INT8_MAX: tl.constexpr,
+    D: tl.constexpr,
+    BLK_Q: tl.constexpr,
+    BLK_K: tl.constexpr,
+    V_QUANT_SCHEME: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_blk_q = tl.arange(0, BLK_Q)
+    offs_blk_k = tl.arange(0, BLK_K)
+    offs_d = tl.arange(0, D)
+    # here we do Q
+    off_blk, off_h, off_b = pid_grid_3d(pid, Q_NUM_BLKS, Q_HEAD, BATCH)
+    offs_qn = off_blk * BLK_Q + offs_blk_q
+
+    q_offs = (
+        off_b * stride_qz
+        + off_h * stride_qh
+        + offs_qn[:, None] * stride_qn
+        + offs_d[None, :]
+    )
+
+    q_input_ptrs = Q_Input + q_offs
+    q_output_ptrs = Q_Output + q_offs
+    q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
+
+    _general_quant_kernel(
+        q_input_ptrs,
+        q_output_ptrs,
+        q_scale_ptrs,
+        INT8_MAX,
+        offs_qn[:, None] < SEQLEN_Q,
+        sm_scale=sm_scale,
+    )
+
+
+
+    
+@triton.jit
+def k_quant_kernel(
+    Q_Input,
+    Q_Output,
+    Q_Scale,
+    K_Input,
+    K_Output,
+    K_Scale,
+    V_Input,
+    V_Output,
+    V_Scale,
+    stride_qz,
+    stride_qh,
+    stride_qn,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_qsz,
+    stride_qsh,
+    stride_ksz,
+    stride_ksh,
+    stride_vsz,
+    stride_vsh,
+    sm_scale,
+    q_task_count,
+    k_task_count,
+    BATCH,
+    Q_HEAD,
+    K_HEAD,
+    Q_NUM_BLKS,
+    K_NUM_BLKS,
+    SEQLEN_Q,
+    SEQLEN_K,
+    SEQLEN_K_PADDED: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    INT8_MAX: tl.constexpr,
+    D: tl.constexpr,
+    BLK_Q: tl.constexpr,
+    BLK_K: tl.constexpr,
+    V_QUANT_SCHEME: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    # pid = remap_xcd(pid, k_task_count, 8)
+
+    offs_blk_q = tl.arange(0, BLK_Q)
+    offs_blk_k = tl.arange(0, BLK_K)
+    offs_d = tl.arange(0, D)
+    # here we do K
+    off_blk, off_h, off_b = pid_grid_3d(pid, K_NUM_BLKS, K_HEAD, BATCH)
+
+    offs_kn = off_blk * BLK_K + offs_blk_k
+
+    k_offs = (
+        off_b * stride_kz
+        + off_h * stride_kh
+        + offs_kn[:, None] * stride_kn
+        + offs_d[None, :]
+    )
+
+    k_input_ptrs = K_Input + k_offs
+    k_output_ptrs = K_Output + k_offs
+    k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
+
+    _general_quant_kernel(
+        k_input_ptrs,
+        k_output_ptrs,
+        k_scale_ptrs,
+        INT8_MAX,
+        offs_kn[:, None] < SEQLEN_K,
+    )
+
+@triton.jit
+def v_quant_kernel(
+    Q_Input,
+    Q_Output,
+    Q_Scale,
+    K_Input,
+    K_Output,
+    K_Scale,
+    V_Input,
+    V_Output,
+    V_Scale,
+    stride_qz,
+    stride_qh,
+    stride_qn,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_qsz,
+    stride_qsh,
+    stride_ksz,
+    stride_ksh,
+    stride_vsz,
+    stride_vsh,
+    sm_scale,
+    q_task_count,
+    k_task_count,
+    BATCH,
+    Q_HEAD,
+    K_HEAD,
+    Q_NUM_BLKS,
+    K_NUM_BLKS,
+    SEQLEN_Q,
+    SEQLEN_K,
+    SEQLEN_K_PADDED: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    INT8_MAX: tl.constexpr,
+    D: tl.constexpr,
+    BLK_Q: tl.constexpr,
+    BLK_K: tl.constexpr,
+    V_QUANT_SCHEME: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid = remap_xcd(pid, k_task_count, 8)
+
+    offs_blk_q = tl.arange(0, BLK_Q)
+    offs_blk_k = tl.arange(0, BLK_K)
+    offs_d = tl.arange(0, D)
+    off_blk, off_h, off_b = pid_grid_3d(pid, K_NUM_BLKS, K_HEAD, BATCH)
+    offs_kn = off_blk * BLK_K + offs_blk_k
+
+    v_offs = (
+        off_b * stride_kz
+        + off_h * stride_kh
+        + offs_kn[:, None] * stride_kn
+        + offs_d[None, :]
+    )
+
+    v_input_ptrs = V_Input + v_offs
+    v_output_ptrs = V_Output + v_offs
+    if V_QUANT_SCHEME == 0:
+        v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_blk
+        _general_quant_kernel(
+            v_input_ptrs,
+            v_output_ptrs,
+            v_scale_ptrs,
+            FP8_MAX,
+            offs_kn[:, None] < SEQLEN_K,
+        )
+    else:
+        # just apply the per channel v_scales that have been computed outside
+        v_scale_ptrs = (
+            V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
+        )
+        v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
+        v = v.to(tl.float32)
+        v_scales = tl.load(v_scale_ptrs)
+        v_quant = v / v_scales
+        v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+        tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
+
+@triton.jit
+def v_perchannel_quant(
+    Q_Input,
+    Q_Output,
+    Q_Scale,
+    K_Input,
+    K_Output,
+    K_Scale,
+    V_Input,
+    V_Output,
+    V_Scale,
+    stride_qz,
+    stride_qh,
+    stride_qn,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_qsz,
+    stride_qsh,
+    stride_ksz,
+    stride_ksh,
+    stride_vsz,
+    stride_vsh,
+    sm_scale,
+    q_task_count,
+    k_task_count,
+    BATCH,
+    Q_HEAD,
+    K_HEAD,
+    Q_NUM_BLKS,
+    K_NUM_BLKS,
+    SEQLEN_Q,
+    SEQLEN_K,
+    SEQLEN_K_PADDED: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    INT8_MAX: tl.constexpr,
+    D: tl.constexpr,
+    BLK_Q: tl.constexpr,
+    BLK_K: tl.constexpr,
+    V_QUANT_SCHEME: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # offs_d = tl.arange(0, D)
+    offs_n = tl.arange(0, SEQLEN_K_PADDED)
+    off_d, off_h, off_b = pid_grid_3d(pid, D, K_HEAD, BATCH)
+
+    v_offs = (
+        off_b * stride_kz
+        + off_h * stride_kh
+        + offs_n * stride_kn
+        + off_d
+    ) # (SEQLEN_K_PADDED,)
+
+    v_scale_offs = (
+        off_b * stride_ksz
+        + off_h * stride_ksh
+        + off_d
+    )
+
+    v_input_ptrs = V_Input + v_offs
+    v_output_ptrs = V_Output + v_offs
+    v_scale_ptrs = V_Scale + v_scale_offs
+    
+    v = tl.load(v_input_ptrs, mask=offs_n < SEQLEN_K, other=0.0)
+    v = v.to(tl.float32)
+    v_scales = tl.max(tl.abs(v)) / FP8_MAX
+    v_quant = v / v_scales
+    v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+    tl.store(v_scale_ptrs, v_scales)
+    tl.store(v_output_ptrs, v_quant, mask=offs_n < SEQLEN_K)
+
+
+
 
 
 @triton.jit
