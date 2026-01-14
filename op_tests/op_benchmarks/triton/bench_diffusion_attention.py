@@ -308,6 +308,7 @@ def fav3_sage_forward_func(
         layout=layout,
     )
     if time_quant:
+        print("timing quantization function")
         return fn
 
     return lambda: fav3_sage_func(
@@ -586,8 +587,11 @@ def bench_kernel(q, k, v, args, provider):
         return total_flops / ms * 1e-9
     elif "GB/s" in provider:  # GB/s
         if time_quant:
+            # read the tensors in bf16
             mem_read = 3 * total_num_tokens_q * HQ * D_HEAD * 2
+            # scale stores
             mem_write = total_num_tokens_q / 256 * HQ * 4 + total_num_tokens_q / 128 * HQ * 4 + D_HEAD * HQ * BATCH
+            # scaled tensor stores
             mem_write += 3 * total_num_tokens_q * HQ * D_HEAD * 1
             mem = mem_read + mem_write
         

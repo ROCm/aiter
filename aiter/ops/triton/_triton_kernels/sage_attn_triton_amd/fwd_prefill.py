@@ -38,13 +38,13 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
         }
     elif arch == "gfx942":
         return {
-        "BLOCK_M": 512,
-        "BLOCK_N": 256,
-        "waves_per_eu": 2,
-        "PRE_LOAD_V": False,
-        "num_stages": 2,
-        "num_warps": 4,
-    }
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 2,
+            "num_warps": 8,
+        }
     else:
         # return tuned config for MI300X by default
         return {
@@ -2039,7 +2039,7 @@ def sage_quant(
     v_task_count = b * h_kv * K_NUM_BLKS
 
     grid = (q_task_count + k_task_count + v_task_count,)
-
+    print("grid size", q_task_count + k_task_count + v_task_count)
     # call sage_quant_kernel
     sage_quant_kernel[grid](
         q,
@@ -2127,6 +2127,8 @@ def sage_quant_kernel(
     V_QUANT_SCHEME: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    if pid < (q_task_count+k_task_count):
+        pid = remap_xcd(pid, q_task_count+k_task_count, 8)
 
     offs_blk_q = tl.arange(0, BLK_Q)
     offs_blk_k = tl.arange(0, BLK_K)
