@@ -10,6 +10,7 @@ import ast
 import functools
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -127,7 +128,31 @@ def list_triton_source_files() -> (
 DEVICES: frozenset[str] = frozenset(["gfx942", "gfx950"])
 
 
-def resolve_json_string_interpolation(json_string: str) -> list[str]:
+def resolve_mnk_placeholders(json_string: str, config_files: list[Path]) -> list[str]:
+    PLACEHOLDERS = "MNK"
+    NUM_PATTERN = r"\d+"
+
+    if not any(f"{{{p}}}" in json_string for p in PLACEHOLDERS):
+        logging.debug("No M/N/K placeholders in [%s].", json_string)
+        return [json_string]
+
+    pattern_str = re.escape(json_string[2:-1])
+
+    for p in PLACEHOLDERS:
+        pattern_str = pattern_str.replace(
+            rf"\{{{p}\}}",
+            rf"(?P<{p}>{NUM_PATTERN})",
+        )
+
+    pattern = re.compile(f"^{pattern_str}$")
+    logging.debug("M/N/K regex is [%s].", pattern.pattern)
+
+    return [f'f"{path}"' for c in config_files if pattern.match(path := c.as_posix())]
+
+
+def resolve_json_string_interpolation(
+    json_string: str, config_files: list[Path]
+) -> list[str]:
     resolved_strings = [json_string]
     if json_string.startswith("f'") or json_string.startswith('f"'):
         # f-string with variable interpolation.
@@ -145,6 +170,12 @@ def resolve_json_string_interpolation(json_string: str) -> list[str]:
         if r"{dev}" in json_string:
             resolved_strings = [json_string.replace(r"{dev}", dev) for dev in DEVICES]
             logging.debug(r"Resolved {dev} in JSON string: %s", str(resolved_strings))
+        # Resolve GEMM M-N-K interpolation:
+        resolved_strings = [
+            match
+            for resolved_string in resolved_strings
+            for match in resolve_mnk_placeholders(resolved_string, config_files)
+        ]
         # Resolve MOE data type interpolation:
         resolved_strings = [
             replaced
@@ -172,11 +203,15 @@ def resolve_json_string_interpolation(json_string: str) -> list[str]:
     return resolved_strings
 
 
-def resolve_json_strings(json_strings: list[str]) -> list[Path]:
+def resolve_json_strings(
+    json_strings: list[str], config_files: list[Path]
+) -> list[Path]:
     json_strings = sorted(
         resolved_json_strings
         for json_string in json_strings
-        for resolved_json_strings in resolve_json_string_interpolation(json_string)
+        for resolved_json_strings in resolve_json_string_interpolation(
+            json_string, config_files
+        )
     )
     resolved: list[Path] = []
     unresolved: list[str] = []
@@ -214,10 +249,12 @@ def resolve_gemm_config_names(gemm_config_names: list[str]) -> list[Path]:
 
 
 def resolve_configs(
-    json_strings: list[str], gemm_config_names: list[str]
+    json_strings: list[str],
+    gemm_config_names: list[str],
+    config_files: list[Path],
 ) -> list[Path]:
     return sorted(
-        set(resolve_json_strings(json_strings)).union(
+        set(resolve_json_strings(json_strings, config_files)).union(
             resolve_gemm_config_names(gemm_config_names)
         )
     )
@@ -510,6 +547,7 @@ def parse_source_file(source_file: Path) -> tuple[list[Path], list[str], list[st
 def parse_source_file_recursively(
     graph: nx.DiGraph,
     source_file: Path,
+    config_files: list[Path],
     visited: set[Path],
     deps_to_ignore: set[Path] = set(),
 ) -> None:
@@ -521,7 +559,7 @@ def parse_source_file_recursively(
             continue
 
         dependencies, json_strings, gemm_config_names = parse_source_file(current)
-        configs = resolve_configs(json_strings, gemm_config_names)
+        configs = resolve_configs(json_strings, gemm_config_names, config_files)
 
         # Add current node to the graph.
         current_str = str(current)
@@ -573,17 +611,20 @@ def add_files_to_dependency_graph(
     graph: nx.DiGraph,
     files: list[Path],
     file_type: str,
+    config_files: list[Path],
     visited: set[Path],
     deps_to_ignore: set[Path] = set(),
 ) -> None:
     for f in files:
-        parse_source_file_recursively(graph, f, visited, deps_to_ignore=deps_to_ignore)
+        parse_source_file_recursively(
+            graph, f, config_files, visited, deps_to_ignore=deps_to_ignore
+        )
         tag_node(graph, f, file_type)
 
 
 def build_dependency_graph(
     kernel_files: list[Path],
-    cofig_files: list[Path],
+    config_files: list[Path],
     test_files: list[Path],
     bench_files: list[Path],
 ) -> nx.DiGraph:
@@ -601,11 +642,16 @@ def build_dependency_graph(
     ), "All ignored source file dependencies must exist in the filesystem."
     # Add files that tests depends on.
     add_files_to_dependency_graph(
-        graph, test_files, "test", visited, deps_to_ignore=deps_to_ignore
+        graph, test_files, "test", config_files, visited, deps_to_ignore=deps_to_ignore
     )
     # Add files that benchmarks depends on.
     add_files_to_dependency_graph(
-        graph, bench_files, "bench", visited, deps_to_ignore=deps_to_ignore
+        graph,
+        bench_files,
+        "bench",
+        config_files,
+        visited,
+        deps_to_ignore=deps_to_ignore,
     )
     logging.debug(
         "Built dependency graph of Triton source files with %d nodes and %d edges.",
@@ -617,8 +663,8 @@ def build_dependency_graph(
         if kernel_file.name != "__init__.py":
             tag_node(graph, kernel_file, "kernel")
     # Tag config files.
-    for cofig_file in cofig_files:
-        tag_node(graph, cofig_file, "config")
+    for config_file in config_files:
+        tag_node(graph, config_file, "config")
     return graph
 
 
