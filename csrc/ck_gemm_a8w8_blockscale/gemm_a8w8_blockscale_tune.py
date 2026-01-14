@@ -97,8 +97,9 @@ def generate_data(m, n, k, seed, is_cktile, is_bpreshuffled, device="cuda"):
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
 
     if is_cktile and is_bpreshuffled:
-        weight_shuffle = shuffle_weight_cktile(weight, layout=(16, 16))
-        return x, weight, x_scale, w_scale, out, weight_shuffle
+        weight_shuffle_16x16 = shuffle_weight_cktile(weight, layout=(16, 16))
+        weight_shuffle_32x32 = shuffle_weight_cktile(weight, layout=(32, 32))
+        return x, weight, x_scale, w_scale, out, weight_shuffle_16x16, weight_shuffle_32x32
     else:
         return x, weight, x_scale, w_scale, out
 
@@ -172,6 +173,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         tasks_ck_tile = []
         for i in range(kernels_num):
             kernel = candidate_kernels_cktile_dict[i]
+            if kernel.N_Warp_Tile == 32:
+                gemm_a8w8_idx = [0, 6 if is_bpreshuffled else 1, 2, 3, 4]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -314,7 +317,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
-
+        print("ret:", ret)
         return ret
 
     def result_to_df(self, results):
