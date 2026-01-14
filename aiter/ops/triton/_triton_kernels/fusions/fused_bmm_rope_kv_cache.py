@@ -234,7 +234,7 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
 
         stride_ab_i64 = tl.cast(stride_ab, tl.int64)
         stride_bb_i64 = tl.cast(stride_bb, tl.int64)
-        stride_cb_i64 = tl.cast(stride_cb, tl.int64)
+        tl.cast(stride_cb, tl.int64)
         stride_bsb_i64 = tl.cast(stride_bsb, tl.int64)
 
         SCALE_GROUP_SIZE: tl.constexpr = 32
