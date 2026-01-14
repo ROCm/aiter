@@ -942,16 +942,147 @@ struct gmem {
         else if constexpr (sizeof(type) == 4)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b32 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 8)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b64 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os, aux)); }
+        else {
+            // For sizes > 16 bytes, load in chunks of 16 bytes and concatenate
+            static constexpr index_t chunk_bytes = 16;
+            static constexpr index_t num_chunks = (sizeof(type) + chunk_bytes - 1) / chunk_bytes;
+            static constexpr index_t elements_per_chunk = chunk_bytes / sizeof(scalar_type);
+            static constexpr index_t total_elements = vec * vector_size;
+            
+            using chunk_type = vector_t<scalar_type, elements_per_chunk>;
+            type result;
+            scalar_type* result_ptr = reinterpret_cast<scalar_type*>(&result);
+            
+            // Load chunks and copy to result
+            static_for<num_chunks>([&](auto i) {
+                constexpr index_t chunk_offset_bytes = i.value * chunk_bytes;
+                constexpr index_t chunk_offset_elements = i.value * elements_per_chunk;
+                constexpr index_t remaining_bytes = sizeof(type) - chunk_offset_bytes;
+                constexpr index_t chunk_size_bytes = (remaining_bytes >= chunk_bytes) ? chunk_bytes : remaining_bytes;
+                constexpr index_t chunk_size_elements = chunk_size_bytes / sizeof(scalar_type);
+                
+                // Load raw bytes based on chunk_size_bytes
+                if constexpr (chunk_size_bytes == 16) {
+                    using load_type = vector_t<scalar_type, 16 / sizeof(scalar_type)>;
+                    auto chunk = __builtin_bit_cast(load_type, __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os + chunk_offset_bytes, s_os, aux));
+                    static_for<chunk_size_elements>([&](auto j) {
+                        result_ptr[chunk_offset_elements + j.value] = chunk[j.value];
+                    });
+                } else if constexpr (chunk_size_bytes == 8) {
+                    using load_type = vector_t<scalar_type, 8 / sizeof(scalar_type)>;
+                    auto chunk = __builtin_bit_cast(load_type, __builtin_amdgcn_raw_buffer_load_b64(cached_rsrc, v_os + chunk_offset_bytes, s_os, aux));
+                    static_for<chunk_size_elements>([&](auto j) {
+                        result_ptr[chunk_offset_elements + j.value] = chunk[j.value];
+                    });
+                } else if constexpr (chunk_size_bytes == 4) {
+                    using load_type = vector_t<scalar_type, 4 / sizeof(scalar_type)>;
+                    auto chunk = __builtin_bit_cast(load_type, __builtin_amdgcn_raw_buffer_load_b32(cached_rsrc, v_os + chunk_offset_bytes, s_os, aux));
+                    static_for<chunk_size_elements>([&](auto j) {
+                        result_ptr[chunk_offset_elements + j.value] = chunk[j.value];
+                    });
+                } else if constexpr (chunk_size_bytes == 2) {
+                    if constexpr (sizeof(scalar_type) <= 2 && chunk_size_elements > 0) {
+                        using load_type = vector_t<scalar_type, 2 / sizeof(scalar_type)>;
+                        auto chunk = __builtin_bit_cast(load_type, __builtin_amdgcn_raw_buffer_load_b16(cached_rsrc, v_os + chunk_offset_bytes, s_os, aux));
+                        static_for<chunk_size_elements>([&](auto j) {
+                            result_ptr[chunk_offset_elements + j.value] = chunk[j.value];
+                        });
+                    } else {
+                        // For 2-byte chunks when scalar_type > 2 bytes, copy bytes directly
+                        uint16_t word_val = __builtin_amdgcn_raw_buffer_load_b16(cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                        *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(result_ptr) + chunk_offset_bytes) = word_val;
+                    }
+                } else if constexpr (chunk_size_bytes == 1) {
+                    // For 1-byte chunks, load as uint8_t and copy directly to memory
+                    uint8_t byte_val = __builtin_amdgcn_raw_buffer_load_b8(cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                    // Copy the byte directly to the result memory
+                    *(reinterpret_cast<uint8_t*>(result_ptr) + chunk_offset_bytes) = byte_val;
+                }
+            });
+            
+            return result;
+        }
     }
 
     template<index_t vec = 1, typename V, index_t aux = 0>   // os in unit of byte
     OPUS_D void _store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
         static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
-        if      constexpr (sizeof(vector_type<vec>) == 1)  { __builtin_amdgcn_raw_buffer_store_b8  (__builtin_bit_cast(i8_t,    x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 2)  { __builtin_amdgcn_raw_buffer_store_b16 (__builtin_bit_cast(i16_t,   x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
+        using type = vector_type<vec>;
+        if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_buffer_store_b8  (__builtin_bit_cast(i8_t,    x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_buffer_store_b16 (__builtin_bit_cast(i16_t,   x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
+        else {
+            // For sizes > 16 bytes, store in chunks of 16 bytes
+            static constexpr index_t chunk_bytes = 16;
+            static constexpr index_t num_chunks = (sizeof(type) + chunk_bytes - 1) / chunk_bytes;
+            static constexpr index_t elements_per_chunk = chunk_bytes / sizeof(scalar_type);
+            
+            const scalar_type* x_ptr = reinterpret_cast<const scalar_type*>(&x);
+            
+            // Store chunks
+            static_for<num_chunks>([&](auto i) {
+                constexpr index_t chunk_offset_bytes = i.value * chunk_bytes;
+                constexpr index_t chunk_offset_elements = i.value * elements_per_chunk;
+                constexpr index_t remaining_bytes = sizeof(type) - chunk_offset_bytes;
+                constexpr index_t chunk_size_bytes = (remaining_bytes >= chunk_bytes) ? chunk_bytes : remaining_bytes;
+                constexpr index_t chunk_size_elements = chunk_size_bytes / sizeof(scalar_type);
+                
+                // Store raw bytes based on chunk_size_bytes
+                if constexpr (chunk_size_bytes == 16) {
+                    using chunk_type = vector_t<scalar_type, 16 / sizeof(scalar_type)>;
+                    chunk_type chunk;
+                    static_for<chunk_size_elements>([&](auto j) {
+                        chunk[j.value] = x_ptr[chunk_offset_elements + j.value];
+                    });
+                    __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, chunk), cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                } else if constexpr (chunk_size_bytes == 8) {
+                    if constexpr (sizeof(scalar_type) <= 8 && chunk_size_elements > 0) {
+                        using chunk_type = vector_t<scalar_type, 8 / sizeof(scalar_type)>;
+                        chunk_type chunk;
+                        static_for<chunk_size_elements>([&](auto j) {
+                            chunk[j.value] = x_ptr[chunk_offset_elements + j.value];
+                        });
+                        __builtin_amdgcn_raw_buffer_store_b64(__builtin_bit_cast(i32x2_t, chunk), cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                    } else {
+                        // For 8-byte chunks when scalar_type > 8 bytes, copy bytes directly
+                        const uint64_t word_val = *reinterpret_cast<const uint64_t*>(reinterpret_cast<const uint8_t*>(x_ptr) + chunk_offset_bytes);
+                        __builtin_amdgcn_raw_buffer_store_b64(__builtin_bit_cast(i32x2_t, word_val), cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                    }
+                } else if constexpr (chunk_size_bytes == 4) {
+                    if constexpr (sizeof(scalar_type) <= 4 && chunk_size_elements > 0) {
+                        using chunk_type = vector_t<scalar_type, 4 / sizeof(scalar_type)>;
+                        chunk_type chunk;
+                        static_for<chunk_size_elements>([&](auto j) {
+                            chunk[j.value] = x_ptr[chunk_offset_elements + j.value];
+                        });
+                        __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(i32_t, chunk), cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                    } else {
+                        // For 4-byte chunks when scalar_type > 4 bytes, copy bytes directly
+                        const uint32_t word_val = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(x_ptr) + chunk_offset_bytes);
+                        __builtin_amdgcn_raw_buffer_store_b32(__builtin_bit_cast(i32_t, word_val), cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                    }
+                } else if constexpr (chunk_size_bytes == 2) {
+                    if constexpr (sizeof(scalar_type) <= 2 && chunk_size_elements > 0) {
+                        using chunk_type = vector_t<scalar_type, 2 / sizeof(scalar_type)>;
+                        chunk_type chunk;
+                        static_for<chunk_size_elements>([&](auto j) {
+                            chunk[j.value] = x_ptr[chunk_offset_elements + j.value];
+                        });
+                        __builtin_amdgcn_raw_buffer_store_b16(__builtin_bit_cast(i16_t, chunk), cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                    } else {
+                        // For 2-byte chunks when scalar_type > 2 bytes, copy bytes directly
+                        const uint16_t word_val = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(x_ptr) + chunk_offset_bytes);
+                        __builtin_amdgcn_raw_buffer_store_b16(__builtin_bit_cast(i16_t, word_val), cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                    }
+                } else if constexpr (chunk_size_bytes == 1) {
+                    // For 1-byte chunks, store directly
+                    const uint8_t byte_val = *(reinterpret_cast<const uint8_t*>(x_ptr) + chunk_offset_bytes);
+                    __builtin_amdgcn_raw_buffer_store_b8(__builtin_bit_cast(i8_t, byte_val), cached_rsrc, v_os + chunk_offset_bytes, s_os, aux);
+                }
+            });
+        }
     }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec

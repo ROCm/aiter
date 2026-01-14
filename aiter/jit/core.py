@@ -556,7 +556,7 @@ def build_module(
 
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
-        flags_cc = ["-O3", "-std=c++20"]
+        flags_cc = ["-O3", "-g", "-std=c++20"]
         flags_hip = [
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",

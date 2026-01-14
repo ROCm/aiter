@@ -1673,3 +1673,13 @@ namespace py = pybind11;
           py::arg("rowEnds")   = torch::Tensor(), \
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1);
+
+#define RMSNORM_QUANT_PYBIND                      \
+    m.def("add_rmsnorm_quant", &aiter::add_rmsnorm_quant, \
+        py::arg("out"), \
+        py::arg("input"), \
+        py::arg("residual_in"), \
+        py::arg("residual_out"), \
+        py::arg("scale"), \
+        py::arg("weight"), \
+        py::arg("epsilon"));

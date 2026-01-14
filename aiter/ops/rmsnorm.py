@@ -129,3 +129,15 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant")
+def add_rmsnorm_quant(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    scale: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None: ...
