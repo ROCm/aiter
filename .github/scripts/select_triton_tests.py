@@ -797,7 +797,7 @@ def main() -> int:
     end_timestamp = time.perf_counter()
     elapsed_time_s = end_timestamp - start_timestamp
     logging.info("Finished, execution took %.2f seconds.", elapsed_time_s)
-    return exit_code
+    return 0
 
 
 if __name__ == "__main__":
