@@ -2,8 +2,8 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.33.2/src/transformers/models/llama/modeling_llama.py
-# Copyright (C) 2023-2025 The vLLM team.
-# Copyright (C) 2022-2025 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+# Copyright (C) 2023-2026 The vLLM team.
+# Copyright (C) 2022-2026 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
 # and OPT implementations in this library. It has been modified from its
@@ -347,7 +347,7 @@ class RotaryEmbedding(nn.Module):
         offsets: Optional[torch.Tensor] = None,
         is_nope_first=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        import aiter.ops.triton.rope as ops
+        import aiter.ops.triton.rope.rope as ops
 
         self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
         self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
