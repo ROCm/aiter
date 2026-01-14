@@ -2016,13 +2016,33 @@ def sage_quant(
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
-    # Apply K tensor smoothing following SageAttention approach
-    if smooth_k:
-        k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+
 
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
     
+    # Apply K tensor smoothing following SageAttention approach
+    if smooth_k:
+        k_mean = torch.empty((b, h_kv, head_dim), device=q.device, dtype=torch.float32)
+        k_task_count = b * h_kv * head_dim
+        grid_k = (k_task_count,)
+        k_mean_kernel[grid_k](
+                k,
+                k_mean,
+                stride_bz_k,
+                stride_h_k,
+                stride_seq_k,
+                k_mean.stride(0),
+                k_mean.stride(1),
+                b,
+                h_kv,
+                kv_len,
+                triton.next_power_of_2(kv_len),
+                D=head_dim,
+            )
+
+        k = k - k_mean.unsqueeze(1 if layout == "bshd" else 2)
+
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
@@ -2483,7 +2503,7 @@ def v_perchannel_max(
 ):
     pid = tl.program_id(0)
     # offs_d = tl.arange(0, D)
-    BLOCK_N: tl.constexpr = 16384
+    BLOCK_N: tl.constexpr = 256
     offs_n = tl.arange(0, BLOCK_N)
     off_d, off_h, off_b = pid_grid_3d(pid, D, K_HEAD, BATCH)
     # offs_d = tl.arange(0, D)
@@ -2518,6 +2538,56 @@ def v_perchannel_max(
 
 
 
+@triton.jit
+def k_mean_kernel(
+
+    K_Input,
+    K_Mean,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_ksz,
+    stride_ksh,
+    BATCH,
+    K_HEAD,
+    SEQLEN_K,
+    SEQLEN_K_PADDED: tl.constexpr,
+    D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    # offs_d = tl.arange(0, D)
+    BLOCK_N: tl.constexpr = 16384
+    offs_n = tl.arange(0, BLOCK_N)
+    off_d, off_h, off_b = pid_grid_3d(pid, D, K_HEAD, BATCH)
+    # offs_d = tl.arange(0, D)
+    k_offs = (
+        off_b * stride_kz
+        + off_h * stride_kh
+        + offs_n * stride_kn
+        + off_d
+    ) # (SEQLEN_K_PADDED,)
+
+    k_scale_offs = (
+        off_b * stride_ksz
+        + off_h * stride_ksh
+        + off_d
+    )
+
+    k_input_ptrs = K_Input + k_offs
+    # v_output_ptrs = V_Output + v_offs
+    k_mean_ptrs = K_Mean + k_scale_offs
+
+    k_sum = 0.0
+    
+    for i in range(tl.cdiv(SEQLEN_K_PADDED, BLOCK_N)):
+        k = tl.load(k_input_ptrs, mask=offs_n < (SEQLEN_K - i*BLOCK_N), other=0.0)
+        k = k.to(tl.float32)
+        k_sum_iter = tl.sum(k) 
+        k_sum = k_sum + k_sum_iter
+        k_input_ptrs += offs_n * stride_kn
+
+    k_mean = k_sum / SEQLEN_K
+    tl.store(k_mean_ptrs, k_mean)
 
 
 
