@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import torch.profiler as tpf
 import os
@@ -355,6 +355,9 @@ def get_trace_perf(prof, num_iters):
             else:
                 r["host_time_sum"] = r["self_device_time_total"]
                 r["device_time_sum"] = 0
+            r["device_time_avg"] = (
+                r["device_time_sum"] / r["cnt"] if r["cnt"] > 0 else 0
+            )
         rets.append(r)
     df = pd.DataFrame(rets)
     cols = [
@@ -362,6 +365,7 @@ def get_trace_perf(prof, num_iters):
         "cnt",
         "host_time_sum",
         "device_time_sum",
+        "device_time_avg",
         "device_type",
         "device_index",
     ]
