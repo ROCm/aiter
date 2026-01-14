@@ -34,33 +34,42 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
 ):
-    device = topk_ids.device
-    M, topk = topk_ids.shape
-    max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
+    try:
+        device = topk_ids.device
+        M, topk = topk_ids.shape
+        max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
 
-    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            max_num_m_blocks, dtype=dtypes.i32, device=device
+        )
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
-    aiter.moe_sorting_fwd(
-        topk_ids,
-        topk_weights,
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_buf,
-        num_experts,
-        block_size,
-        expert_mask,
-        num_local_tokens,
-        dispatch_policy,
-    )
+        aiter.moe_sorting_fwd(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            dispatch_policy,
+        )
+    except Exception as e:
+        logger.error(f"Error in moe_sorting: {e}")
+        logger.error(
+            f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
+        )
+        raise e
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
