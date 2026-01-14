@@ -18,98 +18,23 @@ def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None, 
     assert not autotune, "Autotuning is not supported."
     arch = get_arch()
     if arch == "gfx950":
-        # All tuned configs for different seqlen_k
-        if seqlen_k is not None and seqlen_k <= 512:
-            if seqlen_k <= 16452:
-                return {
-                    "BLOCK_M": 128,
-                    "BLOCK_N": 64,
-                    "num_warps": 4,
-                    "PRE_LOAD_V": True,
-                    "num_stages": 5,
-                    "waves_per_eu": 2
-                }
-            elif seqlen_k <= 29760:
-                return {
-                    'BLOCK_M': 128, 'BLOCK_N': 64, 'num_warps': 4, 'num_stages': 6, 'waves_per_eu': 2, 'PRE_LOAD_V': True
-                }
-            elif seqlen_k <= 75600:
-                return {
-                    "BLOCK_M": 128,
-                    "BLOCK_N": 64,
-                    "num_warps": 4,
-                    "PRE_LOAD_V": True,
-                    "num_stages": 5,
-                    "waves_per_eu": 2
-                }
-            else:
-                # return tuned config for seqlen_k == 118808
-                return {
-                    "BLOCK_M": 64,
-                    "BLOCK_N": 128,
-                    "num_warps": 4,
-                    "PRE_LOAD_V": True,
-                    "num_stages": 2,
-                    "waves_per_eu": 2
-                }
-
-        else:
-            if seqlen_q <= 16452:
-                return {
-                    "BLOCK_M": 128,
-                    "BLOCK_N": 128,
-                    "num_warps": 4,
-                    "PRE_LOAD_V": False,
-                    "num_stages": 1,
-                    "waves_per_eu": 2
-                }
-            elif seqlen_q <= 29760:
-                if num_heads >= 3:
-                    return {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 128,
-                        "PRE_LOAD_V": False,
-                        "num_warps": 4,
-                        "num_stages": 1,
-                        "waves_per_eu": 2
-                    }
-                else:
-                    return {
-                        "BLOCK_M": 256,
-                        "BLOCK_N": 128,
-                        "num_warps": 8,
-                        "num_stages": 3,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False
-                    }
-            elif seqlen_q <= 75600:
-                return {
-                    "BLOCK_M": 256,
-                    "BLOCK_N": 128,
-                    "waves_per_eu": 2,
-                    "PRE_LOAD_V": False,
-                    "num_stages": 5,
-                    "num_warps": 8,
-                }
-            else:
-                # return tuned config for seqlen_q == 118808
-                return {
-                    "BLOCK_M": 128,
-                    "BLOCK_N": 128,
-                    "num_warps": 4,
-                    "PRE_LOAD_V": False,
-                    "num_stages": 1,
-                    "waves_per_eu": 2
-                }
+        return {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "num_warps": 4,
+            "PRE_LOAD_V": False,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        }
     elif arch == "gfx942":
         return {
-        "BLOCK_M": 256,
-        "BLOCK_N": 128,
-        "waves_per_eu": 2,
-        "PRE_LOAD_V": False,
-        "num_stages": 2,
-        "num_warps": 8,
-    }
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 2,
+            "num_warps": 8,
+        }
     else:
         # return tuned config for MI300X by default
         return {
