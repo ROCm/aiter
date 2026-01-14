@@ -2523,7 +2523,7 @@ def v_perchannel_max(
 
     v_max = 0.0
     
-    for k in range(tl.cdiv(SEQLEN_K_PADDED, BLOCK_N)):
+    for k in range(tl.cdiv(SEQLEN_K, BLOCK_N)):
         v = tl.load(v_input_ptrs, mask=offs_n < (SEQLEN_K - k*BLOCK_N), other=0.0)
         v = v.to(tl.float32)
         v_max_iter = tl.max(tl.abs(v)) 
@@ -2574,7 +2574,7 @@ def k_mean_kernel(
 
     k_sum = 0.0
     
-    for i in range(tl.cdiv(SEQLEN_K_PADDED, BLOCK_N)):
+    for i in range(tl.cdiv(SEQLEN_K, BLOCK_N)):
         k = tl.load(k_input_ptrs, mask=offs_n < (SEQLEN_K - i*BLOCK_N), other=0.0)
         k = k.to(tl.float32)
         k_sum_iter = tl.sum(k) 
