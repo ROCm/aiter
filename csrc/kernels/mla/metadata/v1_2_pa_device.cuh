@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "v1_comm.cuh"
 
@@ -30,9 +30,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     extern __shared__ uint8_t p_smem[];
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
-    int32_t* p_lds_pages_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : params.num_batches);
-    int32_t* p_lds_partial_info =
-        p_lds_pages_kv + (Traits::kLdsBatchInfo ? params.num_batches : 0);
+    int32_t* p_lds_pages_kv   = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : params.num_batches);
+    int32_t* p_lds_partial_info = p_lds_pages_kv + (Traits::kLdsBatchInfo ? params.num_batches : 0);
 
     QoState qo_state(
         params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
@@ -47,19 +46,21 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         const int32_t bid_ori = Traits::kIsSparse
                                     ? (bid / params.ori_seqlen_qo / params.qk_batch_ratio)
                                     : (bid / params.qk_batch_ratio);
-        const int32_t qo_length = params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
+        const int32_t qo_length =
+            params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
         const int32_t kv_length = params.p_context_lens[bid_ori];
 
         int32_t num_blocks = 0;
-        for (int32_t qo_offset = 0; qo_offset < qo_length; qo_offset += params.qlen_granularity) {
+        for(int32_t qo_offset = 0; qo_offset < qo_length; qo_offset += params.qlen_granularity)
+        {
             const int32_t local_qo_start = qo_offset;
-            const int32_t local_qo_end = min(local_qo_start + params.qlen_granularity, qo_length);
+            const int32_t local_qo_end   = min(local_qo_start + params.qlen_granularity, qo_length);
             const int32_t effective_kv_length =
-                    params.is_causal ? std::min(kv_length - qo_length + local_qo_end, kv_length) : kv_length;
-            num_blocks = integer_divide_ceil_power2(effective_kv_length,
-                                                    params.kv_granularity,
-                                                    params.kv_granularity_log2);
-            if (Traits::kIsSparse)
+                params.is_causal ? std::min(kv_length - qo_length + local_qo_end, kv_length)
+                                 : kv_length;
+            num_blocks = integer_divide_ceil_power2(
+                effective_kv_length, params.kv_granularity, params.kv_granularity_log2);
+            if(Traits::kIsSparse)
                 num_blocks = min(num_blocks, params.topk);
         }
 
@@ -80,6 +81,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     sum_blocks =
         aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), ck_tile::get_warp_size()>(
             sum_blocks);
+    sum_blocks *= params.num_heads_k;
     sum_blocks += params.num_batches * Traits::kFixedOverheadNumBlocks;
 
     if(lane_idx == 0)
@@ -93,247 +95,271 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     // expected payload handled by each cu part.
-    const int32_t average = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
-                        Traits::kFixedOverheadNumBlocks;
-    const int32_t reminder = std::max(sum_blocks - params.num_splits * average, 0);
+    const int32_t average  = sum_blocks / params.num_splits;
+    const int32_t reminder = sum_blocks % params.num_splits;
 
-    int32_t curr_batch        = 0; // batch ID of the batch which is under review
-    int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
-    int32_t curr_n_split_idx  = 0; // #cu parts used to handle current batch
-    int32_t curr_sub_head_idx = 0;
-
-    int32_t curr_kv_begin = 0;
-    // The size of 1st element equals to the end loc of the 1st element.
-    int32_t curr_kv_end    = Traits::kLdsBatchInfo ? p_lds_pages_kv[0]
-                             : Traits::kIsSparse   ? min(params.p_pages_kv_indptr[1], params.topk)
-                                                   : params.p_pages_kv_indptr[1];
-    int32_t curr_kv_pages = curr_kv_end - curr_kv_begin;
-
-    int32_t num_works          = 0;
-    int32_t partial_idx        = 0;
-    int32_t tot_qo_tiles       = 0;
-    int32_t last_reduce_indptr = 0;
+    int32_t cid                    = 0; // CU ID
+    int32_t cu_per_khead_group     = params.num_cu / params.num_heads_k;
+    int32_t num_works              = 0;
+    int32_t last_reduce_indptr     = 0;
     int32_t global_reduce_tile_idx = 0;
 
-    for(int32_t cid = 0; cid < params.num_cu; ++cid)
+    for(int32_t khead_idx = 0; khead_idx < params.num_heads_k; ++khead_idx)
     {
-        int32_t remain_payload = (cid < reminder) ? (average + 1) : average;
-        while(curr_batch < params.num_batches)
+        // Note:
+        // To control divide strategy more flexibly, store khead info by metadata.qhead_range
+        // instead of launch config. Considering current reduce implementation, khead loop should be
+        // in the outer since different khead need share same divide strategy. Therefor need reset
+        // state variables before allocate work by cu loop -> batch loop).
+        int32_t curr_batch        = 0; // batch ID of the batch which is under review
+        int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
+        int32_t curr_n_split_idx  = 0; // #cu parts used to handle current batch
+        int32_t curr_sub_head_idx = 0;
+
+        int32_t curr_kv_begin = 0;
+        // The size of 1st element equals to the end loc of the 1st element.
+        int32_t curr_kv_end   = Traits::kLdsBatchInfo ? p_lds_pages_kv[0]
+                                : Traits::kIsSparse ? min(params.p_pages_kv_indptr[1], params.topk)
+                                                    : params.p_pages_kv_indptr[1];
+        int32_t curr_kv_pages = curr_kv_end - curr_kv_begin;
+
+        int32_t partial_idx    = 0;
+        last_reduce_indptr     = 0;
+        global_reduce_tile_idx = 0;
+        // allocate work
+        while(cid < params.num_cu)
         {
-            const int32_t packed_qo_len = qo_state.get_seqlen(curr_batch) * params.qhead_granularity;
-            const int32_t num_qo_tiles =
-                Traits::kQoSplits ? integer_divide_ceil_power2(packed_qo_len,
-                                                               Traits::kPackedQoLenPerWg,
-                                                               Traits::kPackedQoLenPerWg_log2)
-                                  : 1;
-            const int32_t qo_tile_size =
-                ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
-            const int32_t num_kv_blocks = curr_kv_pages;
-            const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
-
-            // If current cu part is able to handle this batch of seqences
-            if(remain_payload >= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks))
+            int32_t remain_payload =
+                ((cid % cu_per_khead_group) < reminder) ? (average + 1) : average;
+            while(curr_batch < params.num_batches)
             {
-                const int32_t consuming_blks = remain_kv_blocks;
-                const int32_t num_splits = curr_n_split_idx + 1;
+                const int32_t packed_qo_len =
+                    qo_state.get_seqlen(curr_batch) * params.qhead_granularity;
+                const int32_t num_qo_tiles =
+                    Traits::kQoSplits ? integer_divide_ceil_power2(packed_qo_len,
+                                                                   Traits::kPackedQoLenPerWg,
+                                                                   Traits::kPackedQoLenPerWg_log2)
+                                      : 1;
+                const int32_t qo_tile_size =
+                    ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
+                const int32_t num_kv_blocks    = curr_kv_pages;
+                const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
 
-                auto fill_work_info = [&](const int32_t qo_tile_idx, const int32_t split_idx) {
-
-                    PaWorkInfo work_info{};
-                    work_info.batch_idx = curr_batch;
-                    work_info.qo_start =
-                        qo_state.get_begin(curr_batch) + qo_tile_idx * qo_tile_size;
-                    work_info.qo_end    = ck_tile::min(work_info.qo_start + qo_tile_size,
-                                                    qo_state.get_end(curr_batch));
-                    work_info.kv_start  = curr_kv_begin + curr_kv_block;
-                    work_info.kv_end    = ck_tile::min(work_info.kv_start + consuming_blks),
-                                                    integer_divide_ceil_power2(
-                                                        curr_kv_end * params.kv_granularity
-                                                        - (num_qo_tiles - 1 - qo_tile_idx),
-                                                        params.kv_granularity,
-                                                        params.kv_granularity_log2);
-                    work_info.kv_offset = 0;
-                    work_info.q_head_range = qo_state.get_q_head_range(0, params.qhead_granularity);
-
-                    // split related info
-                    if(curr_n_split_idx > 0)
-                    {
-                        // set work info
-                        work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
-
-                        // set reduce info
-                        if (lane_idx == 0) {
-                            params.p_reduce_indptr[global_reduce_tile_idx + 1] =
-                                last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
-                            params.p_reduce_final_map[global_reduce_tile_idx * 2]     = work_info.qo_start;
-                            params.p_reduce_final_map[global_reduce_tile_idx * 2 + 1] = work_info.qo_end;
-                            global_reduce_tile_idx += 1;
-                        }
-
-                        if constexpr(Traits::kQoSplits)
-                        {
-                            const int32_t partial_qo_loc =
-                                (split_idx < (num_splits - 1))
-                                    ? p_lds_partial_info[qo_tile_idx + split_idx * num_qo_tiles]
-                                    : work_info.partial_qo_loc;
-                            params.p_reduce_partial_map[last_reduce_indptr +
-                                                        qo_tile_idx * num_splits + split_idx] =
-                                partial_qo_loc;
-                        }
-                        else
-                        {
-                            params.p_reduce_partial_map[last_reduce_indptr + split_idx] =
-                                partial_idx - (curr_n_split_idx - split_idx) * qo_tile_size;
-                        }
-                    }
-                    else
-                    {
-                        work_info.partial_qo_loc = -1;
-                    }
-
-                    p_work_info_set[num_works + qo_tile_idx] = work_info;
-                };
-
-                // record a work in work_info_set
-                if constexpr(Traits::kQoSplits)
+                // If current cu part is able to handle this batch of seqences
+                if(remain_payload >= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks))
                 {
-                    if(curr_n_split_idx > 0)
-                    {
-                        for(int32_t idx = lane_idx; idx < num_splits * num_qo_tiles;
-                            idx += ck_tile::get_warp_size())
-                        {
-                            const int32_t qo_tile_idx = idx % num_qo_tiles;
-                            const int32_t split_idx   = idx / num_qo_tiles;
-                            fill_work_info(qo_tile_idx, split_idx);
-                        }
+                    const int32_t consuming_blks = remain_kv_blocks;
+                    const int32_t num_splits     = curr_n_split_idx + 1;
 
-                        partial_idx += num_qo_tiles * qo_tile_size;
-                        last_reduce_indptr += num_qo_tiles * num_splits;
-                    }
-                    else
-                    {
-                        for(int32_t idx = lane_idx; idx < num_qo_tiles;
-                            idx += ck_tile::get_warp_size())
-                        {
-                            fill_work_info(idx, 0);
-                        }
-                    }
-                }
-                else
-                {
-                    if(curr_n_split_idx > 0)
-                    {
-                        for(int32_t idx = lane_idx; idx < num_splits;
-                            idx += ck_tile::get_warp_size())
-                        {
-                            fill_work_info(0, idx);
-                        }
-
-                        partial_idx += qo_tile_size;
-                        last_reduce_indptr += num_splits;
-                    }
-                    else
-                    {
-                        fill_work_info(0, 0);
-                    }
-                }
-
-                tot_qo_tiles += num_qo_tiles;
-                num_works += num_qo_tiles;
-
-                // update state
-                remain_payload -= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks);
-                ++curr_batch;
-                // same as curr_sub_head_idx = curr_batch % params.qk_batch_ratio;
-                curr_sub_head_idx = (curr_sub_head_idx == (params.qk_batch_ratio - 1))
-                                        ? 0
-                                        : (curr_sub_head_idx + 1);
-                if(curr_batch < params.num_batches)
-                {
-                    if(curr_sub_head_idx == 0)
-                    {
-                        if constexpr(Traits::kLdsBatchInfo)
-                        {
-                            curr_kv_pages = p_lds_pages_kv[curr_batch];
-                        }
-                        else
-                        {
-                            const int32_t bid_ori =
-                                Traits::kIsSparse
-                                    ? (curr_batch / params.ori_seqlen_qo / params.qk_batch_ratio)
-                                    : (curr_batch / params.qk_batch_ratio);
-                            curr_kv_pages = params.p_pages_kv_indptr[bid_ori + 1] -
-                                             params.p_pages_kv_indptr[bid_ori];
-                            curr_kv_pages = Traits::kIsSparse ? min(curr_kv_pages, params.topk)
-                                                               : curr_kv_pages;
-                        }
-                        curr_kv_begin =
-                            Traits::kIsSparse ? (curr_kv_begin + params.topk) : curr_kv_end;
-                        curr_kv_end = curr_kv_begin + curr_kv_pages;
-                    }
-                    curr_kv_block    = 0;
-                    curr_n_split_idx = 0;
-                }
-            }
-            else
-            {
-                if(remain_payload > Traits::kFixedOverheadNumBlocks)
-                {
-                    const int32_t consuming_blks = remain_payload - Traits::kFixedOverheadNumBlocks;
-
-                    auto fill_work_info = [&](const int32_t qo_tile_idx) {
+                    auto fill_work_info = [&](const int32_t qo_tile_idx,
+                                              const int32_t split_idx,
+                                              const int32_t khead_idx = 0) {
                         PaWorkInfo work_info{};
                         work_info.batch_idx = curr_batch;
                         work_info.qo_start =
                             qo_state.get_begin(curr_batch) + qo_tile_idx * qo_tile_size;
-                        work_info.qo_end = ck_tile::min(work_info.qo_start + qo_tile_size,
+                        work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
                                                         qo_state.get_end(curr_batch));
-                        work_info.kv_start =
-                            curr_kv_begin + curr_kv_block;
-                        work_info.kv_end = ck_tile::min(
-                            work_info.kv_start + consuming_blks,
-                            integer_divide_ceil_power2(
-                                curr_kv_end * params.kv_granularity
-                                - (num_qo_tiles - 1 - qo_tile_idx),
-                                params.kv_granularity, params.kv_granularity_log2));
-                        work_info.kv_offset      = 0;
-                        work_info.q_head_range = qo_state.get_q_head_range(0, params.qhead_granularity);
-                        work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
-                        p_work_info_set[num_works + qo_tile_idx] = work_info;
+                        work_info.kv_start = curr_kv_begin + curr_kv_block;
+                        work_info.kv_end   = ck_tile::min(work_info.kv_start + consuming_blks),
+                        integer_divide_ceil_power2(curr_kv_end * params.kv_granularity -
+                                                       (num_qo_tiles - 1 - qo_tile_idx),
+                                                   params.kv_granularity,
+                                                   params.kv_granularity_log2);
+                        work_info.kv_offset = 0;
+                        work_info.q_head_range =
+                            qo_state.get_q_head_range(khead_idx * params.qhead_granularity,
+                                                      (khead_idx + 1) * params.qhead_granularity);
 
-                        if constexpr(Traits::kQoSplits)
+                        // split related info
+                        if(curr_n_split_idx > 0)
                         {
-                            p_lds_partial_info[curr_n_split_idx * num_qo_tiles + qo_tile_idx] =
-                                work_info.partial_qo_loc;
+                            // set work info
+                            work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
+
+                            // set reduce info
+                            if(lane_idx == 0)
+                            {
+                                params.p_reduce_indptr[global_reduce_tile_idx + 1] =
+                                    last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
+                                params.p_reduce_final_map[global_reduce_tile_idx * 2] =
+                                    work_info.qo_start;
+                                params.p_reduce_final_map[global_reduce_tile_idx * 2 + 1] =
+                                    work_info.qo_end;
+                                global_reduce_tile_idx += 1;
+                            }
+
+                            if constexpr(Traits::kQoSplits)
+                            {
+                                const int32_t partial_qo_loc =
+                                    (split_idx < (num_splits - 1))
+                                        ? p_lds_partial_info[qo_tile_idx + split_idx * num_qo_tiles]
+                                        : work_info.partial_qo_loc;
+                                params.p_reduce_partial_map[last_reduce_indptr +
+                                                            qo_tile_idx * num_splits + split_idx] =
+                                    partial_qo_loc;
+                            }
+                            else
+                            {
+                                params.p_reduce_partial_map[last_reduce_indptr + split_idx] =
+                                    partial_idx - (curr_n_split_idx - split_idx) * qo_tile_size;
+                            }
                         }
+                        else
+                        {
+                            work_info.partial_qo_loc = -1;
+                        }
+
+                        p_work_info_set[num_works + qo_tile_idx] = work_info;
                     };
 
                     // record a work in work_info_set
                     if constexpr(Traits::kQoSplits)
                     {
-                        for(int32_t qo_tile_idx = lane_idx; qo_tile_idx < num_qo_tiles;
-                            qo_tile_idx += ck_tile::get_warp_size())
+                        if(curr_n_split_idx > 0)
                         {
-                            fill_work_info(qo_tile_idx);
+                            for(int32_t idx = lane_idx; idx < num_splits * num_qo_tiles;
+                                idx += ck_tile::get_warp_size())
+                            {
+                                const int32_t qo_tile_idx = idx % num_qo_tiles;
+                                const int32_t split_idx   = idx / num_qo_tiles;
+                                fill_work_info(qo_tile_idx, split_idx, khead_idx);
+                            }
+
+                            partial_idx += num_qo_tiles * qo_tile_size;
+                            last_reduce_indptr += num_qo_tiles * num_splits;
+                        }
+                        else
+                        {
+                            for(int32_t idx = lane_idx; idx < num_qo_tiles;
+                                idx += ck_tile::get_warp_size())
+                            {
+                                fill_work_info(idx, 0, khead_idx);
+                            }
                         }
                     }
                     else
                     {
-                        fill_work_info(0);
+                        if(curr_n_split_idx > 0)
+                        {
+                            for(int32_t idx = lane_idx; idx < num_splits;
+                                idx += ck_tile::get_warp_size())
+                            {
+                                fill_work_info(0, idx, khead_idx);
+                            }
+
+                            partial_idx += qo_tile_size;
+                            last_reduce_indptr += num_splits;
+                        }
+                        else
+                        {
+                            fill_work_info(0, 0, khead_idx);
+                        }
                     }
 
-                    partial_idx += num_qo_tiles * qo_tile_size;
                     num_works += num_qo_tiles;
 
                     // update state
-                    curr_kv_block += consuming_blks;
-                    ++curr_n_split_idx;
+                    remain_payload -= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks);
+                    ++curr_batch;
+                    // same as curr_sub_head_idx = curr_batch % params.qk_batch_ratio;
+                    curr_sub_head_idx = (curr_sub_head_idx == (params.qk_batch_ratio - 1))
+                                            ? 0
+                                            : (curr_sub_head_idx + 1);
+                    if(curr_batch < params.num_batches)
+                    {
+                        if(curr_sub_head_idx == 0)
+                        {
+                            if constexpr(Traits::kLdsBatchInfo)
+                            {
+                                curr_kv_pages = p_lds_pages_kv[curr_batch];
+                            }
+                            else
+                            {
+                                const int32_t bid_ori = Traits::kIsSparse
+                                                            ? (curr_batch / params.ori_seqlen_qo /
+                                                               params.qk_batch_ratio)
+                                                            : (curr_batch / params.qk_batch_ratio);
+                                curr_kv_pages         = params.p_pages_kv_indptr[bid_ori + 1] -
+                                                params.p_pages_kv_indptr[bid_ori];
+                                curr_kv_pages = Traits::kIsSparse ? min(curr_kv_pages, params.topk)
+                                                                  : curr_kv_pages;
+                            }
+                            curr_kv_begin =
+                                Traits::kIsSparse ? (curr_kv_begin + params.topk) : curr_kv_end;
+                            curr_kv_end = curr_kv_begin + curr_kv_pages;
+                        }
+                        curr_kv_block    = 0;
+                        curr_n_split_idx = 0;
+                    }
                 }
+                else
+                {
+                    if(remain_payload > Traits::kFixedOverheadNumBlocks)
+                    {
+                        const int32_t consuming_blks =
+                            remain_payload - Traits::kFixedOverheadNumBlocks;
+
+                        auto fill_work_info = [&](const int32_t qo_tile_idx,
+                                                  const int32_t khead_idx = 0) {
+                            PaWorkInfo work_info{};
+                            work_info.batch_idx = curr_batch;
+                            work_info.qo_start =
+                                qo_state.get_begin(curr_batch) + qo_tile_idx * qo_tile_size;
+                            work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
+                                                            qo_state.get_end(curr_batch));
+                            work_info.kv_start = curr_kv_begin + curr_kv_block;
+                            work_info.kv_end   = ck_tile::min(
+                                work_info.kv_start + consuming_blks,
+                                integer_divide_ceil_power2(curr_kv_end * params.kv_granularity -
+                                                               (num_qo_tiles - 1 - qo_tile_idx),
+                                                           params.kv_granularity,
+                                                           params.kv_granularity_log2));
+                            work_info.kv_offset    = 0;
+                            work_info.q_head_range = qo_state.get_q_head_range(
+                                khead_idx * params.qhead_granularity,
+                                (khead_idx + 1) * params.qhead_granularity);
+                            work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
+                            p_work_info_set[num_works + qo_tile_idx] = work_info;
+
+                            if constexpr(Traits::kQoSplits)
+                            {
+                                p_lds_partial_info[curr_n_split_idx * num_qo_tiles + qo_tile_idx] =
+                                    work_info.partial_qo_loc;
+                            }
+                        };
+
+                        // record a work in work_info_set
+                        if constexpr(Traits::kQoSplits)
+                        {
+                            for(int32_t qo_tile_idx = lane_idx; qo_tile_idx < num_qo_tiles;
+                                qo_tile_idx += ck_tile::get_warp_size())
+                            {
+                                fill_work_info(qo_tile_idx, khead_idx);
+                            }
+                        }
+                        else
+                        {
+                            fill_work_info(0, khead_idx);
+                        }
+
+                        partial_idx += num_qo_tiles * qo_tile_size;
+                        num_works += num_qo_tiles;
+
+                        // update state
+                        curr_kv_block += consuming_blks;
+                        ++curr_n_split_idx;
+                    }
+                    break;
+                }
+            }
+            params.p_work_indptr[cid + 1] = num_works;
+            ++cid;
+            if(curr_batch == params.num_batches)
+            {
                 break;
             }
         }
-
-        params.p_work_indptr[cid + 1] = num_works;
     }
 
     global_reduce_tile_idx = __shfl(global_reduce_tile_idx, 0);
@@ -346,10 +372,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
 template <int32_t kPackedQoLenPerWg, bool kQoSplits, int32_t kUniSeqlenQo, bool kIsSparse>
 void dispatch_pa_metadata_v1_2_device(const PaMetadataV1KernelParameter& params,
-                                       const hipStream_t stream,
-                                       const int32_t max_seqlen_qo,
-                                       const int32_t warp_size,
-                                       const int32_t lds_size)
+                                      const hipStream_t stream,
+                                      const int32_t max_seqlen_qo,
+                                      const int32_t warp_size,
+                                      const int32_t lds_size)
 {
     const dim3 grid = dim3(1, 1, 1);
 
@@ -407,42 +433,46 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
 
     const int32_t num_clusters = dev_prop.multiProcessorCount;
 
+    // TORCH_CHECK(num_heads_k % num_clusters == 0,
+    //             __func__,
+    //             ": only supports #heads evenly divisible by #num_cu.");
+
     int32_t num_batches    = context_lens.size(0);
     int32_t num_heads      = num_heads_k * num_heads_per_head_k;
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
-    // TODO: check num_splits
     int32_t num_splits = max_split_per_batch < 0
                              ? num_clusters
                              : min(num_clusters, max_split_per_batch * num_batches);
 
     PaMetadataV1KernelParameter params = {};
-    params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
-    params.p_work_indptr                = work_indptr.data_ptr<int32_t>();
-    params.p_work_info_set_raw          = work_info_set.data_ptr<int32_t>();
-    params.p_reduce_indptr              = reduce_indptr.data_ptr<int32_t>();
-    params.p_reduce_final_map           = reduce_final_map.data_ptr<int32_t>();
-    params.p_reduce_partial_map         = reduce_partial_map.data_ptr<int32_t>();
-    params.p_seqlens_qo_indptr          = seqlens_qo_indptr.data_ptr<int32_t>();
-    params.p_pages_kv_indptr            = pages_kv_indptr.data_ptr<int32_t>();
-    params.p_context_lens               = context_lens.data_ptr<int32_t>();
-    params.num_batches                  = num_batches;
-    params.num_heads                    = num_heads_k * num_heads_per_head_k;
-    params.num_cu                       = num_clusters;
-    params.num_splits                   = num_splits;
-    params.reduce_indptr_size           = reduce_indptr.size(0);
-    params.qhead_granularity            = num_heads_per_head_k;
-    params.qlen_granularity             = max_seqlen_qo;
-    params.kv_granularity               = kv_granularity;
-    params.kv_granularity_log2          = __builtin_ctz(kv_granularity);
-    params.block_size                   = block_size;
-    params.blocks_per_unit              = kv_granularity / block_size;
-    params.uni_seqlen_qo                = uni_seqlen_qo;
-    params.ori_seqlen_qo                = ori_uni_seqlen_qo;
-    params.is_causal                    = is_causal;
-    params.topk                         = topk;
-    params.qk_batch_ratio               = qk_batch_ratio;
+    params.p_work_metadata_ptrs        = work_metadata_ptrs.data_ptr<uint64_t>();
+    params.p_work_indptr               = work_indptr.data_ptr<int32_t>();
+    params.p_work_info_set_raw         = work_info_set.data_ptr<int32_t>();
+    params.p_reduce_indptr             = reduce_indptr.data_ptr<int32_t>();
+    params.p_reduce_final_map          = reduce_final_map.data_ptr<int32_t>();
+    params.p_reduce_partial_map        = reduce_partial_map.data_ptr<int32_t>();
+    params.p_seqlens_qo_indptr         = seqlens_qo_indptr.data_ptr<int32_t>();
+    params.p_pages_kv_indptr           = pages_kv_indptr.data_ptr<int32_t>();
+    params.p_context_lens              = context_lens.data_ptr<int32_t>();
+    params.num_batches                 = num_batches;
+    params.num_heads                   = num_heads_k * num_heads_per_head_k;
+    params.num_heads_k                 = num_heads_k;
+    params.num_cu                      = num_clusters;
+    params.num_splits                  = num_splits;
+    params.reduce_indptr_size          = reduce_indptr.size(0);
+    params.qhead_granularity           = num_heads_per_head_k;
+    params.qlen_granularity            = max_seqlen_qo;
+    params.kv_granularity              = kv_granularity;
+    params.kv_granularity_log2         = __builtin_ctz(kv_granularity);
+    params.block_size                  = block_size;
+    params.blocks_per_unit             = kv_granularity / block_size;
+    params.uni_seqlen_qo               = uni_seqlen_qo;
+    params.ori_seqlen_qo               = ori_uni_seqlen_qo;
+    params.is_causal                   = is_causal;
+    params.topk                        = topk;
+    params.qk_batch_ratio              = qk_batch_ratio;
 
     // launch kernel
     MLA_METADATA_DISPATCHER(

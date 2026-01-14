@@ -106,6 +106,15 @@ def ref_masked_attention(
     dtype,
     is_causal=True,
 ) -> torch.Tensor:
+    num_query_heads = query.shape[1]
+    num_kv_heads = key.shape[1]
+
+    if num_query_heads != num_kv_heads:
+        assert num_query_heads % num_kv_heads == 0
+        num_groups = num_query_heads // num_kv_heads
+        key = key.repeat_interleave(num_groups, dim=1)
+        value = value.repeat_interleave(num_groups, dim=1)
+
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
         s_q = query.shape[0]
@@ -227,7 +236,7 @@ def pertoken_quant_kvcache_symm(
     return k_quant, k_scale, v_quant, v_scale, k_scale_asm, v_scale_asm
 
 
-@perftest()
+@perftest(num_rotate_args=20)
 def run_aiter_asm_ps(
     Q,
     K,
@@ -357,7 +366,7 @@ def profile_kernel_breakdown(func, num_iters=100, num_warmup=10):
 
 
 @benchmark()
-def test_pa_mtp(
+def test_pa_ps(
     ctx_lens: int,
     batch_size: int,
     num_heads: Tuple[int, int],
@@ -477,14 +486,7 @@ def test_pa_mtp(
         (reduce_indptr_size, reduce_indptr_type),
         (reduce_final_map_size, reduce_final_map_type),
         (reduce_partial_map_size, reduce_partial_map_type),
-    ) = aiter.get_pa_metadata_info_v1(
-        batch_size,
-        max_qlen,
-        num_query_heads,
-        query.dtype,
-        k_quant_.dtype,
-        is_sparse=False,
-    )
+    ) = aiter.get_pa_metadata_info_v1(batch_size, num_kv_heads)
     work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
     work_indptr = torch.zeros(work_indptr_size, dtype=work_indptr_type)
     work_info = torch.zeros(work_info_set_size, dtype=work_info_set_type)
@@ -568,7 +570,7 @@ def test_pa_mtp(
         for name, meta in metadata_map.items():
             file_name = f"{name}.bin"
             torch.set_printoptions(threshold=999999, linewidth=120)
-            print(f"==>dump {name} to {file_name}:\n{meta}")
+            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}")
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
     # Benchmark PA Persistent Scheduling
@@ -741,6 +743,7 @@ l_block_size = [1024]
 l_dtype = ["bf16"]
 l_num_heads = [
     (10, 1),
+    (16, 2),
     # (16, 1),
 ]
 l_qlen = [1, 2, 3, 4]
@@ -863,7 +866,7 @@ for dtype in l_dtype:
     for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
         l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
     ):
-        ret = test_pa_mtp(
+        ret = test_pa_ps(
             ctx_len,
             batch_size,
             num_heads,
@@ -881,5 +884,6 @@ for dtype in l_dtype:
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
     df.to_csv("pa_ps.csv")
-    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", None)
+    pd.set_option("display.max_colwidth", None)
     print(df)
