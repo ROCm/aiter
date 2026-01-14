@@ -469,7 +469,8 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
     using P                 = typename packed_t<T>::P;
     using A                 = typename packed_t<T>::A;
-    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
+    __shared__ T smem0[tnum_gpu * ngpus * pack_size];
+    __shared__ T smem1[tnum_gpu * ngpus * pack_size];
     int warp_id      = threadIdx.x / tnum_gpu;
     int lane_id      = threadIdx.x % tnum_gpu;
     int tid          = blockIdx.x * tnum_gpu + lane_id;
@@ -489,12 +490,46 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     }
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
+ 
     // stage 1: reduce scatter
+    // Software pipelined: Load N+1 to register while computing N
+    T* smem_ping = &smem0[0];
+    T* smem_pong = &smem1[0];
+    T* smem_swap;
+    if (start + tid < end) {
+        *(reinterpret_cast<P*>(smem_ping) + threadIdx.x) = ptrs[warp_id][start + tid];
+    }
+ 
     for(int idx = start + tid; idx < end; idx += stride)
     {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
         __syncthreads();
-        // cal add in first 64 threads
+       
+        // Prefetch next iteration data into register first (all threads)
+        P prefetch_val;
+        bool has_next = (idx + stride < end);
+       
+#ifdef __HIP_PLATFORM_AMD__
+        if (has_next) {
+            // Use non-temporal load via uint32_t array for compatibility
+            // __builtin_nontemporal_load requires basic types or GCC vector extensions
+            const uint32_t* src_ptr = reinterpret_cast<const uint32_t*>(&ptrs[warp_id][idx+stride]);
+            uint32_t* dst_ptr = reinterpret_cast<uint32_t*>(&prefetch_val);
+           
+            // Load in 4-byte chunks using non-temporal load
+            constexpr int num_dwords = sizeof(P) / sizeof(uint32_t);
+            #pragma unroll
+            for (int i = 0; i < num_dwords; ++i) {
+                dst_ptr[i] = src_ptr[i];
+            }
+        }
+#else
+        if (has_next) {
+            // Standard load for non-AMD platforms
+            prefetch_val = ptrs[warp_id][idx+stride];
+        }
+#endif
+       
+        // cal add in first 64 threads - overlaps with prefetch load above
         if(warp_id == 0)
         {
             A add_reg;
@@ -502,7 +537,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
             for(int i = 0; i < pack_size; ++i)
             {
                 add_reg.data[i] =
-                    ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
+                    ck_tile::type_convert<float>(smem_ping[pack_size * threadIdx.x + i]);
             }
             constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
 #pragma unroll
@@ -512,7 +547,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
                 for(int j = 0; j < pack_size; ++j)
                 {
                     add_reg.data[j] += ck_tile::type_convert<float>(
-                        tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
+                        smem_ping[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
                 }
             }
             P write_reg;
@@ -521,12 +556,28 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
             {
                 write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
             }
-            tmp_out[idx - start] = write_reg;
+            tmp_out[idx - start] = write_reg;  // Global store - overlaps with load
         }
-        __syncthreads();
+       
+        // Write prefetched data to shared memory after computation
+#ifdef __HIP_PLATFORM_AMD__
+        if (has_next) {
+            // Manual wait control - ensure both load and store complete before smem write
+            __asm__ volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            *(reinterpret_cast<P*>(smem_pong) + threadIdx.x) = prefetch_val;
+        }
+#else
+        if (has_next) {
+            *(reinterpret_cast<P*>(smem_pong) + threadIdx.x) = prefetch_val;
+        }
+#endif
+       
+        smem_swap = smem_ping;
+        smem_ping = smem_pong;
+        smem_pong = smem_swap;
     }
     end_sync<ngpus>(sg, self_sg, rank);
-
+ 
     // stage 2: allgather. Note: it's important to match the tid between
     // the two stages, because visibility across devices is only guaranteed
     // between threads that have the same tid. If thread i computes the sum of
