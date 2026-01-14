@@ -648,3 +648,4 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     if num_decode_toks_for_zeros > 0:
         return q_out, decode_q_pe_out, k_pe_out, kv_cache, q_nope_zeros_out
     return q_out, decode_q_pe_out, k_pe_out, kv_cache
+    
