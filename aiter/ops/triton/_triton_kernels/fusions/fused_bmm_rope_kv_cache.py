@@ -1031,3 +1031,4 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
                     k_pe_scaled,
                 )
+                
