@@ -848,7 +848,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             else:
                 descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
-            MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
+            MASK_BLOCK_M1: tl.constexpr = BLOCK_M1
             # bound the masked operation to q len so it does not have to wast cycles
             len_m = min(len_m, seqlen_q)
             num_steps = tl.cdiv(len_m, MASK_BLOCK_M1)
@@ -1069,7 +1069,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 dsink = tl.sum(-psink * delta[:, None])
                 tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
 
-            MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
+            MASK_BLOCK_N2: tl.constexpr = BLOCK_N2
             # start can only be 0 at minimum
             start_n = max(end_n - BLOCK_M2, 0)
             num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N2)
