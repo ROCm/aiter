@@ -7,8 +7,8 @@ namespace aiter {
 namespace torch_itfs {
 std::vector<at::Tensor>
 mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
-                  const at::Tensor& k,            // [total_k, hk, d]
-                  const at::Tensor& v,            // [total_k, hk, d]
+                  const at::Tensor& k,            // [num_blocks, hk, d/8, block_size, 8]
+                  const at::Tensor& v,            // [num_blocks, hk, block_size/8, d, 8]
                   const at::Tensor& cu_seqlens_q, // [b+1]
                   const at::Tensor& kv_indptr,    // [b+1]
                   const at::Tensor& kv_page_indices,
@@ -29,7 +29,11 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   std::optional<const at::Tensor> q_descale,     // [1]
                   std::optional<const at::Tensor> k_descale,     // [1]
                   std::optional<const at::Tensor> v_descale,     // [1]
+                  std::optional<const at::Tensor> kv_last_page_lens,
+                  std::optional<const at::Tensor> block_table,
+                  std::optional<const at::Tensor> seqlen_k,
                   std::optional<const at::Tensor> sink_ptr_,     // [hq];
                   std::optional<at::Generator> gen_);
+
 } // namespace torch_itfs
 } // namespace aiter

@@ -2008,7 +2008,7 @@ class FmoeTuner(TunerCommon):
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
             profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")
-            profile_file = f"aiter/configs/profile_fmoe.csv"
+            profile_file = "aiter/configs/profile_fmoe.csv"
             old_profile = self.get_tuned_gemm_list(
                 profile_file, profile_result.columns.tolist()
             )

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_common.cuh"
 #include "gemm_a8w8_manifest.h"
 #include "gemm_a8w8_lookup.h"
 #include <string>
+#include "py_itfs_common.h"
 
 using RowwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
@@ -61,9 +62,9 @@ torch::Tensor gemm_a8w8_tune(
     int kernelId,
     int splitK)
 {
-  TORCH_CHECK(XQ.dtype() == at::ScalarType::Char && XQ.dtype() == WQ.dtype(),
-              "Weights and activations should both be int8!");
-  TORCH_CHECK( x_scale.dtype() == w_scale.dtype(),
+  TORCH_CHECK(XQ.dtype() == WQ.dtype(),
+              "XQ and WQ should have the same dtype!");
+  TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
               "Scales should have the same dtype!");
   std::optional<torch::Tensor> bias = std::nullopt;
 
@@ -72,26 +73,29 @@ torch::Tensor gemm_a8w8_tune(
   int K = XQ.size(1);
   int KBatch = std::pow(2, splitK);
 
-  // if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
-  // {
-  //   rowwise_dispatch<F32, F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias);
-  // }
-  // else if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
-  // {
-  //   rowwise_dispatch<F32, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias);
-  // }
-  // else if (Y.dtype() == at::ScalarType::Half)
-  // {
-  //   rowwise_dispatch<F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias);
-  // }
-  // else 
+  // Check if input is INT8 or FP8
+  bool is_i8 = (XQ.dtype() == at::ScalarType::Char);
+  bool is_fp8 = (XQ.dtype() == torch_fp8);
+
+  TORCH_CHECK(is_i8 || is_fp8, 
+              "XQ dtype must be int8 or fp8, got: " + std::string(c10::toString(XQ.dtype())));
+
   if (Y.dtype() == at::ScalarType::BFloat16)
   {
-    rowwise_dispatch<I8, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+    if (is_i8)
+    {
+      // INT8 path
+      rowwise_dispatch<I8, B16, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+    }
+    else
+    {
+      // FP8 path
+      rowwise_dispatch<F8, F32, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+    }
   }
   else
   {
-    TORCH_CHECK(false, "Unsupported scales/output dtype!");
+    TORCH_CHECK(false, "Unsupported output dtype: " + std::string(c10::toString(Y.dtype())));
   }
   return Y;
 }
