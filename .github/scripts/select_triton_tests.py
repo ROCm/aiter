@@ -614,7 +614,8 @@ def build_dependency_graph(
     )
     # Tag kernel files.
     for kernel_file in kernel_files:
-        tag_node(graph, kernel_file, "kernel")
+        if kernel_file.name != "__init__.py":
+            tag_node(graph, kernel_file, "kernel")
     # Tag config files.
     for cofig_file in cofig_files:
         tag_node(graph, cofig_file, "config")
