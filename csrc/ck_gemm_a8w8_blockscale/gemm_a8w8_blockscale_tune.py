@@ -32,8 +32,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     n = weight.shape[0]
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    # x_scale = rearrange(x_scale.view(-1, 1).repeat(1, block_shape_n*block_shape_k).view(m, scale_k, 1, block_shape_k),
-    #                           'num_blk_n num_blk_k blk_n blk_k ->(num_blk_n blk_n) (num_blk_k blk_k)')
+
     x = x.to(x_scale.dtype).view(
         m, k // block_shape[1], block_shape[1]
     ) * x_scale.unsqueeze(-1)
@@ -49,8 +48,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     weight = weight.to(w_scale.dtype) * w_scale
 
     out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
-    # scale = torch.matmul(x_scale, w_scale)
-    # out = torch.mul(x, scale)
+
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)

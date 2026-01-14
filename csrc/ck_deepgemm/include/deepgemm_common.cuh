@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 #include <cstdlib>
@@ -132,13 +132,10 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
     const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
 
-    const auto Run = [&](const auto has_hot_loop_,
-                         const auto tail_number_,
-                         const auto memory_operation_) {
-        constexpr bool has_hot_loop_v   = has_hot_loop_.value;
-        constexpr auto tail_number_v    = tail_number_.value;
-        constexpr auto scheduler        = FlatmmConfig::Scheduler;
-        constexpr auto memory_operation = memory_operation_.value;
+    const auto Run = [&](const auto has_hot_loop_, const auto tail_number_) {
+        constexpr bool has_hot_loop_v = has_hot_loop_.value;
+        constexpr auto tail_number_v  = tail_number_.value;
+        constexpr auto scheduler      = FlatmmConfig::Scheduler;
 
         using CodegenPipelineProblem = ck_tile::FlatmmPipelineProblem<ADataType,
                                                                       BDataType,
@@ -185,32 +182,15 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
             s, ck_tile::make_kernel<FlatmmConfig::kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
     };
 
-    const auto RunSplitk = [&](const auto has_hot_loop_, const auto tail_number_) {
-        if(args.k_batch == 1)
-        {
-            Run(has_hot_loop_,
-                tail_number_,
-                ck_tile::integral_constant<ck_tile::memory_operation_enum,
-                                           ck_tile::memory_operation_enum::set>{});
-        }
-        else
-        {
-            Run(has_hot_loop_,
-                tail_number_,
-                ck_tile::integral_constant<ck_tile::memory_operation_enum,
-                                           ck_tile::memory_operation_enum::atomic_add>{});
-        }
-    };
-
     if(tail_num == ck_tile::TailNumber::Odd)
     {
-        RunSplitk(ck_tile::bool_constant<true>{},
-                  ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Odd>{});
+        Run(ck_tile::bool_constant<true>{},
+            ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Odd>{});
     }
     else if(tail_num == ck_tile::TailNumber::Even)
     {
-        RunSplitk(ck_tile::bool_constant<true>{},
-                  ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Even>{});
+        Run(ck_tile::bool_constant<true>{},
+            ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Even>{});
     }
     else
     {
