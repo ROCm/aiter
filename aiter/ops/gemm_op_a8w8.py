@@ -574,7 +574,7 @@ def gemm_a8w8_blockscale(
         # config found in tuned file
         libtype = config["libtype"]
         if config["is_bpreshuffled"] == is_bpreshuffled:
-            if libtype == "ck_tile":
+            if libtype == "cktile":
                 return gemm_a8w8_blockscale_cktile(
                     XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, is_bpreshuffled
                 )
@@ -739,7 +739,7 @@ def gen_gemm_a8w8_blockscale_tune_fake_tensors(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_tune_legacy",
+    "module_gemm_a8w8_blockscale_tune",
     fc_name="gemm_a8w8_blockscale_tune",
     gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
 )
@@ -755,7 +755,7 @@ def gemm_a8w8_blockscale_tune(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_tune_tile",
+    "module_gemm_a8w8_blockscale_cktile_tune",
     fc_name="gemm_a8w8_blockscale_cktile_tune",
     gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
 )

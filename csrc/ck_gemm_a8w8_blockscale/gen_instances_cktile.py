@@ -47,7 +47,7 @@ class gemm_a8w8_blockscale_codegen:
                 device_properties = torch.cuda.get_device_properties(gpu)
                 cu_num = device_properties.multi_processor_count
                 tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck_tile")
+                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "cktile")
                 ].reset_index()
             for i in range(len(tune_df)):
                 M = int(tune_df.loc[i, "M"])
@@ -135,10 +135,10 @@ template torch::Tensor
 
 """
         INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="FP32, TILE_BF16"
+            name=k.name, dtypes="TILE_FP32, TILE_BF16"
         )
         INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="FP32, TILE_FP16"
+            name=k.name, dtypes="TILE_FP32, TILE_FP16"
         )
         # TODO: dFP8_eFP8
 

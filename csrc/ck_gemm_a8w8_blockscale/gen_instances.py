@@ -47,7 +47,7 @@ class gemm_a8w8_blockscale_codegen:
                 device_properties = torch.cuda.get_device_properties(gpu)
                 cu_num = device_properties.multi_processor_count
                 tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck_legacy")
+                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck")
                 ].reset_index()
 
             for i in range(len(tune_df)):
