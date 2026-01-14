@@ -977,7 +977,7 @@ struct gmem {
         else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, 0, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  8, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, 0, aux); }
 #endif
     }
