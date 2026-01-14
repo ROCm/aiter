@@ -150,11 +150,9 @@ def paged_attention_common(
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
     block_tables_stride0: int,
-    logits_soft_cap: float,
     scale: float,
     max_qlen: int = 1,
     max_seq_len: int = 1,
-    cu_query_lens: Optional[torch.Tensor] = None,
     K_QScale_hip: Optional[torch.Tensor] = None,  # [num_seqs, num_heads]
     V_QScale_hip: Optional[torch.Tensor] = None,
     K_QScale_asm: Optional[
