@@ -457,6 +457,7 @@ def gen_mha_varlen_fwd_fake_tensor(
     if out is not None:
         out_tensor = out
     else:
+        out_dtype = dtypes.bf16 if dtype == dtypes.fp8 else dtype
         out_shape = (total_q, num_heads, head_size_v)
         out_tensor = torch.empty(out_shape, device=device, dtype=dtype)
 
