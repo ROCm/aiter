@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -1278,22 +1278,42 @@ class FmoeTuner(TunerCommon):
         return tflops, bw
 
     def get_1stage_file_info(self, q_type, q_dtype_a, doweight_stage1):
-        extraInfo_1stage = ""
-        if q_dtype_a == dtypes.i8:
-            quantDtype = "Int8"
-        elif q_dtype_a == dtypes.fp8:
-            quantDtype = "Fp8"
-        else:
-            quantDtype = ""
-        if doweight_stage1:
-            extraInfo_1stage = "_tkw1"
-        if q_type == QuantType.No:
-            quantDtype_1stage = "noquant"
-        elif q_type == QuantType.per_1x128:
-            quantDtype_1stage = "blockscale" + quantDtype
-        else:
-            quantDtype_1stage = "pertoken" + quantDtype
-        return quantDtype_1stage, extraInfo_1stage
+        if get_gfx() == "gfx950":
+            extraInfo_1stage = ""
+            if q_dtype_a == dtypes.i8:
+                quantDtype = "Int8"
+            elif q_dtype_a == dtypes.fp8:
+                quantDtype = "Fp8"
+            else:
+                quantDtype = ""
+            if doweight_stage1:
+                extraInfo_1stage = "_tkw1"
+            if q_type == QuantType.No:
+                quantDtype_1stage = "noquant"
+            elif q_type == QuantType.per_1x128:
+                quantDtype_1stage = "blockscale" + quantDtype
+            elif q_type == QuantType.per_1x32:
+                quantDtype_1stage = "pertoken" + "MXfp4"
+            else:
+                quantDtype_1stage = "pertoken" + quantDtype
+            return quantDtype_1stage, extraInfo_1stage
+        elif get_gfx() == "gfx942":
+            extraInfo_1stage = ""
+            if q_dtype_a == dtypes.i8:
+                quantDtype = "Int8"
+            elif q_dtype_a == dtypes.fp8:
+                quantDtype = "Fp8"
+            else:
+                quantDtype = ""
+            if doweight_stage1:
+                extraInfo_1stage = "_tkw1"
+            if q_type == QuantType.No:
+                quantDtype_1stage = "noquant"
+            elif q_type == QuantType.per_1x128:
+                quantDtype_1stage = "blockscale" + quantDtype
+            else:
+                quantDtype_1stage = "pertoken" + quantDtype
+            return quantDtype_1stage, extraInfo_1stage
 
     def gen_1stage_asm_task(self, key):
         task_1stage = []
@@ -1988,7 +2008,7 @@ class FmoeTuner(TunerCommon):
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
             profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")
-            profile_file = f"aiter/configs/profile_fmoe.csv"
+            profile_file = "aiter/configs/profile_fmoe.csv"
             old_profile = self.get_tuned_gemm_list(
                 profile_file, profile_result.columns.tolist()
             )
