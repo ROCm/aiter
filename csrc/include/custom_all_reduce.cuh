@@ -28,127 +28,125 @@
 #include <unordered_map>
 #include <vector>
 
+namespace aiter {
 
-namespace aiter
+constexpr int kMaxBlocks = 80;
+// note: we don't want to use atomics for signals because peer atomics are no
+// supported on PCIe links
+struct Signal
 {
-
-  constexpr int kMaxBlocks = 80;
-  // note: we don't want to use atomics for signals because peer atomics are no
-  // supported on PCIe links
-  struct Signal
-  {
     alignas(128) uint32_t start[kMaxBlocks][8];
     alignas(128) uint32_t end[kMaxBlocks][8];
     alignas(128) uint32_t _flag[kMaxBlocks]; // incremental flags for each rank
-  };
+};
 
 #ifdef USE_ROCM
-  struct __align__(16) RankData { const void *ptrs[8]; };
+struct __align__(16) RankData { const void* ptrs[8]; };
 #else
-  struct __align__(16) RankData { const void *__restrict__ ptrs[8]; };
+struct __align__(16) RankData { const void* __restrict__ ptrs[8]; };
 #endif
 
-  struct __align__(16) RankSignals
-  {
+struct __align__(16) RankSignals
+{
 #ifndef USE_ROCM
     volatile
 #endif
-        Signal *signals[8];
-  };
+        Signal* signals[8];
+};
 
-  // like std::array, but aligned
-  template <typename T, int sz>
-  struct __align__(alignof(T) * sz) array_t
-  {
+// like std::array, but aligned
+template <typename T, int sz>
+struct __align__(alignof(T) * sz) array_t
+{
     T data[sz];
-    using type = T;
+    using type                = T;
     static constexpr int size = sz;
-  };
+};
 
-  // use packed type to maximize memory efficiency
-  // goal: generate ld.128 and st.128 instructions
-  template <typename T>
-  struct packed_t
-  {
+// use packed type to maximize memory efficiency
+// goal: generate ld.128 and st.128 instructions
+template <typename T>
+struct packed_t
+{
     // the (P)acked type for load/store
     using P = array_t<T, 16 / sizeof(T)>;
     // the (A)ccumulator type for reduction
     using A = array_t<float, 16 / sizeof(T)>;
-  };
+};
 
 #define DINLINE __device__ __forceinline__
 
-  // scalar cast functions
-  DINLINE float upcast_s(half val) { return __half2float(val); }
+// scalar cast functions
+DINLINE float upcast_s(half val) { return __half2float(val); }
 
-  template <typename T>
-  DINLINE T downcast_s(float val);
-  template <>
-  DINLINE half downcast_s(float val)
-  {
+template <typename T>
+DINLINE T downcast_s(float val);
+template <>
+DINLINE half downcast_s(float val)
+{
     return __float2half(val);
-  }
+}
 
-  // scalar add functions
-  // for some reason when compiling with Pytorch, the + operator for half and
-  // bfloat is disabled so we call the intrinsics directly
-  DINLINE half &assign_add(half &a, half b)
-  {
+// scalar add functions
+// for some reason when compiling with Pytorch, the + operator for half and
+// bfloat is disabled so we call the intrinsics directly
+DINLINE half& assign_add(half& a, half b)
+{
     a = __hadd(a, b);
     return a;
-  }
-  DINLINE float &assign_add(float &a, float b) { return a += b; }
+}
+DINLINE float& assign_add(float& a, float b) { return a += b; }
 
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-  DINLINE float upcast_s(__hip_bfloat16 val) { return __bfloat162float(val); }
-  template <>
-  DINLINE __hip_bfloat16 downcast_s(float val)
-  {
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+DINLINE float upcast_s(__hip_bfloat16 val) { return __bfloat162float(val); }
+template <>
+DINLINE __hip_bfloat16 downcast_s(float val)
+{
     return __float2bfloat16(val);
-  }
-  DINLINE __hip_bfloat16 &assign_add(__hip_bfloat16 &a, __hip_bfloat16 b)
-  {
+}
+DINLINE __hip_bfloat16& assign_add(__hip_bfloat16& a, __hip_bfloat16 b)
+{
     a = __hadd(a, b);
     return a;
-  }
+}
 #endif
 
-  template <typename T, int N>
-  DINLINE array_t<T, N> &packed_assign_add(array_t<T, N> &a, array_t<T, N> b)
-  {
+template <typename T, int N>
+DINLINE array_t<T, N>& packed_assign_add(array_t<T, N>& a, array_t<T, N> b)
+{
 #pragma unroll
-    for (int i = 0; i < N; i++)
+    for(int i = 0; i < N; i++)
     {
-      assign_add(a.data[i], b.data[i]);
+        assign_add(a.data[i], b.data[i]);
     }
     return a;
-  }
+}
 
-  template <typename T, int N>
-  DINLINE array_t<float, N> upcast(array_t<T, N> val)
-  {
-    if constexpr (std::is_same<T, float>::value)
+template <typename T, int N>
+DINLINE array_t<float, N> upcast(array_t<T, N> val)
+{
+    if constexpr(std::is_same<T, float>::value)
     {
-      return val;
+        return val;
     }
     else
     {
-      array_t<float, N> out;
+        array_t<float, N> out;
 #pragma unroll
-      for (int i = 0; i < N; i++)
-      {
-        out.data[i] = upcast_s(val.data[i]);
-      }
-      return out;
+        for(int i = 0; i < N; i++)
+        {
+            out.data[i] = upcast_s(val.data[i]);
+        }
+        return out;
     }
-  }
+}
 
-  template <typename O>
-  DINLINE O downcast(array_t<float, O::size> val)
-  {
-    if constexpr (std::is_same<typename O::type, float>::value)
+template <typename O>
+DINLINE O downcast(array_t<float, O::size> val)
+{
+    if constexpr(std::is_same<typename O::type, float>::value)
     {
-      return val;
+        return val;
     }
     //   else if constexpr (std::is_same<typename O::type, __hip_bfloat16>::value)
     //   {
@@ -167,73 +165,75 @@ namespace aiter
     //   }
     else
     {
-      O out;
+        O out;
 #pragma unroll
-      for (int i = 0; i < O::size; i++)
-      {
-        out.data[i] = downcast_s<typename O::type>(val.data[i]);
-      }
-      return out;
+        for(int i = 0; i < O::size; i++)
+        {
+            out.data[i] = downcast_s<typename O::type>(val.data[i]);
+        }
+        return out;
     }
-  }
+}
 
-  // This function is meant to be used as the first synchronization in the all
-  // reduce kernel. Thus, it doesn't need to make any visibility guarantees for
-  // prior memory accesses. Note: volatile writes will not be reordered against
-  // other volatile writes.
-  template <int ngpus>
-  DINLINE void start_sync(const RankSignals &sg,
-#ifndef USE_ROCM
-                          volatile
-#endif
-                          Signal *self_sg,
-                          int rank)
-  {
-#ifdef USE_ROCM
-    uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
-    if (threadIdx.x < ngpus)
-    {
-      // simultaneously write to the corresponding flag of all ranks.
-      // Latency = 1 p2p write
-      __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
-                              flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-      // wait until we got true from all ranks
-      while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                    __ATOMIC_RELAXED,
-                                    __MEMORY_SCOPE_DEVICE) < flag)
-        ;
-    }
-    __syncthreads();
-    // use one thread to update flag
-    if (threadIdx.x == 0)
-      self_sg->_flag[blockIdx.x] = flag;
-#else
-    if (threadIdx.x < ngpus)
-    {
-      // reset flag for next time
-      self_sg->end[blockIdx.x][threadIdx.x] = 0;
-      // simultaneously write to the corresponding flag of all ranks.
-      // Latency = 1 p2p write
-      sg.signals[threadIdx.x]->start[blockIdx.x][rank] = 1;
-      // wait until we got true from all ranks
-      while (!self_sg->start[blockIdx.x][threadIdx.x])
-        ;
-    }
-    __syncthreads();
-#endif
-  }
-
-  // This function is meant to be used as the second or the final synchronization
-  // barrier in the all reduce kernel. If it's the final synchronization barrier,
-  // we don't need to make any visibility guarantees for prior memory accesses.
-  template <int ngpus, bool final_sync = false>
-  DINLINE void end_sync(const RankSignals &sg,
+// This function is meant to be used as the first synchronization in the all
+// reduce kernel. Thus, it doesn't need to make any visibility guarantees for
+// prior memory accesses. Note: volatile writes will not be reordered against
+// other volatile writes.
+template <int ngpus>
+DINLINE void start_sync(const RankSignals& sg,
 #ifndef USE_ROCM
                         volatile
 #endif
-                        Signal *self_sg,
+                        Signal* self_sg,
                         int rank)
-  {
+{
+#ifdef USE_ROCM
+    uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+    if(threadIdx.x < ngpus)
+    {
+        // simultaneously write to the corresponding flag of all ranks.
+        // Latency = 1 p2p write
+        __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
+                                flag,
+                                __ATOMIC_RELAXED,
+                                __MEMORY_SCOPE_SYSTEM);
+        // wait until we got true from all ranks
+        while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
+                                     __ATOMIC_RELAXED,
+                                     __MEMORY_SCOPE_DEVICE) < flag)
+            ;
+    }
+    __syncthreads();
+    // use one thread to update flag
+    if(threadIdx.x == 0)
+        self_sg->_flag[blockIdx.x] = flag;
+#else
+    if(threadIdx.x < ngpus)
+    {
+        // reset flag for next time
+        self_sg->end[blockIdx.x][threadIdx.x] = 0;
+        // simultaneously write to the corresponding flag of all ranks.
+        // Latency = 1 p2p write
+        sg.signals[threadIdx.x]->start[blockIdx.x][rank] = 1;
+        // wait until we got true from all ranks
+        while(!self_sg->start[blockIdx.x][threadIdx.x])
+            ;
+    }
+    __syncthreads();
+#endif
+}
+
+// This function is meant to be used as the second or the final synchronization
+// barrier in the all reduce kernel. If it's the final synchronization barrier,
+// we don't need to make any visibility guarantees for prior memory accesses.
+template <int ngpus, bool final_sync = false>
+DINLINE void end_sync(const RankSignals& sg,
+#ifndef USE_ROCM
+                      volatile
+#endif
+                      Signal* self_sg,
+                      int rank)
+{
 #ifdef USE_ROCM
     __syncthreads();
     // eliminate the case that prior writes are not visible after signals become
@@ -241,70 +241,71 @@ namespace aiter
     // testing. Might be the case that hardware provides stronger guarantee than
     // the memory model.
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
-    if (threadIdx.x < ngpus)
+    if(threadIdx.x < ngpus)
     {
-      // simultaneously write to the corresponding flag of all ranks.
-      // Latency = 1 p2p write
-      __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
-                              flag,
-                              final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
-                              __MEMORY_SCOPE_SYSTEM);
-      // wait until we got true from all ranks
-      while (
-          __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                                 final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                 __MEMORY_SCOPE_DEVICE) < flag)
-        ;
+        // simultaneously write to the corresponding flag of all ranks.
+        // Latency = 1 p2p write
+        __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
+                                flag,
+                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
+                                __MEMORY_SCOPE_SYSTEM);
+        // wait until we got true from all ranks
+        while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
+                                     final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
+                                     __MEMORY_SCOPE_DEVICE) < flag)
+            ;
     }
     __syncthreads();
     // use one thread to update flag
-    if (threadIdx.x == 0)
-      self_sg->_flag[blockIdx.x] = flag;
+    if(threadIdx.x == 0)
+        self_sg->_flag[blockIdx.x] = flag;
 #else
     __syncthreads();
     // eliminate the case that prior writes are not visible after signals become
     // visible. Note that I did not managed to make this happen through a lot of
     // testing. Might be the case that hardware provides stronger guarantee than
     // the memory model.
-    if constexpr (!final_sync)
-      __threadfence_system();
-    if (threadIdx.x < ngpus)
+    if constexpr(!final_sync)
+        __threadfence_system();
+    if(threadIdx.x < ngpus)
     {
-      // reset flag for next time
-      self_sg->start[blockIdx.x][threadIdx.x] = 0;
-      // simultaneously write to the corresponding flag of all ranks.
-      // Latency = 1 p2p write
-      sg.signals[threadIdx.x]->end[blockIdx.x][rank] = 1;
-      // wait until we got true from all ranks
-      while (!self_sg->end[blockIdx.x][threadIdx.x])
-        ;
+        // reset flag for next time
+        self_sg->start[blockIdx.x][threadIdx.x] = 0;
+        // simultaneously write to the corresponding flag of all ranks.
+        // Latency = 1 p2p write
+        sg.signals[threadIdx.x]->end[blockIdx.x][rank] = 1;
+        // wait until we got true from all ranks
+        while(!self_sg->end[blockIdx.x][threadIdx.x])
+            ;
     }
-    if constexpr (!final_sync)
-      __syncthreads();
+    if constexpr(!final_sync)
+        __syncthreads();
 #endif
-  }
+}
 
-  template <typename P, int ngpus, typename A>
-  DINLINE P packed_reduce(const P *ptrs[], int idx)
-  {
+template <typename P, int ngpus, typename A>
+DINLINE P packed_reduce(const P* ptrs[], int idx)
+{
     A tmp = upcast(ptrs[0][idx]);
 #pragma unroll
-    for (int i = 1; i < ngpus; i++)
+    for(int i = 1; i < ngpus; i++)
     {
-      packed_assign_add(tmp, upcast(ptrs[i][idx]));
+        packed_assign_add(tmp, upcast(ptrs[i][idx]));
     }
     return downcast<P>(tmp);
-  }
+}
 
-  template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1)
-      cross_device_reduce_1stage_naive(RankData *_dp, RankSignals sg,
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_naive(RankData* _dp,
+                                                                           RankSignals sg,
 #ifndef USE_ROCM
-                                 volatile
+                                                                           volatile
 #endif
-                                 Signal *self_sg,
-                                 T *__restrict__ result, int rank, int size)
-  {
+                                                                           Signal* self_sg,
+                                                                           T* __restrict__ result,
+                                                                           int rank,
+                                                                           int size)
+{
     using P = typename packed_t<T>::P;
     using A = typename packed_t<T>::A;
     // note: we don't reorder the address so the accumulation order is the same
@@ -312,57 +313,58 @@ namespace aiter
     auto dp = *_dp;
     start_sync<ngpus>(sg, self_sg, rank);
     // do the actual reduction
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
-         idx += gridDim.x * blockDim.x)
+    for(int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x)
     {
-      ((P *)result)[idx] = packed_reduce<P, ngpus, A>((const P **)&dp.ptrs[0], idx);
+        ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
-  }
+}
 
-  template <typename P>
+template <typename P>
 #ifdef USE_ROCM
-  DINLINE P *get_tmp_buf(Signal *sg)
-  {
+DINLINE P* get_tmp_buf(Signal* sg)
+{
 #else
-  DINLINE P *get_tmp_buf(volatile Signal *sg)
-  {
+DINLINE P* get_tmp_buf(volatile Signal* sg)
+{
 #endif
-    return (P *)(((Signal *)sg) + 1);
-  }
+    return (P*)(((Signal*)sg) + 1);
+}
 
-  template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1)
-      cross_device_reduce_2stage_naive(RankData *_dp, RankSignals sg,
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankData* _dp,
+                                                                           RankSignals sg,
 #ifndef USE_ROCM
-                                 volatile
+                                                                           volatile
 #endif
-                                 Signal *self_sg,
-                                 T *__restrict__ result, int rank, int size)
-  {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = gridDim.x * blockDim.x;
-    using P = typename packed_t<T>::P;
-    using A = typename packed_t<T>::A;
-    int part = size / ngpus;
-    int start = rank * part;
-    int end = rank == ngpus - 1 ? size : start + part;
+                                                                           Signal* self_sg,
+                                                                           T* __restrict__ result,
+                                                                           int rank,
+                                                                           int size)
+{
+    int tid          = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride       = gridDim.x * blockDim.x;
+    using P          = typename packed_t<T>::P;
+    using A          = typename packed_t<T>::A;
+    int part         = size / ngpus;
+    int start        = rank * part;
+    int end          = rank == ngpus - 1 ? size : start + part;
     int largest_part = part + size % ngpus;
-    const P *ptrs[ngpus];
-    P *tmps[ngpus];
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
 #pragma unroll
-    for (int i = 0; i < ngpus; i++)
+    for(int i = 0; i < ngpus; i++)
     {
-      int target = (rank + i) % ngpus;
-      ptrs[i] = (const P *)_dp->ptrs[target];
-      tmps[i] = get_tmp_buf<P>(sg.signals[target]);
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_dp->ptrs[target];
+        tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
     // stage 1: reduce scatter
-    for (int idx = start + tid; idx < end; idx += stride)
+    for(int idx = start + tid; idx < end; idx += stride)
     {
-      tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+        tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
@@ -371,36 +373,38 @@ namespace aiter
     // between threads that have the same tid. If thread i computes the sum of
     // start + i in the first stage, then thread i also gathers start + i from all
     // ranks.
-    for (int idx = tid; idx < largest_part; idx += stride)
+    for(int idx = tid; idx < largest_part; idx += stride)
     {
 #pragma unroll
-      for (int i = 0; i < ngpus; i++)
-      {
-        int gather_from_rank = ((rank + i) % ngpus);
-        if (gather_from_rank == ngpus - 1 || idx < part)
+        for(int i = 0; i < ngpus; i++)
         {
-          int dst_idx = gather_from_rank * part + idx;
-          ((P *)result)[dst_idx] = tmps[i][idx];
+            int gather_from_rank = ((rank + i) % ngpus);
+            if(gather_from_rank == ngpus - 1 || idx < part)
+            {
+                int dst_idx           = gather_from_rank * part + idx;
+                ((P*)result)[dst_idx] = tmps[i][idx];
+            }
         }
-      }
     }
-  }
+}
 
 #define THREAD_NUM 512
 
-  template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1)
-      cross_device_reduce_1stage(RankData *_dp, RankSignals sg,
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _dp,
+                                                                     RankSignals sg,
 #ifndef USE_ROCM
-                                 volatile
+                                                                     volatile
 #endif
-                                 Signal *self_sg,
-                                 T *__restrict__ result, int rank, int size)
-  {
-    using P = typename packed_t<T>::P;
-    using A = typename packed_t<T>::A;
+                                                                     Signal* self_sg,
+                                                                     T* __restrict__ result,
+                                                                     int rank,
+                                                                     int size)
+{
+    using P                 = typename packed_t<T>::P;
+    using A                 = typename packed_t<T>::A;
     constexpr int pack_size = packed_t<T>::P::size;
-    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
     __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
     // note: we don't reorder the address so the accumulation order is the same
     // for all ranks, ensuring bitwise identical results
@@ -411,109 +415,115 @@ namespace aiter
     int lane_id = threadIdx.x % tnum_gpu;
     start_sync<ngpus>(sg, self_sg, rank);
     // do the actual reduction
-    for (int idx = blockIdx.x * tnum_gpu + lane_id; idx < size;
-         idx += gridDim.x * tnum_gpu)
+    for(int idx = blockIdx.x * tnum_gpu + lane_id; idx < size; idx += gridDim.x * tnum_gpu)
     {
-      *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ((const P**)&dp.ptrs[0])[warp_id][idx];
-      __syncthreads();
-      if (warp_id == 0)
-      {
-        A add_reg;
-#pragma unroll
-        for (int i = 0; i < pack_size; ++i)
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) =
+            ((const P**)&dp.ptrs[0])[warp_id][idx];
+        __syncthreads();
+        if(warp_id == 0)
         {
-          add_reg.data[i] = ck_tile::type_convert<float>(tmp_smem[threadIdx.x * pack_size + i]);
-        }
-        constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
+            A add_reg;
 #pragma unroll
-        for (int i = 1; i < ngpus; ++i)
-        {
+            for(int i = 0; i < pack_size; ++i)
+            {
+                add_reg.data[i] =
+                    ck_tile::type_convert<float>(tmp_smem[threadIdx.x * pack_size + i]);
+            }
+            constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
 #pragma unroll
-          for (int j = 0; j < pack_size; ++j)
-          {
-            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[smem_gpu_loop_stride * i + threadIdx.x * pack_size + j]);
-          }
-        }
-        P write_reg;
+            for(int i = 1; i < ngpus; ++i)
+            {
 #pragma unroll
-        for (int i = 0; i < pack_size; ++i)
-        {
-          write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                for(int j = 0; j < pack_size; ++j)
+                {
+                    add_reg.data[j] += ck_tile::type_convert<float>(
+                        tmp_smem[smem_gpu_loop_stride * i + threadIdx.x * pack_size + j]);
+                }
+            }
+            P write_reg;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+            }
+            ((P*)result)[idx] = write_reg;
         }
-        ((P *)result)[idx] = write_reg;
-      }
-      __syncthreads();
+        __syncthreads();
     }
     // maybe do not need device sync
     // end_sync<ngpus, true>(sg, self_sg, rank);
-  }
+}
 
-  template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1)
-      cross_device_reduce_2stage(RankData *_dp, RankSignals sg,
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _dp,
+                                                                     RankSignals sg,
 #ifndef USE_ROCM
-                                 volatile
+                                                                     volatile
 #endif
-                                 Signal *self_sg,
-                                 T *__restrict__ result, int rank, int size)
-  {
+                                                                     Signal* self_sg,
+                                                                     T* __restrict__ result,
+                                                                     int rank,
+                                                                     int size)
+{
     constexpr int pack_size = packed_t<T>::P::size;
-    constexpr int tnum_gpu = THREAD_NUM / ngpus;
-    using P = typename packed_t<T>::P;
-    using A = typename packed_t<T>::A;
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    using P                 = typename packed_t<T>::P;
+    using A                 = typename packed_t<T>::A;
     __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
-    int tid = blockIdx.x * tnum_gpu + lane_id;
-    int stride = gridDim.x * tnum_gpu;
-    int part = size / ngpus;
-    int start = rank * part;
-    int end = rank == ngpus - 1 ? size : start + part;
+    int warp_id      = threadIdx.x / tnum_gpu;
+    int lane_id      = threadIdx.x % tnum_gpu;
+    int tid          = blockIdx.x * tnum_gpu + lane_id;
+    int stride       = gridDim.x * tnum_gpu;
+    int part         = size / ngpus;
+    int start        = rank * part;
+    int end          = rank == ngpus - 1 ? size : start + part;
     int largest_part = part + size % ngpus;
-    const P *ptrs[ngpus];
-    P *tmps[ngpus];
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
 #pragma unroll
-    for (int i = 0; i < ngpus; i++)
+    for(int i = 0; i < ngpus; i++)
     {
-      int target = (rank + i) % ngpus;
-      ptrs[i] = (const P *)_dp->ptrs[target];
-      tmps[i] = get_tmp_buf<P>(sg.signals[target]);
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_dp->ptrs[target];
+        tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
     // stage 1: reduce scatter
-    for (int idx = start + tid; idx < end; idx += stride)
+    for(int idx = start + tid; idx < end; idx += stride)
     {
-      *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
-      __syncthreads();
-      // cal add in first 64 threads
-      if (warp_id == 0)
-      {
-        A add_reg;
-#pragma unroll
-        for (int i = 0; i < pack_size; ++i)
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
+        __syncthreads();
+        // cal add in first 64 threads
+        if(warp_id == 0)
         {
-          add_reg.data[i] = ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
-        }
-        constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
+            A add_reg;
 #pragma unroll
-        for (int i = 1; i < ngpus; ++i)
-        {
+            for(int i = 0; i < pack_size; ++i)
+            {
+                add_reg.data[i] =
+                    ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
+            }
+            constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
 #pragma unroll
-          for (int j = 0; j < pack_size; ++j)
-          {
-            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
-          }
-        }
-        P write_reg;
+            for(int i = 1; i < ngpus; ++i)
+            {
 #pragma unroll
-        for (int i = 0; i < pack_size; ++i)
-        {
-          write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                for(int j = 0; j < pack_size; ++j)
+                {
+                    add_reg.data[j] += ck_tile::type_convert<float>(
+                        tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
+                }
+            }
+            P write_reg;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+            }
+            tmp_out[idx - start] = write_reg;
         }
-        tmp_out[idx - start] = write_reg;
-      }
-      __syncthreads();
+        __syncthreads();
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
@@ -522,734 +532,706 @@ namespace aiter
     // between threads that have the same tid. If thread i computes the sum of
     // start + i in the first stage, then thread i also gathers start + i from all
     // ranks.
-    for (int idx = tid; idx < largest_part; idx += stride)
+    for(int idx = tid; idx < largest_part; idx += stride)
     {
-        int dst_idx = (warp_id + rank) % ngpus * part + idx;
-        ((P *)result)[dst_idx] = tmps[warp_id][idx];
+        int dst_idx           = (warp_id + rank) % ngpus * part + idx;
+        ((P*)result)[dst_idx] = tmps[warp_id][idx];
     }
-  }
+}
 
-  /*
-   * naive allgather
-   * for case: input(1345,)
-   * */
-  template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1) allgather_naive(
-      RankData* _dp,
-      RankSignals sg,
-      Signal* self_sg,
-      T* __restrict__ result,
-      int rank,
-      int size
-  )
-  {
+/*
+ * naive allgather
+ * for case: input(1345,)
+ * */
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) allgather_naive(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
+{
     constexpr int tnum_gpu = THREAD_NUM / ngpus;
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
-    int tid = blockIdx.x * tnum_gpu + lane_id;
-    int stride = gridDim.x * tnum_gpu;
+    int warp_id            = threadIdx.x / tnum_gpu;
+    int lane_id            = threadIdx.x % tnum_gpu;
+    int tid                = blockIdx.x * tnum_gpu + lane_id;
+    int stride             = gridDim.x * tnum_gpu;
     const T* ptrs[ngpus];
 
 #pragma unroll
-    for (int i = 0; i < ngpus; ++i)
+    for(int i = 0; i < ngpus; ++i)
     {
-      ptrs[i] = (const T*)_dp->ptrs[i];
+        ptrs[i] = (const T*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
-    for (int idx = tid; idx < size; idx += stride)
+    for(int idx = tid; idx < size; idx += stride)
     {
-      int write_idx = warp_id * size + idx;
-      result[write_idx] = ptrs[warp_id][idx];
+        int write_idx     = warp_id * size + idx;
+        result[write_idx] = ptrs[warp_id][idx];
     }
-  }
+}
 
-  template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1) allgather_vec(
-      RankData* _dp,
-      RankSignals sg,
-      Signal* self_sg,
-      T* __restrict__ result,
-      int rank,
-      int size
-  )
-  {
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) allgather_vec(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
+{
     constexpr int tnum_gpu = THREAD_NUM / ngpus;
-    using P = typename packed_t<T>::P;
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
-    int tid = blockIdx.x * tnum_gpu + lane_id;
-    int stride = gridDim.x * tnum_gpu;
+    using P                = typename packed_t<T>::P;
+    int warp_id            = threadIdx.x / tnum_gpu;
+    int lane_id            = threadIdx.x % tnum_gpu;
+    int tid                = blockIdx.x * tnum_gpu + lane_id;
+    int stride             = gridDim.x * tnum_gpu;
     const P* ptrs[ngpus];
 
 #pragma unroll
-    for (int i = 0; i < ngpus; ++i)
+    for(int i = 0; i < ngpus; ++i)
     {
-      ptrs[i] = (const P*)_dp->ptrs[i];
+        ptrs[i] = (const P*)_dp->ptrs[i];
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
-    for (int idx = tid; idx < size; idx += stride)
+    for(int idx = tid; idx < size; idx += stride)
     {
-      int write_idx = warp_id * size + idx;
-      *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
+        int write_idx                                   = warp_id * size + idx;
+        *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
-  }
+}
 
-  /*
-   * reduce_scatter, at first dim
-   * range = size / (pack_size * ngpu)
-   * for case:
-   *  input:(ngpus * n) -> output:(n)
-   *  input:(ngpus * m, n, ...) -> output(m, n, ...)
-   * cond: size % (pack_size * ngpus) == 0
-   * */
-  template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1) reduce_scatter_first_dim(
-      RankData *_dp,
-      RankSignals sg,
-      Signal *self_sg,
-      T *__restrict__ result,
-      int rank,
-      int range
-  )
-  {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+/*
+ * reduce_scatter, at first dim
+ * range = size / (pack_size * ngpu)
+ * for case:
+ *  input:(ngpus * n) -> output:(n)
+ *  input:(ngpus * m, n, ...) -> output(m, n, ...)
+ * cond: size % (pack_size * ngpus) == 0
+ * */
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) reduce_scatter_first_dim(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int range)
+{
+    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    using P = typename packed_t<T>::P;
-    using A = typename packed_t<T>::A;
-    const P *ptrs[ngpus];
+    using P    = typename packed_t<T>::P;
+    using A    = typename packed_t<T>::A;
+    const P* ptrs[ngpus];
 #pragma unroll
-    for (int i = 0; i < ngpus; i++)
+    for(int i = 0; i < ngpus; i++)
     {
-      int target = (rank + i) % ngpus;
-      ptrs[i] = (const P *)_dp->ptrs[target];
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_dp->ptrs[target];
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
-    for (int idx = tid; idx < range; idx += stride)
+    for(int idx = tid; idx < range; idx += stride)
     {
-      int load_index = rank * range + idx;
-      int store_index = idx;
-      *(reinterpret_cast<P*>(result) + store_index) = packed_reduce<P, ngpus, A>(ptrs, load_index);
+        int load_index  = rank * range + idx;
+        int store_index = idx;
+        *(reinterpret_cast<P*>(result) + store_index) =
+            packed_reduce<P, ngpus, A>(ptrs, load_index);
     }
-  }
+}
 
-  // fp8 quant all-reduce code start
-  template <typename T>
-  struct Fp16Filter
-  {
+// fp8 quant all-reduce code start
+template <typename T>
+struct Fp16Filter
+{
     static const bool value = false;
-  };
+};
 
-  template <>
-  struct Fp16Filter<half>
-  {
+template <>
+struct Fp16Filter<half>
+{
     static const bool value = true;
-  };
+};
 
-  template <typename T>
-  struct Bf16Filter
-  {
+template <typename T>
+struct Bf16Filter
+{
     static const bool value = false;
-  };
+};
 
-  template <>
-  struct Bf16Filter<__hip_bfloat16>
-  {
+template <>
+struct Bf16Filter<__hip_bfloat16>
+{
     static const bool value = true;
-  };
+};
 
-  // dtypes only support half and bf16 now
-#define FP16_FILTER \
-  typename std::enable_if<Fp16Filter<T>::value, void>::type* = nullptr
+// dtypes only support half and bf16 now
+#define FP16_FILTER typename std::enable_if<Fp16Filter<T>::value, void>::type* = nullptr
 
-#define BF16_FILTER \
-  typename std::enable_if<Bf16Filter<T>::value, void>::type* = nullptr
+#define BF16_FILTER typename std::enable_if<Bf16Filter<T>::value, void>::type* = nullptr
 
-  template <template <typename> class functor, typename T, int size>
-  DINLINE T packReduce(array_t<T, size> pack)
-  {
-    auto op = functor<T>();
+template <template <typename> class functor, typename T, int size>
+DINLINE T packReduce(array_t<T, size> pack)
+{
+    auto op   = functor<T>();
     T ret_val = pack.data[0];
 #pragma unroll
-    for (int i = 1; i < size; ++i)
+    for(int i = 1; i < size; ++i)
     {
-      ret_val = op(ret_val, pack.data[i]);
+        ret_val = op(ret_val, pack.data[i]);
     }
     return ret_val;
-  }
+}
 
-  template <template<typename> class functor, typename T, int size>
-  DINLINE array_t<T, size> packOp(array_t<T, size> a, array_t<T, size> b)
-  {
+template <template <typename> class functor, typename T, int size>
+DINLINE array_t<T, size> packOp(array_t<T, size> a, array_t<T, size> b)
+{
     auto op = functor<T>();
     array_t<T, size> ret_pack;
 #pragma unroll
-    for (int i = 0; i < size; ++i)
+    for(int i = 0; i < size; ++i)
     {
-      ret_pack.data[i] = op(a.data[i], b.data[i]);
+        ret_pack.data[i] = op(a.data[i], b.data[i]);
     }
     return ret_pack;
-  }
+}
 
-  template <typename T>
-  struct AddFunctor
-  {
-    DINLINE T operator() (T a, T b)
+template <typename T>
+struct AddFunctor
+{
+    DINLINE T operator()(T a, T b) { return a + b; }
+};
+
+template <>
+struct AddFunctor<half>
+{
+    DINLINE half operator()(half a, half b)
     {
-      return a + b;
+        float a_fp32 = ck_tile::type_convert<float>(a);
+        float b_fp32 = ck_tile::type_convert<float>(b);
+        return ck_tile::type_convert<half>(a_fp32 + b_fp32);
     }
-  };
+};
 
-  template <>
-  struct AddFunctor<half>
-  {
-    DINLINE half operator() (half a, half b)
+template <>
+struct AddFunctor<__hip_bfloat16>
+{
+    DINLINE __hip_bfloat16 operator()(__hip_bfloat16 a, __hip_bfloat16 b)
     {
-      float a_fp32 = ck_tile::type_convert<float>(a);
-      float b_fp32 = ck_tile::type_convert<float>(b);
-      return ck_tile::type_convert<half>(a_fp32 + b_fp32);
+        float a_fp32 = ck_tile::type_convert<float>(a);
+        float b_fp32 = ck_tile::type_convert<float>(b);
+        return ck_tile::type_convert<__hip_bfloat16>(a_fp32 + b_fp32);
     }
-  };
+};
 
-  template <>
-  struct AddFunctor<__hip_bfloat16>
-  {
-    DINLINE __hip_bfloat16 operator() (__hip_bfloat16 a, __hip_bfloat16 b)
+template <typename T>
+struct MaxFunctor
+{
+    DINLINE T operator()(T a, T b) { return max(a, b); }
+};
+
+/*
+ * todo:
+ * static_cast may not safe
+ * need a convert dtype template function defined by myself
+ *
+ * done
+ * */
+template <typename T>
+struct AbsMaxFunctor
+{
+    DINLINE T operator()(T a, T b)
     {
-      float a_fp32 = ck_tile::type_convert<float>(a);
-      float b_fp32 = ck_tile::type_convert<float>(b);
-      return ck_tile::type_convert<__hip_bfloat16>(a_fp32 + b_fp32);
+        T zero_t = ck_tile::type_convert<T>(0.0f);
+        a        = a > zero_t ? a : zero_t - a;
+        b        = b > zero_t ? b : zero_t - b;
+        return max(a, b);
     }
-  };
+};
 
-  template <typename T>
-  struct MaxFunctor
-  {
-    DINLINE T operator() (T a, T b)
-    {
-      return max(a, b);
-    }
-  };
-
-  /*
-   * todo:
-   * static_cast may not safe
-   * need a convert dtype template function defined by myself
-   *
-   * done
-   * */
-  template <typename T>
-  struct AbsMaxFunctor
-  {
-    DINLINE T operator() (T a, T b)
-    {
-      T zero_t = ck_tile::type_convert<T>(0.0f);
-      a = a > zero_t ? a : zero_t - a;
-      b = b > zero_t ? b : zero_t - b;
-      return max(a, b);
-    }
-  };
-
-  template <template <typename> class functor, typename T, int reduce_range>
-  DINLINE T warpReduce(T val)
-  {
+template <template <typename> class functor, typename T, int reduce_range>
+DINLINE T warpReduce(T val)
+{
     auto op = functor<T>();
 #pragma unroll
-    for (int stride = reduce_range / 2; stride > 0; stride >>= 1)
+    for(int stride = reduce_range / 2; stride > 0; stride >>= 1)
     {
-      T tmp = __shfl_xor(val, stride, reduce_range);
-      val = op(val, tmp);
+        T tmp = __shfl_xor(val, stride, reduce_range);
+        val   = op(val, tmp);
     }
     return val;
-  }
+}
 
-  // the following code only support bf16 and fp16
-  template <typename T>
-  DINLINE hip_fp8 elementQuant(T input, T scale_functor)
-  {
-    return hip_fp8(ck_tile::type_convert<float>(input) / ck_tile::type_convert<float>(scale_functor));
-  }
+// the following code only support bf16 and fp16
+template <typename T>
+DINLINE hip_fp8 elementQuant(T input, T scale_functor)
+{
+    return hip_fp8(ck_tile::type_convert<float>(input) /
+                   ck_tile::type_convert<float>(scale_functor));
+}
 
-  template <typename T>
-  DINLINE T elementDequant(hip_fp8 input, T scale_functor)
-  {
+template <typename T>
+DINLINE T elementDequant(hip_fp8 input, T scale_functor)
+{
     return ck_tile::type_convert<T>(float(input) * ck_tile::type_convert<float>(scale_functor));
-  }
+}
 
-  template <typename T, int pack_size>
-  DINLINE array_t<hip_fp8, pack_size> packQuant(array_t<T, pack_size> inp_pack, T scale_functor)
-  {
+template <typename T, int pack_size>
+DINLINE array_t<hip_fp8, pack_size> packQuant(array_t<T, pack_size> inp_pack, T scale_functor)
+{
     array_t<hip_fp8, pack_size> ret_val;
 #pragma unroll
-    for (int i = 0; i < pack_size; ++i)
+    for(int i = 0; i < pack_size; ++i)
     {
-      ret_val.data[i] = elementQuant<T>(inp_pack.data[i], scale_functor);
+        ret_val.data[i] = elementQuant<T>(inp_pack.data[i], scale_functor);
     }
     return ret_val;
-  }
+}
 
-  template <typename T, int pack_size>
-  DINLINE array_t<T, pack_size> packDequant(array_t<hip_fp8, pack_size> inp_pack, T scale_functor)
-  {
+template <typename T, int pack_size>
+DINLINE array_t<T, pack_size> packDequant(array_t<hip_fp8, pack_size> inp_pack, T scale_functor)
+{
     array_t<T, pack_size> ret_val;
 #pragma unroll
-    for (int i = 0; i < pack_size; ++i)
+    for(int i = 0; i < pack_size; ++i)
     {
-      ret_val.data[i] = elementDequant<T>(inp_pack.data[i], scale_functor);
+        ret_val.data[i] = elementDequant<T>(inp_pack.data[i], scale_functor);
     }
     return ret_val;
-  }
+}
 
-  // convert fp16 pack to fp32 pack
-  template <typename T, int pack_size>
-  DINLINE array_t<float, pack_size> packUpcast(array_t<T, pack_size> inp)
-  {
+// convert fp16 pack to fp32 pack
+template <typename T, int pack_size>
+DINLINE array_t<float, pack_size> packUpcast(array_t<T, pack_size> inp)
+{
     array_t<float, pack_size> ret_val;
 #pragma unroll
-    for (int i = 0; i < pack_size; ++i)
+    for(int i = 0; i < pack_size; ++i)
     {
-      ret_val.data[i] = ck_tile::type_convert<float>(inp.data[i]);
+        ret_val.data[i] = ck_tile::type_convert<float>(inp.data[i]);
     }
     return ret_val;
-  }
+}
 
-  template <typename T, int pack_size>
-  DINLINE array_t<T, pack_size> packDowncast(array_t<float, pack_size> inp)
-  {
+template <typename T, int pack_size>
+DINLINE array_t<T, pack_size> packDowncast(array_t<float, pack_size> inp)
+{
     array_t<T, pack_size> ret_val;
 #pragma unroll
-    for (int i = 0; i < pack_size; ++i)
+    for(int i = 0; i < pack_size; ++i)
     {
-      ret_val.data[i] = ck_tile::type_convert<T>(inp.data[i]);
+        ret_val.data[i] = ck_tile::type_convert<T>(inp.data[i]);
     }
     return ret_val;
-  }
+}
 
-
-  template <typename T, int pack_size, int ngpus>
-  DINLINE array_t<T, pack_size> multiGPUPackReduce(const array_t<T, pack_size> *ptrs[ngpus], int index)
-  {
+template <typename T, int pack_size, int ngpus>
+DINLINE array_t<T, pack_size> multiGPUPackReduce(const array_t<T, pack_size>* ptrs[ngpus],
+                                                 int index)
+{
     array_t<float, pack_size> ret_val = packUpcast<T, pack_size>(ptrs[0][index]);
 #pragma unroll
-    for (int gpu_id = 1; gpu_id < ngpus; ++gpu_id)
+    for(int gpu_id = 1; gpu_id < ngpus; ++gpu_id)
     {
-      array_t<float, pack_size> tmp = packUpcast<T, pack_size>(ptrs[gpu_id][index]);
+        array_t<float, pack_size> tmp = packUpcast<T, pack_size>(ptrs[gpu_id][index]);
 #pragma unroll
-      for (int i = 0; i < pack_size; ++i)
-      {
-        ret_val.data[i] += tmp.data[i];
-      }
+        for(int i = 0; i < pack_size; ++i)
+        {
+            ret_val.data[i] += tmp.data[i];
+        }
     }
     return packDowncast<T, pack_size>(ret_val);
-  }
+}
 
-  // bf16 quant fp8 kernel function
-  // too slow need to be optimized
-  // fp16
-  template <typename T, int quant_scale, int pack_size, int ngpus, FP16_FILTER>
-  __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
-  {
+// bf16 quant fp8 kernel function
+// too slow need to be optimized
+// fp16
+template <typename T, int quant_scale, int pack_size, int ngpus, FP16_FILTER>
+__global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
+{
     float FP8_UPBOUND = ck_tile::type_convert<float>(ck_tile::numeric<ck_tile::fp8_t>::max());
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = gridDim.x * blockDim.x;
-    using inp_pack = array_t<T, pack_size>;
-    using fp8_pack = array_t<hip_fp8, pack_size>;
-    int part = size / ngpus;
-    int start = rank * part;
-    int end = rank == ngpus - 1 ? size : start + part;
-    int largest_part = part + size % ngpus;
-    const inp_pack *ptrs[ngpus];
-    fp8_pack *tmps[ngpus];
+    int tid           = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride        = gridDim.x * blockDim.x;
+    using inp_pack    = array_t<T, pack_size>;
+    using fp8_pack    = array_t<hip_fp8, pack_size>;
+    int part          = size / ngpus;
+    int start         = rank * part;
+    int end           = rank == ngpus - 1 ? size : start + part;
+    int largest_part  = part + size % ngpus;
+    const inp_pack* ptrs[ngpus];
+    fp8_pack* tmps[ngpus];
 #pragma unroll
-    for (int i = 0; i < ngpus; i++)
+    for(int i = 0; i < ngpus; i++)
     {
-      int target = (rank + i) % ngpus;
-      ptrs[i] = (const inp_pack *)_dp->ptrs[target];
-      tmps[i] = get_tmp_buf<fp8_pack>(sg.signals[target]);
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const inp_pack*)_dp->ptrs[target];
+        tmps[i]    = get_tmp_buf<fp8_pack>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
     // stage 1: reduce scatter
-    for (int idx = start + tid; idx < end; idx += stride)
+    for(int idx = start + tid; idx < end; idx += stride)
     {
-      inp_pack half8_reg;
-      // half8_reg = packed_reduce<P, ngpus, A>(ptrs, idx);
-      half8_reg = multiGPUPackReduce<T, pack_size, ngpus>(ptrs, idx);
-      ((inp_pack *)result)[idx] = half8_reg;
-      // quant
-      T thread_max = packReduce<AbsMaxFunctor, T, pack_size>(half8_reg);
-      thread_max = warpReduce<MaxFunctor, T, quant_scale / pack_size>(thread_max);
-      T scale_factor = ck_tile::type_convert<T>(ck_tile::type_convert<float>(thread_max) / FP8_UPBOUND);
-      tmp_out[idx - start] = packQuant<T, pack_size>(half8_reg, scale_factor);
-      if (threadIdx.x % (quant_scale / pack_size) == 0)
-      {
-        *(reinterpret_cast<T*>(&tmp_out[part]) + (idx - start) / (quant_scale / pack_size)) = scale_factor;
-      }
+        inp_pack half8_reg;
+        // half8_reg = packed_reduce<P, ngpus, A>(ptrs, idx);
+        half8_reg                = multiGPUPackReduce<T, pack_size, ngpus>(ptrs, idx);
+        ((inp_pack*)result)[idx] = half8_reg;
+        // quant
+        T thread_max = packReduce<AbsMaxFunctor, T, pack_size>(half8_reg);
+        thread_max   = warpReduce<MaxFunctor, T, quant_scale / pack_size>(thread_max);
+        T scale_factor =
+            ck_tile::type_convert<T>(ck_tile::type_convert<float>(thread_max) / FP8_UPBOUND);
+        tmp_out[idx - start] = packQuant<T, pack_size>(half8_reg, scale_factor);
+        if(threadIdx.x % (quant_scale / pack_size) == 0)
+        {
+            *(reinterpret_cast<T*>(&tmp_out[part]) + (idx - start) / (quant_scale / pack_size)) =
+                scale_factor;
+        }
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
     // stage 2: all-gather
-    for (int idx = tid; idx < largest_part; idx += stride)
+    for(int idx = tid; idx < largest_part; idx += stride)
     {
 #pragma unroll
-      for (int i = 1; i < ngpus; i++)
-      {
-        int gather_from_rank = ((rank + i) % ngpus);
-        if (gather_from_rank == ngpus - 1 || idx < part)
+        for(int i = 1; i < ngpus; i++)
         {
-          // dequant
-          T scale_factor;
-          int factor_stride = quant_scale / pack_size;
-          if (threadIdx.x % factor_stride == 0)
-          {
-            scale_factor = *(reinterpret_cast<T*>(&tmps[i][part]) + idx / factor_stride);
-          }
-          scale_factor = __shfl(scale_factor, (threadIdx.x / factor_stride) * factor_stride);
-          inp_pack half8_reg = packDequant<T, pack_size>(tmps[i][idx], scale_factor);
-          int dst_idx = gather_from_rank * part + idx;
-          ((inp_pack *)result)[dst_idx] = half8_reg;
+            int gather_from_rank = ((rank + i) % ngpus);
+            if(gather_from_rank == ngpus - 1 || idx < part)
+            {
+                // dequant
+                T scale_factor;
+                int factor_stride = quant_scale / pack_size;
+                if(threadIdx.x % factor_stride == 0)
+                {
+                    scale_factor = *(reinterpret_cast<T*>(&tmps[i][part]) + idx / factor_stride);
+                }
+                scale_factor = __shfl(scale_factor, (threadIdx.x / factor_stride) * factor_stride);
+                inp_pack half8_reg = packDequant<T, pack_size>(tmps[i][idx], scale_factor);
+                int dst_idx        = gather_from_rank * part + idx;
+                ((inp_pack*)result)[dst_idx] = half8_reg;
+            }
         }
-      }
     }
-  }
+}
 
-  // fused allreduce rmsnorm first step
-  template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
-      RankData* _dp,
-      RankSignals sg,
-      Signal* self_sg,
-      int rank,
-      int size
-  )
-  {
+// fused allreduce rmsnorm first step
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
+    RankData* _dp, RankSignals sg, Signal* self_sg, int rank, int size)
+{
     constexpr int pack_size = packed_t<T>::P::size;
-    constexpr int tnum_gpu = THREAD_NUM / ngpus;
-    using P = typename packed_t<T>::P;
-    using A = typename packed_t<T>::A;
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    using P                 = typename packed_t<T>::P;
+    using A                 = typename packed_t<T>::A;
     __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
     int warp_id = threadIdx.x / tnum_gpu;
     int lane_id = threadIdx.x % tnum_gpu;
-    int tid = blockIdx.x * tnum_gpu + lane_id;
+    int tid     = blockIdx.x * tnum_gpu + lane_id;
     const P* ptrs[ngpus];
     P* tmps[ngpus];
 #pragma unroll
-    for (int i = 0; i < ngpus; ++i)
+    for(int i = 0; i < ngpus; ++i)
     {
-      ptrs[i] = (const P*)_dp->ptrs[i];
-      tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+        ptrs[i] = (const P*)_dp->ptrs[i];
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
     int part = size / (pack_size * ngpus);
-    for (int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
     {
-      // cross device read by all warp
-      P input_reg = ptrs[warp_id][rank * part + idx];
-      *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
-      __syncthreads();
-      // calculate and save in first warp
-      if (warp_id == 0)
-      {
-        A add_reg;
-#pragma unroll
-        for (int i = 0; i < pack_size; ++i)
+        // cross device read by all warp
+        P input_reg                                         = ptrs[warp_id][rank * part + idx];
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
+        __syncthreads();
+        // calculate and save in first warp
+        if(warp_id == 0)
         {
-          add_reg.data[i] = ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
-        }
+            A add_reg;
 #pragma unroll
-        for (int i = 1; i < ngpus; ++i)
-        {
+            for(int i = 0; i < pack_size; ++i)
+            {
+                add_reg.data[i] =
+                    ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
+            }
 #pragma unroll
-          for (int j = 0; j < pack_size; ++j)
-          {
-            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
-          }
-        }
-        P add_rslt;
+            for(int i = 1; i < ngpus; ++i)
+            {
 #pragma unroll
-        for (int i = 0; i < pack_size; ++i)
-        {
-          add_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                for(int j = 0; j < pack_size; ++j)
+                {
+                    add_reg.data[j] += ck_tile::type_convert<float>(
+                        tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
+                }
+            }
+            P add_rslt;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                add_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+            }
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
         }
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
-      }
-      __syncthreads();
+        __syncthreads();
 
-      // cross device store
-      P rslt = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
-      tmps[warp_id][rank * part + idx] = rslt;
+        // cross device store
+        P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
+        tmps[warp_id][rank * part + idx] = rslt;
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
-  }
+}
 
-  template <int reduce_range>
-  DINLINE void smemReduceSum(float* smem_addr)
-  {
+template <int reduce_range>
+DINLINE void smemReduceSum(float* smem_addr)
+{
     // a warp executes the same instruction
 #pragma unroll
-    for (int stride = reduce_range / 2; stride > 32; stride >>= 1)
+    for(int stride = reduce_range / 2; stride > 32; stride >>= 1)
     {
-      if (threadIdx.x < stride)
-      {
-        smem_addr[threadIdx.x] += smem_addr[threadIdx.x + stride];
-      }
-      __syncthreads();
+        if(threadIdx.x < stride)
+        {
+            smem_addr[threadIdx.x] += smem_addr[threadIdx.x + stride];
+        }
+        __syncthreads();
     }
     volatile float* v_smem = &smem_addr[0];
-    if (threadIdx.x < 32)
+    if(threadIdx.x < 32)
     {
-      v_smem[threadIdx.x] += v_smem[threadIdx.x + 32];
-      v_smem[threadIdx.x] += v_smem[threadIdx.x + 16];
-      v_smem[threadIdx.x] += v_smem[threadIdx.x + 8];
-      v_smem[threadIdx.x] += v_smem[threadIdx.x + 4];
-      v_smem[threadIdx.x] += v_smem[threadIdx.x + 2];
-      v_smem[threadIdx.x] += v_smem[threadIdx.x + 1];
+        v_smem[threadIdx.x] += v_smem[threadIdx.x + 32];
+        v_smem[threadIdx.x] += v_smem[threadIdx.x + 16];
+        v_smem[threadIdx.x] += v_smem[threadIdx.x + 8];
+        v_smem[threadIdx.x] += v_smem[threadIdx.x + 4];
+        v_smem[threadIdx.x] += v_smem[threadIdx.x + 2];
+        v_smem[threadIdx.x] += v_smem[threadIdx.x + 1];
     }
     __syncthreads();
-  }
+}
 
-  /*
-   * input case n dim should be divided by 4096 with dtype bf16
-   * and should be divided by 2048 with dtype fp32
-   * */
-  template <typename T, int tnum, int n_loop>
-  __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_naive(
-      RankSignals sg,
-      T* __restrict__ residual_inp,
-      T* __restrict__ residual_out,
-      T* __restrict__ results,
-      T* __restrict__ weight,
-      float eps,
-      int rank,
-      int m,
-      int n
-  )
-  {
+/*
+ * input case n dim should be divided by 4096 with dtype bf16
+ * and should be divided by 2048 with dtype fp32
+ * */
+template <typename T, int tnum, int n_loop>
+__global__ void __launch_bounds__(tnum, 1)
+    local_device_load_rmsnorm_naive(RankSignals sg,
+                                    T* __restrict__ residual_inp,
+                                    T* __restrict__ residual_out,
+                                    T* __restrict__ results,
+                                    T* __restrict__ weight,
+                                    float eps,
+                                    int rank,
+                                    int m,
+                                    int n)
+{
     constexpr int pack_size = packed_t<T>::P::size;
-    using P = typename packed_t<T>::P;
-    using A = typename packed_t<T>::A;
+    using P                 = typename packed_t<T>::P;
+    using A                 = typename packed_t<T>::A;
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
 
-    for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
-      float square_sum = 0.0f;
-      A rms_inp_f32[n_loop];
-      P w_arr[n_loop];
+        float square_sum = 0.0f;
+        A rms_inp_f32[n_loop];
+        P w_arr[n_loop];
 #pragma unroll
-      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
-      {
-        int read_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-        P reduce_out_pack = tmps[read_idx];
-        P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-        w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
-        A reduce_pack;
-#pragma unroll
-        for (int i = 0; i < pack_size; ++i)
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-          float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
-          float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
-          float rms_inp = res_inp + ar_out;
-          rms_inp_f32[n_iter].data[i] = rms_inp;
-          reduce_pack.data[i] = rms_inp * rms_inp;
+            int read_idx        = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
+            P reduce_out_pack   = tmps[read_idx];
+            P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+            w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
+            A reduce_pack;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+                float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+                float rms_inp = res_inp + ar_out;
+                rms_inp_f32[n_iter].data[i] = rms_inp;
+                reduce_pack.data[i]         = rms_inp * rms_inp;
+            }
+            square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
         }
-        square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
-      }
-      smem[threadIdx.x] = square_sum;
-      __syncthreads();
-      smemReduceSum<tnum>(&smem[0]);
-      square_sum = smem[0];
-      float denom = rsqrtf(square_sum / n + eps);
+        smem[threadIdx.x] = square_sum;
+        __syncthreads();
+        smemReduceSum<tnum>(&smem[0]);
+        square_sum  = smem[0];
+        float denom = rsqrtf(square_sum / n + eps);
 #pragma unroll
-      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
-      {
-        P rmsnorm_rslt;
-        P rmsnorm_inp;
-#pragma unroll
-        for (int i = 0; i < pack_size; ++i)
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-          float x_f32 = rms_inp_f32[n_iter].data[i];
-          float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
-          rmsnorm_inp.data[i] = ck_tile::type_convert<T>(x_f32);
-          rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+            P rmsnorm_rslt;
+            P rmsnorm_inp;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                float x_f32          = rms_inp_f32[n_iter].data[i];
+                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+                rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
+                rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+            }
+            int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
+            *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
+            *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
         }
-        int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-        *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
-        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
-      }
     }
-  }
+}
 
-  /*
-   * block size can be 256 and 512
-   * corresponding 2048 and 4096 elem per block
-   * */
-  template <typename T, int tnum, int n_loop>
-  __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(
-      RankSignals sg,
-      T* __restrict__ residual_inp,
-      T* __restrict__ residual_out,
-      T* __restrict__ results,
-      T* __restrict__ weight,
-      float eps,
-      int rank,
-      int m,
-      int n
-  )
-  {
+/*
+ * block size can be 256 and 512
+ * corresponding 2048 and 4096 elem per block
+ * */
+template <typename T, int tnum, int n_loop>
+__global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals sg,
+                                                                     T* __restrict__ residual_inp,
+                                                                     T* __restrict__ residual_out,
+                                                                     T* __restrict__ results,
+                                                                     T* __restrict__ weight,
+                                                                     float eps,
+                                                                     int rank,
+                                                                     int m,
+                                                                     int n)
+{
     constexpr int pack_size = packed_t<T>::P::size;
-    using P = typename packed_t<T>::P;
-    using A = typename packed_t<T>::A;
+    using P                 = typename packed_t<T>::P;
+    using A                 = typename packed_t<T>::A;
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
 
-    for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
-      float square_sum = 0.0f;
-      A rms_inp_f32[n_loop];
-      P w_arr[n_loop];
+        float square_sum = 0.0f;
+        A rms_inp_f32[n_loop];
+        P w_arr[n_loop];
 #pragma unroll
-      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
-      {
-        if (n_iter * tnum + threadIdx.x < (n / pack_size))
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-          int read_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
-          P reduce_out_pack = tmps[read_idx];
-          P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-          w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
-          A reduce_pack;
+            if(n_iter * tnum + threadIdx.x < (n / pack_size))
+            {
+                int read_idx        = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+                P reduce_out_pack   = tmps[read_idx];
+                P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+                w_arr[n_iter]       = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                A reduce_pack;
 #pragma unroll
-          for (int i = 0; i < pack_size; ++i)
-          {
-            float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
-            float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
-            float rms_inp = ar_out + res_inp;
-            rms_inp_f32[n_iter].data[i] = rms_inp;
-            reduce_pack.data[i] = rms_inp * rms_inp;
-          }
-          square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+                    float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+                    float rms_inp = ar_out + res_inp;
+                    rms_inp_f32[n_iter].data[i] = rms_inp;
+                    reduce_pack.data[i]         = rms_inp * rms_inp;
+                }
+                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            }
         }
-      }
-      smem[threadIdx.x] = square_sum;
-      __syncthreads();
-      smemReduceSum<tnum>(&smem[0]);
-      square_sum = smem[0];
-      float denom = rsqrtf(square_sum / n + eps);
+        smem[threadIdx.x] = square_sum;
+        __syncthreads();
+        smemReduceSum<tnum>(&smem[0]);
+        square_sum  = smem[0];
+        float denom = rsqrtf(square_sum / n + eps);
 #pragma unroll
-      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
-      {
-        if (n_iter * tnum + threadIdx.x < (n / pack_size))
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-          P rmsnorm_rslt;
-          P rmsnorm_inp;
+            if(n_iter * tnum + threadIdx.x < (n / pack_size))
+            {
+                P rmsnorm_rslt;
+                P rmsnorm_inp;
 #pragma unroll
-          for (int i = 0; i < pack_size; ++i)
-          {
-            float x_f32 = rms_inp_f32[n_iter].data[i];
-            float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
-            rmsnorm_inp.data[i] = ck_tile::type_convert<T>(x_f32);
-            rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
-          }
-          int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
-          *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
-          *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float x_f32          = rms_inp_f32[n_iter].data[i];
+                    float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+                    rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
+                    rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+                }
+                int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+                *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
+                *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
+            }
         }
-      }
     }
-  }
+}
 
-  template <typename T, int n_loop>
-  __global__ void __launch_bounds__(256, 1) local_device_load_rmsnorm_512n(
-      RankSignals sg,
-      T* __restrict__ residual_inp,
-      T* __restrict__ residual_out,
-      T* __restrict__ results,
-      T* __restrict__ weight,
-      float eps,
-      int rank,
-      int m,
-      int n
-  )
-  {
+template <typename T, int n_loop>
+__global__ void __launch_bounds__(256, 1)
+    local_device_load_rmsnorm_512n(RankSignals sg,
+                                   T* __restrict__ residual_inp,
+                                   T* __restrict__ residual_out,
+                                   T* __restrict__ results,
+                                   T* __restrict__ weight,
+                                   float eps,
+                                   int rank,
+                                   int m,
+                                   int n)
+{
     constexpr int pack_size = packed_t<T>::P::size;
-    using P = typename packed_t<T>::P;
-    using A = typename packed_t<T>::A;
-    P* tmps = get_tmp_buf<P>(sg.signals[rank]);
-    int warp_id = threadIdx.x / 64;
-    int lane_id = threadIdx.x % 64;
-    int warp_num = blockDim.x / 64;
+    using P                 = typename packed_t<T>::P;
+    using A                 = typename packed_t<T>::A;
+    P* tmps                 = get_tmp_buf<P>(sg.signals[rank]);
+    int warp_id             = threadIdx.x / 64;
+    int lane_id             = threadIdx.x % 64;
+    int warp_num            = blockDim.x / 64;
 
-    for (int bid = blockIdx.x * warp_num + warp_id; bid < m; bid += gridDim.x * warp_num)
+    for(int bid = blockIdx.x * warp_num + warp_id; bid < m; bid += gridDim.x * warp_num)
     {
-      float square_sum = 0.0f;
-      A rms_inp_f32[n_loop];
-      P w_arr[n_loop];
+        float square_sum = 0.0f;
+        A rms_inp_f32[n_loop];
+        P w_arr[n_loop];
 #pragma unroll
-      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
-      {
-        int read_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
-        P reduce_out_pack = tmps[read_idx];
-        P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
-        w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * 64 + lane_id);
-        A reduce_pack;
-#pragma unroll
-        for (int i = 0; i < pack_size; ++i)
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-          float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
-          float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
-          float rms_inp = ar_out + res_inp;
-          rms_inp_f32[n_iter].data[i] = rms_inp;
-          reduce_pack.data[i] = rms_inp * rms_inp;
+            int read_idx        = bid * 64 * n_loop + n_iter * 64 + lane_id;
+            P reduce_out_pack   = tmps[read_idx];
+            P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+            w_arr[n_iter]       = *(reinterpret_cast<P*>(weight) + n_iter * 64 + lane_id);
+            A reduce_pack;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+                float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+                float rms_inp = ar_out + res_inp;
+                rms_inp_f32[n_iter].data[i] = rms_inp;
+                reduce_pack.data[i]         = rms_inp * rms_inp;
+            }
+            float tmp_sum = packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            square_sum += tmp_sum;
         }
-        float tmp_sum = packReduce<AddFunctor, float, pack_size>(reduce_pack);
-        square_sum += tmp_sum;
-      }
-      square_sum = warpReduce<AddFunctor, float, 64>(square_sum);
-      float denom = rsqrtf(square_sum / n + eps);
+        square_sum  = warpReduce<AddFunctor, float, 64>(square_sum);
+        float denom = rsqrtf(square_sum / n + eps);
 #pragma unroll
-      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
-      {
-        P rmsnorm_rslt;
-        P rmsnorm_inp;
-#pragma unroll
-        for (int i = 0; i < pack_size; ++i)
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
         {
-          float x_f32 = rms_inp_f32[n_iter].data[i];
-          float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
-          rmsnorm_inp.data[i] = ck_tile::type_convert<T>(x_f32);
-          rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+            P rmsnorm_rslt;
+            P rmsnorm_inp;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+            {
+                float x_f32          = rms_inp_f32[n_iter].data[i];
+                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+                rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
+                rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+            }
+            int write_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
+            *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
+            *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
         }
-        int write_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
-        *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
-        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
-      }
     }
-  }
+}
 
-  using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
-  static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
-  static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
+using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
+static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
+static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
 
-  class CustomAllreduce
-  {
-  public:
+class CustomAllreduce
+{
+    public:
     int rank_;
     int world_size_;
     bool full_nvlink_;
 
     // below are device pointers
     RankSignals sg_;
-    std::unordered_map<void *, RankData *> buffers_;
-    Signal *self_sg_;
+    std::unordered_map<void*, RankData*> buffers_;
+    Signal* self_sg_;
 
     // stores the registered device pointers from all ranks
     RankData *d_rank_data_base_, *d_rank_data_end_;
-    std::vector<void *> graph_unreg_buffers_;
+    std::vector<void*> graph_unreg_buffers_;
     // a map from IPC handles to opened IPC pointers
-    std::map<IPC_KEY, char *> ipc_handles_;
+    std::map<IPC_KEY, char*> ipc_handles_;
 
     /**
      * meta is a pointer to device metadata and temporary buffer for allreduce.
@@ -1260,137 +1242,135 @@ namespace aiter
      * note: this class does not own any device memory. Any required buffers
      * are passed in from the constructor
      */
-    CustomAllreduce(Signal *meta, void *rank_data, size_t rank_data_sz,
-                    const hipIpcMemHandle_t *handles,
-                    const std::vector<int64_t> &offsets, int rank,
+    CustomAllreduce(Signal* meta,
+                    void* rank_data,
+                    size_t rank_data_sz,
+                    const hipIpcMemHandle_t* handles,
+                    const std::vector<int64_t>& offsets,
+                    int rank,
                     bool fully_connected = true)
         : rank_(rank),
           world_size_(offsets.size()),
           full_nvlink_(fully_connected),
           self_sg_(meta),
-          d_rank_data_base_(reinterpret_cast<RankData *>(rank_data)),
+          d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
           d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData))
     {
-      for (int i = 0; i < world_size_; i++)
-      {
-        Signal *rank_sg;
-        if (i != rank_)
+        for(int i = 0; i < world_size_; i++)
         {
-          char *handle = open_ipc_handle(&handles[i]);
-          handle += offsets[i];
-          rank_sg = (Signal *)handle;
+            Signal* rank_sg;
+            if(i != rank_)
+            {
+                char* handle = open_ipc_handle(&handles[i]);
+                handle += offsets[i];
+                rank_sg = (Signal*)handle;
+            }
+            else
+            {
+                rank_sg = self_sg_;
+            }
+            sg_.signals[i] = rank_sg;
         }
-        else
-        {
-          rank_sg = self_sg_;
-        }
-        sg_.signals[i] = rank_sg;
-      }
     }
 
-    char *open_ipc_handle(const void *ipc_handle)
+    char* open_ipc_handle(const void* ipc_handle)
     {
-      auto [it, new_handle] =
-          ipc_handles_.insert({*((IPC_KEY *)ipc_handle), nullptr});
-      if (new_handle)
-      {
-        char *ipc_ptr;
-        HIP_CALL(hipIpcOpenMemHandle((void **)&ipc_ptr,
-                                       *((const hipIpcMemHandle_t *)ipc_handle),
-                                       hipIpcMemLazyEnablePeerAccess));
-        it->second = ipc_ptr;
-      }
-      return it->second;
+        auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
+        if(new_handle)
+        {
+            char* ipc_ptr;
+            HIP_CALL(hipIpcOpenMemHandle((void**)&ipc_ptr,
+                                         *((const hipIpcMemHandle_t*)ipc_handle),
+                                         hipIpcMemLazyEnablePeerAccess));
+            it->second = ipc_ptr;
+        }
+        return it->second;
     }
 
-    std::pair<std::vector<uint8_t>, std::vector<int64_t>>
-    get_graph_buffer_ipc_meta()
+    std::pair<std::vector<uint8_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta()
     {
-      auto num_buffers = graph_unreg_buffers_.size();
-      auto handle_sz = sizeof(hipIpcMemHandle_t);
-      std::vector<uint8_t> handles(handle_sz * num_buffers, 0);
-      std::vector<int64_t> offsets(num_buffers);
-      for (int i = 0; i < num_buffers; i++)
-      {
-        auto ptr = graph_unreg_buffers_[i];
-        void *base_ptr;
-        // note: must share the base address of each allocation, or we get wrong
-        // address
-        if (hipPointerGetAttribute(&base_ptr,
+        auto num_buffers = graph_unreg_buffers_.size();
+        auto handle_sz   = sizeof(hipIpcMemHandle_t);
+        std::vector<uint8_t> handles(handle_sz * num_buffers, 0);
+        std::vector<int64_t> offsets(num_buffers);
+        for(int i = 0; i < num_buffers; i++)
+        {
+            auto ptr = graph_unreg_buffers_[i];
+            void* base_ptr;
+            // note: must share the base address of each allocation, or we get wrong
+            // address
+            if(hipPointerGetAttribute(&base_ptr,
 #ifdef USE_ROCM
-                                  HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                      HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #else
-                                  CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                      CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #endif
-                                  (hipDeviceptr_t)ptr) != CUDA_SUCCESS)
-          throw std::runtime_error("failed to get pointer attr");
-        HIP_CALL(hipIpcGetMemHandle(
-            (hipIpcMemHandle_t *)&handles[i * handle_sz], base_ptr));
-        offsets[i] = ((char *)ptr) - ((char *)base_ptr);
-      }
-      return std::make_pair(handles, offsets);
+                                      (hipDeviceptr_t)ptr) != CUDA_SUCCESS)
+                throw std::runtime_error("failed to get pointer attr");
+            HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
+            offsets[i] = ((char*)ptr) - ((char*)base_ptr);
+        }
+        return std::make_pair(handles, offsets);
     }
 
     void check_rank_data_capacity(size_t num = 1)
     {
-      if (d_rank_data_base_ + num > d_rank_data_end_)
-        throw std::runtime_error(
-            "Rank data buffer is overflowed by " +
-            std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
+        if(d_rank_data_base_ + num > d_rank_data_end_)
+            throw std::runtime_error("Rank data buffer is overflowed by " +
+                                     std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
     }
 
-    void register_buffer(const std::vector<torch::Tensor> &handles,
-                         const std::vector<int64_t> &offsets, void *self)
+    void register_buffer(const std::vector<torch::Tensor>& handles,
+                         const std::vector<int64_t>& offsets,
+                         void* self)
     {
-      check_rank_data_capacity();
-      RankData data;
-      for (int i = 0; i < world_size_; i++)
-      {
-        if (i != rank_)
+        check_rank_data_capacity();
+        RankData data;
+        for(int i = 0; i < world_size_; i++)
         {
-          hipIpcMemHandle_t* ipc_handle_ptr = (hipIpcMemHandle_t*)handles[i].data_ptr();
-          char *handle = open_ipc_handle((void*)ipc_handle_ptr);
-          handle += offsets[i];
-          data.ptrs[i] = handle;
+            if(i != rank_)
+            {
+                hipIpcMemHandle_t* ipc_handle_ptr = (hipIpcMemHandle_t*)handles[i].data_ptr();
+                char* handle                      = open_ipc_handle((void*)ipc_handle_ptr);
+                handle += offsets[i];
+                data.ptrs[i] = handle;
+            }
+            else
+            {
+                data.ptrs[i] = self;
+            }
+        }
+        auto d_data = d_rank_data_base_++;
+        HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
+        buffers_[self] = d_data;
+    }
+
+    RankData* get_buffer_RD(hipStream_t stream, void* input)
+    {
+        RankData* ptrs;
+        auto it = buffers_.find(input);
+        if(it != buffers_.end())
+        {
+            ptrs = it->second;
         }
         else
         {
-          data.ptrs[i] = self;
+            hipStreamCaptureStatus status;
+            HIP_CALL(hipStreamIsCapturing(stream, &status));
+            if(status == hipStreamCaptureStatusActive)
+            {
+                ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+                graph_unreg_buffers_.push_back(input);
+            }
+            else
+            {
+                throw std::runtime_error("buffer address " +
+                                         std::to_string(reinterpret_cast<uint64_t>(input)) +
+                                         " is not registered!");
+            }
         }
-      }
-      auto d_data = d_rank_data_base_++;
-      HIP_CALL(
-          hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
-      buffers_[self] = d_data;
-    }
 
-    RankData *get_buffer_RD(hipStream_t stream, void *input)
-    {
-      RankData *ptrs;
-      auto it = buffers_.find(input);
-      if (it != buffers_.end())
-      {
-        ptrs = it->second;
-      }
-      else
-      {
-        hipStreamCaptureStatus status;
-        HIP_CALL(hipStreamIsCapturing(stream, &status));
-        if (status == hipStreamCaptureStatusActive)
-        {
-          ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
-          graph_unreg_buffers_.push_back(input);
-        }
-        else
-        {
-          throw std::runtime_error(
-              "buffer address " +
-              std::to_string(reinterpret_cast<uint64_t>(input)) +
-              " is not registered!");
-        }
-      }
-
-      return ptrs;
+        return ptrs;
     }
 
     // note: when registering graph buffers, we intentionally choose to not
@@ -1400,37 +1380,38 @@ namespace aiter
     // rank 1 may get the same input address for the second allreduce, but rank 2
     // got a different address. IPC handles have internal reference counting
     // mechanism so overhead should be small.
-    void register_graph_buffers(
-        const std::vector<torch::Tensor> &handles,
-        const std::vector<torch::Tensor> &offsets)
+    void register_graph_buffers(const std::vector<torch::Tensor>& handles,
+                                const std::vector<torch::Tensor>& offsets)
     {
-      auto num_buffers = graph_unreg_buffers_.size();
-      check_rank_data_capacity(num_buffers);
-      std::vector<RankData> rank_data(num_buffers);
-      for (int i = 0; i < num_buffers; i++)
-      {
-        auto self_ptr = graph_unreg_buffers_[i];
-        auto &rd = rank_data[i];
-        for (int j = 0; j < world_size_; j++)
+        auto num_buffers = graph_unreg_buffers_.size();
+        check_rank_data_capacity(num_buffers);
+        std::vector<RankData> rank_data(num_buffers);
+        for(int i = 0; i < num_buffers; i++)
         {
-          if (j != rank_)
-          {
-            hipIpcMemHandle_t* ipc_handle_ptr = (hipIpcMemHandle_t*)handles[j].data_ptr() + i;
-            char *handle = open_ipc_handle(ipc_handle_ptr);
-            handle += *((int64_t*)offsets[j].data_ptr() + i);
-            rd.ptrs[j] = handle;
-          }
-          else
-          {
-            rd.ptrs[j] = self_ptr;
-          }
+            auto self_ptr = graph_unreg_buffers_[i];
+            auto& rd      = rank_data[i];
+            for(int j = 0; j < world_size_; j++)
+            {
+                if(j != rank_)
+                {
+                    hipIpcMemHandle_t* ipc_handle_ptr =
+                        (hipIpcMemHandle_t*)handles[j].data_ptr() + i;
+                    char* handle = open_ipc_handle(ipc_handle_ptr);
+                    handle += *((int64_t*)offsets[j].data_ptr() + i);
+                    rd.ptrs[j] = handle;
+                }
+                else
+                {
+                    rd.ptrs[j] = self_ptr;
+                }
+            }
         }
-      }
-      HIP_CALL(hipMemcpy(d_rank_data_base_, rank_data.data(),
+        HIP_CALL(hipMemcpy(d_rank_data_base_,
+                           rank_data.data(),
                            sizeof(RankData) * num_buffers,
                            hipMemcpyHostToDevice));
-      d_rank_data_base_ += num_buffers;
-      graph_unreg_buffers_.clear();
+        d_rank_data_base_ += num_buffers;
+        graph_unreg_buffers_.clear();
     }
 
     /*
@@ -1443,58 +1424,58 @@ namespace aiter
     template <typename T>
     void runFp8QuantKernel(hipStream_t stream, T* input, T* output, int size)
     {
-      RankData *ptrs = get_buffer_RD(stream, input);
-      // 32 block 512 thread or 64 block 256 thread
-#define DISPATHC_UNIT(pack_size, quant_scale, ngpus)                                                                             \
-  do                                                                                                                             \
-  {                                                                                                                              \
-    case ngpus:                                                                                                                  \
-    {                                                                                                                            \
-      allReduceQuantFp8<T, quant_scale, pack_size, ngpus><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size); \
-      return ;                                                                                                                   \
-    }                                                                                                                            \
-  }while(0)
+        RankData* ptrs = get_buffer_RD(stream, input);
+        // 32 block 512 thread or 64 block 256 thread
+#define DISPATHC_UNIT(pack_size, quant_scale, ngpus)                                \
+    do                                                                              \
+    {                                                                               \
+    case ngpus: {                                                                   \
+        allReduceQuantFp8<T, quant_scale, pack_size, ngpus>                         \
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size); \
+        return;                                                                     \
+    }                                                                               \
+    } while(0)
 
-#define DISPATCH_CALL(pack_size, block_size, quant_scale)                                \
-  do                                                                                     \
-  {                                                                                      \
-   block.x = block_size;                                                                 \
-    grid.x = min((16384 / block_size), (single_device_size / (pack_size * block_size))); \
-    size /= pack_size;                                                                   \
-    switch (world_size_)                                                                 \
-    {                                                                                    \
-      DISPATHC_UNIT(pack_size, quant_scale, 2);                                          \
-      DISPATHC_UNIT(pack_size, quant_scale, 4);                                          \
-      DISPATHC_UNIT(pack_size, quant_scale, 6);                                          \
-      DISPATHC_UNIT(pack_size, quant_scale, 8);                                          \
-    }                                                                                    \
-  } while(0)
+#define DISPATCH_CALL(pack_size, block_size, quant_scale)                                     \
+    do                                                                                        \
+    {                                                                                         \
+        block.x = block_size;                                                                 \
+        grid.x  = min((16384 / block_size), (single_device_size / (pack_size * block_size))); \
+        size /= pack_size;                                                                    \
+        switch(world_size_)                                                                   \
+        {                                                                                     \
+            DISPATHC_UNIT(pack_size, quant_scale, 2);                                         \
+            DISPATHC_UNIT(pack_size, quant_scale, 4);                                         \
+            DISPATHC_UNIT(pack_size, quant_scale, 6);                                         \
+            DISPATHC_UNIT(pack_size, quant_scale, 8);                                         \
+        }                                                                                     \
+    } while(0)
 
-      int single_device_size = size / world_size_;
-      constexpr int max_thread_num = 512;
-      constexpr int max_pack_size = 8;
-      constexpr int max_elem_perblock = max_thread_num * max_pack_size;
-      dim3 grid, block;
-      if (single_device_size % 128 == 0)
-      {
-        DISPATCH_CALL(8, 256, 128);
-      }
-      else if (single_device_size % 64 == 0)
-      {
-        DISPATCH_CALL(8, 256, 64);
-      }
-      else if (single_device_size % 32 == 0)
-      {
-        DISPATCH_CALL(8, 256, 32);
-      }
-      else if (single_device_size % 16 == 0)
-      {
-        DISPATCH_CALL(8, 256, 16);
-      }
-      else // 512
-      {
-        DISPATCH_CALL(8, 256, 8);
-      }
+        int single_device_size          = size / world_size_;
+        constexpr int max_thread_num    = 512;
+        constexpr int max_pack_size     = 8;
+        constexpr int max_elem_perblock = max_thread_num * max_pack_size;
+        dim3 grid, block;
+        if(single_device_size % 128 == 0)
+        {
+            DISPATCH_CALL(8, 256, 128);
+        }
+        else if(single_device_size % 64 == 0)
+        {
+            DISPATCH_CALL(8, 256, 64);
+        }
+        else if(single_device_size % 32 == 0)
+        {
+            DISPATCH_CALL(8, 256, 32);
+        }
+        else if(single_device_size % 16 == 0)
+        {
+            DISPATCH_CALL(8, 256, 16);
+        }
+        else // 512
+        {
+            DISPATCH_CALL(8, 256, 8);
+        }
     }
 
     /**
@@ -1505,229 +1486,246 @@ namespace aiter
      * will cause contention on NVLink bus.
      */
     template <typename T>
-    void allreduce(hipStream_t stream, T *input, T *output, int size, bool use_new = true,
+    void allreduce(hipStream_t stream,
+                   T* input,
+                   T* output,
+                   int size,
+                   bool use_new = true,
 #ifndef USE_ROCM
-                   int threads = 512, int block_limit = 20){
+                   int threads     = 512,
+                   int block_limit = 20){
 #else
-                   int threads = 512, int block_limit = 16)
+                   int threads     = 512,
+                   int block_limit = 16)
     {
 #endif
         auto d = packed_t<T>::P::size;
-    if (size % d != 0)
-      throw std::runtime_error(
-          "custom allreduce currently requires input length to be multiple "
-          "of " +
-          std::to_string(d));
-    if (block_limit > kMaxBlocks)
-      throw std::runtime_error("max supported block limit is " +
-                               std::to_string(kMaxBlocks) + ". Got " +
-                               std::to_string(block_limit));
+    if(size % d != 0)
+        throw std::runtime_error("custom allreduce currently requires input length to be multiple "
+                                 "of " +
+                                 std::to_string(d));
+    if(block_limit > kMaxBlocks)
+        throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
+                                 ". Got " + std::to_string(block_limit));
 
-    RankData *ptrs = get_buffer_RD(stream, input);
+    RankData* ptrs = get_buffer_RD(stream, input);
 
     auto bytes = size * sizeof(T);
     size /= d;
 
     // use new version of allreduce kernel
-    if (use_new)
+    if(use_new)
     {
-      int blocks = 16;
-      bool call_1stage = false;
-      bool call_2stage = false;
-      if (world_size_ == 2)
-      {
-        call_1stage = true;
-      }
-      else if (full_nvlink_)
-      {
-        if ((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+        int blocks       = 16;
+        bool call_1stage = false;
+        bool call_2stage = false;
+        if(world_size_ == 2)
         {
-          call_1stage = true;
+            call_1stage = true;
         }
-        else
+        else if(full_nvlink_)
         {
-          call_2stage = true;
+            if((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+            {
+                call_1stage = true;
+            }
+            else
+            {
+                call_2stage = true;
+            }
         }
-      }
-      if (call_1stage)
-      {
-        blocks = std::min(kMaxBlocks, (size + (threads / world_size_) - 1) / (threads / world_size_));
-      }
-      else if (call_2stage)
-      {
-        blocks = std::min(kMaxBlocks, (size / world_size_ + (threads / world_size_) - 1) / (threads / world_size_));
-      }
+        if(call_1stage)
+        {
+            blocks = std::min(kMaxBlocks,
+                              (size + (threads / world_size_) - 1) / (threads / world_size_));
+        }
+        else if(call_2stage)
+        {
+            blocks = std::min(kMaxBlocks,
+                              (size / world_size_ + (threads / world_size_) - 1) /
+                                  (threads / world_size_));
+        }
 
-#define KL(ngpus, name)                                                       \
-  name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
-                                                 rank_, size);
+#define KL(ngpus, name) \
+    name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
 
-#define dispatch(ngpus, name)                            \
-    do                                                   \
-    {                                                    \
-      if (bytes % (ngpus * 16) == 0 && world_size_ != 6) \
-      {                                                  \
-        KL(ngpus, name)                                  \
-      }                                                  \
-      else                                               \
-      {                                                  \
-        KL(ngpus, name##_naive)                          \
-      }                                                  \
+#define dispatch(ngpus, name)                             \
+    do                                                    \
+    {                                                     \
+        if(bytes % (ngpus * 16) == 0 && world_size_ != 6) \
+        {                                                 \
+            KL(ngpus, name)                               \
+        }                                                 \
+        else                                              \
+        {                                                 \
+            KL(ngpus, name##_naive)                       \
+        }                                                 \
     } while(0)
 
-#define REDUCE_CASE(ngpus)                         \
-  case ngpus:                                      \
-  {                                                \
-    if (call_1stage)                               \
-    {                                              \
-      KL(ngpus, cross_device_reduce_1stage);       \
-    }                                              \
-    else if (call_2stage)                          \
-    {                                              \
-      dispatch(ngpus, cross_device_reduce_2stage); \
-    }                                              \
-    break;                                         \
-  }
+#define REDUCE_CASE(ngpus)                               \
+    case ngpus: {                                        \
+        if(call_1stage)                                  \
+        {                                                \
+            KL(ngpus, cross_device_reduce_1stage);       \
+        }                                                \
+        else if(call_2stage)                             \
+        {                                                \
+            dispatch(ngpus, cross_device_reduce_2stage); \
+        }                                                \
+        break;                                           \
+    }
 
-      switch (world_size_)
-      {
-        REDUCE_CASE(2)
-        REDUCE_CASE(4)
-        REDUCE_CASE(6)
-        REDUCE_CASE(8)
-      default:
-        throw std::runtime_error(
-            "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
-            "gpus = " +
-            std::to_string(world_size_));
-      }
+        switch(world_size_)
+        {
+            REDUCE_CASE(2)
+            REDUCE_CASE(4)
+            REDUCE_CASE(6)
+            REDUCE_CASE(8)
+        default:
+            throw std::runtime_error(
+                "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+                "gpus = " +
+                std::to_string(world_size_));
+        }
     }
     else // use vllm allreduce kernel
     {
-      int blocks = std::min(block_limit, (size + threads - 1) / threads);
-#define VLLM_REDUCE_CASE(ngpus)                            \
-  case ngpus:                                              \
-  {                                                        \
-    if (world_size_ == 2)                                  \
-    {                                                      \
-      KL(ngpus, cross_device_reduce_1stage);               \
-    }                                                      \
-    else if (full_nvlink_)                                 \
-    {                                                      \
-      if ((world_size_ <= 4 && bytes < 512 * 1024) ||      \
-          (world_size_ <= 8 && bytes < 256 * 1024))        \
-      {                                                    \
-        KL(ngpus, cross_device_reduce_1stage_naive);       \
-      }                                                    \
-      else                                                 \
-      {                                                    \
-        KL(ngpus, cross_device_reduce_2stage_naive);       \
-      }                                                    \
-    }                                                      \
-    break;                                                 \
-  }
+        int blocks = std::min(block_limit, (size + threads - 1) / threads);
+#define VLLM_REDUCE_CASE(ngpus)                              \
+    case ngpus: {                                            \
+        if(world_size_ == 2)                                 \
+        {                                                    \
+            KL(ngpus, cross_device_reduce_1stage);           \
+        }                                                    \
+        else if(full_nvlink_)                                \
+        {                                                    \
+            if((world_size_ <= 4 && bytes < 512 * 1024) ||   \
+               (world_size_ <= 8 && bytes < 256 * 1024))     \
+            {                                                \
+                KL(ngpus, cross_device_reduce_1stage_naive); \
+            }                                                \
+            else                                             \
+            {                                                \
+                KL(ngpus, cross_device_reduce_2stage_naive); \
+            }                                                \
+        }                                                    \
+        break;                                               \
+    }
 
-      switch (world_size_)
-      {
-        VLLM_REDUCE_CASE(2)
-        VLLM_REDUCE_CASE(4)
-        VLLM_REDUCE_CASE(6)
-        VLLM_REDUCE_CASE(8)
-      default:
-        throw std::runtime_error(
-            "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
-            "gpus = " +
-            std::to_string(world_size_));
-      }
+        switch(world_size_)
+        {
+            VLLM_REDUCE_CASE(2)
+            VLLM_REDUCE_CASE(4)
+            VLLM_REDUCE_CASE(6)
+            VLLM_REDUCE_CASE(8)
+        default:
+            throw std::runtime_error(
+                "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+                "gpus = " +
+                std::to_string(world_size_));
+        }
     }
 #undef REDUCE_CASE
 #undef KL
-  }
+}
 
-  template <typename T>
-  void dispatchReduceScatter(hipStream_t stream, T* input, T* output, int size)
-  {
+template <typename T>
+void dispatchReduceScatter(hipStream_t stream, T* input, T* output, int size)
+{
     RankData* ptrs = get_buffer_RD(stream, input);
-    auto d = packed_t<T>::P::size;
-    int range = size / (world_size_ * d);
+    auto d         = packed_t<T>::P::size;
+    int range      = size / (world_size_ * d);
     dim3 block(512);
     int block_num = (range + 511) / 512;
     dim3 grid(std::min(16, block_num));
-    switch (world_size_)
+    switch(world_size_)
     {
-      case 8:
-        reduce_scatter_first_dim<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+    case 8:
+        reduce_scatter_first_dim<T, 8>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
         break;
-      case 4:
-        reduce_scatter_first_dim<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+    case 4:
+        reduce_scatter_first_dim<T, 4>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
         break;
-      case 2:
-        reduce_scatter_first_dim<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+    case 2:
+        reduce_scatter_first_dim<T, 2>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
         break;
-      default:
-        printf("reduce_scatter world_size error!\n");
+    default: printf("reduce_scatter world_size error!\n");
     }
-  }
+}
 
-  template <typename T>
-  void dispatchAllGather(hipStream_t stream, T* input, T* output, int size)
-  {
+template <typename T>
+void dispatchAllGather(hipStream_t stream, T* input, T* output, int size)
+{
     RankData* ptrs = get_buffer_RD(stream, input);
-    auto d = packed_t<T>::P::size;
+    auto d         = packed_t<T>::P::size;
     dim3 block(512);
-    if (size % d != 0)
+    if(size % d != 0)
     {
-      int block_num = (size + 512 - 1) / 512;
-      dim3 grid(std::min(block_num, 80));
-      switch (world_size_)
-      {
+        int block_num = (size + 512 - 1) / 512;
+        dim3 grid(std::min(block_num, 80));
+        switch(world_size_)
+        {
         case 8:
-          allgather_naive<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-          break;
+            allgather_naive<T, 8>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            break;
         case 4:
-          allgather_naive<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-          break;
+            allgather_naive<T, 4>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            break;
         case 2:
-          allgather_naive<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-          break;
-        default:
-          printf("allgather world_size error\n");
-      }
+            allgather_naive<T, 2>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            break;
+        default: printf("allgather world_size error\n");
+        }
     }
     else
     {
-      size /= d;
-      int tnum_per_block = 512 / world_size_;
-      int block_num = (size + tnum_per_block - 1) / tnum_per_block;
-      dim3 grid(std::min(block_num, 80));
-      switch (world_size_)
-      {
+        size /= d;
+        int tnum_per_block = 512 / world_size_;
+        int block_num      = (size + tnum_per_block - 1) / tnum_per_block;
+        dim3 grid(std::min(block_num, 80));
+        switch(world_size_)
+        {
         case 8:
-          allgather_vec<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-          break;
+            allgather_vec<T, 8>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            break;
         case 4:
-          allgather_vec<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-          break;
+            allgather_vec<T, 4>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            break;
         case 2:
-          allgather_vec<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-          break;
-        default:
-          printf("allgather world_size error\n");
-      }
+            allgather_vec<T, 2>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            break;
+        default: printf("allgather world_size error\n");
+        }
     }
-  }
+}
 
-  template <typename T>
-  void dispatchFusedAllReduceRMSNorm(hipStream_t stream, T* input, T* residual_inp, T* residual_out, T* output, T* weight, float eps, int m, int n)
-  {
-    auto d = packed_t<T>::P::size;
+template <typename T>
+void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
+                                   T* input,
+                                   T* residual_inp,
+                                   T* residual_out,
+                                   T* output,
+                                   T* weight,
+                                   float eps,
+                                   int m,
+                                   int n)
+{
+    auto d   = packed_t<T>::P::size;
     int size = m * n;
-    if (size % d != 0)
+    if(size % d != 0)
     {
-      throw std::runtime_error(
-          "custom allreduce currently requires input length to be multiple "
-          "of " +
-          std::to_string(d));
+        throw std::runtime_error("custom allreduce currently requires input length to be multiple "
+                                 "of " +
+                                 std::to_string(d));
     }
     RankData* ptrs = get_buffer_RD(stream, input);
     hipDevice_t dev;
@@ -1740,130 +1738,126 @@ namespace aiter
     dim3 block(512);
     int block_num = ((size / world_size_) + 512 - 1) / 512;
     dim3 grid(std::min(block_num, 80));
-    switch (world_size_)
+    switch(world_size_)
     {
-      case 8:
-        reduce_scatter_cross_device_store<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+    case 8:
+        reduce_scatter_cross_device_store<T, 8>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
-      case 4:
-        reduce_scatter_cross_device_store<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+    case 4:
+        reduce_scatter_cross_device_store<T, 4>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
-      case 2:
-        reduce_scatter_cross_device_store<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+    case 2:
+        reduce_scatter_cross_device_store<T, 2>
+            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
-      default:
-        printf("fused allreduce rmsnorm world size error\n");
+    default: printf("fused allreduce rmsnorm world size error\n");
     }
 
     // step 2, run allgather local device load + rmsnorm
-    int n_bytes = n * sizeof(T);
-    auto setGrid = [&](int naive_grid_size, const void* kernel_ptr)
-    {
-      int occupancy;
-      hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
-      grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
+    int n_bytes  = n * sizeof(T);
+    auto setGrid = [&](int naive_grid_size, const void* kernel_ptr) {
+        int occupancy;
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
+        grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
     };
 
-#define launch_fused_allreduce_rmsnorm(template_kernel)                                                               \
-    do                                                                                                                \
-    {                                                                                                                 \
-      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                                               \
-      setGrid(naive_grid_size, kernel_ptr);                                                                           \
-      template_kernel<<<grid, block, 0, stream>>>(sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
-    } while (0)
+#define launch_fused_allreduce_rmsnorm(template_kernel)                         \
+    do                                                                          \
+    {                                                                           \
+        auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);       \
+        setGrid(naive_grid_size, kernel_ptr);                                   \
+        template_kernel<<<grid, block, 0, stream>>>(                            \
+            sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+    } while(0)
 
-    if (n_bytes % 1024 == 0)
+    if(n_bytes % 1024 == 0)
     {
-      if (8192 <= n_bytes && n_bytes <= 32768)
-      {
-        int naive_grid_size = m;
-        int n_loop = n_bytes / 8192; // 1, 2, 3, 4
-        if (n_bytes % 8192 == 0)
+        if(8192 <= n_bytes && n_bytes <= 32768)
         {
-          switch (n_loop)
-          {
-            case 1:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 1>));
-              break;
-            case 2:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 2>));
-              break;
-            case 3:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 3>));
-              break;
-            case 4:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 4>));
-              break;
-          }
+            int naive_grid_size = m;
+            int n_loop          = n_bytes / 8192; // 1, 2, 3, 4
+            if(n_bytes % 8192 == 0)
+            {
+                switch(n_loop)
+                {
+                case 1:
+                    launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 1>));
+                    break;
+                case 2:
+                    launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 2>));
+                    break;
+                case 3:
+                    launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 3>));
+                    break;
+                case 4:
+                    launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 4>));
+                    break;
+                }
+            }
+            else
+            {
+                n_loop += 1;
+                switch(n_loop)
+                {
+                case 2:
+                    launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 2>));
+                    break;
+                case 3:
+                    launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 3>));
+                    break;
+                case 4:
+                    launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 4>));
+                    break;
+                }
+            }
+        }
+        else if(4096 <= n_bytes && n_bytes < 8192)
+        {
+            block.x             = 256;
+            int naive_grid_size = m;
+            if(n_bytes == 4096)
+            {
+                // naive n_loop = 1
+                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 1>));
+            }
+            else
+            {
+                // n_loop = 2
+                launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 256, 2>));
+            }
+        }
+        else if(1024 <= n_bytes && n_bytes < 4096)
+        {
+            block.x             = 256;
+            int naive_grid_size = (m + 3) / 4;
+            int n_loop          = n_bytes / 1024;
+            switch(n_loop)
+            {
+            case 1: launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 1>)); break;
+            case 2: launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 2>)); break;
+            case 3: launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 3>)); break;
+            }
         }
         else
         {
-          n_loop += 1;
-          switch (n_loop)
-          {
-            case 2:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 2>));
-              break;
-            case 3:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 3>));
-              break;
-            case 4:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 4>));
-              break;
-          }
+            printf("fused allreduce rmsnorm shape size error\n");
         }
-      }
-      else if (4096 <= n_bytes && n_bytes < 8192)
-      {
-        block.x = 256;
-        int naive_grid_size = m;
-        if (n_bytes == 4096)
-        {
-          // naive n_loop = 1
-          launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 1>));
-        }
-        else
-        {
-          // n_loop = 2
-          launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 256, 2>));
-        }
-      }
-      else if (1024 <= n_bytes && n_bytes < 4096)
-      {
-        block.x = 256;
-        int naive_grid_size = (m + 3) / 4;
-        int n_loop = n_bytes / 1024;
-        switch (n_loop)
-        {
-          case 1:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 1>));
-            break;
-          case 2:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 2>));
-            break;
-          case 3:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 3>));
-            break;
-        }
-      }
-      else
-      {
-        printf("fused allreduce rmsnorm shape size error\n");
-      }
     }
     else
     {
-      printf("fused allreduce rmsnorm shape error\n");
+        printf("fused allreduce rmsnorm shape error\n");
     }
-  }
+}
 
-  ~CustomAllreduce()
-  {
-    for (auto [_, ptr] : ipc_handles_)
+~CustomAllreduce()
+{
+    for(auto [_, ptr] : ipc_handles_)
     {
-      HIP_CALL(hipIpcCloseMemHandle(ptr));
+        HIP_CALL(hipIpcCloseMemHandle(ptr));
     }
-  }
+}
 }; // namespace aiter
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
 from typing import Optional, Tuple
@@ -22,7 +22,7 @@ MD_NAME = "module_attention"
 direct_register_custom_op(
     "pa_decode_gluon",
     pa_decode_gluon,
-    ["output", "output_gluon", "exp_sums", "max_logits", "temporary_output"],
+    ["output", "exp_sums", "max_logits", "temporary_output"],
 )
 
 

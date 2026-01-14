@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
@@ -102,14 +102,14 @@ def get_x_vals():
         (32, 7168, 2048),
         (64, 7168, 2048),
         (128, 7168, 2048),
-        (16, 4096, 7168),
-        (32, 4096, 7168),
-        (64, 4096, 7168),
-        (128, 4096, 7168),
-        (16, 7168, 256),
-        (32, 7168, 256),
-        (64, 7168, 256),
-        (128, 7168, 256),
+        (16, 4608, 7168),
+        (32, 4608, 7168),
+        (64, 4608, 7168),
+        (128, 4608, 7168),
+        (16, 7168, 2304),
+        (32, 7168, 2304),
+        (64, 7168, 2304),
+        (128, 7168, 2304),
     ]
     # x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
@@ -159,7 +159,6 @@ def generate_gemm_a8w8_blockscale_inputs(
 
     if shuffle:
         weight_shuffle_layout = (16, 16)
-        # weight_shuffle_layout = (16, 32)
         weight_shuffled = shuffle_weight(weight, weight_shuffle_layout).reshape(
             weight.shape[0] // weight_shuffle_layout[0],
             weight.shape[1] * weight_shuffle_layout[0],
@@ -173,6 +172,7 @@ def generate_gemm_a8w8_blockscale_inputs(
     if output:
         y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
 
+    return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
     return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
 
 
@@ -212,6 +212,19 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             )
 
     dtype = str_to_torch_dtype[dtype]
+    x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
+        generate_gemm_a8w8_blockscale_inputs(
+            M,
+            N,
+            K,
+            block_shape_n,
+            block_shape_k,
+            dtype=dtype,
+            layout=layout,
+            output=output,
+            shuffle=("_shuffle" in impl),
+        )
+    )
     x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
         generate_gemm_a8w8_blockscale_inputs(
             M,

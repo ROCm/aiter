@@ -2,8 +2,8 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck_tile/core.hpp"
-#include <hip/hip_runtime.h>
 #include <cstdint>
+#include <hip/hip_runtime.h>
 #include <iostream>
 
 enum class GPUArch
@@ -12,15 +12,14 @@ enum class GPUArch
     gfx950
 };
 
-
-#define CHECK_COND(x) \
-    do { \
-        if (!(x)) { \
-            std::cerr << "check failed, file=" \
-                << __FILE__ << ", line=" \
-                << __LINE__ << std::endl; \
-            std::terminate(); \
-        } \
+#define CHECK_COND(x)                                                                             \
+    do                                                                                            \
+    {                                                                                             \
+        if(!(x))                                                                                  \
+        {                                                                                         \
+            std::cerr << "check failed, file=" << __FILE__ << ", line=" << __LINE__ << std::endl; \
+            std::terminate();                                                                     \
+        }                                                                                         \
     } while(0)
 
 #define HIP_CALL(call)                                                       \
@@ -67,6 +66,7 @@ struct AiterAsmKernelArgs
     const hipStream_t stream;
 };
 
+static const std::string get_gpu_arch();
 class AiterAsmKernel
 {
     private:
@@ -77,9 +77,11 @@ class AiterAsmKernel
     AiterAsmKernel(const char* name, const char* hsaco)
     {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-        std::cout << "[aiter] hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str()
+        std::string arch_name = get_gpu_arch();
+        std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
+        std::cout << "[aiter] hipModuleLoad: " << hsa_path
                   << " GetFunction: " << name;
-        HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
+        HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
     };

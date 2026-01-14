@@ -26,6 +26,9 @@ if [[ "$BUILD_TRITON" == "1" ]]; then
     cd triton
     pip install -r python/requirements.txt
     pip install filecheck
+    # NetworkX is a dependency of Triton test selection script
+    # `.github/scripts/select_triton_tests.py`.
+    pip install networkx
     MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
     cd ..
 else

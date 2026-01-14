@@ -136,7 +136,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     triton_kv_cache = kv_cache.clone()
     if cache_dtype == torch.uint8:
         triton_kv_cache = triton_kv_cache.view(cache_dtype_actual)
-    triton_q, triton_decode_q_pe, triton_k_pe, triton_kv_cache, triton_zeros = (
+    triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
         fused_qk_rope_cat_and_cache_mla(
             q_nope,
             q_pe,

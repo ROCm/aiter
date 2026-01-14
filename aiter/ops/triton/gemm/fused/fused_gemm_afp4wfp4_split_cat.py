@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
 import torch
@@ -250,7 +250,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
     assert N == D * (S1 + S2), "N is not D * (S1 + S2)"
 
     if config is None:
-        config = _get_config(M, N, K, True)
+        config, _ = _get_config(M, N, K, True)
 
     c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
     c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)

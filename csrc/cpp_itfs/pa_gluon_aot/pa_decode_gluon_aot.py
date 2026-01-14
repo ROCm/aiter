@@ -11,8 +11,8 @@ import triton
 import triton.language as tl
 from jinja2 import Template
 
-from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
     compile_kernel,
@@ -20,10 +20,6 @@ from csrc.cpp_itfs.gluon_aot_tools.compile import (
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     CompileGluonArgs,
     compile_gluon_kernel,
-)
-from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
-    transpose_output_gluon_aot,
-    transpose_query_gluon_aot,
 )
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
 from csrc.cpp_itfs.utils import (
@@ -47,10 +43,7 @@ except ImportError:
     )
     GLUON_AOT_COMPILE_ENABLED = False
 
-TORCH_TO_TL_DTYPE = {
-    torch.float8_e4m3fnuz: tl.float8e4b8,
-    torch.float8_e4m3fn: tl.float8e4nv,
-}
+
 TORCH_TO_TL_DTYPE_SIG = {
     torch.float8_e4m3fnuz: "fp8e4b8",
     torch.float8_e4m3fn: "fp8e4nv",
@@ -113,8 +106,9 @@ def clean_directory_except_so(directory_path):
 
 
 def compile(
-    compute_type: tl.dtype,
-    equivalent_query_group_size: int,
+    compute_type: torch.dtype,
+    query_seq_len: int,
+    one_query_group_size: int,
     head_size: int,
     kv_block_size: int,
     context_partition_size: int,
@@ -130,17 +124,18 @@ def compile(
     """Compile the combined attention and reduce kernel for paged attention decode."""
     head_size_pow2 = triton.next_power_of_2(head_size)
 
-    if equivalent_query_group_size < 16:
-        equi_query_group_size_pow2 = 16
-    else:
-        equi_query_group_size_pow2 = triton.next_power_of_2(equivalent_query_group_size)
+    # Calculate QUERY_GROUP_SIZE_POW2 based on QUERY_SEQ_LEN and ONE_QUERY_GROUP_SIZE
+    query_group_size_pow2 = triton.next_power_of_2(
+        query_seq_len
+    ) * triton.next_power_of_2(one_query_group_size)
 
     if func_name is None:
         func_name = get_default_func_name(
             MD_NAME,
             (
                 compute_type,
-                equi_query_group_size_pow2,
+                query_seq_len,
+                one_query_group_size,
                 head_size_pow2,
                 kv_block_size,
                 context_partition_size,
@@ -160,6 +155,9 @@ def compile(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
 
+        # Convert compute_type from torch.dtype to tl.dtype for AOT compilation
+        compute_type_tl = torch_to_triton_dtype[compute_type]
+
         waves_per_eu = 1
         kv_compute_block_size = context_partition_size
         # Select kernel implementation based on block size
@@ -171,14 +169,14 @@ def compile(
         else:
             # Use standard kernel for normal block sizes
             # Configure waves per EU based on query group size
-            if equi_query_group_size_pow2 == 64:
+            if query_group_size_pow2 == 64:
                 waves_per_eu = 3
             else:
                 waves_per_eu = 4
 
-        tl_fp8_type = TORCH_TO_TL_DTYPE[aiter.dtypes.fp8]
+        tl_fp8_type = torch_to_triton_dtype[aiter.dtypes.fp8]
         tl_fp8_type_sig = TORCH_TO_TL_DTYPE_SIG[aiter.dtypes.fp8]
-        if compute_type == tl_fp8_type or compute_type == tl.bfloat16:
+        if compute_type_tl == tl_fp8_type or compute_type_tl == tl.bfloat16:
             if query_quant_mode >= 0:
                 query_sig = f"*{tl_fp8_type_sig}:16"
             else:
@@ -191,7 +189,7 @@ def compile(
                 value_cache_sig = "*bf16:16"
             logits_sig = "*bf16:16"
             output_sig = "*bf16:16"
-        elif compute_type == tl.float16:
+        elif compute_type_tl == tl.float16:
             if query_quant_mode >= 0:
                 query_sig = f"*{tl_fp8_type_sig}:16"
             else:
@@ -205,19 +203,19 @@ def compile(
             logits_sig = "*fp16:16"
             output_sig = "*fp16:16"
         else:
-            raise ValueError(f"Unsupported compute type: {compute_type}")
+            raise ValueError(f"Unsupported compute type: {compute_type_tl}")
         # Build signature based on kernel parameters (combined from both kernels)
         signature_parts = [
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
-            logits_sig,  # logits_ptr
-            query_sig,  # query_ptr
+            logits_sig,  # logits_ptr (output_ptr for attention kernel)
+            query_sig,  # query_ptr [batch_size, query_length, num_kv_heads, query_group_size, head_size]
             key_cache_sig,  # key_cache_ptr
             value_cache_sig,  # value_cache_ptr
             "*i32:16",  # block_tables_ptr
             "*i32:16",  # context_lengths_ptr
             "fp32:16",  # softmax_scale
-            "*fp32:16",  # query_scale
+            "*fp32:16",  # query_scale [num_seqs, query_length, num_kv_heads, query_group_size, 1](per-token) or [1](per-tensor) or None
             "*fp32:16",  # key_scale
             "*fp32:16",  # value_scale
             "i32:16",  # stride_max_logits_seq
@@ -227,8 +225,11 @@ def compile(
             "i32:16",  # stride_output_head
             "i32:16",  # stride_output_part
             "i32:16",  # stride_output_group
-            "i32:16",  # stride_query_seq
-            "i32:16",  # stride_query_head
+            # 5D query strides for [batch_size, query_length, num_kv_heads, query_group_size, head_size]
+            "i32:16",  # stride_query_bs
+            "i32:16",  # stride_query_qlen
+            "i32:16",  # stride_query_kv_head
+            "i32:16",  # stride_query_group_size
             "i32:16",  # stride_key_block
             "i32:16",  # stride_key_head
             "i32:16",  # stride_key_head_split
@@ -237,17 +238,19 @@ def compile(
             "i32:16",  # stride_value_head
             "i32:16",  # stride_value_head_size
             "i32:16",  # stride_block_table_seq
-            "i32:16",  # query_scale_stride_0
+            # 5D query_scale strides
+            "i32:16",  # stride_query_scale_bs
+            "i32:16",  # stride_query_scale_qlen
+            "i32:16",  # stride_query_scale_kv_head
             "i32:16",  # kv_scale_stride_0
             "i32:16",  # kv_scale_stride_1
-            "i32:16",  # query_length
-            "i32:16",  # query_group_size
             "i32:16",  # head_size
             "i32:16",  # num_seqs
             "i32:16",  # num_kv_heads
             "i32:16",  # max_context_partition_num
-            f"{str(compute_type)}",
-            f"{equi_query_group_size_pow2}",
+            f"{str(compute_type_tl)}",
+            f"{query_seq_len}",  # QUERY_SEQ_LEN (constexpr)
+            f"{one_query_group_size}",  # ONE_QUERY_GROUP_SIZE (constexpr)
             f"{head_size_pow2}",
             f"{kv_block_size}",
             f"{context_partition_size}",
@@ -284,14 +287,17 @@ def compile(
 
         # Compile reduce kernel separately
         reduce_signature_parts = [
-            output_sig,  # output_ptr
+            output_sig,  # output_ptr [batch_size, query_length, num_kv_heads, query_group_size, head_size]
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
             logits_sig,  # logits_ptr
             "*i32:16",  # context_lengths_ptr
-            "*fp32:16",  # sinks_ptr
-            "i32:16",  # stride_output_seq
-            "i32:16",  # stride_output_head
+            "*fp32:16",  # sink_token_ptr
+            # 5D output strides for [batch_size, query_length, num_kv_heads, query_group_size, head_size]
+            "i32:16",  # stride_output_bs
+            "i32:16",  # stride_output_len
+            "i32:16",  # stride_output_kv_head
+            "i32:16",  # stride_output_group_size
             "i32:16",  # stride_exp_sums_seq
             "i32:16",  # stride_exp_sums_head
             "i32:16",  # stride_exp_sums_part
@@ -299,11 +305,11 @@ def compile(
             "i32:16",  # stride_logits_head
             "i32:16",  # stride_logits_part
             "i32:16",  # stride_logits_group
-            "i32:16",  # query_group_size
             "i32:16",  # head_size
             "i32:16",  # num_seqs
             "i32:16",  # num_kv_heads
-            f"{equi_query_group_size_pow2}",
+            f"{query_seq_len}",  # OUTPUT_SEQ_LEN (constexpr)
+            f"{one_query_group_size}",  # ONE_OUTPUT_GROUP_SIZE (constexpr)
             f"{head_size_pow2}",
             f"{context_partition_size}",
             f"{use_sinks}",
@@ -405,10 +411,7 @@ def compile(
 
 def pa_decode_gluon_aot(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    output_gluon: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    query_gluon: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
-    query_scale_gluon: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1] or [1]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     context_lengths: torch.Tensor,  # [num_seqs]
@@ -429,12 +432,15 @@ def pa_decode_gluon_aot(
     sinks: torch.Tensor = None,
 ) -> None:
     """
-    Paged Attention Decode with FP8/BF16/FP16 Support.
+    Paged Attention Decode with FP8/BF16/FP16 Support (AOT Version).
 
     Implements the attention mechanism for transformer decoding with paged KV caches,
     supporting various quantization schemes and data types. This function performs
     attention computation in two phases: a partitioned attention kernel followed
     by a reduction kernel.
+
+    This AOT (Ahead-of-Time) version compiles triton kernels to C++ and then to
+    shared libraries for execution, providing better performance in production.
 
     Parameters
     ----------
@@ -443,25 +449,10 @@ def pa_decode_gluon_aot(
         - Shape: [num_seqs * query_length, num_query_heads, head_size]
         - Dtype: torch.bfloat16, torch.float16
 
-    output_gluon : torch.Tensor
-        Intermediate output tensor in gluon layout for internal computation.
-        - Shape: [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
-        - Dtype: torch.bfloat16, torch.float16 (same as output)
-
     query : torch.Tensor
         Input query tensor in standard layout.
         - Shape: [num_seqs * query_length, num_query_heads, head_size]
         - Dtype: torch.float8_e4m3fnuz (fp8), torch.bfloat16, torch.float16
-
-    query_gluon : torch.Tensor
-        Query tensor in gluon layout for internal computation.
-        - Shape: [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
-        - Dtype: torch.float8_e4m3fnuz (fp8), torch.bfloat16, torch.float16 (same as query)
-
-    query_scale_gluon : torch.Tensor
-        Quantization scales for query in gluon layout.
-        - Shape: [1] (per-tensor) or [num_seqs, num_kv_heads * query_length * query_group_size, 1] (per-token)
-        - Dtype: torch.float32
 
     key_cache : torch.Tensor
         Paged key cache in block layout with interleaved head dimension.
@@ -498,9 +489,9 @@ def pa_decode_gluon_aot(
     context_partition_size : int
         Size of each context partition for partitioned attention computation.
 
-    compute_type : tl.dtype
-        Triton data type for computation.
-        - Supported: tl.float8e4b8, tl.bfloat16, tl.float16
+    compute_type : torch.dtype
+        PyTorch data type for computation.
+        - Supported: torch.float8_e4m3fnuz, torch.bfloat16, torch.float16
 
     query_scale : torch.Tensor
         Quantization scales for queries in standard layout. Required for FP8 queries.
@@ -548,55 +539,24 @@ def pa_decode_gluon_aot(
     -----
     - query_length * query_group_size must be <= 64
     - kv_block_size must be one of [16, 64, 1024]
-    - When query_length > 1, automatic transpose operations are performed
-      between standard and gluon layouts
+    - query_length must be <= 4
     - For FP8 computation, query_scale and key_scale/value_scale are required
     - For BF16/FP16 computation, scales can be None
+    - This function directly reshapes query and output to 5D format internally,
+      avoiding extra transpose operations for better performance
     """
-
     cdna_version = get_cdna_version()
     assert cdna_version in [
         3,
         4,
     ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
-    compute_type = torch_to_triton_dtype[compute_type]
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
     batch_size = query.shape[0] // query_length
     num_kv_heads = key_cache.shape[1]
     query_group_size = num_query_heads // num_kv_heads
-
-    if query_length > 1:
-        # Transpose query and query_scale from [num_seqs * query_length, num_query_heads, head_size]
-        # to [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
-        transpose_query_gluon_aot(
-            input_tensor=query,
-            output_tensor=query_gluon,
-            batch_size=batch_size,
-            seq_len=query_length,
-            num_kv_heads=num_kv_heads,
-            query_group_size=query_group_size,
-            last_dim=head_size,
-            input_scale=(
-                query_scale
-                if (query_scale is not None and len(query_scale.shape) > 1)
-                else None
-            ),
-            output_scale=(
-                query_scale_gluon
-                if (query_scale is not None and len(query_scale.shape) > 1)
-                else None
-            ),
-            run_compiled_kernel=run_compiled_kernel,
-        )
-
-    num_sequences = batch_size
-    num_query_heads_total = num_query_heads
-
-    head_size = query.shape[-1]
     kv_block_size = key_cache.shape[-2]
-    query_group_size = num_query_heads_total // num_kv_heads
 
     # Calculate equivalent group sizes for kernel configuration
     equivalent_query_group_size = query_length * query_group_size
@@ -644,13 +604,16 @@ def pa_decode_gluon_aot(
     ), f"Expected 5D key_cache tensor, but got shape {key_cache.shape}"
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
-    query_scale_stride_0 = 0
+    stride_query_scale_bs = 0
+    stride_query_scale_qlen = 0
+    stride_query_scale_kv_head = 0
     key_scale_stride_0 = 0
     key_scale_stride_1 = 0
     query_quant_mode = -1
     kv_quant_mode = -1
 
     # Configure query quantization
+    query_scale_5d = None
     if query_scale is not None:
         assert (
             isinstance(query_scale, torch.Tensor)
@@ -660,6 +623,7 @@ def pa_decode_gluon_aot(
         if query_scale.numel() == 1:
             # Per-tensor quantization
             query_quant_mode = 0
+            query_scale_5d = query_scale
         else:
             # Per-token quantization
             assert (
@@ -669,7 +633,13 @@ def pa_decode_gluon_aot(
                 query_scale.shape[-1] == 1
             ), f"Expected query_scale.shape[-1] == 1, but got query_scale.shape[-1]={query_scale.shape[-1]}"
             query_quant_mode = 1
-            query_scale_stride_0 = query_scale.stride(0)
+            # Reshape query_scale to 5D: [num_seqs, query_length, num_kv_heads, query_group_size, 1]
+            query_scale_5d = query_scale.reshape(
+                batch_size, query_length, num_kv_heads, query_group_size, 1
+            )
+            stride_query_scale_bs = query_scale_5d.stride(0)
+            stride_query_scale_qlen = query_scale_5d.stride(1)
+            stride_query_scale_kv_head = query_scale_5d.stride(2)
 
     # Configure KV quantization
     if key_scale is not None and value_scale is not None:
@@ -718,7 +688,8 @@ def pa_decode_gluon_aot(
     # Compile the combined attention and reduce kernel
     combined_func = compile(
         compute_type=compute_type,
-        equivalent_query_group_size=equivalent_query_group_size,
+        query_seq_len=query_length,
+        one_query_group_size=query_group_size,
         head_size=head_size,
         kv_block_size=kv_block_size,
         context_partition_size=context_partition_size,
@@ -731,27 +702,39 @@ def pa_decode_gluon_aot(
         cdna_version=cdna_version,
     )
 
+    # Reshape query to 5D for direct read access
+    query_5d = query.reshape(
+        batch_size, query_length, num_kv_heads, query_group_size, head_size
+    )
+    # Reshape output to 5D for direct write access
+    output_5d = output.reshape(
+        batch_size, query_length, num_kv_heads, query_group_size, head_size
+    )
+
     assert combined_func is not None, "Combined function is not compiled"
     # Execute the combined kernel
     if run_compiled_kernel:
         combined_func(
             *torch_to_c_types(
-                output_gluon,
+                output_5d,  # output_ptr [batch_size, query_length, num_kv_heads, query_group_size, head_size]
                 exp_sums,
                 max_logits,
                 temporary_output,
-                query_gluon,
+                query_5d,  # query_ptr [batch_size, query_length, num_kv_heads, query_group_size, head_size]
                 key_cache,
                 value_cache,
                 block_tables,
                 context_lengths,
                 sinks,
                 softmax_scale,
-                query_scale_gluon,
+                query_scale_5d,  # query_scale [num_seqs, query_length, num_kv_heads, query_group_size, 1](per-token) or [1](per-tensor) or None
                 key_scale,
                 value_scale,
-                output_gluon.stride(0),
-                output_gluon.stride(1),
+                # 5D output strides for [batch_size, query_length, num_kv_heads, query_group_size, head_size]
+                output_5d.stride(0),  # stride_output_bs
+                output_5d.stride(1),  # stride_output_len
+                output_5d.stride(2),  # stride_output_kv_head
+                output_5d.stride(3),  # stride_output_group_size
                 exp_sums.stride(0),
                 exp_sums.stride(1),
                 exp_sums.stride(2),
@@ -759,8 +742,11 @@ def pa_decode_gluon_aot(
                 temporary_output.stride(1),
                 temporary_output.stride(2),
                 temporary_output.stride(3),
-                query_gluon.stride(0),
-                query_gluon.stride(1),
+                # 5D query strides for [batch_size, query_length, num_kv_heads, query_group_size, head_size]
+                query_5d.stride(0),  # stride_query_bs
+                query_5d.stride(1),  # stride_query_qlen
+                query_5d.stride(2),  # stride_query_kv_head
+                query_5d.stride(3),  # stride_query_group_size
                 key_cache.stride(0),
                 key_cache.stride(1),
                 key_cache.stride(2),
@@ -769,31 +755,16 @@ def pa_decode_gluon_aot(
                 value_cache.stride(1),
                 value_cache.stride(2),
                 block_tables.stride(0),
-                query_scale_stride_0,
+                # 5D query_scale strides
+                stride_query_scale_bs,
+                stride_query_scale_qlen,
+                stride_query_scale_kv_head,
                 key_scale_stride_0,
                 key_scale_stride_1,
-                num_sequences,
+                batch_size,  # num_seqs
                 num_kv_heads,
                 max_context_partition_num,
-                query_length,
-                query_group_size,
-                equivalent_query_group_size,
                 head_size,
                 torch.cuda.current_stream(output.device),
             )
-        )
-
-    # Transpose output from [num_seqs, num_kv_heads, query_length, query_group_size, head_size]
-    # back to [num_seqs * query_length, num_query_heads, head_size]
-    # Only needed when query_length > 1
-    if query_length > 1:
-        transpose_output_gluon_aot(
-            input_tensor=output_gluon,
-            output_tensor=output,
-            batch_size=batch_size,
-            seq_len=query_length,
-            num_kv_heads=num_kv_heads,
-            query_group_size=query_group_size,
-            last_dim=head_size,
-            run_compiled_kernel=run_compiled_kernel,
         )

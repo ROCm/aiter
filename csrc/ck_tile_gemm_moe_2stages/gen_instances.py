@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import argparse
 import itertools
@@ -15,7 +15,7 @@ from moe_cktile2stages_common import (
     get_heuristic_dispatch_template,
 )
 import sys
-from chip_info import get_gfx
+from chip_info import get_gfx, get_gfx_list
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -116,7 +116,7 @@ torch::Tensor
         xptr = "nullptr"
         wptr = "nullptr"
         biasptr = "nullptr"
-        if k.QuantType == "per_tenser":
+        if k.QuantType == "per_tensor":
             scaleGranA = "0"
             scaleGranB = "0"
             xptr = "static_cast<float>(x_scale.value().data_ptr()[0])"
@@ -135,7 +135,7 @@ torch::Tensor
             wptr = "static_cast<ck_tile::e8m0_t*>(w_scale.value().data_ptr())"
             biasptr = "static_cast<float*>(exp_bias.has_value() ? exp_bias.value().data_ptr() : nullptr)"
 
-        if act_dict[k.ActOP] != 2:
+        if not k.HasBias:
             biasGran = "-1"
 
         INSTANCE_CONTENT = f"""auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranA}>{{{xptr}}};
@@ -237,15 +237,20 @@ template torch::Tensor
         # else:
         def fill_template(name, a_type, b_type, acc_type, c_type):
             nonlocal self
-            intsance = INSTANCE_template.format(
+            # Arch-aware scheduling: skip generating FP4 instances unless gfx950 is targeted
+            if "fp4" in b_type and ("gfx950" not in get_gfx_list()):
+                return
+            body = INSTANCE_template.format(
                 name=name, dtypes=f"{a_type}, {b_type}, {acc_type}, {c_type}"
             )
+            if "fp4" in b_type:
+                body = "#ifndef __gfx942__\n" + body + "\n#endif\n"
             Path(
                 os.path.join(
                     self.instances_path,
                     f"{name}_a{a_type}_b{b_type}_acc{acc_type}_C{c_type}.cpp",
                 )
-            ).write_text(intsance)
+            ).write_text(body)
 
         if (k.QuantType == "1x32") and (a_type in ["bf16", "fp16", "fp8"]):
             fill_template(k.name, self.a_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
