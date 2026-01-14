@@ -36,20 +36,20 @@
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 
-using LEGACY_BF16 = ck::bhalf_t;
-using LEGACY_FP8  = ck::f8_t;
-using LEGACY_FP32 = float;
-using LEGACY_FP16 = ck::half_t;
+using BF16 = ck::bhalf_t;
+using FP8  = ck::f8_t;
+using FP32 = float;
+using FP16 = ck::half_t;
 
 using Row = ck::tensor_layout::gemm::RowMajor;
 using Col = ck::tensor_layout::gemm::ColumnMajor;
 
-using A0DataType       = LEGACY_FP8;
-using A1DataType       = LEGACY_FP32;
-using B0DataType       = LEGACY_FP8;
-using B1DataType       = LEGACY_FP32;
-using AccDataType      = LEGACY_FP32;
-using CShuffleDataType = LEGACY_FP32;
+using A0DataType       = FP8;
+using A1DataType       = FP32;
+using B0DataType       = FP8;
+using B1DataType       = FP32;
+using AccDataType      = FP32;
+using CShuffleDataType = FP32;
 using DsDataType       = ck::Tuple<>;
 
 using A0Layout = Row;

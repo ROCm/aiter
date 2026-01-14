@@ -10,16 +10,16 @@ from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_weight, shuffle_weight_cktile
 
-from gemm_a8w8_blockscale_instance_legacy import candidate_kernels_dict_legacy
-from gemm_a8w8_blockscale_instance_tile import candidate_kernels_dict_tile
+from gemm_a8w8_blockscale_instance import candidate_kernels_dict
+from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
 
 block_shape = (128, 128)
 
 
 """
-a8w8_blockscale_gemm tuning for legacy CK and tile CK
+a8w8_blockscale_gemm tuning for CK Legacy and Tile
 """
 
 
@@ -33,8 +33,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     n = weight.shape[0]
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    # x_scale = rearrange(x_scale.view(-1, 1).repeat(1, block_shape_n*block_shape_k).view(m, scale_k, 1, block_shape_k),
-    #                           'num_blk_n num_blk_k blk_n blk_k ->(num_blk_n blk_n) (num_blk_k blk_k)')
+
     x = x.to(x_scale.dtype).view(
         m, k // block_shape[1], block_shape[1]
     ) * x_scale.unsqueeze(-1)
@@ -50,38 +49,37 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     weight = weight.to(w_scale.dtype) * w_scale
 
     out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
-    # scale = torch.matmul(x_scale, w_scale)
-    # out = torch.mul(x, scale)
+
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
 
 
-def run_ck_gemm_a8w8_blockscale_tile(
-    x, weight, x_scale, w_scale, out, kernel_id, splitK, isBpreshuffled
+def run_ck_gemm_a8w8_blockscale_cktile(
+    x, weight, x_scale, w_scale, out, kernel_id, splitK, is_bpreshuffled
 ):
     """
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
     """
 
-    return aiter.gemm_a8w8_blockscale_tune_tile(
-        x, weight, x_scale, w_scale, out, kernel_id, splitK, isBpreshuffled
+    return aiter.gemm_a8w8_blockscale_cktile_tune(
+        x, weight, x_scale, w_scale, out, kernel_id, splitK, is_bpreshuffled
     )
 
 
-def run_ck_gemm_a8w8_blockscale_legacy(
+def run_ck_gemm_a8w8_blockscale(
     x, weight, x_scale, w_scale, out, kernel_id, splitK
 ):
     """
-    Run gemm a8w8 blockscale tuned kernel for ck_legacy type.
+    Run gemm a8w8 blockscale tuned kernel for ck type.
     """
 
-    return aiter.gemm_a8w8_blockscale_tune_legacy(
+    return aiter.gemm_a8w8_blockscale_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
     )
 
 
-def generate_data(m, n, k, seed, isBpreshuffled, device="cuda"):
+def generate_data(m, n, k, seed, is_bpreshuffled, device="cuda"):
     """
     Generate random data for testing the gemm a8w8 blockscale kernel.
     """
@@ -98,9 +96,9 @@ def generate_data(m, n, k, seed, isBpreshuffled, device="cuda"):
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
 
-    if isBpreshuffled:
+    if is_bpreshuffled:
         weight_shuffle = shuffle_weight(weight, layout=(16, 16))
-        return x, weight_shuffle, x_scale, w_scale, out, weight
+        return x, weight, x_scale, w_scale, out, weight_shuffle
     else:
         return x, weight, x_scale, w_scale, out
 
@@ -132,9 +130,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             "--libtype",
             type=str,
             default="both",
-            choices=["ck_legacy", "ck_tile", "both"],
+            choices=["ck", "ck_tile", "both"],
             required=False,
-            help="CK gemm a8w8 blockscale type to tune: ck_legacy, ck_tile or both",
+            help="CK gemm a8w8 blockscale type to tune: ck, ck_tile or both",
         )
 
     def calculate(self, results, bpes=(1, 1, 2)):
@@ -144,38 +142,36 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 
         return super().calculate(results, bpes=(1, 1, 2))
 
-    def getKernelName(self, kernelId, type="ck_legacy"):
+    def getKernelName(self, kernelId, type="ck"):
         """
         Get the kernel name based on the kernel ID for different types.
         """
 
-        candidate_kernels_dict = {}
-        if type == "ck_legacy":
-            if kernelId >= len(candidate_kernels_dict_legacy) or kernelId < 0:
+        if type == "ck":
+            if kernelId >= len(candidate_kernels_dict) or kernelId < 0:
                 return None
-            candidate_kernels_dict = candidate_kernels_dict_legacy
-        elif type == "ck_tile":
-            if kernelId >= len(candidate_kernels_dict_tile) or kernelId < 0:
+            return candidate_kernels_dict[kernelId].name
+        elif type == "cktile":
+            if kernelId >= len(candidate_kernels_cktile_dict) or kernelId < 0:
                 return None
-            candidate_kernels_dict = candidate_kernels_dict_tile
+            return candidate_kernels_cktile_dict[kernelId].name
         else:
             return None
-        return candidate_kernels_dict[kernelId].name
 
-    def get_ck_tile_gemm_a8w8_blockscale_tune_task(
+    def get_gemm_a8w8_blockscale_cktile_tune_task(
         self,
         info_keys,
         useSplitK,
         seed,
-        isBpreshuffled,
+        is_bpreshuffled,
     ):
         (cu_num, M, N, K) = info_keys
-        kernels_num = len(candidate_kernels_dict_tile)
-        gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
-        ref_data_idx = [0, 5, 2, 3] if isBpreshuffled else [0, 1, 2, 3]
+        kernels_num = len(candidate_kernels_cktile_dict)
+        gemm_a8w8_idx = [0, 5 if is_bpreshuffled else 1, 2, 3, 4]
+        ref_data_idx = [0, 1, 2, 3]
         tasks_ck_tile = []
         for i in range(kernels_num):
-            kernel = candidate_kernels_dict_tile[i]
+            kernel = candidate_kernels_cktile_dict[i]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -189,18 +185,18 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 else 0
             )
             for splitK in range(maxsplitK + 1):
-                info = (info_keys, i, splitK, "", "ck_tile", isBpreshuffled)
+                info = (info_keys, i, splitK, "", "ck_tile", is_bpreshuffled)
                 tasks_ck_tile.append(
                     (
                         info,
                         generate_data,
-                        (M, N, K, seed, isBpreshuffled),
-                        run_ck_gemm_a8w8_blockscale_tile,
+                        (M, N, K, seed, is_bpreshuffled),
+                        run_ck_gemm_a8w8_blockscale_cktile,
                         (
                             gemm_a8w8_idx,
                             i,
                             splitK,
-                            isBpreshuffled,
+                            is_bpreshuffled,
                         ),
                         {},
                         run_torch,
@@ -217,19 +213,19 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 )
         return tasks_ck_tile
 
-    def get_ck_legacy_gemm_a8w8_blockscale_tune_task(
+    def get_ck_gemm_a8w8_blockscale_tune_task(
         self,
         info_keys,
         useSplitK,
         seed,
     ):
         (cu_num, M, N, K) = info_keys
-        kernels_num = len(candidate_kernels_dict_legacy)
-        gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
+        kernels_num = len(candidate_kernels_dict)
+        gemm_a8w8_idx = [0, 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 3]
         tasks_ck_legacy = []
         for i in range(kernels_num):
-            kernel = candidate_kernels_dict_legacy[i]
+            kernel = candidate_kernels_dict[i]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -243,13 +239,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 else 0
             )
             for splitK in range(maxsplitK + 1):
-                info = (info_keys, i, splitK, "", "ck_legacy", False)
+                info = (info_keys, i, splitK, "", "ck", False)
                 tasks_ck_legacy.append(
                     (
                         info,
                         generate_data,
                         (M, N, K, seed, False),
-                        run_ck_gemm_a8w8_blockscale_legacy,
+                        run_ck_gemm_a8w8_blockscale,
                         (
                             gemm_a8w8_idx,
                             i,
@@ -291,20 +287,20 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             K = untunedf.loc[i, "K"]
             seed = seed + 1
             total_kernel_nums = 0
-            # kernels_num = len(candidate_kernels_dict_legacy)
+            # kernels_num = len(candidate_kernels_dict)
             info_keys = (cu_num, M, N, K)
-            if "both" in args.libtype or "ck_legacy" in args.libtype:
+            if args.libtype == "ck" or args.libtype == "both":
                 task.extend(
-                    self.get_ck_legacy_gemm_a8w8_blockscale_tune_task(
+                    self.get_ck_gemm_a8w8_blockscale_tune_task(
                         info_keys,
                         useSplitK,
                         seed,
                     )
                 )
-            if "both" in args.libtype or "ck_tile" in args.libtype:
+            if args.libtype == "cktile" or args.libtype == "both":
                 for b_preshuffled in [True, False]:
                     task.extend(
-                        self.get_ck_tile_gemm_a8w8_blockscale_tune_task(
+                        self.get_gemm_a8w8_blockscale_cktile_tune_task(
                             info_keys,
                             useSplitK,
                             seed,
@@ -330,7 +326,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         resultdf = pd.DataFrame(columns=self.columns)
         for el in results:
             info, time, err_ratio = el
-            keys, kernelId, splitK, kernelName, libtype, isBpreshuffled = info
+            keys, kernelId, splitK, kernelName, libtype, is_bpreshuffled = info
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME
@@ -351,7 +347,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 {
                     "libtype": [libtype],
                     "kernelId": [kernelId],
-                    "isBpreshuffled": [isBpreshuffled],
+                    "is_bpreshuffled": [is_bpreshuffled],
                     "splitK": [splitK],
                     "us": [time],
                     "kernelName": [kernelName],
@@ -373,7 +369,7 @@ if __name__ == "__main__":
     resultList = [
         "libtype",
         "kernelId",
-        "isBpreshuffled",
+        "is_bpreshuffled",
         "splitK",
         "us",
         "kernelName",

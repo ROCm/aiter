@@ -1,23 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <cmath>
-#include <functional>
-#include <unordered_map>
-
-#include <torch/extension.h>
-
-#include "gemm_a8w8_blockscale_common_tile.cuh"
-#include "gemm_a8w8_blockscale_lookup_tile.h"
-#include "gemm_a8w8_blockscale_manifest_tile.h"
-
-// Helper function to return the next largest power of 2
-static constexpr int nextPow2(unsigned int num)
-{
-    if(num <= 1)
-        return 1;
-    return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
-}
+#include "gemm_a8w8_blockscale_cktile_common.cuh"
+#include "gemm_a8w8_blockscale_cktile_lookup.h"
+#include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
@@ -60,14 +46,14 @@ static BlockwiseKernel blockwise_dispatch_tile(int id)
     return lookup.find(0)->second;
 }
 
-torch::Tensor gemm_a8w8_blockscale_tune_tile(torch::Tensor& XQ,
-                                             torch::Tensor& WQ,
-                                             torch::Tensor& x_scale,
-                                             torch::Tensor& w_scale,
-                                             torch::Tensor& Y,
-                                             int kernelId,
-                                             int splitK,
-                                             bool isBpreshuffled)
+torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
+                                               torch::Tensor& WQ,
+                                               torch::Tensor& x_scale,
+                                               torch::Tensor& w_scale,
+                                               torch::Tensor& Y,
+                                               int kernelId,
+                                               int splitK,
+                                               bool is_bpreshuffled)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -80,13 +66,13 @@ torch::Tensor gemm_a8w8_blockscale_tune_tile(torch::Tensor& XQ,
 
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockwise_dispatch_tile<TILE_FP32, TILE_BF16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled);
+        blockwise_dispatch_tile<FP32, TILE_BF16>(kernelId)(
+            XQ, WQ, x_scale, w_scale, Y, is_bpreshuffled);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
-        blockwise_dispatch_tile<TILE_FP32, TILE_FP16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled);
+        blockwise_dispatch_tile<FP32, TILE_FP16>(kernelId)(
+            XQ, WQ, x_scale, w_scale, Y, is_bpreshuffled);
     }
     else
     {

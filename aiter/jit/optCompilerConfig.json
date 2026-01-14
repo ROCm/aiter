@@ -224,11 +224,11 @@
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE}'"
     },
-    "module_gemm_a8w8_blockscale_legacy": {
+    "module_gemm_a8w8_blockscale": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_pybind_legacy.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
-            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_legacy.cu'"
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale.cu'"
         ],
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
@@ -237,13 +237,13 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_legacy.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
-    "module_gemm_a8w8_blockscale_tile": {
+    "module_gemm_a8w8_blockscale_cktile": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_pybind_tile.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_cktile_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
-            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tile.cu'"
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_cktile.cu'"
         ],
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
@@ -252,7 +252,7 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_tile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle": {
         "srcs": [
@@ -595,25 +595,25 @@
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune'"
     },
-    "module_gemm_a8w8_blockscale_tune_legacy": {
+    "module_gemm_a8w8_blockscale_tune": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_tune_pybind_legacy.cu'",
-            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune_legacy.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_tune_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.cu'"
         ],
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_legacy.py --working_path {{}} --tune'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune'"
     },
-    "module_gemm_a8w8_blockscale_tune_tile": {
+    "module_gemm_a8w8_blockscale_cktile_tune": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_tune_pybind_tile.cu'",
-            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune_tile.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_cktile_tune_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_cktile_tune.cu'"
         ],
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_tile.py --working_path {{}} --tune'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle_tune": {
         "srcs": [
@@ -936,7 +936,6 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}'"
-
         ]
     },
     "module_fmha_v3_varlen_fwd": {
@@ -1034,7 +1033,9 @@
         ]
     },
     "libmha_bwd": {
-        "srcs": ["f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'"],
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'"
+        ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 0)}'"
@@ -1142,15 +1143,15 @@
         "blob_gen_cmd": "''"
     },
     "module_groupnorm": {
-	"srcs": [
-	    "f'{AITER_CSRC_DIR}/pybind/groupnorm_pybind.cu'",
-	    "f'{AITER_CSRC_DIR}/kernels/groupnorm.cu'"
-	],
-	"flags_extra_cc": [],
-	"flags_extra_hip": [], 
-	"extra_ldflags": "None",
-	"extra_include": [],
-	"verbose": "False",
-	"blob_gen_cmd": "''"
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/groupnorm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/groupnorm.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }

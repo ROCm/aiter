@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_blockscale_common.h"
-#include "gemm_a8w8_blockscale_common_tile.cuh"
-#include "gemm_a8w8_blockscale_lookup_tile.h"
-#include "gemm_a8w8_blockscale_manifest_tile.h"
+#include "gemm_a8w8_blockscale_cktile_common.cuh"
+#include "gemm_a8w8_blockscale_cktile_lookup.h"
+#include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
@@ -58,15 +57,16 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     }
 
     // Default tile kernel
-    return a8w8_blockscale_tile_128x128x256_1x4x1_16x16x32_intrawave_0x0x0_1<DDataType, EDataType>;
+    return a8w8_blockscale_cktile_128x128x256_1x4x1_16x16x32_intrawave_0x0x0_1<DDataType,
+                                                                               EDataType>;
 }
 
-torch::Tensor gemm_a8w8_blockscale_tile(torch::Tensor& XQ,
-                                        torch::Tensor& WQ,
-                                        torch::Tensor& x_scale,
-                                        torch::Tensor& w_scale,
-                                        torch::Tensor& Y,
-                                        bool isBpreshuffled)
+torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
+                                          torch::Tensor& WQ,
+                                          torch::Tensor& x_scale,
+                                          torch::Tensor& w_scale,
+                                          torch::Tensor& Y,
+                                          bool is_bpreshuffled)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -78,12 +78,12 @@ torch::Tensor gemm_a8w8_blockscale_tile(torch::Tensor& XQ,
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
         blockscale_dispatch<TILE_FP32, TILE_FP16>(M, N, K)(
-            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled);
+            XQ, WQ, x_scale, w_scale, Y, is_bpreshuffled);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
         blockscale_dispatch<TILE_FP32, TILE_BF16>(M, N, K)(
-            XQ, WQ, x_scale, w_scale, Y, isBpreshuffled);
+            XQ, WQ, x_scale, w_scale, Y, is_bpreshuffled);
     }
     else
     {

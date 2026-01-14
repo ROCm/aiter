@@ -7,7 +7,7 @@ from typing import Optional
 import functools
 import pandas as pd
 from aiter import logger
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_weight, shuffle_weight_cktile
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
@@ -140,11 +140,11 @@ def gen_gemm_a8w8_blockscale_ck_fake_tensors(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_legacy",
-    fc_name="gemm_a8w8_blockscale_legacy",
+    "module_gemm_a8w8_blockscale",
+    fc_name="gemm_a8w8_blockscale",
     gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
 )
-def gemm_a8w8_blockscale_ck_legacy(
+def gemm_a8w8_blockscale_ck(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -154,17 +154,17 @@ def gemm_a8w8_blockscale_ck_legacy(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_tile",
-    fc_name="gemm_a8w8_blockscale_tile",
+    "module_gemm_a8w8_blockscale_cktile",
+    fc_name="gemm_a8w8_blockscale_cktile",
     gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
 )
-def gemm_a8w8_blockscale_ck_tile(
+def gemm_a8w8_blockscale_cktile(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    isBpreshuffled: bool = True,
+    is_bpreshuffled: bool = True,
 ) -> torch.Tensor: ...
 
 
@@ -526,7 +526,7 @@ def gemm_a8w8_blockscale_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    isBpreshuffled=False,
+    is_bpreshuffled=False,
 ) -> torch.Tensor:
     m = XQ.shape[0]
     n = WQ.shape[0]
@@ -541,7 +541,8 @@ def gemm_a8w8_blockscale(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    isBpreshuffled: bool = False,
+    is_bpreshuffled: bool = False,
+    is_default_cktile: bool = False,
 ) -> torch.Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -554,39 +555,52 @@ def gemm_a8w8_blockscale(
     from aiter.jit.utils.chip_info import get_gfx
 
     # give the priority to gfx950 asm when possible
-    if isBpreshuffled and get_gfx() == "gfx950" and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+    if is_bpreshuffled and get_gfx() == "gfx950" and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
         
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
     
+    # use tuned config if found in file
     if config is not None:
         # config found in tuned file
         libtype = config["libtype"]
-        if config["isBpreshuffled"] == isBpreshuffled:
+        if config["is_bpreshuffled"] == is_bpreshuffled:
             if libtype == "ck_tile":
-                return gemm_a8w8_blockscale_ck_tile(
-                    XQ, WQ, x_scale, w_scale, Y, isBpreshuffled
+                return gemm_a8w8_blockscale_cktile(
+                    XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, is_bpreshuffled
                 )
-            elif libtype == "ck_legacy":
-                if isBpreshuffled:
+            elif libtype == "ck":
+                if is_bpreshuffled:
                     return gemm_a8w8_blockscale_bpreshuffle_ck(
-                        XQ, WQ, x_scale, w_scale, Y
+                        XQ, shuffle_weight(WQ, layout=(16, 16)), x_scale, w_scale, Y
                     )
                 else:
-                    return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
+                    return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-    
     else:
-        # default to legacy ck implementation
-        if isBpreshuffled:
-            return gemm_a8w8_blockscale_bpreshuffle_ck(
-                XQ, WQ, x_scale, w_scale, Y
-            )
+        # config not found in tuned file, use default
+        if is_default_cktile:
+            # default to ck_tile
+            if is_bpreshuffled:
+                return gemm_a8w8_blockscale_cktile(
+                    XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, is_bpreshuffled
+                )
+            else:
+                return gemm_a8w8_blockscale_cktile(
+                    XQ, WQ, x_scale, w_scale, Y, is_bpreshuffled
+                )
         else:
-            return gemm_a8w8_blockscale_ck_legacy(XQ, WQ, x_scale, w_scale, Y)
+            # default to ck
+            if is_bpreshuffled:
+                return gemm_a8w8_blockscale_bpreshuffle_ck(
+                    XQ, shuffle_weight(WQ, layout=(16, 16)), x_scale, w_scale, Y
+                )
+            else:
+                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+
 
 def flatmm_a8w8_blockscale_ASM(
     XQ: Tensor,
@@ -613,6 +627,28 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
+def gemm_a8w8_blockscale_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    assert dtype in [
+        dtypes.bf16,
+        dtypes.fp16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[1]
+    get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
@@ -697,10 +733,10 @@ def gen_gemm_a8w8_blockscale_tune_fake_tensors(
 
 @compile_ops(
     "module_gemm_a8w8_blockscale_tune_legacy",
-    fc_name="gemm_a8w8_blockscale_tune_legacy",
+    fc_name="gemm_a8w8_blockscale_tune",
     gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
 )
-def gemm_a8w8_blockscale_tune_legacy(
+def gemm_a8w8_blockscale_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -713,10 +749,10 @@ def gemm_a8w8_blockscale_tune_legacy(
 
 @compile_ops(
     "module_gemm_a8w8_blockscale_tune_tile",
-    fc_name="gemm_a8w8_blockscale_tune_tile",
+    fc_name="gemm_a8w8_blockscale_cktile_tune",
     gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
 )
-def gemm_a8w8_blockscale_tune_tile(
+def gemm_a8w8_blockscale_cktile_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -724,7 +760,7 @@ def gemm_a8w8_blockscale_tune_tile(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-    isBpreshuffled: bool = True,
+    is_bpreshuffled: bool = True,
 ) -> torch.Tensor: ...
 
 
