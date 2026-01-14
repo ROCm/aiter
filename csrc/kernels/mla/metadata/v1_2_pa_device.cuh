@@ -362,6 +362,11 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         }
     }
 
+    for(int32_t i = cid + lane_idx; i <= params.num_cu; i += ck_tile::get_warp_size())
+    {
+        params.p_work_indptr[i] = num_works;
+    }
+
     global_reduce_tile_idx = __shfl(global_reduce_tile_idx, 0);
     for(int32_t i = global_reduce_tile_idx + lane_idx; i < params.reduce_indptr_size;
         i += ck_tile::get_warp_size())

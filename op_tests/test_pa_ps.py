@@ -488,11 +488,11 @@ def test_pa_ps(
         (reduce_partial_map_size, reduce_partial_map_type),
     ) = aiter.get_pa_metadata_info_v1(batch_size, num_kv_heads)
     work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
-    work_indptr = torch.zeros(work_indptr_size, dtype=work_indptr_type)
-    work_info = torch.zeros(work_info_set_size, dtype=work_info_set_type)
-    reduce_indptr = torch.zeros(reduce_indptr_size, dtype=reduce_indptr_type)
-    reduce_final_map = torch.zeros(reduce_final_map_size, dtype=reduce_final_map_type)
-    reduce_partial_map = torch.zeros(
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
+    work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
+    reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type)
+    reduce_final_map = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type)
+    reduce_partial_map = torch.empty(
         reduce_partial_map_size, dtype=reduce_partial_map_type
     )
 
