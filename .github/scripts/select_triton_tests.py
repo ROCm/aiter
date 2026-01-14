@@ -754,7 +754,7 @@ def parse_args() -> argparse.Namespace:
 # ------------------------------------------------------------------------------
 
 
-def main_logic(args: argparse.Namespace) -> int:
+def main_logic(args: argparse.Namespace) -> None:
     diff_files = get_filename_diff(args.source, args.target)
     all_files, kernel_files, config_files, test_files, bench_files = (
         list_triton_source_files()
@@ -766,7 +766,7 @@ def main_logic(args: argparse.Namespace) -> int:
         logging.info(
             "There are no Triton source files in diff, there's no need to run Triton tests."
         )
-        return 0
+        return
 
     logging.info(
         "There %s %d Triton source file%s in the diff:",
@@ -783,22 +783,20 @@ def main_logic(args: argparse.Namespace) -> int:
     tests_to_run = find_tests_to_run(graph, sorted_diff_inter_triton)
 
     if not tests_to_run:
-        return 1
+        return
 
     write_env_file(args.env_var, args.env_file, tests_to_run)
-    return 0
 
 
-def main() -> int:
+def main() -> None:
     start_timestamp = time.perf_counter()
     args = parse_args()
     logging.basicConfig(format="%(levelname)s|%(message)s", level=args.log_level)
-    exit_code = main_logic(args)
+    main_logic(args)
     end_timestamp = time.perf_counter()
     elapsed_time_s = end_timestamp - start_timestamp
     logging.info("Finished, execution took %.2f seconds.", elapsed_time_s)
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
