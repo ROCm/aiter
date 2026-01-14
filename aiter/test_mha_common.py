@@ -395,6 +395,7 @@ def attention_ref(
     reorder_ops=False,
     key_leftpad=None,
     sink=None,
+    l_tpf=0,
 ):
     """
     Arguments:

@@ -35,6 +35,7 @@ def run_torch(
     reorder_ops=False,
     query_padding_mask=None,
     key_padding_mask=None,
+    l_tpf=0,
 ):
     (_, seqlen_q, _, _) = q.shape
     (_, seqlen_k, _, _) = k.shape
@@ -61,6 +62,7 @@ def run_torch(
         window_size=window_size,
         upcast=upcast,
         reorder_ops=reorder_ops,
+        l_tpf=l_tpf,
     )
 
     if dout is None:
@@ -319,6 +321,7 @@ def test_flash_attn_output(
         dropout_mask,
         causal,
         window_size,
+        l_tpf=l_tpf,
     )
 
     out_pt, softmax_lse_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
@@ -334,6 +337,7 @@ def test_flash_attn_output(
         window_size,
         upcast=False,
         reorder_ops=True,
+        l_tpf=l_tpf,
     )
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
