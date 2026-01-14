@@ -2528,7 +2528,7 @@ def v_perchannel_max(
         v = v.to(tl.float32)
         v_max_iter = tl.max(tl.abs(v)) 
         v_max = tl.maximum(v_max_iter, v_max)
-        v_input_ptrs += offs_n * stride_kn
+        v_input_ptrs += BLOCK_N * stride_kn
 
     v_scales = v_max / FP8_MAX
     tl.store(v_scale_ptrs, v_scales)
@@ -2579,7 +2579,7 @@ def k_mean_kernel(
         k = k.to(tl.float32)
         k_sum_iter = tl.sum(k) 
         k_sum = k_sum + k_sum_iter
-        k_input_ptrs += offs_n * stride_kn
+        k_input_ptrs += BLOCK_N * stride_kn
 
     k_mean = k_sum / SEQLEN_K
     tl.store(k_mean_ptrs, k_mean)
