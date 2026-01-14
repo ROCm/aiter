@@ -1437,7 +1437,7 @@ def run_pa_gluon_test(
         if compute_type != aiter.dtypes.fp8 and not quant_q and not quant_kv:
             diff_tolerance = 5e-3
     if sliding_window > 0:
-        diff_tolerance = 8e-2
+        diff_tolerance = 5e-2
 
     flash_style_diff_tolerance = 5e-4
     if quant_mode == "per_token" and (quant_q or quant_kv):
@@ -2401,18 +2401,18 @@ def sliding_window_accuracy_test():
 
     SINKS_OPTIONS = [True, False]
     SLIDING_WINDOW_OPTIONS = [0, 128]
-    HEAD_DIMENSION_OPTIONS = [64]
+    HEAD_DIMENSION_OPTIONS = [64, 128]
     CONTEXT_LENGTH_OPTIONS = [1024, 8192]
     BATCH_SIZE_OPTIONS = [1, 4, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, True]]
-    QUANT_MODE_OPTIONS = ["per_token"]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, True]]
+    QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [True]
-    HEAD_CONFIGURATIONS = [(64, 8)]
+    HEAD_CONFIGURATIONS = [(64, 8), (16, 1)]
     USE_AOT_IMPL_OPTIONS = [False]
     PS_OPTIONS = [True]
-    BLOCK_SIZE_OPTIONS = [16]
+    BLOCK_SIZE_OPTIONS = [1024]
     parse_arg_and_run_test()
     # BLOCK_SIZE_OPTIONS = [64]
     # parse_arg_and_run_test()
