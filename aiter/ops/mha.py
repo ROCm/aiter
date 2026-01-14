@@ -459,7 +459,7 @@ def gen_mha_varlen_fwd_fake_tensor(
     else:
         out_dtype = dtypes.bf16 if dtype == dtypes.fp8 else dtype
         out_shape = (total_q, num_heads, head_size_v)
-        out_tensor = torch.empty(out_shape, device=device, dtype=dtype)
+        out_tensor = torch.empty(out_shape, device=device, dtype=out_dtype)
 
     if return_softmax_lse:
         softmax_lse_shape = (num_heads, total_q)
