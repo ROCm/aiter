@@ -19,12 +19,12 @@ def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None, 
     arch = get_arch()
     if arch == "gfx950":
         return {
-            "BLOCK_M": 128,
+            "BLOCK_M": 256,
             "BLOCK_N": 128,
-            "num_warps": 4,
+            "waves_per_eu": 2,
             "PRE_LOAD_V": False,
-            "num_stages": 1,
-            "waves_per_eu": 2
+            "num_stages": 5,
+            "num_warps": 8,
         }
     elif arch == "gfx942":
         return {
