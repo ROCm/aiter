@@ -77,14 +77,14 @@ jobs:
           mkdir -p "$DOCKER_CONFIG" || true
           cp /docker-config/config.json "$DOCKER_CONFIG/config.json"
           echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
-      
+
       - name: Generate Dockerfile
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.DOCKER_IMAGE }}
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
-          RUN pip uninstall -y aiter
+          RUN pip uninstall -y aiter || true
           RUN pip install --upgrade pandas zmq einops numpy==1.26.2
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip install --upgrade "ninja>=1.11.1"
@@ -95,7 +95,7 @@ jobs:
            && git clone ${{ env.GITHUB_REPO_URL }} aiter \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
-           && if [ "${GITHUB_REF:-}" = "refs/heads/main" ]; then \
+           && if [ "${{ github.ref }}" = "refs/heads/main" ]; then \
                 echo "It's main branch, syncing latest CK..."; \
                 git submodule sync && \
                 git submodule update --init --recursive --remote --depth 1 --jobs 4; \
@@ -259,7 +259,7 @@ jobs:
           -w /workspace \
           --name aiter_test \
           rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
-      
+
       - name: Show Aiter version
         run: |
           set -ex
