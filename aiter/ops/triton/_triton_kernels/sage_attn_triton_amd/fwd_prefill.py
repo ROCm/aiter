@@ -2022,6 +2022,13 @@ def sage_quant(
 
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
+    
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    q_task_count = b * h_qo * Q_NUM_BLKS
+    k_task_count = b * h_kv * K_NUM_BLKS
+
     if V_QUANT_SCHEME == 0:
         v_scale = torch.empty(
             (b, h_kv, K_NUM_BLKS), device=v.device, dtype=torch.float32
@@ -2030,19 +2037,57 @@ def sage_quant(
         v_scale = torch.empty(
             (b, h_kv, head_dim), device=v.device, dtype=torch.float32
         )
-        # v_scale = (
-        #     v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-        # )
+        use_triton = True
+        if not use_triton:
+            v_scale = (
+                v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+            )
+        else:
+            v_task_count = b * h_kv * head_dim
+            grid_v = (v_task_count,)
+            v_perchannel_max[grid_v](
+                q,
+                q_int8,
+                q_scale,
+                k,
+                k_int8,
+                k_scale,
+                v,
+                v_fp8,
+                v_scale,
+                stride_bz_q,
+                stride_h_q,
+                stride_seq_q,
+                stride_bz_k,
+                stride_h_k,
+                stride_seq_k,
+                q_scale.stride(0),
+                q_scale.stride(1),
+                k_scale.stride(0),
+                k_scale.stride(1),
+                v_scale.stride(0),
+                v_scale.stride(1),
+                (sm_scale * 1.4426950408889634),
+                q_task_count,
+                k_task_count,
+                b,
+                h_qo,
+                h_kv,
+                Q_NUM_BLKS,
+                K_NUM_BLKS,
+                qo_len,
+                kv_len,
+                triton.next_power_of_2(kv_len),
+                FP8_MAX=FP8_MAX,
+                INT8_MAX=torch.iinfo(q_int8.dtype).max,
+                D=head_dim,
+                BLK_Q=BLKQ,
+                BLK_K=BLKK,
+                V_QUANT_SCHEME=V_QUANT_SCHEME,
+            )
 
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
 
-    q_task_count = b * h_qo * Q_NUM_BLKS
-    k_task_count = b * h_kv * K_NUM_BLKS
-    # v_task_count = b * h_kv * K_NUM_BLKS
-    v_task_count = b * h_kv * head_dim
-
-    # grid = (q_task_count + k_task_count + v_task_count,)
+    v_task_count = b * h_kv * K_NUM_BLKS
     grid_q = (q_task_count,)
     grid_k = (k_task_count,)
     grid_v = (v_task_count,)
@@ -2127,47 +2172,7 @@ def sage_quant(
         BLK_K=BLKK,
         V_QUANT_SCHEME=V_QUANT_SCHEME,
     )
-    # v_quant_kernel[grid_v](
-    #     q,
-    #     q_int8,
-    #     q_scale,
-    #     k,
-    #     k_int8,
-    #     k_scale,
-    #     v,
-    #     v_fp8,
-    #     v_scale,
-    #     stride_bz_q,
-    #     stride_h_q,
-    #     stride_seq_q,
-    #     stride_bz_k,
-    #     stride_h_k,
-    #     stride_seq_k,
-    #     q_scale.stride(0),
-    #     q_scale.stride(1),
-    #     k_scale.stride(0),
-    #     k_scale.stride(1),
-    #     v_scale.stride(0),
-    #     v_scale.stride(1),
-    #     (sm_scale * 1.4426950408889634),
-    #     q_task_count,
-    #     k_task_count,
-    #     b,
-    #     h_qo,
-    #     h_kv,
-    #     Q_NUM_BLKS,
-    #     K_NUM_BLKS,
-    #     qo_len,
-    #     kv_len,
-    #     triton.next_power_of_2(kv_len),
-    #     FP8_MAX=FP8_MAX,
-    #     INT8_MAX=torch.iinfo(q_int8.dtype).max,
-    #     D=head_dim,
-    #     BLK_Q=BLKQ,
-    #     BLK_K=BLKK,
-    #     V_QUANT_SCHEME=V_QUANT_SCHEME,
-    # )
-    v_perchannel_quant[grid_v](
+    v_quant_kernel[grid_v](
         q,
         q_int8,
         q_scale,
@@ -2207,6 +2212,7 @@ def sage_quant(
         BLK_K=BLKK,
         V_QUANT_SCHEME=V_QUANT_SCHEME,
     )
+    
 
     return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
 
@@ -2435,7 +2441,7 @@ def v_quant_kernel(
         tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 @triton.jit
-def v_perchannel_quant(
+def v_perchannel_max(
     Q_Input,
     Q_Output,
     Q_Scale,
@@ -2477,9 +2483,10 @@ def v_perchannel_quant(
 ):
     pid = tl.program_id(0)
     # offs_d = tl.arange(0, D)
-    offs_n = tl.arange(0, SEQLEN_K_PADDED)
+    BLOCK_N: tl.constexpr = 16384
+    offs_n = tl.arange(0, BLOCK_N)
     off_d, off_h, off_b = pid_grid_3d(pid, D, K_HEAD, BATCH)
-
+    # offs_d = tl.arange(0, D)
     v_offs = (
         off_b * stride_kz
         + off_h * stride_kh
@@ -2488,22 +2495,27 @@ def v_perchannel_quant(
     ) # (SEQLEN_K_PADDED,)
 
     v_scale_offs = (
-        off_b * stride_ksz
-        + off_h * stride_ksh
+        off_b * stride_vsz
+        + off_h * stride_vsh
         + off_d
     )
 
     v_input_ptrs = V_Input + v_offs
-    v_output_ptrs = V_Output + v_offs
+    # v_output_ptrs = V_Output + v_offs
     v_scale_ptrs = V_Scale + v_scale_offs
+
+    v_max = 0.0
     
-    v = tl.load(v_input_ptrs, mask=offs_n < SEQLEN_K, other=0.0)
-    v = v.to(tl.float32)
-    v_scales = tl.max(tl.abs(v)) / FP8_MAX
-    v_quant = v / v_scales
-    v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+    for k in range(tl.cdiv(SEQLEN_K_PADDED, BLOCK_N)):
+        v = tl.load(v_input_ptrs, mask=offs_n < (SEQLEN_K - k*BLOCK_N), other=0.0)
+        v = v.to(tl.float32)
+        v_max_iter = tl.max(tl.abs(v)) 
+        v_max = tl.maximum(v_max_iter, v_max)
+        v_input_ptrs += offs_n * stride_kn
+
+    v_scales = v_max / FP8_MAX
     tl.store(v_scale_ptrs, v_scales)
-    tl.store(v_output_ptrs, v_quant, mask=offs_n < SEQLEN_K)
+
 
 
 
