@@ -7,7 +7,7 @@ import torch
 import triton
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
+from aiter.ops.triton.utils.common_utils import deserialize_str
 from aiter.ops.triton.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import _get_config as _get_fp4_config
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
