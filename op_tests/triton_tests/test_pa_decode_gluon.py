@@ -2412,9 +2412,9 @@ def sliding_window_accuracy_test():
     HEAD_CONFIGURATIONS = [(64, 8), (16, 1)]
     USE_AOT_IMPL_OPTIONS = [False]
     PS_OPTIONS = [True]
-    BLOCK_SIZE_OPTIONS = [1024]
+    BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
-    # BLOCK_SIZE_OPTIONS = [64]
+    # BLOCK_SIZE_OPTIONS = [1024]
     # parse_arg_and_run_test()
 
 
