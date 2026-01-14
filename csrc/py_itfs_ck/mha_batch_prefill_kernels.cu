@@ -308,7 +308,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.q_descale_ptr     = q_descale.has_value() ? q_descale.value().data_ptr() : nullptr;
     args.k_descale_ptr     = k_descale.has_value() ? k_descale.value().data_ptr() : nullptr;
     args.v_descale_ptr     = v_descale.has_value() ? v_descale.value().data_ptr() : nullptr;
-    args.sink_ptr        = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
+    args.sink_ptr          = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
     args.bias_ptr          = bias_ptr;
     args.rand_val_ptr      = has_dropout_randval ? dropout_randval.data_ptr() : nullptr;
     args.lse_ptr           = has_lse ? softmax_lse.data_ptr() : nullptr;
