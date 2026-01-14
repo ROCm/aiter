@@ -231,7 +231,9 @@ namespace gfx942 {
 float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
-                  bool is_v3_api_check = false);
+                  bool is_v3_api_check = false,
+                  int magic_const = 0,
+                  int tokens_per_frame = 0);
 }
 
 namespace gfx950 {
