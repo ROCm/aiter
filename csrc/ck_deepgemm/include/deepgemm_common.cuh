@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 #include <cstdlib>
@@ -132,11 +132,10 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
     const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
 
-    const auto Run = [&](const auto has_hot_loop_,
-                         const auto tail_number_) {
-        constexpr bool has_hot_loop_v   = has_hot_loop_.value;
-        constexpr auto tail_number_v    = tail_number_.value;
-        constexpr auto scheduler        = FlatmmConfig::Scheduler;
+    const auto Run = [&](const auto has_hot_loop_, const auto tail_number_) {
+        constexpr bool has_hot_loop_v = has_hot_loop_.value;
+        constexpr auto tail_number_v  = tail_number_.value;
+        constexpr auto scheduler      = FlatmmConfig::Scheduler;
 
         using CodegenPipelineProblem = ck_tile::FlatmmPipelineProblem<ADataType,
                                                                       BDataType,

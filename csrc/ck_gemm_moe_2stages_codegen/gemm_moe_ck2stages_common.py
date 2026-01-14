@@ -162,6 +162,7 @@ a8w8_gemm1_kernels_list_gfx950= {
 }
 
 a8w8_gemm1_kernels_list= {
+    12: kernelInstanceGEMM1(       128,       16,         64,       128,     1,       2,        1,),
     11: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
      0: kernelInstanceGEMM1(       256,       32,         64,       256,     1,       4,        1,),
      1: kernelInstanceGEMM1(       256,       32,         64,       128,     1,       4,        1,),
@@ -278,6 +279,7 @@ a8w8_gemm2_kernels_list_gfx950= {
 
 a8w8_gemm2_kernels_list= {
     17: kernelInstanceGEMM2(       256,        16,       128,       256,     1,       4,         1,),
+    18: kernelInstanceGEMM2(       128,        16,       128,       128,     1,       2,         1,),
      0: kernelInstanceGEMM2(       256,        32,        64,       256,     1,       4,         1,),
      1: kernelInstanceGEMM2(       256,        64,        64,       256,     1,       4,         1,),
      2: kernelInstanceGEMM2(       256,       128,        64,       128,     1,       4,         1,),

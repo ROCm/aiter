@@ -309,7 +309,7 @@ sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
 gfxs = get_gfx_list()
-AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{get_gfx()}/"
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 
 CK_3RDPARTY_DIR = os.environ.get(
@@ -818,7 +818,7 @@ def compile_ops(
                 if module is None:
                     try:
                         module = get_module(md_name)
-                    except Exception as e:
+                    except Exception:
                         md = custom_build_args.get("md_name", md_name)
                         module = get_module(md)
             except ModuleNotFoundError:
