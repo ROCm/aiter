@@ -2304,9 +2304,6 @@ def q_quant_kernel(
         offs_qn[:, None] < SEQLEN_Q,
         sm_scale=sm_scale,
     )
-
-
-
     
 @triton.jit
 def k_quant_kernel(
@@ -2503,7 +2500,7 @@ def v_perchannel_max(
 ):
     pid = tl.program_id(0)
     # offs_d = tl.arange(0, D)
-    BLOCK_N: tl.constexpr = 256
+    BLOCK_N: tl.constexpr = 256*256
     offs_n = tl.arange(0, BLOCK_N)
     off_d, off_h, off_b = pid_grid_3d(pid, D, K_HEAD, BATCH)
     # offs_d = tl.arange(0, D)
@@ -2535,8 +2532,6 @@ def v_perchannel_max(
 
     v_scales = v_max / FP8_MAX
     tl.store(v_scale_ptrs, v_scales)
-
-
 
 @triton.jit
 def k_mean_kernel(
@@ -2589,141 +2584,6 @@ def k_mean_kernel(
     k_mean = k_sum / SEQLEN_K
     tl.store(k_mean_ptrs, k_mean)
 
-
-
-@triton.jit
-def sage_quant_kernel(
-    Q_Input,
-    Q_Output,
-    Q_Scale,
-    K_Input,
-    K_Output,
-    K_Scale,
-    V_Input,
-    V_Output,
-    V_Scale,
-    stride_qz,
-    stride_qh,
-    stride_qn,
-    stride_kz,
-    stride_kh,
-    stride_kn,
-    stride_qsz,
-    stride_qsh,
-    stride_ksz,
-    stride_ksh,
-    stride_vsz,
-    stride_vsh,
-    sm_scale,
-    q_task_count,
-    k_task_count,
-    BATCH,
-    Q_HEAD,
-    K_HEAD,
-    Q_NUM_BLKS,
-    K_NUM_BLKS,
-    SEQLEN_Q,
-    SEQLEN_K,
-    SEQLEN_K_PADDED: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    INT8_MAX: tl.constexpr,
-    D: tl.constexpr,
-    BLK_Q: tl.constexpr,
-    BLK_K: tl.constexpr,
-    V_QUANT_SCHEME: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    if pid < (q_task_count+k_task_count):
-        pid = remap_xcd(pid, q_task_count+k_task_count, 8)
-
-    offs_blk_q = tl.arange(0, BLK_Q)
-    offs_blk_k = tl.arange(0, BLK_K)
-    offs_d = tl.arange(0, D)
-
-    if pid < q_task_count:
-        # here we do Q
-        off_blk, off_h, off_b = pid_grid_3d(pid, Q_NUM_BLKS, Q_HEAD, BATCH)
-        offs_qn = off_blk * BLK_Q + offs_blk_q
-
-        q_offs = (
-            off_b * stride_qz
-            + off_h * stride_qh
-            + offs_qn[:, None] * stride_qn
-            + offs_d[None, :]
-        )
-
-        q_input_ptrs = Q_Input + q_offs
-        q_output_ptrs = Q_Output + q_offs
-        q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
-
-        _general_quant_kernel(
-            q_input_ptrs,
-            q_output_ptrs,
-            q_scale_ptrs,
-            INT8_MAX,
-            offs_qn[:, None] < SEQLEN_Q,
-            sm_scale=sm_scale,
-        )
-    elif pid >= q_task_count and pid < q_task_count + k_task_count:
-        # here we do K
-        _pid = pid - q_task_count
-        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-
-        offs_kn = off_blk * BLK_K + offs_blk_k
-
-        k_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
-        )
-
-        k_input_ptrs = K_Input + k_offs
-        k_output_ptrs = K_Output + k_offs
-        k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
-
-        _general_quant_kernel(
-            k_input_ptrs,
-            k_output_ptrs,
-            k_scale_ptrs,
-            INT8_MAX,
-            offs_kn[:, None] < SEQLEN_K,
-        )
-    else:
-        # V
-        _pid = pid - (q_task_count + k_task_count)
-        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-        offs_kn = off_blk * BLK_K + offs_blk_k
-
-        v_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
-        )
-
-        v_input_ptrs = V_Input + v_offs
-        v_output_ptrs = V_Output + v_offs
-        if V_QUANT_SCHEME == 0:
-            v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_blk
-            _general_quant_kernel(
-                v_input_ptrs,
-                v_output_ptrs,
-                v_scale_ptrs,
-                FP8_MAX,
-                offs_kn[:, None] < SEQLEN_K,
-            )
-        else:
-            # just apply the per channel v_scales that have been computed outside
-            v_scale_ptrs = (
-                V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
-            )
-            v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
-            v = v.to(tl.float32)
-            v_scales = tl.load(v_scale_ptrs)
-            v_quant = v / v_scales
-            v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
-            tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
 @triton.jit
