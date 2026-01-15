@@ -6,9 +6,10 @@ from typing import Optional, Tuple
 import torch
 import triton
 
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import deserialize_str
-from aiter.ops.triton.gemm_a16wfp4 import get_splitk
+from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import _get_config as _get_fp4_config
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _get_config as _get_fp8_config,
@@ -106,6 +107,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         f"transpose_bm={transpose_bm} prequant={prequant} is_neox={is_neox}"
     )
 
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
     assert prequant is True, "prequant=False is not yet supported in fused kernel"
 
     if cos.dim() == 4:
@@ -142,6 +144,9 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     d_freq = cos.shape[-1]
     assert (d_freq == d_pe // 2) or (d_freq == d_pe), \
         f"cos/sin last dim should be half or equal to d_pe: {d_freq} vs {d_pe}"
+    assert (
+        num_decode_toks_for_zeros >= 0
+    ), "num_decode_toks_for_zeros must be non-negative to avoid invalid tensor creation"
     reuse_freqs_front_part = d_freq == d_pe // 2
 
     M = b
@@ -168,7 +173,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     NUM_KSPLIT = config["NUM_KSPLIT"]
-
+    # config["BLOCK_SIZE_M"] = max(16, config["BLOCK_SIZE_M"])
     num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
     num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
     grid_mn = num_pid_m * num_pid_n
@@ -204,13 +209,11 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         device=k_rope.device,
     )
 
-    q_nope_zeros_out = None
-    if num_decode_toks_for_zeros > 0:
-        q_nope_zeros_out = torch.empty(
-            (num_decode_toks_for_zeros, qh, kv_lora_rank),
-            dtype=q_nope.dtype,
-            device=q_nope.device,
-        )
+    q_nope_zeros_out = torch.empty(
+        (num_decode_toks_for_zeros, qh, kv_lora_rank),
+        dtype=q_nope.dtype,
+        device=q_nope.device,
+    )
 
     if NUM_KSPLIT > 1:
         if _USE_GEMM_SPLITK_BF16:
@@ -233,17 +236,10 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     else:
         y_pp = None
         c_ptr = q_out
-        if transpose_bm:
-            stride_cb = q_out.stride(0)  
-            stride_ck = 0                
-            stride_cm = q_out.stride(1)  
-            stride_cn = q_out.stride(2)  
-        else:
-            stride_cb = q_out.stride(1)  
-            stride_ck = 0
-            stride_cm = q_out.stride(0)  
-            stride_cn = q_out.stride(2)  
-
+        stride_cb = q_out.stride(1)
+        stride_ck = 0                
+        stride_cm = q_out.stride(0)
+        stride_cn = q_out.stride(2)
 
     _fused_fp4_bmm_rope_cat_and_cache_mla_kernel[grid](
         q_nope,
@@ -330,7 +326,6 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
         PRE_QUANT=prequant,
-        TRANSPOSE_BM=transpose_bm,
         OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
         HAVE_Y_SCALE=(y_scale is not None),
         HAVE_K_SCALE=(k_scale is not None),
@@ -368,9 +363,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
             transpose_bm,
         )
 
-    if num_decode_toks_for_zeros > 0:
-        return q_out, decode_q_pe_out, k_pe_out, kv_cache, q_nope_zeros_out
-    return q_out, decode_q_pe_out, k_pe_out, kv_cache
+    return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
 
 def fused_fp8_bmm_rope_cat_and_cache_mla(
