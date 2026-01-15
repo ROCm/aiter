@@ -173,7 +173,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     NUM_KSPLIT = config["NUM_KSPLIT"]
-
+    # config["BLOCK_SIZE_M"] = max(16, config["BLOCK_SIZE_M"])
     num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
     num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
     grid_mn = num_pid_m * num_pid_n
@@ -236,17 +236,10 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     else:
         y_pp = None
         c_ptr = q_out
-        if transpose_bm:
-            stride_cb = q_out.stride(0)  
-            stride_ck = 0                
-            stride_cm = q_out.stride(1)  
-            stride_cn = q_out.stride(2)  
-        else:
-            stride_cb = q_out.stride(1)  
-            stride_ck = 0
-            stride_cm = q_out.stride(0)  
-            stride_cn = q_out.stride(2)  
-
+        stride_cb = q_out.stride(1)
+        stride_ck = 0                
+        stride_cm = q_out.stride(0)
+        stride_cn = q_out.stride(2)
 
     _fused_fp4_bmm_rope_cat_and_cache_mla_kernel[grid](
         q_nope,
@@ -333,7 +326,6 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
         PRE_QUANT=prequant,
-        TRANSPOSE_BM=transpose_bm,
         OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
         HAVE_Y_SCALE=(y_scale is not None),
         HAVE_K_SCALE=(k_scale is not None),

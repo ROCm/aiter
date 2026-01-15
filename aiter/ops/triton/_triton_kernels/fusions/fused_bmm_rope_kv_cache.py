@@ -191,7 +191,6 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
     BLOCK_D_pe: tl.constexpr,       
     BLOCK_D_HALF_pe: tl.constexpr,  
     PRE_QUANT: tl.constexpr,
-    TRANSPOSE_BM: tl.constexpr,
     OUTPUT_Q_NOPE_ZEROS: tl.constexpr,
     HAVE_Y_SCALE: tl.constexpr,
     HAVE_K_SCALE: tl.constexpr,
@@ -253,7 +252,7 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
         pid_head_i64 = tl.cast(pid_head, tl.int64)
 
         if NUM_KSPLIT == 1:
-            remap_xcd(pid_tile, GRID_MN)
+            # remap_xcd(pid_tile, GRID_MN)
             pid_m, pid_n = pid_grid(pid_tile, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
         else:
             pid_m = pid_tile // num_pid_n
@@ -330,20 +329,12 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
             offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
 
             if NUM_KSPLIT == 1:
-                if TRANSPOSE_BM:
-                    c_ptrs = (
-                        c_ptr
-                        + offs_cm[:, None] * stride_cb
-                        + pid_head_i64 * stride_cm
-                        + offs_cn[None, :] * stride_cn
-                    )
-                else:
-                    c_ptrs = (
-                        c_ptr
-                        + pid_head_i64 * stride_cb
-                        + offs_cm[:, None] * stride_cm
-                        + offs_cn[None, :] * stride_cn
-                    )
+                c_ptrs = (
+                    c_ptr
+                    + pid_head_i64 * stride_cb
+                    + offs_cm[:, None] * stride_cm
+                    + offs_cn[None, :] * stride_cn
+                )
             else:
                 c_ptrs = (
                     c_ptr
