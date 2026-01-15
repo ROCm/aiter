@@ -265,6 +265,7 @@ def fav2_forward_func(
         return_attn_probs=return_attn_probs,
     )
 
+include_quantization_time = True
 
 def fav3_sage_forward_func(
     q: torch.Tensor,
@@ -285,17 +286,46 @@ def fav3_sage_forward_func(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
+    if include_quantization_time:
+        def fn():
+            q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
+                q,
+                k,
+                v,
+                fp8_dtype,
+                FP8_MAX,
+                sm_scale=softmax_scale,
+                BLKQ=BLKQ,
+                BLKK=BLKK,
+                layout=layout,
+            )
+            fav3_sage_func(
+                q_int8,
+                k_int8,
+                v_fp8,
+                q_descale,
+                k_descale,
+                v_descale,
+                FP8_MAX,
+                causal=causal,
+                inference_mode=inference_mode,
+                layout=layout,
+            )
+        return fn
+    
     q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
-        q,
-        k,
-        v,
-        fp8_dtype,
-        FP8_MAX,
-        sm_scale=softmax_scale,
-        BLKQ=BLKQ,
-        BLKK=BLKK,
-        layout=layout,
-    )
+                q,
+                k,
+                v,
+                fp8_dtype,
+                FP8_MAX,
+                sm_scale=softmax_scale,
+                BLKQ=BLKQ,
+                BLKK=BLKK,
+                layout=layout,
+            )
+    
+    
     return lambda: fav3_sage_func(
         q_int8,
         k_int8,

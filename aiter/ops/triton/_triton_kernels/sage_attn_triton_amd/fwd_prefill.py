@@ -2020,6 +2020,7 @@ def sage_quant(
         v_scale = (
             v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
         )
+        
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
