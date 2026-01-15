@@ -30,6 +30,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                const at::Tensor seqlens_q,
                                const at::Tensor kv_indptr,
                                const at::Tensor kv_page_indices,
+                               std::optional<const at::Tensor> sink_ptr_,
                                std::optional<const at::Tensor>& bias_,
                                std::optional<const at::Tensor>& alibi_slopes_,
                                std::optional<const at::Tensor>& q_descale,
@@ -307,6 +308,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.q_descale_ptr     = q_descale.has_value() ? q_descale.value().data_ptr() : nullptr;
     args.k_descale_ptr     = k_descale.has_value() ? k_descale.value().data_ptr() : nullptr;
     args.v_descale_ptr     = v_descale.has_value() ? v_descale.value().data_ptr() : nullptr;
+    args.sink_ptr          = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
     args.bias_ptr          = bias_ptr;
     args.rand_val_ptr      = has_dropout_randval ? dropout_randval.data_ptr() : nullptr;
     args.lse_ptr           = has_lse ? softmax_lse.data_ptr() : nullptr;
@@ -392,6 +394,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   std::optional<const at::Tensor> kv_last_page_lens_,
                   std::optional<const at::Tensor> block_table_,
                   std::optional<const at::Tensor> seqlen_k_,
+                  std::optional<const at::Tensor> sink_ptr,      // [hq]
                   std::optional<at::Generator> gen_
                 )
 {
@@ -703,6 +706,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                                    cu_seqlens_q,
                                                    kv_indptr,
                                                    kv_page_indices,
+                                                   sink_ptr,
                                                    bias_,
                                                    alibi_slopes_,
                                                    q_descale,

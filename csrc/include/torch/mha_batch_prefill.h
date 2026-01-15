@@ -32,6 +32,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   std::optional<const at::Tensor> kv_last_page_lens,
                   std::optional<const at::Tensor> block_table,
                   std::optional<const at::Tensor> seqlen_k,
+                  std::optional<const at::Tensor> sink_ptr_,     // [hq];
                   std::optional<at::Generator> gen_);
 
 } // namespace torch_itfs
