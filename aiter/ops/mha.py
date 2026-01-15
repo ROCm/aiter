@@ -229,6 +229,7 @@ def gen_fmha_v3_fwd_fake_tensors(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    l_tpf: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return common_mha_fwd_fake_tensors(
         q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
