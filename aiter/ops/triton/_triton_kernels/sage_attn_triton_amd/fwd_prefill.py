@@ -308,7 +308,7 @@ def _attn_fwd_mask(
     ACCUMULATOR_TYPE,
 ):
     if USE_EXP2:
-        RCP_LN2: tl.constexpr = 1.4426950408889634
+        pass
 
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
