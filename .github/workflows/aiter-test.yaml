@@ -216,7 +216,7 @@ jobs:
           echo "Remove current RCCL"
           docker exec -w /workspace aiter_test bash -c "pip show rccl || true && pip uninstall -y rccl || true"
           echo "Updating RCCL..."
-          docker exec -w /workspace aiter_test bash -c "pip install cmake && git clone https://github.com/ROCm/rccl.git /app/rccl/ && cd /app/rccl/ && ./install.sh -p --amdgpu_targets="gfx942;gfx950"
+          docker exec -w /workspace aiter_test bash -c "pip install cmake && git clone https://github.com/ROCm/rccl.git /app/rccl/ && cd /app/rccl/ && ./install.sh -p --amdgpu_targets='gfx942;gfx950'"
           docker exec -w /workspace aiter_test bash -c "DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /app/rccl/build/release/*.deb && rm -rf /app/rccl/build"
           echo "Check RCCL version..."
           docker exec -w /workspace aiter_test bash -c "pip show rccl || true"
