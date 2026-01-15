@@ -1866,7 +1866,8 @@ def fav3_sage_triton_impl(
     return_lse = True if softmax_lse is not None else False
 
     # launch kernel
-    grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
+    def grid(META):
+        return (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     if config is None:
         config = get_fwd_configs(False, seqlen_q=max_seqlens_q, seqlen_k=max_seqlens_k, num_heads=nheads_q)
     attn_fwd[grid](
