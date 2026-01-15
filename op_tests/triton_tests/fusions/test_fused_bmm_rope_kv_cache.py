@@ -17,7 +17,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
 
-@pytest.mark.parametrize("T", [2])
+@pytest.mark.parametrize("T", [1, 2, 32, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [128])  # For now, D is power of 2. D >= 16
@@ -118,7 +118,6 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
             is_neox=(rotate_style == RotateStyle.NEOX),
             num_decode_toks_for_zeros=T,
             apply_scale=(k_pe.dtype != kv_cache.dtype),
-            q_out=None,
             decode_q_pe_out=None,
             k_pe_out=None,
         )

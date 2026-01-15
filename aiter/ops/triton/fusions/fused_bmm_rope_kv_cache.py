@@ -173,7 +173,6 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     NUM_KSPLIT = config["NUM_KSPLIT"]
-    # config["BLOCK_SIZE_M"] = max(16, config["BLOCK_SIZE_M"])
     num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
     num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
     grid_mn = num_pid_m * num_pid_n
@@ -329,7 +328,11 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
         HAVE_Y_SCALE=(y_scale is not None),
         HAVE_K_SCALE=(k_scale is not None),
-        num_warps=1,
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
+        waves_per_eu=config["waves_per_eu"],
+        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+        cache_modifier=config["cache_modifier"],
     )
 
     if NUM_KSPLIT > 1:
