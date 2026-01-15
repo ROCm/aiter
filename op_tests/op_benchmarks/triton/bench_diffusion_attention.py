@@ -144,12 +144,13 @@ def run_aiter_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, has_
             how_v3_bf16_cvt=2
         )
     else:
-        fn = lambda: aiter.ops.mha.flash_attn_func(
-            q, k, v,
-            dropout_p=0.0,
-            causal=False,
-            return_attn_probs=False
-    )
+        def fn():
+            return aiter.ops.mha.flash_attn_func(
+                    q, k, v,
+                    dropout_p=0.0,
+                    causal=False,
+                    return_attn_probs=False
+            )
     return fn
 
 
