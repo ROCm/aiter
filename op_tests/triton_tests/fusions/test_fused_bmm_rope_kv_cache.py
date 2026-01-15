@@ -17,9 +17,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
 
-# @pytest.mark.parametrize("T", [1, 2, 4, 2048])
-@pytest.mark.parametrize("T", [32])
-@pytest.mark.parametrize("N, K", [[512, 128]])
+@pytest.mark.parametrize("T", [2])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [128])  # For now, D is power of 2. D >= 16
@@ -32,8 +30,6 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     T: int,
-    N: int,
-    K: int,
     QH_per_KH: int,
     KH: int,
     D: int,
@@ -45,12 +41,11 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     cache_dtype: bool,
     dtype: torch.dtype,
 ):
-    pos = True
-    q_nope, w_k, _, w_k_scale, _ = generate_batched_gemm_a16wfp4_inputs(
-        QH_per_KH, T, N, K, dtype, layout="TN", output=True
+    _, w_k, _, w_k_scale, _ = generate_batched_gemm_a16wfp4_inputs(
+        QH_per_KH * KH, T, D_lora, D_q_nope, dtype, layout="TN", output=False
     )
 
-    _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
         1,
         T,
         KH,
@@ -59,7 +54,7 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
         cached=True,
         reuse_freqs_front_part=reuse_freqs_front_part,
         nope=False,
-        pos=pos,
+        pos=True,
         offs=False,
         two_inputs=True,
         layout="thd",
@@ -103,7 +98,7 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     slot_mapping = torch.randperm(T, device="cuda")
     kv_cache_og_dtype = kv_cache.dtype
         
-    ref_q_nope_out = batched_gemm_a16wfp4(q_nope, w_k, w_k_scale, dtype, transpose_bm=True, prequant=True, y_scale=None)
+    ref_q_nope_out = batched_gemm_a16wfp4(q_nope.transpose(0, 1), w_k, w_k_scale, dtype, transpose_bm=True, prequant=True, y_scale=None)
 
     ref_kv_cache = kv_cache.clone()
     if cache_dtype == torch.uint8:
@@ -152,8 +147,8 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
         y_scale=None,
         k_scale=k_scale,
         is_neox=(rotate_style == RotateStyle.NEOX),
-        q_out_dtype=kv_cache.dtype,
-        num_decode_toks_for_zeros=0,
+        q_out_dtype=None,
+        num_decode_toks_for_zeros=T,
     )
     triton_kv_cache = triton_kv_cache.view(kv_cache_og_dtype)
 

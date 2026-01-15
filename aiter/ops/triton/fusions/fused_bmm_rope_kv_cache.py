@@ -209,12 +209,11 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         device=k_rope.device,
     )
 
-    if q_nope_zeros_out is None:
-        q_nope_zeros_out = torch.empty(
-            (num_decode_toks_for_zeros, qh, kv_lora_rank),
-            dtype=q_nope.dtype,
-            device=q_nope.device,
-        )
+    q_nope_zeros_out = torch.empty(
+        (num_decode_toks_for_zeros, qh, kv_lora_rank),
+        dtype=q_nope.dtype,
+        device=q_nope.device,
+    )
 
     if NUM_KSPLIT > 1:
         if _USE_GEMM_SPLITK_BF16:
