@@ -3436,36 +3436,6 @@ def pa_decode_gluon(
     query_group_size = num_query_heads // num_kv_heads
     # Calculate equivalent group sizes for kernel configuration
     equivalent_query_group_size = query_length * query_group_size
-
-    one_shot = max_context_partition_num <= 1
-    if exp_sums is None:
-        exp_sums = torch.empty(
-            batch_size,
-            num_kv_heads,
-            max_context_partition_num,
-            equivalent_query_group_size,
-            device=query.device,
-            dtype=aiter.dtypes.fp32,
-        )
-    if max_logits is None:
-        max_logits = torch.empty(
-            batch_size,
-            num_kv_heads,
-            max_context_partition_num,
-            equivalent_query_group_size,
-            device=query.device,
-            dtype=aiter.dtypes.fp32,
-        )
-    if temporary_output is None:
-        temporary_output = torch.empty(
-            batch_size,
-            num_kv_heads,
-            max_context_partition_num,
-            equivalent_query_group_size,
-            head_size,
-            device=query.device,
-            dtype=query.dtype,
-        )
     kv_block_size = key_cache.shape[-2]
 
     # Determine if causal masking is needed
