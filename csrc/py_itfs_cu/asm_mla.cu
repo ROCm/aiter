@@ -51,29 +51,26 @@ struct __attribute__((packed)) KernelArgs
     p3 _p23;
 };
 
-std::string get_heuristic_kernel_mla(std::string q_type,
-                                     std::string kv_type,
-                                     int gqa,
-                                     int ps,
-                                     int prefill,
-                                     int causal,
-                                     int qseqlen,
-                                     std::string arch_id,
-                                     CFG* cfgs)
+const CFG::Entry* get_heuristic_kernel_mla(std::string q_type,
+                                           std::string kv_type,
+                                           int gqa,
+                                           int ps,
+                                           int prefill,
+                                           int causal,
+                                           int qseqlen,
+                                           GPUArchId arch_id,
+                                           const CFG* cfgs)
 {
-    for(const auto& el : *cfgs)
+    for(const auto& cfg : cfgs->get_configs_for_arch(arch_id))
     {
-        if (el.first.find(arch_id) != 0)
-            continue;
-        const auto& cfg = el.second;
-        
         if (cfg.qType != q_type || cfg.kvType != kv_type)
             continue;
         if (cfg.Gqa != gqa || cfg.ps != ps || cfg.prefill != prefill)
             continue;
         if (cfg.causal != causal || cfg.qSeqLen != qseqlen)
             continue;
-        return el.first;
+
+        return &cfg;
     }
     
     TORCH_CHECK(false,
@@ -86,7 +83,7 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                 " prefill:", prefill,
                 " causal:", causal,
                 " qseqlen:", qseqlen);
-    return "";
+    return nullptr;
 }
 
 void mla_decode_stage1_asm_fwd(
@@ -111,7 +108,7 @@ void mla_decode_stage1_asm_fwd(
     std::optional<torch::Tensor> q_scale  = std::nullopt, //   [1]
     std::optional<torch::Tensor> kv_scale = std::nullopt  //   [1]
 )
-{    
+{
     int batch           = qo_indptr.size(0) - 1;
     int num_heads       = Q.size(1);
     int head_size       = Q.size(2);
@@ -126,42 +123,43 @@ void mla_decode_stage1_asm_fwd(
     uint32_t log2_page = (uint32_t)log2f(page_size);
 
     KernelArgs args;
-    size_t arg_size  = sizeof(args);
-    args.ptr_R       = splitData.data_ptr();
-    args.ptr_LSE     = splitLse.data_ptr();
-    args.ptr_Q       = Q.data_ptr();
-    args.ptr_KV      = KV.data_ptr();
-    args.ptr_LTP     = kv_indptr.data_ptr();
-    args.ptr_LTD     = kv_page_indices.data_ptr();
-    args.ptr_LTL     = kv_last_page_lens.data_ptr();
-    args.ptr_QTP     = qo_indptr.data_ptr();
-    args.scalar      = softmax_scale;
-    args.s_MQA       = gqa_ratio * max_seqlen_q;
-    args.s_kv_split  = kv_split;
-    args.s_Q_Bs      = stride_Q;
-    args.s_Bs        = stride_Page;
-    args.s_log2_plen = log2_page;
+    size_t arg_size     = sizeof(args);
+    args.ptr_R          = splitData.data_ptr();
+    args.ptr_LSE        = splitLse.data_ptr();
+    args.ptr_Q          = Q.data_ptr();
+    args.ptr_KV         = KV.data_ptr();
+    args.ptr_LTP        = kv_indptr.data_ptr();
+    args.ptr_LTD        = kv_page_indices.data_ptr();
+    args.ptr_LTL        = kv_last_page_lens.data_ptr();
+    args.ptr_QTP        = qo_indptr.data_ptr();
+    args.scalar         = softmax_scale;
+    args.s_MQA          = gqa_ratio * max_seqlen_q;
+    args.s_kv_split     = kv_split;
+    args.s_Q_Bs         = stride_Q;
+    args.s_Bs           = stride_Page;
+    args.s_log2_plen    = log2_page;
     args.out_16_nosplit = kv_split;
 
-    if (persistent)
+    if(persistent)
     {
-        if (work_meta_data.has_value())
+        if(work_meta_data.has_value())
         {
             args.ptr_STP = work_meta_data.value().data_ptr();
         }
         else
         {
             assert(work_indptr.has_value() && work_info_set.has_value());
-            assert(work_indptr.value().data_ptr() != nullptr && work_info_set.value().data_ptr() != nullptr);
+            assert(work_indptr.value().data_ptr() != nullptr &&
+                   work_info_set.value().data_ptr() != nullptr);
 
-            uint64_t* persistent_meta_data = new uint64_t[10];
-            persistent_meta_data[0] = (uint64_t)work_indptr.value().data_ptr();
-            persistent_meta_data[1] = (uint64_t)work_info_set.value().data_ptr();
+            uint64_t persistent_meta_data[10] = {0};
+            persistent_meta_data[0]        = (uint64_t)work_indptr.value().data_ptr();
+            persistent_meta_data[1]        = (uint64_t)work_info_set.value().data_ptr();
             uint32_t* dev_PS_META_DATA;
 
             unsigned long buf_size_META = 10 * sizeof(uint64_t);
-            hipMalloc(&dev_PS_META_DATA, buf_size_META);
-            hipMemcpy(dev_PS_META_DATA, persistent_meta_data, buf_size_META, hipMemcpyHostToDevice);
+            hipMalloc(&dev_PS_META_DATA, buf_size_META); // TODO(rocm) mem leak!
+            hipMemcpy(dev_PS_META_DATA, &persistent_meta_data[0], buf_size_META, hipMemcpyHostToDevice);
 
             args.ptr_STP = dev_PS_META_DATA;
         }
@@ -170,8 +168,7 @@ void mla_decode_stage1_asm_fwd(
     {
         args.ptr_STP = num_kv_splits_indptr.value().data_ptr();
     }
-    args.ptr_RP = output.data_ptr(); //final output
-    
+    args.ptr_RP = output.data_ptr(); // final output
 
     // std::cout << "mla args" << std::endl;
     // std::cout << "ptr_R: " << args.ptr_R << std::endl;
@@ -233,9 +230,8 @@ void mla_decode_stage1_asm_fwd(
         TORCH_CHECK(false, __func__, ": unsupport KV dtype:", KV.scalar_type());
 
     // Get kernel using config dispatch
-    std::string arch_id = get_gpu_arch();
-    CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    auto arch_id          = get_gpu_arch();
+    const CFG* config_map = &cfg_mla_asm;
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
@@ -309,31 +305,15 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map);
+    const auto* cfg = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map);
     
-    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    TORCH_CHECK(cfg != nullptr, __func__, ": cannot find suitable kernel");
     
-    AiterAsmKernel* impl_ptr = nullptr;
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
     
-    auto it = config_map->find(kernelName);
-    if(it != config_map->end())
-    {
-        const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
-        
-    }
-    else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
-
-    TORCH_CHECK(impl_ptr != nullptr, __func__,
-        ": unsupport current data type or shape. please refer to asm_mla.cu");
+    TORCH_CHECK(impl_ptr != nullptr,
+                __func__,
+                ": unsupport current data type or shape. please refer to asm_mla.cu");
 
     int bdx = 256;
     int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
@@ -350,12 +330,12 @@ void mla_decode_stage1_asm_fwd(
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
-                             gdx,       // gdx
-                             gdy,       // gdy
-                             gdz,       // gdz
-                             256,       // bdx: 4 wv64
-                             1,         // bdy
-                             1,         // bdz
+                             gdx, // gdx
+                             gdy, // gdy
+                             gdz, // gdz
+                             256, // bdx: 4 wv64
+                             1,   // bdy
+                             1,   // bdz
                              stream});
 }
 
@@ -484,44 +464,29 @@ void mla_prefill_ps_asm_fwd(
         TORCH_CHECK(false, __func__, ": unsupport K dtype:", K.scalar_type());
 
     // Get kernel using config dispatch
-    std::string arch_id = get_gpu_arch();
-    if(arch_id == "gfx942"){
+    auto arch_id = get_gpu_arch();
+    if(arch_id == GPUArchId::gfx942){
         TORCH_CHECK(false, __func__, ": fp8 mla persistent prefill is not supported on gfx942");
     }
-    CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    const CFG* config_map = &cfg_mla_asm;
     
     int ps = 1; // ps_prefill always uses persistent scheduling
     int prefill = 1; // prefill stage
     int causal_flag = is_causal ? 1 : 0;
     int qseqlen = 0; // not used for prefill
     
-    std::string kernelName = get_heuristic_kernel_mla(q_type, k_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
+    const auto* cfg = get_heuristic_kernel_mla(q_type, k_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
     
-    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    TORCH_CHECK(cfg != nullptr, __func__, ": cannot find suitable kernel");
     
-    AiterAsmKernel* impl_ptr = nullptr;
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
     int wave_per_tg = 8;
     
-    auto it = config_map->find(kernelName);
-    if(it != config_map->end())
-    {
-        const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
-    }
-    else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+    TORCH_CHECK(impl_ptr != nullptr, __func__, " not find kernel");
     
     // Launch kernel
     int block_size_x = wave_per_tg * 64;  // 8 * 64 = 512
-    // int grid_size_x  = get_num_cu_func();
+    // int grid_size_x  = get_num_cu();
     // std::cout << "grid_size_x" << grid_size_x << std::endl;
     int grid_size_x = work_indptr.value().size(0) - 1;
     // std::cout << "grid_size_x" << grid_size_x << std::endl;
@@ -606,36 +571,19 @@ void mla_prefill_asm_fwd(
         TORCH_CHECK(false, __func__, ": unsupport KV dtype:", KV.scalar_type());
 
     // Get kernel using config dispatch
-    std::string arch_id = get_gpu_arch();
-    CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    auto arch_id          = get_gpu_arch();
+    const CFG* config_map = &cfg_mla_asm;
     
     int ps = 0; // prefill without persistent scheduling
     int prefill = 1; // prefill stage
     int causal_flag = 0;
     int qseqlen = 0;
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
+    const auto* cfg = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
     
-    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    TORCH_CHECK(cfg != nullptr, __func__, ": cannot find suitable kernel");
     
-    AiterAsmKernel* impl_ptr = nullptr;
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
     
-    auto it = config_map->find(kernelName);
-    if(it != config_map->end())
-    {
-        const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
-    }
-    else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
-
     TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
     impl_ptr->launch_kernel({&args,
                              &arg_size,

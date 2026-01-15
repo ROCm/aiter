@@ -7,6 +7,7 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "hip_float8.h"
+#include "asm_flatmm_fp8gemm_blockscale_code_objects.hpp"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -71,22 +72,20 @@ torch::Tensor flatmm_a8w8_blockscale_asm(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(XQ));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    AiterAsmKernel *impl_ptr = nullptr;
-    static AiterAsmKernel impl_kenrel("flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32", "flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32.co");
-    impl_ptr = &impl_kenrel;
+    static AiterAsmKernel<{"flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32", flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32_co}> impl;
 
     int gdx = (n + TileN - 1) / TileN;
     int gdy = (m + TileM - 1) / TileM;
 
-    impl_ptr->launch_kernel({&args,
-                             &arg_size,
-                             gdx,   // gdx
-                             gdy,   // gdy
-                             1,     // gdz
-                             256,   // bdx: 4 wv64
-                             1,     // bdy
-                             1,     // bdz
-                             stream});                                 
+    impl.launch_kernel({&args,
+                        &arg_size,
+                        gdx, // gdx
+                        gdy, // gdy
+                        1,   // gdz
+                        256, // bdx: 4 wv64
+                        1,   // bdy
+                        1,   // bdz
+                        stream});
 
     return out;
 }

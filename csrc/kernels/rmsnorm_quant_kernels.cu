@@ -370,7 +370,7 @@ __global__ void add_rmsnorm_quant_kernel(
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
-        const int cu_num = get_num_cu_func();
+        const int cu_num = get_num_cu();
 
         if(out.dtype() == torch_fp8)
         {
@@ -432,7 +432,7 @@ __global__ void add_rmsnorm_quant_kernel(
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
-        const int cu_num = get_num_cu_func();
+        const int cu_num = get_num_cu();
 
         if(out.dtype() == torch_fp8)
         {
@@ -495,7 +495,7 @@ __global__ void add_rmsnorm_quant_kernel(
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
-        const int cu_num = get_num_cu_func();
+        const int cu_num = get_num_cu();
 
         if(out.dtype() == torch::kBFloat16)
         {
@@ -550,7 +550,7 @@ __global__ void add_rmsnorm_quant_kernel(
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
-        const int cu_num = get_num_cu_func();
+        const int cu_num = get_num_cu();
 
         if(out.dtype() == torch::kBFloat16)
         {

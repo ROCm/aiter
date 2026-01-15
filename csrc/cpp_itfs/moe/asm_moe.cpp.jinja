@@ -63,19 +63,18 @@ struct __attribute__((packed)) KernelArgs
 };
 
 
-unsigned char hsaco[{{bin_size}}] = { {{bin_data}} };
+constexpr unsigned char hsaco[{{bin_size}}] = { {{bin_data}} };
 
 class FMoeKernel
 {
 private:
-    std::unique_ptr<AiterAsmKernelFast> asm_kernel=nullptr;
+    AiterAsmKernel<{"{{kernel_name}}", hsaco}> asm_kernel;
     uint32_t sub_GU = 512;
     bool is_int4 = false;
 
 public:
     FMoeKernel()
     {
-        asm_kernel=std::make_unique<AiterAsmKernelFast>("{{kernel_name}}", hsaco);
         this->sub_GU = {{selected_tile}};
     };
 
@@ -181,11 +180,11 @@ public:
 
         if constexpr (switchGxy)
         {
-            asm_kernel->launch_kernel({&args, &arg_size, gdy, gdx, gdz, bdx, 1, 1, stream});
+            asm_kernel.launch_kernel({&args, &arg_size, gdy, gdx, gdz, bdx, 1, 1, stream});
         }
         else
         {
-            asm_kernel->launch_kernel({&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, stream});
+            asm_kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, stream});
         }
     };
 };
