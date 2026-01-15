@@ -92,18 +92,17 @@ struct __attribute__((packed)) PsKernelArgs
     p2 _p25;
 };
 
-
-std::string get_heuristic_kernel(std::string q_type,
-                                 std::string kv_type,
-                                 int gqa,
-                                 int mtp,
-                                 int msk,
-                                 int hp,
-                                 int block_size,
-                                 std::string arch_id,
-                                 int ps,
-                                 int qTile,
-                                 CFG* cfgs)
+const CFG::Entry* get_heuristic_kernel(std::string q_type,
+                                       std::string kv_type,
+                                       int gqa,
+                                       int mtp,
+                                       int msk,
+                                       int hp,
+                                       int block_size,
+                                       GPUArchId arch_id,
+                                       int ps,
+                                       int qTile,
+                                       const CFG* cfgs)
 {
     // # mtp * gqa <= 16
     // # gpa = 16, mtp 1
@@ -117,17 +116,14 @@ std::string get_heuristic_kernel(std::string q_type,
         for(int gqa_ : gqa_flags)
         {
             // find exact match
-            for(const auto& el : *cfgs)
+            for(const auto& cfg : cfgs->get_configs_for_arch(arch_id))
             {
-                if (el.first.find(arch_id) != 0)
-                    continue;
-                const auto& cfg = el.second;
                 // hp is just distinct from uhp
                 if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
                    cfg.Mtp == mtp_ && cfg.Msk == msk && (cfg.Hp == hp || hp == 1) &&
-                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile)
-
-                    return el.first;
+                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile) {
+                    return &cfg;
+                }
             }
         }
     }
@@ -153,7 +149,7 @@ std::string get_heuristic_kernel(std::string q_type,
                 ps,
                 " qTile:",
                 qTile);
-    return "";
+    return nullptr;
 }
 const float f_log2E = log2f(expf(1));
 
@@ -173,7 +169,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
-    std::string arch_id = get_gpu_arch();
+    auto arch_id         = get_gpu_arch();
     // int block_tables_stride0 = block_tables.size(1);
     int num_heads       = Q.size(1);
     int head_size       = Q.size(2);
@@ -270,34 +266,23 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     default: hp = 0; break;
     };
     int qTile = 0;
-    CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    std::string kernelName = kernelName_.has_value() ? arch_id + kernelName_.value() : "";
+    const CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
+    const CFG::Entry* cfg = nullptr;
     int ps = 0;
-    if (kernelName.empty())
-        kernelName = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, ps, qTile, config_map);
-    if(kernelName.empty())
+    if (!kernelName_.has_value())
+        cfg = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, ps, qTile, config_map);
+    else{
+        cfg = config_map->find_config_by_kernel_name(arch_id, kernelName_.value());
+    }
+
+    if(cfg == nullptr)
     {
         TORCH_CHECK(false, __func__, "not supported this kernel now! ");
     }
 
-    AiterAsmKernel* impl_ptr = nullptr;
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
 
-    auto it = config_map->find(kernelName);
-    if(it != config_map->end())
-    {
-        const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
-    }
-    else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+    TORCH_CHECK(impl_ptr != nullptr, __func__, " not find kernel");
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -451,34 +436,28 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                 " = ", required_qTile, 
                 ") exceeds maximum available qTile. Please reduce gqa_ratio or max_qlen.");
 
-    CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    std::string arch_id = get_gpu_arch();
-    std::string kernelName = kernelName_.value_or(
-        get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, config_map));
-    if(kernelName.empty())
+    const CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
+    auto arch_id          = get_gpu_arch();
+    const CFG::Entry* cfg = nullptr;
+    if (!kernelName_.has_value()) {
+        cfg = get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, config_map);
+    } else {
+        cfg = config_map->find_config_by_kernel_name(arch_id, kernelName_.value());
+    }
+
+    if(cfg == nullptr)
     {
         TORCH_CHECK(false, __func__, "not supported this kernel now! ");
     }
 
-    AiterAsmKernel* impl_ptr = nullptr;
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
     int gdx, gdy;
 
-    auto it = config_map->find(kernelName);
-    if(it != config_map->end())
+    if(impl_ptr != nullptr)
     {
-        const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
+        if(cfg->ps)
         {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
-        if(cfg.ps)
-        {
-            gdx = get_num_cu_func();
+            gdx = get_num_cu();
             gdy = 1;
         }
         else
@@ -488,7 +467,7 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
         }
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        TORCH_CHECK(false, __func__, " not find kernel");
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_fmoe_configs.hpp"
+#include "asm_fmoe_code_objects.hpp"
 #include "moe_op.h"
 #include "py_itfs_common.h"
 #include <ATen/hip/HIPContext.h>
@@ -74,26 +75,21 @@ struct __attribute__((packed)) KernelArgs
 class FMoeKernel
 {
     private:
-    hipModule_t module;
-    hipFunction_t kernel_func;
+    AiterAsmKernel<>* kernel_impl;
     uint32_t sub_GU             = 512;
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
-    const char* name            = nullptr;
 
     public:
-    FMoeKernel(const char* name,
-               const char* hsaco,
+    FMoeKernel(AiterAsmKernel<>* impl,
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0)
     {
-        load_asm_kernel(name, hsaco, module, kernel_func);
+        this->kernel_impl = impl;
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
-        this->name               = name;
     };
 
-    const char* get_name() const { return name; }
     int get_num_persistent_tgs() { return num_persistent_tgs; }
     int get_sub_GU() { return sub_GU; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
@@ -186,11 +182,6 @@ class FMoeKernel
         args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
         args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
 
-        void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
-                          &args,
-                          HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                          &arg_size,
-                          HIP_LAUNCH_PARAM_END};
         int bdx;
         int gdx;
         int gdy;
@@ -235,41 +226,50 @@ class FMoeKernel
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         if constexpr(switchGxy)
         {
-            HIP_CALL(hipModuleLaunchKernel(
-                kernel_func, gdy, gdx, gdz, bdx, 1, 1, 0, stream, nullptr, (void**)&config));
+            kernel_impl->launch_kernel({&args,
+                                        &arg_size,
+                                        gdy, // gdx
+                                        gdx, // gdy
+                                        gdz, // gdz
+                                        bdx, // bdx
+                                        1,   // bdy
+                                        1,   // bdz
+                                        stream});
         }
         else
         {
-            HIP_CALL(hipModuleLaunchKernel(
-                kernel_func, gdx, gdy, gdz, bdx, 1, 1, 0, stream, nullptr, (void**)&config));
+            kernel_impl->launch_kernel({&args,
+                                        &arg_size,
+                                        gdx, // gdx
+                                        gdy, // gdy
+                                        gdz, // gdz
+                                        bdx, // bdx
+                                        1,   // bdy
+                                        1,   // bdz
+                                        stream});
         }
     };
 };
 
-FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "")
+std::optional<FMoeKernel> get_heuristic_kernel(
+    int inter_dim, int sub_X_cnt, const CFG* cfgs, int smf = 0, std::string kernel_name = "")
 {
-    FMoeKernel* impl_ptr        = nullptr;
-    uint32_t num_cu             = get_num_cu_func();
-    uint32_t empty_cu           = num_cu;
-    uint32_t tg_num             = 0;
-    uint32_t num_persistent_tgs = 0;
-    uint32_t round              = 0xffffffff;
-    std::string arch_id         = get_gpu_arch();
-    std::string selectedKl      = kernel_name.empty() ? "" : arch_id + kernel_name;
-    int vskip                   = 1;
-    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+    uint32_t num_cu               = get_num_cu();
+    uint32_t empty_cu             = num_cu;
+    uint32_t tg_num               = 0;
+    uint32_t num_persistent_tgs   = 0;
+    uint32_t round                = 0xffffffff;
+    auto arch_id                  = get_gpu_arch();
+    const CFG::Entry* selectedCfg = nullptr;
+    int vskip                     = 1;
 
     const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
     if(vs_env_value != nullptr && std::string(vs_env_value) == "0")
         vskip = 0;
-    if(selectedKl.empty())
+    if(kernel_name.empty())
     {
-        for(const auto& el : *cfgs)
+        for(const auto& cfg : cfgs->get_configs_for_arch(arch_id))
         {
-            if(el.first.find(arch_id) != 0)
-                continue;
-            const auto& cfg = el.second;
             if(cfg.vskip == vskip && cfg.smf == smf)
             {
                 if((inter_dim % cfg.subGU_n) == 0)
@@ -285,7 +285,7 @@ FMoeKernel* get_heuristic_kernel(
                     {
                         round      = local_round;
                         empty_cu   = local_round * num_cu - tg_num;
-                        selectedKl = el.first;
+                        selectedCfg = &cfg;
                         if(cfg.ps == 1)
                             num_persistent_tgs = cfg.tg_num_perCU * num_cu;
                         else
@@ -295,7 +295,7 @@ FMoeKernel* get_heuristic_kernel(
             }
         }
 
-        TORCH_CHECK(selectedKl != "",
+        TORCH_CHECK(selectedCfg != nullptr,
                     __func__,
                     ": No suitable kernel found for inter_dim: ",
                     inter_dim,
@@ -305,32 +305,28 @@ FMoeKernel* get_heuristic_kernel(
                     smf,
                     ", vskip: ",
                     vskip);
+    } else {
+        selectedCfg = cfgs->find_config_by_kernel_name(arch_id, kernel_name);
     }
-    auto it = cfgs->find(selectedKl);
-    if(it != cfgs->end())
+    auto kernel_impl = cfgs->load_kernel_for_config(selectedCfg);
+    if(kernel_impl != nullptr)
     {
-        const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
+        const auto& cfg     = *selectedCfg;
         if(cfg.ps == 1)
             num_persistent_tgs = cfg.tg_num_perCU * num_cu;
         else
             num_persistent_tgs = 0;
-        if(result.second)
-            result.first->second =
-                std::make_unique<FMoeKernel>(name, co_name, cfg.subGU_n, num_persistent_tgs);
-        impl_ptr = result.first->second.get();
+
+        return FMoeKernel(kernel_impl, cfg.subGU_n, num_persistent_tgs);
     }
-    else
-        TORCH_CHECK(false, __func__, " not find kernel " + selectedKl);
-    return impl_ptr;
+
+    TORCH_CHECK(false, __func__, " not find kernel " + kernel_name);
 }
 
 int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& available_tiles)
 {
     // int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
-    uint32_t num_cu   = get_num_cu_func();
+    uint32_t num_cu   = get_num_cu();
     uint32_t empty_cu = num_cu;
     uint32_t tg_num   = 0;
     uint32_t round    = 0xffffffff;
@@ -373,19 +369,18 @@ void fmoe(torch::Tensor& out,               // [token_cnt, dim]
           uint32_t topk)
 {
     // g1u0
-    FMoeKernel* impl_ptr = nullptr;
+    std::optional<FMoeKernel> impl_ptr;
     if(input.dtype() == at::ScalarType::Half)
     {
-        static FMoeKernel impl_f16("fmoe_kernel_func", "fmoe_f16.co");
-        impl_ptr = &impl_f16;
+        static AiterAsmKernel<{"fmoe_kernel_func", fmoe_f16_co}> impl_f16;
+        impl_ptr = FMoeKernel(&impl_f16);
     }
     else if(input.dtype() == at::ScalarType::BFloat16)
     {
-        static FMoeKernel impl_b16("fmoe_kernel_func", "fmoe_b16.co");
-        impl_ptr = &impl_b16;
+        static AiterAsmKernel<{"fmoe_kernel_func", fmoe_b16_co}> impl_b16;
+        impl_ptr = FMoeKernel(&impl_b16);
     }
-    TORCH_CHECK(
-        impl_ptr != nullptr, __func__, ": unsupport current input type:", input.scalar_type());
+    TORCH_CHECK(impl_ptr, __func__, ": unsupport current input type:", input.scalar_type());
     impl_ptr->launch_kernel<uint16_t, uint16_t>(out,
                                                 input,
                                                 gate,
@@ -412,44 +407,47 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
                     torch::Tensor& fc2_smooth_scale,  // [expert, 1, inter_dim],
                     ActivationType activation)
 {
-    FMoeKernel* impl_ptr = nullptr;
+    std::optional<FMoeKernel> impl_ptr;
     int inter_dim        = down.size(2);
-    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
-
     struct FMoeKernelConfig
     {
-        std::string name;
-        std::string co_name;
+        AiterAsmKernel<>* (*kernel_factory)();
         int tile_size;
     };
+
+#define FACTORY(name, data)                       \
+    +[]() -> AiterAsmKernel<>* {                  \
+        static AiterAsmKernel<{name, data}> impl; \
+        return &impl;                             \
+    }
 
     if(input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
     {
         static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_configs = {
             {512,
-             {"fmoe_int8_g1u0_subGU_512_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_512_gelu.co", 512}},
+             {FACTORY("fmoe_int8_g1u0_subGU_512_gelu", fmoe_int8_g1u0_subGU_512_gelu_co), 512}},
             {448,
-             {"fmoe_int8_g1u0_subGU_448_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_448_gelu.co", 448}},
+             {FACTORY("fmoe_int8_g1u0_subGU_448_gelu", fmoe_int8_g1u0_subGU_448_gelu_co), 448}},
             {384,
-             {"fmoe_int8_g1u0_subGU_384_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_384_gelu.co", 384}},
+             {FACTORY("fmoe_int8_g1u0_subGU_384_gelu", fmoe_int8_g1u0_subGU_384_gelu_co), 384}},
             {320,
-             {"fmoe_int8_g1u0_subGU_320_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_320_gelu.co", 320}},
+             {FACTORY("fmoe_int8_g1u0_subGU_320_gelu", fmoe_int8_g1u0_subGU_320_gelu_co), 320}},
             {256,
-             {"fmoe_int8_g1u0_subGU_256_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_256_gelu.co", 256}},
+             {FACTORY("fmoe_int8_g1u0_subGU_256_gelu", fmoe_int8_g1u0_subGU_256_gelu_co), 256}},
             {192,
-             {"fmoe_int8_g1u0_subGU_192_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_192_gelu.co", 192}},
+             {FACTORY("fmoe_int8_g1u0_subGU_192_gelu", fmoe_int8_g1u0_subGU_192_gelu_co), 192}},
             {128,
-             {"fmoe_int8_g1u0_subGU_128_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_128_gelu.co", 128}}};
+             {FACTORY("fmoe_int8_g1u0_subGU_128_gelu", fmoe_int8_g1u0_subGU_128_gelu_co), 128}}};
 
         static std::unordered_map<int, FMoeKernelConfig> silu_kernel_int8_configs = {
-            {512, {"fmoe_int8_g1u0_subGU_512", "fmoe/silu/fmoe_int8_g1u0_subGU_512.co", 512}},
-            {448, {"fmoe_int8_g1u0_subGU_448", "fmoe/silu/fmoe_int8_g1u0_subGU_448.co", 448}},
-            {384, {"fmoe_int8_g1u0_subGU_384", "fmoe/silu/fmoe_int8_g1u0_subGU_384.co", 384}},
-            {320, {"fmoe_int8_g1u0_subGU_320", "fmoe/silu/fmoe_int8_g1u0_subGU_320.co", 320}},
-            {256, {"fmoe_int8_g1u0_subGU_256", "fmoe/silu/fmoe_int8_g1u0_subGU_256.co", 256}},
-            {192, {"fmoe_int8_g1u0_subGU_192", "fmoe/silu/fmoe_int8_g1u0_subGU_192.co", 192}},
-            {128, {"fmoe_int8_g1u0_subGU_128", "fmoe/silu/fmoe_int8_g1u0_subGU_128.co", 128}}};
-
+            {512, {FACTORY("fmoe_int8_g1u0_subGU_512", fmoe_int8_g1u0_subGU_512_co), 512}},
+            {448, {FACTORY("fmoe_int8_g1u0_subGU_448", fmoe_int8_g1u0_subGU_448_co), 448}},
+            {384, {FACTORY("fmoe_int8_g1u0_subGU_384", fmoe_int8_g1u0_subGU_384_co), 384}},
+            {320, {FACTORY("fmoe_int8_g1u0_subGU_320", fmoe_int8_g1u0_subGU_320_co), 320}},
+            {256, {FACTORY("fmoe_int8_g1u0_subGU_256", fmoe_int8_g1u0_subGU_256_co), 256}},
+            {192, {FACTORY("fmoe_int8_g1u0_subGU_192", fmoe_int8_g1u0_subGU_192_co), 192}},
+            {128, {FACTORY("fmoe_int8_g1u0_subGU_128", fmoe_int8_g1u0_subGU_128_co), 128}}};
+#undef FACTORY
         std::unordered_map<int, FMoeKernelConfig>* config_map = nullptr;
         if(activation == ActivationType::Gelu)
         {
@@ -487,16 +485,7 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
         if(it != config_map->end())
         {
             const auto& config  = it->second;
-            const char* name    = config.name.c_str();
-            const char* co_name = config.co_name.c_str();
-
-            auto result = impl_ptr_map.emplace(name, nullptr);
-            if(result.second)
-            {
-                result.first->second =
-                    std::make_unique<FMoeKernel>(name, co_name, config.tile_size);
-            }
-            impl_ptr = result.first->second.get();
+            impl_ptr = FMoeKernel(config.kernel_factory(), config.tile_size);
         }
     }
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
@@ -530,42 +519,37 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
                std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
                ActivationType activation)
 {
-    struct FMoeKernelConfig
-    {
-        std::string name;
-        std::string co_name;
-        int tile_size;
-    };
-
-    FMoeKernel* impl_ptr = nullptr;
-    CFG* config_map      = nullptr;
+    std::optional<FMoeKernel> impl_ptr;
+    const CFG* config_map      = nullptr;
     int smf              = 0;
     int model_dim        = down.size(1);
     int inter_dim        = down.size(2);
     inter_dim *= model_dim / gate.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
     if(gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int) // int4
     {
         int selectedTile = get_heuristic_tile(
             inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
         if(selectedTile == 512)
         {
-            static FMoeKernel impl_int4_512(
-                "fmoe_int4fp8_g1u1_subGU_512_gelu", "fmoe_int4fp8_g1u1_subGU_512_gelu.co", 512);
-            impl_ptr = &impl_int4_512;
+            static AiterAsmKernel<{"fmoe_int4fp8_g1u1_subGU_512_gelu",
+                                   fmoe_int4fp8_g1u1_subGU_512_gelu_co}>
+                impl_int4_512;
+            impl_ptr = FMoeKernel(&impl_int4_512, 512);
         }
         else if(selectedTile == 256)
         {
-            static FMoeKernel impl_int4_256(
-                "fmoe_int4fp8_g1u1_subGU_256_gelu", "fmoe_int4fp8_g1u1_subGU_256_gelu.co", 256);
-            impl_ptr = &impl_int4_256;
+            static AiterAsmKernel<{"fmoe_int4fp8_g1u1_subGU_256_gelu",
+                                   fmoe_int4fp8_g1u1_subGU_256_gelu_co}>
+                impl_int4_256;
+            impl_ptr = FMoeKernel(&impl_int4_256, 256);
         }
         else if(selectedTile == 128)
         {
-            static FMoeKernel impl_int4_128(
-                "fmoe_int4fp8_g1u1_subGU_128_gelu", "fmoe_int4fp8_g1u1_subGU_128_gelu.co", 128);
-            impl_ptr = &impl_int4_128;
+            static AiterAsmKernel<{"fmoe_int4fp8_g1u1_subGU_128_gelu",
+                                   fmoe_int4fp8_g1u1_subGU_128_gelu_co}>
+                impl_int4_128;
+            impl_ptr = FMoeKernel(&impl_int4_128, 128);
         }
         else
         {
@@ -664,8 +648,8 @@ void fmoe_g1u1_tkw1(torch::Tensor& out,               // [token_cnt, dim]
                     std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
                     ActivationType activation)
 {
-    FMoeKernel* impl_ptr = nullptr;
-    CFG* config_map      = nullptr;
+    std::optional<FMoeKernel> impl_ptr;
+    const CFG* config_map      = nullptr;
 
     const int token_cnt = input.size(0);
     const int block_m   = 32; // fmoe sorting kernel and fmoe kernel only support 32 for now
@@ -724,7 +708,8 @@ void fmoe_int8_g1u0_a16(torch::Tensor& out,               // [token_cnt, dim]
                         torch::Tensor& fc2_smooth_scale   // [expert, 1, inter_dim]
 )
 {
-    static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0_smf.co");
+    static AiterAsmKernel<{"fmoe_kernel_func", fmoe_int8_g1u0_smf_co}> _impl;
+    FMoeKernel impl(&_impl);
     impl.launch_kernel<uint8_t, uint16_t, true>(out,
                                                 input,
                                                 gate,
@@ -756,11 +741,11 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
                    torch::Tensor& fc2_smooth_scale,  // [expert, 1, inter_dim]
                    ActivationType activation)
 {
-    FMoeKernel* impl_ptr = nullptr;
+    std::optional<FMoeKernel> impl_ptr;
     int inter_dim        = down.size(2);
     int sub_X_cnt        = sorted_expert_ids.size(0);
 
-    CFG* config_map = nullptr;
+    const CFG* config_map = nullptr;
     if(gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte) // int8
     {
         if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
@@ -827,9 +812,9 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
                               std::optional<torch::Tensor> fc2_smooth_scale,
                               ActivationType activation)
 {
-    FMoeKernel* impl_ptr     = nullptr;
-    CFG* config_map          = nullptr;
-    uint32_t num_cu          = get_num_cu_func();
+    std::optional<FMoeKernel> impl_ptr;
+    const CFG* config_map          = nullptr;
+    uint32_t num_cu          = get_num_cu();
     int inter_dim            = down.size(2);
     int sub_X_cnt            = sorted_expert_ids.size(0);
     const char* enable_vskip = std::getenv("AITER_ENABLE_VSKIP");

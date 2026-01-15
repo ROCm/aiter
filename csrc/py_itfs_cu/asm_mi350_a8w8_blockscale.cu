@@ -6,6 +6,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
+#include "asm_fp8gemm_blockscale_mi350_code_objects.hpp"
 #include "hip_float8.h"
 
 struct __attribute__((packed)) KernelArgs
@@ -109,9 +110,9 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     // printf("ptr_GUQ: %p\n", args.ptr_GUQ);
     // printf("args.Xs: %d\n", args.Xs);
     // printf("args.token_cnt: %d\n", args.token_cnt);
-    AiterAsmKernel *impl_ptr = nullptr;
-    static AiterAsmKernel impl_kenrel_x128("f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
-    static AiterAsmKernel impl_kenrel_x32("f8_block_scale_mi350_x32", "f8_block_scale_mi350_x32.co");
+    AiterAsmKernel<> *impl_ptr = nullptr;
+    static AiterAsmKernel<{"f8_block_scale_mi350_x128", f8_block_scale_mi350_x128_co}> impl_kenrel_x128;
+    static AiterAsmKernel<{"f8_block_scale_mi350_x32", f8_block_scale_mi350_x32_co}> impl_kenrel_x32;
     impl_ptr = (m <= 32)?&impl_kenrel_x32:&impl_kenrel_x128;
     int gdx = (n + TileN*2 - 1) / (TileN*2);
     int gdy = (m + TileM - 1) / TileM;

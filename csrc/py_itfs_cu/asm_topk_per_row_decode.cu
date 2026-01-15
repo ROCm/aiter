@@ -5,6 +5,8 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
+#include "asm_topk_per_row_decode_code_objects.hpp"
+
 
 struct __attribute__((packed)) TopKDecodeKernelArgs
 {
@@ -34,15 +36,12 @@ void top_k_per_row_decode_fast(const torch::Tensor& logits,
     args.stride1        = static_cast<int32_t>(stride1);
     args.next_n         = static_cast<int32_t>(next_n);
 
-    // Load the compiled assembly kernel
-    // The mangled name: _ZN5aiter10DecodeTopKL19topk_per_row_decodeILi1024ELb0ELi4EEEvPKfPKiPiiii
-    // corresponds to: aiter::DecodeTopK::topk_per_row_decode<1024, false, 4>
-    static AiterAsmKernel impl_topk_decode(
-        "_ZN5aiter10DecodeTopKL19topk_per_row_decodeILi1024ELb0ELi4EEEvPKfPKiPiiii",
-        "/topk_per_row_decode/asm_top_k_per_row_decode.co");
-
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(logits));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    // The mangled name: _ZN5aiter10DecodeTopKL19topk_per_row_decodeILi1024ELb0ELi4EEEvPKfPKiPiiii
+    // corresponds to: aiter::DecodeTopK::topk_per_row_decode<1024, false, 4>
+    static AiterAsmKernel<{"_ZN5aiter10DecodeTopKL19topk_per_row_decodeILi1024ELb0ELi4EEEvPKfPKiPiiii", asm_top_k_per_row_decode_co}> impl_topk_decode;
 
     // Launch kernel configuration
     constexpr int kNumThreadsPerBlock = 1024;

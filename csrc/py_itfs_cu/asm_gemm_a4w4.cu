@@ -61,7 +61,7 @@ struct __attribute__((packed)) KernelArgs
     // p3 _p23;
 };
 
-static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
+static const CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
 {
 
 #if defined(__Float4_e2m1fn_x2)
@@ -83,33 +83,26 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
     }
 };
 
-std::tuple<std::string, int> get_heuristic_kernel(int M,
-                                                  int N,
-                                                  int K,
-                                                  std::string arch_id,
-                                                  std::optional<int> log2_k_split,
-                                                  std::optional<bool> bpreshuffle,
-                                                  CFG* cfgs)
+std::tuple<const CFG::Entry*, int> get_heuristic_kernel(int M,
+                                                        int N,
+                                                        int K,
+                                                        GPUArchId arch_id,
+                                                        std::optional<int> log2_k_split,
+                                                        std::optional<bool> bpreshuffle,
+                                                        const CFG* cfgs)
 {
-    hipDevice_t dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu        = dev_prop.multiProcessorCount;
+    uint32_t num_cu        = get_num_cu();
     uint32_t empty_cu      = num_cu;
     uint32_t tg_num        = 0;
     uint32_t round         = 0xffffffff;
     float compute2mem_effi = 1.0;
     int log2_k_split_en    = (log2_k_split.has_value() && log2_k_split.value() != 0) ? 1 : 0;
     int bpreshuffle_en     = (bpreshuffle.has_value() && !bpreshuffle) ? 0 : 1;
-    std::string selectedKernelName = "";
+    const CFG::Entry* selectedCfg = nullptr;
     int selectedsplitK             = 1;
 
-    for(const auto& el : *cfgs)
+    for(const auto& cfg : cfgs->get_configs_for_arch(arch_id))
     {
-        if(el.first.find(arch_id) != 0)
-            continue;
-        const auto& cfg = el.second;
         if(cfg.bpreshuffle == bpreshuffle_en &&
            (cfg.splitK >= log2_k_split_en))
         {
@@ -141,7 +134,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
                         round              = local_round;
                         empty_cu           = local_round * num_cu - tg_num;
                         compute2mem_effi   = local_compute2mem_effi;
-                        selectedKernelName = el.first;
+                        selectedCfg        = &cfg;
                         selectedsplitK     = splitK;
                     }
                 }
@@ -149,11 +142,11 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
         }
     }
 
-    TORCH_CHECK(selectedKernelName != "", __func__, ": cannot get heuristic kernel!");
+    TORCH_CHECK(selectedCfg != nullptr, __func__, ": cannot get heuristic kernel!");
     int log2_result = 0;
     while(selectedsplitK >>= 1)
         ++log2_result;
-    return std::make_tuple(selectedKernelName, log2_result);
+    return std::make_tuple(selectedCfg, log2_result);
 }
 
 // A4W4 asm gemm kernel
@@ -200,7 +193,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    CFG* config_map          = get_cfg(A, out);
+    const CFG* config_map          = get_cfg(A, out);
     using DictKey            = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
     struct SimpleHash
     {
@@ -213,56 +206,41 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                    std::hash<int>()(log2_key) ^ std::hash<bool>()(shuffle_key);
         }
     };
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash>
-        heuristic_kernel_dict;
+    static SynchronizedCache<DictKey, std::tuple<const CFG::Entry*, int>, SimpleHash>
+        heuristic_kernel_cache;
 
     if(config_map->empty())
     {
         TORCH_CHECK(false, __func__, " no kernel support a4w4 for this gpu arch");
     }
 
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-
-    std::string arch_id = get_gpu_arch();
-    kernelName          = kernelName.empty() ? "" : arch_id + kernelName;
-
+    auto arch_id          = get_gpu_arch();
+    const CFG::Entry* cfg = nullptr;
     int selectedksplit = log2_k_split.has_value() ? log2_k_split.value() : 0;
     if(kernelName.empty())
     {
-        auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle));
-        if(it != heuristic_kernel_dict.end())
-        {
-            auto res       = it->second;
-            kernelName     = std::get<0>(res);
-            selectedksplit = std::get<1>(res);
-        }
-        else
-        {
-            auto it = get_heuristic_kernel(
-                Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
-
-            kernelName     = std::get<0>(it);
-            selectedksplit = std::get<1>(it);
-            heuristic_kernel_dict[{Mdim, Ndim, Kdim, log2_k_split, bpreshuffle}] =
-                std::make_tuple(kernelName, selectedksplit);
-        }
+        std::tie(cfg, selectedksplit) = heuristic_kernel_cache.get_or_create(
+            DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle), [&]() {
+                return get_heuristic_kernel(
+                    Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
+            });
+    }
+    else
+    {
+        cfg = config_map->find_config_by_kernel_name(arch_id, kernelName);
     }
 
-    AiterAsmKernel* impl_ptr = nullptr;
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
     int SUBM                 = 0;
     int SUBN                 = 0;
     int gdz                  = 1;
 
-    auto it = config_map->find(kernelName);
-    if(it != config_map->end())
+    if(impl_ptr != nullptr)
     {
-        const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        SUBM                = cfg.tile_M;
-        SUBN                = cfg.tile_N;
+        SUBM                = cfg->tile_M;
+        SUBN                = cfg->tile_N;
 
-        if(cfg.splitK == 1)
+        if(cfg->splitK == 1)
         {
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
@@ -273,13 +251,6 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
             k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
             gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
         }
-
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
     }
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);

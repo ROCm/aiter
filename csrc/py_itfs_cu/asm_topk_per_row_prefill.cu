@@ -5,6 +5,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
+#include "asm_topk_per_row_prefill_code_objects.hpp"
 
 struct __attribute__((packed)) TopKDecodeKernelArgs
 {
@@ -51,13 +52,10 @@ void top_k_per_row_prefill_fast(const torch::Tensor& logits,
     args.stride0        = static_cast<int32_t>(stride0);
     args.stride1        = static_cast<int32_t>(stride1);
 
-    // Load the compiled assembly kernel
-    static AiterAsmKernel impl_topk_decode(
-        "_ZN5aiter11PrefillTopKL10topKPerRowILi1024ELi2048ELi2048ELi512EEEvPvPKfPKiS6_PiPfii",
-        "/topk_per_row_prefill/asm_top_k_per_row_prefill.co");
-
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(logits));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    static AiterAsmKernel<{"_ZN5aiter11PrefillTopKL10topKPerRowILi1024ELi2048ELi2048ELi512EEEvPvPKfPKiS6_PiPfii", asm_top_k_per_row_prefill_co}> impl_topk_decode;
 
     // Launch kernel configuration
     constexpr int kNumThreadsPerBlock = 1024;
