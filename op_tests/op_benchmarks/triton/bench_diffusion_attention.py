@@ -118,12 +118,13 @@ def run_aiter_fp8_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
             "k_descale": k_descale,
             "v_descale": v_descale,
         }
-    fn = lambda: aiter.flash_attn_fp8_pertensor_func(
-        q,
-        k,
-        v,
-        **attn_kwargs,
-    )
+    def fn():
+        return aiter.flash_attn_fp8_pertensor_func(
+            q,
+            k,
+            v,
+            **attn_kwargs,
+        )
     return fn
     # torch.cuda.synchronize()
     #return output
