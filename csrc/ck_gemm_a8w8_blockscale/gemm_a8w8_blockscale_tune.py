@@ -99,9 +99,9 @@ def run_ck_gemm_a8w8_blockscale_bpreshuffle(
     )
 
 
-def generate_cktile_data(m, n, k, seed, device="cuda"):
+def generate_data(m, n, k, seed, device="cuda"):
     """
-    Generate random data for testing cktile gemm a8w8 blockscale kernel.
+    Generate random data for testing gemm a8w8 blockscale kernel.
     """
 
     torch.manual_seed(seed)
@@ -114,30 +114,12 @@ def generate_cktile_data(m, n, k, seed, device="cuda"):
     )
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
-    weight_shuffle_16x16 = shuffle_weight_cktile(weight, layout=(16, 16))
-    weight_shuffle_32x32 = shuffle_weight_cktile(weight, layout=(32, 32))
-    out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
-    return x, weight, x_scale, w_scale, out, weight_shuffle_16x16, weight_shuffle_32x32
-
-def generate_ck_data(m, n, k, seed, device="cuda"):
-    """
-    Generate random data for testing ck gemm a8w8 blockscale kernel.
-    """
-    
-    torch.manual_seed(seed)
-    block_shape_n, block_shape_k = block_shape
-    scale_n = (n + block_shape_n - 1) // block_shape_n
-    scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = (torch.rand((m, k), dtype=dtypes.fp16, device=device) / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp16, device=device) / 10).to(
-        dtypes.fp8
-    )
-    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
-    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
-    weight_shuffle = shuffle_weight(weight, layout=(16, 16))
+    ck_weight_shuffle = shuffle_weight(weight, layout=(16, 16))
+    cktile_weight_shuffle_16x16 = shuffle_weight_cktile(weight, layout=(16, 16))
+    cktile_weight_shuffle_32x32 = shuffle_weight_cktile(weight, layout=(32, 32))
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    return x, weight_shuffle, x_scale_t, w_scale, out, weight, x_scale
+    return x, weight, x_scale, w_scale, out, cktile_weight_shuffle_16x16, cktile_weight_shuffle_32x32, ck_weight_shuffle, x_scale_t
 
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
@@ -209,8 +191,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         tasks_ck_tile = []
         for i in range(kernels_num):
             kernel = candidate_kernels_cktile_dict[i]
-            if kernel.N_Warp_Tile == 32:
-                gemm_a8w8_idx = [0, 6 if preshuffleB else 1, 2, 3, 4]
+            # if kernel.N_Warp_Tile == 32:
+            #     gemm_a8w8_idx = [0, 6 if preshuffleB else 1, 2, 3, 4]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -228,7 +210,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 tasks_ck_tile.append(
                     (
                         info,
-                        generate_cktile_data,
+                        generate_data,
                         (M, N, K, seed),
                         run_cktile_gemm_a8w8_blockscale,
                         (
@@ -262,8 +244,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         (cu_num, M, N, K) = info_keys
         kernel_dict = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
         kernels_num = len(kernel_dict)
-        gemm_a8w8_idx = [0, 1 if preshuffleB else 5, 2 if preshuffleB else 6, 3, 4]
-        ref_data_idx = [0, 5, 6, 3]
+        gemm_a8w8_idx = [0, 7 if preshuffleB else 1, 8 if preshuffleB else 2, 3, 4]
+        ref_data_idx = [0, 1, 2, 3]
         tasks_ck = []
         for i in range(kernels_num):
             kernel = kernel_dict[i]
@@ -284,7 +266,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 tasks_ck.append(
                     (
                         info,
-                        generate_ck_data,
+                        generate_data,
                         (M, N, K, seed),
                         run_ck_gemm_a8w8_blockscale_bpreshuffle if preshuffleB else run_ck_gemm_a8w8_blockscale,
                         (
