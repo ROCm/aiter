@@ -5,9 +5,9 @@
 #include <string>
 
 namespace aiter {
-std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
+std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, GPUArchId arch_id)
 {
-    if(hdim_q == 192 && hdim_v == 128 && arch_id == "gfx950")
+    if(hdim_q == 192 && hdim_v == 128 && arch_id == GPUArchId::gfx950)
         return std::make_tuple(hdim_q, hdim_v);
     assert(hdim_q == hdim_v);
     if(hdim_q <= 64)
@@ -27,53 +27,44 @@ std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id
     return std::make_tuple(hdim_q, hdim_v);
 }
 
-std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::string data_type,
-                                                                       std::string arch_id,
-                                                                       int seqlen_q,
-                                                                       int seqlen_k,
-                                                                       int hdim_q,
-                                                                       int hdim_v,
-                                                                       int mask_type,
-                                                                       bool atomic32,
-                                                                       int bf16_cvt,
-                                                                       bool mode,
-                                                                       CFG* pre_cfgs,
-                                                                       CFG* cfgs,
-                                                                       CFG* post_cfgs)
+std::tuple<const CFG::Entry*, const CFG::Entry*, const CFG::Entry*>
+get_heuristic_kernel(std::string data_type,
+                     GPUArchId arch_id,
+                     int seqlen_q,
+                     int seqlen_k,
+                     int hdim_q,
+                     int hdim_v,
+                     int mask_type,
+                     bool atomic32,
+                     int bf16_cvt,
+                     bool mode,
+                     const CFG* pre_cfgs,
+                     const CFG* cfgs,
+                     const CFG* post_cfgs)
 {
     auto [padded_hdim_q, padded_hdim_v] = get_padded_hdim(hdim_q, hdim_v, arch_id);
     int pddv                            = (padded_hdim_q != hdim_q) || (padded_hdim_v != hdim_v);
     int pssk;
     int ts_kv = 0;
 
-    std::string preProcessingKernelName  = "";
-    std::string dQdKdVKernelName         = "";
-    std::string postProcessingKernelName = "";
+    const CFG::Entry* preProcessingCfg  = nullptr;
+    const CFG::Entry* dQdKdVCfg         = nullptr;
+    const CFG::Entry* postProcessingCfg = nullptr;
 
-    for(const auto& el : *pre_cfgs)
+    for(const auto& cfg : pre_cfgs->get_configs_for_arch(arch_id))
     {
-        if(el.first.find(arch_id) != 0)
-            continue;
-        const auto& cfg = el.second;
-
         if((cfg.dtype == data_type) && (cfg.hdim_v == padded_hdim_v) && (cfg.mode == mode))
         {
-            preProcessingKernelName = el.first;
+            preProcessingCfg = &cfg;
             break;
         }
     }
 
-    for(const auto& el : *cfgs)
+    for(const auto& cfg : cfgs->get_configs_for_arch(arch_id))
     {
-        if(el.first.find(arch_id) != 0)
-        {
-            continue;
-        }
-        const auto& cfg = el.second;
-
         if((cfg.dtype == data_type) && (cfg.hdim_q == padded_hdim_q) &&
            (cfg.hdim_v == padded_hdim_v) && (cfg.mask == mask_type) && (cfg.atomic32 == atomic32) &&
-           ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))) &&
+           ((arch_id == GPUArchId::gfx950) || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))) &&
            (cfg.mode == mode))
         {
             int tmp_ts_kv = 0;
@@ -82,7 +73,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
                 ts_kv     = cfg.ts;
                 tmp_ts_kv = ts_kv;
                 if(cfg.atomic32 == 0 &&
-                   ((arch_id == "gfx942") || (el.first.find("recompile") != std::string::npos)))
+                   ((arch_id == GPUArchId::gfx942) || (cfgs->get_kernel_name_for_config(&cfg).find("recompile") != std::string::npos)))
                 {
 
                     tmp_ts_kv = 64;
@@ -91,38 +82,34 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
             }
             if((cfg.pssk == pssk) && (cfg.pddv == pddv))
             {
-                dQdKdVKernelName = el.first;
+                dQdKdVCfg = &cfg;
                 break;
             }
             else if((cfg.pssk >= pssk) && (cfg.pddv >= pddv))
             {
-                dQdKdVKernelName = el.first;
+                dQdKdVCfg = &cfg;
             }
         }
     }
 
     if(!post_cfgs)
     {
-        return std::make_tuple(preProcessingKernelName, dQdKdVKernelName, postProcessingKernelName);
+        return std::make_tuple(preProcessingCfg, dQdKdVCfg, nullptr);
     }
 
-    for(const auto& el : *post_cfgs)
+    for(const auto& cfg : post_cfgs->get_configs_for_arch(arch_id))
     {
-        if(el.first.find(arch_id) != 0)
-            continue;
-        const auto& cfg = el.second;
-
         if((cfg.hdim_q == padded_hdim_q) && (cfg.mode == mode) &&
-           ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))))
+           ((arch_id == GPUArchId::gfx950) || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))))
         {
             if((cfg.dtype == data_type) || (atomic32 == 0))
             {
-                postProcessingKernelName = el.first;
+                postProcessingCfg = &cfg;
                 break;
             }
         }
     }
-    return std::make_tuple(preProcessingKernelName, dQdKdVKernelName, postProcessingKernelName);
+    return std::make_tuple(preProcessingCfg, dQdKdVCfg, postProcessingCfg);
 }
 
 float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
@@ -236,11 +223,11 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
-    std::string arch_id = get_gpu_arch();
+    auto arch_id = get_gpu_arch();
 
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
        (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic) ||
-       ((arch_id != "gfx942") && (arch_id != "gfx950")))
+       ((arch_id != GPUArchId::gfx942) && (arch_id != GPUArchId::gfx950)))
     {
         return -1;
     }
@@ -248,7 +235,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     auto pre_cfgs    = &cfg_fmha_bwd_odo;
     auto dqdkdv_cfgs = &cfg_fmha_bwd_dqdkdv;
     auto post_cfgs   = [&]() {
-        if(arch_id == "gfx950")
+        if(arch_id == GPUArchId::gfx950)
         {
             if(a.v3_atomic_fp32)
             {
@@ -267,29 +254,29 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             }
             else
             {
-                return static_cast<CFG*>(nullptr);
+                return static_cast<const CFG*>(nullptr);
             }
         }
     }();
 
     bool need_post_processing =
-        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
+        ((arch_id == GPUArchId::gfx950) && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
 
-    auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
-                                                                         arch_id,
-                                                                         a.seqlen_q,
-                                                                         a.seqlen_k,
-                                                                         a.hdim_q,
-                                                                         a.hdim_v,
-                                                                         a.mask_type,
-                                                                         a.v3_atomic_fp32,
-                                                                         a.v3_bf16_cvt,
-                                                                         a.is_group_mode,
-                                                                         pre_cfgs,
-                                                                         dqdkdv_cfgs,
-                                                                         post_cfgs);
+    auto [pre_cfg, dqdkdv_cfg, post_cfg] = get_heuristic_kernel(a.data_type,
+                                                                arch_id,
+                                                                a.seqlen_q,
+                                                                a.seqlen_k,
+                                                                a.hdim_q,
+                                                                a.hdim_v,
+                                                                a.mask_type,
+                                                                a.v3_atomic_fp32,
+                                                                a.v3_bf16_cvt,
+                                                                a.is_group_mode,
+                                                                pre_cfgs,
+                                                                dqdkdv_cfgs,
+                                                                post_cfgs);
 
-    if((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == "")))
+    if((pre_cfg == nullptr) || (dqdkdv_cfg == nullptr) || (need_post_processing && (post_cfg == nullptr)))
     {
         return -1;
     }
@@ -298,76 +285,18 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     int ts_kv;
     int ts_dq;
     int arg_size;
+    AiterAsmKernel<>* impl_ptr_pre    = nullptr;
+    AiterAsmKernel<>* impl_ptr_dqdkdv = nullptr;
+    AiterAsmKernel<>* impl_ptr_post   = nullptr;
 
-    AiterAsmKernel* impl_ptr_pre    = nullptr;
-    AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
-    AiterAsmKernel* impl_ptr_post   = nullptr;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-
-    auto it_pre = pre_cfgs->find(pre_kernel);
-    if(it_pre != pre_cfgs->end())
+    impl_ptr_pre    = pre_cfgs->load_kernel_for_config(pre_cfg);
+    ts_odo          = pre_cfg->ts;
+    impl_ptr_dqdkdv = dqdkdv_cfgs->load_kernel_for_config(dqdkdv_cfg);
+    ts_kv           = dqdkdv_cfg->ts;
+    if(post_cfg != nullptr)
     {
-        const auto& cfg     = it_pre->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        ts_odo              = cfg.ts;
-
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-
-        impl_ptr_pre = result.first->second.get();
-    }
-    else
-    {
-        return -1;
-    }
-
-    auto it_dqdkdv = dqdkdv_cfgs->find(dqdkdv_kernel);
-    if(it_dqdkdv != dqdkdv_cfgs->end())
-    {
-        const auto& cfg     = it_dqdkdv->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        ts_kv               = cfg.ts;
-
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-
-        impl_ptr_dqdkdv = result.first->second.get();
-    }
-    else
-    {
-        return -1;
-    }
-
-    if(need_post_processing)
-    {
-        auto it_post = post_cfgs->find(post_kernel);
-        if(it_post != post_cfgs->end())
-        {
-            const auto& cfg     = it_post->second;
-            const char* name    = cfg.knl_name.c_str();
-            const char* co_name = cfg.co_name.c_str();
-            ts_dq               = cfg.ts;
-
-            auto result = impl_ptr_map.emplace(name, nullptr);
-            if(result.second)
-            {
-                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-            }
-
-            impl_ptr_post = result.first->second.get();
-        }
-        else
-        {
-            return -1;
-        }
+        impl_ptr_post = post_cfgs->load_kernel_for_config(post_cfg);
+        ts_dq         = post_cfg->ts;
     }
 
     if(a.v3_api_check)
