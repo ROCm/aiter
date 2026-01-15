@@ -10,7 +10,9 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import deserialize_str
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
-from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import _get_config as _get_fp4_config
+from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+    _get_config as _get_fp4_config,
+)
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _get_config as _get_fp8_config,
 )
@@ -31,19 +33,18 @@ def set_use_gemm_splitk_bf16(value: bool):
     _USE_GEMM_SPLITK_BF16 = value
 
 
-
 def fused_fp4_bmm_rope_cat_and_cache_mla(
-    q_nope: torch.Tensor,          
-    w_k: torch.Tensor,             
-    w_k_scale: torch.Tensor,  
-    q_pe: torch.Tensor,            
-    k_nope: torch.Tensor,          
-    k_rope: torch.Tensor,          
-    kv_cache: torch.Tensor,        
-    slot_mapping: torch.Tensor,    
-    positions: torch.Tensor,       
-    cos: torch.Tensor,          
-    sin: torch.Tensor,          
+    q_nope: torch.Tensor,
+    w_k: torch.Tensor,
+    w_k_scale: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
     y: Optional[torch.Tensor] = None,
     transpose_bm: bool = True,
     prequant: bool = True,
@@ -119,7 +120,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
 
     qh, b, p = q_nope.shape
     qh_w, n, k_packed = w_k.shape
-    k = k_packed * 2  
+    k = k_packed * 2
 
     b2, qh2, d_pe = q_pe.shape
 
@@ -129,21 +130,29 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
-    assert qh == qh_w == qh2, f"Query head dimensions must match: {qh} vs {qh_w} vs {qh2}"
+    assert (
+        qh == qh_w == qh2
+    ), f"Query head dimensions must match: {qh} vs {qh_w} vs {qh2}"
     assert b == b2, f"Batch dimensions must match: {b} vs {b2}"
     assert bk == bk2, f"K batch dimensions must match: {bk} vs {bk2}"
-    assert kh == kh2 == h_cache, f"KV head dimensions must match: {kh} vs {kh2} vs {h_cache}"
+    assert (
+        kh == kh2 == h_cache
+    ), f"KV head dimensions must match: {kh} vs {kh2} vs {h_cache}"
     assert b_slot <= bk, f"slot_mapping batch must not exceed k batch: {b_slot} > {bk}"
     assert b <= bk, f"q batch must not exceed k batch: {b} > {bk}"
     assert qh % kh == 0, f"Query heads must be multiple of KV heads: {qh} % {kh} != 0"
     assert p == k, f"BMM K dimension mismatch: q_nope has {p}, w_k (unpacked) has {k}"
-    assert n == kv_lora_rank, f"BMM output dim must match kv_lora_rank: {n} vs {kv_lora_rank}"
-    assert kv_lora_rank + qk_rope_head_dim == d_cache, \
-        f"k_nope + k_rope dims must equal kv_cache dim: {kv_lora_rank} + {qk_rope_head_dim} != {d_cache}"
+    assert (
+        n == kv_lora_rank
+    ), f"BMM output dim must match kv_lora_rank: {n} vs {kv_lora_rank}"
+    assert (
+        kv_lora_rank + qk_rope_head_dim == d_cache
+    ), f"k_nope + k_rope dims must equal kv_cache dim: {kv_lora_rank} + {qk_rope_head_dim} != {d_cache}"
 
     d_freq = cos.shape[-1]
-    assert (d_freq == d_pe // 2) or (d_freq == d_pe), \
-        f"cos/sin last dim should be half or equal to d_pe: {d_freq} vs {d_pe}"
+    assert (d_freq == d_pe // 2) or (
+        d_freq == d_pe
+    ), f"cos/sin last dim should be half or equal to d_pe: {d_freq} vs {d_pe}"
     assert (
         num_decode_toks_for_zeros >= 0
     ), "num_decode_toks_for_zeros must be non-negative to avoid invalid tensor creation"
@@ -236,7 +245,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         y_pp = None
         c_ptr = q_out
         stride_cb = q_out.stride(1)
-        stride_ck = 0                
+        stride_ck = 0
         stride_cm = q_out.stride(0)
         stride_cn = q_out.stride(2)
 
@@ -370,26 +379,20 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
 
 
 def fused_fp8_bmm_rope_cat_and_cache_mla(
-
-    q_nope: torch.Tensor,          
-    w_k: torch.Tensor,            
-    w_k_scale: torch.Tensor,      
-
-
-    q_pe: torch.Tensor,           
-    k_nope: torch.Tensor,         
-    k_rope: torch.Tensor,          
-    kv_cache: torch.Tensor,       
-    slot_mapping: torch.Tensor,   
-    positions: torch.Tensor,      
-    cos: torch.Tensor,            
-    sin: torch.Tensor,            
-
-
+    q_nope: torch.Tensor,
+    w_k: torch.Tensor,
+    w_k_scale: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
     group_size: int = 128,
     transpose_bm: bool = True,
     config: Optional[dict] = None,
-
     k_scale: Optional[torch.Tensor] = None,
     is_neox: bool = False,
     q_out_dtype: Optional[torch.dtype] = torch.bfloat16,
@@ -455,7 +458,6 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     if k_scale is not None and not isinstance(k_scale, torch.Tensor):
         k_scale = torch.tensor(k_scale, dtype=torch.float32, device=q_nope.device)
 
-
     qh, b, p = q_nope.shape
     qh_w, n, k = w_k.shape
 
@@ -467,22 +469,32 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
-    assert qh == qh_w == qh2, f"Query head dimensions must match: {qh} vs {qh_w} vs {qh2}"
+    assert (
+        qh == qh_w == qh2
+    ), f"Query head dimensions must match: {qh} vs {qh_w} vs {qh2}"
     assert b == b2, f"Batch dimensions must match: {b} vs {b2}"
     assert bk == bk2, f"K batch dimensions must match: {bk} vs {bk2}"
-    assert kh == kh2 == h_cache, f"KV head dimensions must match: {kh} vs {kh2} vs {h_cache}"
+    assert (
+        kh == kh2 == h_cache
+    ), f"KV head dimensions must match: {kh} vs {kh2} vs {h_cache}"
     assert b_slot <= bk, f"slot_mapping batch must not exceed k batch: {b_slot} > {bk}"
     assert b <= bk, f"q batch must not exceed k batch: {b} > {bk}"
     assert qh % kh == 0, f"Query heads must be multiple of KV heads: {qh} % {kh} != 0"
     assert p == k, f"BMM K dimension mismatch: q_nope has {p}, w_k has {k}"
-    assert n == kv_lora_rank, f"BMM output dim must match kv_lora_rank: {n} vs {kv_lora_rank}"
-    assert kv_lora_rank + qk_rope_head_dim == d_cache, \
-        f"k_nope + k_rope dims must equal kv_cache dim: {kv_lora_rank} + {qk_rope_head_dim} != {d_cache}"
-    assert triton.next_power_of_2(group_size) == group_size, "group_size must be power of 2"
+    assert (
+        n == kv_lora_rank
+    ), f"BMM output dim must match kv_lora_rank: {n} vs {kv_lora_rank}"
+    assert (
+        kv_lora_rank + qk_rope_head_dim == d_cache
+    ), f"k_nope + k_rope dims must equal kv_cache dim: {kv_lora_rank} + {qk_rope_head_dim} != {d_cache}"
+    assert (
+        triton.next_power_of_2(group_size) == group_size
+    ), "group_size must be power of 2"
 
     d_freq = cos.shape[-1]
-    assert (d_freq == d_pe // 2) or (d_freq == d_pe), \
-        f"cos/sin last dim should be half or equal to d_pe: {d_freq} vs {d_pe}"
+    assert (d_freq == d_pe // 2) or (
+        d_freq == d_pe
+    ), f"cos/sin last dim should be half or equal to d_pe: {d_freq} vs {d_pe}"
     assert (
         num_decode_toks_for_zeros >= 0
     ), "num_decode_toks_for_zeros must be non-negative to avoid invalid tensor creation"
@@ -490,16 +502,14 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
 
     w_k_t = w_k.transpose(1, 2)
 
-
     M = b
     N = kv_lora_rank
     K = k
 
     if config is None:
         config, _ = _get_fp8_config(M, N, K)
-    
-    config["BLOCK_SIZE_K"] = group_size
 
+    config["BLOCK_SIZE_K"] = group_size
 
     num_pid_m = triton.cdiv(M, config["BLOCK_SIZE_M"])
     num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
@@ -514,7 +524,6 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     total_programs = bmm_programs + rope_programs + prefill_programs
 
     grid = (total_programs, 1, 1)
-
 
     if q_out_dtype is None:
         q_out_dtype = torch.bfloat16
@@ -543,9 +552,9 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         device=q_nope.device,
     )
 
-    stride_cb = q_out.stride(1)  
-    stride_cm = q_out.stride(0)  
-    stride_cn = q_out.stride(2)  
+    stride_cb = q_out.stride(1)
+    stride_cm = q_out.stride(0)
+    stride_cn = q_out.stride(2)
 
     DTYPE_MAX = (
         torch.finfo(w_k_t.dtype).max
@@ -640,5 +649,3 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
-
-    

@@ -12,15 +12,20 @@ from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
     fused_fp4_bmm_rope_cat_and_cache_mla,
     fused_fp8_bmm_rope_cat_and_cache_mla,
 )
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import generate_batched_gemm_a16wfp4_inputs
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
+    generate_batched_gemm_a16wfp4_inputs,
+)
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
-) 
+)
 
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import generate_batched_gemm_a16w8_inputs
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+    generate_batched_gemm_a16w8_inputs,
+)
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
+
 
 @pytest.mark.parametrize("T", [1, 2, 32, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
@@ -102,57 +107,64 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
         )[0]
     slot_mapping = torch.randperm(T, device="cuda")
     kv_cache_og_dtype = kv_cache.dtype
-        
-    ref_q_nope_out = batched_gemm_a16wfp4(q_nope.transpose(0, 1), w_k, w_k_scale, dtype, transpose_bm=True, prequant=True, y_scale=None)
+
+    ref_q_nope_out = batched_gemm_a16wfp4(
+        q_nope.transpose(0, 1),
+        w_k,
+        w_k_scale,
+        dtype,
+        transpose_bm=True,
+        prequant=True,
+        y_scale=None,
+    )
 
     ref_kv_cache = kv_cache.clone()
     if cache_dtype == torch.uint8:
         ref_kv_cache = ref_kv_cache.view(cache_dtype_actual)
-    ref_q, ref_decode_q_pe, ref_k_pe, ref_zeros = (
-        fused_qk_rope_cat_and_cache_mla(
-            ref_q_nope_out,
-            q_pe,
-            k_lora,
-            k_pe,
-            ref_kv_cache,
-            slot_mapping,
-            positions,
-            cos,
-            sin,
-            k_scale=k_scale,
-            is_neox=(rotate_style == RotateStyle.NEOX),
-            num_decode_toks_for_zeros=T,
-            apply_scale=(k_pe.dtype != kv_cache.dtype),
-            decode_q_pe_out=None,
-            k_pe_out=None,
-        )
-    )
-    ref_kv_cache = ref_kv_cache.view(kv_cache_og_dtype)
-
-    
-    triton_kv_cache = kv_cache.clone()
-    if cache_dtype == torch.uint8:
-        triton_kv_cache = triton_kv_cache.view(cache_dtype_actual)
-    triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = fused_fp4_bmm_rope_cat_and_cache_mla(
-        q_nope.transpose(0, 1),
-        w_k,
-        w_k_scale,
-        q_pe,                   
+    ref_q, ref_decode_q_pe, ref_k_pe, ref_zeros = fused_qk_rope_cat_and_cache_mla(
+        ref_q_nope_out,
+        q_pe,
         k_lora,
         k_pe,
-        triton_kv_cache,
+        ref_kv_cache,
         slot_mapping,
         positions,
         cos,
         sin,
-        y=None,
-        transpose_bm=True,
-        prequant=True,
-        y_scale=None,
         k_scale=k_scale,
         is_neox=(rotate_style == RotateStyle.NEOX),
-        q_out_dtype=None,
         num_decode_toks_for_zeros=T,
+        apply_scale=(k_pe.dtype != kv_cache.dtype),
+        decode_q_pe_out=None,
+        k_pe_out=None,
+    )
+    ref_kv_cache = ref_kv_cache.view(kv_cache_og_dtype)
+
+    triton_kv_cache = kv_cache.clone()
+    if cache_dtype == torch.uint8:
+        triton_kv_cache = triton_kv_cache.view(cache_dtype_actual)
+    triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
+        fused_fp4_bmm_rope_cat_and_cache_mla(
+            q_nope.transpose(0, 1),
+            w_k,
+            w_k_scale,
+            q_pe,
+            k_lora,
+            k_pe,
+            triton_kv_cache,
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            y=None,
+            transpose_bm=True,
+            prequant=True,
+            y_scale=None,
+            k_scale=k_scale,
+            is_neox=(rotate_style == RotateStyle.NEOX),
+            q_out_dtype=None,
+            num_decode_toks_for_zeros=T,
+        )
     )
     triton_kv_cache = triton_kv_cache.view(kv_cache_og_dtype)
 
@@ -175,6 +187,7 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     )
 
     torch.testing.assert_close(ref_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
+
 
 @pytest.mark.parametrize("T", [1, 2, 32, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
@@ -203,7 +216,15 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
     QH = QH_per_KH * KH
 
     q_nope, w_k, w_k_scale, _, _ = generate_batched_gemm_a16w8_inputs(
-        QH, T, D_q_nope, D_lora, dtype, has_bias=False, output=False, layout="TN", transpose_bm=True
+        QH,
+        T,
+        D_q_nope,
+        D_lora,
+        dtype,
+        has_bias=False,
+        output=False,
+        layout="TN",
+        transpose_bm=True,
     )
 
     _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
@@ -248,8 +269,17 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
     slot_mapping = torch.randperm(T, device="cuda")
     kv_cache_og_dtype = kv_cache.dtype
 
-    ref_q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-        q_nope, w_k, w_k_scale, group_size=128, bias=None, dtype=dtype, YQ=None, transpose_bm=True
+    ref_q_nope_out = (
+        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+            q_nope,
+            w_k,
+            w_k_scale,
+            group_size=128,
+            bias=None,
+            dtype=dtype,
+            YQ=None,
+            transpose_bm=True,
+        )
     )
 
     ref_kv_cache = kv_cache.clone()
@@ -280,30 +310,34 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
     if cache_dtype == torch.uint8:
         triton_kv_cache = triton_kv_cache.view(cache_dtype_actual)
 
-    triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = fused_fp8_bmm_rope_cat_and_cache_mla(
-        q_nope,
-        w_k,
-        w_k_scale,
-        q_pe,
-        k_lora,
-        k_pe,
-        triton_kv_cache,
-        slot_mapping,
-        positions,
-        cos,
-        sin,
-        group_size=128,
-        transpose_bm=True,
-        config=None,
-        k_scale=k_scale,
-        is_neox=(rotate_style == RotateStyle.NEOX),
-        q_out_dtype=dtype,
-        num_decode_toks_for_zeros=T,
+    triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
+        fused_fp8_bmm_rope_cat_and_cache_mla(
+            q_nope,
+            w_k,
+            w_k_scale,
+            q_pe,
+            k_lora,
+            k_pe,
+            triton_kv_cache,
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            group_size=128,
+            transpose_bm=True,
+            config=None,
+            k_scale=k_scale,
+            is_neox=(rotate_style == RotateStyle.NEOX),
+            q_out_dtype=dtype,
+            num_decode_toks_for_zeros=T,
+        )
     )
     triton_kv_cache = triton_kv_cache.view(kv_cache_og_dtype)
 
     torch.testing.assert_close(ref_q, triton_q, atol=1e-1, rtol=1e-1)
-    torch.testing.assert_close(ref_decode_q_pe, triton_decode_q_pe, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(
+        ref_decode_q_pe, triton_decode_q_pe, atol=1e-1, rtol=1e-1
+    )
     torch.testing.assert_close(ref_k_pe, triton_k_pe, atol=1e-1, rtol=1e-1)
     torch.testing.assert_close(ref_zeros, triton_zeros, atol=0.1, rtol=0.1)
 

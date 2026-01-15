@@ -68,6 +68,7 @@ _fused_fp8_bmm_rope_cat_and_cache_mla_repr = make_kernel_repr(
     ],
 )
 
+
 @triton.jit
 def _unit_rope(
     x_ptrs,
@@ -107,48 +108,48 @@ def _unit_rope(
 )
 @triton.jit(repr=_fused_fp4_bmm_rope_cat_and_cache_mla_repr)
 def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
-    a_ptr,                       
-    b_ptr,                      
-    b_scales_ptr,              
-    c_ptr,                   
-    c_scale_ptr,               
-    q_pe_ptr,                 
-    k_nope_ptr,              
-    k_pe_ptr,                    
-    pos_ptr,                    
-    cos_ptr,                    
-    sin_ptr,                    
-    q_out_ptr,                 
-    decode_q_pe_out_ptr,       
-    k_pe_out_ptr,              
-    q_nope_zeros_out_ptr,       
-    kv_cache_ptr,               
-    slot_mapping_ptr,           
-    M,                           
-    N,                           
-    K,                           
-    B,                           
-    B_slot,                     
+    a_ptr,
+    b_ptr,
+    b_scales_ptr,
+    c_ptr,
+    c_scale_ptr,
+    q_pe_ptr,
+    k_nope_ptr,
+    k_pe_ptr,
+    pos_ptr,
+    cos_ptr,
+    sin_ptr,
+    q_out_ptr,
+    decode_q_pe_out_ptr,
+    k_pe_out_ptr,
+    q_nope_zeros_out_ptr,
+    kv_cache_ptr,
+    slot_mapping_ptr,
+    M,
+    N,
+    K,
+    B,
+    B_slot,
     num_decode_toks_for_zeros,
-    QH,                          
-    KH,                          
-    bmm_programs,                
-    grid_mn,                     
-    num_pid_m,                   
-    num_pid_n,                   
-    stride_ab,                   
-    stride_am,                   
-    stride_ak,                   
-    stride_bb,                   
-    stride_bn,                  
-    stride_bk,                  
-    stride_bsb,                  
-    stride_bsn,                 
-    stride_bsk,                 
-    stride_cb,                   
-    stride_ck,                  
-    stride_cm,                   
-    stride_cn,                   
+    QH,
+    KH,
+    bmm_programs,
+    grid_mn,
+    num_pid_m,
+    num_pid_n,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bn,
+    stride_bk,
+    stride_bsb,
+    stride_bsn,
+    stride_bsk,
+    stride_cb,
+    stride_ck,
+    stride_cm,
+    stride_cn,
     q_pe_stride_b,
     q_pe_stride_h,
     q_pe_stride_d,
@@ -186,10 +187,10 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
     QH_PER_KH: tl.constexpr,
     REUSE_FREQS_FRONT_PART: tl.constexpr,
     IS_NEOX: tl.constexpr,
-    BLOCK_D_nope: tl.constexpr,      
-    BLOCK_DK_nope: tl.constexpr,    
-    BLOCK_D_pe: tl.constexpr,       
-    BLOCK_D_HALF_pe: tl.constexpr,  
+    BLOCK_D_nope: tl.constexpr,
+    BLOCK_DK_nope: tl.constexpr,
+    BLOCK_D_pe: tl.constexpr,
+    BLOCK_D_HALF_pe: tl.constexpr,
     PRE_QUANT: tl.constexpr,
     OUTPUT_Q_NOPE_ZEROS: tl.constexpr,
     HAVE_Y_SCALE: tl.constexpr,
@@ -253,7 +254,9 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
 
         if NUM_KSPLIT == 1:
             # remap_xcd(pid_tile, GRID_MN)
-            pid_m, pid_n = pid_grid(pid_tile, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+            pid_m, pid_n = pid_grid(
+                pid_tile, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M
+            )
         else:
             pid_m = pid_tile // num_pid_n
             pid_n = pid_tile % num_pid_n
@@ -303,10 +306,14 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                     b = tl.load(b_ptrs, cache_modifier=cache_modifier)
                 else:
                     a_bf16 = tl.load(
-                        a_ptrs, mask=offs_k_bf16[None, :] < K - k_idx * BLOCK_SIZE_K, other=0
+                        a_ptrs,
+                        mask=offs_k_bf16[None, :] < K - k_idx * BLOCK_SIZE_K,
+                        other=0,
                     )
                     b = tl.load(
-                        b_ptrs, mask=offs_k[:, None] < K - k_idx * (BLOCK_SIZE_K // 2), other=0
+                        b_ptrs,
+                        mask=offs_k[:, None] < K - k_idx * (BLOCK_SIZE_K // 2),
+                        other=0,
                     )
 
                 if PRE_QUANT:
@@ -405,11 +412,15 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 + pid_hq * decode_q_pe_out_stride_h
                 + d_pe_offs * decode_q_pe_out_stride_d
             )
-            tl.store(decode_q_pe_out_ptrs, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty))
+            tl.store(
+                decode_q_pe_out_ptrs, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty)
+            )
 
         if OUTPUT_Q_NOPE_ZEROS:
             if pid_adjusted < num_decode_toks_for_zeros * QH:
-                z = tl.zeros((BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+                z = tl.zeros(
+                    (BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
+                )
                 tl.store(
                     q_nope_zeros_out_ptr
                     + pid_b * q_nope_zeros_out_stride_b
@@ -474,7 +485,9 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_hk * kv_cache_stride_h
                 )
 
-                tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope_scaled)
+                tl.store(
+                    kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope_scaled
+                )
                 tl.store(
                     kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
                     k_pe_scaled,
@@ -535,12 +548,13 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_hk * kv_cache_stride_h
                 )
 
-                tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope_scaled)
+                tl.store(
+                    kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope_scaled
+                )
                 tl.store(
                     kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
                     k_pe_scaled,
                 )
-
 
 
 @triton.jit(repr=_fused_fp4_bmm_reduce_repr)
@@ -607,7 +621,6 @@ def _fused_fp4_bmm_reduce_kernel(
     tl.store(c_out_ptrs, c, mask=c_mask)
 
 
-
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -617,42 +630,42 @@ def _fused_fp4_bmm_reduce_kernel(
 )
 @triton.jit(repr=_fused_fp8_bmm_rope_cat_and_cache_mla_repr)
 def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
-    a_ptr,                       
-    b_ptr,                       
-    b_scale_ptr,                 
-    c_ptr,                       
-    q_pe_ptr,                    
-    k_nope_ptr,                  
-    k_pe_ptr,                    
-    pos_ptr,                     
-    cos_ptr,                     
-    sin_ptr,                     
-    decode_q_pe_out_ptr,         
-    k_pe_out_ptr,                
-    q_nope_zeros_out_ptr,        
-    kv_cache_ptr,                
-    slot_mapping_ptr,            
-    M,                           
-    N,                           
-    K,                           
-    B,                           
-    B_slot,                      
+    a_ptr,
+    b_ptr,
+    b_scale_ptr,
+    c_ptr,
+    q_pe_ptr,
+    k_nope_ptr,
+    k_pe_ptr,
+    pos_ptr,
+    cos_ptr,
+    sin_ptr,
+    decode_q_pe_out_ptr,
+    k_pe_out_ptr,
+    q_nope_zeros_out_ptr,
+    kv_cache_ptr,
+    slot_mapping_ptr,
+    M,
+    N,
+    K,
+    B,
+    B_slot,
     num_decode_toks_for_zeros,
-    QH,                          
-    KH,                          
-    bmm_programs,                
-    grid_mn,                     
-    num_pid_m,                   
-    num_pid_n,                   
-    stride_ab,                   
-    stride_am,                  
-    stride_ak,                  
-    stride_bb,                   
-    stride_bk,                  
-    stride_bn,                 
-    stride_cb,                  
-    stride_cm,                   
-    stride_cn,                  
+    QH,
+    KH,
+    bmm_programs,
+    grid_mn,
+    num_pid_m,
+    num_pid_n,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    stride_bn,
+    stride_cb,
+    stride_cm,
+    stride_cn,
     q_pe_stride_b,
     q_pe_stride_h,
     q_pe_stride_d,
@@ -789,14 +802,20 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
-                a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k_idx * BLOCK_SIZE_K, other=0.0)
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_idx * BLOCK_SIZE_K, other=0.0)
+                a = tl.load(
+                    a_ptrs, mask=offs_k[None, :] < K - k_idx * BLOCK_SIZE_K, other=0.0
+                )
+                b = tl.load(
+                    b_ptrs, mask=offs_k[:, None] < K - k_idx * BLOCK_SIZE_K, other=0.0
+                )
 
             # Per-token group quantization
             m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
             a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
             a_scale_recip = 1.0 / a_scale
-            a = tl.clamp(a * a_scale_recip, -DTYPE_MAX, DTYPE_MAX).to(b_ptr.dtype.element_ty)
+            a = tl.clamp(a * a_scale_recip, -DTYPE_MAX, DTYPE_MAX).to(
+                b_ptr.dtype.element_ty
+            )
 
             accumulator += tl.dot(a, b, input_precision="ieee") * a_scale
 
@@ -878,11 +897,15 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 + pid_hq * decode_q_pe_out_stride_h
                 + d_pe_offs * decode_q_pe_out_stride_d
             )
-            tl.store(decode_q_pe_out_ptrs, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty))
+            tl.store(
+                decode_q_pe_out_ptrs, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty)
+            )
 
         if OUTPUT_Q_NOPE_ZEROS:
             if pid_adjusted < num_decode_toks_for_zeros * QH:
-                z = tl.zeros((BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+                z = tl.zeros(
+                    (BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
+                )
                 tl.store(
                     q_nope_zeros_out_ptr
                     + pid_b * q_nope_zeros_out_stride_b
@@ -947,7 +970,9 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_hk * kv_cache_stride_h
                 )
 
-                tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope_scaled)
+                tl.store(
+                    kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope_scaled
+                )
                 tl.store(
                     kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
                     k_pe_scaled,
@@ -1008,9 +1033,10 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                     + pid_hk * kv_cache_stride_h
                 )
 
-                tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope_scaled)
+                tl.store(
+                    kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope_scaled
+                )
                 tl.store(
                     kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
                     k_pe_scaled,
                 )
-                
