@@ -59,6 +59,7 @@ std::string getHipblasltKernelName(int solution_index);
 
 int get_algoIdx_hip_tuning_csv(
   const std::string filename, hipblasLtHandle_t handle,
+  const bool bpreshuffle, const bool use_rowwise,
   const hipblasOperation_t trans_a, const hipblasOperation_t trans_b,
   const int32_t m, const int32_t n, const int32_t k,
   const hipDataType A_data_type, const int32_t lda, const int64_t stride_a,
@@ -68,6 +69,7 @@ int get_algoIdx_hip_tuning_csv(
 
 void append_hip_tuning_csv(
   hipblasLtMatmulAlgo_t& algo, const std::string filename,
+  bool bpreshuffle, bool use_rowwise,
   hipblasOperation_t trans_a, hipblasOperation_t trans_b,int m, int n, int k,
   hipDataType A_data_type, int32_t lda, int64_t stride_a,
   hipDataType B_data_type, int32_t ldb, int64_t stride_b,
@@ -80,3 +82,4 @@ hipblasStatus_t hipblasLt_online_tuning(
     const void* A, const void* B, void* C,
     void* workspace, size_t workspaceSize, const void* alpha, const void* beta,
     std::vector<hipblasLtMatmulHeuristicResult_t>& tunedResults, hipStream_t steam);
+

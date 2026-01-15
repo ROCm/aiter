@@ -290,6 +290,7 @@ inline void post_gpu_time(hipEvent_t&  event_gpu_time_start,
 */
 int get_algoIdx_hip_tuning_csv(
   const std::string filename, hipblasLtHandle_t handle,
+  const bool bpreshuffle, const bool use_rowwise,
   const hipblasOperation_t trans_a, const hipblasOperation_t trans_b,
   const int32_t m, const int32_t n, const int32_t k,
   const hipDataType A_data_type, const int32_t lda, const int64_t stride_a,
@@ -300,6 +301,17 @@ int get_algoIdx_hip_tuning_csv(
   std::ifstream file(filename);
   if (!file.is_open())
     return -1;
+
+  auto boolToString = [](bool val) -> const char* {
+    switch (val) {
+        case true:
+          return "true";
+        case false:
+          return "false";
+	default:
+          return "<?>";
+    }
+  };
 
   auto opToString = [](hipblasOperation_t op) -> std::string_view {
     switch (op) {
@@ -326,6 +338,8 @@ int get_algoIdx_hip_tuning_csv(
     }
   };
 
+  const std::string_view key_bpreshuffle  = boolToString(bpreshuffle);
+  const std::string_view key_use_rowwise  = boolToString(use_rowwise);
   const std::string_view key_trans_a  = opToString(trans_a);
   const std::string_view key_trans_b  = opToString(trans_b);
   const std::string_view key_A_type   = dataTypeToString(A_data_type);
@@ -345,7 +359,7 @@ int get_algoIdx_hip_tuning_csv(
 
     if (skip_header) {
       skip_header = false;
-      if (line.rfind("trans_a", 0) == 0)
+      if (line.rfind("bpreshuffle", 0) == 0)
         continue;
     }
 
@@ -360,56 +374,58 @@ int get_algoIdx_hip_tuning_csv(
     }
     cols.emplace_back(line.data() + start, line.size() - start);
 
-    if (cols.size() != 18)
+    if (cols.size() != 20)
       continue;
 
     char* e = nullptr;
     long v = 0;
     long long llv = 0;
 
-    if (cols[0] != key_trans_a) continue;
-    if (cols[1] != key_trans_b) continue;
-
-    v = std::strtol(cols[2].data(), &e, 10);
-    if (e != cols[2].data() + cols[2].size() || v != m) continue;
-
-    v = std::strtol(cols[3].data(), &e, 10);
-    if (e != cols[3].data() + cols[3].size() || v != n) continue;
+    if (cols[0] != key_bpreshuffle) continue;
+    if (cols[1] != key_use_rowwise) continue;
+    if (cols[2] != key_trans_a) continue;
+    if (cols[3] != key_trans_b) continue;
 
     v = std::strtol(cols[4].data(), &e, 10);
-    if (e != cols[4].data() + cols[4].size() || v != k) continue;
+    if (e != cols[4].data() + cols[4].size() || v != m) continue;
 
-    if (cols[5] != key_A_type) continue;
+    v = std::strtol(cols[5].data(), &e, 10);
+    if (e != cols[5].data() + cols[5].size() || v != n) continue;
 
     v = std::strtol(cols[6].data(), &e, 10);
-    if (e != cols[6].data() + cols[6].size() || v != lda) continue;
+    if (e != cols[6].data() + cols[6].size() || v != k) continue;
 
-    llv = std::strtoll(cols[7].data(), &e, 10);
-    if (e != cols[7].data() + cols[7].size() || llv != stride_a) continue;
+    if (cols[7] != key_A_type) continue;
 
-    if (cols[8] != key_B_type) continue;
+    v = std::strtol(cols[8].data(), &e, 10);
+    if (e != cols[8].data() + cols[8].size() || v != lda) continue;
 
-    v = std::strtol(cols[9].data(), &e, 10);
-    if (e != cols[9].data() + cols[9].size() || v != ldb) continue;
+    llv = std::strtoll(cols[9].data(), &e, 10);
+    if (e != cols[9].data() + cols[9].size() || llv != stride_a) continue;
 
-    llv = std::strtoll(cols[10].data(), &e, 10);
-    if (e != cols[10].data() + cols[10].size() || llv != stride_b) continue;
+    if (cols[10] != key_B_type) continue;
 
-    if (cols[11] != key_C_type) continue;
+    v = std::strtol(cols[11].data(), &e, 10);
+    if (e != cols[11].data() + cols[11].size() || v != ldb) continue;
 
-    v = std::strtol(cols[12].data(), &e, 10);
-    if (e != cols[12].data() + cols[12].size() || v != ldc) continue;
+    llv = std::strtoll(cols[12].data(), &e, 10);
+    if (e != cols[12].data() + cols[12].size() || llv != stride_b) continue;
 
-    llv = std::strtoll(cols[13].data(), &e, 10);
-    if (e != cols[13].data() + cols[13].size() || llv != stride_c) continue;
+    if (cols[13] != key_C_type) continue;
 
-    if (cols[14] != key_compute) continue;
+    v = std::strtol(cols[14].data(), &e, 10);
+    if (e != cols[14].data() + cols[14].size() || v != ldc) continue;
 
-    v = std::strtol(cols[15].data(), &e, 10);
-    if (e != cols[15].data() + cols[15].size() || v != batch_count) continue;
+    llv = std::strtoll(cols[15].data(), &e, 10);
+    if (e != cols[15].data() + cols[15].size() || llv != stride_c) continue;
 
-    v = std::strtol(cols[16].data(), &e, 10);
-    if (e != cols[16].data() + cols[16].size()) continue;
+    if (cols[16] != key_compute) continue;
+
+    v = std::strtol(cols[17].data(), &e, 10);
+    if (e != cols[17].data() + cols[17].size() || v != batch_count) continue;
+
+    v = std::strtol(cols[18].data(), &e, 10);
+    if (e != cols[18].data() + cols[18].size()) continue;
 
     return static_cast<int>(v);
   }
@@ -422,6 +438,7 @@ int get_algoIdx_hip_tuning_csv(
 */
 void append_hip_tuning_csv(
   hipblasLtMatmulAlgo_t& algo, const std::string filename,
+  bool bpreshuffle, bool use_rowwise,
   hipblasOperation_t trans_a, hipblasOperation_t trans_b,int m, int n, int k,
   hipDataType A_data_type, int32_t lda, int64_t stride_a,
   hipDataType B_data_type, int32_t ldb, int64_t stride_b,
@@ -440,13 +457,24 @@ void append_hip_tuning_csv(
 
   // If the file is new or empty, write header first
   if (write_header_if_missing && (!file_exists || file_empty)) {
-    file << "trans_a, trans_b, m, n, k, A_data_type, lda, stride_a, B_data_type, ldb, stride_b, C_data_type, ldc, stride_c, compute_type, batch_count, algo_index, kernel_name" << "\n";
+    file << "preshuffle, use_rowwise, trans_a, trans_b, m, n, k, A_data_type, lda, stride_a, B_data_type, ldb, stride_b, C_data_type, ldc, stride_c, compute_type, batch_count, algo_index, kernel_name" << "\n";
   }
     
   int algo_index = -1;
   algo_index         = hipblaslt_ext::getIndexFromAlgo(algo);
   std::string kernel_name = "NA";
   kernel_name = std::string(hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, algo));
+
+  auto boolToString = [](bool val) -> const char* {
+    switch (val) {
+        case true:
+          return "true";
+        case false:
+          return "false";
+	default:
+          return "<?>";
+    }
+  };
 
   auto opToString = [](hipblasOperation_t op) -> const char* {
     switch (op) {
@@ -484,7 +512,9 @@ void append_hip_tuning_csv(
   };
 
   std::ostringstream oss;
-  oss << opToString(trans_a) << ","
+  oss << boolToString(bpreshuffle) << ","
+      << boolToString(use_rowwise) << "," 
+      << opToString(trans_a) << ","
       << opToString(trans_b) << ","
       << m << ","
       << n << ","
@@ -748,6 +778,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     // load tuning cache file and check if the gemm has been already tuned
     if (std::getenv("HIP_ONLINE_TUNING")!= nullptr && n <= decode_max_n) { 
       solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
+                                                  bpreshuffle, use_rowwise,
                                                   op_A, op_B, m, n, k,
                                                   intype, lda, 0,
                                                   intype, ldb, 0,
@@ -762,7 +793,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
       if (std::getenv("HIP_ONLINE_TUNING") != nullptr && n <= decode_max_n) {
         std::cout << "Tuning hip GEMM (" << m << ", " << n << ", " << k << ")\n";
         hipblasLt_online_tuning(      
-	    handle, m, n, k,
+	        handle, m, n, k,
             matmul, matA, matB, matC,
             a, b, c,
             d_workspace, workspace_size, alpha, beta,
@@ -770,6 +801,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
       
         append_hip_tuning_csv(
             heuristicResult[0].algo, "./hip_online_tuning_res.csv",
+            bpreshuffle, use_rowwise,
             op_A, op_B, m, n, k,
             intype, lda, 0,
             intype, ldb, 0,
@@ -1306,4 +1338,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("bpreshuffle") = false);
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }
+
 
