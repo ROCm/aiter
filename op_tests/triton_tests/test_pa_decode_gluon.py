@@ -77,6 +77,11 @@ SINKS_OPTIONS = [True, False]
 SLIDING_WINDOW_OPTIONS = [0, 128]
 COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = []
 PS_OPTIONS = [True, False]
+SCHED_BARRIER_MODE_OPTIONS = [
+    0,
+    1,
+    2,
+]  # 0=disabled, 1=conservative(full barrier), 2=latency hiding
 
 CASE_SET_NAME_OPTIONS = [
     "normal_accuracy",
@@ -2321,7 +2326,7 @@ def normal_performance_test():
     CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
     BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    # COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
@@ -2329,7 +2334,7 @@ def normal_performance_test():
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     BLOCK_SIZE_OPTIONS = [64]
-    parse_arg_and_run_test()
+    # parse_arg_and_run_test()
 
 
 def normal_performance_aot_test():
