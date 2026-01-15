@@ -7,7 +7,6 @@ from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_A8W8_BATCHED_GEMM
 from aiter.utility.base_tuner import GemmCommonTuner
 from batched_gemm_a8w8_common import kernels_list
-import argparse
 from aiter.utility.mp_tuner import mp_tuner
 
 
