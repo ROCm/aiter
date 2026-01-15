@@ -99,7 +99,7 @@ def _attn_fwd_no_mask(
     ACCUMULATOR_TYPE,
 ):
     if USE_EXP2:
-        RCP_LN2: tl.constexpr = 1.4426950408889634
+        pass
 
     k_descale_ptr = k_descale_base_ptr
     if V_QUANT_SCHEME == 0:
