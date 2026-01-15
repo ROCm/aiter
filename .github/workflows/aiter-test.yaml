@@ -161,7 +161,7 @@ jobs:
   multi-gpu:
     needs: define-runners
     # only run multi-gpu tests on main branch due to limited multi-gpu resources
-    if: github.ref == 'refs/heads/main' 
+    # if: github.ref == 'refs/heads/main' 
     strategy:
       fail-fast: false
       matrix:
@@ -187,6 +187,25 @@ jobs:
 
       - name: Clean up Rocm processes
         run: ./.github/scripts/clean_up_rocm.sh
+
+      - name: Update RCCL
+        run: |
+          set -ex
+          echo "Remove current RCCL"
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "pip show rccl || true && pip uninstall -y rccl || true"
+          echo "Updating RCCL..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "pip install cmake && git clone https://github.com/ROCm/rccl.git /app/rccl/ && cd /app/rccl/ && python setup.py install"
+          echo "Check RCCL version..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "pip show rccl || true"
 
       - name: Run the container
         run: |
