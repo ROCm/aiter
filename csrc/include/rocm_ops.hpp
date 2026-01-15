@@ -820,6 +820,7 @@ namespace py = pybind11;
           py::arg("q_descale")     = std::nullopt, \
           py::arg("k_descale")     = std::nullopt, \
           py::arg("v_descale")     = std::nullopt, \
+          py::arg("sink_ptr")      = std::nullopt, \
           py::arg("gen")           = std::nullopt);
 
 #define LIBMHA_FWD_PYBIND                          \
@@ -904,46 +905,48 @@ namespace py = pybind11;
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
 
-#define MOE_CK_2STAGES_PYBIND                       \
-    m.def("ck_moe_stage1",                          \
-          &ck_moe_stage1,                           \
-          py::arg("hidden_states"),                 \
-          py::arg("w1"),                            \
-          py::arg("w2"),                            \
-          py::arg("sorted_token_ids"),              \
-          py::arg("sorted_expert_ids"),             \
-          py::arg("num_valid_ids"),                 \
-          py::arg("out"),                           \
-          py::arg("topk"),                          \
-          py::arg("kernelName")     = std::nullopt, \
-          py::arg("w1_scale")       = std::nullopt, \
-          py::arg("a1_scale")       = std::nullopt, \
-          py::arg("block_m")        = 32,           \
-          py::arg("sorted_weights") = std::nullopt, \
-          py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0,            \
-          py::arg("splitk")         = 1,            \
-          py::arg("dst_type")       = std::nullopt);      \
-                                                    \
-    m.def("ck_moe_stage2",                          \
-          &ck_moe_stage2,                           \
-          py::arg("inter_states"),                  \
-          py::arg("w1"),                            \
-          py::arg("w2"),                            \
-          py::arg("sorted_token_ids"),              \
-          py::arg("sorted_expert_ids"),             \
-          py::arg("num_valid_ids"),                 \
-          py::arg("out"),                           \
-          py::arg("topk"),                          \
-          py::arg("kernelName")     = std::nullopt, \
-          py::arg("w2_scale")       = std::nullopt, \
-          py::arg("a2_scale")       = std::nullopt, \
-          py::arg("block_m")        = 32,           \
-          py::arg("sorted_weights") = std::nullopt, \
-          py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0,            \
-          py::arg("splitk")         = 1,            \
-          py::arg("dst_type")       = std::nullopt);
+#define MOE_CK_2STAGES_PYBIND                          \
+    m.def("ck_moe_stage1",                             \
+          &ck_moe_stage1,                              \
+          py::arg("hidden_states"),                    \
+          py::arg("w1"),                               \
+          py::arg("w2"),                               \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("out"),                              \
+          py::arg("topk"),                             \
+          py::arg("kernelName")        = std::nullopt, \
+          py::arg("w1_scale")          = std::nullopt, \
+          py::arg("a1_scale")          = std::nullopt, \
+          py::arg("block_m")           = 32,           \
+          py::arg("sorted_weights")    = std::nullopt, \
+          py::arg("quant_type")        = 0,            \
+          py::arg("activation")        = 0,            \
+          py::arg("splitk")            = 1,            \
+          py::arg("non_temporal_load") = false,        \
+          py::arg("dst_type")          = std::nullopt);         \
+                                                       \
+    m.def("ck_moe_stage2",                             \
+          &ck_moe_stage2,                              \
+          py::arg("inter_states"),                     \
+          py::arg("w1"),                               \
+          py::arg("w2"),                               \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("out"),                              \
+          py::arg("topk"),                             \
+          py::arg("kernelName")        = std::nullopt, \
+          py::arg("w2_scale")          = std::nullopt, \
+          py::arg("a2_scale")          = std::nullopt, \
+          py::arg("block_m")           = 32,           \
+          py::arg("sorted_weights")    = std::nullopt, \
+          py::arg("quant_type")        = 0,            \
+          py::arg("activation")        = 0,            \
+          py::arg("splitk")            = 1,            \
+          py::arg("non_temporal_load") = false,        \
+          py::arg("dst_type")          = std::nullopt);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \
@@ -1016,7 +1019,8 @@ namespace py = pybind11;
           py::arg("v_descale")           = std::nullopt, \
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
-          py::arg("cu_seqlens_k_padded") = std::nullopt);
+          py::arg("cu_seqlens_k_padded") = std::nullopt, \
+          py::arg("sink_ptr")            = std::nullopt);
 
 #define MHA_BATCH_PREFILL_PYBIND                       \
     m.def("mha_batch_prefill",                         \
@@ -1047,6 +1051,7 @@ namespace py = pybind11;
           py::arg("kv_last_page_lens") = std::nullopt, \
           py::arg("block_table")       = std::nullopt, \
           py::arg("seqlen_k")          = std::nullopt, \
+          py::arg("sink_ptr")          = std::nullopt, \
           py::arg("gen")               = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \

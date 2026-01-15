@@ -142,6 +142,7 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr
+                        nullptr, // sink_ptr
                         total_q,
                         total_k,
                         b,
