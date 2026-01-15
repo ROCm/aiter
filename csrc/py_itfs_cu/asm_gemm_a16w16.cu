@@ -57,23 +57,19 @@ struct __attribute__((packed)) KernelArgs
     p2 _p21;
 };
 
-std::tuple<std::string, int>
+std::tuple<const CFG::Entry*, int>
 get_heuristic_kernel(int M,
                      int N,
                      int K,
-                     CFG* cfgs,
-                     std::string arch_id,
+                     const CFG* cfgs,
+                     GPUArchId arch_id,
                      bool bpreshuffle,
                      int add_bias,
                      std::optional<int> splitk             = std::nullopt,
                      std::optional<std::string> kernelName = std::nullopt)
 {
     TORCH_CHECK(K % 64 == 0, __func__, " Kdim must be divisible by 64 !"); // load min size is 128b
-    hipDevice_t dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu = dev_prop.multiProcessorCount;
+    uint32_t num_cu = get_num_cu();
 
     uint32_t empty_cu      = num_cu;
     uint32_t pure_tg_num   = 0;
@@ -81,15 +77,13 @@ get_heuristic_kernel(int M,
     float compute2mem_effi = 1.0;
     int oob                = M;
 
-    std::string selectedKernelName = "";
+    const CFG::Entry* selectedCfg = nullptr;
     int selectedsplitK             = 1;
 
-    for(const auto& el : *cfgs)
+    for(const auto& cfg : cfgs->get_configs_for_arch(arch_id))
     {
-        if(el.first.find(arch_id) != 0)
-            continue;
-        const auto& cfg = el.second;
-        if(kernelName.has_value() && el.first != (arch_id + kernelName.value()))
+
+        if(kernelName.has_value() && cfgs->get_kernel_name_for_config(&cfg) !=  kernelName.value())
             continue;
         // check specified kernel name
         if(kernelName.has_value())
@@ -98,7 +92,7 @@ get_heuristic_kernel(int M,
                             (add_bias == 0 || cfg.bias == 1),
                         __func__,
                         " The specified kernel name ",
-                        el.first,
+                        kernelName.value(),
                         " cannot support the input shape (N=",
                         N,
                         ", tileN=",
@@ -108,7 +102,7 @@ get_heuristic_kernel(int M,
                         ", bias=",
                         add_bias,
                         ").");
-            selectedKernelName = el.first;
+            selectedCfg = &cfg;
             if(splitk.has_value())
             {
                 selectedsplitK = splitk.value();
@@ -119,7 +113,7 @@ get_heuristic_kernel(int M,
                             " The specified splitK ",
                             selectedsplitK,
                             " cannot be supported by the specified kernel or Kdim",
-                            el.first,
+                            kernelName.value(),
                             ".");
                 break;
             }
@@ -161,37 +155,15 @@ get_heuristic_kernel(int M,
                 empty_cu           = local_round * num_cu - tg_num;
                 compute2mem_effi   = local_compute2mem_effi;
                 oob                = (M % cfg.tileM == 0) ? 0 : cfg.tileM - (M % cfg.tileM);
-                selectedKernelName = el.first;
+                selectedCfg        = &cfg;
                 selectedsplitK     = split_K;
             }
         }
     }
-    TORCH_CHECK(
-        selectedKernelName != "", __func__, " not find kernel for bf16gemm~ " + selectedKernelName);
-    return std::make_tuple(selectedKernelName, selectedsplitK);
-}
-
-AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
-                                   CFG* config_map,
-                                   unsigned int& SUBM,
-                                   unsigned int& SUBN)
-{
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-
-    auto it_kl = config_map->find(selectedKernelName);
-    TORCH_CHECK(it_kl != config_map->end(), __func__, " not find kernel~ " + selectedKernelName);
-
-    const auto& cfg     = it_kl->second;
-    const char* name    = cfg.knl_name.c_str();
-    const char* co_name = cfg.co_name.c_str();
-    SUBM                = cfg.tileM;
-    SUBN                = cfg.tileN;
-
-    auto result = impl_ptr_map.emplace(name, nullptr);
-    if(result.second)
-        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-
-    return result.first->second.get();
+    TORCH_CHECK(selectedCfg != nullptr,
+                __func__,
+                " not find kernel for bf16gemm~ " + kernelName.value_or(""));
+    return std::make_tuple(selectedCfg, selectedsplitK);
 }
 
 torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
@@ -207,13 +179,10 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
                     out.dtype() == torch::ScalarType::BFloat16,
                 "GEMM A16W16 asm only support Float32 or Bf16 output now!");
 
-    std::string arch_id = get_gpu_arch();
-    int Mdim            = A.size(0);
-    int Ndim            = B.size(0);
-    int Kdim            = A.size(1);
-
-    unsigned int SUBM = 32;
-    unsigned int SUBN = 64;
+    auto arch_id = get_gpu_arch();
+    int Mdim     = A.size(0);
+    int Ndim     = B.size(0);
+    int Kdim     = A.size(1);
 
     KernelArgs args = {};
     args.ptr_D      = (void*)out.data_ptr();
@@ -232,15 +201,17 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,
     args.is_out_b16                 = (out.dtype() == torch::ScalarType::BFloat16) ? 1 : 0;
     args.add_bias                   = bias.has_value() ? 1 : 0;
 
-    CFG* config_map = &cfg_bf16gemm_fp32bf16;
+    const CFG* config_map = &cfg_bf16gemm_fp32bf16;
 
-    auto [name, split] = get_heuristic_kernel(
+    auto [cfg, split] = get_heuristic_kernel(
         Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, splitK, kernelName);
     args.splitk              = split;
-    AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
+    int SUBM = cfg->tileM;
+    int SUBN = cfg->tileN;
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
     int gdz = split;
