@@ -8,6 +8,8 @@ import sys
 import argparse
 import aiter
 import triton
+import sys
+import logging
 
 from aiter.ops.triton.mha import (
     flash_attn_func,
@@ -42,8 +44,6 @@ layout_converter = {
 reversed_layout_converter = {v: k for k, v in layout_converter.items()}
 
 # test_mha.py configures root logging to DEBUG on import; reset to INFO to avoid noisy deps
-import logging
-
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -848,6 +848,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
-
     sys.exit(main())
