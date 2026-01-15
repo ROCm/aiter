@@ -144,7 +144,7 @@ struct HkMlaDecodeFwdParams
 // [0, 568-575], [1, 568-575], ..., [31, 568-575]  (by warp 7)
 //
 // @param p_lds_kv_warp_fixed here is expected to be the start address of the warp:
-//        p_lds_kv + warp_idx * kWarpOffset(264).
+//        p_lds_kv + warp_idx * kWarpOffset(272).
 // @param row: the row index loaded from p_kv_indices.
 // @param col_base: the base column index which should be:
 //        warp_idx * kNumColsPerWarp(8) + lane_idx % kNumColThreads(2) * kNumBytesPerThrPerRnd(4)
@@ -180,7 +180,7 @@ __device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv_warp_fixed
     const uintptr_t p_lds_kv_warp =
         p_lds_kv_warp_fixed + kColOffset / kNumColsPerWarp * kWarpOffset;
 
-    if(row == -1)
+    if(kCheckBoundary && (row == -1))
     {
         const uintptr_t p_lds_kv_lane = p_lds_kv_warp + lane_idx * kNumBytesPerThrPerRnd;
         // Use flat instruction here for easy synchronization.
@@ -230,7 +230,6 @@ __device__ __forceinline__ void load_k_to_gpr(RT& dst, const uintptr_t p_lds_kv)
     static_assert(((kColOffset % 32) == 0) && (kColOffset < 576),
                   "load_k_to_gpr(): Unsupported column offset!");
 
-    const uint32_t warp_idx = ckt::get_warp_id();
     const uint32_t lane_idx = ckt::get_lane_id();
 
     // // equivalent with kFixedOffset=0
@@ -256,7 +255,7 @@ __device__ __forceinline__ void load_k_to_gpr(RT& dst, const uintptr_t p_lds_kv)
 // Load un-transposed vector from LDS to GPR.
 typedef uint32_t v8ui __attribute__((ext_vector_type(8)));
 template <typename T>
-__device__ __forceinline__ void load_v_to_gpr(v8ui* p_result, const uintptr_t p_lds_vt)
+__device__ __forceinline__ void load_v_to_gpr(v8ui* p_result, const uintptr_t p_lds_v)
 {
     using kv_t = T::kv_t;
 
@@ -274,15 +273,17 @@ __device__ __forceinline__ void load_v_to_gpr(v8ui* p_result, const uintptr_t p_
     const uint32_t warp_idx = ckt::get_warp_id();
     const uint32_t lane_idx = ckt::get_lane_id();
 
-    // Each warp takes 16x128 elements. Each thread takes 4x8 elements
-    const uint32_t row = (warp_idx % 2) * 16 + lane_idx / 16;
+    // Each warp takes 16x128 elements. Each thread takes 4x8 elements block-wise column-major
+    // layout.
+    const uint32_t row = (warp_idx % 2) * 16 + lane_idx / 16 * 4;
     const uint32_t col = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
 
-    const uintptr_t p_lds_vt_lane =
-        p_lds_vt + row * 8 * sizeof(kv_t) + col / kNumColsPerWarp * kWarpOffset;
+    const uintptr_t p_lds_v_lane =
+        p_lds_v + row * 8 * sizeof(kv_t) +
+        col / kNumColsPerWarp * kWarpOffset /*+ col % kNumColsPerWarp * sizeof(kv_t)*/;
 
-    const uint4 pass_0 = hkm::ds_read_b128(p_lds_vt_lane, 0);
-    const uint4 pass_1 = hkm::ds_read_b128(p_lds_vt_lane, 128);
+    const uint4 pass_0 = hkm::ds_read_b128(p_lds_v_lane, 0);
+    const uint4 pass_1 = hkm::ds_read_b128(p_lds_v_lane, 4 * sizeof(uint32_t));
 
     *p_result = {pass_0.x, pass_0.y, pass_0.z, pass_0.w, pass_1.x, pass_1.y, pass_1.z, pass_1.w};
 }
@@ -294,36 +295,64 @@ __device__ __forceinline__ void store_transposed_v_to_lds(const uintptr_t p_lds_
     using kv_t = T::kv_t;
 
     /// TODO: These parameters should reside in Traits.
-    // In the view of thread block on loading
-    constexpr uint32_t kNumRows = 32;
-    constexpr uint32_t kNumCols = 64;
-    // In the view of warp on loading
-    constexpr uint32_t kNumColsPerWarp = kNumCols / T::kNumWarps;    // 64/8=8
-    constexpr uint32_t kNumElemPerWarp = kNumRows * kNumColsPerWarp; // 32*8=256
-    constexpr uint32_t kNumPaddingDw   = 4;                          // Skip 4 banks.
-    constexpr uint32_t kWarpOffset =
-        kNumElemPerWarp * sizeof(kv_t) + kNumPaddingDw * sizeof(uint32_t); // 256*1+4*4=272
+    constexpr uint32_t kNumRowsPerThr    = 4;
+    constexpr uint32_t kNumColsPerThr    = 8;
+    constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
+    constexpr uint32_t kNumBlocksPerRow  = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
 
     const uint32_t warp_idx = ckt::get_warp_id();
     const uint32_t lane_idx = ckt::get_lane_id();
 
-    // Each warp takes 16x128 elements. Each thread takes 4x8 elements
-    const uint32_t row = (warp_idx % 2) * 16 + lane_idx / 16;
-    const uint32_t col = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
-
-    /// TODO: Same as load_v_to_gpr(), try to merge them.
-    const uintptr_t p_lds_vt_lane =
-        p_lds_vt + row * 8 * sizeof(kv_t) + col / kNumColsPerWarp * kWarpOffset;
+    // 4x8 block-wise row major layout. No padding between rows or columns.
+    const uint32_t row          = (warp_idx % 2) * 16 + lane_idx / 16 * 4;
+    const uint32_t col          = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
+    const uint32_t block_offset = (row / kNumRowsPerThr * kNumBlocksPerRow + col / kNumColsPerThr) *
+                                  kNumElemsPerBlock * sizeof(kv_t);
+    const uintptr_t p_lds_vt_lane = p_lds_vt + block_offset;
 
     const uint4 pass_0 = uint4(v_transposed[0], v_transposed[1], v_transposed[2], v_transposed[3]);
     const uint4 pass_1 = uint4(v_transposed[4], v_transposed[5], v_transposed[6], v_transposed[7]);
 
     hkm::ds_write_b128(p_lds_vt_lane, 0, pass_0);
-    hkm::ds_write_b128(p_lds_vt_lane, 128, pass_1);
+    hkm::ds_write_b128(p_lds_vt_lane, sizeof(uint4), pass_1);
+}
+
+// load 32x32 block for each warp. Each threads takes 4x4 elements.
+template <typename T, uint32_t kColOffset, uint32_t GPR>
+__device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt)
+{
+    using kv_t = T::kv_t;
+
+    /// TODO: These parameters should reside in Traits.
+    constexpr uint32_t kNumRowsPerThr    = 4;
+    constexpr uint32_t kNumColsPerThr    = 8;
+    constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
+    constexpr uint32_t kNumBlocksPerRow  = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
+
+    static_assert(((kColOffset % 32) == 0) && (kColOffset < 512),
+                  "load_transpose_v_to_gpr(): Unsupported column offset!");
+
+    const uint32_t lane_idx = ckt::get_lane_id();
+
+    // calculate logical coordinate of up-left dw
+    const uint32_t row          = (lane_idx / 16) * 4 + (lane_idx % 4);
+    const uint32_t col          = kColOffset * 32 + ((lane_idx % 16) / 4) * 4;
+    const uint32_t block_offset = (row / kNumRowsPerThr * kNumBlocksPerRow + col / kNumColsPerThr) *
+                                  kNumElemsPerBlock * sizeof(kv_t);
+    const uint32_t lane_offset =
+        ((row % kNumRowsPerThr) * kNumColsPerThr + (col % kNumColsPerThr)) * sizeof(kv_t);
+
+    const uintptr_t p_lds_vt_ul_lane = p_lds_vt + block_offset + lane_offset;
+
+    hkm::ds_read_b32<GPR + 0>(p_lds_vt_ul_lane, 0);
+    hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kNumColsPerThr * 2 * sizeof(kv_t));
+    hkm::ds_read_b32<GPR + 2>(p_lds_vt_ul_lane, 16 * T::kVoHeadDim * sizeof(kv_t));
+    hkm::ds_read_b32<GPR + 3>(
+        p_lds_vt_ul_lane, 16 * T::kVoHeadDim * sizeof(kv_t) + kNumColsPerThr * 2 * sizeof(kv_t));
 }
 
 template <uint32_t kPart>
-__device__ __forceinline__ void store_transposed_v_to_lds(v8ui* p_v)
+__device__ __forceinline__ void transpose_v(v8ui* p_v)
 {
     constexpr uint32_t perm_0 = 0x05010400;
     constexpr uint32_t perm_1 = 0x05040100;
@@ -960,12 +989,26 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     typename T::st_kv_rope(&lds_k_rope) = al.allocate<typename T::st_kv_rope>();
     // Manually LDS manage. HK doesn't supports paged kv for now. We need the following info to
     // manually load data from VRAM to LDS. On loading LDS to GPR, HK function will be used.
-    // constexpr int32_t kSzLdsKNope = T::kBlockN * (T::kQkNopeHeadDim + 1);
-    // constexpr int32_t kSzLdsKRope = T::kBlockN * (T::kQkRopeHeadDim + 1);
-    constexpr int32_t kSzLdsKNope = T::kBlockN * T::kNopeLdsRowSz * sizeof(kv_t);
-    constexpr int32_t kSzLdsKRope = T::kBlockN * T::kRopeLdsRowSz * sizeof(kv_t);
-    uintptr_t p_lds_k_nope        = reinterpret_cast<uintptr_t>(p_lds);
-    uintptr_t p_lds_k_rope        = p_lds_k_nope + kSzLdsKNope;
+    constexpr uint32_t kSzLdsKNope = T::kBlockN * T::kNopeLdsRowSz * sizeof(kv_t);
+    constexpr uint32_t kSzLdsKRope = T::kBlockN * T::kRopeLdsRowSz * sizeof(kv_t);
+
+    /// TODO: These parameters should reside in Traits.
+    // In the view of thread block on loading
+    constexpr uint32_t kNumRows = 32;
+    constexpr uint32_t kNumCols = 64;
+    // In the view of warp on loading
+    constexpr uint32_t kNumColsPerWarp = kNumCols / T::kNumWarps;    // 64/8=8
+    constexpr uint32_t kNumElemPerWarp = kNumRows * kNumColsPerWarp; // 32*8=256
+    constexpr uint32_t kNumPaddingDw   = 4;                          // Skip 4 banks.
+    constexpr uint32_t kWarpOffset =
+        kNumElemPerWarp * sizeof(kv_t) + kNumPaddingDw * sizeof(uint32_t); // 256*1+4*4=272
+    constexpr uint32_t kSzLdsKvTest =
+        kWarpOffset * (T::kQkHeadDim / kNumColsPerWarp); // 272*(576/8)=19584
+
+    uintptr_t p_lds_k_nope  = reinterpret_cast<uintptr_t>(p_lds);
+    uintptr_t p_lds_k_rope  = p_lds_k_nope + kSzLdsKNope;
+    uintptr_t p_lds_kv_test = p_lds_k_nope + (kSzLdsKRope + kSzLdsKNope) * 2;
+    uintptr_t p_lds_vt      = p_lds_kv_test + kSzLdsKvTest;
 
     // Reg tiles
     constexpr uint32_t k_o_sz      = 128;
@@ -1028,8 +1071,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
     // Runtime constants
-    const uint32_t warp_idx = ckt::get_warp_id();
-    const uint32_t lane_idx = __lane_id();
+    const uint32_t warp_idx            = ckt::get_warp_id();
+    const uint32_t lane_idx            = __lane_id();
+    const uint32_t kv_ld_row_base_idx  = lane_idx / 2; // [0, 32). 2 adjacent threads take one row.
+    const uint32_t kv_ld_col_base      = warp_idx * 8 + (lane_idx % 2) * 4;
+    const uintptr_t p_lds_kv_test_warp = p_lds_kv_test + warp_idx * 272; // TODO: 272 = kWarpOffset
 
     std::uintptr_t out_as_int       = reinterpret_cast<std::uintptr_t>(params.final_output.raw_ptr);
     std::uint64_t out_as_u64        = static_cast<std::uint64_t>(out_as_int);
@@ -1076,6 +1122,37 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                      kv_tile_start,
                                      kv_tile_end);
 
+            /// TODO: Try to place p_kv_indices in LDS
+            const uint32_t row_kv_ld_idx = kv_ld_row_base_idx + kv_tile_start;
+            int32_t row_kv_ld;
+            if(kIsTail && (row_kv_ld_idx >= kv_tile_end))
+            {
+                row_kv_ld = -1;
+            }
+            else
+            {
+                row_kv_ld = params.p_kv_indices[row_kv_ld_idx];
+            }
+
+            async_load_k<T, 0, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 64, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 128, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 192, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 256, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 320, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 384, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 448, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 512, kIsTail>(
+                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+
             __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -1092,10 +1169,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 // Load K from LDS to GPR
                 constexpr int32_t tile_idx = (idx.value - k_q_nope_begin) / 2;
-                load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim, 0, tile_idx * T::kBlockK>(
-                    kv_0, p_lds_k_nope, 0, 0);
-                load_lds_to_gpr<T, T::kBlockN, T::kQkNopeHeadDim, 0, (tile_idx + 1) * T::kBlockK>(
-                    kv_1, p_lds_k_nope, 0, 0);
+
+                load_k_to_gpr<T, 0, tile_idx * T::kBlockK>(kv_0, p_lds_kv_test);
+                load_k_to_gpr<T, 16, tile_idx * T::kBlockK>(kv_0, p_lds_kv_test);
+                load_k_to_gpr<T, 0, (tile_idx + 1) * T::kBlockK>(kv_1, p_lds_kv_test);
+                load_k_to_gpr<T, 16, (tile_idx + 1) * T::kBlockK>(kv_1, p_lds_kv_test);
 
                 asm volatile("s_waitcnt lgkmcnt(0)");
 
@@ -1122,10 +1200,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 // Load K from LDS to GPR
                 constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
-                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim, 0, tile_idx * T::kBlockK>(
-                    kv_0, p_lds_k_rope, 0, 0);
-                load_lds_to_gpr<T, T::kBlockN, T::kQkRopeHeadDim, 0, (tile_idx + 1) * T::kBlockK>(
-                    kv_1, p_lds_k_rope, 0, 0);
+                load_k_to_gpr<T, 0, (tile_idx + 16) * T::kBlockK>(kv_0, p_lds_kv_test);
+                load_k_to_gpr<T, 16, (tile_idx + 16) * T::kBlockK>(kv_0, p_lds_kv_test);
+                load_k_to_gpr<T, 0, (tile_idx + 16 + 1) * T::kBlockK>(kv_1, p_lds_kv_test);
+                load_k_to_gpr<T, 16, (tile_idx + 16 + 1) * T::kBlockK>(kv_1, p_lds_kv_test);
 
                 asm volatile("s_waitcnt lgkmcnt(0)");
 
@@ -1165,6 +1243,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
             // GEMM on PV
 
+            // Transpose
+            v8ui v;
+            load_v_to_gpr<T>(&v, p_lds_kv_test);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            transpose_v<0>(&v);
+            transpose_v<1>(&v);
+            store_transposed_v_to_lds<T>(p_lds_vt, v);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
             /// TODO: replace 512 with other value if LDS padding is used!
             constexpr uint32_t v_row_stride = 512 / (sizeof(uint32_t) / sizeof(kv_t));
             constexpr uint32_t v_col_stride =
@@ -1173,7 +1262,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             const uint32_t col_idx = (lane_idx % 16) / 4;
             const uint32_t off_00  = row_idx * v_row_stride + col_idx;
 
-            constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2);
+            constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
             ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
                 constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
                 using oaccu_range_0           = hkdart::split_many_t<
@@ -1187,79 +1276,83 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_range_1>
                     oaccu_1;
 
-                const uint32_t* p_lds_v_0 =
-                    reinterpret_cast<const uint32_t*>(p_lds_k_nope + idx.value * T::kBlockK * 2);
+                // uintptr_t p_lds_v = p_lds_k_nope + idx.value * T::kBlockK * 2 + off_00 * 4;
+                // uint32_t t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, ta, tb, tc, td, te, tf;
+                // hkm::ds_read_b32(t0, p_lds_v, 0 * v_row_stride * 4);
+                // hkm::ds_read_b32(t1, p_lds_v, 1 * v_row_stride * 4);
+                // hkm::ds_read_b32(t2, p_lds_v, 2 * v_row_stride * 4);
+                // hkm::ds_read_b32(t3, p_lds_v, 3 * v_row_stride * 4);
+                // hkm::ds_read_b32(t4, p_lds_v, 16 * v_row_stride * 4 + 0 * v_row_stride * 4);
+                // hkm::ds_read_b32(t5, p_lds_v, 16 * v_row_stride * 4 + 1 * v_row_stride * 4);
+                // hkm::ds_read_b32(t6, p_lds_v, 16 * v_row_stride * 4 + 2 * v_row_stride * 4);
+                // hkm::ds_read_b32(t7, p_lds_v, 16 * v_row_stride * 4 + 3 * v_row_stride * 4);
+                // hkm::ds_read_b32(t8, p_lds_v, v_col_stride * 4 + 0 * v_row_stride * 4);
+                // hkm::ds_read_b32(t9, p_lds_v, v_col_stride * 4 + 1 * v_row_stride * 4);
+                // hkm::ds_read_b32(ta, p_lds_v, v_col_stride * 4 + 2 * v_row_stride * 4);
+                // hkm::ds_read_b32(tb, p_lds_v, v_col_stride * 4 + 3 * v_row_stride * 4);
+                // hkm::ds_read_b32(
+                //     tc, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 0 * v_row_stride *
+                //     4);
+                // hkm::ds_read_b32(
+                //     td, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 1 * v_row_stride *
+                //     4);
+                // hkm::ds_read_b32(
+                //     te, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 2 * v_row_stride *
+                //     4);
+                // hkm::ds_read_b32(
+                //     tf, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 3 * v_row_stride *
+                //     4);
 
-                uintptr_t p_lds_v = p_lds_k_nope + idx.value * T::kBlockK * 2 + off_00 * 4;
-                uint32_t t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, ta, tb, tc, td, te, tf;
-                hkm::ds_read_b32(t0, p_lds_v, 0 * v_row_stride * 4);
-                hkm::ds_read_b32(t1, p_lds_v, 1 * v_row_stride * 4);
-                hkm::ds_read_b32(t2, p_lds_v, 2 * v_row_stride * 4);
-                hkm::ds_read_b32(t3, p_lds_v, 3 * v_row_stride * 4);
-                hkm::ds_read_b32(t4, p_lds_v, 16 * v_row_stride * 4 + 0 * v_row_stride * 4);
-                hkm::ds_read_b32(t5, p_lds_v, 16 * v_row_stride * 4 + 1 * v_row_stride * 4);
-                hkm::ds_read_b32(t6, p_lds_v, 16 * v_row_stride * 4 + 2 * v_row_stride * 4);
-                hkm::ds_read_b32(t7, p_lds_v, 16 * v_row_stride * 4 + 3 * v_row_stride * 4);
-                hkm::ds_read_b32(t8, p_lds_v, v_col_stride * 4 + 0 * v_row_stride * 4);
-                hkm::ds_read_b32(t9, p_lds_v, v_col_stride * 4 + 1 * v_row_stride * 4);
-                hkm::ds_read_b32(ta, p_lds_v, v_col_stride * 4 + 2 * v_row_stride * 4);
-                hkm::ds_read_b32(tb, p_lds_v, v_col_stride * 4 + 3 * v_row_stride * 4);
-                hkm::ds_read_b32(
-                    tc, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 0 * v_row_stride * 4);
-                hkm::ds_read_b32(
-                    td, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 1 * v_row_stride * 4);
-                hkm::ds_read_b32(
-                    te, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 2 * v_row_stride * 4);
-                hkm::ds_read_b32(
-                    tf, p_lds_v, v_col_stride * 4 + 16 * v_row_stride * 4 + 3 * v_row_stride * 4);
+                // // For 2nd part of V load
+                // constexpr uint32_t v1_offset =
+                //     8 * (sizeof(uint32_t) / sizeof(kv_t)); // move 8 dw/32 elements
 
-                // For 2nd part of V load
-                constexpr uint32_t v1_offset =
-                    8 * (sizeof(uint32_t) / sizeof(kv_t)); // move 8 dw/32 elements
+                // asm volatile("s_waitcnt lgkmcnt(12)");
+                // transpose<k_kv_0_begin + 0>(lane_idx, t0, t1, t2, t3);
+                // hkm::ds_read_b32(t0, p_lds_v, v1_offset + 0 * v_row_stride * 4);
+                // hkm::ds_read_b32(t1, p_lds_v, v1_offset + 1 * v_row_stride * 4);
+                // hkm::ds_read_b32(t2, p_lds_v, v1_offset + 2 * v_row_stride * 4);
+                // hkm::ds_read_b32(t3, p_lds_v, v1_offset + 3 * v_row_stride * 4);
 
-                asm volatile("s_waitcnt lgkmcnt(12)");
-                transpose<k_kv_0_begin + 0>(lane_idx, t0, t1, t2, t3);
-                hkm::ds_read_b32(t0, p_lds_v, v1_offset + 0 * v_row_stride * 4);
-                hkm::ds_read_b32(t1, p_lds_v, v1_offset + 1 * v_row_stride * 4);
-                hkm::ds_read_b32(t2, p_lds_v, v1_offset + 2 * v_row_stride * 4);
-                hkm::ds_read_b32(t3, p_lds_v, v1_offset + 3 * v_row_stride * 4);
+                // asm volatile("s_waitcnt lgkmcnt(12)");
+                // transpose<k_kv_0_begin + 1>(lane_idx, t4, t5, t6, t7);
+                // hkm::ds_read_b32(
+                //     t4, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 0 * v_row_stride * 4);
+                // hkm::ds_read_b32(
+                //     t5, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 1 * v_row_stride * 4);
+                // hkm::ds_read_b32(
+                //     t6, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 2 * v_row_stride * 4);
+                // hkm::ds_read_b32(
+                //     t7, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 3 * v_row_stride * 4);
 
-                asm volatile("s_waitcnt lgkmcnt(12)");
-                transpose<k_kv_0_begin + 1>(lane_idx, t4, t5, t6, t7);
-                hkm::ds_read_b32(
-                    t4, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 0 * v_row_stride * 4);
-                hkm::ds_read_b32(
-                    t5, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 1 * v_row_stride * 4);
-                hkm::ds_read_b32(
-                    t6, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 2 * v_row_stride * 4);
-                hkm::ds_read_b32(
-                    t7, p_lds_v, v1_offset + 16 * v_row_stride * 4 + 3 * v_row_stride * 4);
+                // asm volatile("s_waitcnt lgkmcnt(12)");
+                // transpose<k_kv_0_begin + 2>(lane_idx, t8, t9, ta, tb);
+                // hkm::ds_read_b32(t8, p_lds_v, v1_offset + v_col_stride * 4 + 0 * v_row_stride *
+                // 4); hkm::ds_read_b32(t9, p_lds_v, v1_offset + v_col_stride * 4 + 1 * v_row_stride
+                // * 4); hkm::ds_read_b32(ta, p_lds_v, v1_offset + v_col_stride * 4 + 2 *
+                // v_row_stride * 4); hkm::ds_read_b32(tb, p_lds_v, v1_offset + v_col_stride * 4 + 3
+                // * v_row_stride * 4);
 
-                asm volatile("s_waitcnt lgkmcnt(12)");
-                transpose<k_kv_0_begin + 2>(lane_idx, t8, t9, ta, tb);
-                hkm::ds_read_b32(t8, p_lds_v, v1_offset + v_col_stride * 4 + 0 * v_row_stride * 4);
-                hkm::ds_read_b32(t9, p_lds_v, v1_offset + v_col_stride * 4 + 1 * v_row_stride * 4);
-                hkm::ds_read_b32(ta, p_lds_v, v1_offset + v_col_stride * 4 + 2 * v_row_stride * 4);
-                hkm::ds_read_b32(tb, p_lds_v, v1_offset + v_col_stride * 4 + 3 * v_row_stride * 4);
+                // asm volatile("s_waitcnt lgkmcnt(12)");
+                // transpose<k_kv_0_begin + 3>(lane_idx, tc, td, te, tf);
+                // hkm::ds_read_b32(tc,
+                //                  p_lds_v,
+                //                  v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
+                //                      0 * v_row_stride * 4);
+                // hkm::ds_read_b32(td,
+                //                  p_lds_v,
+                //                  v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
+                //                      1 * v_row_stride * 4);
+                // hkm::ds_read_b32(te,
+                //                  p_lds_v,
+                //                  v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
+                //                      2 * v_row_stride * 4);
+                // hkm::ds_read_b32(tf,
+                //                  p_lds_v,
+                //                  v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
+                //                      3 * v_row_stride * 4);
 
-                asm volatile("s_waitcnt lgkmcnt(12)");
-                transpose<k_kv_0_begin + 3>(lane_idx, tc, td, te, tf);
-                hkm::ds_read_b32(tc,
-                                 p_lds_v,
-                                 v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
-                                     0 * v_row_stride * 4);
-                hkm::ds_read_b32(td,
-                                 p_lds_v,
-                                 v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
-                                     1 * v_row_stride * 4);
-                hkm::ds_read_b32(te,
-                                 p_lds_v,
-                                 v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
-                                     2 * v_row_stride * 4);
-                hkm::ds_read_b32(tf,
-                                 p_lds_v,
-                                 v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
-                                     3 * v_row_stride * 4);
+                load_transpose_v_to_gpr<T, 0, k_kv_0_begin>(p_lds_kv_test);
 
                 if constexpr(kIsFirstIter)
                 {
@@ -1270,14 +1363,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
                 }
 
-                asm volatile("s_waitcnt lgkmcnt(12)");
-                transpose<k_kv_1_begin + 0>(lane_idx, t0, t1, t2, t3);
-                asm volatile("s_waitcnt lgkmcnt(8)");
-                transpose<k_kv_1_begin + 1>(lane_idx, t4, t5, t6, t7);
-                asm volatile("s_waitcnt lgkmcnt(4)");
-                transpose<k_kv_1_begin + 2>(lane_idx, t8, t9, ta, tb);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                transpose<k_kv_1_begin + 3>(lane_idx, tc, td, te, tf);
+                // asm volatile("s_waitcnt lgkmcnt(12)");
+                // transpose<k_kv_1_begin + 0>(lane_idx, t0, t1, t2, t3);
+                // asm volatile("s_waitcnt lgkmcnt(8)");
+                // transpose<k_kv_1_begin + 1>(lane_idx, t4, t5, t6, t7);
+                // asm volatile("s_waitcnt lgkmcnt(4)");
+                // transpose<k_kv_1_begin + 2>(lane_idx, t8, t9, ta, tb);
+                // asm volatile("s_waitcnt lgkmcnt(0)");
+                // transpose<k_kv_1_begin + 3>(lane_idx, tc, td, te, tf);
 
                 if constexpr(kIsFirstIter)
                 {
