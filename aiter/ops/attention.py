@@ -207,9 +207,9 @@ def pa_persistent_fwd(
     output: torch.Tensor,
     max_qlen: int,  # default = 1
     qo_indptr: torch.Tensor,  # [batch+1], qolen prefix sum
-    kv_indptr: torch.Tensor,  # [batch+1], kvlen prefix sum   1
-    kv_indices: torch.Tensor,  # [sum_kvlen], packed kv ids    2
-    context_lens: torch.Tensor,  # [batch]                       3
+    kv_indptr: torch.Tensor,  # [batch+1], kv_used_pages prefix sum
+    kv_indices: torch.Tensor,  # [sum_kv_used_pages], packed kv ids
+    context_lens: torch.Tensor,  # [batch]
     # work_meta_data: torch.Tensor,
     work_indptr: torch.Tensor,
     work_info: torch.Tensor,
@@ -494,12 +494,7 @@ def mla_prefill_asm_fwd(
 
 def get_pa_metadata_info_v1(
     batch_size: int,
-    max_seqlen_qo: int,
-    num_head_qo: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
-    is_sparse: int,
-    fast_mode: bool = True,
+    num_head_k: int = 1,
 ):
     """
     Returns:
@@ -515,22 +510,9 @@ def get_pa_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
 
-    tile_q = 16  # TODO: fix hack
-    # max_qo_tiles_per_batch = max_seqlen_qo * gqa_ratio / tile_q
-    # tile_q related to kernel dispatch strategy
-    # better hide inside get_xxx_metadata csrc?
-    max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * num_head_qo / tile_q))
-    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
-    tile_cnt = batch_size * max_qo_tiles_per_batch
-
-    if fast_mode:
-        max_work = tile_cnt + cu_num - 1
-        max_split_tiles = (
-            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
-        )
-    else:
-        max_work = tile_cnt * cu_num
-        max_split_tiles = tile_cnt * cu_num
+    tile_cnt = batch_size
+    max_work = (tile_cnt + cu_num - 1) * num_head_k
+    max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs

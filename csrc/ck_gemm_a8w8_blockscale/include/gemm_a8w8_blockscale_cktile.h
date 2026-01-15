@@ -5,7 +5,7 @@
 #include <torch/all.h>
 #include <torch/extension.h>
 
-torch::Tensor gemm_a8w8_blockscale(
+torch::Tensor gemm_a8w8_blockscale_cktile(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
@@ -13,7 +13,7 @@ torch::Tensor gemm_a8w8_blockscale(
     torch::Tensor &Y);
 
     
-torch::Tensor gemm_a8w8_blockscale_tune(
+torch::Tensor gemm_a8w8_blockscale_cktile_tune(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
