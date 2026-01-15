@@ -136,13 +136,14 @@ def run_aiter_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, has_
     # [aiter] type hints mismatch, override to --> fmha_v3_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float, softmax_scale: float, is_causal: bool, window_size_left: int, window_size_right: int, return_softmax_lse: bool, return_dropout_randval: bool, out: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> list[torch.Tensor]
 
     if has_round_mode:
-        fn = lambda: aiter.ops.mha.flash_attn_func(
-            q, k, v,
-            dropout_p=0.0,
-            causal=False,
-            return_attn_probs=False,
-            how_v3_bf16_cvt=2
-        )
+        def fn():
+            return aiter.ops.mha.flash_attn_func(
+                    q, k, v,
+                    dropout_p=0.0,
+                    causal=False,
+                    return_attn_probs=False,
+                    how_v3_bf16_cvt=2
+                )
     else:
         def fn():
             return aiter.ops.mha.flash_attn_func(
