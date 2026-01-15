@@ -350,7 +350,7 @@ def test_sage(
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128), (512, 128), (128, 512)],
 )
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]

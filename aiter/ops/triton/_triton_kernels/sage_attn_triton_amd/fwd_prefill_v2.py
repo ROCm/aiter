@@ -32,10 +32,10 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
         return {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
-            "waves_per_eu": 2,
+            "waves_per_eu": 1,
             "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
+            "num_stages": 1,
+            "num_warps": 4,
         }
     elif arch == "gfx942":
         return {
@@ -1092,14 +1092,11 @@ def sage_fwd_v2(
     # Load scale factors
     # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (off_h_k)
     # For MHA (GROUP_SIZE == 1), q_descale uses off_h_q (same as off_h_k)
-    # TODO: consider GROUP_SIZE != 1
-    q_descale = tl.load(
-        Q_Descale
-        + off_z * stride_q_descale_z
-        + off_h_q * stride_q_descale_h
-        + offs_m[:, None] * stride_q_descale_s
-        + offs_d_qk_s[None, :]
-    )  # MHA: use q head index
+    # tl.static_print("Q_Descale:", Q_Descale)
+
+    q_descale_ptrs = Q_Descale + off_z * stride_q_descale_z + off_h_q * stride_q_descale_h + offs_m[:, None] * stride_q_descale_s + offs_d_qk_s[None, :]
+
+    q_descale = tl.load(q_descale_ptrs)  # MHA: use q head index
 
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
     if V_QUANT_SCHEME == 1:
@@ -1183,11 +1180,11 @@ def sage_fwd_v2(
     q_offset = (
         Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
     )
-    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk_s[None, :] * stride_qk
+    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
     k_offset = (
         K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
     )
-    k_ptrs = k_offset + offs_d_qk_s[:, None] * stride_kk + offs_n[None, :] * stride_kn
+    k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[None, :] * stride_kn
     v_offset = (
         V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     )
@@ -1822,8 +1819,8 @@ def fav3_sage_triton_impl_v2(
             torch.float32,
         ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
 
-    stride_q_descale_z, stride_q_descale_h, stride_q_descale_s, _ = q_descale.stride()
-    stride_k_descale_z, stride_k_descale_h, stride_k_descale_s, _ = k_descale.stride()
+    stride_q_descale_z, stride_q_descale_s, stride_q_descale_h, _ = map_dims(q_descale.stride(), bshd)
+    stride_k_descale_z, stride_k_descale_s, stride_k_descale_h, _ = map_dims(k_descale.stride(), bshd)
 
     if V_QUANT_SCHEME == 1:
         stride_v_descale_z, stride_v_descale_h, stride_v_descale_blk = v_descale.stride()

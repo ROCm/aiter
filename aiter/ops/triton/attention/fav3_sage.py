@@ -119,18 +119,18 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                 num_k_blocks,
             ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
         elif sage_version == fav3_sage.Sage_version.V2:
-            assert q_descale.shape == (
+            assert map_dims(q_descale.shape, bshd) == [
                 batch,
-                num_q_heads,
                 seqlen_q,
+                num_q_heads,
                 head_dim // 32
-            ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, seqlen_q, head_dim // 32)}"
-            assert k_descale.shape == (
+            ], f"q_descale shape {map_dims(q_descale.shape, bshd)} != expected {(batch, seqlen_q, num_q_heads, head_dim // 32)}"
+            assert map_dims(k_descale.shape, bshd) == [
                 batch,
-                num_kv_heads,
                 seqlen_k,
+                num_kv_heads,
                 head_dim // 32
-            ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, seqlen_k, head_dim // 32)}"
+            ], f"k_descale shape {map_dims(k_descale.shape, bshd)} != expected {(batch, seqlen_k, num_kv_heads, head_dim // 32)}"
 
 
         # Validate unsupported features
@@ -439,18 +439,19 @@ def fav3_sage_func(
             num_k_blocks,
         ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
     elif sage_version == fav3_sage.Sage_version.V2:
-        assert q_descale.shape == (
+        assert map_dims(q_descale.shape, bshd) == [
             batch,
-            num_q_heads,
             seqlen_q,
+            num_q_heads,
             head_dim // 32
-        ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, seqlen_q, head_dim // 32)}"
-        assert k_descale.shape == (
+        ], f"q_descale shape {map_dims(q_descale.shape, bshd)} != expected {(batch, seqlen_q, num_q_heads, head_dim // 32)}"
+        assert map_dims(k_descale.shape, bshd) == [
             batch,
-            num_kv_heads,
             seqlen_k,
+            num_kv_heads,
             head_dim // 32
-        ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, seqlen_k, head_dim // 32)}"
+        ], f"k_descale shape {map_dims(k_descale.shape, bshd)} != expected {(batch, seqlen_k, num_kv_heads, head_dim // 32)}"
+
 
     # Validate unsupported features
     if attention_chunk not in (0, 1):
