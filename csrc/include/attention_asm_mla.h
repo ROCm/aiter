@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 void mla_decode_stage1_asm_fwd(
@@ -38,7 +38,7 @@ void mla_prefill_asm_fwd(
     torch::Tensor& splitLse   //[batch_size, num_kv_splits, num_heads,  1]
 );
 
-void mla_ps_prefill_asm_fwd(
+void mla_prefill_ps_asm_fwd(
     torch::Tensor& Q,                            //  [num_seqs, num_q_heads, qk_hetad_size], fp8
     torch::Tensor& K,                            //   [num_page, num_kv_heads, qk_head_size], fp8
     torch::Tensor& V,                            //   [num_page, num_kv_heads, v_head_size], fp8

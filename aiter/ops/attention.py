@@ -764,7 +764,7 @@ def get_ps_metadata_v1(
 
 
 @compile_ops(MD_NAME)
-def mla_ps_prefill_asm_fwd(
+def mla_prefill_ps_asm_fwd(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,

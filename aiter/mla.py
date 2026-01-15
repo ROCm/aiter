@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # user interface
 
@@ -396,7 +396,7 @@ def mla_prefill_fwd(
     return o.view(bs, nhead, v_head_dim), attn_lse
 
 
-def mla_ps_prefill_fwd(
+def mla_prefill_ps_fwd(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -421,9 +421,6 @@ def mla_ps_prefill_fwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
 
-    def ceil_div(a, b):
-        return (a + b - 1) // b
-
     tile_q = 256
     logits = torch.empty(
         (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim), dtype=dtypes.fp32, device=device
@@ -431,8 +428,9 @@ def mla_ps_prefill_fwd(
     attn_lse = torch.empty(
         (reduce_partial_map.size(0) * tile_q, nhead), dtype=dtypes.fp32, device=device
     )
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
-    aiter.mla_ps_prefill_asm_fwd(
+    aiter.mla_prefill_ps_asm_fwd(
         Q,
         K,
         V,
@@ -452,28 +450,16 @@ def mla_ps_prefill_fwd(
         v_scale,
     )
 
-    # This is triton kernel
-    mla_prefill_reduce(
+    aiter.mla_reduce_v1(
         logits,
         attn_lse,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        tile_q,
         output,
-        tile_q=256,
-        use_triton=True,  # Set to False to use PyTorch fallback
+        final_lse,
     )
-    # final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
-    # aiter.mla_reduce_v1(
-    #     logits,
-    #     attn_lse,
-    #     reduce_indptr,
-    #     reduce_final_map,
-    #     reduce_partial_map,
-    #     tile_q,
-    #     output,
-    #     final_lse,
-    # )
 
     return output.view(total_s, nhead, v_head_dim), attn_lse
 
