@@ -612,7 +612,7 @@ def run_benchmark_captured(args):
 
     args.layout = "bhsd"  # captured inputs are in BHSD format
     logger.info(
-        f"Captured inpputs are in BHSD format. Setting args.layout to bhsd for benchmark."
+        "Captured inpputs are in BHSD format. Setting args.layout to bhsd for benchmark."
     )
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
 
