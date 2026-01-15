@@ -13,7 +13,7 @@ using BlockwiseKernel = std::function<torch::Tensor(
 using BlockwiseKernelMap = std::unordered_map<int, BlockwiseKernel>;
 
 template <typename DDataType, typename EDataType = DDataType>
-static BlockwiseKernel blockwise_dispatch_legacy(int id)
+static BlockwiseKernel blockwise_dispatch(int id)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
@@ -31,7 +31,7 @@ static BlockwiseKernel blockwise_dispatch_legacy(int id)
         }
         else
         {
-            static_assert(false, "blockwise_dispatch_legacy used with unsupported dtype!");
+            static_assert(false, "blockwise_dispatch used with unsupported dtype!");
         }
     }();
 
@@ -65,11 +65,11 @@ torch::Tensor gemm_a8w8_blockscale_tune(torch::Tensor& XQ,
 
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockwise_dispatch_legacy<FP32, BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch<FP32, BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
-        blockwise_dispatch_legacy<FP32, FP16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch<FP32, FP16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
     }
     else
     {

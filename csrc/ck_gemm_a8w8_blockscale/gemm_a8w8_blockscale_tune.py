@@ -10,10 +10,18 @@ from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.shuffle import shuffle_weight_cktile
+from aiter.ops.shuffle import shuffle_weight_cktile, shuffle_weight
 
 from gemm_a8w8_blockscale_instance import candidate_kernels_dict
 from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
+
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common import (
+    kernels_list as candidate_kernels_bpreshuffle_dict,
+)
 
 block_shape = (128, 128)
 
@@ -55,7 +63,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-def run_ck_gemm_a8w8_blockscale_cktile(
+def run_cktile_gemm_a8w8_blockscale(
     x, weight, x_scale, w_scale, out, kernel_id, splitK, preshuffleB
 ):
     """
@@ -77,11 +85,23 @@ def run_ck_gemm_a8w8_blockscale(
     return aiter.gemm_a8w8_blockscale_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
     )
-
-
-def generate_data(m, n, k, seed, device="cuda"):
+    
+    
+def run_ck_gemm_a8w8_blockscale_bpreshuffle(
+        x, weight, x_scale, w_scale, out, kernel_id, splitK
+    ):
     """
-    Generate random data for testing the gemm a8w8 blockscale kernel.
+    Run gemm a8w8 blockscale bpreshuffle tuned kernel for ck type.
+    """
+    
+    return aiter.gemm_a8w8_blockscale_bpreshuffle_tune(
+        x, weight, x_scale, w_scale, out, kernel_id, splitK
+    )
+
+
+def generate_cktile_data(m, n, k, seed, device="cuda"):
+    """
+    Generate random data for testing cktile gemm a8w8 blockscale kernel.
     """
 
     torch.manual_seed(seed)
@@ -99,7 +119,25 @@ def generate_data(m, n, k, seed, device="cuda"):
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     return x, weight, x_scale, w_scale, out, weight_shuffle_16x16, weight_shuffle_32x32
 
-
+def generate_ck_data(m, n, k, seed, device="cuda"):
+    """
+    Generate random data for testing ck gemm a8w8 blockscale kernel.
+    """
+    
+    torch.manual_seed(seed)
+    block_shape_n, block_shape_k = block_shape
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    scale_k = (k + block_shape_k - 1) // block_shape_k
+    x = (torch.rand((m, k), dtype=dtypes.fp16, device=device) / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp16, device=device) / 10).to(
+        dtypes.fp8
+    )
+    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
+    weight_shuffle = shuffle_weight(weight, layout=(16, 16))
+    out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    return x, weight_shuffle, x_scale_t, w_scale, out, weight, x_scale
 
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
@@ -140,15 +178,16 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 
         return super().calculate(results, bpes=(1, 1, 2))
 
-    def getKernelName(self, kernelId, type="ck"):
+    def getKernelName(self, kernelId, type="ck", preshuffleB=False):
         """
         Get the kernel name based on the kernel ID for different types.
         """
 
         if type == "ck":
-            if kernelId >= len(candidate_kernels_dict) or kernelId < 0:
+            callable_dict = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
+            if kernelId >= len(callable_dict) or kernelId < 0:
                 return None
-            return candidate_kernels_dict[kernelId].name
+            return callable_dict[kernelId].name
         elif type == "cktile":
             if kernelId >= len(candidate_kernels_cktile_dict) or kernelId < 0:
                 return None
@@ -189,9 +228,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 tasks_ck_tile.append(
                     (
                         info,
-                        generate_data,
+                        generate_cktile_data,
                         (M, N, K, seed),
-                        run_ck_gemm_a8w8_blockscale_cktile,
+                        run_cktile_gemm_a8w8_blockscale,
                         (
                             gemm_a8w8_idx,
                             i,
@@ -218,14 +257,16 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         info_keys,
         useSplitK,
         seed,
+        preshuffleB,
     ):
         (cu_num, M, N, K) = info_keys
-        kernels_num = len(candidate_kernels_dict)
-        gemm_a8w8_idx = [0, 1, 2, 3, 4]
-        ref_data_idx = [0, 1, 2, 3]
+        kernel_dict = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
+        kernels_num = len(kernel_dict)
+        gemm_a8w8_idx = [0, 1 if preshuffleB else 5, 2 if preshuffleB else 6, 3, 4]
+        ref_data_idx = [0, 5, 6, 3]
         tasks_ck = []
         for i in range(kernels_num):
-            kernel = candidate_kernels_dict[i]
+            kernel = kernel_dict[i]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -239,13 +280,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 else 0
             )
             for splitK in range(maxsplitK + 1):
-                info = (info_keys, i, splitK, "", "ck", False)
+                info = (info_keys, i, splitK, "", "ck", preshuffleB)
                 tasks_ck.append(
                     (
                         info,
-                        generate_data,
+                        generate_ck_data,
                         (M, N, K, seed),
-                        run_ck_gemm_a8w8_blockscale,
+                        run_ck_gemm_a8w8_blockscale_bpreshuffle if preshuffleB else run_ck_gemm_a8w8_blockscale,
                         (
                             gemm_a8w8_idx,
                             i,
@@ -290,21 +331,23 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             # kernels_num = len(candidate_kernels_dict)
             info_keys = (cu_num, M, N, K)
             if args.libtype == "ck" or args.libtype == "both":
-                task.extend(
-                    self.get_ck_gemm_a8w8_blockscale_tune_task(
-                        info_keys,
-                        useSplitK,
-                        seed,
+                for preshuffleB in [True, False]:
+                    task.extend(
+                        self.get_ck_gemm_a8w8_blockscale_tune_task(
+                            info_keys,
+                            useSplitK,
+                            seed,
+                            preshuffleB
+                        )
                     )
-                )
             if args.libtype == "cktile" or args.libtype == "both":
-                for b_preshuffled in [True, False]:
+                for preshuffleB in [True, False]:
                     task.extend(
                         self.get_gemm_a8w8_blockscale_cktile_tune_task(
                             info_keys,
                             useSplitK,
                             seed,
-                            b_preshuffled
+                            preshuffleB
                         )
                     )
 
@@ -314,7 +357,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
-
+        print("ret:", ret)
         return ret
 
     def result_to_df(self, results):
@@ -330,7 +373,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 "None"
                 if time == self.INVALID_TIME
                 else (
-                    self.getKernelName(kernelId, libtype)
+                    self.getKernelName(kernelId, libtype, preshuffleB)
                     if kernelName == ""
                     else kernelName
                 )
