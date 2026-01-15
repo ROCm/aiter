@@ -483,6 +483,9 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     d_freq = cos.shape[-1]
     assert (d_freq == d_pe // 2) or (d_freq == d_pe), \
         f"cos/sin last dim should be half or equal to d_pe: {d_freq} vs {d_pe}"
+    assert (
+        num_decode_toks_for_zeros >= 0
+    ), "num_decode_toks_for_zeros must be non-negative to avoid invalid tensor creation"
     reuse_freqs_front_part = d_freq == d_pe // 2
 
     w_k_t = w_k.transpose(1, 2)
@@ -534,23 +537,15 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         device=k_rope.device,
     )
 
-    q_nope_zeros_out = None
-    if num_decode_toks_for_zeros > 0:
-        q_nope_zeros_out = torch.empty(
-            (num_decode_toks_for_zeros, qh, kv_lora_rank),
-            dtype=q_nope.dtype,
-            device=q_nope.device,
-        )
+    q_nope_zeros_out = torch.empty(
+        (num_decode_toks_for_zeros, qh, kv_lora_rank),
+        dtype=q_nope.dtype,
+        device=q_nope.device,
+    )
 
-    if transpose_bm:
-        stride_cb = q_out.stride(0)  
-        stride_cm = q_out.stride(1)  
-        stride_cn = q_out.stride(2)  
-    else:
-        stride_cb = q_out.stride(1)  
-        stride_cm = q_out.stride(0)  
-        stride_cn = q_out.stride(2)  
-
+    stride_cb = q_out.stride(1)  
+    stride_cm = q_out.stride(0)  
+    stride_cn = q_out.stride(2)  
 
     DTYPE_MAX = (
         torch.finfo(w_k_t.dtype).max
@@ -634,14 +629,15 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         BLOCK_DK_nope=kv_lora_rank,
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
-        TRANSPOSE_BM=transpose_bm,
         OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
         HAVE_K_SCALE=(k_scale is not None),
         DTYPE_MAX=DTYPE_MAX,
-        num_warps=1,
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
+        waves_per_eu=config["waves_per_eu"],
+        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+        cache_modifier=config["cache_modifier"],
     )
 
-    if num_decode_toks_for_zeros > 0:
-        return q_out, decode_q_pe_out, k_pe_out, kv_cache, q_nope_zeros_out
     return q_out, decode_q_pe_out, k_pe_out, kv_cache
     

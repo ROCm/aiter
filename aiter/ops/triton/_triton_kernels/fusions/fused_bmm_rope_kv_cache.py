@@ -692,7 +692,6 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
     BLOCK_DK_nope: tl.constexpr,
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
-    TRANSPOSE_BM: tl.constexpr,
     OUTPUT_Q_NOPE_ZEROS: tl.constexpr,
     HAVE_K_SCALE: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
@@ -811,20 +810,12 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-        if TRANSPOSE_BM:
-            c_ptrs = (
-                c_ptr
-                + offs_cm[:, None] * stride_cb_i64
-                + pid_head_i64 * stride_cm_i64
-                + offs_cn[None, :] * stride_cn_i64
-            )
-        else:
-            c_ptrs = (
-                c_ptr
-                + pid_head_i64 * stride_cb_i64
-                + offs_cm[:, None] * stride_cm_i64
-                + offs_cn[None, :] * stride_cn_i64
-            )
+        c_ptrs = (
+            c_ptr
+            + pid_head_i64 * stride_cb_i64
+            + offs_cm[:, None] * stride_cm_i64
+            + offs_cn[None, :] * stride_cn_i64
+        )
 
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
