@@ -244,6 +244,7 @@ jobs:
           bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Tests
+        timeout-minutes: 120
         run: |
           set -ex
           docker exec \
