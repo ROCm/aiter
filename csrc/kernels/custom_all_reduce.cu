@@ -142,6 +142,7 @@ void part_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, int inp_num
 {
   auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
   int size = inp_numel / chunk_num;
+  printf("[custom_all_reduce.cu] part_reduce -> chunk_id = %d, size = %d\n", chunk_id, size);
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
   auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
   fa->allreduce_sdma_impl(stream, reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()), reinterpret_cast<__hip_bfloat16*>(out.data_ptr()), size, chunk_num, chunk_id);
@@ -153,6 +154,7 @@ void sdma_copy(fptr_t _fa, torch::Tensor& input, int chunk_num, int chunk_id, st
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
   auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
   int size = input.numel() * input.element_size();
+  printf("[custom_all_reduce.cu] sdma_cpoy -> chunk_id = %d, size = %d\n", chunk_id, size);
   if (reg_buf.has_value())
   {
     int copy_size = size / chunk_num;

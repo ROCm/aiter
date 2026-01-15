@@ -1337,7 +1337,7 @@ namespace aiter
       for (int i = 0; i < 8; ++i)
       {
         int op_id = (rank + i) % ngpus;
-        *(reinterpret_cast<P*>(output) + chunk_id * part * ngpus + op_id * part + idx) = tmps[i][op_id * part + idx];
+        *(reinterpret_cast<P*>(output) + op_id * part + idx) = tmps[i][op_id * part + idx];
       }
     }
   }
@@ -1658,7 +1658,7 @@ namespace aiter
       constexpr int ngpus = 8;
       int chunk_part = size / chunk_num;
       int part = chunk_part / ngpus;
-      int buf_size = part * 2;
+      // int buf_size = part * 2;
       for (int i = 1; i < ngpus; ++i)
       {
         int device_id = (rank_ + i) % world_size_;
@@ -1666,7 +1666,7 @@ namespace aiter
         bool* src_start = reinterpret_cast<bool*>(input);
         void* dst = reinterpret_cast<void*>(dst_start + chunk_part * chunk_id + rank_ * part);
         void* src = reinterpret_cast<void*>(src_start + chunk_part * chunk_id + device_id * part);
-        HIP_CALL(hipMemcpyAsync(dst, src, buf_size, hipMemcpyDeviceToDevice, stream));
+        HIP_CALL(hipMemcpyAsync(dst, src, part, hipMemcpyDeviceToDevice, stream));
       }
     }
 
