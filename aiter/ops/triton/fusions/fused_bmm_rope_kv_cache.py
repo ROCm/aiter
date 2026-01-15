@@ -639,5 +639,6 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         cache_modifier=config["cache_modifier"],
     )
 
-    return q_out, decode_q_pe_out, k_pe_out, kv_cache
+    return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
+
     
