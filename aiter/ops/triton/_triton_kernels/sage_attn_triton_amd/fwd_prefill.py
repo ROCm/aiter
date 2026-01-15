@@ -14,7 +14,9 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
 
 
-def get_fwd_configs(autotune: bool, seqlen_q: int = None, seqlen_k: int = None, num_heads: int = None):
+def get_fwd_configs(
+    autotune: bool, seqlen_q: int = None, seqlen_k: int = None, num_heads: int = None
+):
     assert not autotune, "Autotuning is not supported."
     arch = get_arch()
     if arch == "gfx950":
@@ -1868,8 +1870,11 @@ def fav3_sage_triton_impl(
     # launch kernel
     def grid(META):
         return (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
+
     if config is None:
-        config = get_fwd_configs(False, seqlen_q=max_seqlens_q, seqlen_k=max_seqlens_k, num_heads=nheads_q)
+        config = get_fwd_configs(
+            False, seqlen_q=max_seqlens_q, seqlen_k=max_seqlens_k, num_heads=nheads_q
+        )
     attn_fwd[grid](
         q,
         k,
