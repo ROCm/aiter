@@ -153,9 +153,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             // If current cu part is able to handle this batch of seqences
             if(remain_payload >= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks))
             {
-                const int32_t num_splits = curr_n_split_idx + 1;
+                int32_t num_splits = curr_n_split_idx + 1;
 
-                auto fill_work_info = [&](const int32_t split_idx) {
                     const int32_t global_qo_tile_idx = tot_qo_tiles;
 
                     MlaWorkInfo work_info{};
@@ -177,12 +176,17 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                         curr_kv_end - batch_tail);
                     work_info.kv_offset = curr_kv_end - work_info.kv_end;
+		if(work_info.kv_start >= work_info.kv_end){
+			--curr_n_split_idx;
+			--num_splits;
+			// --partial_idx;
+		}
 
+                auto fill_work_info = [&](const int32_t split_idx) {
                     // split related info
                     if(curr_n_split_idx > 0)
                     {
                         // set work info
-                        work_info.partial_qo_loc = partial_idx;
 
                         // set reduce info
                         params.p_reduce_indptr[global_qo_tile_idx + 1] =
@@ -194,31 +198,39 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     }
                     else
                     {
-                        work_info.partial_qo_loc                       = -1;
                         params.p_reduce_indptr[global_qo_tile_idx + 1] = last_reduce_indptr;
                     }
 
-                    p_work_info_set[num_works] = work_info;
                 };
 
                 // record a work in work_info_set
                 if(curr_n_split_idx > 0)
                 {
+                    work_info.partial_qo_loc = partial_idx;
                     for(int32_t idx = lane_idx; idx < num_splits; idx += ck_tile::get_warp_size())
                     {
                         fill_work_info(idx);
                     }
 
+		if(work_info.kv_start < work_info.kv_end){
+                    p_work_info_set[num_works] = work_info;
+                    num_works += 1;
+		}
                     partial_idx += qo_tile_size;
                     last_reduce_indptr += num_splits;
+
                 }
                 else
                 {
+                    work_info.partial_qo_loc                       = -1;
                     fill_work_info(0);
+		if(work_info.kv_start < work_info.kv_end){
+                    p_work_info_set[num_works] = work_info;
+                    num_works += 1;
+		}
                 }
 
                 tot_qo_tiles += 1;
-                num_works += 1;
 
                 remain_payload -= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks);
 
@@ -272,7 +284,6 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 {
                     const int32_t consuming_blks = remain_payload - Traits::kFixedOverheadNumBlocks;
 
-                    auto fill_work_info = [&]() {
                         MlaWorkInfo work_info{};
                         work_info.batch_idx = curr_batch;
                         work_info.qo_start =
@@ -293,19 +304,23 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             work_info.kv_start + (consuming_blks * params.kv_granularity),
                             curr_kv_end - batch_tail);
                         work_info.kv_offset        = curr_kv_end - work_info.kv_end;
-                        work_info.partial_qo_loc   = partial_idx;
+                        // work_info.partial_qo_loc   = (work_info.kv_start + (consuming_blks * params.kv_granularity) > curr_kv_end - batch_tail) ? -1 : partial_idx;
+
+			work_info.partial_qo_loc = partial_idx;
+			if (curr_n_split_idx == 0 && batch_tail == work_info.kv_offset)
+				work_info.partial_qo_loc = -1;
+
+		if(work_info.kv_start < work_info.kv_end){
                         p_work_info_set[num_works] = work_info;
-                    };
 
-                    // record a work in work_info_set
-                    fill_work_info();
-
-                    partial_idx += qo_tile_size;
                     num_works += 1;
+                    ++curr_n_split_idx;
+		}
+		if (batch_tail != work_info.kv_offset)
+                    partial_idx += qo_tile_size;
 
                     // update state
                     curr_kv_block += consuming_blks;
-                    ++curr_n_split_idx;
                 }
                 break;
             }
