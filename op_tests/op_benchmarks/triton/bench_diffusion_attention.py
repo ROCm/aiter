@@ -471,9 +471,10 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
                 sm_margin=0,
             )
         else:
-            fn = lambda: attention_ref(
-                q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
-            )
+            def fn():
+                return attention_ref(
+                            q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
+                        )
     return fn
 
 
