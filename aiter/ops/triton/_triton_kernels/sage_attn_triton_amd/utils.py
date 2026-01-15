@@ -220,7 +220,6 @@ def generate_bhsd_tensor(
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
-        og_fp8_dtype = dtype
         dtype = torch.float32
 
     # gen tensor based on mode
@@ -264,7 +263,6 @@ def generate_bshd_qkv_packed(
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
-        og_fp8_dtype = dtype
         dtype = torch.float32
 
     # gen tensor
@@ -300,7 +298,6 @@ def generate_bshd_kv_packed(
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
-        og_fp8_dtype = dtype
         dtype = torch.float32
 
     # gen tensor
@@ -413,7 +410,6 @@ def generate_varlen_qkv_packed(
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
-        og_fp8_dtype = dtype
         dtype = torch.float32
 
     # get valid batch_size
@@ -490,7 +486,6 @@ def generate_varlen_kv_packed(
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
-        og_fp8_dtype = dtype
         dtype = torch.float32
 
     # get valid batch_size
