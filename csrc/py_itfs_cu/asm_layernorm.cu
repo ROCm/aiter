@@ -6,6 +6,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
+#include "asm_norm_code_objects.hpp"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -69,8 +70,7 @@ void layernorm2d_with_add_asm(torch::Tensor &out,          // [m ,n]
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     int sub_M = 2;
-    static AiterAsmKernel impl("layer_norm_kernel_func", "layer_norm.co");
-
+    static AiterAsmKernel<{"layer_norm_kernel_func", layer_norm_co}> impl;
     impl.launch_kernel({&args,
                         &arg_size,
                         ((m + sub_M - 1) / sub_M), // gdx
@@ -122,7 +122,7 @@ void layernorm2d_with_add_smoothquant_asm(torch::Tensor &out,          // [m ,n]
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     int sub_M = 2;
-    static AiterAsmKernel impl("layer_norm_qnt", "layer_norm_qnt.co");
+    static AiterAsmKernel<{"layer_norm_qnt", layer_norm_qnt_co}> impl;
 
     impl.launch_kernel({&args,
                         &arg_size,

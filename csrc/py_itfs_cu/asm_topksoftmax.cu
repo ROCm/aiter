@@ -27,31 +27,26 @@ struct __attribute__((packed)) KernelArgs
     p3 _p8;
 };
 
-std::pair<std::string, int> get_heuristic_kernel_topksoftmax(std::string arch_id,
+const CFG::Entry* get_heuristic_kernel_topksoftmax(GPUArchId arch_id,
     std::string dtype,
     int max_subm,
     int num_experts,
     int topk,
-    CFG* cfgs)
+    const CFG* cfgs)
 {
-    int subm = -1;
-    std::string kernelName = "";
-    for(const auto& el : *cfgs)
+    const CFG::Entry* entry = nullptr;
+    for(const auto& cfg : cfgs->get_configs_for_arch(arch_id))
     {
-        if (el.first.find(arch_id) != 0)
-            continue;
-        const auto& cfg = el.second;
         if (cfg.dtype != dtype || cfg.subm > max_subm || cfg.num_experts != num_experts || cfg.topk != topk)
             continue;
         
         if (cfg.subm > subm)
         {
-            kernelName = el.first;
-            subm = cfg.subm;
+            entry = &cfg;
         }
     }
 
-    TORCH_CHECK(!kernelName.empty(),
+    TORCH_CHECK(entry != nullptr,
     __func__,
     ": cannot get heuristic kernel!"
     " arch_id:", arch_id,
@@ -59,7 +54,7 @@ std::pair<std::string, int> get_heuristic_kernel_topksoftmax(std::string arch_id
     " max_subm:", max_subm,
     " num_experts:", num_experts,
     " topk:", topk);
-    return {kernelName, subm};
+    return entry;
 }
 
 void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
@@ -68,7 +63,7 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
                       torch::Tensor& gating_output,        // [num_tokens, num_experts]
                       bool need_renorm)
 {
-    std::string arch_id = get_gpu_arch();
+    auto arch_id           = get_gpu_arch();
     const uint num_experts = gating_output.size(-1);
     const uint num_tokens  = gating_output.numel() / num_experts;
     const uint topk        = topk_weights.size(-1);
@@ -94,31 +89,18 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
     args.renormalize = need_renorm ? 1 : 0;
     args.out_stride  = out_stride * 4;
 
-    CFG* config_map = &cfg_topksoftmax;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    AiterAsmKernel* impl_ptr = nullptr;
-    auto [kernelName, subm] = get_heuristic_kernel_topksoftmax(arch_id, dtype, MAX_SUBM, num_experts, topk, config_map);
+    const CFG* config_map = &cfg_topksoftmax;
 
-    auto it = config_map->find(kernelName);
-    if(it != config_map->end())
-    {
-        const auto& cfg     = it->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
-    }
-    else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+    const auto* cfg = get_heuristic_kernel_topksoftmax(arch_id, dtype, MAX_SUBM, num_experts, topk, config_map);
+
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
+
+    TORCH_CHECK(impl_ptr != nullptr, __func__, " not find kernel");
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    uint gdx = (num_tokens + subm - 1) / subm;
+    uint gdx = (num_tokens + cfg->subm - 1) / cfg->subm;
     TORCH_CHECK(gdx >> 31 == 0, "num_tokens too large: ", num_tokens);
     impl_ptr->launch_kernel({&args,
                              &arg_size,
