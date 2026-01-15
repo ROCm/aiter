@@ -104,15 +104,15 @@ def get_search_space(small: bool = False) -> List[Dict[str, Any]]:
         block_n_list = [32, 64]
         num_warps_list = [4]
         group_size_list = [1]
-        waves_per_eu_list = [3]
+        waves_per_eu_list = [2]
     else:
-        num_stages_list = [2, 3, 4, 5]
+        num_stages_list = [1, 2, 3, 4, 5]
         block_m_list = [16, 32, 64, 128, 256]
-        block_k_list = [64, 128]
+        block_k_list = [32, 64, 128]
         block_n_list = [32, 64, 128, 256]
-        num_warps_list = [4, 8]
-        group_size_list = [1, 16, 32, 64]
-        waves_per_eu_list = [2, 3, 4]
+        num_warps_list = [2, 4, 8]
+        group_size_list = [1, 8, 16, 32, 64]
+        waves_per_eu_list = [1, 2, 4, 6, 8]
 
     for num_stages in num_stages_list:
         for block_m in block_m_list:

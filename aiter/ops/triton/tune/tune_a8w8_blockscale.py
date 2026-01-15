@@ -6,8 +6,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
-from aiter.ops.triton.tune.base import (
-    get_search_space,
+from aiter.ops.triton.tune.utils import (
     save_configs_to_json,
     tune_kernel,
 )
