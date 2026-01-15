@@ -313,7 +313,10 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p_dropout,
                 drop_seed_offset);
         
-        int magic_const = (uint32_t)(((1ULL << 32) + tokens_per_frame - 1) / tokens_per_frame);
+        int magic_const = 0;
+        if (tokens_per_frame != 0) {
+            magic_const = (uint32_t)(((1ULL << 32) + tokens_per_frame - 1) / tokens_per_frame);
+        }
 
         float t = aiter::mha_fwd(args,
                                  stream_config,
