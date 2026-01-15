@@ -643,7 +643,7 @@ def run_benchmark(args):
         Benchmark function for attention kernels with generated random inputs.
         """
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
-        assert causal == False, "Causal not supported in this benchmark."
+        assert not causal, "Causal not supported in this benchmark."
 
         # Generate base inputs in BHSD layout which is the layout used in wan model.
         q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
