@@ -435,7 +435,7 @@ def test_flash_attn_varlen_func(
 ):
     return_lse = True
     torch.random.manual_seed(0)
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 8)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -896,7 +896,6 @@ def varlen_flash_attn_seq_padding_benchmark(
 
 l_causal = [False, True]
 l_local = [False, True]
-l_deterministic = [False, True]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -908,25 +907,28 @@ if __name__ == "__main__":
         "--batch_size",
         type=int,
         nargs="?",
-        default=4,
+        default=1,
         help="""Batch size.
     e.g.: -b 16""",
     )
     parser.add_argument(
-        "-nh",
+        "-n",
         "--nheads",
         type=int,
-        nargs="?",
-        default=9,
-        help="""Number of attention heads.
-    e.g. -nh 4""",
+        nargs="+",
+        default=[32, 64],
+        help="""Number of heads. Default is 6.
+        e.g.: -n 8""",
     )
     parser.add_argument(
         "-s",
         "--seqlen_q_k",
         type=dtypes.str2tuple,
-        nargs="?",
-        default=(4, 8),
+        nargs="+",
+        default=[
+            (1024, 1024),
+            (2048, 2048),
+        ],
         help="""Sequence length of query&key.
     e.g. -s 4,8""",
     )
@@ -992,11 +994,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "-det",
         "--deterministic",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="""Deterministic attention, default is None.
-    -det or --deterministic    # enable deterministic attention
-    --no-deterministic         # disable deterministic attention""",
+        action="store_true",
+        help="""Deterministic attention. Default is False.
+        -det or --deterministic    # enable deterministic attention""",
     )
     parser.add_argument(
         "-mha",
@@ -1029,29 +1029,32 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    (seqlen_q, seqlen_k) = args.seqlen_q_k
-
     if args.causal is not None:
         l_causal = [args.causal]
     if args.local is not None:
         l_local = [args.local]
-    if args.deterministic is not None:
-        l_deterministic = [args.deterministic]
 
     collected = []
     for (
         dtype,
+        nheads,
+        (seqlen_q, seqlen_k),
         (dim_qk, dim_v),
         mha_type,
         causal,
         local,
-        deterministic,
     ) in itertools.product(
-        args.dtype, args.d_qk_v, args.mha_type, l_causal, l_local, l_deterministic
+        args.dtype,
+        args.nheads,
+        args.seqlen_q_k,
+        args.d_qk_v,
+        args.mha_type,
+        l_causal,
+        l_local,
     ):
         ret = flash_attn_varlen_func_benchmark(
             args.batch_size,
-            args.nheads,
+            nheads,
             seqlen_q,
             seqlen_k,
             dim_qk,
@@ -1061,7 +1064,7 @@ if __name__ == "__main__":
             causal,
             local,
             args.bias_type,
-            deterministic,
+            args.deterministic,
             mha_type,
             dtypes.d_dtypes[dtype],
             args.input_layout,
@@ -1074,21 +1077,19 @@ if __name__ == "__main__":
         dtype,
         (dim_qk, dim_v),
         mha_type,
-        deterministic,
         padding_scenario,
         local,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
         args.mha_type,
-        l_deterministic,
         ["mixed", "q_only", "k_only", "no_padding"],
         l_local,
     ):
         ret = varlen_flash_attn_seq_padding_benchmark(
             args.batch_size,
             mha_type,
-            deterministic,
+            args.deterministic,
             padding_scenario,
             dtypes.d_dtypes[dtype],
             dim_qk,

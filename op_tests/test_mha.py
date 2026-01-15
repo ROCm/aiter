@@ -216,7 +216,7 @@ def test_flash_attn_output(
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 8)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -494,10 +494,9 @@ def test_flash_attn_seq_padding(
     mha_type,
     dtype,
 ):
-
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 8)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -680,7 +679,6 @@ def test_flash_attn_seq_padding(
 
 l_causal = [False, True]
 l_local = [False, True]
-l_deterministic = [False, True]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -690,7 +688,7 @@ parser.add_argument(
     "-b",
     "--batch_size",
     type=int,
-    default=2,
+    default=1,
     help="""Batch size. Default is 2.
     e.g.: -b 16""",
 )
@@ -698,7 +696,8 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=6,
+    nargs="+",
+    default=[32, 64],
     help="""Number of heads. Default is 6.
     e.g.: -n 8""",
 )
@@ -719,6 +718,18 @@ parser.add_argument(
     e.g.: -k 1024""",
 )
 parser.add_argument(
+    "-s",
+    "--seqlen_q_k",
+    type=dtypes.str2tuple,
+    nargs="+",
+    default=[
+        (1024, 1024),
+        (2048, 2048),
+    ],
+    help="""Sequence length for query and key.
+    e.g.: -seqlen_q_k 1024,1024""",
+)
+parser.add_argument(
     "-d_qk_v",
     type=dtypes.str2tuple,
     nargs="+",
@@ -732,7 +743,7 @@ parser.add_argument(
         (192, 128),
     ],
     help="""Dimension of query and key. Default is None.
-    e.g.: -qk_v 256,256""",
+    e.g.: -d_qk_v 256,256""",
 )
 parser.add_argument(
     "-p",
@@ -771,11 +782,9 @@ parser.add_argument(
 parser.add_argument(
     "-det",
     "--deterministic",
-    action=argparse.BooleanOptionalAction,
-    default=None,
-    help="""Deterministic attention. Default is None.
-    -det or --deterministic    # enable deterministic attention
-    --no-deterministic         # disable deterministic attention""",
+    action="store_true",
+    help="""Deterministic attention. Default is False.
+    -det or --deterministic    # enable deterministic attention""",
 )
 parser.add_argument(
     "-m",
@@ -815,32 +824,36 @@ if __name__ == "__main__":
     if args.local is not None:
         l_local = [args.local]
 
-    if args.deterministic is not None:
-        l_deterministic = [args.deterministic]
-
     collected = []
     for (
         dtype,
+        nheads,
+        (seqlen_q, seqlen_k),
         (dim_qk, dim_v),
         mha_type,
         causal,
         local,
-        deterministic,
     ) in itertools.product(
-        args.dtype, args.d_qk_v, args.mha_type, l_causal, l_local, l_deterministic
+        args.dtype,
+        args.nheads,
+        args.seqlen_q_k,
+        args.d_qk_v,
+        args.mha_type,
+        l_causal,
+        l_local,
     ):
         ret = flash_attn_output_benchmark(
             args.batch_size,
-            args.nheads,
-            args.seqlen_q,
-            args.seqlen_k,
+            nheads,
+            seqlen_q,
+            seqlen_k,
             dim_qk,
             dim_v,
             args.dropout_p,
             causal,
             local,
             args.bias_type,
-            deterministic,
+            args.deterministic,
             mha_type,
             dtypes.d_dtypes[dtype],
             args.input_layout,
@@ -849,16 +862,16 @@ if __name__ == "__main__":
         test_flash_attn_seq_padding(
             "mixed",
             args.batch_size,
-            args.nheads,
-            args.seqlen_q,
-            args.seqlen_k,
+            nheads,
+            seqlen_q,
+            seqlen_k,
             dim_qk,
             dim_v,
             args.dropout_p,
             causal,
             local,
             args.bias_type if args.bias_type != "bias" else "no",
-            deterministic,
+            args.deterministic,
             mha_type,
             dtypes.d_dtypes[dtype],
         )
