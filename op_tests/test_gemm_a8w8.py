@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -175,7 +175,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         # hipb_mm bpreshuffle only supports bfloat16 as output type
         init_hipblas()
         e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
-        e = e + bias
+        # e = e + bias
         err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
     else:
         avg_e = None
