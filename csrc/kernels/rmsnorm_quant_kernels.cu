@@ -30,7 +30,7 @@ __global__ void add_rmsnorm_quant_kernel(
     int residual_out_stride,
     int out_stride)
     {
-        int idx = blockIdx.x;
+        int64_t idx = blockIdx.x;
         int tid = threadIdx.x;
         using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
         using vec_o = opus::vector_t<DTYPE_O, thread_data_size>;
@@ -39,17 +39,17 @@ __global__ void add_rmsnorm_quant_kernel(
         static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
         static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
         const float inverted_DTYPE_MAX = (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
-        const DTYPE_I* input_ptr = input + idx * input_stride;
-        const DTYPE_I* residual_in_ptr = residual_in + idx * residual_in_stride;
-        DTYPE_I* residual_out_ptr = residual_out + idx * residual_out_stride;
-        DTYPE_O* out_ptr = out + idx * out_stride;
-        const int64_t oob_i = (n + ooba_i - 1) / ooba_i * ooba_i;
+        const DTYPE_I* input_ptr = input + idx * static_cast<int64_t>(input_stride);
+        const DTYPE_I* residual_in_ptr = residual_in + idx * static_cast<int64_t>(residual_in_stride);
+        DTYPE_I* residual_out_ptr = residual_out + idx * static_cast<int64_t>(residual_out_stride);
+        DTYPE_O* out_ptr = out + idx * static_cast<int64_t>(out_stride);
+        const int oob_i = (n + ooba_i - 1) / ooba_i * ooba_i;
         auto buffer_i = opus::make_gmem<DTYPE_I>(input_ptr, oob_i * sizeof(DTYPE_I));
         auto buffer_residual_in = opus::make_gmem<DTYPE_I>(residual_in_ptr, oob_i * sizeof(DTYPE_I));
         auto buffer_residual_out = opus::make_gmem<DTYPE_I>(residual_out_ptr, oob_i * sizeof(DTYPE_I));
-        auto weight_buffer = opus::make_gmem<DTYPE_I>(weight, n * sizeof(DTYPE_I));
+        auto weight_buffer = opus::make_gmem<DTYPE_I>(weight, oob_i * sizeof(DTYPE_I));
         
-        const int64_t oob_o = (n + ooba_o - 1) / ooba_o * ooba_o;
+        const int oob_o = (n + ooba_o - 1) / ooba_o * ooba_o;
         auto buffer_out = opus::make_gmem<DTYPE_O>(out_ptr, oob_o * sizeof(DTYPE_O));
 
         int row_offset = tid * thread_data_size;
@@ -58,6 +58,7 @@ __global__ void add_rmsnorm_quant_kernel(
         auto& thread_data_i = thread_data_ix2[0];
         thread_data_ix2[1] = buffer_residual_in.template load<thread_data_size>(row_offset);
         auto& thread_data_residual_in = thread_data_ix2[1];
+        vec_i thread_data_weight = weight_buffer.template load<thread_data_size>(row_offset);
 
         vec_f thread_data_float;
         for(int i = 0; i < thread_data_size; i++)
@@ -65,8 +66,8 @@ __global__ void add_rmsnorm_quant_kernel(
             thread_data_float[i] = ck_tile::type_convert<float>(thread_data_i[i]) + ck_tile::type_convert<float>(thread_data_residual_in[i]);
         }
 
-        thread_data_ix2[0] = weight_buffer.template load<thread_data_size>(row_offset);
-        auto& thread_data_weight = thread_data_ix2[0];
+        // thread_data_ix2[0] = weight_buffer.template load<thread_data_size>(row_offset);
+        // auto& thread_data_weight = thread_data_ix2[0];
 
         for(int i = 0; i < thread_data_size; i++)
         {
@@ -80,15 +81,30 @@ __global__ void add_rmsnorm_quant_kernel(
             square_sum += (thread_data_float[i] * thread_data_float[i]);
         }
         auto sum_f = [](float a, float b) { return a + b; };
-        float rcp = block_reduce<float, decltype(sum_f), BlockSize, true>(square_sum, sum_f);
-        rcp = rsqrtf(rcp / n + epsilon);
+        using vec2_f = opus::vector_t<float, 2>;
+        vec2_f rcp;
+        rcp[0] = block_reduce<float, decltype(sum_f), BlockSize, true>(square_sum, sum_f);
+        rcp[0] = rsqrtf(rcp[0] / n + epsilon);
+        rcp[1] = rcp[0];
+        vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
+        for(int i = 0; i < thread_data_size / 2; i++)
+        {
+            asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(rcp));
+        }
+        auto& thread_data_weight_float = reinterpret_cast<vec_f&>(thread_data_ix2);
         for(int i = 0; i < thread_data_size; i++)
         {
-            thread_data_float[i] = thread_data_float[i] * rcp * ck_tile::type_convert<float>(thread_data_weight[i]);
+            thread_data_weight_float[i] = ck_tile::type_convert<float>(thread_data_weight[i]);
         }
+        vec2_f* thread_data_weight_float2 = reinterpret_cast<vec2_f*>(&thread_data_weight_float);
+        for(int i = 0; i < thread_data_size / 2; i++)
+        {
+            asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2[i]));
+        }
+
         if constexpr(FUSE_QUANT)
         {
-            float thread_max = 0.0f;
+            float thread_max = 1e-10f;
             if constexpr(thread_data_size % 2 == 0)
             {
                 for(int i = 0; i < thread_data_size; i += 2)
