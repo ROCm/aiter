@@ -1683,7 +1683,7 @@ def fav3_sage_triton_impl(
             ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
             assert (
                 softmax_lse.device == q.device
-            ), f"softmax_lse must be on same device as q"
+            ), "softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
