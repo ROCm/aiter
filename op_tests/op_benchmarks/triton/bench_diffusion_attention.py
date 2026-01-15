@@ -8,7 +8,6 @@ import sys
 import argparse
 import aiter
 import triton
-import sys
 import logging
 
 from aiter.ops.triton.mha import (
