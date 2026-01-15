@@ -6,9 +6,10 @@ from typing import Optional, Tuple
 import torch
 import triton
 
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import deserialize_str
-from aiter.ops.triton.gemm_a16wfp4 import get_splitk
+from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import _get_config as _get_fp4_config
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _get_config as _get_fp8_config,
@@ -106,6 +107,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         f"transpose_bm={transpose_bm} prequant={prequant} is_neox={is_neox}"
     )
 
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
     assert prequant is True, "prequant=False is not yet supported in fused kernel"
 
     if cos.dim() == 4:
@@ -142,6 +144,9 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     d_freq = cos.shape[-1]
     assert (d_freq == d_pe // 2) or (d_freq == d_pe), \
         f"cos/sin last dim should be half or equal to d_pe: {d_freq} vs {d_pe}"
+    assert (
+        num_decode_toks_for_zeros >= 0
+    ), "num_decode_toks_for_zeros must be non-negative to avoid invalid tensor creation"
     reuse_freqs_front_part = d_freq == d_pe // 2
 
     M = b
@@ -204,8 +209,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         device=k_rope.device,
     )
 
-    q_nope_zeros_out = None
-    if num_decode_toks_for_zeros > 0:
+    if q_nope_zeros_out is None:
         q_nope_zeros_out = torch.empty(
             (num_decode_toks_for_zeros, qh, kv_lora_rank),
             dtype=q_nope.dtype,
@@ -368,9 +372,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
             transpose_bm,
         )
 
-    if num_decode_toks_for_zeros > 0:
-        return q_out, decode_q_pe_out, k_pe_out, kv_cache, q_nope_zeros_out
-    return q_out, decode_q_pe_out, k_pe_out, kv_cache
+    return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
 
 def fused_fp8_bmm_rope_cat_and_cache_mla(
