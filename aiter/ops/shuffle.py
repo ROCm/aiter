@@ -128,7 +128,7 @@ def shuffle_weight_cktile(x: torch.Tensor, layout=(16, 16), use_int4=False) -> t
     x_type = x.dtype
 
     IN, IK = layout
-    divisor = 2 if IN == 32 else 4
+    divisor = 4 if IN == 32 else 2
 
     x_ = x #(torch.ones((x.shape[-2], x.shape[-1]), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
     x_ = x_.view(x.shape[-2] // IN, IN, x.shape[-1] // IK, divisor, IK // divisor)

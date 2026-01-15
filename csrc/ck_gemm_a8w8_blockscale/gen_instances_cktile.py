@@ -82,7 +82,7 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool is_bpreshuffled
+    bool preshuffleB
     )
 {{
     // Get M, N, K from input tensors.
@@ -107,7 +107,7 @@ torch::Tensor
             {k.BlockPerCu}>;
 
         // Run kernel instance.
-        return tile_gemm_a8w8_blockscale_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, is_bpreshuffled);
+        return tile_gemm_a8w8_blockscale_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
 """
 
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
@@ -130,7 +130,7 @@ template torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool is_bpreshuffled
+    bool preshuffleB
     );
 
 """
@@ -215,7 +215,7 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool is_bpreshuffled);
+    bool preshuffleB);
 """
         MAINFEST_end = """
 

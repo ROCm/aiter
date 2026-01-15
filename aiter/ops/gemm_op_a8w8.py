@@ -164,7 +164,7 @@ def gemm_a8w8_blockscale_cktile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    is_bpreshuffled: bool = True,
+    preshuffleB: bool = True,
 ) -> torch.Tensor: ...
 
 
@@ -533,7 +533,7 @@ def gemm_a8w8_blockscale_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    is_bpreshuffled=False,
+    preshuffleB=False,
 ) -> torch.Tensor:
     m = XQ.shape[0]
     n = WQ.shape[0]
@@ -548,7 +548,7 @@ def gemm_a8w8_blockscale(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    is_bpreshuffled: bool = False,
+    preshuffleB: bool = False,
     is_default_cktile: bool = False,
 ) -> torch.Tensor:
     assert dtype in [
@@ -562,7 +562,7 @@ def gemm_a8w8_blockscale(
     from aiter.jit.utils.chip_info import get_gfx
 
     # give the priority to gfx950 asm when possible
-    if is_bpreshuffled and get_gfx() == "gfx950" and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+    if preshuffleB and get_gfx() == "gfx950" and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
         
     config = get_CKGEMM_config(
@@ -573,13 +573,13 @@ def gemm_a8w8_blockscale(
     if config is not None:
         # config found in tuned file
         libtype = config["libtype"]
-        if config["is_bpreshuffled"] == is_bpreshuffled:
+        if config["preshuffleB"] == preshuffleB:
             if libtype == "cktile":
                 return gemm_a8w8_blockscale_cktile(
-                    XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, is_bpreshuffled
+                    XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, preshuffleB
                 )
             elif libtype == "ck":
-                if is_bpreshuffled:
+                if preshuffleB:
                     return gemm_a8w8_blockscale_bpreshuffle_ck(
                         XQ, shuffle_weight(WQ, layout=(16, 16)), x_scale, w_scale, Y
                     )
@@ -591,17 +591,17 @@ def gemm_a8w8_blockscale(
         # config not found in tuned file, use default
         if is_default_cktile:
             # default to ck_tile
-            if is_bpreshuffled:
+            if preshuffleB:
                 return gemm_a8w8_blockscale_cktile(
-                    XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, is_bpreshuffled
+                    XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, preshuffleB
                 )
             else:
                 return gemm_a8w8_blockscale_cktile(
-                    XQ, WQ, x_scale, w_scale, Y, is_bpreshuffled
+                    XQ, WQ, x_scale, w_scale, Y, preshuffleB
                 )
         else:
             # default to ck
-            if is_bpreshuffled:
+            if preshuffleB:
                 return gemm_a8w8_blockscale_bpreshuffle_ck(
                     XQ, shuffle_weight(WQ, layout=(16, 16)), x_scale, w_scale, Y
                 )
@@ -767,7 +767,7 @@ def gemm_a8w8_blockscale_cktile_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-    is_bpreshuffled: bool = True,
+    preshuffleB: bool = True,
 ) -> torch.Tensor: ...
 
 
