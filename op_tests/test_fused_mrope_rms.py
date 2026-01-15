@@ -6,16 +6,11 @@ import torch
 from torch import Tensor
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
-<<<<<<< HEAD
 from aiter import dtypes, per_tensor_quant
 from typing import List
 import triton
 import triton.language as tl
-=======
-from aiter.utility import dtypes
-from typing import List
-import argparse
->>>>>>> 4589599a8 (mdf_bf16_semaphore_check (#1773))
+
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -289,7 +284,7 @@ def set_kv_cache_shuffle_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Triton kernel to set KV cache with shuffle layout.
-    
+
     This implements the same shuffle logic as reshape_and_cache_shuffle_kernel:
     - Key shuffle: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     - Value shuffle: [num_blocks, num_kv_heads, block_size // x, head_size, x]
@@ -333,7 +328,7 @@ def set_kv_cache_shuffle_layout(
     x: int,
 ):
     """Set KV cache with shuffle layout using Triton kernel.
-    
+
     This implements the same shuffle logic as the triton kernel:
     - Key shuffle: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     - Value shuffle: [num_blocks, num_kv_heads, block_size // x, head_size, x]
@@ -341,7 +336,7 @@ def set_kv_cache_shuffle_layout(
     num_tokens = kv_loc.shape[0]
     _, num_kv_heads, head_size = k_quantized.shape
     num_blocks = k_cache.shape[0]
-    
+
     # Create template tensors for view_as
     k_cache_template = torch.empty(
         [num_blocks, num_kv_heads, head_size // x, block_size, x],
@@ -355,7 +350,7 @@ def set_kv_cache_shuffle_layout(
     )
     new_key_cache = k_cache.view_as(k_cache_template)
     new_value_cache = v_cache.view_as(v_cache_template)
-    
+
     grid = (num_tokens, num_kv_heads)
     set_kv_cache_shuffle_kernel[grid](
         k_quantized,
@@ -455,7 +450,7 @@ def run_torch_mrope_3d_rms_set_kv(
     # Use the actual k_scale and v_scale parameters, and ensure quant_dtype matches kv_cache_dtype
     kv_cache_dtype = k_cache.dtype
     qkv_dtype = qkv.dtype
-    
+
     # When kv_cache_dtype == qkv_dtype, kernel directly stores without quantization
     # Only quantize when types differ (e.g., fp8)
     if kv_cache_dtype == qkv_dtype:
@@ -464,7 +459,7 @@ def run_torch_mrope_3d_rms_set_kv(
     else:
         k_quantized, _ = per_tensor_quant(k_for_quant, scale=torch.tensor(k_scale, device=k_for_quant.device), quant_dtype=kv_cache_dtype)
         v_quantized, _ = per_tensor_quant(v_for_quant, scale=torch.tensor(v_scale, device=v_for_quant.device), quant_dtype=kv_cache_dtype)
-    
+
     # Store k and v to cache using kv_loc indexing
     if use_shuffle_layout:
         # Calculate x for shuffle layout: x = 16 // k_cache.element_size()
@@ -486,7 +481,7 @@ def run_torch_mrope_3d_rms_set_kv(
     # q_out shape is [num_tokens, num_heads_q, head_size]
     # q shape after reshape is [num_tokens, q_size] where q_size = num_heads_q * head_size
     q_out.copy_(q.view(num_tokens, num_heads_q, head_size))
-    
+
     # Return k_out and v_out if requested
     # k_out and v_out should match k_cache[kv_loc] and v_cache[kv_loc] respectively
     # In kernel: k_out is stored at token_id order, k_cache is stored at kv_loc[token_id] order
@@ -495,7 +490,7 @@ def run_torch_mrope_3d_rms_set_kv(
         # k_out and v_out are stored in token_id order, same as k_quantized and v_quantized
         k_out.copy_(k_quantized)
         v_out.copy_(v_quantized)
-    
+
     return None
 
 
@@ -534,7 +529,7 @@ def run_fused_mrope_3d_rms_set_kv(
     block_size = page_size
     if use_shuffle_layout:
         x = 16 // k_cache.element_size()
-    
+
     if is_mrope:
         aiter.fused_mrope_3d_rms_set_kv(
             qkv,
@@ -634,13 +629,13 @@ def test_mrope_3d_rms_set_kv(
         num_tokens, num_heads_q, head_size, dtype=dtype, device="cuda"
     )
     q_out = torch.empty(num_tokens, num_heads_q, head_size, dtype=dtype, device="cuda")
-    
+
     # Determine KV cache dtype
     # Use the same logic as sglang: fp8_e4m3 maps to float8_e4m3fnuz on HIP, float8_e4m3fn on CUDA
     if kv_cache_dtype is None:
         # Use aiter's default FP8 dtype which matches the hardware (gfx942 -> fnuz, gfx950 -> fn)
         kv_cache_dtype = dtypes.fp8  # This will be torch.float8_e4m3fnuz on HIP (gfx942) or torch.float8_e4m3fn on CUDA/gfx950
-    
+
     # Create cache buffers based on layout type
     if use_shuffle_layout:
         # Calculate x: x = 16 // k_cache.element_size()
@@ -749,7 +744,7 @@ def test_mrope_3d_rms_set_kv(
     if use_shuffle_layout:
         info += f", use_shuffle_layout:{use_shuffle_layout}, page_size:{page_size}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
-    
+
     checkAllclose(q_out_ref, q_out, msg="q_out", rtol=1e-2, atol=0.05)
     # For shuffle layout, we need to reshape cache for comparison
     if use_shuffle_layout:
@@ -785,7 +780,7 @@ def test_mrope_3d_rms_set_kv(
             rtol=1e-2,
             atol=0.05,
         )
-    
+
     # Verify k_out and v_out if return_kv is enabled
     if test_return_kv and k_out is not None and v_out is not None:
         checkAllclose(
@@ -817,7 +812,7 @@ if __name__ == "__main__":
             for num_head in num_heads:
                 for i, head_size in enumerate(head_sizes):
                     test_mrope_3d_rms(
-                        args.dtype,
+                        dtype,
                         num_token,
                         num_head,
                         num_head,
@@ -846,7 +841,7 @@ if __name__ == "__main__":
                     ms = mrope_sections[i]
                     for is_interleaved in is_interleaveds:
                         test_mrope_3d_rms(
-                            args.dtype,
+                            dtype,
                             num_token,
                             num_head,
                             num_head,
@@ -858,7 +853,7 @@ if __name__ == "__main__":
                             eps=1e-6,
                             is_mrope=True,
                         )
-    
+
     print("\n\n================== test_rope_rms_set_kv ==================\n\n")
     is_neox_styles = [True, False]
     num_tokens = [513, 1257, 127, 778, 10024, 3]
@@ -870,7 +865,7 @@ if __name__ == "__main__":
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [False, True]  # Test both normal and shuffle layouts
     page_sizes = [16, 1024]  # Test two page sizes for shuffle layout
-    
+
     for kv_cache_dtype in kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
             for use_shuffle_layout in use_shuffle_layouts:
@@ -949,6 +944,6 @@ if __name__ == "__main__":
                                             use_shuffle_layout=use_shuffle_layout,
                                             page_size=page_size,
                                         )
- 
+
 
     print("done")
