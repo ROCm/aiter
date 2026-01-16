@@ -286,6 +286,42 @@ __device__ __forceinline__ void load_v_to_gpr(v8ui* p_result, const uintptr_t p_
     *p_result = {pass_0.x, pass_0.y, pass_0.z, pass_0.w, pass_1.x, pass_1.y, pass_1.z, pass_1.w};
 }
 
+// After loading, the elements are in the following layout:
+// [0, 0-7], [1, 0-7], [2, 0-7], [3, 0-7], (done by warp 0 thread 0)
+// [0, 8-15], [1, 8-15], [2, 8-15], [3, 8-15] (done by warp 0 thread 1)
+// ...
+// [0, 120-127], [1, 120-127], [2, 120-127], [3, 120-127] (done by warp 0 thread 15)
+// [0, 128-135], [1, 128-135], [2, 128-135], [3, 128-135] (done by warp 2 thread 0)
+// ...
+// [0, 504-511], [1, 504-511], [2, 504-511], [3, 504-511] (done by warp 6 thread 15)
+// Pad 64 bytes/16 DWORDs for avoiding bank conflicts.
+// [4, 0-7], [5, 0-7], [6, 0-7], [7, 0-7] (done by warp 0 thread 16)
+// ...
+// [4, 504-511], [5, 504-511], [6, 504-511], [7, 504-511] (done by warp 6 thread 31)
+// Pad 64 bytes/16 DWORDs
+// [8, 0-7], [9, 0-7], [10, 0-7], [11, 0-7] (done by warp 0 thread 32)
+// ...
+// [8, 504-511], [9, 504-511], [10, 504-511], [11, 504-511] (done by warp 6 thread 47)
+// Pad 64 bytes/16 DWORDs
+// [12, 0-7], [13, 0-7], [14, 0-7], [15, 0-7] (done by warp 0 thread 48)
+// ...
+// [12, 504-511], [13, 504-511], [14, 504-511], [15, 504-511] (done by warp 6 thread 63)
+// Pad 64 bytes/16 DWORDs
+// [16, 0-7], [17, 0-7], [18, 0-7], [19, 0-7] (done by warp 1 thread 0)
+// ...
+// [16, 504-511], [17, 504-511], [18, 504-511], [19, 504-511] (done by warp 7 thread 15)
+// Pad 64 bytes/16 DWORDs
+// [20, 0-7], [21, 0-7], [22, 0-7], [23, 0-7] (done by warp 1 thread 16)
+// ...
+// [20, 504-511], [21, 504-511], [22, 504-511], [23, 504-511] (done by warp 7 thread 31)
+// Pad 64 bytes/16 DWORDs
+// [24, 0-7], [25, 0-7], [26, 0-7], [27, 0-7] (done by warp 1 thread 32)
+// ...
+// [24, 504-511], [25, 504-511], [26, 504-511], [27, 504-511] (done by warp 7 thread 47)
+// Pad 64 bytes/16 DWORDs
+// [28, 0-7], [29, 0-7], [30, 0-7], [31, 0-7] (done by warp 1 thread 48)
+// ...
+// [28, 504-511], [29, 504-511], [30, 504-511], [31, 504-511] (done by warp 7 thread 63)
 template <typename T>
 __device__ __forceinline__ void store_transposed_v_to_lds(const uintptr_t p_lds_vt,
                                                           const v8ui& v_transposed)
