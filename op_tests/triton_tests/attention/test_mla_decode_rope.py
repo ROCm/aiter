@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
 
-from aiter.ops.triton.mla_decode_rope import (
+from aiter.ops.triton.attention.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
     decode_attention_fwd_grouped_rope,
     _get_config,

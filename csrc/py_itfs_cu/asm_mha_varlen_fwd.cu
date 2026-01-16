@@ -38,7 +38,10 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           float softmax_scale,
                                           float logits_soft_cap,
                                           float p_dropout,
-                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                          const std::string& data_type,
+                                          bias_enum bias_type,
+                                          int how_v3_bf16_cvt)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -114,7 +117,16 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
     } else {
         seqstart_q_ptr = cu_seqlens_q.data_ptr();
     }
-    return mha_fwd_args{q.data_ptr(),
+    return mha_fwd_args{true, // use_asm_v3
+                        false, // v3_api_check
+                        how_v3_bf16_cvt,
+                        data_type,
+                        true, //is_group_mode
+                        static_cast<int>(bias_type),
+                        has_lse,
+                        0, // qscale_type
+                        false, // has_sink
+                        q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
                         bias_ptr,
@@ -388,19 +400,13 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 softmax_scale,
                 logits_soft_cap,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                q_dtype_str,
+                bias_type,
+                how_v3_bf16_cvt);
 
-        float t = aiter::mha_fwd(args,
-                                stream_config,
-                                q_dtype_str,
-                                true, //is_group_mode
-                                mask.type,
-                                bias_type,
-                                has_lse,
-                                quant_scale_enum::no_scale,
-                                true,
-                                how_v3_bf16_cvt);
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd 3");
+        float t = aiter::mha_fwd(args, stream_config);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd");
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.

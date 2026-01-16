@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Any, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import AITER_CSRC_DIR, CK_DIR, AITER_META_DIR, compile_ops
+from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
@@ -92,7 +92,6 @@ def cmdGenFunc_mha_fwd(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
         "--receipt 100 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 2 --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
@@ -360,9 +359,6 @@ def cmdGenFunc_mha_varlen_fwd(
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
             "--receipt 200 --filter {} --output_dir {{}}".format('" @ "')
         )
-        blob_gen_cmd.append(
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
-        )
     else:
         filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
         filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
@@ -413,9 +409,6 @@ def cmdGenFunc_mha_varlen_fwd(
         blob_gen_cmd.append(
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
-        )
-        blob_gen_cmd.append(
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
         )
     return {
         "md_name": md_name,
@@ -974,8 +967,15 @@ def cmdGenFunc_mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    kv_last_page_lens: Optional[Tensor] = None,
+    block_table: Optional[Tensor] = None,
+    seqlen_k: Optional[Tensor] = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -989,6 +989,12 @@ def cmdGenFunc_mha_batch_prefill(
     elif q.dtype == torch.bfloat16:
         md_name += "_bf16"
         filter_fwd += "bf16*"
+    elif q.dtype == dtypes.fp8:
+        if out is None or out.dtype == dtypes.bf16:
+            md_name += "_fp8bf16"
+            filter_fwd += "fp8bf16*"
+        else:
+            raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if 0.0 < logits_soft_cap:
         md_name += "_logits"
         filter_fwd += "_logits*"
@@ -1019,13 +1025,17 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_dropout"
         filter_fwd += "_dropout*"
+    if q_descale is None or k_descale is None or v_descale is None:
+        md_name += "_nqscale"
+        filter_fwd += "_nqscale*"
+    else:
+        # only support per-tensor quantization for now
+        md_name += "_pertensor"
+        filter_fwd += "_pertensor*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
     ]
-    blob_gen_cmd.append(
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 4 --output_dir {{}}"
-    )
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
@@ -1533,7 +1543,9 @@ def _flash_attn_backward_fake(
     return softmax_d
 
 
-@torch_compile_guard(gen_fake=_flash_attn_backward_fake)
+@torch_compile_guard(
+    mutates_args=["dq", "dk", "dv"], gen_fake=_flash_attn_backward_fake
+)
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -2589,12 +2601,26 @@ def mha_batch_prefill_fake_tensors(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
+    kv_last_page_lens: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    seqlen_k: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    is_vectorized = k.dim() == 5 and v.dim() == 5
+    is_linear = (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
+    if not (is_vectorized or is_linear):
+        raise ValueError(
+            "Batch prefill requires 5D vectorized, 4D linear, or 3D linear (page_size=1) K/V"
+            " tensors"
+        )
     num_heads = q.size(1)  # num_heads = q.sizes()[1]
-    head_size_v = v.size(2)  # head_size_v = v.size(2)
+    head_size_v = v.size(-2) if is_vectorized else v.size(-1)
     total_q = q.size(0)  # total_q = q.size(0)
 
     if out is None:
@@ -2654,7 +2680,14 @@ def mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    kv_last_page_lens: Optional[Tensor] = None,
+    block_table: Optional[Tensor] = None,
+    seqlen_k: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
@@ -2674,11 +2707,18 @@ def _mha_batch_prefill(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
     zero_tensors: bool = False,
     out: torch.Tensor = None,
+    kv_last_page_lens: torch.Tensor = None,
+    block_table: torch.Tensor = None,
+    seqlen_k: torch.Tensor = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2701,8 +2741,14 @@ def _mha_batch_prefill(
         return_lse,
         return_softmax,
         out,
+        bias,
         alibi_slopes,
-        None,
+        q_descale,
+        k_descale,
+        v_descale,
+        kv_last_page_lens,
+        block_table,
+        seqlen_k,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
@@ -2727,16 +2773,44 @@ def mha_batch_prefill_func(
     return_lse=False,
     return_attn_probs=False,
     out=None,
+    kv_last_page_lens=None,
+    block_table=None,
+    seqlen_k=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-    head_size_q_og = q.size(2)
-    head_size_v_og = v.size(2)
-    if head_size_q_og % 8 != 0:
-        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
-        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
-    if head_size_v_og % 8 != 0:
-        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    head_size_q_og = q.size(-1)
+    # 16 bytes = 128-bit (dwordx4) vector width assumed by CK kernels.
+    k_vector_size = 16 // k.element_size()
+    is_vectorized = k.dim() == 5 and v.dim() == 5
+    is_linear = (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
+    if not (is_vectorized or is_linear):
+        raise ValueError(
+            "Batch prefill requires 5D vectorized, 4D linear, or 3D linear (page_size=1) K/V"
+            " tensors"
+        )
+    head_size_v_og = v.size(-2) if is_vectorized else v.size(-1)
+    if head_size_q_og % k_vector_size != 0 or head_size_v_og % k_vector_size != 0:
+        raise ValueError("Batch prefill requires head size divisible by vector size")
+    if is_vectorized:
+        if k.size(-3) * k_vector_size != head_size_q_og:
+            raise ValueError("K vectorized layout does not match Q head size")
+        if k.size(-2) % k_vector_size != 0:
+            raise ValueError(
+                "Vectorized KV requires page size divisible by vector size"
+            )
+        if v.size(-1) != k_vector_size:
+            raise ValueError("Vectorized KV requires last dim equal to vector size")
+    else:
+        if k.size(-1) != head_size_q_og:
+            raise ValueError("K linear layout does not match Q head size")
+        if k.size(1) != v.size(1) or k.size(2) != v.size(2):
+            raise ValueError("K/V linear layout must match page size and head count")
+    if k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError("Batch prefill requires K/V with contiguous last dimension")
     out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
         q,
         k,
@@ -2756,6 +2830,12 @@ def mha_batch_prefill_func(
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
         out=out,
+        kv_last_page_lens=kv_last_page_lens,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     out = out_padded[..., :head_size_v_og]
 

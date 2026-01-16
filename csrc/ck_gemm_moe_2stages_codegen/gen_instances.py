@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import argparse
 import itertools
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages_common{quanttype}.cuh"
 
 using A0DataType = {A0DataType};
@@ -768,7 +768,11 @@ A8W8_blockscale_gemm2_heuristic_dispatch = """
     {{
         if (block_m == 16)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            if (inter_dim % 256 == 0)
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            else
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 128, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+
         }}
         else if (block_m == 64)
         {{
@@ -874,6 +878,7 @@ class ck_moe_2stage_gemm_codegen:
         activation,
         mul_routed_weight_stage,
         preshuffle,
+        splitk,
     ):
         self.working_path = working_path
         self.a_dtype = a_dtype.upper()
@@ -884,6 +889,7 @@ class ck_moe_2stage_gemm_codegen:
         self.mul_routed_weight_stage = mul_routed_weight_stage
         self.nswizzle = False
         self.preshuffle = preshuffle
+        self.splitk = splitk
 
     def generate_instance_and_lookUpTable(self):
         _, gemm1_kernel_list = get_gemm1_kernels_list(
@@ -895,6 +901,7 @@ class ck_moe_2stage_gemm_codegen:
             self.activation,
             self.mul_routed_weight_stage == 1,
             self.preshuffle,
+            self.splitk,
         )
         tag, gemm2_kernel_list = get_gemm2_kernels_list(
             self.a_dtype,
@@ -929,6 +936,9 @@ class ck_moe_2stage_gemm_codegen:
                         quanttype = "_mxfp4"
                 else:
                     quanttype = ""
+                gemm1_fp32 = (
+                    self.splitk and (kernel.stage == 1) and (quanttype == "_blockscale")
+                )
                 if not os.path.exists(f_instance):
                     with open(f_instance, "a") as f_ins:
                         stage_instance = STG_INSTANCE_IMPL.format(
@@ -936,7 +946,7 @@ class ck_moe_2stage_gemm_codegen:
                             A0DataType=self.a_dtype,
                             B0DataType=self.b_dtype,
                             AccDataType="F32" if self.a_dtype != "I8" else "I32",
-                            EDataType=self.c_dtype,
+                            EDataType="F32" if gemm1_fp32 else self.c_dtype,
                             CDEElementOp=kernel.CDEElementOp,
                             Nswizzle=str(self.nswizzle).lower(),
                             Quant=self.quant_type,
@@ -965,7 +975,7 @@ class ck_moe_2stage_gemm_codegen:
                     A0DataType=self.a_dtype,
                     B0DataType=self.b_dtype,
                     AccDataType="F32" if self.a_dtype != "I8" else "I32",
-                    EDataType=self.c_dtype,
+                    EDataType="F32" if gemm1_fp32 else self.c_dtype,
                     CDEElementOp=kernel.CDEElementOp,
                     Nswizzle=str(self.nswizzle).lower(),
                     Quant=self.quant_type,
@@ -991,11 +1001,12 @@ class ck_moe_2stage_gemm_codegen:
             tag
         ]
         with open(f_gemm1_heuristic_dispatch, "a") as f_h:
+            gemm1_fp32 = self.splitk and (quanttype == "_blockscale")
             gemm1_heuristic_dispatch_str = gemm1_heuristic_dispatch.format(
                 A0DataType=self.a_dtype,
                 B0DataType=self.b_dtype,
                 AccDataType="F32" if self.a_dtype != "I8" else "I32",
-                EDataType=self.c_dtype,
+                EDataType="F32" if gemm1_fp32 else self.c_dtype,
                 CDEElementOp=kernel_list[0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
@@ -1108,6 +1119,12 @@ if __name__ == "__main__":
         help="enable pre-shuffle weight mode",
     )
 
+    parser.add_argument(
+        "--issplitk",
+        action="store_true",
+        help="enable moe_stage1 splitk mode",
+    )
+
     args = parser.parse_args()
     args.quant_type = (
         "per_1x128" if args.quant_type == "per_128x128" else args.quant_type
@@ -1157,13 +1174,15 @@ if __name__ == "__main__":
                 act,
                 routed_weight,
                 preshuffle_mode,
+                False,  # splitk
             )
             codegen.generate_instance_and_lookUpTable()
 
         # blk-quant moe
         blk_quant_l = ["per_1x128"]
-        for c_dtype, act, routed_weight, quant in itertools.product(
-            c_dtypes, acts, routed_weight_l, blk_quant_l
+        blk_splitk_l = [False, True]
+        for c_dtype, act, routed_weight, quant, splitk in itertools.product(
+            c_dtypes, acts, routed_weight_l, blk_quant_l, blk_splitk_l
         ):
             codegen = ck_moe_2stage_gemm_codegen(
                 args.working_path,
@@ -1174,6 +1193,7 @@ if __name__ == "__main__":
                 act,
                 routed_weight,
                 preshuffle_mode,
+                splitk,
             )
             codegen.generate_instance_and_lookUpTable()
 
@@ -1198,6 +1218,7 @@ if __name__ == "__main__":
                 act,
                 routed_weight,
                 preshuffle_mode,
+                False,  # splitk
             )
             codegen.generate_instance_and_lookUpTable()
     else:
@@ -1212,6 +1233,7 @@ if __name__ == "__main__":
                 args.activation,
                 args.mul_routed_weight_stage,
                 args.preshuffle,
+                args.issplitk,
             )
             codegen.generate_instance_and_lookUpTable()
 

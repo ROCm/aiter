@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "aiter_hip_common.h"
 #include "dispatch_utils.h"
@@ -68,7 +68,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     using vec_i = ck_tile::vec_t<DTYPE_I, thread_data_size>;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? thread_data_size / 2 : thread_data_size;
-    using vec_o = ck_tile::vec_t<DTYPE_O, vec_size_o>;
     const float inverted_DTYPE_MAX =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
             ? 0.25
@@ -135,8 +134,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
     auto buffer_o =
-        ck_tile::make_buffer_view<ck_tile::address_space_enum::global,
-                                  ck_tile::amd_buffer_coherence_enum::glc>(out_ptr, oob_o);
+        ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(out_ptr, oob_o);
     buffer_o.init_raw();
 
     auto out_s =
@@ -341,7 +339,6 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
 
     using vec_i       = ck_tile::vec_t<DTYPE_I, vec_size_i>;
-    using vec_o       = ck_tile::vec_t<DTYPE_O, vec_size_o>;
     using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
 
     const int64_t row_offset        = blockIdx.x * cols;

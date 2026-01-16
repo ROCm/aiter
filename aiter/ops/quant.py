@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import functools
+from typing import Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
-import torch
-from torch import Tensor
-from typing import Optional, Tuple
+
 from ..jit.core import compile_ops
-import torch.nn.functional as F
-import functools
-from .enum import QuantType, ActivationType
-from . import triton
 from ..utility import dtypes, fp4_utils
+from . import triton
+from .enum import ActivationType, QuantType
 
 
 @compile_ops("module_smoothquant")
@@ -99,6 +102,42 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     if shuffle:
         scale = fp4_utils.e8m0_shuffle(scale)
     return y, scale.view(dtypes.fp8_e8m0)
+
+
+def per_1x32_f8_scale_f8_quant(
+    x, scale=None, quant_dtype=dtypes.fp8, scale_type=dtypes.fp32, shuffle=False
+):
+    assert quant_dtype == dtypes.fp8
+    block_size = 32
+    dtypeMax = 448.0
+    MAX_POW2 = int(torch.log2(torch.tensor(dtypeMax, dtype=torch.float32)).item())
+    dtypeMax = 2.0**MAX_POW2
+
+    shape_original = x.shape
+    x = x.view(-1, shape_original[-1])
+
+    m, n = x.shape
+    x = x.view(-1, block_size)
+    max_abs = torch.amax(torch.abs(x.float()), 1)
+
+    # fp8e8m0fnu_from_fp32_value
+    if scale_type == dtypes.fp32:
+        scale_f32 = max_abs / dtypeMax
+        scale_e8m0_biased = None
+    else:
+        scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+        scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
+        # scale_f32 = max_abs / dtypeMax
+
+    y = x.float() / scale_f32.view(-1, 1)
+    y = y.view(*shape_original[:-1], -1)
+    if scale_type == dtypes.fp32:
+        scale = scale_f32.view(m, -1)
+    else:
+        scale = scale_e8m0_biased.view(m, -1)  # .view(torch.uint8)
+        if shuffle:
+            scale = fp4_utils.e8m0_shuffle(scale)
+    return y.to(quant_dtype), scale
 
 
 def per_tensor_quant(
@@ -384,12 +423,12 @@ def dynamic_per_token_scaled_quant(
 
 @compile_ops("module_quant")
 def dynamic_per_group_scaled_quant_fp4(
-    out: Tensor,
-    input: Tensor,
-    scales: Tensor,
-    group_size: Optional[int] = 32,
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int = 32,
     shuffle_scale: bool = True,
-    num_rows: Optional[Tensor] = None,
+    num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
 ) -> None:
     """

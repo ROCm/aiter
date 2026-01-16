@@ -32,7 +32,10 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
                                    float p_dropout,
-                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                   const std::string& data_type,
+                                   bias_enum bias_type,
+                                   int how_v3_bf16_cvt)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -85,7 +88,16 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return mha_fwd_args{q.data_ptr(),
+    return mha_fwd_args{true, // use_asm_v3
+                        false, // v3_api_check
+                        how_v3_bf16_cvt,
+                        data_type,
+                        false, // is_group_mode
+                        static_cast<int>(bias_type),
+                        has_lse,
+                        0, // qscale_type
+                        false, //has_sink
+                        q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
                         bias_ptr,
@@ -310,18 +322,12 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                q_dtype_str,
+                bias_type,
+                how_v3_bf16_cvt);
 
-        float t = aiter::mha_fwd(args,
-                                 stream_config,
-                                 q_dtype_str,
-                                 false, // is_group_mode
-                                 mask.type,
-                                 bias_type,
-                                 has_lse,
-                                 quant_scale_enum::no_scale,
-                                 true,
-                                 how_v3_bf16_cvt);
+        float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

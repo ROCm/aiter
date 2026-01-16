@@ -11,12 +11,19 @@ from csrc.cpp_itfs.pa.pa_ragged import (
 )
 from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 
 from aiter import dtypes
 
 from ..jit.core import compile_ops
 
 MD_NAME = "module_attention"
+
+direct_register_custom_op(
+    "pa_decode_gluon",
+    pa_decode_gluon,
+    ["output", "output_gluon", "exp_sums", "max_logits", "temporary_output"],
+)
 
 
 def gen_pa_fwd_native_fake(
@@ -629,7 +636,8 @@ def get_mla_metadata_info_v1(
 
     max_qo_tiles_per_batch = (
         int(math.ceil(max_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
+        if num_head_qo == 16
+        or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size

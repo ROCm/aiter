@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 import os
 import sys
@@ -166,6 +166,8 @@ a8w8_gemm1_kernels_list_gfx950= {
 }
 
 a8w8_gemm1_kernels_list= {
+    12: kernelInstanceGEMM1(       128,       16,         64,       128,     1,       2,        1,),
+    11: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
      0: kernelInstanceGEMM1(       256,       32,         64,       256,     1,       4,        1,),
      1: kernelInstanceGEMM1(       256,       32,         64,       128,     1,       4,        1,),
      2: kernelInstanceGEMM1(       256,       64,         64,       256,     1,       4,        1,),
@@ -184,6 +186,7 @@ a8w8_gemm1_kernels_list= {
 a8w8_gemm1_blockscale_kernels_list= {
      1: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
      0: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
+     2: kernelInstanceGEMM1(       128,       16,        128,       128,     1,       2,        1,),
      #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
 }
 
@@ -283,6 +286,8 @@ a8w8_gemm2_kernels_list_gfx950= {
 }
 
 a8w8_gemm2_kernels_list= {
+    17: kernelInstanceGEMM2(       256,        16,       128,       256,     1,       4,         1,),
+    18: kernelInstanceGEMM2(       128,        16,       128,       128,     1,       2,         1,),
      0: kernelInstanceGEMM2(       256,        32,        64,       256,     1,       4,         1,),
      1: kernelInstanceGEMM2(       256,        64,        64,       256,     1,       4,         1,),
      2: kernelInstanceGEMM2(       256,       128,        64,       128,     1,       4,         1,),
@@ -311,6 +316,7 @@ a8w8_gemm2_kernels_list= {
 a8w8_gemm2_blockscale_kernels_list= {
      0: kernelInstanceGEMM2(       256,       16,        128,       256,     1,       4,        1,),
      1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
+     2: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
      #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
 }
 
@@ -372,6 +378,7 @@ def get_gemm1_kernels_list(
     ActOP: str,
     MulRoutedWeight: bool,
     preshuffle: bool = False,
+    splitk: bool = False,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -417,7 +424,10 @@ def get_gemm1_kernels_list(
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleWint4"
         elif tag == "a8w8blkscale":
-            kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
+            if splitk:
+                kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscaleSplitk"
+            else:
+                kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
         elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScale"
         elif tag == "a16w16":

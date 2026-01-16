@@ -3,8 +3,8 @@ import sys
 import torch
 from triton.testing import runtime
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
-from aiter.ops.triton.rope import RotateStyle
-from aiter.ops.triton.rope import (
+from aiter.ops.triton.rope.rope import RotateStyle
+from aiter.ops.triton.rope.rope import (
     rope_fwd,
     rope_fwd_inplace,
     rope_bwd,
