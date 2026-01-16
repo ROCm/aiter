@@ -1225,7 +1225,7 @@ def sage_fwd_v2(
         block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
 
         k_descale_ptr = (
-            K_Descale + k_descale_offset + (n_front_skip_blocks + offs_n[None, :]) * stride_k_descale_s + offs_d_qk_s[:, None]
+            K_Descale + k_descale_offset + ((n_front_skip_blocks * BLOCK_N) + offs_n[None, :]) * stride_k_descale_s + offs_d_qk_s[:, None]
         )
         v_descale_ptr = (
             V_Descale + k_descale_offset + n_front_skip_blocks * stride_v_descale_blk
@@ -1298,7 +1298,8 @@ def sage_fwd_v2(
         k_descale_ptr = (
             K_Descale
             + k_descale_offset +
-            (n_front_skip_blocks + offs_n[None, :]) * stride_k_descale_s + offs_d_qk_s[:, None]
+            ((n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
+              + offs_n[None, :]) * stride_k_descale_s + offs_d_qk_s[:, None]
         )
         v_descale_ptr = (
             V_Descale
@@ -1373,7 +1374,7 @@ def sage_fwd_v2(
         k_descale_ptr = (
             K_Descale
             + k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks + offs_n[None, :])
+            + ((n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * BLOCK_N + offs_n[None, :])
             * stride_k_descale_s + offs_d_qk_s[:, None]
         )
         v_descale_ptr = (
