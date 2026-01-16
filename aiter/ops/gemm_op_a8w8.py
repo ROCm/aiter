@@ -153,6 +153,20 @@ def gemm_a8w8_blockscale_ck(
 
 
 @compile_ops(
+    "module_gemm_a8w8_blockscale_cktile",
+    fc_name="gemm_a8w8_blockscale_cktile",
+    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+)
+def gemm_a8w8_blockscale_cktile(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+) -> torch.Tensor: ...
+
+
+@compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle",
     fc_name="gemm_a8w8_blockscale_bpreshuffle",
     gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
@@ -275,7 +289,6 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
         ).to_dict("index")
 
     cu_num = get_cu_num()
-
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
@@ -551,7 +564,17 @@ def gemm_a8w8_blockscale(
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
-        get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
+        config = get_CKGEMM_config(
+            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+        )
+        if config is not None:
+            libtype = config["libtype"]
+            if libtype == "ck":
+                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+            elif libtype == "cktile":
+                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
+            else:
+                assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
@@ -672,6 +695,24 @@ def gemm_a8w8_blockscale_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_cktile_tune",
+    fc_name="gemm_a8w8_blockscale_cktile_tune",
+    gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
+)
+def gemm_a8w8_blockscale_cktile_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
+
 @compile_ops(
     "module_gemm_a8w8_bpreshuffle_tune",
     fc_name="gemm_a8w8_bpreshuffle_tune",
@@ -686,6 +727,8 @@ def gemm_a8w8_bpreshuffle_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
+
+
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle_tune",
     fc_name="gemm_a8w8_blockscale_bpreshuffle_tune",

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_blockscale_common.cuh"
+#include "gemm_a8w8_blockscale_cktile_common.cuh"
+#include "gemm_a8w8_blockscale_cktile_lookup.h"
+#include "gemm_a8w8_blockscale_cktile_manifest.h"
 #include "gemm_a8w8_blockscale_common.h"
-#include "gemm_a8w8_blockscale_lookup.h"
-#include "gemm_a8w8_blockscale_manifest.h"
 
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
@@ -14,13 +14,13 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     // This is fine since kernels are padded anyway.
 
     static const auto lookup = [] {
-        if constexpr(std::is_same_v<EDataType, FP16>)
+        if constexpr(std::is_same_v<EDataType, TILE_FP16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, FP16)};
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, TILE_FP16)};
         }
-        else if constexpr(std::is_same_v<EDataType, BF16>)
+        else if constexpr(std::is_same_v<EDataType, TILE_BF16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, BF16)};
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, TILE_BF16)};
         }
         else
         {
@@ -57,17 +57,16 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
         return it->second;
     }
 
-    // Default legacy kernel
-    return a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1<
-        DDataType,
-        EDataType>;
+    // Default tile kernel
+    return a8w8_blockscale_cktile_128x128x256_1x4x1_16x16x32_intrawave_0x0x0x0_1<DDataType,
+                                                                                 EDataType>;
 }
 
-torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
-                                   torch::Tensor& WQ,
-                                   torch::Tensor& x_scale,
-                                   torch::Tensor& w_scale,
-                                   torch::Tensor& Y)
+torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
+                                          torch::Tensor& WQ,
+                                          torch::Tensor& x_scale,
+                                          torch::Tensor& w_scale,
+                                          torch::Tensor& Y)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -78,11 +77,11 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<FP32, FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<TILE_FP32, TILE_FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<FP32, BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<TILE_FP32, TILE_BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
     }
     else
     {
