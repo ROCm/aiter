@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -8,7 +8,6 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
-from aiter import per_tensor_quant
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -204,143 +203,6 @@ def test_mla(
     #     us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
     nhead_kv = 1
-
-    # ############################## absorb: prefill (persistent scheduler)
-    def test_ps_prefill():
-        seq_lens_qo_prefill = seq_lens_qo.clone()
-        qo_indptr_prefill = torch.zeros(batch_size + 1, dtype=torch.int)
-        qo_indptr_prefill[1 : batch_size + 1] = torch.cumsum(seq_lens_qo_prefill, dim=0)
-        total_q_prefill = qo_indptr_prefill[-1].item()
-        max_seqlen_qo_prefill = seq_lens_qo_prefill.max().item()
-
-        q = torch.randn((total_q_prefill, nhead, qk_head_dim), dtype=torch.bfloat16)
-
-        out_ref, lse_ref = torch_mla_extend(
-            q,
-            kv_buffer,
-            qo_indptr_prefill,
-            kv_indptr,
-            kv_indices,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            dtype=out_dtype,
-            is_causal=True,
-        )
-
-        # Get metadata info using get_mla_metadata_info_v1
-        (
-            (work_meta_data_size, work_meta_data_type),
-            (work_indptr_size, work_indptr_type),
-            (work_info_set_size, work_info_set_type),
-            (reduce_indptr_size, reduce_indptr_type),
-            (reduce_final_map_size, reduce_final_map_type),
-            (reduce_partial_map_size, reduce_partial_map_type),
-        ) = aiter.get_mla_metadata_info_v1(
-            batch_size,
-            max_seqlen_qo_prefill,
-            nhead,
-            q.dtype,
-            kv_buffer.dtype,
-            is_sparse=False,
-            fast_mode=True,
-        )
-
-        # Allocate tensors based on metadata info
-        work_meta_data = torch.empty(
-            work_meta_data_size, dtype=work_meta_data_type, device="cuda"
-        )
-        work_indptr = torch.empty(
-            work_indptr_size, dtype=work_indptr_type, device="cuda"
-        )
-        work_info_set = torch.empty(
-            work_info_set_size,
-            dtype=work_info_set_type,
-            device="cuda",
-        )
-        reduce_indptr = torch.empty(
-            reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
-        )
-        reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
-        )
-        reduce_partial_map = torch.empty(
-            reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
-        )
-
-        meta = aiter.get_mla_metadata_v1(
-            qo_indptr_prefill,
-            kv_indptr,
-            nhead // nhead_kv,
-            nhead_kv,
-            True,
-            work_meta_data,
-            work_indptr,
-            work_info_set,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            kv_granularity=max(page_size, 16),
-            max_seqlen_qo=int(max_seqlen_qo_prefill),
-            uni_seqlen_qo=-1,  # Variable length for prefill
-            fast_mode=True,
-            max_split_per_batch=max_split_per_batch,
-        )
-
-        # Prepare K and V from kv_buffer
-        # kv_buffer shape: [num_page * page_size, nhead_kv, qk_head_dim]
-        # K shape required: [num_page * page_size, nhead_kv, qk_head_dim] (flattened pages)
-        # V shape required: [num_page * page_size, nhead_kv, v_head_dim]
-        K = kv_buffer  # [num_page * page_size, nhead_kv, qk_head_dim]
-        V, _ = torch.split(K, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-
-        out_asm = torch.empty(
-            (total_q_prefill, nhead, v_head_dim), dtype=out_dtype
-        ).fill_(-1)
-        quant_dtype = dtypes.fp8
-        q_quant, q_scale = per_tensor_quant(q, scale=torch.tensor(1), quant_dtype=quant_dtype)
-        k_quant, k_scale = per_tensor_quant(K, scale=torch.tensor(1), quant_dtype=quant_dtype)
-        v_quant, v_scale = per_tensor_quant(V, scale=torch.tensor(1), quant_dtype=quant_dtype)
-
-        (out_result, attn_lse), us_asm_prefill = run_perftest(
-            aiter.mla.mla_ps_prefill_fwd,
-            q_quant,
-            k_quant,
-            v_quant,
-            out_asm,
-            qo_indptr_prefill,
-            kv_indptr,
-            kv_indices,
-            work_indptr,
-            work_info_set,
-            max_seqlen_qo_prefill,
-            True,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            sm_scale,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-
-        # Check results
-        err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_ps_prefill-absorb    [torch vs aiter_asm]: {us_asm_prefill:>8.2f} us......",
-        )
-        return err, us_asm_prefill
-
-    # Test prefill if conditions are met
-    err_prefill = None
-    us_asm_prefill = 1e12
-    if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16
-    ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
-        err_prefill, us_asm_prefill = test_ps_prefill()
-    ret["prefill:err"] = err_prefill
-    ret["prefill:asm_ps"] = us_asm_prefill
 
     # ############################## absorb: decode
     # seq_lens_qo = torch.randint(1, 5, (batch_size,), dtype=torch.int)

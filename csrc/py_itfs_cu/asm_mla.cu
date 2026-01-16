@@ -280,7 +280,21 @@ void mla_decode_stage1_asm_fwd(
                 TORCH_CHECK(false, __func__, ":only support fp8 mla decoding for qo_len <= 4");
             }
         }
-    } 
+    } else if (gqa_ratio == 32){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                config_max_seqlen_q = 0;
+                sub_Q = 64;
+            }
+        }
+    } else if (gqa_ratio == 64){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                config_max_seqlen_q = 0;
+                sub_Q = 64;
+            }
+        }
+    }
 
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map);
     
