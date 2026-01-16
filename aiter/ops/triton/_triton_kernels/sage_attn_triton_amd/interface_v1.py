@@ -311,7 +311,9 @@ def fwd(
     # sd_mask is not returned in v3 interface
     sd_mask = None
 
-    sage_func = fav3_sage_triton_impl if sage_version == Sage_version.V1 else fav3_sage_triton_impl_v2
+    # print("sage_version", sage_version)
+    # print(sage_version == Sage_version.V1)
+    sage_func = fav3_sage_triton_impl if sage_version == 1 else fav3_sage_triton_impl_v2
 
     sage_func(
         q,

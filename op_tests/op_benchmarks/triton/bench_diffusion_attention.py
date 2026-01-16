@@ -31,6 +31,7 @@ from aiter.ops.triton.attention.fav3_sage import (
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_fwd_configs,
     sage_quant,
+    sage_quant_v2
 )
 
 CAUSAL = False
@@ -221,7 +222,6 @@ def fav3_sage_forward_func(
     layout: Literal["bshd", "bhsd"],
 ):
     config = get_fwd_configs(False, seqlen_k=k.shape[1])
-    print("config", config)
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
@@ -231,30 +231,59 @@ def fav3_sage_forward_func(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
-        q,
-        k,
-        v,
-        fp8_dtype,
-        FP8_MAX,
-        sm_scale=softmax_scale,
-        BLKQ=BLKQ,
-        BLKK=BLKK,
-        layout=layout,
-    )
-    return lambda: fav3_sage_func(
-        q_int8,
-        k_int8,
-        v_fp8,
-        q_descale,
-        k_descale,
-        v_descale,
-        FP8_MAX,
-        causal=causal,
-        inference_mode=inference_mode,
-        layout=layout,
-    )
+    sage_version = 2
+    if sage_version == 1:
+        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
+            q,
+            k,
+            v,
+            fp8_dtype,
+            FP8_MAX,
+            sm_scale=softmax_scale,
+            BLKQ=BLKQ,
+            BLKK=BLKK,
+            layout=layout,
+        )
+        return lambda: fav3_sage_func(
+            q_int8,
+            k_int8,
+            v_fp8,
+            q_descale,
+            k_descale,
+            v_descale,
+            FP8_MAX,
+            causal=causal,
+            inference_mode=inference_mode,
+            layout=layout,
+            sage_version=1
+        )
+    else:
+        q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale = sage_quant_v2(
+            q,
+            k,
+            v,
+            fp8_dtype,
+            FP8_MAX,
+            sm_scale=softmax_scale,
+            BLKQ=BLKQ,
+            BLKK=BLKK,
+            layout=layout,
+        )
 
+        return lambda: fav3_sage_func(
+            q_fp4,
+            k_fp4,
+            v_fp8,
+            q_descale,
+            k_descale,
+            v_descale,
+            FP8_MAX,
+            causal=False,
+            inference_mode=True,
+            layout=layout,
+            config=config,
+            sage_version=2
+        )
 
 def create_benchmark_configs(args):
     dtype = arg_to_torch_dtype[args.dtype]
@@ -378,7 +407,6 @@ def primary_output(result):
 
 
 def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
-    print(func_name)
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,

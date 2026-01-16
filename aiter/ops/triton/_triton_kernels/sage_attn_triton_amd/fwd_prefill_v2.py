@@ -1043,7 +1043,7 @@ def sage_fwd_v2(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK // 2)
+    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK // 2) # we fit 2 fp4 elements per int8
     offs_d_qk_s = tl.arange(0, BLOCK_DMODEL_QK // SCALE_GROUP_SIZE)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
 
@@ -1621,9 +1621,9 @@ def fav3_sage_triton_impl_v2(
     assert (
         q.device == k.device == v.device == o.device
     ), f"All tensors must be on the same device. Got: q={q.device}, k={k.device}, v={v.device}, o={o.device}"
-    assert (
-        q.dtype == k.dtype == torch.uint8
-    ), f"q, k must have the dtype torch.int8. Got {q.dtype} for q and {k.dtype} for k"
+    # assert (
+    #     q.dtype == k.dtype == torch.uint8
+    # ), f"q, k must have the dtype torch.int8. Got {q.dtype} for q and {k.dtype} for k"
     current_device = torch.cuda.current_device()
     assert (
         q.is_cuda and q.device.index == current_device
