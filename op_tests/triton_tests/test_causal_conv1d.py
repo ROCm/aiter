@@ -1,7 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-
 import random
 import pytest
 import torch
@@ -11,6 +7,7 @@ import numpy as np
 
 from aiter.ops.triton.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from aiter.ops.triton._triton_kernels.causal_conv1d import PAD_SLOT_ID
+
 
 def seed_everything(seed: int = 0) -> None:
     """Set random seed for reproducibility"""
@@ -150,8 +147,9 @@ def causal_conv1d_opcheck_fn(
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("dim", [1024, 2048, 4096])
 @pytest.mark.parametrize("batch", [1, 8, 64, 128, 256, 512, 1024])
-
-def test_causal_conv1d_update(batch, dim, width, seqlen, has_bias, silu_activation, itype):
+def test_causal_conv1d_update(
+    batch, dim, width, seqlen, has_bias, silu_activation, itype
+):
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -358,9 +356,11 @@ def test_causal_conv1d_varlen(
                 activation=activation,
                 return_final_states=True,
                 final_states_out=final_states_ref[padded_state_indices[i]].unsqueeze(0),
-                initial_states=final_states_ref[padded_state_indices[i]].unsqueeze(0)
-                if has_initial_states[i]
-                else None,
+                initial_states=(
+                    final_states_ref[padded_state_indices[i]].unsqueeze(0)
+                    if has_initial_states[i]
+                    else None
+                ),
             )
         )
     out_ref.append(torch.cat([t[0] for t in out_ref_b], dim=2))

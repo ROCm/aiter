@@ -1,10 +1,3 @@
-# Copyright (c) 2024, Tri Dao.
-# Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
-# and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
-
-from typing import List, Optional, Union
-
-import torch
 import triton
 import triton.language as tl
 
@@ -373,6 +366,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
+
 
 @triton.jit()
 def _causal_conv1d_update_kernel(
