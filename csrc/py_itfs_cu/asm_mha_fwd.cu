@@ -113,6 +113,7 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         nullptr, // seqlen_k_ptr
                         nullptr, // cu_seqlen_q_ptr
                         nullptr, // cu_seqlen_k_ptr
+                        nullptr, //sink_ptr
                         seqlen_q,
                         seqlen_k,
                         b,
