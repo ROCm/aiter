@@ -437,3 +437,7 @@ def test_sage_v2(
         rtol=RTOL_fp8,
         max_diff_percentage=0.5,
     )
+
+
+if __name__ == "__main__":
+    test_sage_v2(1, 5, 5, 1, 1, 128, "bhsd")
