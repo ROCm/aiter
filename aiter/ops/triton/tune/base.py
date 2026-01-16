@@ -87,6 +87,9 @@ def benchmark_config(
         latencies.append(start_event.elapsed_time(end_event))
         torch.testing.assert_close(kernel_out, ground_truth, atol=atol, rtol=rtol)
     avg = sum(latencies) / (num_iters * 10) * 1000  # us
+
+    # empty cache to avoid OOM in subsequent runs
+    torch.cuda.empty_cache()
     return avg
 
 
