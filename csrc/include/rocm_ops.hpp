@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include <pybind11/pybind11.h>
@@ -1674,19 +1674,23 @@ namespace py = pybind11;
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1);
 
-#define RMSNORM_QUANT_PYBIND                      \
-    m.def("add_rmsnorm_quant", &aiter::add_rmsnorm_quant, \
-        py::arg("out"), \
-        py::arg("input"), \
-        py::arg("residual_in"), \
-        py::arg("residual_out"), \
-        py::arg("scale"), \
-        py::arg("weight"), \
-        py::arg("epsilon")); \
-    m.def("add_rmsnorm", &aiter::add_rmsnorm, \
-        py::arg("out"), \
-        py::arg("input"), \
-        py::arg("residual_in"), \
-        py::arg("residual_out"), \
-        py::arg("weight"), \
-        py::arg("epsilon"));
+#define RMSNORM_QUANT_PYBIND                 \
+    m.def("add_rmsnorm_quant",               \
+          &aiter::add_rmsnorm_quant,         \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("residual_in"),            \
+          py::arg("residual_out"),           \
+          py::arg("scale"),                  \
+          py::arg("weight"),                 \
+          py::arg("epsilon"),                \
+          py::arg("group_size")    = 0,      \
+          py::arg("shuffle_scale") = false); \
+    m.def("add_rmsnorm",                     \
+          &aiter::add_rmsnorm,               \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("residual_in"),            \
+          py::arg("residual_out"),           \
+          py::arg("weight"),                 \
+          py::arg("epsilon"));

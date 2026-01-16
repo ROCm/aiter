@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
@@ -140,6 +140,8 @@ def add_rmsnorm_quant(
     scale: Tensor,
     weight: Tensor,
     epsilon: float,
+    group_size: int = 0,
+    shuffle_scale: bool = False,
 ) -> None: ...
 
 
