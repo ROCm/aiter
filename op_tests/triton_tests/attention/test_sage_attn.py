@@ -21,6 +21,7 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.interface_v1 import (
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
 )
+from aiter.ops.triton.moe.quant_moe import upcast_from_mxfp
 
 
 logging.basicConfig(level=logging.DEBUG)
@@ -149,6 +150,8 @@ def input_generation(
     dtype,
     layout,
     ):
+    torch.manual_seed(20)
+
     if layout == "bhsd":
         q_shape = (BATCH, HQ, N_CTX_Q, D_HEAD)
         k_shape = (BATCH, HK, N_CTX_K, D_HEAD)
@@ -336,7 +339,8 @@ def test_sage(
         print(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
-
+    print(triton_out.flatten()[0:20])
+    print(torch_out.flatten()[0:20])
     check_attention_outputs(
         triton_out,
         torch_out,
@@ -410,6 +414,15 @@ def test_sage_v2(
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
+    q_dequnt = upcast_from_mxfp(q_fp4, q_descale, torch.bfloat16, -1)
+    k_dequnt = upcast_from_mxfp(k_fp4, k_descale, torch.bfloat16, -1)
+
+    print("q quant comparison")
+    print(q_dequnt.flatten()[0:20])
+    print(q.flatten()[0:20])
+    q = q_dequnt
+    k = k_dequnt
+
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
         k = k.permute(0, 2, 1, 3).contiguous()
@@ -429,6 +442,11 @@ def test_sage_v2(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
+    print("result comparison")
+    print("Triton")
+    print(triton_out.flatten()[0:20])
+    print("Torch")
+    print(torch_out.flatten()[0:20])
     check_attention_outputs(
         triton_out,
         torch_out,
@@ -440,4 +458,5 @@ def test_sage_v2(
 
 
 if __name__ == "__main__":
-    test_sage_v2(1, 5, 5, 1, 1, 128, "bhsd")
+    test_sage_v2(1, 512, 512, 1, 1, 128, "bhsd")
+    # test_sage(1, 512, 512, 1, 1, 128, "bhsd")

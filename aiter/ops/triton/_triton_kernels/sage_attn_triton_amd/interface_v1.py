@@ -248,7 +248,7 @@ def fwd(
 
     if out is None:
         # NOTE: Using types that are lower precision than float32 such as bfloat16 for fp8 causes mismatches on a small set of tests.
-        out_dtype = torch.float16
+        out_dtype = torch.bfloat16
         if layout in ["bshd", "bhsd"]:
             out = torch.zeros(
                 q.shape[0],
@@ -313,7 +313,7 @@ def fwd(
 
     # print("sage_version", sage_version)
     # print(sage_version == Sage_version.V1)
-    sage_func = fav3_sage_triton_impl if sage_version == 1 else fav3_sage_triton_impl_v2
+    sage_func = fav3_sage_triton_impl if sage_version == Sage_version.V1 else fav3_sage_triton_impl_v2
 
     sage_func(
         q,
