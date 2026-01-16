@@ -1099,6 +1099,7 @@ def sage_fwd_v2(
     q_descale = tl.load(q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)  # MHA: use q head index
 
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
+    v_descale_offset = off_z * stride_v_descale_z + off_h_k * stride_v_descale_h
     if V_QUANT_SCHEME == 1:
         v_descale = tl.load(
             V_Descale
@@ -1228,7 +1229,7 @@ def sage_fwd_v2(
             K_Descale + k_descale_offset + ((n_front_skip_blocks * BLOCK_N) + offs_n[None, :]) * stride_k_descale_s + offs_d_qk_s[:, None]
         )
         v_descale_ptr = (
-            V_Descale + k_descale_offset + n_front_skip_blocks * stride_v_descale_blk
+            V_Descale + v_descale_offset + n_front_skip_blocks * stride_v_descale_blk
         )
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
@@ -1303,7 +1304,7 @@ def sage_fwd_v2(
         )
         v_descale_ptr = (
             V_Descale
-            + k_descale_offset
+            + v_descale_offset
             + (n_front_skip_blocks + n_front_masked_blocks) * stride_v_descale_blk
         )
 
@@ -1379,7 +1380,7 @@ def sage_fwd_v2(
         )
         v_descale_ptr = (
             V_Descale
-            + k_descale_offset
+            + v_descale_offset
             + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
             * stride_v_descale_blk
         )
