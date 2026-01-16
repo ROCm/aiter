@@ -449,16 +449,19 @@ def test_mla_prefill(
         # input: fp32 partial_out & partial_lse + int32 reduce_indptr, reduce_final_map & reduce_partial_map
         # output: bf16 final_out & final_lse
         allocate_input_bytes = (
-            logits.numel()
-            + attn_lse.numel()
-            + reduce_indptr.numel()
-            + reduce_final_map.numel()
-            + reduce_partial_map.numel()
-        ) * 4
-        allocate_output_bytes = (output.numel() + final_lse.numel()) * 2
+            logits.numel() * logits.element_size()
+            + attn_lse.numel() * attn_lse.element_size()
+            + reduce_indptr.numel() * reduce_indptr.element_size()
+            + reduce_final_map.numel() * reduce_final_map.element_size()
+            + reduce_partial_map.numel() * reduce_partial_map.element_size()
+        )
+        allocate_output_bytes = (
+            output.numel() * output.element_size()
+            + final_lse.numel() * final_lse.element_size()
+        )
         allocate_bytes = allocate_input_bytes + allocate_output_bytes
 
-        effective_final_tiles = torch.argmax(reduce_final_map).item()
+        effective_final_tiles = torch.argmax(reduce_indptr).item()
         effective_partial_tiles = reduce_indptr[-1].item()
         effective_input_bytes = (
             effective_partial_tiles * qlen_granularity * num_head_q * (v_head_dim + 1)
@@ -470,9 +473,22 @@ def test_mla_prefill(
             effective_final_tiles * qlen_granularity * num_head_q * (v_head_dim + 1) * 2
         )
         effective_bytes = effective_input_bytes + effective_output_bytes
+        print(
+            f"effective_partial_tiles: {effective_partial_tiles}, allocate_partial_tiles: {reduce_partial_map.numel()}"
+        )
+        print(
+            f"effective_final_tiles: {effective_final_tiles}, allocate_final_tiles: {reduce_final_map.numel()}"
+        )
+        print(
+            f"effective_input_bytes: {effective_input_bytes}, allocate_input_bytes: {allocate_input_bytes}"
+        )
+        print(
+            f"effective_output_bytes: {effective_output_bytes}, allocate_output_bytes: {allocate_output_bytes}"
+        )
+        print(f"effective_bytes: {effective_bytes}, allocate_bytes: {allocate_bytes}")
 
         reduce_bytes = effective_bytes
-        bw_reduce = reduce_bytes / us_reduce / (1e6)
+        bw_reduce = (reduce_bytes / 1e12) / (us_reduce / (1e6))
         # Store results
         ret["us_metadata"] = us_metadata
         ret["us_mla_prefill_ps"] = us_mla_prefill_ps
@@ -481,7 +497,7 @@ def test_mla_prefill(
         ret["tflops_mla_prefill_asm"] = tflops_mla_prefill_asm
         ret["us_reduce"] = us_reduce
         ret["us_reduce_ratio"] = us_reduce / us_mla_prefill_ps
-        ret["bw_reduce"] = bw_reduce if effective_final_tiles > 0 else 0
+        ret["bw_reduce(TB/s)"] = bw_reduce if effective_final_tiles > 0 else 0
     else:
         _, us_aiter_asm = run_perftest(
             aiter.mla.mla_prefill_ps_fwd,
