@@ -255,12 +255,11 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 }
 
 template <typename QDataType, typename OutDataType, typename GemmInstance>
-__forceinline__ torch::Tensor tile_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
-                                                             torch::Tensor& WQ,
-                                                             torch::Tensor& x_scale,
-                                                             torch::Tensor& w_scale,
-                                                             torch::Tensor& Y,
-                                                             bool isBpreshuffled)
+__forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ,
+                                                               torch::Tensor& WQ,
+                                                               torch::Tensor& x_scale,
+                                                               torch::Tensor& w_scale,
+                                                               torch::Tensor& Y)
 {
     // check
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");

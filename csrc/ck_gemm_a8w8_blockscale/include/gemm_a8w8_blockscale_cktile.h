@@ -9,8 +9,7 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                                           torch::Tensor& WQ,
                                           torch::Tensor& x_scale,
                                           torch::Tensor& w_scale,
-                                          torch::Tensor& Y,
-                                          bool isBpreshuffled);
+                                          torch::Tensor& Y);
 
 torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
                                                torch::Tensor& WQ,
@@ -18,5 +17,4 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
                                                torch::Tensor& w_scale,
                                                torch::Tensor& Y,
                                                int kernelId,
-                                               int splitK,
-                                               bool isBpreshuffled);
+                                               int splitK);

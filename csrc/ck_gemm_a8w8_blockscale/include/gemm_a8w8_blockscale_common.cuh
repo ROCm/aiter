@@ -120,11 +120,11 @@ using DeviceLegacyGemmHelperF8BlockScale =
 // clang-format on
 
 template <typename DDataType, typename EDataType, typename GemmInstance>
-__forceinline__ torch::Tensor legacy_gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
-                                                               torch::Tensor& WQ,
-                                                               torch::Tensor& x_scale,
-                                                               torch::Tensor& w_scale,
-                                                               torch::Tensor& Y)
+__forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
+                                                        torch::Tensor& WQ,
+                                                        torch::Tensor& x_scale,
+                                                        torch::Tensor& w_scale,
+                                                        torch::Tensor& Y)
 {
     int M = XQ.size(0);
     int N = WQ.size(0);

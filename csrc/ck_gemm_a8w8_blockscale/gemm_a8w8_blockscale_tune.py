@@ -23,6 +23,9 @@ from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common
     kernels_list as candidate_kernels_bpreshuffle_dict,
 )
 
+from gemm_a8w8_blockscale_instance import candidate_kernels_dict
+from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
+
 block_shape = (128, 128)
 
 

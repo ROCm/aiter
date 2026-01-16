@@ -164,7 +164,10 @@ def gemm_a8w8_blockscale_cktile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+<<<<<<< HEAD
     preshuffleB: bool = True,
+=======
+>>>>>>> origin
 ) -> torch.Tensor: ...
 
 
@@ -588,6 +591,7 @@ def gemm_a8w8_blockscale(
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
     else:
+<<<<<<< HEAD
         # config not found in tuned file, use default
         if is_default_cktile:
             # default to ck_tile
@@ -607,6 +611,20 @@ def gemm_a8w8_blockscale(
                 )
             else:
                 return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+=======
+        config = get_CKGEMM_config(
+            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+        )
+        if config is not None:
+            libtype = config["libtype"]
+            if libtype == "ck":
+                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+            elif libtype == "cktile":
+                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
+            else:
+                assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+>>>>>>> origin
 
 
 def flatmm_a8w8_blockscale_ASM(
@@ -767,7 +785,10 @@ def gemm_a8w8_blockscale_cktile_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+<<<<<<< HEAD
     preshuffleB: bool = True,
+=======
+>>>>>>> origin
 ) -> torch.Tensor: ...
 
 
