@@ -12,10 +12,6 @@ from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight_cktile, shuffle_weight
 
-from gemm_a8w8_blockscale_instance import candidate_kernels_dict
-from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
-
-
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
