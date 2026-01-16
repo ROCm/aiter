@@ -390,7 +390,12 @@ def run_fused_mrope_3d_rms_set_kv(
             kv_loc,
             k_scale,
             v_scale,
-            None, None, False, False, 0, 0,
+            None,
+            None,
+            False,
+            False,
+            0,
+            0,
         )
     else:
         aiter.fused_rope_rms_set_kv(
@@ -412,7 +417,12 @@ def run_fused_mrope_3d_rms_set_kv(
             kv_loc,
             k_scale,
             v_scale,
-            None, None, False, False, 0, 0,
+            None,
+            None,
+            False,
+            False,
+            0,
+            0,
         )
     return None
 
@@ -573,10 +583,7 @@ def set_kv_cache_shuffle_kernel(
         dst_offset + offset // x * block_size * x + block_offset * x + offset % x
     )
     dst_v_shuffle_offset = (
-        dst_offset
-        + block_offset // x * head_size * x
-        + offset * x
-        + block_offset % x
+        dst_offset + block_offset // x * head_size * x + offset * x + block_offset % x
     )
     k_val = tl.load(key_ptr + src_offset_k + offset)
     v_val = tl.load(value_ptr + src_offset_v + offset)
@@ -678,7 +685,9 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
     k = k_by_head.view(k.shape)
 
     # Infer max_positions from cos_sin shape
-    max_positions = cos_sin.shape[0] // head_size if cos_sin.ndim == 1 else cos_sin.shape[0]
+    max_positions = (
+        cos_sin.shape[0] // head_size if cos_sin.ndim == 1 else cos_sin.shape[0]
+    )
     cos_sin = cos_sin.view(max_positions, head_size)
     if is_mrope:
         positions = positions.view(3, num_tokens)
@@ -723,13 +732,26 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
         k_quantized = k_for_quant.to(kv_cache_dtype)
         v_quantized = v_for_quant.to(kv_cache_dtype)
     else:
-        k_quantized, _ = per_tensor_quant(k_for_quant, scale=torch.tensor(k_scale, device=k_for_quant.device), quant_dtype=kv_cache_dtype)
-        v_quantized, _ = per_tensor_quant(v_for_quant, scale=torch.tensor(v_scale, device=v_for_quant.device), quant_dtype=kv_cache_dtype)
+        k_quantized, _ = per_tensor_quant(
+            k_for_quant,
+            scale=torch.tensor(k_scale, device=k_for_quant.device),
+            quant_dtype=kv_cache_dtype,
+        )
+        v_quantized, _ = per_tensor_quant(
+            v_for_quant,
+            scale=torch.tensor(v_scale, device=v_for_quant.device),
+            quant_dtype=kv_cache_dtype,
+        )
 
     # Store k and v to cache using kv_loc indexing
     if use_shuffle_layout:
         # Calculate x for shuffle layout: x = 16 // k_cache.element_size()
-        x = 16 // torch.empty(0, dtype=kv_cache_dtype, device=k_cache.device).element_size()
+        x = (
+            16
+            // torch.empty(
+                0, dtype=kv_cache_dtype, device=k_cache.device
+            ).element_size()
+        )
         # Use shuffle layout implementation (k_quantized and v_quantized are already quantized)
         set_kv_cache_shuffle_layout(
             k_quantized,
@@ -900,7 +922,9 @@ def test_mrope_3d_rms_set_kv_shuffle(
     # Use the same logic as sglang: fp8_e4m3 maps to float8_e4m3fnuz on HIP, float8_e4m3fn on CUDA
     if kv_cache_dtype is None:
         # Use aiter's default FP8 dtype which matches the hardware (gfx942 -> fnuz, gfx950 -> fn)
-        kv_cache_dtype = dtypes.fp8  # This will be torch.float8_e4m3fnuz on HIP (gfx942) or torch.float8_e4m3fn on CUDA/gfx950
+        kv_cache_dtype = (
+            dtypes.fp8
+        )  # This will be torch.float8_e4m3fnuz on HIP (gfx942) or torch.float8_e4m3fn on CUDA/gfx950
 
     # Create cache buffers based on layout type
     if use_shuffle_layout:
@@ -909,21 +933,29 @@ def test_mrope_3d_rms_set_kv_shuffle(
         num_blocks = (max_positions + page_size - 1) // page_size
         # Shuffle layout: key_cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
         #                 value_cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
-        k_cache_ref = torch.rand(num_blocks, num_heads_k, head_size // x, page_size, x, device="cuda").to(kv_cache_dtype)
-        v_cache_ref = torch.rand(num_blocks, num_heads_v, page_size // x, head_size, x, device="cuda").to(kv_cache_dtype)
+        k_cache_ref = torch.rand(
+            num_blocks, num_heads_k, head_size // x, page_size, x, device="cuda"
+        ).to(kv_cache_dtype)
+        v_cache_ref = torch.rand(
+            num_blocks, num_heads_v, page_size // x, head_size, x, device="cuda"
+        ).to(kv_cache_dtype)
         k_cache = k_cache_ref.clone()
         v_cache = v_cache_ref.clone()
         # For shuffle layout, we need to reshape to flat format for reference comparison
         # But we'll use the shuffle format directly for kernel call
-        k_cache_ref_flat = k_cache_ref.view(num_blocks * page_size, num_heads_k, head_size)
-        v_cache_ref_flat = v_cache_ref.view(num_blocks * page_size, num_heads_v, head_size)
+        k_cache_ref_flat = k_cache_ref.view(
+            num_blocks * page_size, num_heads_k, head_size
+        )
+        v_cache_ref_flat = v_cache_ref.view(
+            num_blocks * page_size, num_heads_v, head_size
+        )
     else:
-        k_cache_ref = torch.rand(max_positions, num_heads_k, head_size, device="cuda").to(
-            kv_cache_dtype
-        )
-        v_cache_ref = torch.rand(max_positions, num_heads_v, head_size, device="cuda").to(
-            kv_cache_dtype
-        )
+        k_cache_ref = torch.rand(
+            max_positions, num_heads_k, head_size, device="cuda"
+        ).to(kv_cache_dtype)
+        v_cache_ref = torch.rand(
+            max_positions, num_heads_v, head_size, device="cuda"
+        ).to(kv_cache_dtype)
         k_cache = k_cache_ref.clone()
         v_cache = v_cache_ref.clone()
         k_cache_ref_flat = k_cache_ref
@@ -940,10 +972,18 @@ def test_mrope_3d_rms_set_kv_shuffle(
     k_out = None
     v_out = None
     if test_return_kv:
-        k_out_ref = torch.empty(num_tokens, num_heads_k, head_size, dtype=kv_cache_dtype, device="cuda")
-        v_out_ref = torch.empty(num_tokens, num_heads_v, head_size, dtype=kv_cache_dtype, device="cuda")
-        k_out = torch.empty(num_tokens, num_heads_k, head_size, dtype=kv_cache_dtype, device="cuda")
-        v_out = torch.empty(num_tokens, num_heads_v, head_size, dtype=kv_cache_dtype, device="cuda")
+        k_out_ref = torch.empty(
+            num_tokens, num_heads_k, head_size, dtype=kv_cache_dtype, device="cuda"
+        )
+        v_out_ref = torch.empty(
+            num_tokens, num_heads_v, head_size, dtype=kv_cache_dtype, device="cuda"
+        )
+        k_out = torch.empty(
+            num_tokens, num_heads_k, head_size, dtype=kv_cache_dtype, device="cuda"
+        )
+        v_out = torch.empty(
+            num_tokens, num_heads_v, head_size, dtype=kv_cache_dtype, device="cuda"
+        )
 
     _, avg_torch = run_torch_mrope_3d_rms_set_kv_shuffle(
         qkv,
@@ -1265,7 +1305,9 @@ if __name__ == "__main__":
                                         max_positions=args.max_positions,
                                     )
 
-    print("\n\n================== test_mrope_3d_rms_set_kv_shuffle ==================\n\n")
+    print(
+        "\n\n================== test_mrope_3d_rms_set_kv_shuffle ==================\n\n"
+    )
     for kv_cache_dtype in kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
             for use_shuffle_layout in use_shuffle_layouts:
