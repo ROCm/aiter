@@ -287,6 +287,7 @@ def mla_decode_fwd(
             q = q.view(total_s, nhead, -1)
             o = o.view(total_s, nhead, -1)
             io_transformed = True
+            max_seqlen_q = 1
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
