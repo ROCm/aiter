@@ -96,7 +96,7 @@ def run_torch_mrope_3d_rms(
     k_by_head = rms_norm_forward(k_by_head, kw, eps)
     k = k_by_head.view(k.shape)
 
-    cos_sin = cos_sin.view(max_positions, head_size)
+    cos_sin = cos_sin.view(-1, head_size)
     if is_mrope:
         positions = positions.view(3, num_tokens)
     cos_sin = cos_sin[positions]
@@ -204,6 +204,7 @@ def test_mrope_3d_rms(
     is_interleaved,
     eps,
     is_mrope,
+    max_positions,
 ):
     qkv = torch.randn(
         (num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size),
@@ -303,7 +304,7 @@ def run_torch_mrope_3d_rms_set_kv(
     k_by_head = rms_norm_forward(k_by_head, kw, eps)
     k = k_by_head.view(k.shape)
 
-    cos_sin = cos_sin.view(max_positions, head_size)
+    cos_sin = cos_sin.view(-1, head_size)
     if is_mrope:
         positions = positions.view(3, num_tokens)
     cos_sin = cos_sin[positions]
@@ -424,6 +425,7 @@ def test_mrope_3d_rms_set_kv(
     is_interleaved,
     eps,
     is_mrope,
+    max_positions,
 ):
     qkv = torch.randn(
         (num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size),
@@ -527,18 +529,93 @@ def test_mrope_3d_rms_set_kv(
     )
 
 
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-n",
+    "--neox_style",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    e.g.: -n true   # for Neox-style
+          or -n false # for GPT-J-style""",
+)
+parser.add_argument(
+    "-t",
+    "--token",
+    type=int,
+    nargs="*",
+    default=[513, 1257, 127, 778, 10024, 3],
+    help="""Number of tokens.
+    e.g.: -t 513""",
+)
+parser.add_argument(
+    "-hd",
+    "--head",
+    type=int,
+    nargs="*",
+    default=[32, 64],
+    help="""Number of heads.
+    e.g.: -hd 32""",
+)
+parser.add_argument(
+    "-hs",
+    "--head_sizes",
+    type=int,
+    nargs="*",
+    default=[64, 128, 256],
+    help="""Head size.
+    e.g.: -hs 64""",
+)
+parser.add_argument(
+    "-m",
+    "--max_positions",
+    type=int,
+    default=10000,
+    help="""Max Positions.
+    e.g.: -m 10000""",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=dtypes.str2Dtype,
+    default="bf16",
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-i",
+    "--is_interleaved",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""Whether to use the interleaved MRoPE.
+    e.g.: -i true   # for interleaved MRoPE
+          or -i false # for non-interleaved MRoPE""",
+)
+parser.add_argument(
+    "-ms",
+    "--mrope_sections",
+    type=dtypes.str2tuple,
+    nargs="*",
+    default=[[12, 10, 10], [24, 20, 20], [48, 40, 40]],
+    help="""Mrope section.
+    e.g.: -m 12,10,10""",
+)
+
+
 if __name__ == "__main__":
+    args = parser.parse_args()
+
     print("\n\n================== test_rope_rms ==================\n\n")
-    is_neox_styles = [True, False]
-    num_tokens = [513, 1257, 127, 778, 10024, 3]
-    num_heads = [32, 64]
-    head_sizes = [64, 128, 256]
-    max_positions = 10000
-    dtype = torch.bfloat16
-    for is_neox_style in is_neox_styles:
-        for num_token in num_tokens:
-            for num_head in num_heads:
-                for i, head_size in enumerate(head_sizes):
+    for is_neox_style in args.neox_style:
+        for num_token in args.token:
+            for num_head in args.head:
+                for i, head_size in enumerate(args.head_sizes):
                     test_mrope_3d_rms(
                         args.dtype,
                         num_token,
@@ -551,23 +628,16 @@ if __name__ == "__main__":
                         None,
                         eps=1e-6,
                         is_mrope=False,
+                        max_positions=args.max_positions,
                     )
 
     print("\n\n================== test_mrope_3d_rms ==================\n\n")
-    is_neox_styles = [True, False]
-    num_tokens = [513, 1257, 127, 778, 10024, 3]
-    num_heads = [32, 64]
-    head_sizes = [64, 128, 256]
-    mrope_sections = [[12, 10, 10], [24, 20, 20], [48, 40, 40]]
-    is_interleaveds = [True, False]
-    max_positions = 10000
-    dtype = torch.bfloat16
-    for is_neox_style in is_neox_styles:
-        for num_token in num_tokens:
-            for num_head in num_heads:
-                for i, head_size in enumerate(head_sizes):
-                    ms = mrope_sections[i]
-                    for is_interleaved in is_interleaveds:
+    for is_neox_style in args.neox_style:
+        for num_token in args.token:
+            for num_head in args.head:
+                for i, head_size in enumerate(args.head_sizes):
+                    ms = args.mrope_sections[i]
+                    for is_interleaved in args.is_interleaved:
                         test_mrope_3d_rms(
                             args.dtype,
                             num_token,
@@ -580,21 +650,16 @@ if __name__ == "__main__":
                             is_interleaved,
                             eps=1e-6,
                             is_mrope=True,
+                            max_positions=args.max_positions,
                         )
 
     print("\n\n================== test_rope_rms_set_kv ==================\n\n")
-    is_neox_styles = [True, False]
-    num_tokens = [513, 1257, 127, 778, 10024, 3]
-    num_heads = [32, 64]
-    head_sizes = [64, 128, 256]
-    max_positions = 10000
-    dtype = torch.bfloat16
-    for is_neox_style in is_neox_styles:
-        for num_token in num_tokens:
-            for num_head in num_heads:
-                for i, head_size in enumerate(head_sizes):
+    for is_neox_style in args.neox_style:
+        for num_token in args.token:
+            for num_head in args.head:
+                for i, head_size in enumerate(args.head_sizes):
                     test_mrope_3d_rms_set_kv(
-                        dtype,
+                        args.dtype,
                         num_token,
                         num_head,
                         num_head,
@@ -605,25 +670,18 @@ if __name__ == "__main__":
                         None,
                         eps=1e-6,
                         is_mrope=False,
+                        max_positions=args.max_positions,
                     )
 
     print("\n\n================== test_mrope_3d_rms_set_kv ==================\n\n")
-    is_neox_styles = [True, False]
-    num_tokens = [513, 1257, 127, 778, 10024, 3]
-    num_heads = [32, 64]
-    head_sizes = [64, 128, 256]
-    mrope_sections = [[12, 10, 10], [24, 20, 20], [48, 40, 40]]
-    is_interleaveds = [True, False]
-    max_positions = 10000
-    dtype = torch.bfloat16
-    for is_neox_style in is_neox_styles:
-        for num_token in num_tokens:
-            for num_head in num_heads:
-                for i, head_size in enumerate(head_sizes):
-                    ms = mrope_sections[i]
-                    for is_interleaved in is_interleaveds:
+    for is_neox_style in args.neox_style:
+        for num_token in args.token:
+            for num_head in args.head:
+                for i, head_size in enumerate(args.head_sizes):
+                    ms = args.mrope_sections[i]
+                    for is_interleaved in args.is_interleaved:
                         test_mrope_3d_rms_set_kv(
-                            dtype,
+                            args.dtype,
                             num_token,
                             num_head,
                             num_head,
@@ -634,6 +692,7 @@ if __name__ == "__main__":
                             is_interleaved,
                             eps=1e-6,
                             is_mrope=True,
+                            max_positions=args.max_positions,
                         )
 
     print("done")
