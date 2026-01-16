@@ -217,7 +217,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 }
                 else
                 {
-                    work_info.partial_qo_loc                       = -1;
+                    work_info.partial_qo_loc = -1;
                     fill_work_info(0);
                 }
                 if(work_info.kv_start < work_info.kv_end){
@@ -408,9 +408,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool kv_is_bf16 = kv_dtype == at::ScalarType::BFloat16;
 
     const bool natively_supported = (num_heads == 16) ||
-                                    ((num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
-                                    ((num_heads == 64) && q_is_bf16 && kv_is_bf16) ||
-                                    ((num_heads == 32) && q_is_bf16 && kv_is_bf16);
+                                    ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
@@ -419,9 +417,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         num_batches *= qk_batch_ratio;
     }
 
-    TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
-                ((num_heads == 64) && q_is_bf16 && kv_is_bf16) ||
-                ((num_heads == 32) && q_is_bf16 && kv_is_bf16),
+    TORCH_CHECK((num_heads == 16) || (num_heads == 128),
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).")
