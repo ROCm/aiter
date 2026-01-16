@@ -416,8 +416,10 @@ def test_sage_v2(
 
     q_dequant = upcast_from_mxfp(q_fp4, q_descale, torch.bfloat16, -1)
     k_dequant = upcast_from_mxfp(k_fp4, k_descale, torch.bfloat16, -1)
-
-
+    check_kernel_only = True
+    if check_kernel_only:
+        q = q_dequant
+        k = k_dequant
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
