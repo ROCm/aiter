@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
 import triton.language as tl
@@ -292,7 +292,7 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
             Out_buffer
             + (pid_batch * next_n + pid_next_n) * stride_out_batch
             + (pid_q_head * ChunkQ + tl.arange(0, ChunkQ)[:, None, None])
-            * stride_out_heads
+            * stride_out_heads.to(tl.int64)
             + (context_idx + tl.arange(0, ChunkK)[None, None, :]),
             o[:, None, :],
         )
