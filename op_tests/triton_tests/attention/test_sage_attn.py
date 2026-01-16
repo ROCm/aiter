@@ -414,14 +414,11 @@ def test_sage_v2(
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
-    q_dequnt = upcast_from_mxfp(q_fp4, q_descale, torch.bfloat16, -1)
-    k_dequnt = upcast_from_mxfp(k_fp4, k_descale, torch.bfloat16, -1)
+    q_dequant = upcast_from_mxfp(q_fp4, q_descale, torch.bfloat16, -1)
+    k_dequant = upcast_from_mxfp(k_fp4, k_descale, torch.bfloat16, -1)
 
-    print("q quant comparison")
-    print(q_dequnt.flatten()[0:20])
-    print(q.flatten()[0:20])
-    q = q_dequnt
-    k = k_dequnt
+    q = q_dequant
+    k = k_dequant
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -442,21 +439,18 @@ def test_sage_v2(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    print("result comparison")
-    print("Triton")
-    print(triton_out.flatten()[0:20])
-    print("Torch")
-    print(torch_out.flatten()[0:20])
+    print("Triton out", triton_out.flatten()[:10])
+    print("Torch out", torch_out.flatten()[:10])
+
     check_attention_outputs(
         triton_out,
         torch_out,
         fp8=True,
-        atol=ATOL_fp8,
-        rtol=RTOL_fp8,
+        atol=0.01, rtol=1e-2,
         max_diff_percentage=0.5,
     )
 
 
 if __name__ == "__main__":
-    test_sage_v2(1, 512, 512, 1, 1, 128, "bhsd")
+    test_sage_v2(1, 1024, 1024, 1, 1, 128, "bhsd")
     # test_sage(1, 512, 512, 1, 1, 128, "bhsd")

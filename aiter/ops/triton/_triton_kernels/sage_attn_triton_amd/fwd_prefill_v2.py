@@ -11,8 +11,6 @@ from .utils import (
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid_3d
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
-# 0 for per block quantization, 1 for per channel quantization
-V_QUANT_SCHEME = int(os.environ.get("V_QUANT_SCHEME", "1"))
 
 
 def get_fwd_configs(autotune: bool, seqlen_k: int = None):
@@ -95,7 +93,6 @@ def _sage_fwd_no_mask_v2(
     v_descale_base_ptr,
     FP8_MAX,
     stride_k_descale_s,
-    stride_v_descale_blk,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
@@ -107,15 +104,12 @@ def _sage_fwd_no_mask_v2(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
-    V_QUANT_SCHEME: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
 
     k_descale_ptr = k_descale_base_ptr
-    if V_QUANT_SCHEME == 0:
-        v_descale_ptr = v_descale_base_ptr
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -134,10 +128,6 @@ def _sage_fwd_no_mask_v2(
         k_descale = tl.load(k_descale_ptr)
         k_descale_ptr += stride_k_descale_s * BLOCK_N
 
-        if V_QUANT_SCHEME == 0:
-            v_descale = tl.load(v_descale_ptr)
-            v_descale_ptr += stride_v_descale_blk
-
         # Optionally preload V
         if PRE_LOAD_V:
             if PADDED_HEAD_V:
@@ -152,16 +142,15 @@ def _sage_fwd_no_mask_v2(
         # -- compute qk ----
         qk += tl.dot_scaled(
             q, q_descale, "e2m1", k, k_descale, "e2m1", qk
-        )        # qk_scaled = qk * SM_SCALE
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
+        )   
+        
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            qk_scaled += alibi_block
+            qk += alibi_block
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -170,14 +159,14 @@ def _sage_fwd_no_mask_v2(
         if bias_base_ptrs is not None:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+            qk += bias
 
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
         q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+            m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
         )
 
         # Compute scaled QK and softmax probabilities
@@ -256,12 +245,8 @@ def _sage_fwd_no_mask_v2(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        if V_QUANT_SCHEME == 0:
-            acc += (
-                tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32) * v_descale
-            )
-        else:
-            acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+    
+        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
 
@@ -304,7 +289,6 @@ def _sage_fwd_mask_v2(
     v_descale_base_ptr,
     FP8_MAX,
     stride_k_descale_s,
-    stride_v_descale_blk,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -320,7 +304,6 @@ def _sage_fwd_mask_v2(
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
-    V_QUANT_SCHEME: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
     if USE_EXP2:
@@ -330,8 +313,6 @@ def _sage_fwd_mask_v2(
     seqlen_delta_qk = seqlen_k - seqlen_q
 
     k_descale_ptr = k_descale_base_ptr
-    if V_QUANT_SCHEME == 0:
-        v_descale_ptr = v_descale_base_ptr
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -353,9 +334,6 @@ def _sage_fwd_mask_v2(
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         k_descale = tl.load(k_descale_ptr, mask=kv_offs_n[None, :] < seqlen_k, other=0.0)
         k_descale_ptr += stride_k_descale_s * BLOCK_N
-        if V_QUANT_SCHEME == 0:
-            v_descale = tl.load(v_descale_ptr)
-            v_descale_ptr += stride_v_descale_blk
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
@@ -380,8 +358,8 @@ def _sage_fwd_mask_v2(
         # -- compute qk ----
         qk += tl.dot_scaled(
             q, q_descale, "e2m1", k, k_descale, "e2m1", qk
-        )        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
+        )        #  * SM_SCALE
+        
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -389,7 +367,7 @@ def _sage_fwd_mask_v2(
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            qk_scaled += alibi_block
+            qk += alibi_block
 
         if USE_SLIDING_WINDOW:
             if IS_CAUSAL:
@@ -431,7 +409,7 @@ def _sage_fwd_mask_v2(
                 mask = causal_mask | window_mask
 
                 # Apply mask
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
+                qk = tl.where(mask, float("-inf"), qk)
             else:
                 # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
                 # Exactly matching reference construct_local_mask:
@@ -478,12 +456,12 @@ def _sage_fwd_mask_v2(
                     )
 
                 # Apply mask (set to -inf where mask is True)
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
+                qk = tl.where(mask, float("-inf"), qk)
         else:
             if IS_CAUSAL:
                 causal_boundary = start_n + offs_n - seqlen_delta_qk
                 causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-                qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+                qk = tl.where(causal_mask, qk, float("-inf"))
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -492,23 +470,23 @@ def _sage_fwd_mask_v2(
         if bias_base_ptrs is not None:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+            qk += bias
 
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
         # IMPORTANT: Handle the case where all values are -inf
-        # When m_ij = -inf and qk_scaled = -inf, subtraction gives NaN
+        # When m_ij = -inf and qk = -inf, subtraction gives NaN
         # We need to handle this explicitly
         if USE_SLIDING_WINDOW:
             # Check if this block has any valid values (m_ij != -inf)
             # For rows where everything is -inf, set q_shifted to -inf (not NaN)
             q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
             )
         else:
-            q_shifted = qk_scaled - m_ij[:, None]
+            q_shifted = qk - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -637,12 +615,8 @@ def _sage_fwd_mask_v2(
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        if V_QUANT_SCHEME == 0:
-            acc += (
-                tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32) * v_descale
-            )
-        else:
-            acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+
+        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
 
@@ -955,7 +929,6 @@ def sage_fwd_v2(
     stride_k_descale_s,
     stride_v_descale_z,
     stride_v_descale_h,
-    stride_v_descale_blk,
     LSE,
     Out,
     SD_MASK,
@@ -1020,7 +993,6 @@ def sage_fwd_v2(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
-    V_QUANT_SCHEME: tl.constexpr,
 ):
     # set params
     ACCUMULATOR_TYPE: tl.constexpr = tl.float32  # for q*k product
@@ -1099,16 +1071,15 @@ def sage_fwd_v2(
     q_descale = tl.load(q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)  # MHA: use q head index
 
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
-    v_descale_offset = off_z * stride_v_descale_z + off_h_k * stride_v_descale_h
-    if V_QUANT_SCHEME == 1:
-        v_descale = tl.load(
-            V_Descale
-            + off_z * stride_v_descale_z
-            + off_h_k * stride_v_descale_h
-            + offs_d_v,
-            mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
-            other=0.0,
-        )
+    
+    v_descale = tl.load(
+        V_Descale
+        + off_z * stride_v_descale_z
+        + off_h_k * stride_v_descale_h
+        + offs_d_v,
+        mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
+        other=0.0,
+    )
 
     # figure out masking pattern
     (
@@ -1226,10 +1197,10 @@ def sage_fwd_v2(
         block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
 
         k_descale_ptr = (
-            K_Descale + k_descale_offset + ((n_front_skip_blocks * BLOCK_N) + offs_n[None, :]) * stride_k_descale_s + offs_d_qk_s[:, None]
-        )
-        v_descale_ptr = (
-            V_Descale + v_descale_offset + n_front_skip_blocks * stride_v_descale_blk
+            K_Descale
+            + k_descale_offset 
+            + (block_min + offs_n[None, :]) * stride_k_descale_s 
+            + offs_d_qk_s[:, None]
         )
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
@@ -1266,10 +1237,9 @@ def sage_fwd_v2(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            v_descale_ptr if V_QUANT_SCHEME == 0 else None,
+            None,
             FP8_MAX,
             stride_k_descale_s,
-            stride_v_descale_blk,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_N,
@@ -1286,7 +1256,6 @@ def sage_fwd_v2(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            V_QUANT_SCHEME=V_QUANT_SCHEME,
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1298,14 +1267,9 @@ def sage_fwd_v2(
 
         k_descale_ptr = (
             K_Descale
-            + k_descale_offset +
-            ((n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
-              + offs_n[None, :]) * stride_k_descale_s + offs_d_qk_s[:, None]
-        )
-        v_descale_ptr = (
-            V_Descale
-            + v_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks) * stride_v_descale_blk
+            + k_descale_offset 
+            + (block_min + offs_n[None, :]) * stride_k_descale_s 
+            + offs_d_qk_s[:, None]
         )
 
         acc, l_i, m_i = _sage_fwd_no_mask_v2(
@@ -1341,10 +1305,9 @@ def sage_fwd_v2(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            v_descale_ptr if V_QUANT_SCHEME == 0 else None,
+            None,
             FP8_MAX,
             stride_k_descale_s,
-            stride_v_descale_blk,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -1357,7 +1320,6 @@ def sage_fwd_v2(
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            V_QUANT_SCHEME=V_QUANT_SCHEME,
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1374,15 +1336,9 @@ def sage_fwd_v2(
 
         k_descale_ptr = (
             K_Descale
-            + k_descale_offset
-            + ((n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * BLOCK_N + offs_n[None, :])
-            * stride_k_descale_s + offs_d_qk_s[:, None]
-        )
-        v_descale_ptr = (
-            V_Descale
-            + v_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
-            * stride_v_descale_blk
+            + k_descale_offset 
+            + (block_min + offs_n[None, :]) * stride_k_descale_s 
+            + offs_d_qk_s[:, None]
         )
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
@@ -1419,10 +1375,9 @@ def sage_fwd_v2(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            v_descale_ptr if V_QUANT_SCHEME == 0 else None,
+            None,
             FP8_MAX,
             stride_k_descale_s,
-            stride_v_descale_blk,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_N,
@@ -1439,7 +1394,6 @@ def sage_fwd_v2(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            V_QUANT_SCHEME=V_QUANT_SCHEME,
         )
 
     # ============================================================
@@ -1457,10 +1411,8 @@ def sage_fwd_v2(
     else:
         invalid_mask = None
         l_recip = 1 / l_i[:, None]
-    if V_QUANT_SCHEME == 0:
-        acc = acc * l_recip
-    else:
-        acc = acc * l_recip * v_descale
+
+    acc = acc * l_recip * v_descale
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
@@ -1824,13 +1776,13 @@ def fav3_sage_triton_impl_v2(
     stride_q_descale_z, stride_q_descale_s, stride_q_descale_h, _ = map_dims(q_descale.stride(), bshd)
     stride_k_descale_z, stride_k_descale_s, stride_k_descale_h, _ = map_dims(k_descale.stride(), bshd)
 
-    if V_QUANT_SCHEME == 1:
-        stride_v_descale_z, stride_v_descale_h, stride_v_descale_blk = v_descale.stride()
-    else:
-        stride_v_descale_z = stride_v_descale_h = 0
+
+    stride_v_descale_z, stride_v_descale_h, _ = v_descale.stride()
+
 
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+    
     use_alibi, (stride_az, stride_ah) = (
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
@@ -1909,7 +1861,6 @@ def fav3_sage_triton_impl_v2(
         stride_k_descale_s,
         stride_v_descale_z,
         stride_v_descale_h,
-        stride_v_descale_blk,
         softmax_lse,
         o,
         sd_mask,
@@ -1947,7 +1898,6 @@ def fav3_sage_triton_impl_v2(
         cu_seqlens_k,
         seqused_q,
         seqused_k,  # Pass seqused tensors
-        V_QUANT_SCHEME=V_QUANT_SCHEME,
         dropout_p=dropout_p,
         philox_seed=philox_seed,
         philox_offset_base=philox_offset,
@@ -2027,14 +1977,10 @@ def sage_quant_v2(
     if smooth_k:
         k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
-    if V_QUANT_SCHEME == 0:
-        v_scale = torch.empty(
-            (b, h_kv, K_NUM_BLKS), device=v.device, dtype=torch.float32
-        )
-    else:
-        v_scale = (
-            v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-        )
+
+    v_scale = (
+        v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+    )
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -2060,7 +2006,6 @@ def sage_quant_v2(
         FP8_MAX=FP8_MAX,
         D=head_dim,
         BLK_K=BLKK,
-        V_QUANT_SCHEME=V_QUANT_SCHEME,
     )
     # TODO check the sm_scale multiplication accuracy
     # q = q.to(torch.float32)
@@ -2089,7 +2034,6 @@ def sage_quant_v_kernel(
     FP8_MAX: tl.constexpr,
     D: tl.constexpr,
     BLK_K: tl.constexpr,
-    V_QUANT_SCHEME: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -2109,26 +2053,17 @@ def sage_quant_v_kernel(
 
     v_input_ptrs = V_Input + v_offs
     v_output_ptrs = V_Output + v_offs
-    if V_QUANT_SCHEME == 0:
-        v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + off_blk
-        _general_quant_kernel(
-            v_input_ptrs,
-            v_output_ptrs,
-            v_scale_ptrs,
-            FP8_MAX,
-            offs_kn[:, None] < SEQLEN_K,
-        )
-    else:
-        # just apply the per channel v_scales that have been computed outside
-        v_scale_ptrs = (
-            V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
-        )
-        v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
-        v = v.to(tl.float32)
-        v_scales = tl.load(v_scale_ptrs)
-        v_quant = v / v_scales
-        v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
-        tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
+
+    # just apply the per channel v_scales that have been computed outside
+    v_scale_ptrs = (
+        V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
+    )
+    v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
+    v = v.to(tl.float32)
+    v_scales = tl.load(v_scale_ptrs)
+    v_quant = v / v_scales
+    v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+    tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
 @triton.jit
