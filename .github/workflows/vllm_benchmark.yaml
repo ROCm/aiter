@@ -75,6 +75,7 @@ jobs:
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
 
           ENTRYPOINT ["/bin/bash"]
+          CMD ["-l"]
           EOF
 
       - name: Show Dockerfile
