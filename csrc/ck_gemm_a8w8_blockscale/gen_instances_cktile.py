@@ -8,15 +8,15 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from gemm_a8w8_blockscale_instance import (
-    default_kernels_dict,
-    KernelInstance,
-    candidate_kernels_dict,
+from gemm_a8w8_blockscale_cktile_instance import (
+    default_kernels_cktile_dict,
+    TileKernelInstance,
+    candidate_kernels_cktile_dict,
 )
 
 
 """
-a8w8_blockscale_gemm instance gen for legacy CK
+a8w8_blockscale_gemm instance gen for tile CK
 """
 
 
@@ -36,7 +36,7 @@ class gemm_a8w8_blockscale_codegen:
         Get tune dict from csv file
         """
 
-        tune_dict = default_kernels_dict
+        tune_dict = default_kernels_cktile_dict
 
         if os.path.exists(tune_dict_csv):
             tune_df = pd.read_csv(tune_dict_csv)
@@ -45,77 +45,32 @@ class gemm_a8w8_blockscale_codegen:
                 device_properties = torch.cuda.get_device_properties(gpu)
                 cu_num = device_properties.multi_processor_count
                 tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "ck")
+                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "cktile")
                 ].reset_index()
-
             for i in range(len(tune_df)):
                 M = int(tune_df.loc[i, "M"])
                 N = int(tune_df.loc[i, "N"])
                 K = int(tune_df.loc[i, "K"])
                 kid = int(tune_df.loc[i, "kernelId"])
 
-                if kid in candidate_kernels_dict:
-                    tune_dict[(M, N, K)] = candidate_kernels_dict[kid]
+                if kid in candidate_kernels_cktile_dict:
+                    tune_dict[(M, N, K)] = candidate_kernels_cktile_dict[kid]
                 else:
                     print(
-                        f"Warning: kernelId {kid} not found in candidate_kernels_dict for shape ({M}, {N}, {K})"
+                        f"Warning: kernelId {kid} not found in candidate_kernels_cktile_dict for shape ({M}, {N}, {K})"
                     )
 
         return tune_dict
 
-    def gen_legacy_instance(self, k: KernelInstance):
+    def gen_tile_instance(self, k: TileKernelInstance):
         """
-        Generate kernel instance code for legacy gemm a8w8 blockscale
+        Generate kernel instance code for tile gemm a8w8 blockscale
         """
 
-        LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+        TILE_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_blockscale_common.cuh"
-
-enum class GemmSpecialization {{
-    Default    = 0,
-    MPadding   = 1,
-    NPadding   = 2,
-    KPadding   = 3,
-    MNPadding  = 4,
-    MKPadding  = 5,
-    NKPadding  = 6,
-    MNKPadding = 7
-}};
-
-static const std::unordered_map<std::string, GemmSpecialization> g_gemm_spec_names{{
-    {{"", GemmSpecialization::Default}},
-    {{"M", GemmSpecialization::MPadding}},
-    {{"N", GemmSpecialization::NPadding}},
-    {{"K", GemmSpecialization::KPadding}},
-    {{"MN", GemmSpecialization::MNPadding}},
-    {{"MK", GemmSpecialization::MKPadding}},
-    {{"NK", GemmSpecialization::NKPadding}},
-    {{"MNK", GemmSpecialization::MNKPadding}}
-}};
-
-static GemmSpecialization GetGemmSpec(const int64_t m,
-                               const int64_t n,
-                               const int64_t k,
-                               const int64_t m_per_block,
-                               const int64_t n_per_block,
-                               const int64_t k_per_block)
-{{
-    auto IntegerDivideCeil = [](int x, int y) {{
-        return (x + y - size_t{{1}}) / y;
-    }};
-
-    std::string spec = "";
-    if (IntegerDivideCeil(m, m_per_block) * m_per_block - m != 0)
-        spec += "M";
-    if (IntegerDivideCeil(n, n_per_block) * n_per_block - n != 0)
-        spec += "N";
-    if (IntegerDivideCeil(k, k_per_block) * k_per_block - k != 0)
-        spec += "K";
-
-    return g_gemm_spec_names.at(spec);
-}}
+#include "gemm_a8w8_blockscale_cktile_common.cuh"
 
 template <typename DDataType, typename EDataType>
 torch::Tensor
@@ -132,108 +87,33 @@ torch::Tensor
     int N = WQ.size(0);
     int K = WQ.size(1);
 
-    // Get whether this input needs to be padded.
-    auto gemm_spec = GetGemmSpec(M, N, K, {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK});
+    // Instantiate tile gemm instance.
+    __TILE_INSTANCE_PLACEHOLDER__
 
-
-    if(gemm_spec == GemmSpecialization::Default)
-    {{
-        // Default
-        __INSTANCE_CONTENT_DEFAULT__
-    }} else if(gemm_spec == GemmSpecialization::MPadding)
-    {{
-        // MNK Padding
-        __INSTANCE_CONTENT_MPAD__
-    }} else if(gemm_spec == GemmSpecialization::NPadding)
-    {{
-        // N Padding
-        __INSTANCE_CONTENT_NPAD__
-    }} else if(gemm_spec == GemmSpecialization::KPadding)
-    {{
-        // K Padding
-        __INSTANCE_CONTENT_KPAD__
-    }} else if(gemm_spec == GemmSpecialization::MNPadding)
-    {{
-        // MN Padding
-        __INSTANCE_CONTENT_MNPAD__
-    }} else if(gemm_spec == GemmSpecialization::MKPadding)
-    {{
-        // MK Padding
-        __INSTANCE_CONTENT_MKPAD__
-    }} else if(gemm_spec == GemmSpecialization::NKPadding)
-    {{
-        // NK Padding
-        __INSTANCE_CONTENT_NKPAD__
-    }} else if(gemm_spec == GemmSpecialization::MNKPadding)
-    {{
-        // MNK Padding
-        __INSTANCE_CONTENT_MNKPAD__
-    }} else
-    {{
-        throw std::runtime_error("Unsupported GemmSpecialization!");
-    }}
 }}
 
 """
-
-        LEGACY_INSTANCE = f"""using LegacyGemmInstance = DeviceLegacyGemmHelperF8BlockScale<
-            DDataType, EDataType,
-            {k.BLOCK_SIZE},
-            {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
-            {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
-            {k.AK1}, {k.BK1},
-            {k.MPerXDL}, {k.NPerXDL},
-            {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-            {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-            {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
-            ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
-            ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-            ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
+        TILE_INSTANCE = f"""using TileGemmInstance = TileGemmConfig<
+            {k.M_Tile}, {k.N_Tile}, {k.K_Tile},
+            {k.M_Warp}, {k.N_Warp}, {k.K_Warp},
+            {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
+            {str(k.TiledMMAPermuteN).lower()},
+            {str(k.TransposeC).lower()},
+            {str(k.DoubleSmemBuffer).lower()},
+            {str(k.UsePersistentKernel).lower()},
+            ck_tile::GemmPipelineScheduler::{k.Scheduler},
+            {k.BlockPerCu}>;
 
         // Run kernel instance.
-        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
 """
-        INSTANCE_IMPL_str = (
-            LEGACY_INSTANCE_IMPL.replace(
-                "__INSTANCE_CONTENT_DEFAULT__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "Default"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_MPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "MPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_NPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "NPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_KPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "KPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_MNPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "MNPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_MKPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "MKPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_NKPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "NKPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_MNKPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "MNKPadding"),
-            )
+
+        TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
+            "__TILE_INSTANCE_PLACEHOLDER__", TILE_INSTANCE
         )
 
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-            INSTANCE_IMPL_str
+            TILE_INSTANCE_IMPL_str
         )
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
@@ -252,10 +132,10 @@ template torch::Tensor
 
 """
         INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="FP32, BF16"
+            name=k.name, dtypes="TILE_FP32, TILE_BF16"
         )
         INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="FP32, FP16"
+            name=k.name, dtypes="TILE_FP32, TILE_FP16"
         )
         # TODO: dFP8_eFP8
 
@@ -266,7 +146,7 @@ template torch::Tensor
             INSTANCE_dFP32_eFP16
         )
 
-    def gen_lookup_dict(self, kernels_dict):
+    def gen_lookup_dict(self, kernels_dict: dict):
         """
         Generate lookup dictionary for kernel instances
         """
@@ -290,7 +170,7 @@ template torch::Tensor
 #endif // USE_ROCM
 """
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"), "w"
         ) as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
@@ -339,7 +219,7 @@ torch::Tensor
 """
 
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest.h"),
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_manifest.h"),
             "w",
         ) as f:
             f.write(MAINFEST_head)
@@ -349,12 +229,12 @@ torch::Tensor
 
     def gen_code(self, kernels_dict: dict):
         """
-        Codegen for legacy gemm a8w8 blockscale
+        Codegen for tile gemm a8w8 blockscale
         """
 
         # generate instances code
         for _, k in kernels_dict.items():
-            self.gen_legacy_instance(k)
+            self.gen_tile_instance(k)
 
         # generate lookup dict for kernel instances
         self.gen_lookup_dict(kernels_dict)
@@ -378,7 +258,7 @@ torch::Tensor
         # generate code for legacy and tile
         if self.istune:
             # generate code for default kernels
-            self.gen_code(candidate_kernels_dict)
+            self.gen_code(candidate_kernels_cktile_dict)
         else:
             # generate code for tuned kernels from tune_file
             self.gen_code(self.get_tune_dict(self.tune_file))
