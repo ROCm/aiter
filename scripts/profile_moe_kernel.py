@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-MOE Kernel Profiler with rocprofv3.
-Profiles kernels, collects all 58 counters, and adds metrics to original CSV.
+Profile MOE kernels using rocprofv3 with tuner integration.
+
+For each kernel in sample.csv:
+1. Uses tuner to force execution of the specific kernel
+2. Runs under rocprofv3 to collect hardware counters
+3. Extracts FLOPS and bandwidth from profiling data
 """
 
 import subprocess
@@ -9,295 +13,442 @@ import sys
 import os
 from pathlib import Path
 import pandas as pd
-import numpy as np
+import torch
+import sqlite3
 
-# Setup PATH for rocprofv3
-os.environ['PATH'] = f"{os.environ['PATH']}:/opt/venv/lib/python3.12/site-packages/_rocm_sdk_core/bin"
+# Add paths for tuner imports
+current_dir = Path(__file__).parent
+aiter_root = current_dir.parent
+sys.path.insert(0, str(aiter_root))
+sys.path.insert(0, str(aiter_root / "hsa/gfx942/fmoe_2stages"))
 
-# GPU specs - from actual hardware
-GPU_SPECS = {
-    "peak_fp32": 91.1,        # TFLOP/s
-    "peak_fp16": 728.8,       # TFLOP/s
-    "bandwidth": 6000.0,      # GB/s (6 TB/s)
-    "ridge_fp32": 15.2,       # FLOP/byte
-    "ridge_fp16": 121.5,      # FLOP/byte
-}
+import aiter
+from aiter import QuantType, ActivationType
+import tune
+from tune import FmoeTuner
 
-# All 58 counters from framework (8 categories)
+# Note: With new ROCm image, rocprofv3 --pmc now works without crashes!
+
+# Essential counters (active)
 COUNTERS = [
-    # COMPUTE (8)
-    "SQ_INSTS_MFMA", "SQ_INSTS_VALU", "SQ_INSTS_SALU", "SQ_INSTS_SMEM",
-    "SQ_INSTS_LDS", "SQ_WAVE_CYCLES", "SQ_ACTIVE_CYCLES", "SQ_WAVES_EXE",
+    # "MemUnitStalled", "FetchSize", "MfmaFlops", "MfmaFlopsF16", "MfmaFlopsF32", "MfmaFlopsF64", 
+    "TCC_HIT", "TCC_MISS", "LDSBankConflict",
     
-    # MEMORY (9)
-    "TCC_HIT_sum", "TCC_MISS_sum", "TCP_TCC_READ_REQ_sum", "TCP_TCC_WRITE_REQ_sum",
-    "TCC_PENDING_sum", "TCC_EA0_RDREQ_sum", "TCC_EA0_WRREQ_sum", "TCC_MC_RDREQ_sum", "TCC_MC_WRREQ_sum",
-    
-    # COALESCING (6)
-    "TCC_EA0_RDREQ_32B_sum", "TCC_EA0_RDREQ_64B_sum", "TCC_EA0_RDREQ_96B_sum",
-    "TCC_EA0_WRREQ_32B_sum", "TCC_EA0_WRREQ_64B_sum", "TCC_EA0_WRREQ_96B_sum",
-    
-    # LDS (7)
-    "SQ_LDS_BANK_CONFLICT", "SQ_LDS_ADDR_CONFLICT", "SQ_LDS_READ", "SQ_LDS_WRITE",
-    "SQ_LDS_READ_REQ", "SQ_WAIT_LGKM_CYCLES", "SQ_WAIT_MEM_CYCLES",
-    
-    # STALLS (8)
-    "SQ_WAIT_ANY_CYCLES", "SQ_WAIT_ANY", "SQ_WAIT_INST_ANY_CYCLES", "SQ_INSTS_EXECUTED",
-    "GRBM_COUNT", "SQ_IFETCH", "SQ_INSTS_SMEM_NORM", "SQ_WAIT_DEPENDENCY",
-    
-    # UTILIZATION (6)
-    "GPU_UTIL", "GRBM_GUI_ACTIVE", "SQ_UTILIZATION", "SQ_UTILIZATION_BUSY", "GRBM_SPI_BUSY", "SQ_SCALARS_WRITTEN",
-    
-    # PRECISION (8)
-    "SQ_INSTS_FP32", "SQ_INSTS_FP16", "SQ_INSTS_FP64", "SQ_INSTS_INT32",
-    "MfmaFlops", "MfmaFlopsF16", "MfmaFlopsF32", "MfmaFlopsF64",
-    
-    # COHERENCE (6)
-    "TCP_TCC_ATOMIC_REQ_sum", "TCC_ATOMIC_WITH_RET_sum", "TCC_ATOMIC_WO_RET_sum",
-    "TCC_HIT", "TCC_MISS", "TCC_NC_READ_sum",
 ]
+
+# Full comprehensive counter list (commented for reference)
+# ALL_COUNTERS = [
+#     "SQ_INSTS_MFMA", "SQ_INSTS_VALU", "SQ_INSTS_SALU", "SQ_INSTS_SMEM",
+#     "SQ_INSTS_LDS", "SQ_WAVE_CYCLES", "SQ_ACTIVE_CYCLES", "SQ_WAVES_EXE",
+#     "TCC_HIT_sum", "TCC_MISS_sum", "TCP_TCC_READ_REQ_sum", "TCP_TCC_WRITE_REQ_sum",
+#     "TCC_PENDING_sum", "TCC_EA0_RDREQ_sum", "TCC_EA0_WRREQ_sum", "TCC_MC_RDREQ_sum", "TCC_MC_WRREQ_sum",
+#     "TCC_EA0_RDREQ_32B_sum", "TCC_EA0_RDREQ_64B_sum", "TCC_EA0_RDREQ_96B_sum",
+#     "TCC_EA0_WRREQ_32B_sum", "TCC_EA0_WRREQ_64B_sum", "TCC_EA0_WRREQ_96B_sum",
+#     "SQ_LDS_BANK_CONFLICT", "SQ_LDS_ADDR_CONFLICT", "SQ_LDS_READ", "SQ_LDS_WRITE",
+#     "SQ_LDS_READ_REQ", "SQ_WAIT_LGKM_CYCLES", "SQ_WAIT_MEM_CYCLES",
+#     "SQ_WAIT_ANY_CYCLES", "SQ_WAIT_ANY", "SQ_WAIT_INST_ANY_CYCLES", "SQ_INSTS_EXECUTED",
+#     "GRBM_COUNT", "SQ_IFETCH", "SQ_INSTS_SMEM_NORM", "SQ_WAIT_DEPENDENCY",
+#     "GPU_UTIL", "GRBM_GUI_ACTIVE", "SQ_UTILIZATION", "SQ_UTILIZATION_BUSY", "GRBM_SPI_BUSY", "SQ_SCALARS_WRITTEN",
+#     "SQ_INSTS_FP32", "SQ_INSTS_FP16", "SQ_INSTS_FP64", "SQ_INSTS_INT32",
+#     "MfmaFlops", "MfmaFlopsF16", "MfmaFlopsF32", "MfmaFlopsF64",
+#     "TCP_TCC_ATOMIC_REQ_sum", "TCC_ATOMIC_WITH_RET_sum", "TCC_ATOMIC_WO_RET_sum",
+#     "TCC_HIT", "TCC_MISS", "TCC_NC_READ_sum",
+# ]
+
+def generate_asm_1stage_script(config_idx, kernel_name, token, model_dim, inter_dim,
+                                expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                                q_type_str, act_type_str, use_g1u1):
+    """Generate script for ASM 1-stage kernel (matching profile_asm_1stage.py template)."""
+    return f'''#!/usr/bin/env python3
+"""
+Profiling ASM 1-stage kernel (fused operation).
+Kernel: {kernel_name}
+"""
+
+import sys
+sys.path.insert(0, '/home/AMD/msaffari/workspace/aiter')
+
+import torch
+import aiter
+from aiter import QuantType, ActivationType
+from aiter.ops.shuffle import shuffle_weight
+
+print("="*80)
+print("ASM 1-Stage Kernel Profiling - Config {config_idx}")
+print("="*80)
+print("Kernel: {kernel_name}")
+print("Type: asm, Stage: 1-stage (fused), block_m: {block_m}")
+print("="*80)
+
+TARGET_KERNEL = "{kernel_name}"
+token = {token}
+model_dim = {model_dim}
+inter_dim = {inter_dim}
+expert = {expert}
+topk = {topk}
+dtype = {dtype_str}
+q_dtype_a = {q_dtype_a_str}
+q_dtype_w = {q_dtype_w_str}
+q_type = {q_type_str}
+act_type = {act_type_str}
+use_g1u1 = {use_g1u1}
+block_m = {block_m}
+
+print("\\nGenerating test data...")
+torch.manual_seed(42)
+torch.set_default_device('cuda')
+
+hidden_states = torch.randn(token, model_dim, dtype=dtype)
+topk_weights = torch.randn(token, topk, dtype=torch.float32)
+topk_ids = torch.randint(0, expert, (token, topk), dtype=torch.int32)
+
+w1 = torch.randn(expert, inter_dim, model_dim, dtype=dtype)
+w2 = torch.randn(expert, model_dim, inter_dim, dtype=dtype)
+
+print("Quantizing...")
+a1_qt, a1_scale = aiter.get_torch_quant(q_type)(hidden_states, quant_dtype=q_dtype_a)
+w1_qt, w1_scale = aiter.pertoken_quant(w1.view(expert, -1, 128), quant_dtype=q_dtype_w)
+w2_qt, w2_scale = aiter.pertoken_quant(w2.view(expert, -1, 128), quant_dtype=q_dtype_w)
+
+w1_qt = w1_qt.view(expert, inter_dim, model_dim)
+w2_qt = w2_qt.view(expert, model_dim, inter_dim)
+
+w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
+w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
+
+print("Sorting...")
+from aiter.fused_moe import moe_sorting
+sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+    topk_ids, topk_weights, expert, model_dim, dtype
+)
+
+print(f"\\n{{'*'*80}}")
+print(f"*** EXECUTING ASM 1-STAGE KERNEL (block_m={{block_m}}) ***")
+print(f"*** {{TARGET_KERNEL}}")
+print(f"{{'*'*80}}")
+
+from aiter.fused_moe import fused_moe_1stage
+
+result = fused_moe_1stage(
+    hidden_states=hidden_states,
+    w1=w1_qt_shffle,
+    w2=w2_qt_shffle,
+    topk=topk,
+    sorted_ids=sorted_ids,
+    sorted_weights=sorted_weights,
+    sorted_expert_ids=sorted_expert_ids,
+    num_valid_ids=num_valid_ids,
+    moe_buf=moe_buf,
+    isG1U1=use_g1u1,
+    block_size_M=block_m,
+    activation=act_type,
+    quant_type=q_type,
+    kernelName=TARGET_KERNEL,
+    q_dtype_a=q_dtype_a,
+    q_dtype_w=q_dtype_w,
+    w1_scale=w1_scale,
+    w2_scale=w2_scale,
+)
+
+torch.cuda.synchronize()
+
+print("\\n" + "="*80)
+print("✓ ASM 1-STAGE KERNEL executed!")
+print(f"Output shape: {{result.shape}}")
+print("="*80)
+'''
+
+
+def generate_ck_stage2_script(config_idx, kernel_name, token, model_dim, inter_dim,
+                               expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                               q_type_str, act_type_str, use_g1u1, doweight_stage1):
+    """Generate script for CK stage2 kernel (matching profile_ck_stage2.py template)."""
+    return f'''#!/usr/bin/env python3
+"""
+Profiling CK stage2 kernel.
+Kernel: {kernel_name}
+"""
+
+import sys
+sys.path.insert(0, '/home/AMD/msaffari/workspace/aiter')
+
+import torch
+import aiter
+from aiter import QuantType, ActivationType
+from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.moe_op import ck_moe_stage2_fwd
+
+print("="*80)
+print("CK Stage2 Kernel Profiling - Config {config_idx}")
+print("="*80)
+print("TARGET KERNEL: {kernel_name}")
+print("TARGET STAGE: stage2")
+print("Config: token={token}, model_dim={model_dim}, inter_dim={inter_dim}, expert={expert}, topk={topk}")
+print("="*80)
+
+TARGET_KERNEL = "{kernel_name}"
+token = {token}
+model_dim = {model_dim}
+inter_dim = {inter_dim}
+expert = {expert}
+topk = {topk}
+dtype = {dtype_str}
+q_dtype_a = {q_dtype_a_str}
+q_dtype_w = {q_dtype_w_str}
+q_type = {q_type_str}
+act_type = {act_type_str}
+use_g1u1 = {use_g1u1}
+doweight_stage1 = {doweight_stage1}
+block_m = {block_m}
+
+print("\\nGenerating test data...")
+torch.manual_seed(42)
+torch.set_default_device('cuda')
+
+hidden_states = torch.randn(token, model_dim, dtype=dtype)
+topk_weights = torch.randn(token, topk, dtype=torch.float32)
+topk_ids = torch.randint(0, expert, (token, topk), dtype=torch.int32)
+
+w1 = torch.randn(expert, inter_dim, model_dim, dtype=dtype)
+w2 = torch.randn(expert, model_dim, inter_dim, dtype=dtype)
+
+print("Quantizing...")
+a1_qt, a1_scale = aiter.get_torch_quant(q_type)(hidden_states, quant_dtype=q_dtype_a)
+w1_qt, w1_scale = aiter.pertoken_quant(w1.view(expert, -1, 128), quant_dtype=q_dtype_w)
+w2_qt, w2_scale = aiter.pertoken_quant(w2.view(expert, -1, 128), quant_dtype=q_dtype_w)
+
+w1_qt = w1_qt.view(expert, inter_dim, model_dim)
+w2_qt = w2_qt.view(expert, model_dim, inter_dim)
+
+w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
+w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
+
+print("Sorting...")
+from aiter.fused_moe import moe_sorting
+sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+    topk_ids, topk_weights, expert, model_dim, dtype
+)
+
+print("SKIPPING Stage1 - Generating fake intermediate data...")
+fake_inter_states = torch.randn(token, topk, inter_dim, dtype=dtype)
+a2_qt, a2_scale = aiter.pertoken_quant(fake_inter_states.view(token, -1, 128), quant_dtype=q_dtype_a)
+a2_qt = a2_qt.view(token, topk, -1)
+
+print(f"\\n{{'*'*80}}")
+print(f"*** PROFILING TARGET: Stage2 (block_m={{block_m}}) ***")
+print(f"*** {{TARGET_KERNEL}}")
+print(f"{{'*'*80}}")
+
+output = torch.empty(token, model_dim, dtype=dtype)
+ck_moe_stage2_fwd(
+    inter_states=a2_qt,
+    w1=w1_qt_shffle,
+    w2=w2_qt_shffle,
+    sorted_token_ids=sorted_ids,
+    sorted_expert_ids=sorted_expert_ids,
+    num_valid_ids=num_valid_ids,
+    out=output,
+    topk=topk,
+    kernelName=TARGET_KERNEL,
+    w2_scale=w2_scale,
+    a2_scale=a2_scale,
+    block_m=block_m,
+    sorted_weights=sorted_weights if not doweight_stage1 else None,
+    quant_type=q_type,
+    activation=act_type,
+)
+
+torch.cuda.synchronize()
+
+print("\\n" + "="*80)
+print("✓ TARGET KERNEL executed!")
+print(f"Output shape: {{output.shape}}")
+print("="*80)
+'''
 
 
 def get_kernels():
-    """Load kernel configs from CSV."""
-    csv_path = Path("results/all_kernel_combinations.csv")
+    """Load the CSV with best kernels."""
+    csv_path = Path("results/sample1.csv")
     if not csv_path.exists():
         print(f"Error: {csv_path} not found")
         sys.exit(1)
-    
-    df = pd.read_csv(csv_path)
-    print(f"Loaded {len(df)} kernels from CSV")
-    print(f"Original columns: {len(df.columns)}")
-    print(f"Columns: {list(df.columns)}\n")
-    return df
+    return pd.read_csv(csv_path)
 
-
-def create_kernel_script(row, script_path):
-    """Create a simple Python script to run the kernel."""
-    code = f"""
-import torch
-import sys
-sys.path.insert(0, '{Path(__file__).parent.parent}')
-
-# Run simple tensor operation to test GPU
-try:
-    token = {int(row['token'])}
-    model_dim = {int(row['model_dim'])}
-    
-    x = torch.randn(token, model_dim, device='cuda', dtype=torch.float32)
-    w = torch.randn(model_dim, model_dim, device='cuda', dtype=torch.float32)
-    
-    # Warm up
-    y = torch.mm(x, w)
-    torch.cuda.synchronize()
-    
-    # Run 5 times like benchmark
-    for i in range(5):
-        y = torch.mm(x, w)
-        torch.cuda.synchronize()
-    
-    print("OK")
-except Exception as e:
-    print(f"Error: {{e}}")
-    sys.exit(1)
-"""
-    script_path.write_text(code)
-
-
-def run_rocprofv3(row, idx, total, output_dir):
-    """Run rocprofv3 on a kernel config."""
+def create_kernel_execution_script(row, script_path):
+    """
+    Create script matching your template format - directly calls kernel functions.
+    """
+    # Extract all config info
     config_idx = int(row['config_idx'])
-    config_name = f"config_{config_idx:04d}"
+    kernel_name = row['kernel_name']
+    kernel_type = str(row['kernel_type'])  # asm or ck
+    stage = str(row['stage'])  # stage1, stage2, or asm_1stage
     
-    print(f"[{idx}/{total}] config_idx={config_idx}, kernel={row['kernel_name'][:50]}")
-    
-    # Create kernel script
-    script_path = Path(f"_kernel_{idx}.py")
-    create_kernel_script(row, script_path)
-    
-    # Build rocprofv3 command
-    output_file = output_dir / config_name
-    counter_str = " ".join(COUNTERS)
-    
-    cmd = [
-        "rocprofv3",
-        "--kernel-trace",
-        "--pmc", counter_str,
-        "-d", str(output_dir),
-        "-o", str(output_file),
-        "--",
-        sys.executable, str(script_path)
-    ]
-    
-    print(f"  Counters: {len(COUNTERS)} (58 total)")
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
-        if result.returncode != 0:
-            print(f"  ⚠ rocprofv3 execution issue (continuing with theoretical metrics)")
-            script_path.unlink()
-            return None
-        
-        print(f"  ✓ rocprofv3 completed")
-        script_path.unlink()
-        return config_name
-        
-    except subprocess.TimeoutExpired:
-        print(f"  ✗ Timeout")
-        script_path.unlink()
-        return None
-    except Exception as e:
-        print(f"  ✗ Exception: {e}")
-        script_path.unlink()
-        return None
-
-
-def parse_rocprofv3_output(config_name, output_dir):
-    """Parse rocprofv3 CSV output and extract all counter values."""
-    csv_file = output_dir / f"{config_name}.csv"
-    
-    if not csv_file.exists():
-        return {}
-    
-    try:
-        df = pd.read_csv(csv_file)
-        if df.empty:
-            return {}
-        
-        # Get first row and convert to dict
-        data = df.iloc[0].to_dict()
-        print(f"  Extracted {len(data)} counter values from rocprofv3")
-        return data
-    except Exception as e:
-        print(f"  Could not parse rocprofv3 output: {e}")
-        return {}
-
-
-def calculate_metrics(row, counter_data):
-    """Calculate performance metrics from rocprofv3 counters or theoretical values."""
-    metrics = {}
-    
-    # Roofline analysis (theoretical)
     token = int(row['token'])
     model_dim = int(row['model_dim'])
     inter_dim = int(row['inter_dim'])
+    expert = int(row['expert'])
     topk = int(row['topk'])
+    block_m = int(row['block_m'])
     
-    # Operations: token * topk * model_dim * inter_dim * 2 (mul + add)
-    ops = token * topk * model_dim * inter_dim * 2
+    dtype_str = str(row['dtype'])
+    q_dtype_a_str = str(row['q_dtype_a'])
+    q_dtype_w_str = str(row['q_dtype_w'])
+    q_type_str = str(row['q_type'])
+    act_type_str = str(row['act_type'])
+    use_g1u1 = bool(row['use_g1u1'])
+    doweight_stage1 = bool(row['doweight_stage1'])
     
-    # Memory: input + weights + output (in bytes)
-    bytes_moved = (token * model_dim + inter_dim * model_dim + token * inter_dim) * 4
-    
-    ai = ops / bytes_moved if bytes_moved > 0 else 0
-    metrics['arithmetic_intensity'] = ai
-    
-    # Determine bottleneck and expected performance
-    dtype_str = str(row['dtype']).lower()
-    if 'float16' in dtype_str or 'f16' in dtype_str or 'bf16' in dtype_str:
-        ridge = GPU_SPECS['ridge_fp16']
-        peak = GPU_SPECS['peak_fp16']
+    # Generate script based on kernel type and stage
+    if stage == "asm_1stage":
+        code = generate_asm_1stage_script(config_idx, kernel_name, token, model_dim, inter_dim,
+                                         expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                                         q_type_str, act_type_str, use_g1u1)
+    elif kernel_type == "ck" and stage == "stage2":
+        code = generate_ck_stage2_script(config_idx, kernel_name, token, model_dim, inter_dim,
+                                         expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                                         q_type_str, act_type_str, use_g1u1, doweight_stage1)
+    elif kernel_type == "ck" and stage == "stage1":
+        code = generate_ck_stage1_script(config_idx, kernel_name, token, model_dim, inter_dim,
+                                         expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                                         q_type_str, act_type_str, use_g1u1, doweight_stage1)
     else:
-        ridge = GPU_SPECS['ridge_fp32']
-        peak = GPU_SPECS['peak_fp32']
-    
-    if ai < ridge:
-        metrics['bottleneck'] = 'memory'
-        expected_tflops = GPU_SPECS['bandwidth'] * ai / 1000
-    else:
-        metrics['bottleneck'] = 'compute'
-        expected_tflops = peak
-    
-    metrics['expected_tflops'] = expected_tflops
-    metrics['achieved_tflops'] = row['tflops']
-    metrics['efficiency_percent'] = (row['tflops'] / expected_tflops * 100) if expected_tflops > 0 else 0
-    
-    # Extract rocprofv3 counter metrics if available
-    if counter_data:
-        try:
-            # L2 Cache
-            l2_hits = float(counter_data.get('TCC_HIT_sum', 0))
-            l2_misses = float(counter_data.get('TCC_MISS_sum', 0))
-            total = l2_hits + l2_misses
-            if total > 0:
-                metrics['l2_hit_rate_percent'] = (l2_hits / total) * 100
-            
-            # LDS Bank conflicts
-            lds_conflicts = float(counter_data.get('SQ_LDS_BANK_CONFLICT', 0))
-            lds_reads = float(counter_data.get('SQ_LDS_READ', 0))
-            if lds_reads > 0:
-                metrics['lds_conflict_percent'] = (lds_conflicts / lds_reads) * 100
-            
-            # MFMA utilization
-            mfma_insts = float(counter_data.get('SQ_INSTS_MFMA', 0))
-            active_cycles = float(counter_data.get('SQ_ACTIVE_CYCLES', 0))
-            if active_cycles > 0:
-                metrics['mfma_util_percent'] = (mfma_insts / active_cycles) * 100
-            
-            # Pipeline stalls
-            wait_cycles = float(counter_data.get('SQ_WAIT_ANY_CYCLES', 0))
-            if active_cycles > 0:
-                metrics['pipeline_stall_percent'] = (wait_cycles / active_cycles) * 100
-            
-            # Memory coalescing (64B efficiency)
-            reads_32 = float(counter_data.get('TCC_EA0_RDREQ_32B_sum', 0))
-            reads_64 = float(counter_data.get('TCC_EA0_RDREQ_64B_sum', 0))
-            total_reads = reads_32 + reads_64
-            if total_reads > 0:
-                metrics['coalescing_64b_percent'] = (reads_64 / total_reads) * 100
-            
-            # FP precision mix
-            fp32_ops = float(counter_data.get('SQ_INSTS_FP32', 0))
-            fp16_ops = float(counter_data.get('SQ_INSTS_FP16', 0))
-            total_fp = fp32_ops + fp16_ops
-            if total_fp > 0:
-                metrics['fp16_percent'] = (fp16_ops / total_fp) * 100
-            
-            # Store all counter values with prefix
-            for counter, value in counter_data.items():
-                metrics[f"counter_{counter}"] = value
-                
-        except Exception as e:
-            print(f"  Error extracting counters: {e}")
-    
-    return metrics
+        # ASM stage1/stage2 - use similar approach
+        code = generate_asm_stage_script(config_idx, kernel_name, stage, token, model_dim, inter_dim,
+                                        expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                                        q_type_str, act_type_str, use_g1u1, doweight_stage1)
+    script_path.write_text(code)
 
+def run_rocprofv3(row, output_dir):
+    """Run rocprofv3 kernel-trace with optional counter collection."""
+    config_idx = int(row['config_idx'])
+    
+    script_path = Path(f"_profiling_{config_idx}.py")
+    create_kernel_execution_script(row, script_path)
+    
+    output_file = output_dir / f"cfg_{config_idx}"
+    
+    # rocprofv3 is now in PATH with new ROCm image
+    # Add --pmc with counters to collect performance metrics
+    counter_str = " ".join(COUNTERS)
+    cmd = [
+        "rocprofv3",
+        "--pmc", counter_str,
+        "--output-format", "csv",  # Save as CSV, not database
+        "-d", str(output_dir.absolute()),
+        "-o", str(output_file.absolute()),
+        "--",
+        sys.executable, str(script_path.absolute())
+    ]
+    print(cmd)
+    
+    print(f"Config {config_idx}: Running rocprofv3 kernel-trace...")
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            print(f"  ✓ Success!")
+            print(f"  Test script: {script_path}")
+        else:
+            print(f"  ✗ Failed (exit code {result.returncode})")
+            print(f"  Test script: {script_path}")
+            
+            # Show full stdout and stderr for debugging
+            if result.stdout:
+                print(f"\n  --- STDOUT ---")
+                for line in result.stdout.split('\n')[:20]:  # First 20 lines
+                    if line.strip():
+                        print(f"  {line}")
+            
+            if result.stderr:
+                print(f"\n  --- STDERR (last 20 lines) ---")
+                stderr_lines = result.stderr.split('\n')
+                for line in stderr_lines[-20:]:  # Last 20 lines
+                    if line.strip():
+                        print(f"  {line}")
+        
+        # Keep temp file for debugging (don't delete)
+        # script_path.unlink()
+        return f"cfg_{config_idx}" if result.returncode == 0 else None
+    except Exception as e:
+        print(f"  Exception: {e}")
+        print(f"  Test script kept: {script_path}")
+        # Keep temp file even on error (don't delete)
+        # script_path.unlink()
+        return None
+
+def parse_rocprofv3_output(config_name, output_dir):
+    """Parse rocprofv3 PMC counter_collection CSV to extract counter values."""
+    # rocprofv3 creates cfg_N_counter_collection.csv with counter data
+    counter_file = output_dir / f"{config_name}_counter_collection.csv"
+    
+    if not counter_file.exists():
+        # Try glob pattern
+        files = list(output_dir.glob("*counter_collection.csv"))
+        if not files:
+            return {}
+        counter_file = max(files, key=lambda p: p.stat().st_mtime)
+    
+    try:
+        df = pd.read_csv(counter_file)
+        
+        if len(df) == 0:
+            return {}
+        
+        # Get last dispatch (target kernel - others are PyTorch overhead)
+        last_dispatch_id = df['Dispatch_Id'].max()
+        target_rows = df[df['Dispatch_Id'] == last_dispatch_id]
+        
+        # Extract counter values from Counter_Name and Counter_Value columns
+        counter_data = {}
+        for _, row in target_rows.iterrows():
+            counter_name = row['Counter_Name']
+            counter_value = row['Counter_Value']
+            if counter_name in COUNTERS:
+                counter_data[counter_name] = counter_value
+        
+        return counter_data
+        
+    except Exception as e:
+        print(f"  Error parsing PMC data: {e}")
+        return {}
 
 def main():
-    print("=" * 80)
-    print("MOE Kernel Profiler - rocprofv3 with 58 Counters")
-    print("=" * 80)
-    
-    # Load original CSV
     kernels = get_kernels()
     output_dir = Path("rocprofv3_results")
     output_dir.mkdir(exist_ok=True)
     
-    # Process each kernel
-    all_results = []
+    print(f"\nProfiling {len(kernels)} kernels using rocprofv3 kernel-trace...")
+    print(f"Output directory: {output_dir.absolute()}\n")
     
+    results = []
     for idx, (_, row) in enumerate(kernels.iterrows(), 1):
-        config_name = run_rocprofv3(row, idx, len(kernels), output_dir)
-        
-        # Parse rocprofv3 output
+        config_name = run_rocprofv3(row, output_dir)
         counter_data = parse_rocprofv3_output(config_name, output_dir) if config_name else {}
         
-        # Calculate metrics
-        metrics = calculate_metrics(row, counter_data)
-        
-        # Combine original row with new metrics
         result_row = dict(row)
-        result_row.update(metrics)
-        all_results.append(result_row)
+        result_row.update(counter_data)
+        results.append(result_row)
+        
+        if len(kernels) > 1 and idx % max(1, len(kernels) // 5) == 0:
+            print(f"  Progress: {idx}/{len(kernels)}")
     
-    # Save results
-    results_df = pd.DataFrame(all_results)
-    output_file = "rocprofv3_results/analysis_complete.csv"
+    results_df = pd.DataFrame(results)
+    output_file = "rocprofv3_results/kernels_with_counters.csv"
     results_df.to_csv(output_file, index=False)
     
-    print(f"\n{'=' * 80}")
-    print(f"Results saved to: {output_file}")
+    print(f"\n{'='*60}")
+    print(f"RESULTS SUMMARY")
+    print(f"{'='*60}")
+    print(f"Output file: {output_file}")
+    print(f"Original columns: {len(kernels.columns)}")
+    print(f"Profiling columns added: {len(results_df.columns) - len(kernels.columns)}")
+    print(f"New columns:")
+    for col in results_df.columns[len(kernels.columns):]:
+        print(f"  - {col}")
+    print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     main()
