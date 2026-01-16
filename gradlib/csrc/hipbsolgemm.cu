@@ -778,7 +778,9 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     int decode_max_n = 512;
 
     // load tuning cache file and check if the gemm has been already tuned
-    if (std::getenv("HIP_ONLINE_TUNING") == 1 && n <= decode_max_n) { 
+    const char* env = std::getenv("HIP_ONLINE_TUNING");
+    bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
+    if (online_tuning && n <= decode_max_n) { 
       solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
                                                   bpreshuffle, use_rowwise,
                                                   op_A, op_B, m, n, k,
@@ -792,7 +794,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     if(solution_index < 0)
     {
       // if enable hipblaslt online tuning, check the cache file and tune the gemm
-      if (std::getenv("HIP_ONLINE_TUNING") == 1 && n <= decode_max_n) {
+      if (online_tuning && n <= decode_max_n) {
         std::cout << "Tuning hip GEMM (" << m << ", " << n << ", " << k << ")\n";
         hipblasLt_online_tuning(      
 	        handle, m, n, k,
