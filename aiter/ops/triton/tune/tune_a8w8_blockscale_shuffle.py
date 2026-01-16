@@ -341,7 +341,7 @@ def create_default_config(
     all_configs: List,
     save_path: str,
     device_name: str,
-    tag: str = "A8W8_BLOCKSCALE_SHUFFLE",
+    tag: str = "A8W8_BLOCKSCALE_PRESHUFFLED",
 ) -> dict:
     """
     Create a default config by selecting the most common config across all shapes.
@@ -353,7 +353,7 @@ def create_default_config(
         all_configs: List of best_configs dictionaries from different (N, K) shapes
         save_path: Path to the directory where config files are saved
         device_name: Device/architecture name for file matching
-        tag: Tag prefix to match config files (e.g., "A8W8_BLOCKSCALE_SHUFFLE")
+        tag: Tag prefix to match config files (e.g., "A8W8_BLOCKSCALE_PRESHUFFLED")
 
     Returns:
         Default configuration dictionary with most common configs for each category
@@ -416,7 +416,7 @@ def save_default_config(
     config: dict,
     save_path: str,
     device_name: str,
-    tag: str = "A8W8_BLOCKSCALE_SHUFFLE",
+    tag: str = "A8W8_BLOCKSCALE_PRESHUFFLED",
 ) -> None:
     """
     Save the default config file (without N,K parameters).
@@ -535,7 +535,7 @@ def main():
 
     # Tune for each configuration
     for batch_sizes, N, K in test_configs:
-        tag = f"A8W8_BLOCKSCALE_SHUFFLE-N={N}-K={K}"
+        tag = f"A8W8_BLOCKSCALE_PRESHUFFLED-N={N}-K={K}"
         print(f"Running {tag}...")
         best_configs = tune_and_save_configs(
             batch_sizes=batch_sizes,
@@ -551,9 +551,9 @@ def main():
         all_configs.append(best_configs)
 
     # Create a default config file (without N,K parameters) by selecting most common config
-    default_config = create_default_config(all_configs, save_path, dev, "A8W8_BLOCKSCALE_SHUFFLE")
+    default_config = create_default_config(all_configs, save_path, dev, "A8W8_BLOCKSCALE_PRESHUFFLED")
     save_default_config(
-        default_config, save_path, dev, "A8W8_BLOCKSCALE_SHUFFLE"
+        default_config, save_path, dev, "A8W8_BLOCKSCALE_PRESHUFFLED"
     )
 
 
