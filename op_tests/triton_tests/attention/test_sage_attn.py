@@ -414,14 +414,22 @@ def test_sage_v2(
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
-    q_dequnt = upcast_from_mxfp(q_fp4, q_descale, torch.bfloat16, -1)
-    k_dequnt = upcast_from_mxfp(k_fp4, k_descale, torch.bfloat16, -1)
+    q_dequant = upcast_from_mxfp(q_fp4, q_descale, torch.bfloat16, -1)
+    k_dequant = upcast_from_mxfp(k_fp4, k_descale, torch.bfloat16, -1)
+
+    v_descale.unsqueeze(1 if layout == "bshd" else 2)
+    v_dequant = (v_fp8.float() * v_descale).to(q.dtype)
+
+    print("v quant comparison")
+    print(v_dequant.flatten()[0:20])
+    print(v.flatten()[0:20])
 
     print("q quant comparison")
-    print(q_dequnt.flatten()[0:20])
+    print(q_dequant.flatten()[0:20])
     print(q.flatten()[0:20])
-    q = q_dequnt
-    k = k_dequnt
+    q = q_dequant
+    k = k_dequant
+    v = v_dequant
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -444,9 +452,9 @@ def test_sage_v2(
 
     print("result comparison")
     print("Triton")
-    print(triton_out.flatten()[0:20])
+    print(triton_out.flatten()[-20:-1])
     print("Torch")
-    print(torch_out.flatten()[0:20])
+    print(torch_out.flatten()[-20:-1])
     check_attention_outputs(
         triton_out,
         torch_out,
