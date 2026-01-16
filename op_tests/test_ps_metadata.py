@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import aiter
 import argparse
@@ -66,9 +66,7 @@ def test_ps_metadata(
 
     qhead_granularity = gqa_ratio
     qlen_granularity = tile_q // qhead_granularity  # prefill: tile_q, decode: max_qlen
-    kvlen_granularity = max(
-        tile_kv, block_size
-    )  # prefill: tile_kv, decode: block_size
+    kvlen_granularity = max(tile_kv, block_size)  # prefill: tile_kv, decode: block_size
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),
@@ -85,9 +83,7 @@ def test_ps_metadata(
     work_metadata_ptrs = torch.zeros(
         work_meta_data_size, dtype=work_meta_data_type, device=device
     )
-    work_indptr = torch.zeros(
-        work_indptr_size, dtype=work_indptr_type, device=device
-    )
+    work_indptr = torch.zeros(work_indptr_size, dtype=work_indptr_type, device=device)
     work_info = torch.zeros(work_info_size, dtype=work_info_type, device=device)
     reduce_indptr = torch.zeros(
         reduce_indptr_size, dtype=reduce_indptr_type, device=device
