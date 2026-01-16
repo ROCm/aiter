@@ -360,5 +360,5 @@ for (
         raise ValueError(f"Unknown test type: {test}")
     df.append(ret)
 df = pd.DataFrame(df)
-# df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("kvcache summary (markdown):\n%s", df_md)

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <sstream>
 #include <torch/python.h>
@@ -599,6 +599,10 @@ __global__ void kn_mla_reduce_v1(
     MLA_REDUCE_CASE_IF(                                                     \
         NUM_HEAD,   1, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,   2, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,   4, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD,   8, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD,  10, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
@@ -606,6 +610,10 @@ __global__ void kn_mla_reduce_v1(
         NUM_HEAD,  16, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD,  16, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  32, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
+    MLA_REDUCE_CASE_EF(                                                     \
+        NUM_HEAD,  64, HEAD_DIM, 512, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \
         NUM_HEAD, 128, HEAD_DIM, 128, NUM_WG_PER_SEQ, NAME, __VA_ARGS__)    \
     MLA_REDUCE_CASE_EF(                                                     \

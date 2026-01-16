@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.utility import dtypes
 from typing import List
+import argparse
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -538,7 +540,7 @@ if __name__ == "__main__":
             for num_head in num_heads:
                 for i, head_size in enumerate(head_sizes):
                     test_mrope_3d_rms(
-                        dtype,
+                        args.dtype,
                         num_token,
                         num_head,
                         num_head,
@@ -567,7 +569,7 @@ if __name__ == "__main__":
                     ms = mrope_sections[i]
                     for is_interleaved in is_interleaveds:
                         test_mrope_3d_rms(
-                            dtype,
+                            args.dtype,
                             num_token,
                             num_head,
                             num_head,

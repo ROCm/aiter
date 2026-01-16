@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
 import logging
 import numpy as np
-from aiter.ops.triton.mha import (
+from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
-from aiter.ops.triton.mha_v3 import (
+from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )

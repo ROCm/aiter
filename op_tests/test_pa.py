@@ -15,6 +15,8 @@ from aiter.test_common import (
     benchmark,
 )
 from aiter import pertoken_quant
+from aiter.ops import attention
+
 import argparse
 import pandas as pd
 
@@ -404,6 +406,110 @@ def run_aiter_asm(
     )
 
 
+@perftest()
+def run_aiter_common(
+    query,
+    k_cache,
+    v_cache,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    kv_cache_dtype,
+    num_kv_heads,
+    scale,
+    alibi_slopes,
+    block_tables_stride0,
+    # ROCm/HIP (scalar) scales
+    k_scale_hip=None,
+    v_scale_hip=None,
+    # ASM (expanded) scales
+    k_scale_asm=None,
+    v_scale_asm=None,
+    high_precision=0,
+    kv_cache_tensor_dtype=None,
+):
+    """
+    Test paged_attention_common which automatically switches between ASM and HIP kernels.
+    """
+
+    num_seqs, num_heads, head_size = query.shape
+    # Client-side allocations required by ROCm paged attention path.
+    _PARTITION_SIZE_ROCM = 256
+    max_num_partitions = (
+        max_seq_len + _PARTITION_SIZE_ROCM - 1
+    ) // _PARTITION_SIZE_ROCM
+    tmp_out = torch.empty(
+        (num_seqs, num_heads, max_num_partitions, head_size),
+        dtype=query.dtype,
+        device=query.device,
+    )
+    exp_sums = torch.empty(
+        (num_seqs, num_heads, max_num_partitions),
+        dtype=dtypes.fp32,
+        device=query.device,
+    )
+    max_logits = torch.empty_like(exp_sums)
+
+    def _normalize_scale(s):
+        if s is None:
+            return None
+        if isinstance(s, torch.Tensor):
+            return s.to(device=query.device, dtype=dtypes.fp32)
+        # python scalar
+        return torch.tensor(float(s), device=query.device, dtype=dtypes.fp32)
+
+    k_scale_hip_tensor = _normalize_scale(k_scale_hip)
+    v_scale_hip_tensor = _normalize_scale(v_scale_hip)
+    # ASM scales are already tensors in the expected layout; just ensure fp32 on device.
+    k_scale_asm_tensor = _normalize_scale(k_scale_asm)
+    v_scale_asm_tensor = _normalize_scale(v_scale_asm)
+
+    # Determine kv_cache_dtype string.
+    def _is_fp8_storage(dt: torch.dtype) -> bool:
+        if dt == torch.int8 or dt == torch.uint8:
+            return True
+        # torch float8 dtypes (guard for older torch builds)
+        for name in (
+            "float8_e4m3fnuz",
+            "float8_e4m3fn",
+            "float8_e5m2fnuz",
+            "float8_e5m2",
+        ):
+            if hasattr(torch, name) and dt == getattr(torch, name):
+                return True
+        return False
+
+    cache_dt = (
+        kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else k_cache.dtype
+    )
+    kv_cache_dtype_str = "fp8" if _is_fp8_storage(cache_dt) else "auto"
+
+    return attention.paged_attention_common(
+        Q=query.contiguous(),
+        K=k_cache,
+        V=v_cache,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        tmp_out=tmp_out,
+        block_tables=block_tables,
+        context_lens=seq_lens,
+        block_tables_stride0=block_tables_stride0,
+        scale=scale,
+        max_qlen=1,
+        max_seq_len=max_seq_len,
+        K_QScale_hip=k_scale_hip_tensor,
+        V_QScale_hip=v_scale_hip_tensor,
+        K_QScale_asm=k_scale_asm_tensor,
+        V_QScale_asm=v_scale_asm_tensor,
+        out_=None,
+        qo_indptr=None,
+        high_precision=high_precision,
+        kernelName=None,
+        kv_cache_dtype=kv_cache_dtype_str,
+        kv_cache_tensor_dtype=kv_cache_tensor_dtype,
+    )
+
+
 def dump_input(
     path,
     query: torch.Tensor,
@@ -587,6 +693,32 @@ def test_paged_attention(
         )
         # tensor_dump(out_aiter, 'out_aiter')
 
+    # Test paged_attention_common which automatically switches between ASM and HIP
+    # The routing is internal, so we just test the common API regardless of which path it takes
+    time_aiter_common = None
+    if dtype == dtypes.bf16:
+        try:
+            out_aiter_common, time_aiter_common = run_aiter_common(
+                query.contiguous(),
+                k_cache,
+                asm_V_shuffle(v_cache),  # Shuffle V cache, same as run_aiter_asm
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                kv_cache_dtype,
+                num_kv_heads,
+                scale,
+                alibi_slopes,
+                block_tables.stride(0),
+            )
+            checkAllclose(
+                out_golden,
+                out_aiter_common,
+                msg=f"golden vs aiter_common:{time_aiter_common:>8.2f} us......",
+            )
+        except Exception as e:
+            print(f"Warning: Could not test aiter_common: {e}")
+
     for quant_algo_, cache_type_ in [
         (0, k_cache.dtype),
         (2, dtypes.fp8),
@@ -705,6 +837,31 @@ def test_paged_attention(
                 msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
             )
 
+            if quant_algo_ == 4:
+                # Test paged_attention_common with quantized cache
+                out_aiter_common, time_aiter_common = run_aiter_common(
+                    query.contiguous(),
+                    k_quant_,
+                    asm_V_shuffle(v_quant_),
+                    block_tables,
+                    seq_lens,
+                    max_seq_len,
+                    kv_cache_dtype,
+                    num_kv_heads,
+                    scale,
+                    alibi_slopes,
+                    block_tables.stride(0),
+                    k_scale_hip=k_scale_,
+                    v_scale_hip=v_scale_,
+                    k_scale_asm=k_scale_asm,
+                    v_scale_asm=v_scale_asm,
+                )
+                checkAllclose(
+                    out_golden,
+                    out_aiter_common,
+                    msg=f"golden vs aiter_common:{time_aiter_common:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+                )
+
             if (
                 dtype in [dtypes.bf16, dtypes.fp16]
                 and quant_algo_ == 2
@@ -809,7 +966,11 @@ def test_paged_attention(
     print(
         f"finish~ {ctx_lens=}, {num_seqs=}, {num_heads=}, {head_size=}, {use_alibi=}, {block_size=}, {dtype=}, {kv_cache_dtype=}\n"
     )
-    return {"aiter_shomy": time_aiter, "aiter_asm": time_aiter_asm}
+    return {
+        "aiter_shomy": time_aiter,
+        "aiter_asm": time_aiter_asm,
+        "aiter_common": time_aiter_common,
+    }
 
 
 df = []
@@ -876,4 +1037,5 @@ for num_heads in l_num_heads:
             )
             df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("pa summary (markdown):\n%s", df_md)

@@ -1,6 +1,6 @@
 """
 * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-* Copyright (C) 2024-2025, The vLLM team.
+* Copyright (C) 2024-2026, The vLLM team.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,7 +24,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
+from aiter import (
+    dtypes,
+    gemm_a16w16_asm,
+    hipb_create_extension,
+    hipb_mm,
+    logger,
+)
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -406,7 +412,7 @@ def triton_gemm(
     scale_c: Optional[Tensor] = None,
     bpreshuffle: Optional[bool] = False,
 ):
-    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
     assert (
         scale_a is None and scale_b is None and scale_c is None

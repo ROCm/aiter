@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import os
 import random
-import sys
 from functools import lru_cache
 
 import pandas as pd
@@ -445,6 +443,7 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=dtypes.str2Dtype,
+    nargs="*",
     # choices=["bf16", "fp16", "fp8"],
     default=[torch.bfloat16, torch.float16],
     help="""Data type. Support "bf16", "fp16", "fp8".
@@ -515,4 +514,5 @@ for test in args.test:
         ret = test_skinny_gemm()
         df += ret
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
