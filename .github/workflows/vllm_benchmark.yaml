@@ -138,7 +138,7 @@ jobs:
               --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
               --network=host --security-opt seccomp=unconfined --shm-size=16G \
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
-              rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} python -m vllm.entrypoints.cli.main bench latency \
+              rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} --entrypoint python -m vllm.entrypoints.cli.main bench latency \
               --model "${{ matrix.model }}" \
               --batch-size 123 --input-len 456 --output-len 78 \
               --num-iters-warmup 3 --num-iters 10 \
