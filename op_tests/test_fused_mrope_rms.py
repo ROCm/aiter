@@ -1049,7 +1049,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
         info += f", return_kv:{test_return_kv}"
     if use_shuffle_layout:
         info += f", use_shuffle_layout:{use_shuffle_layout}, page_size:{page_size}"
-    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
+    # msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
 
     checkAllclose(q_out_ref, q_out, msg="q_out", rtol=1e-2, atol=0.05)
     # For shuffle layout, we need to reshape cache for comparison
