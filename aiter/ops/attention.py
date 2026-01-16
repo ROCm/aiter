@@ -99,8 +99,7 @@ def pa_fwd_naive(
     block_size: int,
     quant_algo: int,
     out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    ...
+) -> torch.Tensor: ...
 
 
 @compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
@@ -120,8 +119,7 @@ def pa_fwd_asm(
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
-) -> torch.Tensor:
-    ...
+) -> torch.Tensor: ...
 
 
 def _should_use_asm_kernel(
@@ -287,8 +285,7 @@ def pa_ps_fwd_asm(
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
-) -> torch.Tensor:
-    ...
+) -> torch.Tensor: ...
 
 
 def pa_reduce_v1(
@@ -579,8 +576,7 @@ def mla_decode_stage1_asm_fwd(
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
     # [1] pertensor
-) -> None:
-    ...
+) -> None: ...
 
 
 @compile_ops(MD_NAME)
@@ -603,8 +599,7 @@ def mla_prefill_asm_fwd(
     splitData: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
-) -> None:
-    ...
+) -> None: ...
 
 
 def get_pa_metadata_info_v1(
@@ -767,8 +762,7 @@ def get_ps_metadata_v1(
     kvlen_granularity: int = 16,
     block_size: int = 16,
     is_causal: bool = True,
-) -> None:
-    ...
+) -> None: ...
 
 
 @compile_ops(MD_NAME)
@@ -790,8 +784,7 @@ def mla_prefill_ps_asm_fwd(
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
-) -> None:
-    ...
+) -> None: ...
 
 
 def get_mla_metadata_info_v1(
@@ -974,5 +967,4 @@ def mla_reduce_v1(
     max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-) -> None:
-    ...
+) -> None: ...
