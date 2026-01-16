@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 
@@ -41,7 +41,13 @@ void fused_mrope_3d_rms_set_kv(Tensor& qkv,
                                Tensor& v_cache,
                                Tensor& kv_loc,
                                double k_scale,
-                               double v_scale);
+                               double v_scale,
+                               std::optional<Tensor> k_out,
+                               std::optional<Tensor> v_out,
+                               bool return_kv,
+                               bool use_shuffle_layout,
+                               int64_t block_size,
+                               int64_t x);
 
 void fused_rope_rms(Tensor& qkv,
                     Tensor& qw,
@@ -73,4 +79,10 @@ void fused_rope_rms_set_kv(Tensor& qkv,
                            Tensor& v_cache,
                            Tensor& kv_loc,
                            double k_scale,
-                           double v_scale);
+                           double v_scale,
+                           std::optional<Tensor> k_out,
+                           std::optional<Tensor> v_out,
+                           bool return_kv,
+                           bool use_shuffle_layout,
+                           int64_t block_size,
+                           int64_t x);
