@@ -415,6 +415,11 @@ def build_reference_output(
             ],
             dim=0,
         ).to(dtype)
+        if qi.shape[1] != num_kv_heads:
+            assert qi.shape[1] % num_kv_heads == 0
+            ratio = qi.shape[1] // num_kv_heads
+            ki = ki.repeat_interleave(ratio, dim=1)
+            vi = vi.repeat_interleave(ratio, dim=1)
         o_ref_list.append(
             ref_masked_attention(
                 qi, ki, vi, causal=causal, logits_soft_cap=logits_soft_cap
