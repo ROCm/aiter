@@ -99,7 +99,8 @@ def pa_fwd_naive(
     block_size: int,
     quant_algo: int,
     out: Optional[torch.Tensor] = None,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 @compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
@@ -119,7 +120,8 @@ def pa_fwd_asm(
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 def _should_use_asm_kernel(
@@ -285,7 +287,8 @@ def pa_ps_fwd_asm(
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    ...
 
 
 def pa_reduce_v1(
@@ -576,7 +579,8 @@ def mla_decode_stage1_asm_fwd(
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
     # [1] pertensor
-) -> None: ...
+) -> None:
+    ...
 
 
 @compile_ops(MD_NAME)
@@ -599,7 +603,8 @@ def mla_prefill_asm_fwd(
     splitData: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
-) -> None: ...
+) -> None:
+    ...
 
 
 def get_pa_metadata_info_v1(
@@ -720,8 +725,8 @@ def get_ps_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(device)
     cu_num = device_properties.multi_processor_count
 
-    num_clusters       = math.gcd(num_head_k, cu_num)
-    cus_per_cluster    = cu_num // num_clusters
+    num_clusters = math.gcd(num_head_k, cu_num)
+    cus_per_cluster = cu_num // num_clusters
     kheads_per_cluster = num_head_k // num_clusters
 
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
@@ -729,7 +734,10 @@ def get_ps_metadata_info_v1(
     qo_tile_cnt = batch_size * max_qo_split_per_batch
     # TODO: consider split q to reduce max_works & max_partials
     max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
-    max_partials = min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2) * max_qo_split_per_batch
+    max_partials = (
+        min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2)
+        * max_qo_split_per_batch
+    )
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs
@@ -782,7 +790,8 @@ def mla_prefill_ps_asm_fwd(
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
-) -> None: ...
+) -> None:
+    ...
 
 
 def get_mla_metadata_info_v1(
@@ -965,4 +974,5 @@ def mla_reduce_v1(
     max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-) -> None: ...
+) -> None:
+    ...

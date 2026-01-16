@@ -423,7 +423,9 @@ def mla_prefill_ps_fwd(
 
     tile_q = 256
     logits = torch.empty(
-        (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim), dtype=dtypes.fp32, device=device
+        (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
     )
     attn_lse = torch.empty(
         (reduce_partial_map.size(0) * tile_q, nhead), dtype=dtypes.fp32, device=device
