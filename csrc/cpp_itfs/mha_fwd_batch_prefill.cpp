@@ -2,35 +2,36 @@
 #include <string>
 
 namespace aiter {
-mha_fwd_traits get_mha_fwd_traits(int head_size_q,
-                                  int head_size_v,
-                                  std::string dtype,
-                                  bool is_group_mode,
-                                  bool has_logits_soft_cap,
-                                  mask_enum mask_type,
-                                  bias_enum bias_type,
-                                  bool has_lse,
-                                  bool has_dropout,
-                                  quant_scale_enum qscale_type,
-                                  bool use_ext_asm,
-                                  bool has_sink          = false,
-                                  int how_v3_bf16_cvt    = 1,
-                                  bool skip_min_seqlen_q = false)
+mha_batch_prefill_traits
+get_mha_batch_prefill_traits(int head_size_q,
+                             int head_size_v,
+                             std::string dtype,
+                             bool is_group_mode,
+                             bool has_logits_soft_cap,
+                             mask_enum mask_type,
+                             bias_enum bias_type,
+                             bool has_lse,
+                             bool has_dropout,
+                             quant_scale_enum qscale_type,
+                             ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout,
+                             ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
+                             int page_size,
+                             bool skip_min_seqlen_q = false)
 {
-    return mha_fwd_traits(head_size_q,
-                          head_size_v,
-                          dtype,
-                          is_group_mode,
-                          has_logits_soft_cap,
-                          mask_type,
-                          bias_type,
-                          has_lse,
-                          has_dropout,
-                          qscale_type,
-                          use_ext_asm,
-                          how_v3_bf16_cvt,
-                          skip_min_seqlen_q,
-                          has_sink);
+    return mha_batch_prefill_traits(head_size_q,
+                                    head_size_v,
+                                    dtype,
+                                    is_group_mode,
+                                    has_logits_soft_cap,
+                                    mask_type,
+                                    bias_type,
+                                    has_lse,
+                                    has_dropout,
+                                    qscale_type,
+                                    skip_min_seqlen_q,
+                                    kv_memory_layout,
+                                    kv_lookup_table,
+                                    page_size);
 }
 
 float mha_batch_prefill(mha_batch_prefill_args args,
@@ -46,17 +47,19 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     int head_size_q  = args.hdim_q;
     int head_size_v  = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
-    auto traits      = get_mha_fwd_traits(head_size_q,
-                                     head_size_v,
-                                     q_dtype_str,
-                                     is_group_mode,
-                                     args.logits_soft_cap > 0.f,
-                                     mask_type,
-                                     bias_type,
-                                     has_lse,
-                                     has_dropout,
-                                     qscale_type,
-                                     use_ext_asm);
+    auto traits      = get_mha_batch_prefill_traits(head_size_q,
+                                               head_size_v,
+                                               q_dtype_str,
+                                               is_group_mode,
+                                               args.logits_soft_cap > 0.f,
+                                               mask_type,
+                                               bias_type,
+                                               has_lse,
+                                               has_dropout,
+                                               qscale_type,
+                                               args.kv_memory_layout,
+                                               args.kv_lookup_table,
+                                               args.page_block_size);
     return fmha_batch_prefill(traits, args, stream_config);
 }
 

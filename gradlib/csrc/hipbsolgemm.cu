@@ -8,6 +8,8 @@
 // __HIP_NO_HALF_CONVERSIONS__ #endif
 
 #include "hipbsolgemm.cuh"
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 // #include <rocblas/rocblas.h>
 
@@ -659,7 +661,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
                                             const void* bias,
                                             hipDataType intype,
                                             hipDataType outtype,
-                                            hipStream_t& stream,
+                                            const hipStream_t& stream,
                                             int solution_index = -1,
                                             bool bpreshuffle   = false,
                                             bool use_rowwise   = false)
@@ -1103,7 +1105,8 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     void* ptrC{static_cast<void*>(result.data_ptr())};
     if(transpose_result)
         std::swap(d_scaleA, d_scaleB);
-    auto current_stream{torch::hip::getCurrentHIPStream().stream()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(mat1));
+    const hipStream_t current_stream = at::hip::getCurrentHIPStream();
     void* bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
 
     CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,

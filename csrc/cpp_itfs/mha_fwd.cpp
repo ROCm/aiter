@@ -215,7 +215,9 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     };
 
     AiterAsmKernel* impl_ptr = nullptr;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static thread_local std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>>
+        impl_ptr_map;
+
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
@@ -226,17 +228,21 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
     }
     impl_ptr = result.first->second.get();
+
     fmha_fwd_v3_args args;
     int arg_size = sizeof(args);
     init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
 
-    auto fwd_kernel_launch = [&]() {
-        int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
-        auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
-        impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
-    };
-    return ck_tile::launch_kernel(s,
-                                  [=](const ck_tile::stream_config& s_) { fwd_kernel_launch(); });
+    int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
+    auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        // Explicit assignment forces evaluation order and prevents compiler from
+        // reordering operations that could lead to accessing uninitialized args
+        void* args_ptr     = &args;
+        void* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
+    });
 }
 #endif
 
@@ -273,6 +279,7 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.seqlen_k_ptr,
                        a.cu_seqlen_q_ptr,
                        a.cu_seqlen_k_ptr,
+                       a.sink_ptr,
                        a.seqlen_q,
                        a.seqlen_k,
                        a.batch,
