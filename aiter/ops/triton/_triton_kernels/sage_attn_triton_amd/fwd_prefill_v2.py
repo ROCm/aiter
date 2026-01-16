@@ -12,7 +12,6 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 
-
 def get_fwd_configs(autotune: bool, seqlen_k: int = None):
     assert not autotune, "Autotuning is not supported."
     arch = get_arch()
@@ -24,9 +23,9 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
                 "num_warps": 4,
                 "PRE_LOAD_V": True,
                 "num_stages": 2,
-                "waves_per_eu": 1
+                "waves_per_eu": 1,
             }
-       
+
         return {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
@@ -37,13 +36,13 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
         }
     elif arch == "gfx942":
         return {
-        "BLOCK_M": 256,
-        "BLOCK_N": 128,
-        "waves_per_eu": 2,
-        "PRE_LOAD_V": False,
-        "num_stages": 2,
-        "num_warps": 8,
-    }
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 2,
+            "num_warps": 8,
+        }
     else:
         # return tuned config for MI300X by default
         return {
@@ -140,10 +139,8 @@ def _sage_fwd_no_mask_v2(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
         # -- compute qk ----
-        qk += tl.dot_scaled(
-            q, q_descale, "e2m1", k, k_descale, "e2m1", qk
-        )   
-        
+        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1")
+
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -245,7 +242,6 @@ def _sage_fwd_no_mask_v2(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-    
         acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
@@ -332,7 +328,9 @@ def _sage_fwd_mask_v2(
 
         # load k and if preload_v then v
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
-        k_descale = tl.load(k_descale_ptr, mask=kv_offs_n[None, :] < seqlen_k, other=0.0)
+        k_descale = tl.load(
+            k_descale_ptr, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
+        )
         k_descale_ptr += stride_k_descale_s * BLOCK_N
 
         if PRE_LOAD_V:
@@ -356,10 +354,7 @@ def _sage_fwd_mask_v2(
             qk = tl.where(mask, qk, float("-inf"))
 
         # -- compute qk ----
-        qk += tl.dot_scaled(
-            q, q_descale, "e2m1", k, k_descale, "e2m1", qk
-        )        #  * SM_SCALE
-        
+        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1")  #  * SM_SCALE
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -1015,7 +1010,7 @@ def sage_fwd_v2(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK // 2) # we fit 2 fp4 elements per int8
+    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK // 2)  # we fit 2 fp4 elements per int8
     offs_d_qk_s = tl.arange(0, BLOCK_DMODEL_QK // SCALE_GROUP_SIZE)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
 
@@ -1066,12 +1061,20 @@ def sage_fwd_v2(
     # For MHA (GROUP_SIZE == 1), q_descale uses off_h_q (same as off_h_k)
     # tl.static_print("Q_Descale:", Q_Descale)
 
-    q_descale_ptrs = Q_Descale + off_z * stride_q_descale_z + off_h_q * stride_q_descale_h + offs_m[:, None] * stride_q_descale_s + offs_d_qk_s[None, :]
+    q_descale_ptrs = (
+        Q_Descale
+        + off_z * stride_q_descale_z
+        + off_h_q * stride_q_descale_h
+        + offs_m[:, None] * stride_q_descale_s
+        + offs_d_qk_s[None, :]
+    )
 
-    q_descale = tl.load(q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)  # MHA: use q head index
+    q_descale = tl.load(
+        q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0
+    )  # MHA: use q head index
 
     k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
-    
+
     v_descale = tl.load(
         V_Descale
         + off_z * stride_v_descale_z
@@ -1198,9 +1201,9 @@ def sage_fwd_v2(
 
         k_descale_ptr = (
             K_Descale
-            + k_descale_offset 
-            + (block_min + offs_n[None, :]) * stride_k_descale_s 
-            + offs_d_qk_s[:, None]
+            + k_descale_offset
+            + (block_min + offs_n[:, None]) * stride_k_descale_s
+            + offs_d_qk_s[None, :]
         )
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
@@ -1267,9 +1270,9 @@ def sage_fwd_v2(
 
         k_descale_ptr = (
             K_Descale
-            + k_descale_offset 
-            + (block_min + offs_n[None, :]) * stride_k_descale_s 
-            + offs_d_qk_s[:, None]
+            + k_descale_offset
+            + (block_min + offs_n[:, None]) * stride_k_descale_s
+            + offs_d_qk_s[None, :]
         )
 
         acc, l_i, m_i = _sage_fwd_no_mask_v2(
@@ -1336,9 +1339,9 @@ def sage_fwd_v2(
 
         k_descale_ptr = (
             K_Descale
-            + k_descale_offset 
-            + (block_min + offs_n[None, :]) * stride_k_descale_s 
-            + offs_d_qk_s[:, None]
+            + k_descale_offset
+            + (block_min + offs_n[:, None]) * stride_k_descale_s
+            + offs_d_qk_s[None, :]
         )
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
@@ -1773,16 +1776,18 @@ def fav3_sage_triton_impl_v2(
             torch.float32,
         ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
 
-    stride_q_descale_z, stride_q_descale_s, stride_q_descale_h, _ = map_dims(q_descale.stride(), bshd)
-    stride_k_descale_z, stride_k_descale_s, stride_k_descale_h, _ = map_dims(k_descale.stride(), bshd)
-
+    stride_q_descale_z, stride_q_descale_s, stride_q_descale_h, _ = map_dims(
+        q_descale.stride(), bshd
+    )
+    stride_k_descale_z, stride_k_descale_s, stride_k_descale_h, _ = map_dims(
+        k_descale.stride(), bshd
+    )
 
     stride_v_descale_z, stride_v_descale_h, _ = v_descale.stride()
 
-
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
-    
+
     use_alibi, (stride_az, stride_ah) = (
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
@@ -1977,10 +1982,7 @@ def sage_quant_v2(
     if smooth_k:
         k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
-
-    v_scale = (
-        v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-    )
+    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -2055,9 +2057,7 @@ def sage_quant_v_kernel(
     v_output_ptrs = V_Output + v_offs
 
     # just apply the per channel v_scales that have been computed outside
-    v_scale_ptrs = (
-        V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
-    )
+    v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
     v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
     v = v.to(tl.float32)
     v_scales = tl.load(v_scale_ptrs)
