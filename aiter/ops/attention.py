@@ -122,6 +122,116 @@ def pa_fwd_asm(
 ) -> torch.Tensor: ...
 
 
+def _should_use_asm_kernel(
+    num_seqs: int,
+    num_heads: int,
+    kv_cache_tensor_dtype: torch.dtype,
+) -> bool:
+
+    if kv_cache_tensor_dtype == torch.int8:
+        return True
+
+    # Get GPU compute units (CUs)
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    # ASM kernel becomes relevant, once the total_heads is sufficiently large compared to CUs
+    total_heads = num_seqs * num_heads
+    return total_heads > 2 * cu_num
+
+
+def paged_attention_common(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    scale: float,
+    max_qlen: int = 1,
+    max_seq_len: int = 1,
+    K_QScale_hip: Optional[torch.Tensor] = None,  # [num_seqs, num_heads]
+    V_QScale_hip: Optional[torch.Tensor] = None,
+    K_QScale_asm: Optional[
+        torch.Tensor
+    ] = None,  # [num_blocks, num_kv_heads, block_size]
+    V_QScale_asm: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    high_precision: Optional[
+        int
+    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: Optional[str] = None,
+    kv_cache_dtype: str = "auto",
+    kv_cache_tensor_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """
+    Paged attention forward pass with automatic kernel selection.
+    ASM is favored for int8 kv caches, for short ctx_len, or when the workload exceeds
+    the heuristic thresholds for larger ctx_len values.
+    PA is normally using per tensor quant and this is what has been tested, however,
+    per head quant can be supported as well in principle, but not tested.
+    """
+    kv_cache_tensor_dtype = (
+        kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else K.dtype
+    )
+    num_seqs, num_heads, head_size = Q.shape
+
+    use_asm_kernel = (
+        _should_use_asm_kernel(num_seqs, num_heads, kv_cache_tensor_dtype)
+        or high_precision == 2
+    )
+
+    if use_asm_kernel:
+        output = pa_fwd_asm(
+            Q,
+            K,
+            V,
+            block_tables,
+            context_lens,
+            block_tables_stride0,
+            max_qlen,
+            K_QScale_asm,
+            V_QScale_asm,
+            out_,
+            qo_indptr,
+            high_precision,
+            kernelName,
+        )
+        return output
+
+    # Use ROCm paged attention kernel for smaller workloads / common path.
+    output = out_ if out_ is not None else torch.empty_like(Q)
+
+    paged_attention_rocm(
+        out=output,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        tmp_out=tmp_out,
+        query=Q,
+        key_cache=K,
+        value_cache=V,
+        num_kv_heads=int(K.size(1)),
+        scale=scale,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        block_size=int(K.size(3)),
+        max_context_len=max_seq_len,
+        alibi_slopes=None,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=K_QScale_hip,
+        v_scale=V_QScale_hip,
+        fp8_out_scale=None,
+        partition_size=256,
+        mtp=1,
+        q_scale=None,
+    )
+    return output
+
+
 def gen_pa_ps_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
