@@ -321,7 +321,7 @@ CK_DIR = CK_3RDPARTY_DIR
 
 @functools.lru_cache(maxsize=1)
 def get_asm_dir():
-    return AITER_ASM_DIR
+    return AITER_ASM_DIR + "/" + get_gfx()
 
 
 @functools.lru_cache(maxsize=1)
