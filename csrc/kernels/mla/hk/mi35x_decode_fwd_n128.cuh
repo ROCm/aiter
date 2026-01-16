@@ -295,26 +295,24 @@ __device__ __forceinline__ void store_transposed_v_to_lds(const uintptr_t p_lds_
     using kv_t = T::kv_t;
 
     /// TODO: These parameters should reside in Traits.
-    constexpr uint32_t kNumRowsPerThr    = 4;
-    constexpr uint32_t kNumColsPerThr    = 8;
-    constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
-    constexpr uint32_t kNumBlocksPerRow  = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
+    constexpr uint32_t kNumRowsPerThr              = 4;
+    constexpr uint32_t kNumColsPerThr              = 8;
+    constexpr uint32_t kNumElemsPerBlock           = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
+    constexpr uint32_t kNumBlocksPerRow            = T::kVoHeadDim / kNumColsPerThr; // 512 / 8 = 64
+    constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;           // 64 + 2 = 66
 
     const uint32_t warp_idx = ckt::get_warp_id();
     const uint32_t lane_idx = ckt::get_lane_id();
 
     // 4x8 block-wise row major layout. No padding between rows or columns.
-    const uint32_t row          = (warp_idx % 2) * 16 + lane_idx / 16 * 4;
-    const uint32_t col          = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
-    const uint32_t block_offset = (row / kNumRowsPerThr * kNumBlocksPerRow + col / kNumColsPerThr) *
-                                  kNumElemsPerBlock * sizeof(kv_t);
+    const uint32_t row_blk = (warp_idx % 2) * 4 + lane_idx / 16;
+    const uint32_t col_blk = (lane_idx % 16) + warp_idx / 2 * 16;
+    const uint32_t block_offset =
+        (row_blk * kNumBlocksPerRowWithPadding + col_blk) * kNumElemsPerBlock * sizeof(kv_t);
     const uintptr_t p_lds_vt_lane = p_lds_vt + block_offset;
 
-    const uint4 pass_0 = uint4(v_transposed[0], v_transposed[1], v_transposed[2], v_transposed[3]);
-    const uint4 pass_1 = uint4(v_transposed[4], v_transposed[5], v_transposed[6], v_transposed[7]);
-
-    hkm::ds_write_b128(p_lds_vt_lane, 0, pass_0);
-    hkm::ds_write_b128(p_lds_vt_lane, sizeof(uint4), pass_1);
+    hkm::ds_write_b128(p_lds_vt_lane, 0, v_transposed.lo);
+    hkm::ds_write_b128(p_lds_vt_lane, sizeof(uint4), v_transposed.hi);
 }
 
 // load 32x32 block for each warp. Each threads takes 4x4 elements.
@@ -327,28 +325,36 @@ __device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt
     constexpr uint32_t kNumRowsPerThr    = 4;
     constexpr uint32_t kNumColsPerThr    = 8;
     constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
-    constexpr uint32_t kNumBlocksPerRow  = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
+    constexpr uint32_t kNumDwPerBlock =
+        kNumElemsPerBlock / (sizeof(uint32_t) / sizeof(kv_t));                       // 32 / 4 = 8
+    constexpr uint32_t kNumBlocksPerRow            = T::kVoHeadDim / kNumColsPerThr; // 512 / 8 = 64
+    constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;           // 64 + 2 = 66
+    constexpr uint32_t kOffsetTlTr                 = kNumColsPerThr * 2 * sizeof(kv_t);
+    constexpr uint32_t kOffsetTlBl =
+        4 * kNumBlocksPerRowWithPadding * kNumElemsPerBlock * sizeof(kv_t);
+    constexpr uint32_t kOffsetTlBr = kOffsetTlTr + kOffsetTlBl;
 
     static_assert(((kColOffset % 32) == 0) && (kColOffset < 512),
                   "load_transpose_v_to_gpr(): Unsupported column offset!");
 
     const uint32_t lane_idx = ckt::get_lane_id();
 
-    // calculate logical coordinate of up-left dw
-    const uint32_t row          = (lane_idx / 16) * 4 + (lane_idx % 4);
-    const uint32_t col          = kColOffset * 32 + ((lane_idx % 16) / 4) * 4;
-    const uint32_t block_offset = (row / kNumRowsPerThr * kNumBlocksPerRow + col / kNumColsPerThr) *
-                                  kNumElemsPerBlock * sizeof(kv_t);
-    const uint32_t lane_offset =
-        ((row % kNumRowsPerThr) * kNumColsPerThr + (col % kNumColsPerThr)) * sizeof(kv_t);
+    // calculate logical coordinate of top-left dw
+    const uint32_t row_blk = lane_idx / 16; // 16: 16x16 mfma tile.
+    const uint32_t col_blk = ((lane_idx % 16) + kColOffset) / kNumColsPerThr;
+    const uint32_t block_offset =
+        (row_blk * kNumBlocksPerRowWithPadding + col_blk) * kNumElemsPerBlock * sizeof(kv_t);
 
-    const uintptr_t p_lds_vt_ul_lane = p_lds_vt + block_offset + lane_offset;
+    const uint32_t row_inblk      = lane_idx % kNumRowsPerThr;
+    const uint32_t col_inblk      = ((lane_idx % kNumDwPerBlock) / kNumRowsPerThr) * kNumRowsPerThr;
+    const uint32_t inblock_offset = (row_inblk * kNumColsPerThr + col_inblk) * sizeof(kv_t);
+
+    const uintptr_t p_lds_vt_ul_lane = p_lds_vt + block_offset + inblock_offset;
 
     hkm::ds_read_b32<GPR + 0>(p_lds_vt_ul_lane, 0);
-    hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kNumColsPerThr * 2 * sizeof(kv_t));
-    hkm::ds_read_b32<GPR + 2>(p_lds_vt_ul_lane, 16 * T::kVoHeadDim * sizeof(kv_t));
-    hkm::ds_read_b32<GPR + 3>(
-        p_lds_vt_ul_lane, 16 * T::kVoHeadDim * sizeof(kv_t) + kNumColsPerThr * 2 * sizeof(kv_t));
+    hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kOffsetTlTr);
+    hkm::ds_read_b32<GPR + 2>(p_lds_vt_ul_lane, kOffsetTlBl);
+    hkm::ds_read_b32<GPR + 3>(p_lds_vt_ul_lane, kOffsetTlBr);
 }
 
 template <uint32_t kPart>
@@ -1352,7 +1358,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 //                  v1_offset + v_col_stride * 4 + 16 * v_row_stride * 4 +
                 //                      3 * v_row_stride * 4);
 
-                load_transpose_v_to_gpr<T, 0, k_kv_0_begin>(p_lds_kv_test);
+                load_transpose_v_to_gpr<T, idx.value * T::kBlockK * 2, k_kv_0_begin>(p_lds_kv_test);
+                load_transpose_v_to_gpr<T, idx.value * T::kBlockK * 2 + T::kBlockK, k_kv_1_begin>(
+                    p_lds_kv_test);
 
                 if constexpr(kIsFirstIter)
                 {
