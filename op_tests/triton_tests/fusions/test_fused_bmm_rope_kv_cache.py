@@ -218,7 +218,7 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
 ):
     if not arch_info.is_fp8_avail():
         pytest.skip("MXFP8 is not available on this device")
-        
+
     QH = QH_per_KH * KH
 
     q_nope, w_k, w_k_scale, _, _ = generate_batched_gemm_a16w8_inputs(
