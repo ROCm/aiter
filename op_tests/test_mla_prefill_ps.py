@@ -55,7 +55,6 @@ def ref_masked_attention(
     q_scale=None,
     kv_scale=None,
 ):
-
     if is_fp8_q and q_scale is not None:
         scale *= q_scale
     if is_fp8_kvc and kv_scale is not None:
@@ -77,7 +76,7 @@ def ref_masked_attention(
 
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
 
-    l = attn_weights_exp.sum(-1)
+    attn_weights_l = attn_weights_exp.sum(-1)
 
     if is_fp8_q:
         attn_weights_fp8 = attn_weights_exp.to(dtype)
@@ -85,7 +84,7 @@ def ref_masked_attention(
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
 
-    out = out / l.transpose(0, 1).unsqueeze(-1)
+    out = out / attn_weights_l.transpose(0, 1).unsqueeze(-1)
 
     if is_fp8_kvc and kv_scale is not None:
         out *= kv_scale
@@ -232,7 +231,6 @@ def test_mla_prefill(
 ):
     ret = {}
     out_dtype = torch.bfloat16
-    seed = 0
     device = "cuda:0"
     torch.set_default_device(device)
     num_head_q = num_head
@@ -253,7 +251,6 @@ def test_mla_prefill(
         seq_lens_kv.fill_(ctx_lens)
     seq_lens_qo = seq_lens_kv.clone()
     max_qlen = seq_lens_qo.max().item()
-    max_kvlen = seq_lens_kv.max().item()
 
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     actual_blocks = (seq_lens_kv + block_size - 1) // block_size
