@@ -1481,7 +1481,7 @@ struct tiled_mma_adaptor : public MMA_ {
         static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
             auto s_a = a[i_m * EXPAND_K + i_k];
             auto s_b = b[i_n * EXPAND_K + i_k];
-            auto s_c = c[i_m * EXPAND_N + i_n];
+            auto s_c = c_[i_m * EXPAND_N + i_n];
             s_c = MMA{}(s_a, s_b, s_c);
             c_[i_m * EXPAND_N + i_n] = s_c;
         });
@@ -1505,7 +1505,7 @@ struct tiled_mma_adaptor : public MMA_ {
             constexpr index_t i_tile_c = i_m * EXPAND_N + i_n;
             auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
             auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
-            auto s_c = slice(c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+            auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
             s_c = MMA{}(s_a, s_b, s_c);
             set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
         });
