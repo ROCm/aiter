@@ -722,7 +722,6 @@ def get_ps_metadata_info_v1(
 
     num_clusters = math.gcd(num_head_k, cu_num)
     cus_per_cluster = cu_num // num_clusters
-    kheads_per_cluster = num_head_k // num_clusters
 
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
 
