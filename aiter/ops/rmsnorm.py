@@ -154,3 +154,24 @@ def add_rmsnorm(
     weight: Tensor,
     epsilon: float,
 ) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant")
+def rmsnorm_quant(
+    out: Tensor,
+    input: Tensor,
+    scale: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    group_size: int = 0,
+    shuffle_scale: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_rmsnorm_quant")
+def rmsnorm(
+    out: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None: ...
