@@ -87,9 +87,16 @@ class FMoeKernel
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0)
     {
-        const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-        std::string arch_name     = get_gpu_arch();
-        std::string hsa_path      = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
+        const char* aiter_asm_dir = std::getenv("AITER_ASM_DIR");
+#ifdef AITER_ASM_DIR
+        // Use compile-time default if environment variable is not set
+        if(aiter_asm_dir == nullptr)
+        {
+            aiter_asm_dir = AITER_ASM_DIR;
+        }
+#endif
+        std::string arch_name = get_gpu_arch();
+        std::string hsa_path  = std::string(aiter_asm_dir) + "/" + arch_name + "/" + hsaco;
         std::cout << "[aiter] hipModuleLoad: " << hsa_path.c_str() << " GetFunction: " << name;
         HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));

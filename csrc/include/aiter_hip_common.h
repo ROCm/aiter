@@ -76,11 +76,17 @@ class AiterAsmKernel
     public:
     AiterAsmKernel(const char* name, const char* hsaco)
     {
-        const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
+        const char* aiter_asm_dir = std::getenv("AITER_ASM_DIR");
+#ifdef AITER_ASM_DIR
+        // Use compile-time default if environment variable is not set
+        if(aiter_asm_dir == nullptr)
+        {
+            aiter_asm_dir = AITER_ASM_DIR;
+        }
+#endif
         std::string arch_name = get_gpu_arch();
-        std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
-        std::cout << "[aiter] hipModuleLoad: " << hsa_path
-                  << " GetFunction: " << name;
+        std::string hsa_path  = std::string(aiter_asm_dir) + "/" + arch_name + "/" + hsaco;
+        std::cout << "[aiter] hipModuleLoad: " << hsa_path << " GetFunction: " << name;
         HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
