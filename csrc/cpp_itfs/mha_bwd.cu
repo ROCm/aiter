@@ -1,10 +1,19 @@
-#include "mha_bwd.h"
 #include "aiter_hip_common.h"
-#include "asm_fmha_v3_bwd_configs.hpp"
+#include "mha_bwd.h"
 #include <memory>
 #include <string>
 
+#if !defined(FAV3_ON) && !defined(FAV2_ON)
+#define FAV3_ON 1
+#define FAV2_ON 1
+#endif
+
+#if FAV3_ON
+#include "asm_fmha_v3_bwd_configs.hpp"
+#endif
+
 namespace aiter {
+#if FAV3_ON
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
 {
     if(hdim_q == 192 && hdim_v == 128 && arch_id == "gfx950")
@@ -125,10 +134,16 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
     return std::make_tuple(preProcessingKernelName, dQdKdVKernelName, postProcessingKernelName);
 }
 
+#endif
+
 float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
+#if FAV3_ON
     float asm_ret = fmha_v3_bwd(a, s);
-#if ONLY_FAV3
+#else
+    float asm_ret = -1;
+#endif
+#if !FAV2_ON
     return asm_ret;
 #else
     fmha_bwd_traits traits{a.hdim_q,
@@ -226,7 +241,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* drop_seed_offset   */ a.drop_seed_offset,
     };
 
-    if(asm_ret == -1)
+    if(asm_ret == -1 && !a.v3_api_check)
     {
         return fmha_bwd(traits, ck_args, s);
     }
@@ -234,6 +249,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
 }
 
+#if FAV3_ON
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     std::string arch_id = get_gpu_arch();
@@ -534,5 +550,6 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         [=](const ck_tile::stream_config& s_) { dqdkdv_kernel_launch(); },
         [=](const ck_tile::stream_config& s_) { post_kernel_launch(); });
 }
+#endif
 
 } // namespace aiter

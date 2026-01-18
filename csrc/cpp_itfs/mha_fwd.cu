@@ -1,10 +1,16 @@
-#include "mha_fwd.h"
 #include "aiter_hip_common.h"
+#include "mha_fwd.h"
+#include <memory>
+#include <string>
+
+#if !defined(FAV3_ON) && !defined(FAV2_ON)
+#define FAV3_ON 1
+#define FAV2_ON 1
+#endif
+
 #if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
-#include <memory>
-#include <string>
 
 namespace aiter {
 #if FAV3_ON

@@ -674,7 +674,7 @@ def cmdGenFunc_mha_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["'-DFAV3_ON=1'", "'-DFAV2_ON=1'"],
     }
 
 
@@ -929,7 +929,7 @@ def cmdGenFunc_mha_varlen_bwd(
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["'-DFAV3_ON=1'", "'-DFAV2_ON=1'"],
     }
 
 

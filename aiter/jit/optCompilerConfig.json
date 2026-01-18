@@ -917,7 +917,7 @@
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
-            "'-DONLY_FAV3=1'"
+            "'-DFAV3_ON=1'"
         ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
@@ -939,7 +939,7 @@
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
-            "'-DONLY_FAV3=1'"
+            "'-DFAV3_ON=1'"
         ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
@@ -982,7 +982,10 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV3_ON=1'",
+            "'-DFAV2_ON=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
@@ -1005,7 +1008,10 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV3_ON=1'",
+            "'-DFAV2_ON=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
@@ -1027,7 +1033,9 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cu'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV2_ON=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
@@ -1051,7 +1059,9 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV2_ON=1'"
+        ],
         "flags_extra_hip": [
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 0)}'"
         ],
