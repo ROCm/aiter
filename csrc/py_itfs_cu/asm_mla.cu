@@ -275,6 +275,7 @@ void mla_decode_stage1_asm_fwd(
             }else if(max_seqlen_q == 2){
                 config_max_seqlen_q = 2;
             }else if(max_seqlen_q <= 4){
+                sub_Q = 64;
                 config_max_seqlen_q = 4;
             }else if (max_seqlen_q > 4){
                 TORCH_CHECK(false, __func__, ":only support fp8 mla decoding for qo_len <= 4");
