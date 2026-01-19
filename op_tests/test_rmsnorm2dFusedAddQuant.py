@@ -6,7 +6,8 @@ import torch.nn.functional as F
 import aiter
 import argparse
 from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import dtypes, QuantType, get_torch_quant
+from aiter import dtypes, QuantType, get_torch_quant, get_gfx
+from aiter.utility import fp4_utils
 from functools import partial
 import pandas as pd
 
@@ -156,7 +157,10 @@ def run_hip(
             residual_out = torch.empty_like(input)
             aiter.add_rmsnorm(output, input, residual, residual_out, weight, eps)
     else:
-        output = torch.empty(input.shape, dtype=q_dtype)
+        if q_dtype == dtypes.fp4x2:
+            output = torch.empty((input.shape[0], input.shape[1] // 2), dtype=q_dtype)
+        else:
+            output = torch.empty(input.shape, dtype=q_dtype)
         scale = torch.empty(scale_shape, dtype=dtypes.fp32)
         if residual is None:
             residual_out = None
@@ -182,8 +186,10 @@ def test_rmsnorm(
     if quant_dtype is dtypes.fp4x2 and quant_type == QuantType.per_Token:
         print("fp4x2 per token is not supported")
         return {}
-    elif quant_type == QuantType.per_1x32 and quant_dtype is not dtypes.fp4x2:
-        print("per_1x32 is only supported for fp4x2")
+    elif quant_type == QuantType.per_1x32 and (
+        quant_dtype is not dtypes.fp4x2 or get_gfx() not in ["gfx950"]
+    ):
+        print("per_1x32 is only supported for fp4x2 on gfx950")
         return {}
     dim = (m, n)
     scale_type = dtypes.fp32
@@ -243,13 +249,20 @@ def test_rmsnorm(
         (c, res_c, yscale_c, _), avg_c = run_hip(
             input, weight, 1e-5, res, q_dtype=quant_dtype, quant_type=quant_type
         )
+        if quant_dtype == dtypes.fp4x2:
+            a = fp4_utils.mxfp4_to_f32(a)
+            c = fp4_utils.mxfp4_to_f32(c)
         err_hip = checkAllclose(
             a.to(dtypes.fp32), c.to(dtypes.fp32), rtol=0, atol=1, msg="check hip out"
         )
         if add_residual:
             checkAllclose(res_a, res_c, msg="check hip res")
         if quant_type != QuantType.No:
-            checkAllclose(yscale_a, yscale_c, msg="check hip scale")
+            checkAllclose(
+                yscale_a.view(torch.float32),
+                yscale_c.view(torch.float32),
+                msg="check hip scale",
+            )
         ret["hip us"] = avg_c
         ret["hip err"] = err_hip
         ret["hip bw(GB/s)"] = (
@@ -292,7 +305,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-m",
         type=int,
-        default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        default=[8, 256, 32768],
         nargs="*",
         help="""M of mnk.
     e.g.: -m 32""",
@@ -300,7 +313,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-n",
         type=int,
-        default=[1024, 2048],
+        default=[1024, 2048, 4096, 8192],
         nargs="*",
         help="""N of mnk.
     e.g.: -n 1024""",
@@ -341,9 +354,11 @@ if __name__ == "__main__":
         )
 
     df = []
-    for m in args.m:
-        for n in args.n:
-            ret = test_rmsnorm_func(m, n, quant_dtype=args.quant_dtype)
+    for n in args.n:
+        for m in args.m:
+            ret = test_rmsnorm_func(
+                m, n, quant_dtype=args.quant_dtype if args.mode not in [1, 2] else None
+            )
             df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
