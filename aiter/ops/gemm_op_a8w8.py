@@ -567,44 +567,36 @@ def gemm_a8w8_blockscale(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
     
-    # use tuned config if found in file
+    # Lambda functions for kernel calls based on preshuffleB parameter
+    call_cktile = lambda preshuffle: gemm_a8w8_blockscale_cktile(
+        XQ, 
+        shuffle_weight_cktile(WQ, layout=(16, 16)) if preshuffle else WQ,
+        x_scale, w_scale, Y, preshuffle
+    )
+    
+    call_ck = lambda preshuffle: (
+        gemm_a8w8_blockscale_bpreshuffle_ck(
+            XQ, shuffle_weight(WQ, layout=(16, 16)), x_scale.transpose(0, 1).contiguous().view(*x_scale.shape), w_scale, Y
+        ) if preshuffle else gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+    )
+    
+    # Determine which kernel library to use (cktile or ck)
+    use_cktile = config is not None and config["libtype"] == "cktile"
+    if config is None:
+        use_cktile = is_default_cktile
+    
+    # Parse config preshuffleB if available (could be string "True"/"False" or boolean)
     if config is not None:
-        # config found in tuned file
-        libtype = config["libtype"]
-        if config["preshuffleB"] == preshuffleB:
-            if libtype == "cktile":
-                return gemm_a8w8_blockscale_cktile(
-                    XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, preshuffleB
-                )
-            elif libtype == "ck":
-                if preshuffleB:
-                    return gemm_a8w8_blockscale_bpreshuffle_ck(
-                        XQ, shuffle_weight(WQ, layout=(16, 16)), x_scale, w_scale, Y
-                    )
-                else:
-                    return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
-            else:
-                assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+        config_preshuffle = config["preshuffleB"]
+        if isinstance(config_preshuffle, str):
+            config_preshuffle = config_preshuffle.lower() == "true"
     else:
-        # config not found in tuned file, use default
-        if is_default_cktile:
-            # default to ck_tile
-            if preshuffleB:
-                return gemm_a8w8_blockscale_cktile(
-                    XQ, shuffle_weight_cktile(WQ, layout=(16, 16)), x_scale, w_scale, Y, preshuffleB
-                )
-            else:
-                return gemm_a8w8_blockscale_cktile(
-                    XQ, WQ, x_scale, w_scale, Y, preshuffleB
-                )
-        else:
-            # default to ck
-            if preshuffleB:
-                return gemm_a8w8_blockscale_bpreshuffle_ck(
-                    XQ, shuffle_weight(WQ, layout=(16, 16)), x_scale, w_scale, Y
-                )
-            else:
-                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+        config_preshuffle = preshuffleB
+    
+    # Use requested preshuffleB if config matches, otherwise use config's preshuffleB
+    effective_preshuffle = preshuffleB if (config is None or config_preshuffle == preshuffleB) else config_preshuffle
+    
+    return call_cktile(effective_preshuffle) if use_cktile else call_ck(effective_preshuffle)
 
 
 def flatmm_a8w8_blockscale_ASM(
