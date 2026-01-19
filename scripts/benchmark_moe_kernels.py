@@ -43,7 +43,7 @@ from pathlib import Path
 current_dir = Path(__file__).parent
 aiter_root = current_dir.parent
 sys.path.insert(0, str(aiter_root))
-sys.path.insert(0, str(aiter_root / "hsa/gfx942/fmoe_2stages"))
+sys.path.insert(0, str(aiter_root / "csrc/ck_gemm_moe_2stages_codegen"))
 
 import pandas as pd
 import torch
@@ -54,8 +54,8 @@ import re
 import aiter
 from aiter import QuantType, ActivationType
 from aiter import dtypes
-import tune
-from tune import FmoeTuner
+import gemm_moe_tune
+from gemm_moe_tune import FmoeTuner
 
 
 def parse_kernel_parameters(kernel_name, kernel_type, stage):
@@ -284,10 +284,17 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
         in_data = [(len(all_tasks), ())]
         
         # Execute all kernel tasks using mp_tuner utility from tune.py
-        # mp_num=1: Parameter for execution mode
-        # shape_grouped=False: Returns individual results per kernel
+        # FIXED: Added missing parameters to match tuner's call signature
         try:
-            results = mp_tuner(all_tasks, in_data, mp_num=1, shape_grouped=False)
+            results = mp_tuner(
+                all_tasks, 
+                in_data, 
+                mp_num=1, 
+                fast_mode=True,  # FIX: Must specify fast_mode explicitly
+                shape_grouped=False,
+                timeout=300,  # FIX: Added timeout parameter
+                verbose=False  # FIX: Added verbose parameter
+            )
         except Exception as e:
             error_msg = str(e)
             print(f"ERROR: Kernel execution crash for this configuration!")
@@ -355,9 +362,25 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
         # ========================================================================
         print(f"\nProcessing {len(results)} results...")
         
-        for (key_info, stage, kernel_name, block_m), us, err in results:
+        # FIXED: Proper two-step unpacking to handle mp_tuner result format
+        for result in results:
+            # Unpack the result tuple: (info, us, err)
+            info_tuple, us, err = result
+            
+            # Unpack the info tuple: (key_info, stage, kernel_name, block_m)
+            if not isinstance(info_tuple, tuple) or len(info_tuple) < 4:
+                print(f"Warning: Unexpected info structure: {info_tuple}")
+                continue
+                
+            key_info, stage, kernel_name, block_m = info_tuple
+            
             # Calculate performance metrics from timing
-            tflops, bw = tuner.calculate((key_info, stage, kernel_name, block_m, us, err))
+            # calculate() expects: (key, stage, kernelName, block_m, us, err)
+            try:
+                tflops, bw = tuner.calculate((key_info, stage, kernel_name, block_m, us, err))
+            except Exception as calc_err:
+                print(f"Warning: Failed to calculate metrics for {kernel_name}: {calc_err}")
+                tflops, bw = 0, 0
             
             # Categorize kernel implementation type from kernel name and stage
             # ASM kernels have mangled names starting with _ZN or contain aiter::
@@ -413,12 +436,10 @@ def run_all_kernel_tests(config_file="trace_moe_config.csv",
             
             all_results.append(result_dict)
             
-            # Print result with status (PASS/WARN/FAIL based on error)
+            # Print result with simplified status
             status = "PASS" if err < 0.01 else "WARN" if err < 1.0 else "FAIL"
             print(f"[{status}] {kernel_type:6} {stage:12} block_m={block_m:3} "
-                  f"time={us:8.2f}us err={err:6.2%} "
-                  f"TFLOPS={tflops:7.2f} BW={bw:7.2f}GB/s "
-                  f"{kernel_name[:50]}")
+                  f"time={us:8.2f}us err={err*100:5.1f}% {kernel_name[:50]}")
         
         # Incremental save after each configuration
         # This ensures results are preserved even if benchmarking is interrupted
