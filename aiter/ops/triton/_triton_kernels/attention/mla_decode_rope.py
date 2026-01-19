@@ -33,7 +33,6 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-
 _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
     "_fwd_grouped_kernel_stage1_rope",
     [

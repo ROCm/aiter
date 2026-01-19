@@ -9,7 +9,6 @@ from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
-
 _fused_fp4_bmm_rope_cat_and_cache_mla_repr = make_kernel_repr(
     "_fused_fp4_bmm_rope_cat_and_cache_mla_kernel",
     [

@@ -612,7 +612,7 @@ def test_paged_attention(
     print(f"{debug_mode=}")
 
     if debug_mode == VERIFY:
-        (query, k_cache, v_cache, block_tables, seq_lens, out_golden) = load_input()
+        query, k_cache, v_cache, block_tables, seq_lens, out_golden = load_input()
     else:
         query = torch.empty_strided(
             (num_seqs, num_query_heads, head_size),
