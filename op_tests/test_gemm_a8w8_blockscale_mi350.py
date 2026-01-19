@@ -59,7 +59,7 @@ def test_gemm(dtype, m, n, k):
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, dtype)
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
+    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a / avg_b - 1:<5.1%}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
     return {"us": avg_b}
@@ -116,23 +116,9 @@ def test_gemm_asm_gfx950(dtype, m, n, k):
     a = a.to(dtypes.fp32)
     b = b.to(dtypes.fp32)
     tflops = 2 * m * n * k / (avg_b) / 1e6
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}, tflops:{tflops:<8.2f}"
+    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_b:<8.2f} us, uplift: {avg_a / avg_b - 1:<5.1%}, tflops:{tflops:<8.2f}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=1e-2)
 
-
-l_dtype = ["bf16"]
-l_m = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]
-l_nk = [
-    (1536, 7168),
-    (3072, 1536),
-    (576, 7168),
-    (7168, 256),
-    (7168, 2048),
-    (4608, 7168),
-    (7168, 2304),
-    (512, 7168),
-    (4096, 512),
-]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -141,74 +127,49 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
+    metavar="{bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    choices=[16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480],
+    default=[16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480],
     help="""M of mnk.
     e.g.: -m 32""",
 )
 parser.add_argument(
     "-nk",
     type=dtypes.str2tuple,
-    nargs="?",
+    nargs="*",
     const=None,
-    default=None,
+    default=[
+        (1536, 7168),
+        (3072, 1536),
+        (576, 7168),
+        (7168, 256),
+        (7168, 2048),
+        (4608, 7168),
+        (7168, 2304),
+        (512, 7168),
+        (4096, 512),
+    ],
     help="""N&K of mnk.
     e.g.: -nk 4096,512""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.nk is not None:
-    l_nk = [args.nk]
 
-for dtype in [dtypes.bf16]:
+for dtype in args.dtype:
     # deepseek-r1
-    for m in [
-        16,
-        17,
-        31,
-        33,
-        127,
-        129,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024,
-        1536,
-        2048,
-        4096,
-        8192,
-        16384,
-        20480,
-    ]:
-        for n, k in [
-            (1536, 7168),
-            (3072, 1536),
-            (7168, 2048),
-            (4608, 7168),
-            (7168, 2304),
-            (512, 7168),
-            (4096, 512),
-        ][1:2]:
+    for m in args.m:
+        for n, k in args.nk:
             continue  # Disabled now due to coredump issue
             test_gemm_asm_gfx950(dtype, m, n, k)
             break
