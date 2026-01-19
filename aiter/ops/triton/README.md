@@ -2,14 +2,15 @@
 
 This folder contains Triton-based kernels and wrappers used by AITER.
 
-# AITER Triton Ops Code Reorganization
+## AITER Triton Ops Code Reorganization
 
 Reorganized the flat Triton files into categorized subdirectories. **All existing imports still work** via backward compatibility.
 
-## What Changed
+### What Changed
 
-### Old Structure
-```
+#### Old Structure
+
+```text
 aiter/ops/triton/
 ├── __init__.py
 ├── gemm_a16w16.py
@@ -24,8 +25,9 @@ aiter/ops/triton/
     └── ... (matching kernel files)
 ```
 
-### New Structure
-```
+#### New Structure
+
+```text
 aiter/ops/triton/
 ├── __init__.py (with backward compatibility)
 ├── gemm/
@@ -45,16 +47,16 @@ aiter/ops/triton/_triton_kernels/
 └── (uses the same new structure as above)
 ```
 
-## Backward Compatibility
+### Backward Compatibility
 
 Old imports **still work** - no changes needed:
 
 ```python
 # Both work identically:
- # Old (still works via backward compatibility (_BACKWARD_COMPAT_MAP) in `aiter/ops/triton/__init__.py`)
+# Old (still works via backward compatibility (_BACKWARD_COMPAT_MAP) in `aiter/ops/triton/__init__.py`)
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
- # New
-    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+# New
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 ```
 
 For **Imports**: Use new structure in the wrapper
@@ -68,7 +70,7 @@ GEMM kernels now use a single utility function instead of managing their own con
 
 ### Config file formats
 
-**Deprecated format**
+#### Deprecated format
 
 ```json
 {
@@ -77,7 +79,7 @@ GEMM kernels now use a single utility function instead of managing their own con
 }
 ```
 
-**New format (required)**
+#### New format (required)
 
 ```json
 {
@@ -88,6 +90,7 @@ GEMM kernels now use a single utility function instead of managing their own con
 ```
 
 Meaning:
+
 - `M_LEQ_64`: applies when `M <= 64`
 - `M_GEQ_4096`: applies when `M >= 4096`
 - `any`: fallback for all other `M` values (**must exist if a config exists**)
@@ -95,10 +98,12 @@ Meaning:
 ### How config selection works
 
 Config files are loaded from:
+
 - Default configs: `aiter/ops/triton/configs/gemm/{arch}-{config_name}.json`
 - Specialized configs (optional): `{arch}-{config_name}-N={N}-K={K}.json`
 
 Selection rules for the `M` dimension:
+
 1. Searches `M_LEQ_x` keys in ascending order using this default list:
    `[4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]`
 2. If no match, searches `M_GEQ_x` keys in descending order.
@@ -106,14 +111,14 @@ Selection rules for the `M` dimension:
 
 ### Usage patterns
 
-**Normal case (most common)**
+#### Normal case (most common)
 
 ```python
 def _get_config(M: int, N: int, K: int):
     return get_gemm_config("GEMM-A16W16", M, N, K)
 ```
 
-**With Split-K**
+#### With Split-K
 
 ```python
 def _get_config(M: int, N: int, K: int):
@@ -121,14 +126,14 @@ def _get_config(M: int, N: int, K: int):
     return compute_splitk_params(config, K), is_tuned
 ```
 
-**With custom bounds**
+#### With custom bounds
 
 ```python
 def _get_config(M: int, N: int, K: int):
     return get_gemm_config("FF-A16W16-fused", M, N, K, bounds=[4, 8, 64, 4096])
 ```
 
-**With specialized filename (mostly for fused kernels)**
+#### With specialized filename (mostly for fused kernels)
 
 ```python
 def _get_config(M: int, N_fp4: int, N_bf16: int, K: int, shuffle: bool = False):
@@ -139,15 +144,18 @@ def _get_config(M: int, N_fp4: int, N_bf16: int, K: int, shuffle: bool = False):
 
 ### Config file naming convention
 
-**Default config**
+#### Default config
+
 - Pattern: `{arch}-{CONFIG_NAME}.json`
 - Example: `gfx950-GEMM-A16W16.json`
 
-**Specialized config (N, K specific)**
+#### Specialized config (N, K specific)
+
 - Pattern: `{arch}-{CONFIG_NAME}-N={N}-K={K}.json`
 - Example: `gfx950-GEMM-A16W16-N=256-K=7168.json`
 
-**Specialized config (custom)**
+#### Specialized config (custom)
+
 - Pattern: `{arch}-{CONFIG_NAME}-{custom_suffix}.json`
 - Example: `gfx950-FUSED-GEMM-AFP4WFP4-A16W16-N4=512-N16=256-K=7168.json`
 
@@ -190,6 +198,7 @@ def _gemm_a16_w16_kernel(...):
 ```
 
 How it works:
+
 - Reads `specialization.constants` and appends `KEY_VALUE` pairs to the kernel name.
 - Values are sanitized for readability:
   - `None -> NONE`
@@ -201,6 +210,7 @@ How it works:
 Kernels should include a concise doc comment (preferably a docstring near the wrapper):
 
 Include:
+
 - What the kernel computes
 - Which configuration parameters are included (and what they control)
 - What it returns
@@ -272,7 +282,7 @@ Categories include: `gemm/`, `moe/`, `attention/`, `quant/`, etc.
 - MOE tests only:
   - `pytest op_tests/triton_tests/moe/`
 
----
+## Quick checklists
 
 ### Quick checklist when adding a new kernel
 
