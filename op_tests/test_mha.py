@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import itertools
@@ -36,8 +36,8 @@ def run_torch(
     query_padding_mask=None,
     key_padding_mask=None,
 ):
-    (_, seqlen_q, _, _) = q.shape
-    (_, seqlen_k, _, _) = k.shape
+    _, seqlen_q, _, _ = q.shape
+    _, seqlen_k, _, _ = k.shape
 
     if bias is not None:
         attn_bias = bias
@@ -106,16 +106,16 @@ def run_ck(
         deterministic,
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
-        how_v3_bf16_cvt=1,
+        how_v3_bf16_cvt=2,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
         num_rotate_args=1,
     )
 
     if dropout_p > 0.0:
-        (_, seqlen_q, _, d) = q.shape
-        (_, seqlen_k, _, d) = k.shape
-        (_, seqlen_k, _, d_v) = v.shape
+        _, seqlen_q, _, d = q.shape
+        _, seqlen_k, _, d = k.shape
+        _, seqlen_k, _, d_v = v.shape
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,

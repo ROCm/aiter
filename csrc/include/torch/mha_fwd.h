@@ -13,6 +13,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,       // [b, sq, hq, d]
                                 bool is_causal,
                                 int window_size_left,
                                 int window_size_right,
+                                int sink_size,
                                 bool return_softmax_lse,
                                 bool return_dropout_randval,
                                 std::optional<at::Tensor> cu_seqlens_q,
@@ -20,6 +21,10 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,       // [b, sq, hq, d]
                                 std::optional<at::Tensor> out,                // [b, sq, hq, d]
                                 std::optional<const at::Tensor> bias,         // [sq, sk]
                                 std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
+                                std::optional<const at::Tensor> q_descale,    // [1]
+                                std::optional<const at::Tensor> k_descale,    // [1]
+                                std::optional<const at::Tensor> v_descale,    // [1]
+                                std::optional<const at::Tensor> sink_ptr,     // [hq]
                                 std::optional<at::Generator> gen);
 } // namespace torch_itfs
 } // namespace aiter

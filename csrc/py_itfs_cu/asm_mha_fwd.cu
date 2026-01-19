@@ -32,7 +32,10 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
                                    float p_dropout,
-                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                   const std::string& data_type,
+                                   bias_enum bias_type,
+                                   int how_v3_bf16_cvt)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -85,58 +88,70 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return mha_fwd_args{q.data_ptr(),
-                         k.data_ptr(),
-                         v.data_ptr(),
-                         bias_ptr,
-                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
-                         has_lse ? softmax_lse.data_ptr() : nullptr,
-                         out.data_ptr(),
-                         nullptr, // seqstart_q_ptr
-                         nullptr, // seqstart_k_ptr
-                         nullptr, // seqlen_q_ptr
-                         nullptr, // seqlen_k_ptr
-                         nullptr, // cu_seqlen_q_ptr
-                         nullptr, // cu_seqlen_k_ptr
-                         seqlen_q,
-                         seqlen_k,
-                         b,
-                         seqlen_q,      // max_seqlen_q
-                         d,             // hdim_q
-                         d_v,           // hdim_v
-                         h,             // nhead_q
-                         h_k,           // nhead_k
-                         softmax_scale, // scale_s
-                         1,             // scale_p
-                         1,             // scale_o
-                         0.0,           // logits_soft_cap
-                         stride_q,
-                         stride_k,
-                         stride_v,
-                         stride_bias,
-                         stride_randval,
-                         stride_o,
-                         nhead_stride_q,
-                         nhead_stride_k,
-                         nhead_stride_v,
-                         0, // nhead_stride_bias
-                         nhead_stride_randval,
-                         nhead_stride_lse,
-                         nhead_stride_o,
-                         batch_stride_q,
-                         batch_stride_k,
-                         batch_stride_v,
-                         0, // batch_stride_bias
-                         batch_stride_randval,
-                         batch_stride_lse,
-                         batch_stride_o,
-                         mask.left,
-                         mask.right,
-                         static_cast<ck_tile::index_t>(mask.type),
-                         0, // min_seqlen_q
-                         p_dropout,
-                         has_dropout_randval,
-                         drop_seed_offset};
+    return mha_fwd_args{true, // use_asm_v3
+                        false, // v3_api_check
+                        how_v3_bf16_cvt,
+                        data_type,
+                        false, // is_group_mode
+                        static_cast<int>(bias_type),
+                        has_lse,
+                        0, // qscale_type
+                        false, //has_sink
+                        q.data_ptr(),
+                        k.data_ptr(),
+                        v.data_ptr(),
+                        bias_ptr,
+                        nullptr, // q_descale_ptr
+                        nullptr, // k_descale_ptr
+                        nullptr, // v_descale_ptr
+                        has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
+                        has_lse ? softmax_lse.data_ptr() : nullptr,
+                        out.data_ptr(),
+                        nullptr, // seqstart_q_ptr
+                        nullptr, // seqstart_k_ptr
+                        nullptr, // seqlen_q_ptr
+                        nullptr, // seqlen_k_ptr
+                        nullptr, // cu_seqlen_q_ptr
+                        nullptr, // cu_seqlen_k_ptr
+                        nullptr, //sink_ptr
+                        seqlen_q,
+                        seqlen_k,
+                        b,
+                        seqlen_q,      // max_seqlen_q
+                        d,             // hdim_q
+                        d_v,           // hdim_v
+                        h,             // nhead_q
+                        h_k,           // nhead_k
+                        softmax_scale, // scale_s
+                        0.0,           // logits_soft_cap
+                        stride_q,
+                        stride_k,
+                        stride_v,
+                        stride_bias,
+                        stride_randval,
+                        stride_o,
+                        nhead_stride_q,
+                        nhead_stride_k,
+                        nhead_stride_v,
+                        0, // nhead_stride_bias
+                        nhead_stride_randval,
+                        nhead_stride_lse,
+                        nhead_stride_o,
+                        batch_stride_q,
+                        batch_stride_k,
+                        batch_stride_v,
+                        0, // batch_stride_bias
+                        batch_stride_randval,
+                        batch_stride_lse,
+                        batch_stride_o,
+                        mask.left,
+                        mask.right,
+                        0, // sink_size
+                        static_cast<ck_tile::index_t>(mask.type),
+                        0, // min_seqlen_q
+                        p_dropout,
+                        has_dropout_randval,
+                        drop_seed_offset};
 }
 
 std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
@@ -308,17 +323,12 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                q_dtype_str,
+                bias_type,
+                how_v3_bf16_cvt);
 
-        float t = aiter::mha_fwd(args,
-                                 stream_config,
-                                 q_dtype_str,
-                                 false, // is_group_mode
-                                 mask.type,
-                                 bias_type,
-                                 has_lse,
-                                 true,
-                                 how_v3_bf16_cvt);
+        float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

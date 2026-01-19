@@ -8,12 +8,14 @@ on:
     paths:
       - "aiter/ops/triton/**"
       - "op_tests/triton_tests/**"
+      - "op_tests/op_benchmarks/triton/**"
       - ".github/workflows/triton-test.yaml"
+      - ".github/scripts/select_triton_tests.py"
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check-signal:
@@ -39,6 +41,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          fetch-depth: 1
           submodules: 'recursive'
 
       - name: Clean up Rocm processes
@@ -49,9 +52,15 @@ jobs:
         run: |
           set -ex
           echo "Starting container: triton_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
           docker run -dt \
-          --device=/dev/dri \
-          --device=/dev/kfd \
+          --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
@@ -68,6 +77,11 @@ jobs:
           -w /workspace \
           triton_test \
           bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root triton_test bash -c "pip config set global.retries 10"
 
       - name: Setup Aiter and Triton
         run: |
@@ -87,12 +101,34 @@ jobs:
           triton_test \
           pip install pytest
 
+      # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
+      #       command to enable test selection.
+      - name: Triton Test Selection Script
+        # main branch should always run the full test suite.
+        if: ${{ github.ref != 'refs/heads/main' }}
+        run: |
+          set -ex
+          git fetch --no-tags origin --depth=1 \
+            "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
+          git fetch --no-tags origin --depth=1 \
+            "refs/heads/${{ github.event.pull_request.base.ref }}:target"
+          ENV_FILE=$(docker exec -w /workspace triton_test \
+            mktemp /workspace/github_env.XXXXXXXXXX.tmp)
+          docker exec -w /workspace triton_test \
+            git config --global --add safe.directory /workspace
+          docker exec -w /workspace triton_test \
+            python .github/scripts/select_triton_tests.py \
+              --source pr-merge --target target \
+              --env-var TRITON_TEST --env-file "${ENV_FILE}"
+          # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
+          docker exec -w /workspace triton_test rm "${ENV_FILE}"
+
       - name: Triton Tests
         run: |
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          docker exec -w /workspace triton_test pytest -v ${{ env.TRITON_TEST }} --junitxml=test-reports/triton.xml
+          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
