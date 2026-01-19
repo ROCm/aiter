@@ -15,7 +15,6 @@ from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
 )
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
-
 _LOGGER = AiterTritonLogger()
 
 

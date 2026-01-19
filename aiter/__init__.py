@@ -5,7 +5,6 @@ import torch
 import os
 import logging
 
-
 logger = logging.getLogger("aiter")
 
 

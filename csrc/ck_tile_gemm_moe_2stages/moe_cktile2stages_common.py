@@ -16,7 +16,6 @@ sys.path.insert(0, AITER_CORE_DIR)
 
 from chip_info import get_gfx  # noqa: E402
 
-
 act_dict = {
     "no": -1,
     "silu": 0,
