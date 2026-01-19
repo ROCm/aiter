@@ -312,6 +312,7 @@ __global__ void add_rmsnorm_quant_kernel(
 #if defined(__Float4_e2m1fn_x2)
         else if(out.dtype() == torch_fp4x2)
         {
+            TORCH_CHECK(group_size != 0, __func__, " fused quant fp4x2 not support per token quant");
             ADD_RMSNORM_QUANT_KERNEL_DISPATCH(ck_tile::fp4x2_t, true, true);
         }
 #endif
@@ -368,6 +369,7 @@ __global__ void add_rmsnorm_quant_kernel(
 #if defined(__Float4_e2m1fn_x2)
         else if(out.dtype() == torch_fp4x2)
         {
+            TORCH_CHECK(group_size != 0, __func__, " fused quant fp4x2 not support per token quant");
             RMSNORM_QUANT_KERNEL_DISPATCH(ck_tile::fp4x2_t, false, true);
         }
 #endif
