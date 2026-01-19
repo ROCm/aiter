@@ -177,8 +177,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     curr_kv_end - batch_tail);
                 work_info.kv_offset = curr_kv_end - work_info.kv_end;
 
-                // fix non-native case mtp acc
-                if(work_info.kv_start >= work_info.kv_end){
+                // fix non-natively case mtp acc for case: eg:
+                // kv_start=5, kv_end=4
+                if(work_info.kv_start >= work_info.kv_end)
+                {
                     --curr_n_split_idx;
                     --num_splits;
                 }
@@ -220,7 +222,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     work_info.partial_qo_loc = -1;
                     fill_work_info(0);
                 }
-                if(work_info.kv_start < work_info.kv_end){
+                if(work_info.kv_start < work_info.kv_end)
+                {
                     p_work_info_set[num_works] = work_info;
                     num_works += 1;
                 }
@@ -303,13 +306,13 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     work_info.partial_qo_loc = (curr_n_split_idx == 0 && batch_tail == work_info.kv_offset) ?
                         -1 : partial_idx;
 
+                    // fix non-natively case mtp acc for case
                     if(work_info.kv_start < work_info.kv_end)
                     {
                         p_work_info_set[num_works] = work_info;
                         num_works += 1;
                         ++curr_n_split_idx;
                     }
-
                     if (batch_tail != work_info.kv_offset)
                     {
                         partial_idx += qo_tile_size;
