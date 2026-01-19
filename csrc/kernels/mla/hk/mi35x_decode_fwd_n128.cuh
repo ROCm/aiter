@@ -141,16 +141,16 @@ struct HkMlaDecodeFwdParams
 // ...
 // [0, 568-575], [1, 568-575], ..., [31, 568-575]  (by warp 7)
 //
-// @param p_lds_kv_warp_fixed here is expected to be the start address of the warp:
+// @param p_lds_kv_warp_base here is expected to be the start address of the warp:
 //        p_lds_kv + warp_idx * kWarpOffset(272).
 // @param row: the row index loaded from p_kv_indices.
 // @param col_base: the base column index which should be:
 //        warp_idx * kNumColsPerWarp(8) + lane_idx % kNumColThreads(2) * kNumBytesPerThrPerRnd(4)
 template <typename T, uint32_t kColOffset, bool kCheckBoundary = true>
-__device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv_warp_fixed,
-                                             const typename T::gl_kv& kv_buffer,
-                                             const int32_t row,
-                                             const int32_t col_base)
+__device__ __forceinline__ void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
+                                                  const typename T::gl_kv& kv_buffer,
+                                                  const int32_t row,
+                                                  const int32_t col_base)
 {
     using kv_t = T::kv_t;
 
@@ -176,7 +176,7 @@ __device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv_warp_fixed
     const uint32_t lane_idx = ckt::get_lane_id();
 
     const uintptr_t p_lds_kv_warp =
-        p_lds_kv_warp_fixed + kColOffset / kNumColsPerWarp * kWarpOffset - kColOffset;
+        p_lds_kv_warp_base + kColOffset / kNumColsPerWarp * kWarpOffset - kColOffset;
 
     if(kCheckBoundary && (row == -1))
     {
@@ -619,7 +619,7 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
 {
     constexpr comp_t log2e = 1.4426950408889634;
 
-    const uint32_t lane_idx = __lane_id();
+    const uint32_t lane_idx = ckt::get_lane_id();
 
     // Element-wise scale. Boundary problem is handled here as well.
     const uint32_t col_0_idx = lane_idx >> 4;
@@ -793,6 +793,54 @@ __device__ __forceinline__ void transpose(const uint32_t lane_idx,
     asm volatile("v_or_b32_e32 v[%0], %1, %2" : : "i"(DST_GPR), "v"(front_part), "v"(latter_part));
 };
 
+template <bool kCheckBoundary>
+__device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
+                                                 const int32_t row_base,
+                                                 const int32_t kv_tile_start,
+                                                 const int32_t kv_tile_end)
+{
+    int32_t row_kv_ld;
+
+    /// TODO: Try to place p_kv_indices in LDS
+    const uint32_t row_kv_ld_idx = row_base + kv_tile_start;
+    if(kCheckBoundary && (row_kv_ld_idx >= kv_tile_end))
+    {
+        row_kv_ld = -1;
+    }
+    else
+    {
+        row_kv_ld = p_kv_indices[row_kv_ld_idx];
+    }
+
+    return row_kv_ld;
+}
+
+template <typename T, bool kCheckBoundary>
+__device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv,
+                                             const int32_t* p_kv_indices,
+                                             const typename T::gl_kv& kv_buffer,
+                                             const int32_t kv_ld_row_base_idx,
+                                             const int32_t kv_ld_col_base,
+                                             const int32_t kv_tile_start,
+                                             const int32_t kv_tile_end)
+{
+    const uint32_t warp_idx       = ckt::get_warp_id();
+    const uintptr_t p_lds_kv_warp = p_lds_kv + warp_idx * 272; // TODO: 272 = kWarpOffset
+
+    const int32_t row_kv_ld =
+        get_kv_ld_row<kCheckBoundary>(p_kv_indices, kv_ld_row_base_idx, kv_tile_start, kv_tile_end);
+
+    async_load_k_tile<T, 0, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    async_load_k_tile<T, 64, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    async_load_k_tile<T, 128, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    async_load_k_tile<T, 192, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    async_load_k_tile<T, 256, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    async_load_k_tile<T, 320, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    async_load_k_tile<T, 384, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    async_load_k_tile<T, 448, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    async_load_k_tile<T, 512, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+}
+
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(72))) void kn_mla_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
@@ -896,7 +944,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
     // Runtime constants
     const uint32_t warp_idx           = ckt::get_warp_id();
-    const uint32_t lane_idx           = __lane_id();
+    const uint32_t lane_idx           = ckt::get_lane_id();
     const uint32_t kv_ld_row_base_idx = lane_idx / 2; // [0, 32). 2 adjacent threads take one row.
     const uint32_t kv_ld_col_base     = warp_idx * 8 + (lane_idx % 2) * 4;
 
@@ -931,43 +979,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
         auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_tile_start,
                                                              const int32_t kv_tile_end) {
-            const uintptr_t p_lds_kv_warp =
-                p_lds_kv_curr + warp_idx * 272; // TODO: 272 = kWarpOffset
-
             if constexpr(kIsFirstIter == false)
             {
                 __builtin_amdgcn_s_barrier();
             }
 
-            /// TODO: Try to place p_kv_indices in LDS
-            const uint32_t row_kv_ld_idx = kv_ld_row_base_idx + kv_tile_start;
-            int32_t row_kv_ld;
-            if(kIsTail && (row_kv_ld_idx >= kv_tile_end))
-            {
-                row_kv_ld = -1;
-            }
-            else
-            {
-                row_kv_ld = params.p_kv_indices[row_kv_ld_idx];
-            }
-
-            async_load_k<T, 0, kIsTail>(p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k<T, 64, kIsTail>(
-                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k<T, 128, kIsTail>(
-                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k<T, 192, kIsTail>(
-                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k<T, 256, kIsTail>(
-                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k<T, 320, kIsTail>(
-                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k<T, 384, kIsTail>(
-                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k<T, 448, kIsTail>(
-                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k<T, 512, kIsTail>(
-                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, kIsTail>(p_lds_kv_curr,
+                                     params.p_kv_indices,
+                                     params.kv_buffer,
+                                     kv_ld_row_base_idx,
+                                     kv_ld_col_base,
+                                     kv_tile_start,
+                                     kv_tile_end);
 
             __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_s_barrier();
