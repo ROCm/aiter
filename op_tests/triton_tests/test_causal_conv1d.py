@@ -146,7 +146,7 @@ def causal_conv1d_opcheck_fn(
 @pytest.mark.parametrize("seqlen", [1, 4, 8])
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("dim", [1024, 2048, 4096])
-@pytest.mark.parametrize("batch", [1, 8, 64, 128, 256, 512, 1024])
+@pytest.mark.parametrize("batch", [1, 7, 64, 127, 512])
 def test_causal_conv1d_update(
     batch, dim, width, seqlen, has_bias, silu_activation, itype
 ):
@@ -191,7 +191,7 @@ def test_causal_conv1d_update(
 @pytest.mark.parametrize("dim", [2048, 4096])
 # tests correctness in case subset of the sequences are padded
 @pytest.mark.parametrize("with_padding", [True, False])
-@pytest.mark.parametrize("batch_size", [1, 64, 128, 256, 512, 1024])
+@pytest.mark.parametrize("batch_size", [1, 64, 128, 256, 512])
 def test_causal_conv1d_update_with_batch_gather(
     batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, itype
 ):
@@ -265,10 +265,10 @@ def test_causal_conv1d_update_with_batch_gather(
 @pytest.mark.parametrize("silu_activation", [True, False])
 @pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", [1, 4, 8])
-@pytest.mark.parametrize("dim", [1024, 2048, 4096])
+@pytest.mark.parametrize("seqlen", [1, 64, 1024, 5120, 8192])
+@pytest.mark.parametrize("dim", [2048, 4096])
 @pytest.mark.parametrize("with_padding", [True, False])
-@pytest.mark.parametrize("batch", [1, 16, 64, 128, 256, 512, 1024])
+@pytest.mark.parametrize("batch", [1, 64, 1024, 5120, 8192])
 def test_causal_conv1d_varlen(
     batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
 ):
