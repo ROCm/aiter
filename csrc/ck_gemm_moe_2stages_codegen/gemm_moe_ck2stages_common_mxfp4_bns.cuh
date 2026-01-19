@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_moe_mx_gemm_bns.hpp"
@@ -37,8 +37,9 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         void*& num_valid_ids,          // [1]
                         void*& out,                    // [max_num_tokens_padded, inter_dim]
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void*> a1_scale  // [m, 1], token scale
-)
+                        std::optional<void*> a1_scale, // [m, 1], token scale
+                        std::optional<int> splitk,     // splitk
+                        std::optional<bool> nt)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
@@ -96,10 +97,10 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
 ///######|         |         |         |        |           |           |           |          |            |                 |   Operation|   Operation|    Operation|               |      |      |      |      |    |    |     |     | Wave| Wave| Lengths_K0_M_K1|   ArrangeOrder|               |               |      PerVector|   PerVector_K1|          | Lengths_K0_N_K1|   ArrangeOrder|               |              |      PerVector|   PerVector_K1|          |  PerShuffle|  PerShuffle|         _NBlock_NWaveNPerXdl|   _NWaveNPerXdl|
 ///######|         |         |         |        |           |           |           |          |            |                 |            |            |             |               |      |      |      |      |    |    |     |     |     |     |                |               |               |               |               |               |          |                |               |               |              |               |               |          |            |            |                             |    S<C, D0, D1>|
 ///###### RCR
-          <     Row,  Col,  DsLayout, ELayout, 
+          <     Row,  Col,  DsLayout, ELayout,
                 A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
-                AElementOp,  BElementOp, CDEElementOp,       GemmSpec, 
-                32,      BLOCKSIZE,   
+                AElementOp,  BElementOp, CDEElementOp,       GemmSpec,
+                32,      BLOCKSIZE,
                 MPerBlock,      NPerBlock,    128,
                 AK1,   BK1,
                 MNPerXDL,   MNPerXDL,
@@ -193,7 +194,9 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                             void*& num_valid_ids,             \
                                             void*& out,                       \
                                             std::optional<void*> w1_scale,    \
-                                            std::optional<void*> a1_scale);
+                                            std::optional<void*> a1_scale,    \
+                                            std::optional<int> splitk,        \
+                                            std::optional<bool> nt);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -226,8 +229,9 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         void*& num_valid_ids,          //[1]
                         void*& out,                    // [m, out_dim]
                         std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void*> a2_scale  // [max_num_tokens_padded, 1], token scale
-)
+                        std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
+                        std::optional<int> splitk,     // splitk
+                        std::optional<bool> nt)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
@@ -285,10 +289,10 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
 ///#####|         |         |         |        |           |           |           |          |            |                 |   Operation|   Operation|    Operation|               |      |      |      |      |    |    |     |     | Wave| Wave| Lengths_K0_M_K1|   ArrangeOrder|               |               |      PerVector|   PerVector_K1|          | Lengths_K0_N_K1|   ArrangeOrder|               |              |      PerVector|   PerVector_K1|          |  PerShuffle|  PerShuffle|         _NBlock_NWaveNPerXdl|   _NWaveNPerXdl|
 ///#####|         |         |         |        |           |           |           |          |            |                 |            |            |             |               |      |      |      |      |    |    |     |     |     |     |                |               |               |               |               |               |          |                |               |               |              |               |               |          |            |            |                             |    S<C, D0, D1>|
 ///##### RCR
-          <     Row,  Col,  DsLayout, ELayout, 
+          <     Row,  Col,  DsLayout, ELayout,
                 A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
                 AElementOp,  BElementOp, CDEElementOp,       GemmSpec,
-                32,      BLOCKSIZE,   
+                32,      BLOCKSIZE,
                 MPerBlock,      NPerBlock,    128,
                 AK1,   BK1,
                 MNPerXDL,   MNPerXDL,
@@ -364,4 +368,6 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         void *&num_valid_ids,                                                                                                                                        \
         void *&out,                                                                                                                                                  \
         std::optional<void *> w2_scale,                                                                                                                              \
-        std::optional<void *> a2_scale);
+        std::optional<void *> a2_scale,                                                                                                                              \
+        std::optional<int>   splitk,                                                                                                                                 \
+        std::optional<bool>  nt);

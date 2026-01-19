@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
@@ -153,6 +153,20 @@ def gemm_a8w8_blockscale_ck(
 
 
 @compile_ops(
+    "module_gemm_a8w8_blockscale_cktile",
+    fc_name="gemm_a8w8_blockscale_cktile",
+    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+)
+def gemm_a8w8_blockscale_cktile(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+) -> torch.Tensor: ...
+
+
+@compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle",
     fc_name="gemm_a8w8_blockscale_bpreshuffle",
     gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
@@ -275,7 +289,6 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
         ).to_dict("index")
 
     cu_num = get_cu_num()
-
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
@@ -295,7 +308,7 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
 
 
 @functools.lru_cache(maxsize=1024)
-def get_bpreshuffle_GEMM_config(
+def get_GEMM_config_with_quant_type(
     M: int,
     N: int,
     K: int,
@@ -303,29 +316,32 @@ def get_bpreshuffle_GEMM_config(
     tuned_file=f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
 ):
     # Use dict to cache configs for different files
-    if not hasattr(get_bpreshuffle_GEMM_config, "file_cache"):
-        get_bpreshuffle_GEMM_config.file_cache = {}
+    if not hasattr(get_GEMM_config_with_quant_type, "file_cache"):
+        get_GEMM_config_with_quant_type.file_cache = {}
 
     # Load file if not cached
-    if tuned_file not in get_bpreshuffle_GEMM_config.file_cache:
+    if tuned_file not in get_GEMM_config_with_quant_type.file_cache:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
-        get_bpreshuffle_GEMM_config.file_cache[tuned_file] = asmGemmDictDf.set_index(
-            ["cu_num", "M", "N", "K", "q_dtype_w"]
-        ).to_dict("index")
+        get_GEMM_config_with_quant_type.file_cache[tuned_file] = (
+            asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
+                "index"
+            )
+        )
 
     cu_num = get_cu_num()
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = get_bpreshuffle_GEMM_config.file_cache[tuned_file].get(
+        config = get_GEMM_config_with_quant_type.file_cache[tuned_file].get(
             (cu_num, padded_M, N, K, str(q_dtype_w)), None
         )
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
-                logger.info(
-                    f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}, libtype is {config['libtype']}!"
-                )
+                msg = f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
+                if "libtype" in config:
+                    msg += f" libtype is {config['libtype']}!"
+                logger.info(msg)
             break
     if config is None:
         logger.info(
@@ -394,7 +410,7 @@ def gemm_a8w8_ASM(
         x_scale.dtype == dtypes.fp32
         and w_scale.dtype == dtypes.fp32
         and (
-            asm_config := get_bpreshuffle_GEMM_config(
+            asm_config := get_GEMM_config_with_quant_type(
                 m,
                 n,
                 k,
@@ -434,7 +450,11 @@ def gemm_a8w8_CK(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
-    ck_config = get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE)
+
+    q_dtype_w = WQ.dtype if WQ.dtype in [dtypes.fp8, dtypes.i8] else dtypes.i8
+    ck_config = get_GEMM_config_with_quant_type(
+        m, n, k, q_dtype_w, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
+    )
     if splitK is None:
         if ck_config is not None:
             splitK = ck_config["splitK"]
@@ -488,7 +508,7 @@ def gemm_a8w8_bpreshuffle(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     # CKTile only supports bf16 dtype
-    config = get_bpreshuffle_GEMM_config(
+    config = get_GEMM_config_with_quant_type(
         m,
         n,
         k,
@@ -544,7 +564,17 @@ def gemm_a8w8_blockscale(
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
-        get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
+        config = get_CKGEMM_config(
+            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+        )
+        if config is not None:
+            libtype = config["libtype"]
+            if libtype == "ck":
+                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+            elif libtype == "cktile":
+                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
+            else:
+                assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
@@ -665,6 +695,24 @@ def gemm_a8w8_blockscale_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_cktile_tune",
+    fc_name="gemm_a8w8_blockscale_cktile_tune",
+    gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
+)
+def gemm_a8w8_blockscale_cktile_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
+
 @compile_ops(
     "module_gemm_a8w8_bpreshuffle_tune",
     fc_name="gemm_a8w8_bpreshuffle_tune",
@@ -679,6 +727,8 @@ def gemm_a8w8_bpreshuffle_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
+
+
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle_tune",
     fc_name="gemm_a8w8_blockscale_bpreshuffle_tune",
