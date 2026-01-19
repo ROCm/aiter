@@ -100,7 +100,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
 
         for(int32_t i = 0; i < num_query_tile_ranges; ++i)
         {
-            // ping-pong allocate bwteen head & tail: 0, n-1, 1, n-2, 2, n-3, ...
+            // ping-pong allocate between head & tail: 0, n-1, 1, n-2, 2, n-3, ...
             int32_t idx = (i % 2 == 0) ? (i / 2) : (num_query_tile_ranges - 1 - i / 2);
 
             const int32_t local_qo_start = query_tile_ranges[idx].first;
