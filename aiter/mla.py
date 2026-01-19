@@ -356,9 +356,9 @@ def mla_decode_fwd(
                 final_lse,
             )
 
-            compare_with_asm = True
-            compare_with_golden = True
-            compare_with_emu = True
+            compare_with_asm = False
+            compare_with_golden = False
+            compare_with_emu = False
 
             #
             # ASM

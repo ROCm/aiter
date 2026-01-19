@@ -827,11 +827,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     constexpr uint32_t kNumPaddingDw   = 4;                          // Skip 4 banks.
     constexpr uint32_t kWarpOffset =
         kNumElemPerWarp * sizeof(kv_t) + kNumPaddingDw * sizeof(uint32_t); // 256*1+4*4=272
-    constexpr uint32_t kSzLdsKvTest =
+    constexpr uint32_t kSzLdsKv =
         kWarpOffset * (T::kQkHeadDim / kNumColsPerWarp); // 272*(576/8)=19584
 
-    uintptr_t p_lds_kv_test = reinterpret_cast<uintptr_t>(p_lds);
-    uintptr_t p_lds_vt      = p_lds_kv_test + kSzLdsKvTest;
+    uintptr_t p_lds_kv_curr  = reinterpret_cast<uintptr_t>(p_lds);
+    uintptr_t p_lds_kv_next  = p_lds_kv_curr + kSzLdsKv;
+    const uintptr_t p_lds_vt = p_lds_kv_next + kSzLdsKv;
 
     // Reg tiles
     constexpr uint32_t k_o_sz      = 128;
@@ -894,11 +895,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
     // Runtime constants
-    const uint32_t warp_idx            = ckt::get_warp_id();
-    const uint32_t lane_idx            = __lane_id();
-    const uint32_t kv_ld_row_base_idx  = lane_idx / 2; // [0, 32). 2 adjacent threads take one row.
-    const uint32_t kv_ld_col_base      = warp_idx * 8 + (lane_idx % 2) * 4;
-    const uintptr_t p_lds_kv_test_warp = p_lds_kv_test + warp_idx * 272; // TODO: 272 = kWarpOffset
+    const uint32_t warp_idx           = ckt::get_warp_id();
+    const uint32_t lane_idx           = __lane_id();
+    const uint32_t kv_ld_row_base_idx = lane_idx / 2; // [0, 32). 2 adjacent threads take one row.
+    const uint32_t kv_ld_col_base     = warp_idx * 8 + (lane_idx % 2) * 4;
 
     std::uintptr_t out_as_int       = reinterpret_cast<std::uintptr_t>(params.final_output.raw_ptr);
     std::uint64_t out_as_u64        = static_cast<std::uint64_t>(out_as_int);
@@ -931,6 +931,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
         auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_tile_start,
                                                              const int32_t kv_tile_end) {
+            const uintptr_t p_lds_kv_warp =
+                p_lds_kv_curr + warp_idx * 272; // TODO: 272 = kWarpOffset
+
             if constexpr(kIsFirstIter == false)
             {
                 __builtin_amdgcn_s_barrier();
@@ -948,30 +951,33 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 row_kv_ld = params.p_kv_indices[row_kv_ld_idx];
             }
 
-            async_load_k<T, 0, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k<T, 0, kIsTail>(p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k<T, 64, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k<T, 128, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k<T, 192, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k<T, 256, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k<T, 320, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k<T, 384, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k<T, 448, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k<T, 512, kIsTail>(
-                p_lds_kv_test_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
 
             __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
             // GEMM on NoPE
+            load_k_to_gpr<T, 0, 0>(kv_0, p_lds_kv_curr);
+            load_k_to_gpr<T, 16, 0>(kv_0, p_lds_kv_curr);
+            load_k_to_gpr<T, 0, T::kBlockK>(kv_1, p_lds_kv_curr);
+            load_k_to_gpr<T, 16, T::kBlockK>(kv_1, p_lds_kv_curr);
             ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}([&](auto idx) {
                 using q_range_0 =
                     hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
@@ -983,14 +989,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 // Load K from LDS to GPR
                 constexpr int32_t tile_idx = (idx.value - k_q_nope_begin) / 2;
-
-                load_k_to_gpr<T, 0, tile_idx * T::kBlockK>(kv_0, p_lds_kv_test);
-                load_k_to_gpr<T, 16, tile_idx * T::kBlockK>(kv_0, p_lds_kv_test);
-                load_k_to_gpr<T, 0, (tile_idx + 1) * T::kBlockK>(kv_1, p_lds_kv_test);
-                load_k_to_gpr<T, 16, (tile_idx + 1) * T::kBlockK>(kv_1, p_lds_kv_test);
-
-                asm volatile("s_waitcnt lgkmcnt(0)");
-
+                asm volatile("s_waitcnt lgkmcnt(2)");
                 if constexpr(idx.value == k_q_nope_begin)
                 {
                     hk::mma_ABt(p_comp, kv_0, q_0);
@@ -999,7 +998,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 {
                     hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
                 }
+                load_k_to_gpr<T, 0, (tile_idx + 2) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                load_k_to_gpr<T, 16, (tile_idx + 2) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                asm volatile("s_waitcnt lgkmcnt(2)");
                 hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
+                load_k_to_gpr<T, 0, (tile_idx + 3) * T::kBlockK>(kv_1, p_lds_kv_curr);
+                load_k_to_gpr<T, 16, (tile_idx + 3) * T::kBlockK>(kv_1, p_lds_kv_curr);
             });
 
             // GEMM on RoPE
@@ -1014,15 +1018,24 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 // Load K from LDS to GPR
                 constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
-                load_k_to_gpr<T, 0, (tile_idx + 16) * T::kBlockK>(kv_0, p_lds_kv_test);
-                load_k_to_gpr<T, 16, (tile_idx + 16) * T::kBlockK>(kv_0, p_lds_kv_test);
-                load_k_to_gpr<T, 0, (tile_idx + 16 + 1) * T::kBlockK>(kv_1, p_lds_kv_test);
-                load_k_to_gpr<T, 16, (tile_idx + 16 + 1) * T::kBlockK>(kv_1, p_lds_kv_test);
-
-                asm volatile("s_waitcnt lgkmcnt(0)");
-
+                asm volatile("s_waitcnt lgkmcnt(2)");
                 hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
+                if constexpr(idx.value < k_q_rope_end + 1 - 2 * 2)
+                {
+                    load_k_to_gpr<T, 0, (tile_idx + 2 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                    load_k_to_gpr<T, 16, (tile_idx + 2 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                    asm volatile("s_waitcnt lgkmcnt(2)");
+                }
+                else
+                {
+                    asm volatile("s_waitcnt lgkmcnt(0)");
+                }
                 hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
+                if constexpr(idx.value < k_q_rope_end + 1 - 2 * 2)
+                {
+                    load_k_to_gpr<T, 0, (tile_idx + 3 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                    load_k_to_gpr<T, 16, (tile_idx + 3 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                }
             });
 
             float rescale;
@@ -1059,7 +1072,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
             // Transpose
             v8ui v;
-            load_v_to_gpr<T>(&v, p_lds_kv_test);
+            load_v_to_gpr<T>(&v, p_lds_kv_curr);
             asm volatile("s_waitcnt lgkmcnt(0)");
             transpose_v<0>(&v);
             transpose_v<1>(&v);
@@ -1105,6 +1118,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     hk::mma_ABt(oaccu_1, kv_1, p_mfma, oaccu_1);
                 }
             });
+
+            std::swap(p_lds_kv_curr, p_lds_kv_next);
         };
 
         const int32_t kv_len = kv_end - kv_start;
