@@ -1097,6 +1097,11 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    non_reduce_out = torch.empty(
+        (token_num, topk, model_dim),
+        dtype=moe_out.dtype,
+        device=moe_out.device,
+    )
     metadata.stage2(
         a2,
         w1,
@@ -1104,7 +1109,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        moe_out,
+        non_reduce_out,  # moe_out,
         topk,
         w2_scale=(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
@@ -1114,6 +1119,8 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
+    # reduce topk axis of non_reduce_out
+    moe_out = non_reduce_out.sum(dim=1)
 
     return moe_out
 
