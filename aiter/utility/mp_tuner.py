@@ -208,7 +208,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             )
 
             # Run worker with explicit GPU ID
-            ret = worker(*work_args, printLog=verbose, tol_err_ratio=err_ratio)
+            ret = worker(*work_args)
             rets.append(ret)
         return rets
 
