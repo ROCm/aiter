@@ -18,8 +18,18 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
 
     x_ = x
-    x_ = x_.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // K, K)
-    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    # Match CK GFX11/GFX10 shuffle_b implementation:
+    # CK does 5D reshape: (N/NW, NW, K/KW, divisor, K/divisor)
+    # with permute: {0, 2, 3, 1, 4}
+    # 
+    # In our case: NW=BN, KW=BK, divisor=BK/K
+    x_ = x_.view(-1, x.shape[-2] // BN, x.shape[-1] // BK, BK // K, K)
+    #             batch N/BN            K/BK            divisor  K_rest
+    #             0     1               2               3        4
+    
+    # Permute to: {0, 2, 3, 1, 4}
+    # batch K/BK divisor N/BN K_rest (matches CK layout)
+    x_ = x_.permute(0, 2, 3, 1, 4)
     x_ = x_.contiguous()
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
@@ -111,3 +121,20 @@ def shuffle_scale_a16w4(
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
     return shfl_scale.view(*src.shape).contiguous()
+
+
+def shuffle_weight_cktile(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
+    # Hardcode BLOCK_K and BLOCK_N
+    x_type = x.dtype
+
+    IN, IK = layout
+    divisor = 4 if IN == 32 else 2
+
+    x_ = x #(torch.ones((x.shape[-2], x.shape[-1]), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
+    x_ = x_.view(x.shape[-2] // IN, IN, x.shape[-1] // IK, divisor, IK // divisor)
+    x_ = x_.permute(0, 2, 3, 1, 4)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    x_ = x_.view(x_type)
+    x_.is_shuffled = True
+    return x_

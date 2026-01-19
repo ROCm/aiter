@@ -16,7 +16,7 @@ from gemm_a8w8_blockscale_instance import (
 
 
 """
-a8w8_blockscale_gemm instance gen for legacy CK
+a8w8_blockscale_gemm instance gen for CK Legacy
 """
 
 
