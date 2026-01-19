@@ -141,4 +141,5 @@ for (
             ret = test_quant(m, n, q_type, q_dtype, h_dtype)
             df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("quant summary (markdown):\n%s", df_md)

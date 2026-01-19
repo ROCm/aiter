@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
-#include "ck/tensor_operation/gpu/device/impl/device_moe_mx_gemm_bpreshuffle.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3.hpp"
+#include "ck/tensor_operation/gpu/device/impl/device_moe_mx_gemm_bpreshuffle.hpp"
 // #include "ck/tensor_operation/gpu/device/impl/device_moe_mx_gemm_bns.hpp"
 #include "gemm_moe_ck2stages.h"
 #include <iostream>
@@ -38,8 +38,9 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         void*& num_valid_ids,          // [1]
                         void*& out,                    // [max_num_tokens_padded, inter_dim]
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void*> a1_scale  // [m, 1], token scale
-)
+                        std::optional<void*> a1_scale, // [m, 1], token scale
+                        std::optional<int> splitk,     // splitk
+                        std::optional<bool> nt)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
@@ -77,18 +78,19 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     // : 128;
     static constexpr ck::index_t CShuffleMXDLPerWave = MXDLPerWave;
     static constexpr ck::index_t CShuffleNXDLPerWave = NXDLPerWave;
-    static constexpr ck::index_t CShuffleNLane       = NPerBlock / 2 / NXDLPerWave; // 64
-    static constexpr ck::index_t CShuffleMLane       = BLOCKSIZE / CShuffleNLane;
-    static constexpr ck::index_t AK1                 = 16 / sizeof(A0DataType);
-    static constexpr ck::index_t BK1                 = 16 / sizeof(B0DataType);
-    static constexpr ck::index_t EVec                = 16 / sizeof(EDataType);
-    static constexpr ck::index_t K0_A                = KPerBlock / AK1;
-    static constexpr ck::index_t K0_B                = KPerBlock / BK1;
-    static constexpr ck::index_t K0_M_A              = BLOCKSIZE / K0_A;
-    static constexpr ck::index_t K0_N_B              = BLOCKSIZE / K0_B;
-    static constexpr ck::index_t D0Vec               = 1;
-    static constexpr ck::index_t D1Vec               = PerTensorQuant ? 1 : EVec;
-    static constexpr ck::index_t D2Vec               = 1;
+    static constexpr ck::index_t CShuffleNLane =
+        BLOCKSIZE == 64 ? NPerBlock / NXDLPerWave : NPerBlock / 2 / NXDLPerWave; // 64
+    static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
+    static constexpr ck::index_t AK1           = 16 / sizeof(A0DataType);
+    static constexpr ck::index_t BK1           = 16 / sizeof(B0DataType);
+    static constexpr ck::index_t EVec          = 16 / sizeof(EDataType);
+    static constexpr ck::index_t K0_A          = KPerBlock / AK1;
+    static constexpr ck::index_t K0_B          = KPerBlock / BK1;
+    static constexpr ck::index_t K0_M_A        = BLOCKSIZE / K0_A;
+    static constexpr ck::index_t K0_N_B        = BLOCKSIZE / K0_B;
+    static constexpr ck::index_t D0Vec         = 1;
+    static constexpr ck::index_t D1Vec         = PerTensorQuant ? 1 : EVec;
+    static constexpr ck::index_t D2Vec         = 1;
 
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmMXBPreShuffle
         // clang-format off
@@ -97,17 +99,17 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
 ///######|         |         |         |        |           |           |           |          |            |                 |   Operation|   Operation|    Operation|               |      |      |      |      |    |    |     |     | Wave| Wave| Lengths_K0_M_K1|   ArrangeOrder|               |               |      PerVector|   PerVector_K1|          | Lengths_K0_N_K1|   ArrangeOrder|               |              |      PerVector|   PerVector_K1|          |  PerShuffle|  PerShuffle|         _NBlock_NWaveNPerXdl|   _NWaveNPerXdl|
 ///######|         |         |         |        |           |           |           |          |            |                 |            |            |             |               |      |      |      |      |    |    |     |     |     |     |                |               |               |               |               |               |          |                |               |               |              |               |               |          |            |            |                             |    S<C, D0, D1>|
 ///###### RCR
-          <     Row,  Col,  DsLayout, ELayout, 
+          <     Row,  Col,  DsLayout, ELayout,
                 A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
-                AElementOp,  BElementOp, CDEElementOp,       GemmSpec, 
-                32,      BLOCKSIZE,   
+                AElementOp,  BElementOp, CDEElementOp,       GemmSpec,
+                32,      BLOCKSIZE,
                 MPerBlock,      NPerBlock,    128,
                 AK1,   BK1,
                 MNPerXDL,   MNPerXDL,
                 MXDLPerWave,     NXDLPerWave,
                 S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 1,
                 S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 1,
-                2,    CShuffleNXDLPerWave,   S<1, 32, 1, 8>, S<EVec, D0Vec, D1Vec>,
+                2,    CShuffleNXDLPerWave,   S<1, CShuffleNLane, 1, CShuffleMLane>, S<EVec, D0Vec, D1Vec>,
                 ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, ck::index_t, A0DataType>; // clang-format on
     // clang-format on
 
@@ -194,7 +196,9 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                             void*& num_valid_ids,             \
                                             void*& out,                       \
                                             std::optional<void*> w1_scale,    \
-                                            std::optional<void*> a1_scale);
+                                            std::optional<void*> a1_scale,    \
+                                            std::optional<int> splitk,        \
+                                            std::optional<bool> nt);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -227,8 +231,9 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         void*& num_valid_ids,          //[1]
                         void*& out,                    // [m, out_dim]
                         std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
-                        std::optional<void*> a2_scale  // [max_num_tokens_padded, 1], token scale
-)
+                        std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
+                        std::optional<int> splitk,     // splitk
+                        std::optional<bool> nt)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
@@ -286,10 +291,10 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
 ///#####|         |         |         |        |           |           |           |          |            |                 |   Operation|   Operation|    Operation|               |      |      |      |      |    |    |     |     | Wave| Wave| Lengths_K0_M_K1|   ArrangeOrder|               |               |      PerVector|   PerVector_K1|          | Lengths_K0_N_K1|   ArrangeOrder|               |              |      PerVector|   PerVector_K1|          |  PerShuffle|  PerShuffle|         _NBlock_NWaveNPerXdl|   _NWaveNPerXdl|
 ///#####|         |         |         |        |           |           |           |          |            |                 |            |            |             |               |      |      |      |      |    |    |     |     |     |     |                |               |               |               |               |               |          |                |               |               |              |               |               |          |            |            |                             |    S<C, D0, D1>|
 ///##### RCR
-          <     Row,  Col,  DsLayout, ELayout, 
+          <     Row,  Col,  DsLayout, ELayout,
                 A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
                 AElementOp,  BElementOp, CDEElementOp,       GemmSpec,
-                32,      BLOCKSIZE,   
+                32,      BLOCKSIZE,
                 MPerBlock,      NPerBlock,    128,
                 AK1,   BK1,
                 MNPerXDL,   MNPerXDL,
@@ -365,4 +370,6 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         void *&num_valid_ids,                                                                                                                                        \
         void *&out,                                                                                                                                                  \
         std::optional<void *> w2_scale,                                                                                                                              \
-        std::optional<void *> a2_scale);
+        std::optional<void *> a2_scale,                                                                                                                              \
+        std::optional<int>   splitk,                                                                                                                                 \
+        std::optional<bool>   nt);

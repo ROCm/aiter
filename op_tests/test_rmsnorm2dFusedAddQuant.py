@@ -8,7 +8,6 @@ import argparse
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
 
-
 quant_dtype_map = {"i8": dtypes.i8, "fp8": dtypes.fp8}
 
 

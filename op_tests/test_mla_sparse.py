@@ -20,6 +20,12 @@ torch.set_printoptions(sci_mode=False)
 # qdtype fp8, kdtype bf16: nhead16
 
 
+def check_support(dtype, kv_dtype, nhead):
+    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    return True
+
+
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
@@ -326,6 +332,7 @@ def test_mla(
     page_size,
     varlen,
     decode_qlen,
+    max_split_per_batch,
 ):
     ret = {}
 
@@ -408,10 +415,11 @@ def test_mla(
         batch_size,
         max_seqlen_qo,
         nhead,
-        q.dtype,
-        kv_buffer.dtype,
+        dtype,
+        kvtype,
         is_sparse=True,
         fast_mode=True,
+        num_kv_splits=max_split_per_batch,
     )
 
     # aiter implementation
@@ -448,12 +456,13 @@ def test_mla(
         reduce_final_map,
         reduce_partial_map,
         kv_granularity=max(page_size, 16),
-        max_seqlen_qo=int(max_seqlen_qo),
-        uni_seqlen_qo=decode_qlen,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
         fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
         topk=2048,
-        dtype_q=q.dtype,
-        dtype_kv=kv_buffer.dtype,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
     )
 
     # generate kv topk per token & convert indices into per token
@@ -501,6 +510,7 @@ def test_mla(
             kv_last_page_lens,
             1,
             sm_scale,
+            num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
@@ -521,7 +531,7 @@ def test_mla(
         )
         return err, us_asm_decode
 
-    def test_absorb_decode_fp8():
+    def test_sparse_mla_fp8():
         if dtype != dtypes.fp8 and nhead == 128:
             aiter.logger.info("don't support this case:\n")
             return None, 1e12
@@ -561,6 +571,7 @@ def test_mla(
             kv_last_page_lens,
             1,
             sm_scale,
+            num_kv_splits=max_split_per_batch,
             q_scale=q_scale,
             kv_scale=kv_scale,
             work_meta_data=work_meta_data,
@@ -592,14 +603,10 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
-    ):
+    if dtype == torch.bfloat16:
         err, us_asm_decode = test_sparse_mla_bf16()
-    elif kvtype == dtypes.fp8 and (
-        (nhead in [16, 128]) or (max_seqlen_qo == 1 and nhead in range(32, 128 + 1, 16))
-    ):
-        err, us_asm_decode = test_absorb_decode_fp8()
+    elif kvtype == dtypes.fp8:
+        err, us_asm_decode = test_sparse_mla_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
@@ -677,7 +684,7 @@ parser.add_argument(
     type=str,
     choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    default=["bf16", "fp8"],
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
@@ -687,7 +694,7 @@ parser.add_argument(
     type=str,
     choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    default=["bf16", "fp8"],
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
@@ -720,6 +727,15 @@ parser.add_argument(
     e.g.: -n 16,1""",
 )
 parser.add_argument(
+    "-ms",
+    "--max_split_per_batch",
+    type=int,
+    nargs="*",
+    default=[32],
+    help="""kv seqlens max split num for per batch.
+    e.g.: -ms 32""",
+)
+parser.add_argument(
     "--varlen",
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
@@ -736,24 +752,27 @@ if args.nhead is not None:
 
 for nhead, decode_qlen in list_nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
+    for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
+        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
-        ret = test_mla(
-            ctx_len,
-            batch_size,
-            nhead,
-            args.kv_lora_rank,
-            args.qk_nope_head_dim,
-            args.qk_rope_head_dim,
-            args.v_head_dim,
-            dtype,
-            kvtype,
-            args.block_size,
-            varlen=args.varlen,
-            decode_qlen=decode_qlen,
-        )
-        df.append(ret)
+        if check_support(dtype, kvtype, nhead):
+            ret = test_mla(
+                ctx_len,
+                batch_size,
+                nhead,
+                args.kv_lora_rank,
+                args.qk_nope_head_dim,
+                args.qk_rope_head_dim,
+                args.v_head_dim,
+                dtype,
+                kvtype,
+                args.block_size,
+                varlen=args.varlen,
+                decode_qlen=decode_qlen,
+                max_split_per_batch=max_split_per_batch,
+            )
+            df.append(ret)
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mla_sparse summary (markdown):\n%s", df_md)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 import importlib
@@ -70,24 +70,22 @@ AITER_CONFIG_GEMM_A4W4 = os.getenv(
     "AITER_CONFIG_GEMM_A4W4",
     f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
 )
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
 )
+
 AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
-)
-
-AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE = os.getenv(
-    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE",
-    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_cktile_tuned_gemm.csv",
 )
 
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
 )
+
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
@@ -181,14 +179,6 @@ class AITER_CONFIG(object):
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
         )
 
-    @property
-    def AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE",
-            AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE,
-            "a8w8_bpreshuffle_cktile_tuned_gemm",
-        )
-
     def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
@@ -210,7 +200,11 @@ class AITER_CONFIG(object):
                 df_list.append(df)
             else:
                 logger.info(f"path {i+1}: {path} (not exist)")
-        merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+        merge_df = (
+            pd.concat([df for df in df_list if not df.empty], ignore_index=True)
+            if df_list
+            else pd.DataFrame()
+        )
         ## get keys from untuned file to drop_duplicates
         untuned_name = (
             re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
@@ -221,7 +215,9 @@ class AITER_CONFIG(object):
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
-            keys.append("cu_num")
+            # Add "cu_num" if not already present
+            if "cu_num" not in keys:
+                keys.append("cu_num")
             merge_df = (
                 merge_df.sort_values("us")
                 .drop_duplicates(subset=keys, keep="first")
@@ -296,17 +292,24 @@ if find_aiter is not None:
 
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
-    # install mode
     else:
         AITER_META_DIR = os.path.abspath(f"{AITER_ROOT_DIR}/aiter_meta/")
 else:
     AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
+
+# honor environment override and fallback if missing
+env_meta = os.environ.get("AITER_META_DIR")
+if env_meta:
+    AITER_META_DIR = os.path.abspath(env_meta)
+if not os.path.exists(os.path.join(AITER_META_DIR, "csrc")):
+    AITER_META_DIR = AITER_ROOT_DIR
+
 sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
 gfxs = get_gfx_list()
-AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{get_gfx()}/"
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 
 CK_3RDPARTY_DIR = os.environ.get(
@@ -318,7 +321,7 @@ CK_DIR = CK_3RDPARTY_DIR
 
 @functools.lru_cache(maxsize=1)
 def get_asm_dir():
-    return AITER_ASM_DIR
+    return os.path.join(AITER_ASM_DIR, get_gfx())
 
 
 @functools.lru_cache(maxsize=1)
@@ -357,6 +360,15 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1103",
+        "gfx1150",
+        "gfx1151",
+        "gfx1152",
+        "gfx1153",
+        "gfx1200",
+        "gfx1201",
         "gfx950",
     ]
 
@@ -369,12 +381,38 @@ def validate_and_update_archs():
 
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str) -> bool:
-    ret = os.system(f"hipcc {flag_hip} -x hip -E -P /dev/null -o /dev/null")
-    if ret == 0:
-        return True
-    else:
-        logger.warning(f"{flag_hip} is not supported by hipcc.")
+    import subprocess
+
+    cmd = (
+        ["hipcc"]
+        + flag_hip.split()
+        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    )
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
+    return True
+
+
+@functools.lru_cache()
+def check_LLVM_MAIN_REVISION():
+    # for https://github.com/ROCm/ROCm/issues/5646 and https://github.com/ROCm/composable_kernel/pull/3469
+    # ck using following logic...
+    """#if LLVM_MAIN_REVISION < 554785
+    #define CK_TILE_HOST_DEVICE_EXTERN __host__ __device__
+    #else
+    #define CK_TILE_HOST_DEVICE_EXTERN"""
+    import subprocess
+
+    cmd = """echo "#include <tuple>
+__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -"""
+    try:
+        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError:
+        return 554785
+    return 554785 - 1
 
 
 def check_and_set_ninja_worker():
@@ -496,6 +534,7 @@ def build_module(
     torch_exclude,
     hipify=False,
 ):
+    os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
@@ -534,6 +573,7 @@ def build_module(
             "-Wno-macro-redefined",
             "-Wno-missing-template-arg-list-after-template-kw",
             "-fgpu-flush-denormals-to-zero",
+            f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
         ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
@@ -572,7 +612,7 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob"
+                blob_dir = f"{op_dir}/blob/"
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
@@ -778,7 +818,7 @@ def compile_ops(
                 if module is None:
                     try:
                         module = get_module(md_name)
-                    except Exception as e:
+                    except Exception:
                         md = custom_build_args.get("md_name", md_name)
                         module = get_module(md)
             except ModuleNotFoundError:
@@ -857,7 +897,7 @@ def compile_ops(
                     pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
                     doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                     for el in enum_types:
-                        doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
+                        doc_str = re.sub(f" (module_)?aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
                         "Optional": Optional,

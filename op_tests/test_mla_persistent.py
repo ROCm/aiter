@@ -18,6 +18,12 @@ torch.set_printoptions(sci_mode=False)
 # qdtype fp8, kdtype bf16: nhead16
 
 
+def check_support(dtype, kv_dtype, nhead):
+    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    return True
+
+
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
@@ -69,7 +75,7 @@ def ref_masked_attention(
     l = attn_weights_exp.sum(-1)
 
     if is_fp8_q:
-        attn_weights_fp8 = attn_weights_exp.to(dtype)
+        attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
@@ -150,6 +156,7 @@ def test_mla(
     varlen,
     decode_qlen,
     max_split_per_batch,
+    non_persistent_mode,
 ):
     ret = {}
 
@@ -222,6 +229,16 @@ def test_mla(
         dtype=out_dtype,
     )
 
+    # It is necessary to limit the size of the tensor in the DP mode
+    # so reduce the split_num in the DP mode.
+    if nhead >= 128:
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+        max_split_per_batch = min(
+            (cu_num + batch_size - 1) // batch_size, max_split_per_batch
+        )
+
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),
@@ -233,10 +250,12 @@ def test_mla(
         batch_size,
         max_seqlen_qo,
         nhead,
-        q.dtype,
-        kv_buffer.dtype,
+        dtype,
+        kvtype,
         is_sparse=False,
-        fast_mode=True,
+        fast_mode=True if not non_persistent_mode else False,
+        num_kv_splits=max_split_per_batch,
+        intra_batch_mode=non_persistent_mode,
     )
 
     # aiter implementation
@@ -275,10 +294,11 @@ def test_mla(
         kv_granularity=max(page_size, 16),
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
-        fast_mode=True,
+        fast_mode=True if not non_persistent_mode else False,
         max_split_per_batch=max_split_per_batch,
-        dtype_q=q.dtype,
-        dtype_kv=kv_buffer.dtype,
+        intra_batch_mode=non_persistent_mode,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
     )
 
     def test_absorb_decode_bf16():
@@ -303,6 +323,7 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            intra_batch_mode=non_persistent_mode,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -318,17 +339,13 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
-        if dtype != dtypes.fp8 and nhead == 128:
-            aiter.logger.info("don't support this case:\n")
-            return None, 1e12
-
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         q_fp8 = q.to(dtypes.fp8)
         q_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        kv_buffer_fp8 = kv_buffer.to(kvtype)
+        kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
@@ -366,6 +383,7 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            intra_batch_mode=non_persistent_mode,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -389,11 +407,9 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        (nhead in [16]) or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
-    ):
+    if dtype == torch.bfloat16:
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
+    elif kvtype == dtypes.fp8:
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
@@ -472,7 +488,7 @@ parser.add_argument(
     type=str,
     choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    default=["bf16", "fp8"],
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
@@ -482,7 +498,7 @@ parser.add_argument(
     type=str,
     choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    default=["bf16", "fp8"],
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
@@ -519,12 +535,19 @@ parser.add_argument(
     "--max_split_per_batch",
     type=int,
     nargs="*",
-    default=[16, 32],
+    default=[32],
     help="""kv seqlens max split num for per batch.
     e.g.: -ms 32""",
 )
 parser.add_argument(
     "--varlen",
+    action="store_true",
+    help="""variable kv seqlens per batch. Default: False.
+    --varlen # True""",
+)
+parser.add_argument(
+    "-nps",
+    "--non_persistent_mode",
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
@@ -543,22 +566,25 @@ for nhead, decode_qlen in list_nhead:
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
         list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
-        ret = test_mla(
-            ctx_len,
-            batch_size,
-            nhead,
-            args.kv_lora_rank,
-            args.qk_nope_head_dim,
-            args.qk_rope_head_dim,
-            args.v_head_dim,
-            dtype,
-            kvtype,
-            args.block_size,
-            varlen=args.varlen,
-            decode_qlen=decode_qlen,
-            max_split_per_batch=max_split_per_batch,
-        )
-        df.append(ret)
+        if check_support(dtype, kvtype, nhead):
+            ret = test_mla(
+                ctx_len,
+                batch_size,
+                nhead,
+                args.kv_lora_rank,
+                args.qk_nope_head_dim,
+                args.qk_rope_head_dim,
+                args.v_head_dim,
+                dtype,
+                kvtype,
+                args.block_size,
+                varlen=args.varlen,
+                decode_qlen=decode_qlen,
+                max_split_per_batch=max_split_per_batch,
+                non_persistent_mode=args.non_persistent_mode,
+            )
+            df.append(ret)
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)

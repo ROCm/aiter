@@ -266,7 +266,7 @@ class CustomAllreduce:
         inp: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
-        use_new: bool = False,
+        use_new: bool = True,
         open_fp8_quant: bool = False,
         registered: bool = False,
     ):
@@ -289,7 +289,7 @@ class CustomAllreduce:
         return out
 
     def custom_all_reduce(
-        self, input: torch.Tensor, use_new: bool = False, open_fp8_quant: bool = False
+        self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -314,6 +314,32 @@ class CustomAllreduce:
             return self.all_reduce(
                 input, use_new=use_new, open_fp8_quant=open_fp8_quant, registered=False
             )
+
+    def reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        registered: bool = False,
+    ):
+        ops.reduce_scatter(
+            self._ptr,
+            inp,
+            out,
+            None if registered else self.buffer,
+        )
+
+    def custom_reduce_scatter(
+        self, input: torch.Tensor, output: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        # when custom allreduce is disabled, this will be None
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.reduce_scatter(input, output, registered=True)
+        else:
+            return self.reduce_scatter(input, output, registered=False)
 
     def all_gather_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
         if out is None:

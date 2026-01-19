@@ -2,7 +2,7 @@ import sys
 import torch
 import triton
 import math
-from op_tests.triton_tests.test_batched_gemm_afp4wfp4 import (
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     generate_batched_gemm_afp4wfp4_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -17,7 +17,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.batched_gemm_afp4wfp4 import (
+from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import (
     batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info

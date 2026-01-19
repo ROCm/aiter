@@ -24,7 +24,7 @@ from .parallel_state import get_tp_group
 
 
 def tensor_model_parallel_all_reduce(
-    input_: torch.Tensor, use_new: bool = False, open_fp8_quant: bool = False
+    input_: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
 ) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_, use_new, open_fp8_quant)
@@ -38,6 +38,12 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
 
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().custom_all_gather(input_)
+
+
+def tensor_model_parallel_reduce_scatter(
+    input_: torch.Tensor, use_custom: bool = True, dim: int = 0
+) -> torch.Tensor:
+    return get_tp_group().reduce_scatter_tensor(input_, use_custom, dim)
 
 
 def tensor_model_parallel_all_gather(
