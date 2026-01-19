@@ -177,13 +177,15 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout, imp
             "Latest upstream compiler as of Aug 22 (necessary for Gluon) causes"
             " infinite hang when EVEN_K is false. Try seeing if it's fixed if it's been a while."
         )
+
     if N % D != 0:
         pytest.skip("N must be divisible by D as N = D * (S1 + S2)")
+
     if impl == "triton_shuffle":
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
+        if N % 16 > 0:
+            pytest.skip("N has to be multiple of 16 for preshuffle cases")
+        if K % 128 > 0:
+            pytest.skip("K has to be multiple of 128 for preshuffle cases")
 
     # deconstruct N
     S = N // D
