@@ -18,18 +18,8 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
 
     x_ = x
-    # Match CK GFX11/GFX10 shuffle_b implementation:
-    # CK does 5D reshape: (N/NW, NW, K/KW, divisor, K/divisor)
-    # with permute: {0, 2, 3, 1, 4}
-    # 
-    # In our case: NW=BN, KW=BK, divisor=BK/K
-    x_ = x_.view(-1, x.shape[-2] // BN, x.shape[-1] // BK, BK // K, K)
-    #             batch N/BN            K/BK            divisor  K_rest
-    #             0     1               2               3        4
-    
-    # Permute to: {0, 2, 3, 1, 4}
-    # batch K/BK divisor N/BN K_rest (matches CK layout)
-    x_ = x_.permute(0, 2, 3, 1, 4)
+    x_ = x_.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // K, K)
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
     x_ = x_.contiguous()
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
