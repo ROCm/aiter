@@ -282,6 +282,24 @@ Categories include: `gemm/`, `moe/`, `attention/`, `quant/`, etc.
 - MOE tests only:
   - `pytest op_tests/triton_tests/moe/`
 
+### Test selection script
+
+There is a test selection script, that is currently under evaluation, available in `.github/scripts/select_triton_tests.py` file. Its goal is to programmatically select which Triton tests to run, based on the diff content of a given AITER PR, so Triton test CI step can run faster.
+
+The script builds a dependency graph of Triton source files, including kernel config files. The hard part is to relate kernel config files with their respective kernel. The script basically search for the following code patterns:
+
+```python
+# Interpolated strings referring to JSON config files:
+f"{AITER_TRITON_CONFIGS_PATH}/{dev}-KERNEL.json"
+```
+
+```python
+# Calls to `get_gemm_config` utility function in which `config_name` is a constant string:
+get_gemm_config("AMAZING-GEMM", M, N, K)
+```
+
+It is a good practice, when writing kerels, to follow these patterns.
+
 ## Quick checklists
 
 ### Quick checklist when adding a new kernel
@@ -289,6 +307,7 @@ Categories include: `gemm/`, `moe/`, `attention/`, `quant/`, etc.
 - Config filenames use `{arch}` like `gfx950`.
 - Add config-aware trace naming via `make_kernel_repr(...)` and `@triton.jit(repr=...)`.
 - Add a kernel docstring describing behavior + config params + returns + notes.
+- If possible, adopt patterns recognized by test selection script when loading kernel configs.
 
 ### Quick checklist when adding arch-specific exceptions
 
