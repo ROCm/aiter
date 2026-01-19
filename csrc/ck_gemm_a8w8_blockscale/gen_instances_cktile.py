@@ -14,7 +14,6 @@ from gemm_a8w8_blockscale_cktile_instance import (
     candidate_kernels_cktile_dict,
 )
 
-
 """
 a8w8_blockscale_gemm instance gen for CK tile
 """

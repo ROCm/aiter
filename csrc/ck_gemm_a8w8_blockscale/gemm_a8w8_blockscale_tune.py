@@ -183,7 +183,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         seed,
         preshuffleB,
     ):
-        (cu_num, M, N, K) = info_keys
+        cu_num, M, N, K = info_keys
         kernels_num = len(candidate_kernels_cktile_dict)
         gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 3]
@@ -338,7 +338,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
-        print("ret:", ret)
+
         return ret
 
     def result_to_df(self, results):

@@ -77,12 +77,6 @@ def check_common_skip_conditions(
     ):
         return True
 
-    if skip_test_if(
-        not contiguous_kv and is_input_fp8,
-        "Non-contiguous KV is only validated for non-FP8 path",
-    ):
-        return True
-
     return False
 
 
@@ -101,11 +95,6 @@ def check_layout_skip_conditions(
     """
     if kvcache_layout == "vectorized":
         if skip_test_if(
-            not contiguous_kv,
-            "Non-contiguous KV is only validated for linear layout",
-        ):
-            return True
-        if skip_test_if(
             page_size % k_vector_size != 0 or head_dim % k_vector_size != 0,
             "Vectorized layout requires page/head dim divisible by vector size",
         ):
@@ -116,17 +105,6 @@ def check_layout_skip_conditions(
                 page_size % k_vector_size_fp8 != 0 or head_dim % k_vector_size_fp8 != 0
             ),
             "FP8 vectorized layout requires page/head dim divisible by vector size",
-        ):
-            return True
-    else:
-        if skip_test_if(
-            head_dim % k_vector_size != 0,
-            "Linear layout requires head dim divisible by vector size",
-        ):
-            return True
-        if skip_test_if(
-            is_input_fp8 and head_dim % k_vector_size_fp8 != 0,
-            "FP8 linear layout requires head dim divisible by vector size",
         ):
             return True
 
@@ -437,6 +415,11 @@ def build_reference_output(
             ],
             dim=0,
         ).to(dtype)
+        if qi.shape[1] != num_kv_heads:
+            assert qi.shape[1] % num_kv_heads == 0
+            ratio = qi.shape[1] // num_kv_heads
+            ki = ki.repeat_interleave(ratio, dim=1)
+            vi = vi.repeat_interleave(ratio, dim=1)
         o_ref_list.append(
             ref_masked_attention(
                 qi, ki, vi, causal=causal, logits_soft_cap=logits_soft_cap
@@ -699,7 +682,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
         (8192, 8192),
     ],
 )
-@pytest.mark.parametrize("page_size", [128, 256, 1024])
+@pytest.mark.parametrize("page_size", [16, 1024])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (16, 1)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
@@ -1188,7 +1171,7 @@ def test_batch_prefill_vs_varlen_fp8(
     torch.manual_seed(42)
     dtype = torch.bfloat16
     quant_dtype = dtypes.fp8
-    page_size = 128
+    page_size = 1024
     k_vector_size = get_vector_size(quant_dtype)
 
     if skip_test_if(
@@ -1351,8 +1334,8 @@ parser.add_argument(
     "--pagesize",
     type=int,
     const=None,
-    choices=[1, 1024],
-    default=[1, 1024],
+    choices=[1, 16, 1024],
+    default=[1, 16, 1024],
     nargs="*",
     help="""page size.
     e.g.: -p 1024""",

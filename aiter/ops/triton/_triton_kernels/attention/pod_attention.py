@@ -5,7 +5,6 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 import importlib.util
 from pathlib import Path
 
-
 file_path = Path("./aiter/ops/triton/lean_atten.py").resolve()
 module_name = "la_persistent"
 spec = importlib.util.spec_from_file_location(module_name, file_path)
@@ -47,7 +46,7 @@ def get_cu_id():
     # XCC_ID Register bit structure for 942/950
     #   XCC_ID      3:0     XCC the wave is assigned to.
 
-    (cu_id, se_id, xcc_id) = tl.inline_asm_elementwise(
+    cu_id, se_id, xcc_id = tl.inline_asm_elementwise(
         asm="""
         s_getreg_b32 $0, hwreg(HW_REG_HW_ID, 8, 4)
         s_getreg_b32 $1, hwreg(HW_REG_HW_ID, 13, 2)
@@ -180,7 +179,7 @@ def pod_persistent(
 ):
 
     # cu_id: 4 bits, se_id: 2 bits, xcc_id: 4 bits
-    (cu_id, se_id, xcc_id) = get_cu_id()
+    cu_id, se_id, xcc_id = get_cu_id()
     gcu_id = (xcc_id << 6) + (se_id << 4) + cu_id
     # tl.device_print("gcu_id is ", gcu_id)
 

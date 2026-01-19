@@ -955,12 +955,14 @@ struct gmem {
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D void _async_load(__shared__ void* dst, int v_os, int s_os = 0, number<aux> = {}) {
         using type = vector_type<vec>;
+#if __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
         if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, 0, aux); }
 #if  defined(__gfx950__)
         else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, 0, aux); }
+#endif
 #endif
     }
 
@@ -1447,7 +1449,7 @@ struct tiled_mma_adaptor : public MMA_ {
         static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
             auto s_a = a[i_m * EXPAND_K + i_k];
             auto s_b = b[i_n * EXPAND_K + i_k];
-            auto s_c = c[i_m * EXPAND_N + i_n];
+            auto s_c = c_[i_m * EXPAND_N + i_n];
             s_c = MMA{}(s_a, s_b, s_c);
             c_[i_m * EXPAND_N + i_n] = s_c;
         });
@@ -1471,7 +1473,7 @@ struct tiled_mma_adaptor : public MMA_ {
             constexpr index_t i_tile_c = i_m * EXPAND_N + i_n;
             auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
             auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
-            auto s_c = slice(c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+            auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
             s_c = MMA{}(s_a, s_b, s_c);
             set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
         });
