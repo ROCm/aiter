@@ -7,7 +7,6 @@ import triton
 
 from aiter.ops.triton.attention.lean_atten import _persistent_lean_attention
 
-
 configs = []
 configs.append(
     triton.testing.Benchmark(
