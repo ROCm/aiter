@@ -32,8 +32,10 @@ def causal_conv1d_update(
     """
     batch, dim, seqlen = x.shape
 
-    # Create output tensor
-    out = torch.empty_like(x)
+    # Create output tensor (initialize to zero to handle padding slots correctly)
+    # When conv_state_indices[i] == pad_slot_id, the kernel will skip processing
+    # and leave the output unchanged, so we need to initialize to zero
+    out = torch.zeros_like(x)
 
     # Convert weight to input dtype if needed
     weight_tensor = weight.to(dtype=x.dtype) if weight.dtype != x.dtype else weight
