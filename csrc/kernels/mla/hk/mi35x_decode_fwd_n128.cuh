@@ -176,11 +176,12 @@ __device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv_warp_fixed
     const uint32_t lane_idx = ckt::get_lane_id();
 
     const uintptr_t p_lds_kv_warp =
-        p_lds_kv_warp_fixed + kColOffset / kNumColsPerWarp * kWarpOffset;
+        p_lds_kv_warp_fixed + kColOffset / kNumColsPerWarp * kWarpOffset - kColOffset;
 
     if(kCheckBoundary && (row == -1))
     {
-        const uintptr_t p_lds_kv_lane = p_lds_kv_warp + lane_idx * kNumBytesPerThrPerRnd;
+        const uintptr_t p_lds_kv_lane =
+            p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
         // Use flat instruction here for easy synchronization.
         // hkm::ds_write_b32(p_lds_kv_lane, 0, 0u);
         *reinterpret_cast<uint32_t*>(p_lds_kv_lane) = 0u;
@@ -190,15 +191,14 @@ __device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv_warp_fixed
         const kv_t* p_kv_buffer = &kv_buffer[{0, 0, 0, 0}];
         const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
 
-        const uint32_t col     = col_base + kColOffset / sizeof(kv_t);
-        const uint32_t voffset = row * T::kQkHeadDim + col;
+        const uint32_t voffset = row * T::kQkHeadDim * sizeof(kv_t) + col_base;
 
         hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
                                             (as3_uint32_ptr)(p_lds_kv_warp),
                                             kNumBytesPerThrPerRnd,
                                             voffset,
                                             0,
-                                            0, /// TODO: try to use instruction offset to save gpr.
+                                            kColOffset,
                                             0);
     }
 }
@@ -368,6 +368,9 @@ __device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt
                                      sizeof(kv_t);              // 4 * 66 * 32 * 1 = 8448
     constexpr uint32_t kOffsetTlBr = kOffsetTlTr + kOffsetTlBl; // 64 + 8448 = 8512
 
+    constexpr uint32_t kFixedColBlk      = kColOffset / kNumColsPerThr;
+    constexpr uint32_t kFixedBlockOffset = kFixedColBlk * kNumElemsPerBlock * sizeof(kv_t);
+
     static_assert(((kColOffset % 32) == 0) && (kColOffset < 512),
                   "load_transpose_v_to_gpr(): Unsupported column offset!");
 
@@ -375,7 +378,7 @@ __device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt
 
     // calculate logical coordinate of top-left dw
     const uint32_t row_blk = lane_idx / 16; // 16: 16x16 mfma tile.
-    const uint32_t col_blk = ((lane_idx % 16) + kColOffset) / kNumColsPerThr;
+    const uint32_t col_blk = (lane_idx % 16) / kNumColsPerThr;
     const uint32_t block_offset =
         (row_blk * kNumBlocksPerRowWithPadding + col_blk) * kNumElemsPerBlock * sizeof(kv_t);
 
@@ -385,10 +388,10 @@ __device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt
 
     const uintptr_t p_lds_vt_ul_lane = p_lds_vt + block_offset + inblock_offset;
 
-    hkm::ds_read_b32<GPR + 0>(p_lds_vt_ul_lane, 0);
-    hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kOffsetTlBl);
-    hkm::ds_read_b32<GPR + 2>(p_lds_vt_ul_lane, kOffsetTlTr);
-    hkm::ds_read_b32<GPR + 3>(p_lds_vt_ul_lane, kOffsetTlBr);
+    hkm::ds_read_b32<GPR + 0>(p_lds_vt_ul_lane, kFixedBlockOffset);
+    hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlBl);
+    hkm::ds_read_b32<GPR + 2>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlTr);
+    hkm::ds_read_b32<GPR + 3>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlBr);
 }
 
 template <uint32_t kPart>
