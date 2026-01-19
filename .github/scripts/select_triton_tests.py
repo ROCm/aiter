@@ -127,102 +127,104 @@ def list_triton_source_files() -> (
 
 DEVICES: frozenset[str] = frozenset(["gfx942", "gfx950"])
 
+MNK_PLACEHOLDERS: str = "MNK"
+NUM_PATTERN: str = r"\d+"
 
-def resolve_mnk_placeholders(json_string: str, config_files: list[Path]) -> list[str]:
-    PLACEHOLDERS = "MNK"
-    NUM_PATTERN = r"\d+"
+MOE_DTYPES: tuple[str, ...] = (
+    "DEFAULT",
+    "FP8_W8A8",
+    "INT8_W8A16",
+    "INT8_W8A8",
+    "INT4_W4A16",
+    "MX_FP4",
+)
 
-    if not any(f"{{{p}}}" in json_string for p in PLACEHOLDERS):
+
+def expand_mnk(json_string: str, config_files: list[Path]) -> list[str]:
+    if not any(f"{{{p}}}" in json_string for p in MNK_PLACEHOLDERS):
         logging.debug("No M/N/K placeholders in [%s].", json_string)
         return [json_string]
-
     pattern_str = re.escape(json_string[2:-1])
-
-    for p in PLACEHOLDERS:
+    for p in MNK_PLACEHOLDERS:
         pattern_str = pattern_str.replace(
             rf"\{{{p}\}}",
             rf"(?P<{p}>{NUM_PATTERN})",
         )
-
     pattern = re.compile(f"^{pattern_str}$")
     logging.debug("M/N/K regex is [%s].", pattern.pattern)
-
     return [f'f"{path}"' for c in config_files if pattern.match(path := c.as_posix())]
 
 
-def resolve_json_string_interpolation(
-    json_string: str, config_files: list[Path]
-) -> list[str]:
-    resolved_strings = [json_string]
-    if json_string.startswith("f'") or json_string.startswith('f"'):
-        # f-string with variable interpolation.
-        # Resolve {AITER_TRITON_CONFIGS_PATH} interpolation:
-        if r"{AITER_TRITON_CONFIGS_PATH}" in json_string:
-            json_string = json_string.replace(
-                r"{AITER_TRITON_CONFIGS_PATH}",
-                str(triton_config_dir().relative_to(root_dir()).as_posix()),
+def expand_moe_dtypes(json_strings: list[str]) -> list[str]:
+    expanded_moe_dtypes: list[str] = []
+    for s in json_strings:
+        if r"MOE-{dtype_str}" in s:
+            expanded_moe_dtypes.extend(
+                s.replace(r"{dtype_str}", dtype) for dtype in MOE_DTYPES
             )
-            logging.debug(
-                r"Resolved {AITER_TRITON_CONFIGS_PATH} in JSON string: [%s]",
-                json_string,
-            )
-        # Resolve {dev} interpolation:
-        if r"{dev}" in json_string:
-            resolved_strings = [json_string.replace(r"{dev}", dev) for dev in DEVICES]
-            logging.debug(r"Resolved {dev} in JSON string: %s", str(resolved_strings))
-        # Resolve GEMM M-N-K interpolation:
-        resolved_strings = [
-            match
-            for resolved_string in resolved_strings
-            for match in resolve_mnk_placeholders(resolved_string, config_files)
-        ]
-        # Resolve MOE data type interpolation:
-        resolved_strings = [
-            replaced
-            for resolved_string in resolved_strings
-            for replaced in (
-                [
-                    resolved_string.replace(r"{dtype_str}", moe_dtype)
-                    for moe_dtype in [
-                        "DEFAULT",
-                        "FP8_W8A8",
-                        "INT8_W8A16",
-                        "INT8_W8A8",
-                        "INT4_W4A16",
-                        "MX_FP4",
-                    ]
-                ]
-                if r"MOE-{dtype_str}" in resolved_string
-                else [resolved_string]
-            )
-        ]
-        # Remove f-string delimiters if there's no more variable interpolation.
-        resolved_strings = [
-            s[2:-1] if not any(c in s for c in "{}") else s for s in resolved_strings
-        ]
-    return resolved_strings
+        else:
+            expanded_moe_dtypes.append(s)
+    return expanded_moe_dtypes
+
+
+def expand_interpolations(json_string: str, config_files: list[Path]) -> list[str]:
+    if not (json_string.startswith("f'") or json_string.startswith('f"')):
+        return [json_string]
+    # Replace config path placeholder
+    if r"{AITER_TRITON_CONFIGS_PATH}" in json_string:
+        json_string = json_string.replace(
+            r"{AITER_TRITON_CONFIGS_PATH}",
+            str(triton_config_dir().relative_to(root_dir()).as_posix()),
+        )
+        logging.debug("Resolved {AITER_TRITON_CONFIGS_PATH}: [%s]", json_string)
+    # Expand device variants
+    expanded = [json_string]
+    if r"{dev}" in json_string:
+        expanded = [s.replace(r"{dev}", dev) for s in expanded for dev in DEVICES]
+        logging.debug("Resolved {dev}: %s", expanded)
+    # Expand GEMM M-N-K patterns
+    expanded = [
+        expanded_mnk for s in expanded for expanded_mnk in expand_mnk(s, config_files)
+    ]
+    # Expand MOE data type variants
+    expanded = expand_moe_dtypes(expanded)
+    # Clean up f-string delimiters if no more interpolation needed
+    expanded = [s[2:-1] if not any(c in s for c in "{}") else s for s in expanded]
+    return expanded
+
+
+def resolve_path(json_string: str) -> Path | None:
+    p = Path(json_string)
+    # Try absolute path
+    if p.is_absolute() and p.exists() and p.is_file():
+        return p.relative_to(root_dir())
+    # Try relative to root
+    p = root_dir() / json_string
+    if p.exists() and p.is_file():
+        return p.relative_to(root_dir())
+    return None
 
 
 def resolve_json_strings(
     json_strings: list[str], config_files: list[Path]
 ) -> list[Path]:
-    json_strings = sorted(
-        resolved_json_strings
+    # Expand all interpolations first
+    expanded_strings = [
+        expanded
         for json_string in json_strings
-        for resolved_json_strings in resolve_json_string_interpolation(
-            json_string, config_files
-        )
-    )
+        for expanded in expand_interpolations(json_string, config_files)
+    ]
+    # Sort and deduplicate
+    expanded_strings = sorted(set(expanded_strings))
+    # Resolve to actual paths
     resolved: list[Path] = []
     unresolved: list[str] = []
-    for json_string in json_strings:
-        p = Path(json_string)
-        if p.is_absolute() and p.exists() and p.is_file():
-            resolved.append(p.relative_to(root_dir()))
-        elif (p := root_dir() / json_string).exists() and p.is_file():
-            resolved.append(p.relative_to(root_dir()))
+    for json_string in expanded_strings:
+        if resolved_path := resolve_path(json_string):
+            resolved.append(resolved_path)
         else:
             unresolved.append(json_string)
+    # Log results
     if resolved:
         logging.debug("Resolved JSON config files:")
         log_file_list(logging.DEBUG, resolved)
