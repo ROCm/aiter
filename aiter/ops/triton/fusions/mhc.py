@@ -5,14 +5,14 @@
 Python wrapper for mHC (manifold-constrained Hyper Connection) fused kernel.
 
 Provides the mhc function using a fused Triton kernel
-with the deferred RMSNorm division optimization.
+with the deferred RMSNorm division optimization and sigmoid activation.
 """
 
 from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.fusions.mhc import (
-    _mhc_fused_rmsnorm_matmul_kernel,
+    _mhc_fused_rmsnorm_matmul_sigmoid_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -28,9 +28,9 @@ def mhc(
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Computes mHC mapping with fused RMSNorm + MatMul + Scale + Bias.
+    Computes mHC mapping with fused RMSNorm + MatMul + Scale + Bias + Sigmoid.
 
-    Implements: H = α · (x · φ / ||x||_rms) + b
+    Implements: H = sigmoid(α · (x · φ / ||x||_rms) + b)
 
     Uses deferred RMSNorm division optimization: computes (x @ φ) / rms instead of
     (x / rms) @ φ, reducing divisions from K to N elements per row.
@@ -47,7 +47,7 @@ def mhc(
             If None, a new tensor is allocated.
 
     Returns:
-        torch.Tensor: Output tensor with shape (M, N).
+        torch.Tensor: Output tensor with shape (M, N) after sigmoid activation.
     """
     _LOGGER.info(
         f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha={alpha}"
@@ -84,7 +84,7 @@ def mhc(
     # 2D grid: (num_m_blocks, num_n_blocks)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
-    _mhc_fused_rmsnorm_matmul_kernel[grid](
+    _mhc_fused_rmsnorm_matmul_sigmoid_kernel[grid](
         x,
         phi,
         out,

@@ -10,7 +10,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _mhc_fused_rmsnorm_matmul_kernel(
+def _mhc_fused_rmsnorm_matmul_sigmoid_kernel(
     # Pointers to matrices
     x_ptr,      # Input: (M, K) - flattened n-stream residual
     phi_ptr,    # Weight: (K, N) - projection matrix
@@ -37,9 +37,9 @@ def _mhc_fused_rmsnorm_matmul_kernel(
     BLOCK_SIZE_K: tl.constexpr,
 ):
     """
-    Fused kernel: RMSNorm + MatMul + Scale + Bias with deferred division.
+    Fused kernel: RMSNorm + MatMul + Scale + Bias + Sigmoid with deferred division.
 
-    Computes: out = α · (x · φ / ||x||_rms) + b
+    Computes: out = sigmoid(α · (x · φ / ||x||_rms) + b)
 
     Grid: (cdiv(M, BLOCK_SIZE_M), cdiv(N, BLOCK_SIZE_N))
     Each program handles one (BLOCK_SIZE_M, BLOCK_SIZE_N) tile of output.
@@ -100,7 +100,10 @@ def _mhc_fused_rmsnorm_matmul_kernel(
     mask_n = offs_n < N
     bias = tl.load(bias_ptrs, mask=mask_n, other=0.0).to(tl.float32)
 
-    out = alpha * result + bias[None, :]
+    linear_out = alpha * result + bias[None, :]
+    
+    # Apply sigmoid activation: σ(x) = 1 / (1 + exp(-x))
+    out = tl.sigmoid(linear_out)
 
     # Store output
     out_ptrs = out_ptr + offs_m[:, None] * stride_outm + offs_n[None, :] * stride_outn

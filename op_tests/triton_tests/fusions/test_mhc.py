@@ -35,9 +35,9 @@ def mhc_torch(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
-    PyTorch reference implementation of mHC projection mapping.
+    PyTorch reference implementation of mHC projection mapping with sigmoid.
 
-    H = α · (x · φ / ||x||_rms) + b
+    H = sigmoid(α · (x · φ / ||x||_rms) + b)
 
     Args:
         x: Input x_l with shape (M, nC) - flattened n-stream residual
@@ -47,7 +47,7 @@ def mhc_torch(
         eps: Epsilon for RMSNorm numerical stability
 
     Returns:
-        H with shape (M, n) - mapping coefficients
+        H with shape (M, n) - mapping coefficients after sigmoid activation
     """
     x_f32 = x.to(torch.float32)
     mean_sq = torch.mean(x_f32 ** 2, dim=-1, keepdim=True)
@@ -58,7 +58,10 @@ def mhc_torch(
     result = x_norm @ phi_f32
 
     bias_f32 = bias.to(torch.float32)
-    out = alpha * result + bias_f32
+    linear_out = alpha * result + bias_f32
+    
+    # Apply sigmoid
+    out = torch.sigmoid(linear_out)
 
     return out.to(x.dtype)
 
@@ -267,3 +270,38 @@ def test_mhc_large_values():
         atol=0.1,
         rtol=0.05,
     )
+
+
+@pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_small_shapes(M, n, C, dtype):
+    """Test mHC with a subset of representative shapes for quick validation."""
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    x, phi, alpha, bias = generate_mhc_inputs(M, n, C, dtype)
+
+    out_torch = mhc_torch(x, phi, alpha, bias)
+    out_triton = mhc(x, phi, alpha, bias)
+
+    torch.testing.assert_close(
+        out_triton.to(torch.float32),
+        out_torch.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_mhc_output_range():
+    """Test that sigmoid output is in valid range [0, 1]."""
+    torch.cuda.empty_cache()
+
+    M, n, C = 64, 4, 1024
+    x, phi, alpha, bias = generate_mhc_inputs(M, n, C)
+
+    out_triton = mhc(x, phi, alpha, bias)
+
+    # Sigmoid output should be in [0, 1]
+    assert torch.all(out_triton >= 0.0), "Sigmoid output has values < 0"
+    assert torch.all(out_triton <= 1.0), "Sigmoid output has values > 1"
+
