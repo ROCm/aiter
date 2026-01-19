@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "metadata/v1_0_device.cuh"
@@ -241,18 +241,31 @@ void get_ps_metadata_v1(
     const int32_t        block_size,
     const bool           is_causal)
 {
-    // const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(pages_kv_indptr));
 
-    TORCH_CHECK((kvlen_granlarity & (kvlen_granlarity - 1)) == 0,
-                __func__, ": kvlen_granlarity Must be power of 2!");
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
     TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
                 __func__, ": seqlens_qo_indptr's element type should be int!");
     TORCH_CHECK(pages_kv_indptr.stride(0) == 1,
-                __func__, ": seqlens_kv_indptr should be continuous!");
+                __func__, ": pages_kv_indptr should be continuous!");
     TORCH_CHECK(pages_kv_indptr.scalar_type() == at::ScalarType::Int,
-                __func__, ": seqlens_kv_indptr's element type should be int!");
+                __func__, ": pages_kv_indptr's element type should be int!");
+    TORCH_CHECK(context_lens.stride(0) == 1,
+                __func__, ": context_lens should be continuous!");
+    TORCH_CHECK(context_lens.scalar_type() == at::ScalarType::Int,
+                __func__, ": context_lens's element type should be int!");
+    TORCH_CHECK(gqa_ratio >= 1,
+                __func__, ": gqa_ratio must be >= 1!");
+    TORCH_CHECK(num_heads_k >= 1,
+                __func__, ": num_heads_k must be >= 1!");
+    TORCH_CHECK(qhead_granularity >= 1,
+                __func__, ": qhead_granularity must be >= 1!");
+    TORCH_CHECK(qlen_granularity >= 1,
+                __func__, ": qlen_granularity must be >= 1!");
+    TORCH_CHECK(kvlen_granlarity >= 1,
+                __func__, ": kvlen_granlarity must be >= 1!");
+    TORCH_CHECK(block_size >= 1,
+                __func__, ": block_size must be >= 1!");
 
     get_ps_metadata_v1_2_host(
         seqlens_qo_indptr,
