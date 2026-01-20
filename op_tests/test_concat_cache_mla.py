@@ -616,7 +616,7 @@ parser.add_argument(
     "--head",
     type=int,
     nargs="*",
-    default=[2, 4, 8, 16, 128],
+    default=[1, 2, 4, 8],
     help="""num heads.
     e.g.: -hd 1""",
 )
