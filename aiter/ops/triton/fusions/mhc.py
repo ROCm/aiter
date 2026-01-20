@@ -2,107 +2,122 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Python wrapper for mHC (manifold-constrained Hyper Connection) fused kernel.
+High-level Python wrapper for mHC (manifold-constrained Hyper Connection).
 
-Provides the mhc function using a fused Triton kernel
-with the deferred RMSNorm division optimization and sigmoid activation.
+Implements equations 14-18 from the mHC paper in a single optimized kernel call.
 """
 
-from typing import Optional
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.fusions.mhc import (
-    _mhc_fused_rmsnorm_matmul_sigmoid_kernel,
-)
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 
-_LOGGER = AiterTritonLogger()
+from aiter.ops.triton._triton_kernels.fusions import _mhc_fused_kernel
 
 
 def mhc(
     x: torch.Tensor,
     phi: torch.Tensor,
-    alpha: float,
+    alpha_pre: float,
+    alpha_post: float,
+    alpha_res: float,
     bias: torch.Tensor,
+    n: int,
     eps: float = 1e-6,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Computes mHC mapping with fused RMSNorm + MatMul + Scale + Bias + Sigmoid.
+    Compute mHC projection mapping with all three streams (equations 14-18).
 
-    Implements: H = sigmoid(α · (x · φ / ||x||_rms) + b)
+    This function implements:
+    - Eq 14: H̃ = x̃φ (matrix multiplication)
+    - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
+    - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
+    - Eq 17: H^pre = σ(H^pre)
+    - Eq 18: H^post = 2σ(H^post)
+    - H^res: identity (ready for Sinkhorn-Knopp)
 
-    Uses deferred RMSNorm division optimization: computes (x @ φ) / rms instead of
-    (x / rms) @ φ, reducing divisions from K to N elements per row.
+    All operations are fused in a single Triton kernel for optimal performance.
 
     Args:
-        x (torch.Tensor): Input tensor with shape (M, K), where K = n_streams * hidden_dim.
-            Typically BF16 or FP16.
-        phi (torch.Tensor): Projection weight matrix with shape (K, N), where N = n_streams.
-            Typically BF16 or FP16.
-        alpha (float): Scaling factor applied after normalization.
-        bias (torch.Tensor): Bias tensor with shape (N,). Typically FP32.
-        eps (float): Epsilon for numerical stability in RMSNorm. Default: 1e-6.
-        out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-            If None, a new tensor is allocated.
+        x: Input tensor with shape (M, nC) - flattened n-stream residual
+        phi: Projection matrix with shape (nC, n² + 2n)
+        alpha_pre: Scaling factor for pre-stream (n² elements)
+        alpha_post: Scaling factor for post-stream (n elements)
+        alpha_res: Scaling factor for residual stream (n elements)
+        bias: Bias vector with shape (n² + 2n,)
+        n: Number of streams
+        eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
+        out: Optional pre-allocated output tensor with shape (M, n² + 2n)
 
     Returns:
-        torch.Tensor: Output tensor with shape (M, N) after sigmoid activation.
+        Output tensor H with shape (M, n² + 2n) containing [H^pre, H^post, H^res]
+
+    Shape requirements:
+        - x: (M, nC) where nC = n * C (flattened streams)
+        - phi: (nC, n² + 2n)
+        - bias: (n² + 2n,)
+        - output: (M, n² + 2n)
+
+    Example:
+        >>> M, n, C = 32, 4, 1024
+        >>> nC = n * C  # 4096
+        >>> N_total = n * n + 2 * n  # 24
+        >>> x = torch.randn(M, nC, dtype=torch.bfloat16, device='cuda')
+        >>> phi = torch.randn(nC, N_total, dtype=torch.bfloat16, device='cuda')
+        >>> bias = torch.randn(N_total, dtype=torch.float32, device='cuda')
+        >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
+        >>> H = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+        >>> H.shape  # (32, 24)
     """
-    _LOGGER.info(
-        f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha={alpha}"
-    )
-
     # Validate inputs
-    assert x.dim() == 2, f"x must be 2D, got {x.dim()}D"
-    assert phi.dim() == 2, f"phi must be 2D, got {phi.dim()}D"
-    assert bias.dim() == 1, f"bias must be 1D, got {bias.dim()}D"
-
     M, K = x.shape
     K_phi, N = phi.shape
+    N_total_expected = n * n + 2 * n
 
-    assert K == K_phi, f"x.shape[1] ({K}) must match phi.shape[0] ({K_phi})"
-    assert bias.shape[0] == N, f"bias.shape[0] ({bias.shape[0]}) must match N ({N})"
-
-    # Ensure contiguous tensors
-    x = x.contiguous()
-    phi = phi.contiguous()
-    bias = bias.contiguous()
+    assert K == K_phi, f"Dimension mismatch: x has K={K}, phi has K={K_phi}"
+    assert N == N_total_expected, f"Dimension mismatch: phi has N={N}, expected {N_total_expected}"
+    assert bias.shape[0] == N, f"Bias shape mismatch: expected ({N},), got {bias.shape}"
+    assert x.device == phi.device == bias.device, "All tensors must be on the same device"
+    assert x.device.type == "cuda", "mHC kernel requires CUDA device"
 
     # Allocate output if not provided
     if out is None:
-        out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+        out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     else:
-        assert out.shape == (M, N), f"out.shape {out.shape} must be ({M}, {N})"
-        out = out.contiguous()
+        assert out.shape == (M, N), f"Output shape mismatch: expected ({M}, {N}), got {out.shape}"
+        assert out.dtype == x.dtype, f"Output dtype mismatch: expected {x.dtype}, got {out.dtype}"
+        assert out.device == x.device, f"Output device mismatch"
 
-    # Block sizes
-    BLOCK_SIZE_M = 32
-    BLOCK_SIZE_N = triton.next_power_of_2(min(N, 64))
-    BLOCK_SIZE_K = min(128, triton.next_power_of_2(K))
+    # Determine block sizes for optimal performance
+    # For matrix multiplication: balance between occupancy and memory usage
+    BLOCK_M = 64 if M >= 64 else 32
+    BLOCK_N = min(128, triton.next_power_of_2(N))
+    BLOCK_K = min(128, triton.next_power_of_2(K))
 
-    # 2D grid: (num_m_blocks, num_n_blocks)
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    # Launch kernel with 2D grid over (M, N)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
-    _mhc_fused_rmsnorm_matmul_sigmoid_kernel[grid](
+    _mhc_fused_kernel[grid](
         x,
         phi,
-        out,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
-        alpha,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        phi.stride(0),
-        phi.stride(1),
-        out.stride(0),
-        out.stride(1),
-        eps,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        out,
+        M=M,
+        K=K,
+        N=N,
+        n=n,
+        eps=eps,
+        stride_xm=x.stride(0),
+        stride_xk=x.stride(1),
+        stride_phik=phi.stride(0),
+        stride_phin=phi.stride(1),
+        stride_om=out.stride(0),
+        stride_on=out.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
 
     return out
