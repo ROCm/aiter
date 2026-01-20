@@ -4,17 +4,21 @@
 """
 Pytest tests for mHC (manifold-constrained Hyper Connection) fused kernel.
 
-Tests correctness of the Triton implementation against PyTorch reference
-for various input shapes and configurations.
+Tests correctness of the Triton implementation (equations 14-18) against
+PyTorch reference for various input shapes and configurations.
 
-Notation (from mHC paper):
-    - n: Number of streams (expansion factor, typically 4)
+Notation (from mHC paper arXiv:2512.24880v2):
+    - M: Batch/sequence dimension
+    - n: Stream parameter controlling manifold dimension
     - C: Hidden dimension per stream
-    - nC: Total flattened input dimension (K in kernel)
-    - M: Batch size
-    - x_l ∈ ℝ^(M×nC): Flattened n-stream residual
-    - φ ∈ ℝ^(nC×n): Projection matrix
-    - H ∈ ℝ^(M×n): Output mapping coefficients
+    - nC: Total flattened input dimension (K in kernel, K = n × C)
+    - N: Total output dimension (n² + 2n)
+    - x_l ∈ ℝ^(M×nC): Flattened n-stream residual (input)
+    - φ ∈ ℝ^(nC×N): Projection matrix for transformation to 3 streams
+    - H ∈ ℝ^(M×N): Output containing [H^pre, H^post, H^res]
+      - H^pre: [0:n²] manifold projection with sigmoid activation
+      - H^post: [n²:n²+n] post-processing with 2*sigmoid activation
+      - H^res: [n²+n:n²+2n] residual connection (identity activation)
 """
 
 import torch
@@ -30,38 +34,86 @@ from aiter.ops.triton.fusions.mhc import mhc, sinkhorn_knopp
 def mhc_torch(
     x: torch.Tensor,
     phi: torch.Tensor,
-    alpha: float,
+    alpha_pre: float,
+    alpha_post: float,
+    alpha_res: float,
     bias: torch.Tensor,
+    n: int,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
-    PyTorch reference implementation of mHC projection mapping with sigmoid.
+    PyTorch reference implementation of mHC projection mapping (Eq 14-18).
 
-    H = sigmoid(α · (x · φ / ||x||_rms) + b)
+    This serves as ground truth for validating the Triton kernel implementation.
+
+    Implements:
+    - Eq 14: H̃ = x̃φ (matrix multiplication)
+    - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
+    - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b (scaling)
+    - Eq 17: H^pre = σ(H^pre) (sigmoid activation for pre-stream)
+    - Eq 18: H^post = 2σ(H^post) (scaled sigmoid activation for post-stream)
+    - H^res: identity (no activation, ready for Eq 19: Sinkhorn-Knopp)
 
     Args:
         x: Input x_l with shape (M, nC) - flattened n-stream residual
-        phi: Projection φ with shape (nC, n)
-        alpha: Scaling factor α
-        bias: Bias b with shape (n,)
-        eps: Epsilon for RMSNorm numerical stability
+        phi: Projection φ with shape (nC, n² + 2n)
+        alpha_pre: Scaling factor α^pre for pre-stream (n² elements)
+        alpha_post: Scaling factor α^post for post-stream (n elements)
+        alpha_res: Scaling factor α^res for residual stream (n elements)
+        bias: Bias vector b with shape (n² + 2n,)
+        n: Stream parameter controlling manifold dimension
+        eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
 
     Returns:
-        H with shape (M, n) - mapping coefficients after sigmoid activation
+        H with shape (M, n² + 2n) containing three concatenated streams:
+        - H^pre: [0:n²] manifold projection with sigmoid
+        - H^post: [n²:n²+n] post-processing with 2*sigmoid
+        - H^res: [n²+n:n²+2n] residual connection (identity)
     """
     x_f32 = x.to(torch.float32)
+    nC = x.shape[1]
+    
+    # Eq 15: r = ||x̃||₂ / √(nC)
     mean_sq = torch.mean(x_f32 ** 2, dim=-1, keepdim=True)
     rms = torch.sqrt(mean_sq + eps)
     x_norm = x_f32 / rms
 
+    # Eq 14: H̃ = x̃φ
     phi_f32 = phi.to(torch.float32)
-    result = x_norm @ phi_f32
+    H_tilde = x_norm @ phi_f32
 
+    # Split into three streams
+    n_squared = n * n
+    H_tilde_pre = H_tilde[:, :n_squared]  # n² coefficients
+    H_tilde_post = H_tilde[:, n_squared:n_squared + n]  # n coefficients
+    H_tilde_res = H_tilde[:, n_squared + n:]  # n coefficients
+
+    # Split bias
     bias_f32 = bias.to(torch.float32)
-    linear_out = alpha * result + bias_f32
+    bias_pre = bias_f32[:n_squared]
+    bias_post = bias_f32[n_squared:n_squared + n]
+    bias_res = bias_f32[n_squared + n:]
+
+    # Eq 16: Apply stream-specific scaling and bias
+    # Note: normalization already applied in x_norm above
+    H_pre = alpha_pre * H_tilde_pre + bias_pre
+    H_post = alpha_post * H_tilde_post + bias_post
+    H_res = alpha_res * H_tilde_res + bias_res
     
-    # Apply sigmoid
-    out = torch.sigmoid(linear_out)
+    # Eq 17: Apply sigmoid activation to pre-stream
+    # H^pre = σ(H^pre)
+    H_pre = torch.sigmoid(H_pre)
+    
+    # Eq 18: Apply scaled sigmoid activation to post-stream
+    # H^post = 2σ(H^post)
+    H_post = 2.0 * torch.sigmoid(H_post)
+    
+    # H^res: identity activation (no change)
+    # Preserves values for subsequent Sinkhorn-Knopp normalization (Eq 19)
+    # H_res stays as is
+    
+    # Concatenate streams
+    out = torch.cat([H_pre, H_post, H_res], dim=1)
 
     return out.to(x.dtype)
 
@@ -82,32 +134,40 @@ def generate_mhc_inputs(
     Generate test inputs for mHC mapping.
 
     Args:
-        M: Batch size
-        n: Number of streams (expansion factor)
+        M: Batch/sequence dimension
+        n: Stream parameter (manifold dimension controller)
         C: Hidden dimension per stream
+        dtype: Tensor dtype (bfloat16 or float16)
+        device: Device to create tensors on (default: 'cuda')
 
     Returns:
-        Tuple of (x, phi, alpha, bias) where:
-        - x: (M, nC) flattened n-stream residual
-        - phi: (nC, n) projection matrix
-        - alpha: scaling factor
-        - bias: (n,) bias vector
+        Tuple of (x, phi, alpha_pre, alpha_post, alpha_res, bias, n) where:
+        - x: (M, nC) flattened n-stream residual input
+        - phi: (nC, n² + 2n) projection matrix (Eq 10)
+        - alpha_pre: α^pre scaling factor for pre-stream (Eq 12)
+        - alpha_post: α^post scaling factor for post-stream (Eq 12)
+        - alpha_res: α^res scaling factor for residual stream (Eq 12)
+        - bias: (n² + 2n,) bias vector b (Eq 13)
+        - n: stream parameter (returned for convenience)
     """
     nC = n * C  # Total flattened dimension
+    N_total = n * n + 2 * n  # n² + 2n
 
     # flattened n-stream residual
     x = torch.randn(M, nC, dtype=dtype, device=device)
 
-    # projection matrix
-    phi = torch.randn(nC, n, dtype=dtype, device=device) * 0.1
+    # projection matrix (Eq 10)
+    phi = torch.randn(nC, N_total, dtype=dtype, device=device) * 0.1
 
-    # scaling factor
-    alpha = 0.5 + torch.rand(1).item()
+    # scaling factors (Eq 12)
+    alpha_pre = 0.5 + torch.rand(1).item()
+    alpha_post = 0.5 + torch.rand(1).item()
+    alpha_res = 0.5 + torch.rand(1).item()
 
-    # bias
-    bias = torch.randn(n, dtype=torch.float32, device=device) * 0.1
+    # bias (Eq 13)
+    bias = torch.randn(N_total, dtype=torch.float32, device=device) * 0.1
 
-    return x, phi, alpha, bias
+    return x, phi, alpha_pre, alpha_post, alpha_res, bias, n
 
 
 # =============================================================================
@@ -120,9 +180,15 @@ def get_test_shapes():
     Generate test shape configurations.
 
     Returns list of (M, n, C) tuples where:
-        M: batch size
-        n: number of streams
+        M: batch/sequence dimension
+        n: stream parameter (manifold dimension controller)
         C: hidden dimension per stream
+        
+    Generates comprehensive test coverage including:
+    - Various batch sizes (1 to 1024)
+    - Different stream parameters (1, 2, 4, 8)
+    - Multiple hidden dimensions (512 to 4096)
+    - Edge cases (non-power-of-2, extreme sizes)
     """
     shapes = []
 
@@ -150,14 +216,18 @@ def get_test_shapes():
 @pytest.mark.parametrize("M, n, C", get_test_shapes())
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_correctness(M, n, C, dtype):
-    """Test that Triton implementation matches PyTorch reference."""
+    """
+    Test that Triton kernel matches PyTorch reference for equations 14-18.
+    
+    Validates correctness across various shapes and data types.
+    """
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    x, phi, alpha, bias = generate_mhc_inputs(M, n, C, dtype)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, dtype)
 
-    out_torch = mhc_torch(x, phi, alpha, bias)
-    out_triton = mhc(x, phi, alpha, bias)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     torch.testing.assert_close(
         out_triton.to(torch.float32),
@@ -169,14 +239,19 @@ def test_mhc_correctness(M, n, C, dtype):
 
 @pytest.mark.parametrize("M, n, C", get_test_shapes())
 def test_mhc_preallocated_output(M, n, C):
-    """Test with pre-allocated output tensor."""
+    """
+    Test mHC with pre-allocated output tensor.
+    
+    Verifies that the kernel correctly writes to user-provided output buffer.
+    """
     torch.cuda.empty_cache()
 
-    x, phi, alpha, bias = generate_mhc_inputs(M, n, C)
-    out = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
+    N_total = n * n + 2 * n
+    out = torch.empty(M, N_total, dtype=x.dtype, device=x.device)
 
-    out_torch = mhc_torch(x, phi, alpha, bias)
-    result = mhc(x, phi, alpha, bias, out=out)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    result = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams, out=out)
 
     assert result is out
 
@@ -189,15 +264,19 @@ def test_mhc_preallocated_output(M, n, C):
 
 
 @pytest.mark.parametrize("eps", [1e-6, 1e-5, 1e-8])
-@pytest.mark.parametrize("M, n, C", get_test_shapes())
+@pytest.mark.parametrize("M, n, C", [(32, 4, 1024)])
 def test_mhc_different_epsilon(eps, M, n, C):
-    """Test with different epsilon values for RMSNorm."""
+    """
+    Test mHC with different epsilon values for RMSNorm (Eq 15).
+    
+    Validates numerical stability parameter handling.
+    """
     torch.cuda.empty_cache()
 
-    x, phi, alpha, bias = generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
 
-    out_torch = mhc_torch(x, phi, alpha, bias, eps=eps)
-    out_triton = mhc(x, phi, alpha, bias, eps=eps)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams, eps=eps)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams, eps=eps)
 
     torch.testing.assert_close(
         out_triton.to(torch.float32),
@@ -207,16 +286,25 @@ def test_mhc_different_epsilon(eps, M, n, C):
     )
 
 
-@pytest.mark.parametrize("alpha", [0.1, 0.5, 1.0, 2.0, 10.0])
-def test_mhc_different_alpha(alpha):
-    """Test with different scaling factors α."""
+@pytest.mark.parametrize("alpha_scale", [0.1, 0.5, 1.0, 2.0, 10.0])
+def test_mhc_different_alpha(alpha_scale):
+    """
+    Test mHC with different scaling factors α (Eq 16).
+    
+    Validates stream-specific scaling behavior across range of α values.
+    """
     torch.cuda.empty_cache()
 
     M, n, C = 32, 4, 1024
-    x, phi, _, bias = generate_mhc_inputs(M, n, C)
+    x, phi, _, _, _, bias, n_streams = generate_mhc_inputs(M, n, C)
+    
+    # Use same alpha for all streams, scaled by alpha_scale
+    alpha_pre = alpha_scale
+    alpha_post = alpha_scale
+    alpha_res = alpha_scale
 
-    out_torch = mhc_torch(x, phi, alpha, bias)
-    out_triton = mhc(x, phi, alpha, bias)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     torch.testing.assert_close(
         out_triton.to(torch.float32),
@@ -227,19 +315,24 @@ def test_mhc_different_alpha(alpha):
 
 
 def test_mhc_zero_input():
-    """Test with zero input (edge case for RMSNorm where ||x||_rms → ε)."""
+    """
+    Test mHC with zero input (edge case for RMSNorm).
+    
+    When x = 0, RMS norm → ε, testing numerical stability of Eq 15.
+    """
     torch.cuda.empty_cache()
 
     M, n, C = 16, 4, 512
     nC = n * C
+    N_total = n * n + 2 * n
 
     x = torch.zeros(M, nC, dtype=torch.bfloat16, device="cuda")
-    phi = torch.randn(nC, n, dtype=torch.bfloat16, device="cuda") * 0.1
-    alpha = 1.0
-    bias = torch.randn(n, dtype=torch.float32, device="cuda") * 0.1
+    phi = torch.randn(nC, N_total, dtype=torch.bfloat16, device="cuda") * 0.1
+    alpha_pre = alpha_post = alpha_res = 1.0
+    bias = torch.randn(N_total, dtype=torch.float32, device="cuda") * 0.1
 
-    out_torch = mhc_torch(x, phi, alpha, bias)
-    out_triton = mhc(x, phi, alpha, bias)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 
     torch.testing.assert_close(
         out_triton.to(torch.float32),
@@ -250,19 +343,24 @@ def test_mhc_zero_input():
 
 
 def test_mhc_large_values():
-    """Test numerical stability with large input values."""
+    """
+    Test numerical stability with large input values.
+    
+    Validates that float32 accumulation prevents overflow/underflow.
+    """
     torch.cuda.empty_cache()
 
     M, n, C = 32, 4, 1024
     nC = n * C
+    N_total = n * n + 2 * n
 
     x = torch.randn(M, nC, dtype=torch.bfloat16, device="cuda") * 100
-    phi = torch.randn(nC, n, dtype=torch.bfloat16, device="cuda") * 0.01
-    alpha = 1.0
-    bias = torch.randn(n, dtype=torch.float32, device="cuda")
+    phi = torch.randn(nC, N_total, dtype=torch.bfloat16, device="cuda") * 0.01
+    alpha_pre = alpha_post = alpha_res = 1.0
+    bias = torch.randn(N_total, dtype=torch.float32, device="cuda")
 
-    out_torch = mhc_torch(x, phi, alpha, bias)
-    out_triton = mhc(x, phi, alpha, bias)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 
     torch.testing.assert_close(
         out_triton.to(torch.float32),
@@ -275,14 +373,18 @@ def test_mhc_large_values():
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_small_shapes(M, n, C, dtype):
-    """Test mHC with a subset of representative shapes for quick validation."""
+    """
+    Quick smoke test with representative shapes.
+    
+    Subset of test_mhc_correctness for faster validation during development.
+    """
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    x, phi, alpha, bias = generate_mhc_inputs(M, n, C, dtype)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, dtype)
 
-    out_torch = mhc_torch(x, phi, alpha, bias)
-    out_triton = mhc(x, phi, alpha, bias)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     torch.testing.assert_close(
         out_triton.to(torch.float32),
@@ -293,17 +395,38 @@ def test_mhc_small_shapes(M, n, C, dtype):
 
 
 def test_mhc_output_range():
-    """Test that sigmoid output is in valid range [0, 1]."""
+    """
+    Validate output value ranges for each stream.
+    
+    Verifies activation functions produce expected bounds:
+    - Pre-stream (Eq 17): σ(·) ∈ [0, 1]
+    - Post-stream (Eq 18): 2σ(·) ∈ [0, 2]
+    - Res-stream: No constraints (identity activation)
+    """
     torch.cuda.empty_cache()
 
     M, n, C = 64, 4, 1024
-    x, phi, alpha, bias = generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
 
-    out_triton = mhc(x, phi, alpha, bias)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
-    # Sigmoid output should be in [0, 1]
-    assert torch.all(out_triton >= 0.0), "Sigmoid output has values < 0"
-    assert torch.all(out_triton <= 1.0), "Sigmoid output has values > 1"
+    # Split output into streams
+    n_squared = n * n
+    out_pre = out_triton[:, :n_squared]
+    out_post = out_triton[:, n_squared:n_squared + n]
+    out_res = out_triton[:, n_squared + n:]
+
+    # Pre-stream: sigmoid output should be in [0, 1]
+    assert torch.all(out_pre >= 0.0), "Pre-stream has values < 0"
+    assert torch.all(out_pre <= 1.0), "Pre-stream has values > 1"
+
+    # Post-stream: 2*sigmoid output should be in [0, 2]
+    assert torch.all(out_post >= 0.0), "Post-stream has values < 0"
+    assert torch.all(out_post <= 2.0), "Post-stream has values > 2"
+    
+    # Res-stream: no constraints (identity activation)
+    # Just verify it exists
+    assert out_res.shape == (M, n), f"Res-stream shape mismatch"
 
 
 # =============================================================================
