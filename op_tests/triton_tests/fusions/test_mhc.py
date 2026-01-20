@@ -19,7 +19,7 @@ Notation (from mHC paper):
 
 import torch
 import pytest
-from aiter.ops.triton.fusions.mhc import mhc
+from aiter.ops.triton.fusions.mhc import mhc, sinkhorn_knopp
 
 
 # =============================================================================
@@ -305,3 +305,554 @@ def test_mhc_output_range():
     assert torch.all(out_triton >= 0.0), "Sigmoid output has values < 0"
     assert torch.all(out_triton <= 1.0), "Sigmoid output has values > 1"
 
+
+# =============================================================================
+# Sinkhorn-Knopp Tests
+# =============================================================================
+
+
+def sinkhorn_knopp_exp_domain_torch(
+    logits: torch.Tensor,
+    num_iters: int = 10,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    PyTorch reference implementation of Sinkhorn-Knopp in exponential domain.
+
+    Args:
+        logits: Input raw logits with shape (M, N, N)
+        num_iters: Number of Sinkhorn iterations
+        eps: Small epsilon for numerical stability in division
+
+    Returns:
+        Doubly stochastic matrices with shape (M, N, N)
+    """
+    M, N, _ = logits.shape
+
+    A = logits.to(torch.float32)
+
+    # Ensure positivity via exp (subtract max for numerical stability)
+    A_max = A.amax(dim=(-2, -1), keepdim=True)  # Max per matrix
+    P = torch.exp(A - A_max)
+
+    # Alternatingly iterate on row-column normalization
+    for _ in range(num_iters):
+        # Row normalization: make each row sum to 1
+        row_sums = P.sum(dim=-1, keepdim=True)  # (M, N, 1)
+        P = P / (row_sums + eps)
+
+        # Column normalization: make each column sum to 1
+        col_sums = P.sum(dim=-2, keepdim=True)  # (M, 1, N)
+        P = P / (col_sums + eps)
+
+    return P.to(logits.dtype)
+
+
+def sinkhorn_knopp_log_domain_torch(
+    logits: torch.Tensor,
+    num_iters: int = 10,
+) -> torch.Tensor:
+    """
+    PyTorch reference implementation of Sinkhorn-Knopp in log domain.
+
+    Algorithm:
+        1. log_A = A (input logits, already in log domain)
+        2. Initialize: log_u = 0, log_v = 0
+        3. For each iteration:
+           - log_u = -logsumexp_j(log_A + log_v)  # Row normalization
+           - log_v = -logsumexp_i(log_A + log_u)  # Column normalization
+        4. Output: P = exp(log_A + log_u + log_v)
+
+    Args:
+        logits: Input raw logits with shape (M, N, N)
+        num_iters: Number of Sinkhorn iterations
+
+    Returns:
+        Doubly stochastic matrices with shape (M, N, N)
+    """
+    M, N, _ = logits.shape
+
+    log_A = logits.to(torch.float32)
+
+    # Initialize log scaling factors (log(1) = 0, so no initial scaling)
+    log_u = torch.zeros(M, N, device=logits.device, dtype=torch.float32)
+    log_v = torch.zeros(M, N, device=logits.device, dtype=torch.float32)
+
+    for _ in range(num_iters):
+        # Row normalization in log domain:
+        # log_u[i] = -logsumexp_j(log_A[i,j] + log_v[j])
+        scaled = log_A + log_v.unsqueeze(1)  # (M, N, N)
+        log_row_sums = torch.logsumexp(scaled, dim=2)  # (M, N)
+        log_u = -log_row_sums
+
+        # Column normalization in log domain:
+        # log_v[j] = -logsumexp_i(log_A[i,j] + log_u[i])
+        scaled = log_A + log_u.unsqueeze(2)  # (M, N, N)
+        log_col_sums = torch.logsumexp(scaled, dim=1)  # (M, N)
+        log_v = -log_col_sums
+
+    # Compute final matrix: P = exp(log_A + log_u + log_v)
+    log_P = log_A + log_u.unsqueeze(2) + log_v.unsqueeze(1)
+    P = torch.exp(log_P)
+
+    return P.to(logits.dtype)
+
+
+def is_doubly_stochastic(P: torch.Tensor, tol: float = 1e-3) -> bool:
+    """
+    Check if a batch of matrices is doubly stochastic.
+
+    Args:
+        P: Tensor of shape (M, N, N)
+        tol: Tolerance for sum checks
+
+    Returns:
+        True if all matrices are doubly stochastic within tolerance
+    """
+    # Check non-negative
+    if not torch.all(P >= -tol):
+        return False
+
+    # Check row sums ≈ 1
+    row_sums = P.sum(dim=-1)  # (M, N)
+    if not torch.allclose(row_sums, torch.ones_like(row_sums), atol=tol):
+        return False
+
+    # Check column sums ≈ 1
+    col_sums = P.sum(dim=-2)  # (M, N)
+    if not torch.allclose(col_sums, torch.ones_like(col_sums), atol=tol):
+        return False
+
+    return True
+
+
+# Test shape configurations for Sinkhorn-Knopp
+def get_sk_test_shapes():
+    """
+    Generate test shape configurations for Sinkhorn-Knopp.
+
+    Returns list of (M, N) tuples where:
+        M: batch size (number of matrices)
+        N: matrix size (must be power of 2, max 64)
+    """
+    shapes = []
+
+    # Various batch sizes with typical matrix sizes
+    for M in [1, 4, 16, 64, 256]:
+        for N in [2, 4, 8, 16, 32]:
+            shapes.append((M, N))
+
+    return shapes
+
+
+@pytest.mark.parametrize("M, N", get_sk_test_shapes())
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sk_correctness(M, N, dtype):
+    """Test that Triton Sinkhorn-Knopp matches PyTorch reference."""
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    logits = torch.randn(M, N, N, dtype=dtype, device="cuda")
+
+    out_torch_exp = sinkhorn_knopp_exp_domain_torch(logits, num_iters=20)
+    out_torch_log = sinkhorn_knopp_log_domain_torch(logits, num_iters=20)
+    out_triton = sinkhorn_knopp(logits, num_iters=20)
+
+    torch.testing.assert_close(
+        out_triton.to(torch.float32),
+        out_torch_log.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        out_triton.to(torch.float32),
+        out_torch_exp.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+@pytest.mark.parametrize("M, N", get_sk_test_shapes())
+def test_sk_doubly_stochastic(M, N):
+    """Test that output matrices are doubly stochastic."""
+    torch.cuda.empty_cache()
+
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out = sinkhorn_knopp(logits, num_iters=20)
+
+    # Convert to float32 for accurate sum checking
+    out_f32 = out.to(torch.float32)
+
+    assert is_doubly_stochastic(out_f32, tol=1e-2), (
+        f"Output is not doubly stochastic. "
+        f"Row sums: {out_f32.sum(dim=-1)}, Col sums: {out_f32.sum(dim=-2)}"
+    )
+
+
+@pytest.mark.parametrize("num_iters", [5, 10, 20, 50])
+def test_sk_different_iters(num_iters):
+    """Test with different numbers of Sinkhorn iterations."""
+    torch.cuda.empty_cache()
+
+    M, N = 16, 4
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out_torch_exp = sinkhorn_knopp_exp_domain_torch(logits, num_iters=num_iters)
+    out_torch_log = sinkhorn_knopp_log_domain_torch(logits, num_iters=num_iters)
+    out_triton = sinkhorn_knopp(logits, num_iters=num_iters)
+
+    torch.testing.assert_close(
+        out_triton.to(torch.float32),
+        out_torch_log.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        out_triton.to(torch.float32),
+        out_torch_exp.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("M", [1, 4, 16, 64, 256, 1024])
+def test_sk_batch_sizes(M):
+    """Test with various batch sizes."""
+    torch.cuda.empty_cache()
+
+    N = 4  # Typical mHC stream count
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out = sinkhorn_knopp(logits, num_iters=10)
+
+    assert out.shape == (M, N, N)
+    assert is_doubly_stochastic(out.to(torch.float32), tol=1e-2)
+
+
+@pytest.mark.parametrize("N", [3, 4, 8, 16])
+def test_sk_matrix_sizes(N):
+    """Test with various matrix sizes (must be power of 2)."""
+    torch.cuda.empty_cache()
+
+    M = 16
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out = sinkhorn_knopp(logits, num_iters=10)
+
+    assert out.shape == (M, N, N)
+    assert is_doubly_stochastic(out.to(torch.float32), tol=1e-2)
+
+
+def test_sk_numerical_stability_large_values():
+    """Test numerical stability with large input values."""
+    torch.cuda.empty_cache()
+
+    M, N = 16, 4
+    # Large positive and negative values
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda") * 10
+
+    out = sinkhorn_knopp(logits, num_iters=50)
+
+    # Primary stability check: no NaN or Inf
+    assert not torch.isnan(out).any(), "Output contains NaN"
+    assert not torch.isinf(out).any(), "Output contains Inf"
+    # Values should be valid probabilities
+    assert torch.all(out >= 0.0), "Output has negative values"
+    assert torch.all(out <= 1.0), "Output has values > 1"
+    # Large values produce peaked matrices; use relaxed tolerance due to bf16 precision
+    assert is_doubly_stochastic(out.to(torch.float32), tol=5e-2)
+
+
+def test_sk_numerical_stability_small_values():
+    """Test numerical stability with small input values."""
+    torch.cuda.empty_cache()
+
+    M, N = 16, 4
+    # Small values (close to zero)
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda") * 0.01
+
+    out = sinkhorn_knopp(logits, num_iters=20)
+
+    assert is_doubly_stochastic(out.to(torch.float32), tol=1e-2)
+    assert not torch.isnan(out).any(), "Output contains NaN"
+    assert not torch.isinf(out).any(), "Output contains Inf"
+
+
+def test_sk_preallocated_output():
+    """Test with pre-allocated output tensor."""
+    torch.cuda.empty_cache()
+
+    M, N = 16, 4
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(M, N, N, dtype=logits.dtype, device=logits.device)
+
+    result = sinkhorn_knopp(logits, num_iters=10, out=out)
+
+    assert result is out
+    assert is_doubly_stochastic(out.to(torch.float32), tol=1e-2)
+
+
+def test_sk_identity_initialization():
+    """Test that identity-like input produces identity-like output."""
+    torch.cuda.empty_cache()
+
+    M, N = 8, 4
+    # Create logits that favor diagonal (identity-like)
+    logits = torch.zeros(M, N, N, dtype=torch.bfloat16, device="cuda")
+    logits[:, range(N), range(N)] = 10.0  # Large diagonal values
+
+    out = sinkhorn_knopp(logits, num_iters=20)
+
+    # Output should be close to identity
+    identity = torch.eye(N, device="cuda").unsqueeze(0).expand(M, -1, -1)
+    torch.testing.assert_close(
+        out.to(torch.float32),
+        identity,
+        atol=0.1,
+        rtol=0.1,
+    )
+
+
+def test_sk_uniform_input():
+    """Test that uniform input produces uniform output (1/N everywhere)."""
+    torch.cuda.empty_cache()
+
+    M, N = 8, 4
+    # Uniform logits (all same value)
+    logits = torch.ones(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out = sinkhorn_knopp(logits, num_iters=20)
+
+    # Output should be uniform: 1/N everywhere
+    expected = torch.full((M, N, N), 1.0 / N, device="cuda")
+    torch.testing.assert_close(
+        out.to(torch.float32),
+        expected,
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_sk_convergence():
+    """Test that more iterations lead to better convergence."""
+    torch.cuda.empty_cache()
+
+    M, N = 16, 4
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    # Compute with different iteration counts
+    out_5 = sinkhorn_knopp(logits, num_iters=5).to(torch.float32)
+    out_20 = sinkhorn_knopp(logits, num_iters=20).to(torch.float32)
+
+    # Measure how close row/col sums are to 1
+    def sum_error(P):
+        row_err = (P.sum(dim=-1) - 1).abs().max()
+        col_err = (P.sum(dim=-2) - 1).abs().max()
+        return max(row_err.item(), col_err.item())
+
+    err_5 = sum_error(out_5)
+    err_20 = sum_error(out_20)
+
+    # More iterations should give better convergence
+    assert err_20 <= err_5, f"More iterations should improve convergence: {err_20} > {err_5}"
+
+
+def test_sk_output_range():
+    """Test that all output values are in valid range [0, 1]."""
+    torch.cuda.empty_cache()
+
+    M, N = 64, 4
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out = sinkhorn_knopp(logits, num_iters=10)
+
+    assert torch.all(out >= 0.0), "Output has negative values"
+    assert torch.all(out <= 1.0), "Output has values > 1"
+
+
+# =============================================================================
+# Tests: Triton vs Exponential Domain PyTorch
+# =============================================================================
+
+
+@pytest.mark.parametrize("M, N", get_sk_test_shapes())
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sk_triton_vs_exp_domain(M, N, dtype):
+    """
+    Test that Triton (log-domain) produces similar results to exponential-domain PyTorch.
+
+    Both implementations should converge to the same doubly stochastic matrix,
+    though there may be small numerical differences due to different computation paths.
+    """
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    logits = torch.randn(M, N, N, dtype=dtype, device="cuda")
+
+    # Use more iterations for better convergence comparison
+    num_iters = 20
+
+    out_exp_domain = sinkhorn_knopp_exp_domain_torch(logits, num_iters=num_iters)
+    out_triton = sinkhorn_knopp(logits, num_iters=num_iters)
+
+    # Both should produce doubly stochastic matrices
+    assert is_doubly_stochastic(out_exp_domain.to(torch.float32), tol=1e-2), (
+        "Exponential domain output is not doubly stochastic"
+    )
+    assert is_doubly_stochastic(out_triton.to(torch.float32), tol=1e-2), (
+        "Triton output is not doubly stochastic"
+    )
+
+    # Results should be close (allowing for numerical differences between domains)
+    torch.testing.assert_close(
+        out_triton.to(torch.float32),
+        out_exp_domain.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.parametrize("num_iters", [10, 20, 50])
+def test_sk_exp_vs_log_domain_convergence(num_iters):
+    """
+    Test that exponential and log domain implementations converge to same result.
+
+    This validates that the mathematical transformation from exponential to log
+    domain is correct and both produce equivalent doubly stochastic matrices.
+
+    Note: Minimum 10 iterations required for reliable convergence.
+    """
+    torch.cuda.empty_cache()
+
+    M, N = 16, 4
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out_exp = sinkhorn_knopp_exp_domain_torch(logits, num_iters=num_iters)
+    out_log = sinkhorn_knopp_log_domain_torch(logits, num_iters=num_iters)
+
+    # Both should be doubly stochastic
+    assert is_doubly_stochastic(out_exp.to(torch.float32), tol=1e-2)
+    assert is_doubly_stochastic(out_log.to(torch.float32), tol=1e-2)
+
+    # Results should match closely
+    torch.testing.assert_close(
+        out_exp.to(torch.float32),
+        out_log.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_sk_exp_domain_numerical_stability():
+    """
+    Test that exponential domain handles moderate input ranges.
+
+    Note: Exponential domain is less stable than log domain for extreme values.
+    This test uses moderate values where both should work well.
+    """
+    torch.cuda.empty_cache()
+
+    M, N = 16, 4
+
+    # Moderate values (not too large, not too small)
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda") * 2
+
+    out_exp = sinkhorn_knopp_exp_domain_torch(logits, num_iters=20)
+    out_triton = sinkhorn_knopp(logits, num_iters=20)
+
+    # Both should be valid
+    assert not torch.isnan(out_exp).any(), "Exp domain output contains NaN"
+    assert not torch.isnan(out_triton).any(), "Triton output contains NaN"
+    assert not torch.isinf(out_exp).any(), "Exp domain output contains Inf"
+    assert not torch.isinf(out_triton).any(), "Triton output contains Inf"
+
+    # Both should be doubly stochastic
+    assert is_doubly_stochastic(out_exp.to(torch.float32), tol=1e-2)
+    assert is_doubly_stochastic(out_triton.to(torch.float32), tol=1e-2)
+
+
+def test_sk_log_domain_advantage_large_values():
+    """
+    Demonstrate that log domain (Triton) handles large values without overflow/underflow.
+
+    With very large input values (* 20), the matrices become extremely peaked
+    (close to permutation matrices with values like 1e-16). The key advantage
+    of log domain is numerical stability - no NaN/Inf even with extreme inputs.
+
+    Note: bf16 precision limits mean row/col sums may not be exactly 1 for
+    extremely peaked matrices, so we use a relaxed tolerance.
+    """
+    torch.cuda.empty_cache()
+
+    M, N = 16, 4
+
+    # Large values that stress exponential domain
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda") * 20
+
+    out_triton = sinkhorn_knopp(logits, num_iters=50)
+
+    # Primary check: log domain should handle this gracefully - no numerical issues
+    assert not torch.isnan(out_triton).any(), "Triton output contains NaN"
+    assert not torch.isinf(out_triton).any(), "Triton output contains Inf"
+    # All values should be valid probabilities
+    assert torch.all(out_triton >= 0.0), "Output has negative values"
+    assert torch.all(out_triton <= 1.0), "Output has values > 1"
+    # Use relaxed tolerance (10%) due to bf16 precision with extremely peaked matrices
+    assert is_doubly_stochastic(out_triton.to(torch.float32), tol=0.1), (
+        "Triton output is not doubly stochastic for large inputs"
+    )
+
+
+@pytest.mark.parametrize("M", [1, 4, 16, 64])
+@pytest.mark.parametrize("N", [2, 4, 8])
+def test_sk_exp_domain_batch_sizes(M, N):
+    """Test exponential domain implementation with various batch and matrix sizes."""
+    torch.cuda.empty_cache()
+
+    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out = sinkhorn_knopp_exp_domain_torch(logits, num_iters=20)
+
+    assert out.shape == (M, N, N)
+    assert is_doubly_stochastic(out.to(torch.float32), tol=1e-2)
+
+
+def test_sk_exp_domain_identity_initialization():
+    """Test that exponential domain produces identity-like output for diagonal-heavy input."""
+    torch.cuda.empty_cache()
+
+    M, N = 8, 4
+    # Create logits that favor diagonal (identity-like)
+    logits = torch.zeros(M, N, N, dtype=torch.bfloat16, device="cuda")
+    logits[:, range(N), range(N)] = 10.0  # Large diagonal values
+
+    out = sinkhorn_knopp_exp_domain_torch(logits, num_iters=20)
+
+    # Output should be close to identity
+    identity = torch.eye(N, device="cuda").unsqueeze(0).expand(M, -1, -1)
+    torch.testing.assert_close(
+        out.to(torch.float32),
+        identity,
+        atol=0.1,
+        rtol=0.1,
+    )
+
+
+def test_sk_exp_domain_uniform_input():
+    """Test that exponential domain produces uniform output for uniform input."""
+    torch.cuda.empty_cache()
+
+    M, N = 8, 4
+    # Uniform logits (all same value)
+    logits = torch.ones(M, N, N, dtype=torch.bfloat16, device="cuda")
+
+    out = sinkhorn_knopp_exp_domain_torch(logits, num_iters=20)
+
+    # Output should be uniform: 1/N everywhere
+    expected = torch.full((M, N, N), 1.0 / N, device="cuda")
+    torch.testing.assert_close(
+        out.to(torch.float32),
+        expected,
+        atol=1e-2,
+        rtol=1e-2,
+    )

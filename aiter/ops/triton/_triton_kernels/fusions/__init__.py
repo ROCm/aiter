@@ -3,8 +3,10 @@
 
 from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_fused_rmsnorm_matmul_sigmoid_kernel,
+    _sinkhorn_knopp_log_domain_kernel,
 )
 
 __all__ = [
     "_mhc_fused_rmsnorm_matmul_sigmoid_kernel",
+    "_sinkhorn_knopp_log_domain_kernel",
 ]
