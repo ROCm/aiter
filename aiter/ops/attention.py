@@ -122,6 +122,116 @@ def pa_fwd_asm(
 ) -> torch.Tensor: ...
 
 
+def _should_use_asm_kernel(
+    num_seqs: int,
+    num_heads: int,
+    kv_cache_tensor_dtype: torch.dtype,
+) -> bool:
+
+    if kv_cache_tensor_dtype == torch.int8:
+        return True
+
+    # Get GPU compute units (CUs)
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    # ASM kernel becomes relevant, once the total_heads is sufficiently large compared to CUs
+    total_heads = num_seqs * num_heads
+    return total_heads > 2 * cu_num
+
+
+def paged_attention_common(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    scale: float,
+    max_qlen: int = 1,
+    max_seq_len: int = 1,
+    K_QScale_hip: Optional[torch.Tensor] = None,  # [num_seqs, num_heads]
+    V_QScale_hip: Optional[torch.Tensor] = None,
+    K_QScale_asm: Optional[
+        torch.Tensor
+    ] = None,  # [num_blocks, num_kv_heads, block_size]
+    V_QScale_asm: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    high_precision: Optional[
+        int
+    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: Optional[str] = None,
+    kv_cache_dtype: str = "auto",
+    kv_cache_tensor_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """
+    Paged attention forward pass with automatic kernel selection.
+    ASM is favored for int8 kv caches, for short ctx_len, or when the workload exceeds
+    the heuristic thresholds for larger ctx_len values.
+    PA is normally using per tensor quant and this is what has been tested, however,
+    per head quant can be supported as well in principle, but not tested.
+    """
+    kv_cache_tensor_dtype = (
+        kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else K.dtype
+    )
+    num_seqs, num_heads, head_size = Q.shape
+
+    use_asm_kernel = (
+        _should_use_asm_kernel(num_seqs, num_heads, kv_cache_tensor_dtype)
+        or high_precision == 2
+    )
+
+    if use_asm_kernel:
+        output = pa_fwd_asm(
+            Q,
+            K,
+            V,
+            block_tables,
+            context_lens,
+            block_tables_stride0,
+            max_qlen,
+            K_QScale_asm,
+            V_QScale_asm,
+            out_,
+            qo_indptr,
+            high_precision,
+            kernelName,
+        )
+        return output
+
+    # Use ROCm paged attention kernel for smaller workloads / common path.
+    output = out_ if out_ is not None else torch.empty_like(Q)
+
+    paged_attention_rocm(
+        out=output,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        tmp_out=tmp_out,
+        query=Q,
+        key_cache=K,
+        value_cache=V,
+        num_kv_heads=int(K.size(1)),
+        scale=scale,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        block_size=int(K.size(3)),
+        max_context_len=max_seq_len,
+        alibi_slopes=None,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=K_QScale_hip,
+        v_scale=V_QScale_hip,
+        fp8_out_scale=None,
+        partition_size=256,
+        mtp=1,
+        q_scale=None,
+    )
+    return output
+
+
 def gen_pa_ps_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -588,6 +698,92 @@ def get_pa_metadata_v1(
                                                     reduced.
     """
     ...
+
+
+def get_ps_metadata_info_v1(
+    batch_size: int,
+    num_head_k: int,
+    max_qlen: int,
+    qlen_granularity: int = 256,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    device = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(device)
+    cu_num = device_properties.multi_processor_count
+
+    num_clusters = math.gcd(num_head_k, cu_num)
+    cus_per_cluster = cu_num // num_clusters
+
+    max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
+
+    qo_tile_cnt = batch_size * max_qo_split_per_batch
+    # TODO: consider split q to reduce max_works & max_partials
+    max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
+    max_partials = (
+        min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2)
+        * max_qo_split_per_batch
+    )
+
+    return (
+        (2, torch.uint64),  # work_metadata_ptrs
+        (cu_num + 1, torch.int32),  # work_indptr
+        ((max_works, 8), torch.int32),  # work_info
+        (qo_tile_cnt + 1, torch.int32),  # reduce_indptr
+        ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_partials, torch.int32),  # reduce_partial_map
+    )
+
+
+@compile_ops("module_ps_metadata")
+def get_ps_metadata_v1(
+    seqlens_qo_indptr: torch.Tensor,
+    pages_kv_indptr: torch.Tensor,
+    context_lens: torch.Tensor,
+    gqa_ratio: int,
+    num_heads_k: int,
+    work_metadata_ptrs: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    qhead_granularity: int = 1,
+    qlen_granularity: int = 256,
+    kvlen_granularity: int = 16,
+    block_size: int = 16,
+    is_causal: bool = True,
+) -> None: ...
+
+
+@compile_ops(MD_NAME)
+def mla_prefill_ps_asm_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+) -> None: ...
 
 
 def get_mla_metadata_info_v1(
