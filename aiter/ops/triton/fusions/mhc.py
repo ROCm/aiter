@@ -7,6 +7,7 @@ High-level Python wrapper for mHC (manifold-constrained Hyper Connection).
 Implements equations 14-18 from the mHC paper in a single optimized kernel call.
 """
 
+from typing import Optional
 import torch
 import triton
 
@@ -28,7 +29,7 @@ def mhc(
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
-    out: torch.Tensor = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute mHC projection mapping with all three streams (equations 14-18).
@@ -55,7 +56,7 @@ def mhc(
         n: Stream parameter - hyperparameter controlling manifold dimension.
            Determines output size: n² (pre) + n (post) + n (res) = n² + 2n
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
-        out: Optional pre-allocated output tensor with shape (M, n² + 2n)
+        out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, n² + 2n)
 
     Returns:
         Output tensor H with shape (M, n² + 2n) containing three concatenated streams:
