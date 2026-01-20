@@ -529,7 +529,7 @@ def test_sk_batch_sizes(M):
     assert is_doubly_stochastic(out.to(torch.float32), tol=1e-2)
 
 
-@pytest.mark.parametrize("N", [3, 4, 8, 16])
+@pytest.mark.parametrize("N", [2, 4, 8, 16, 32, 64])
 def test_sk_matrix_sizes(N):
     """Test with various matrix sizes (must be power of 2)."""
     torch.cuda.empty_cache()
