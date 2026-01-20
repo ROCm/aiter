@@ -32,7 +32,7 @@ from gemm_moe_tune import FmoeTuner
 # Essential counters (active)
 COUNTERS = [
     # "MemUnitStalled", "FetchSize", "MfmaFlops", "MfmaFlopsF16", "MfmaFlopsF32", "MfmaFlopsF64", 
-    "TCC_HIT", "TCC_MISS", "LDSBankConflict",
+    "TCC_HIT", "TCC_MISS", "LDSBankConflict", "OccupancyPercent", "MemUnitStalled", "MfmaUtil", "SQ_WAIT_INST_ANY", "TCC_TAG_STALL_sum",
     
 ]
 
@@ -607,7 +607,7 @@ def run_rocprofv3(row, output_dir, keep_temp_files=False):
     kernel_type = str(row['kernel_type'])
     stage = str(row['stage'])
     block_m = int(row['block_m'])
-    kernel_name = row['kernel_name'][:40]  # Truncate for filename
+    kernel_name = row['kernel_name'][:]  # Truncate for filename
     
     # Create descriptive script name with config_idx prefix for uniqueness
     base_name = f"cfg{config_idx}_{kernel_type}_{stage}_block{block_m}_{kernel_name}"
