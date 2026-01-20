@@ -199,11 +199,10 @@ def _sinkhorn_knopp_log_domain_kernel(
     col_idx = tl.arange(0, N)[None, :]  # (1, N)
     flat_idx = row_idx * stride_row + col_idx * stride_col
 
-
     # Load the NxN matrix (raw logits) in log domain
     log_A = tl.load(logits_ptr + batch_offset + flat_idx).to(tl.float32)
 
-    # STEP 2: Initialize log scaling factors
+    # Initialize log scaling factors
     # Initially u = v = 1 (no scaling), so log(1) = 0, 
     log_u = tl.zeros((N,), dtype=tl.float32)  # Row scalings
     log_v = tl.zeros((N,), dtype=tl.float32)  # Column scalings
