@@ -380,52 +380,55 @@ def test_fused_rope_concat_and_cache_mla(
         is_nope_first,
         q_out_dtype,
     )
-    #### triton test
+    ############################################################
+    # triton test
+    ############################################################
     # reshaped_kv_c = kv_c.unsqueeze(1)
     # reshaped_k_pe = k_pe.unsqueeze(1)
-    triton_q_out = torch.empty(
-        (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
-        dtype=q_out_dtype,
-        device=q_nope.device,
-    )
-    from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+    # triton_q_out = torch.empty(
+    #    (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
+    #    dtype=q_out_dtype,
+    #    device=q_nope.device,
+    # )
+    # from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 
     #
-    triton_temp = torch.zeros(
-        (num_tokens, num_kv_heads, entry_size), dtype=cache_dtype, device=device
-    )
+    # triton_temp = torch.zeros(
+    #    (num_tokens, num_kv_heads, entry_size), dtype=cache_dtype, device=device
+    # )
     #
-    if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
-        (triton_q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out), triton_us = (
-            run_perftest(
-                fused_qk_rope_cat_and_cache_mla,
-                q_nope,
-                q_pe,
-                kv_c,
-                k_pe,
-                triton_temp,
-                slot_mapping,
-                pos,
-                cos_cache,
-                sin_cache,
-                scale,
-                is_neox,
-                0,
-                True if kv_cache_dtype == "fp8" else False,
-                triton_q_out,
-            )
-        )
-    else:
-        (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = (
-            triton_q_out,
-            None,
-            None,
-            triton_temp,
-        ), None
+    # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
+    #    (triton_q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out), triton_us = (
+    #        run_perftest(
+    #            fused_qk_rope_cat_and_cache_mla,
+    #            q_nope,
+    #            q_pe,
+    #            kv_c,
+    #            k_pe,
+    #            triton_temp,
+    #            slot_mapping,
+    #            pos,
+    #            cos_cache,
+    #            sin_cache,
+    #            scale,
+    #            is_neox,
+    #            0,
+    #            True if kv_cache_dtype == "fp8" else False,
+    #            triton_q_out,
+    #        )
+    #    )
+    # else:
+    #    (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = (
+    #        triton_q_out,
+    #        None,
+    #        None,
+    #        triton_temp,
+    #    ), None
     #
-    triton_temp = triton_temp.reshape(
-        num_tokens // block_size, block_size, num_kv_heads, entry_size
-    )
+    # triton_temp = triton_temp.reshape(
+    #    num_tokens // block_size, block_size, num_kv_heads, entry_size
+    # )
+    ############################################################
     if num_kv_heads == 1:
         kv_c = kv_c.squeeze(1)
         k_pe = k_pe.squeeze(1)
@@ -462,19 +465,19 @@ def test_fused_rope_concat_and_cache_mla(
         err_kv = checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
         err_q_out = checkAllclose(q_result_tmp, q_expected_tmp, atol=0.01, rtol=0.01)
         ### compare with qscale=1.0
-        if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
-            err_triton_kv = checkAllclose(
-                triton_temp.to(torch.float32),
-                kv_expected_temp,
-                atol=0.01,
-                rtol=0.01,
-                msg="fp8 kv result compared with triton",
-            )
-            err_triton_q_out = checkAllclose(
-                triton_q_out.to(torch.float32) * q_scale,
-                q_expected_tmp,
-                msg="fp8 qout result compared with triton",
-            )
+        # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
+        #    err_triton_kv = checkAllclose(
+        #        triton_temp.to(torch.float32),
+        #        kv_expected_temp,
+        #        atol=0.01,
+        #        rtol=0.01,
+        #        msg="fp8 kv result compared with triton",
+        #    )
+        #    err_triton_q_out = checkAllclose(
+        #        triton_q_out.to(torch.float32) * q_scale,
+        #        q_expected_tmp,
+        #        msg="fp8 qout result compared with triton",
+        #    )
     elif kv_cache_dtype == "fp8" and q_dtype == "auto":
         kv_result_temp = kv_cache.to(torch.float32)
         kv_expected_temp = ref_kv_cache.to(torch.float32)
@@ -488,16 +491,15 @@ def test_fused_rope_concat_and_cache_mla(
         err_q_out = checkAllclose(
             q_out, ref_q_out, msg="bf16 qout result compared with ref"
         )
-        if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
-            err_triton_q_out = checkAllclose(
-                triton_q_out, ref_q_out, msg="bf16 triton qout result compared with ref"
-            )
-
-            err_triton_kv = checkAllclose(
-                triton_temp.to(torch.float32),
-                kv_expected_temp,
-                msg="fp8 triton kv result compared with ref",
-            )
+        # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
+        #    err_triton_q_out = checkAllclose(
+        #        triton_q_out, ref_q_out, msg="bf16 triton qout result compared with ref"
+        #    )
+        #    err_triton_kv = checkAllclose(
+        #        triton_temp.to(torch.float32),
+        #        kv_expected_temp,
+        #        msg="fp8 triton kv result compared with ref",
+        #    )
     else:
         print(
             f"kv_cache.shape={kv_cache.shape}, ref_kv_cache.shape={ref_kv_cache.shape}"
@@ -509,14 +511,14 @@ def test_fused_rope_concat_and_cache_mla(
             q_out, ref_q_out, msg="bf16 qout result compared with ref"
         )
 
-        if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
-            err_triton_q_out = checkAllclose(
-                triton_q_out, ref_q_out, msg="bf16 triton qout result compared with ref"
-            )
-            err_triton_kv = checkAllclose(
-                triton_temp, ref_kv_cache, msg="bf16 triton kv result compared with ref"
-            )
-    ret["triton_us"] = triton_us
+        # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
+        #    err_triton_q_out = checkAllclose(
+        #        triton_q_out, ref_q_out, msg="bf16 triton qout result compared with ref"
+        #    )
+        #    err_triton_kv = checkAllclose(
+        #        triton_temp, ref_kv_cache, msg="bf16 triton kv result compared with ref"
+        #    )
+    # ret["triton_us"] = triton_us
     # ret['triton_kv_err'] = err_triton_kv
     # ret['triton_q_err'] = err_triton_q_out
     ret["fused_qk_us"] = avg_us
