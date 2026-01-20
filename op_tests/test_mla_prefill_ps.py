@@ -14,12 +14,12 @@ import torch
 from aiter import dtypes
 from aiter import per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
-from aiter.ops.triton.utils._triton import arch_info
+from aiter.jit.utils.chip_info import get_gfx
 
 from typing import Tuple, Optional
 
 # This test only supports gfx950, skip on gfx942
-if arch_info.get_arch() == "gfx942":
+if get_gfx() == "gfx942":
     aiter.logger.info(
         "Skipping test_mla_prefill_ps.py: only supported on gfx950, not gfx942"
     )
