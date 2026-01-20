@@ -32,7 +32,7 @@ from gemm_moe_tune import FmoeTuner
 # Essential counters (active)
 COUNTERS = [
     # "MemUnitStalled", "FetchSize", "MfmaFlops", "MfmaFlopsF16", "MfmaFlopsF32", "MfmaFlopsF64", 
-    "TCC_HIT", "TCC_MISS", "LDSBankConflict",
+    "TCC_HIT", "TCC_MISS", "LDSBankConflict", "OccupancyPercent", "MemUnitStalled", "MfmaUtil", "SQ_WAIT_INST_ANY", "TCC_TAG_STALL_sum",
     
 ]
 
@@ -601,16 +601,16 @@ def create_kernel_execution_script(row, script_path):
                                          q_type_str, act_type_str, use_g1u1, doweight_stage1)
     script_path.write_text(code)
 
-def run_rocprofv3(row, output_dir):
+def run_rocprofv3(row, output_dir, keep_temp_files=False):
     """Run rocprofv3 kernel-trace with optional counter collection."""
     config_idx = int(row['config_idx'])
     kernel_type = str(row['kernel_type'])
     stage = str(row['stage'])
     block_m = int(row['block_m'])
-    kernel_name = row['kernel_name'][:40]  # Truncate for filename
+    kernel_name = row['kernel_name'][:]  # Truncate for filename
     
-    # Create descriptive script name
-    base_name = f"kernel_run_{kernel_type}_{stage}_block{block_m}_{kernel_name}"
+    # Create descriptive script name with config_idx prefix for uniqueness
+    base_name = f"cfg{config_idx}_{kernel_type}_{stage}_block{block_m}_{kernel_name}"
     script_name = f"{base_name}.py"
     script_path = output_dir / script_name
     
@@ -640,7 +640,11 @@ def run_rocprofv3(row, output_dir):
         
         if result.returncode == 0:
             print(f"  ✓ Success!")
-            print(f"  Test script: {script_path}")
+            if not keep_temp_files:
+                # Delete temp script after successful execution
+                script_path.unlink()
+            else:
+                print(f"  Test script: {script_path}")
         else:
             print(f"  ✗ Failed (exit code {result.returncode})")
             print(f"  Test script: {script_path}")
@@ -659,17 +663,13 @@ def run_rocprofv3(row, output_dir):
                     if line.strip():
                         print(f"  {line}")
         
-        # Keep temp file for debugging (don't delete)
-        # script_path.unlink()
         return base_name if result.returncode == 0 else None
     except Exception as e:
         print(f"  Exception: {e}")
         print(f"  Test script kept: {script_path}")
-        # Keep temp file even on error (don't delete)
-        # script_path.unlink()
         return None
 
-def parse_rocprofv3_output(config_name, output_dir):
+def parse_rocprofv3_output(config_name, output_dir, keep_temp_files=False):
     """Parse rocprofv3 PMC counter_collection CSV to extract counter values."""
     # rocprofv3 creates cfg_N_counter_collection.csv with counter data
     counter_file = output_dir / f"{config_name}_counter_collection.csv"
@@ -699,6 +699,18 @@ def parse_rocprofv3_output(config_name, output_dir):
             if counter_name in COUNTERS:
                 counter_data[counter_name] = counter_value
         
+        # Clean up rocprofv3 CSV files after parsing (unless keep_temp_files is set)
+        if not keep_temp_files:
+            # Delete all rocprofv3 output CSV files for this config
+            for csv_file in output_dir.glob(f"{config_name}*.csv"):
+                csv_file.unlink()
+            
+            # Also clean up .rocprofv3 directory if it exists
+            rocprof_dir = output_dir / ".rocprofv3"
+            if rocprof_dir.exists() and rocprof_dir.is_dir():
+                import shutil
+                shutil.rmtree(rocprof_dir)
+        
         return counter_data
         
     except Exception as e:
@@ -711,6 +723,8 @@ def main():
     parser = argparse.ArgumentParser(description="Profile MOE kernels with rocprofv3")
     parser.add_argument('-i', '--input', required=True, help='Input CSV file with kernel configs')
     parser.add_argument('-o', '--output-dir', default='rocprofv3_results', help='Output directory')
+    parser.add_argument('--keep-temp-files', action='store_true', 
+                        help='Keep temporary Python scripts and rocprofv3 CSV files (default: delete after use)')
     
     args = parser.parse_args()
     
@@ -720,33 +734,59 @@ def main():
     
     print(f"\nProfiling {len(kernels)} kernels using rocprofv3")
     print(f"Input: {args.input}")
-    print(f"Output directory: {output_dir.absolute()}\n")
+    print(f"Output directory: {output_dir.absolute()}")
+    print(f"Temp files: {'KEEP' if args.keep_temp_files else 'DELETE after use'}\n")
+    
+    # Prepare output file and write header
+    output_file = output_dir / "kernels_with_counters.csv"
     
     results = []
+    skipped_count = 0
+    profiled_count = 0
     for idx, (_, row) in enumerate(kernels.iterrows(), 1):
-        config_name = run_rocprofv3(row, output_dir)
-        counter_data = parse_rocprofv3_output(config_name, output_dir) if config_name else {}
+        # Check if kernel failed during benchmarking
+        error_value = str(row.get('error', '')).strip()
+        if error_value == 'failed':
+            print(f"Config {row['config_idx']}: Skipping failed kernel: {row['kernel_name'][:40]}")
+            skipped_count += 1
+            # Don't write failed kernels to output CSV
+            continue
+        
+        config_name = run_rocprofv3(row, output_dir, args.keep_temp_files)
+        counter_data = parse_rocprofv3_output(config_name, output_dir, args.keep_temp_files) if config_name else {}
         
         result_row = dict(row)
         result_row.update(counter_data)
         results.append(result_row)
+        profiled_count += 1
+        
+        # Write to CSV immediately after processing each kernel
+        # Write header only for the first successfully profiled kernel
+        pd.DataFrame([result_row]).to_csv(
+            output_file, 
+            mode='a', 
+            header=(profiled_count == 1), 
+            index=False
+        )
         
         if len(kernels) > 1 and idx % max(1, len(kernels) // 5) == 0:
             print(f"  Progress: {idx}/{len(kernels)}")
     
     results_df = pd.DataFrame(results)
-    output_file = output_dir / "kernels_with_counters.csv"
-    results_df.to_csv(output_file, index=False)
     
     print(f"\n{'='*60}")
     print(f"RESULTS SUMMARY")
     print(f"{'='*60}")
     print(f"Output file: {output_file}")
+    print(f"Total kernels in input: {len(kernels)}")
+    print(f"Skipped (failed): {skipped_count}")
+    print(f"Profiled: {len(kernels) - skipped_count}")
     print(f"Original columns: {len(kernels.columns)}")
     print(f"Profiling columns added: {len(results_df.columns) - len(kernels.columns)}")
-    print(f"New columns:")
-    for col in results_df.columns[len(kernels.columns):]:
-        print(f"  - {col}")
+    if len(results_df.columns) > len(kernels.columns):
+        print(f"New columns:")
+        for col in results_df.columns[len(kernels.columns):]:
+            print(f"  - {col}")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
