@@ -497,7 +497,7 @@ def gemm_afp4wfp4(
     w_scales: torch.Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    config: Optional[dict] = None,
     skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
     """

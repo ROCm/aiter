@@ -6,7 +6,7 @@
         "GROUP_SIZE_M": 2,
         "num_warps": 8,
         "num_stages": 2,
-        "waves_per_eu": 1,
+        "waves_per_eu": 0,
         "matrix_instr_nonkdim": 32,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
