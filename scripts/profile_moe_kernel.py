@@ -20,12 +20,12 @@ import sqlite3
 current_dir = Path(__file__).parent
 aiter_root = current_dir.parent
 sys.path.insert(0, str(aiter_root))
-sys.path.insert(0, str(aiter_root / "hsa/gfx942/fmoe_2stages"))
+sys.path.insert(0, str(aiter_root / "csrc/ck_gemm_moe_2stages_codegen"))
 
 import aiter
 from aiter import QuantType, ActivationType
-import tune
-from tune import FmoeTuner
+import gemm_moe_tune
+from gemm_moe_tune import FmoeTuner
 
 # Note: With new ROCm image, rocprofv3 --pmc now works without crashes!
 
@@ -267,9 +267,251 @@ print("="*80)
 '''
 
 
-def get_kernels():
+def generate_ck_stage1_script(config_idx, kernel_name, token, model_dim, inter_dim,
+                               expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                               q_type_str, act_type_str, use_g1u1, doweight_stage1):
+    """Generate script for CK stage1 kernel."""
+    return f'''#!/usr/bin/env python3
+"""
+Profiling CK stage1 kernel.
+Kernel: {kernel_name}
+"""
+
+import sys
+sys.path.insert(0, '/home/AMD/msaffari/workspace/aiter')
+
+import torch
+import aiter
+from aiter import QuantType, ActivationType
+from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.moe_op import ck_moe_stage1_fwd
+
+print("="*80)
+print("CK Stage1 Kernel Profiling - Config {config_idx}")
+print("="*80)
+print("TARGET KERNEL: {kernel_name}")
+print("TARGET STAGE: stage1")
+print("Config: token={token}, model_dim={model_dim}, inter_dim={inter_dim}, expert={expert}, topk={topk}")
+print("="*80)
+
+TARGET_KERNEL = "{kernel_name}"
+token = {token}
+model_dim = {model_dim}
+inter_dim = {inter_dim}
+expert = {expert}
+topk = {topk}
+dtype = {dtype_str}
+q_dtype_a = {q_dtype_a_str}
+q_dtype_w = {q_dtype_w_str}
+q_type = {q_type_str}
+act_type = {act_type_str}
+use_g1u1 = {use_g1u1}
+doweight_stage1 = {doweight_stage1}
+block_m = {block_m}
+
+print("\\nGenerating test data...")
+torch.manual_seed(42)
+torch.set_default_device('cuda')
+
+hidden_states = torch.randn(token, model_dim, dtype=dtype)
+topk_weights = torch.randn(token, topk, dtype=torch.float32)
+topk_ids = torch.randint(0, expert, (token, topk), dtype=torch.int32)
+
+w1 = torch.randn(expert, inter_dim, model_dim, dtype=dtype)
+w2 = torch.randn(expert, model_dim, inter_dim, dtype=dtype)
+
+print("Quantizing...")
+a1_qt, a1_scale = aiter.get_torch_quant(q_type)(hidden_states, quant_dtype=q_dtype_a)
+w1_qt, w1_scale = aiter.pertoken_quant(w1.view(expert, -1, 128), quant_dtype=q_dtype_w)
+w2_qt, w2_scale = aiter.pertoken_quant(w2.view(expert, -1, 128), quant_dtype=q_dtype_w)
+
+w1_qt = w1_qt.view(expert, inter_dim, model_dim)
+w2_qt = w2_qt.view(expert, model_dim, inter_dim)
+
+w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
+w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
+
+print("Sorting...")
+from aiter.fused_moe import moe_sorting
+sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+    topk_ids, topk_weights, expert, model_dim, dtype
+)
+
+print(f"\\n{{'*'*80}}")
+print(f"*** PROFILING TARGET: Stage1 (block_m={{block_m}}) ***")
+print(f"*** {{TARGET_KERNEL}}")
+print(f"{{'*'*80}}")
+
+inter_states = torch.empty(token, topk, inter_dim, dtype=dtype)
+ck_moe_stage1_fwd(
+    hidden_states=a1_qt,
+    w1=w1_qt_shffle,
+    w2=w2_qt_shffle,
+    sorted_token_ids=sorted_ids,
+    sorted_expert_ids=sorted_expert_ids,
+    num_valid_ids=num_valid_ids,
+    out=inter_states,
+    topk=topk,
+    kernelName=TARGET_KERNEL,
+    w1_scale=w1_scale,
+    a1_scale=a1_scale,
+    block_m=block_m,
+    sorted_weights=sorted_weights if doweight_stage1 else None,
+    quant_type=q_type,
+    activation=act_type,
+    dst_type=dtype,
+)
+
+torch.cuda.synchronize()
+
+print("\\n" + "="*80)
+print("✓ TARGET KERNEL executed!")
+print(f"Output shape: {{inter_states.shape}}")
+print("="*80)
+'''
+
+
+def generate_asm_stage1_script(config_idx, kernel_name, stage, token, model_dim, inter_dim,
+                                expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                                q_type_str, act_type_str, use_g1u1, doweight_stage1):
+    """Generate script for ASM stage1 kernel."""
+    return f'''#!/usr/bin/env python3
+"""
+Profiling ASM {stage} kernel.
+Kernel: {kernel_name}
+"""
+
+import sys
+sys.path.insert(0, '/home/AMD/msaffari/workspace/aiter')
+
+import torch
+import aiter
+from aiter import QuantType, ActivationType
+from aiter.ops.shuffle import shuffle_weight
+
+print("="*80)
+print("ASM {stage.capitalize()} Kernel Profiling - Config {config_idx}")
+print("="*80)
+print("TARGET KERNEL: {kernel_name}")
+print("TARGET STAGE: {stage}")
+print("Config: token={token}, model_dim={model_dim}, inter_dim={inter_dim}, expert={expert}, topk={topk}")
+print("="*80)
+
+TARGET_KERNEL = "{kernel_name}"
+token = {token}
+model_dim = {model_dim}
+inter_dim = {inter_dim}
+expert = {expert}
+topk = {topk}
+dtype = {dtype_str}
+q_dtype_a = {q_dtype_a_str}
+q_dtype_w = {q_dtype_w_str}
+q_type = {q_type_str}
+act_type = {act_type_str}
+use_g1u1 = {use_g1u1}
+doweight_stage1 = {doweight_stage1}
+block_m = {block_m}
+
+print("\\nGenerating test data...")
+torch.manual_seed(42)
+torch.set_default_device('cuda')
+
+hidden_states = torch.randn(token, model_dim, dtype=dtype)
+topk_weights = torch.randn(token, topk, dtype=torch.float32)
+topk_ids = torch.randint(0, expert, (token, topk), dtype=torch.int32)
+
+# For g1u1, w1 is inter_dim*2 (gate+up), else just inter_dim (from tune.py's generate_data)
+if use_g1u1:
+    w1 = torch.randn(expert, inter_dim * 2, model_dim, dtype=dtype)
+else:
+    w1 = torch.randn(expert, inter_dim, model_dim, dtype=dtype)
+w2 = torch.randn(expert, model_dim, inter_dim, dtype=dtype)
+
+print("Quantizing...")
+# For per_1x128, need special handling (from tune.py's generate_data)
+if q_type == QuantType.per_1x128:
+    a1_qt, a1_scale = aiter.pertoken_quant(
+        hidden_states.view(token, -1, 128), quant_dtype=q_dtype_a
+    )
+    a1_qt = a1_qt.view(token, model_dim)
+    a1_scale = a1_scale.squeeze(-1)
+else:
+    a1_qt, a1_scale = aiter.get_torch_quant(q_type)(hidden_states, quant_dtype=q_dtype_a)
+
+w1_qt, w1_scale = aiter.pertoken_quant(w1.view(expert, -1, 128), quant_dtype=q_dtype_w)
+w2_qt, w2_scale = aiter.pertoken_quant(w2.view(expert, -1, 128), quant_dtype=q_dtype_w)
+
+w1_qt = w1_qt.view(w1.shape)
+w2_qt = w2_qt.view(w2.shape)
+
+w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
+w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
+
+print("Sorting...")
+from aiter.fused_moe import moe_sorting
+sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+    topk_ids, topk_weights, expert, model_dim, dtype, block_m
+)
+
+print(f"\\n{{'*'*80}}")
+print(f"*** PROFILING TARGET: ASM {stage} (block_m={{block_m}}) ***")
+print(f"*** {{TARGET_KERNEL}}")
+print(f"{{'*'*80}}")
+
+if "{stage}" != "stage1":
+    print("ERROR: ASM 2-stage kernels only have stage1!")
+    print(f"Got stage: {{'{stage}'}}")
+    sys.exit(1)
+
+# Call ASM stage1 using positional arguments (matching tune.py's run_asm_stage1)
+from aiter.fused_moe import asm_stage1
+
+# Create output tensor with special handling for per_1x128 (from tune.py's generate_asm_stage1)
+if q_type == QuantType.per_1x128:
+    ratio = a1_scale.element_size() // a1_qt.element_size()
+    out = torch.zeros(
+        (token + (token * ratio + 127) // 128, topk, inter_dim),
+        dtype=a1_qt.dtype,  # Use quantized dtype, not output dtype!
+    )
+else:
+    out = torch.empty((token, topk, inter_dim), dtype=dtype)
+
+# For per_1x128, a1_scale needs to be transposed (from tune.py's generate_asm_stage1)
+a1_scale_for_kernel = a1_scale
+if q_type == QuantType.per_1x128:
+    a1_scale_for_kernel = a1_scale.t().contiguous()
+
+result = asm_stage1(
+    a1_qt,                                          # input
+    w1_qt_shffle,                                   # w1
+    w2_qt_shffle,                                   # w2
+    sorted_ids,                                     # sorted_ids
+    sorted_expert_ids,                              # sorted_expert_ids
+    num_valid_ids,                                  # num_valid_ids
+    out,                                            # out
+    topk,                                           # topk
+    block_m,                                        # block_m
+    TARGET_KERNEL,                                  # kernelName
+    0,                                              # ksplit
+    act_type,                                       # activation
+    q_type,                                         # quant_type
+    a1_scale_for_kernel,                            # a1_scale (transposed for per_1x128)
+    w1_scale,                                       # w1_scale
+    sorted_weights if doweight_stage1 else None,   # sorted_weights
+)
+
+torch.cuda.synchronize()
+
+print("\\n" + "="*80)
+print("✓ TARGET KERNEL executed!")
+print(f"Output shape: {{result.shape}}")
+print("="*80)
+'''
+
+
+def get_kernels(csv_file):
     """Load the CSV with best kernels."""
-    csv_path = Path("results/sample1.csv")
+    csv_path = Path(csv_file)
     if not csv_path.exists():
         print(f"Error: {csv_path} not found")
         sys.exit(1)
@@ -314,20 +556,28 @@ def create_kernel_execution_script(row, script_path):
                                          expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
                                          q_type_str, act_type_str, use_g1u1, doweight_stage1)
     else:
-        # ASM stage1/stage2 - use similar approach
-        code = generate_asm_stage_script(config_idx, kernel_name, stage, token, model_dim, inter_dim,
-                                        expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
-                                        q_type_str, act_type_str, use_g1u1, doweight_stage1)
+        code = generate_asm_stage1_script(config_idx, kernel_name, stage, token, model_dim, inter_dim,
+                                         expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
+                                         q_type_str, act_type_str, use_g1u1, doweight_stage1)
     script_path.write_text(code)
 
 def run_rocprofv3(row, output_dir):
     """Run rocprofv3 kernel-trace with optional counter collection."""
     config_idx = int(row['config_idx'])
+    kernel_type = str(row['kernel_type'])
+    stage = str(row['stage'])
+    block_m = int(row['block_m'])
+    kernel_name = row['kernel_name'][:40]  # Truncate for filename
     
-    script_path = Path(f"_profiling_{config_idx}.py")
+    # Create descriptive script name
+    base_name = f"kernel_run_{kernel_type}_{stage}_block{block_m}_{kernel_name}"
+    script_name = f"{base_name}.py"
+    script_path = output_dir / script_name
+    
     create_kernel_execution_script(row, script_path)
     
-    output_file = output_dir / f"cfg_{config_idx}"
+    # Use same base name for rocprofv3 output files
+    output_file = output_dir / base_name
     
     # rocprofv3 is now in PATH with new ROCm image
     # Add --pmc with counters to collect performance metrics
@@ -371,7 +621,7 @@ def run_rocprofv3(row, output_dir):
         
         # Keep temp file for debugging (don't delete)
         # script_path.unlink()
-        return f"cfg_{config_idx}" if result.returncode == 0 else None
+        return base_name if result.returncode == 0 else None
     except Exception as e:
         print(f"  Exception: {e}")
         print(f"  Test script kept: {script_path}")
@@ -416,11 +666,20 @@ def parse_rocprofv3_output(config_name, output_dir):
         return {}
 
 def main():
-    kernels = get_kernels()
-    output_dir = Path("rocprofv3_results")
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Profile MOE kernels with rocprofv3")
+    parser.add_argument('-i', '--input', required=True, help='Input CSV file with kernel configs')
+    parser.add_argument('-o', '--output-dir', default='rocprofv3_results', help='Output directory')
+    
+    args = parser.parse_args()
+    
+    kernels = get_kernels(args.input)
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
     
-    print(f"\nProfiling {len(kernels)} kernels using rocprofv3 kernel-trace...")
+    print(f"\nProfiling {len(kernels)} kernels using rocprofv3")
+    print(f"Input: {args.input}")
     print(f"Output directory: {output_dir.absolute()}\n")
     
     results = []
@@ -436,7 +695,7 @@ def main():
             print(f"  Progress: {idx}/{len(kernels)}")
     
     results_df = pd.DataFrame(results)
-    output_file = "rocprofv3_results/kernels_with_counters.csv"
+    output_file = output_dir / "kernels_with_counters.csv"
     results_df.to_csv(output_file, index=False)
     
     print(f"\n{'='*60}")
