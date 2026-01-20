@@ -160,7 +160,7 @@ def get_GEMM_A16W16_config(
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
         logger.info(
-            f"using {default_config['libtype']} solution:{default_config['solidx']} for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
+            f"using {default_config['libtype']} solution:{default_config['solidx']} for {M=} {N=} {K=} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
         )
         return default_config
 

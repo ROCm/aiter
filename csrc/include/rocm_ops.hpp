@@ -75,7 +75,27 @@ namespace py = pybind11;
           py::arg("max_seqlen_q"),             \
           py::arg("softmax_scale"),            \
           py::arg("splitData"),                \
-          py::arg("splitLse"));
+          py::arg("splitLse"));                \
+    m.def("mla_prefill_ps_asm_fwd",            \
+          &mla_prefill_ps_asm_fwd,             \
+          "mla_prefill_ps_asm_fwd",            \
+          py::arg("Q"),                        \
+          py::arg("K"),                        \
+          py::arg("V"),                        \
+          py::arg("qo_indptr"),                \
+          py::arg("kv_indptr"),                \
+          py::arg("kv_page_indices"),          \
+          py::arg("work_indptr"),              \
+          py::arg("work_info_set"),            \
+          py::arg("max_seqlen_q"),             \
+          py::arg("softmax_scale"),            \
+          py::arg("is_causal"),                \
+          py::arg("splitData"),                \
+          py::arg("splitLse"),                 \
+          py::arg("output"),                   \
+          py::arg("q_scale") = std::nullopt,   \
+          py::arg("k_scale") = std::nullopt,   \
+          py::arg("v_scale") = std::nullopt);
 
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
@@ -1679,6 +1699,27 @@ namespace py = pybind11;
           py::arg("fast_mode")           = true, \
           py::arg("topk")                = -1,   \
           py::arg("max_split_per_batch") = -1);
+
+#define PS_METADATA_PYBIND                    \
+    m.def("get_ps_metadata_v1",               \
+          &get_ps_metadata_v1,                \
+          "get_ps_metadata_v1",               \
+          py::arg("seqlens_qo_indptr"),       \
+          py::arg("pages_kv_indptr"),         \
+          py::arg("context_lens"),            \
+          py::arg("gqa_ratio"),               \
+          py::arg("num_heads_k"),             \
+          py::arg("work_metadata_ptrs"),      \
+          py::arg("work_indptr"),             \
+          py::arg("work_info"),               \
+          py::arg("reduce_indptr"),           \
+          py::arg("reduce_final_map"),        \
+          py::arg("reduce_partial_map"),      \
+          py::arg("qhead_granularity") = 1,   \
+          py::arg("qlen_granularity")  = 256, \
+          py::arg("kvlen_granularity") = 1,   \
+          py::arg("block_size")        = 1,   \
+          py::arg("is_causal")         = true);
 
 #define MLA_REDUCE_PYBIND                \
     m.def("mla_reduce_v1",               \

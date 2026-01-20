@@ -426,15 +426,13 @@ def checkAllclose(
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
         if percent > tol_err_ratio:
-            logger.info(
-                f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
+            logger.info(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
     a    : {a.shape}
            {a_msked[:printNum]}
     b    : {b.shape}
            {b_msked[:printNum]}
     delta:
-           {delta[:printNum]}"""
-            )
+           {delta[:printNum]}""")
         else:
             logger.info(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""

@@ -700,6 +700,92 @@ def get_pa_metadata_v1(
     ...
 
 
+def get_ps_metadata_info_v1(
+    batch_size: int,
+    num_head_k: int,
+    max_qlen: int,
+    qlen_granularity: int = 256,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    device = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(device)
+    cu_num = device_properties.multi_processor_count
+
+    num_clusters = math.gcd(num_head_k, cu_num)
+    cus_per_cluster = cu_num // num_clusters
+
+    max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
+
+    qo_tile_cnt = batch_size * max_qo_split_per_batch
+    # TODO: consider split q to reduce max_works & max_partials
+    max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
+    max_partials = (
+        min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2)
+        * max_qo_split_per_batch
+    )
+
+    return (
+        (2, torch.uint64),  # work_metadata_ptrs
+        (cu_num + 1, torch.int32),  # work_indptr
+        ((max_works, 8), torch.int32),  # work_info
+        (qo_tile_cnt + 1, torch.int32),  # reduce_indptr
+        ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_partials, torch.int32),  # reduce_partial_map
+    )
+
+
+@compile_ops("module_ps_metadata")
+def get_ps_metadata_v1(
+    seqlens_qo_indptr: torch.Tensor,
+    pages_kv_indptr: torch.Tensor,
+    context_lens: torch.Tensor,
+    gqa_ratio: int,
+    num_heads_k: int,
+    work_metadata_ptrs: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    qhead_granularity: int = 1,
+    qlen_granularity: int = 256,
+    kvlen_granularity: int = 16,
+    block_size: int = 16,
+    is_causal: bool = True,
+) -> None: ...
+
+
+@compile_ops(MD_NAME)
+def mla_prefill_ps_asm_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 def get_mla_metadata_info_v1(
     batch_size: int,
     max_seqlen_qo: int,

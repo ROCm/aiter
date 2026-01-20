@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rotary Positional Embeddings."""
+
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -704,10 +705,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         super().__init__()
 
         if rotary_dim != head_size:
-            raise ValueError(
-                f"`Phi3LongRoPEScaledRotaryEmbedding` does not support \
-                    rotary_dim != head_size ({rotary_dim}!={head_size})."
-            )
+            raise ValueError(f"`Phi3LongRoPEScaledRotaryEmbedding` does not support \
+                    rotary_dim != head_size ({rotary_dim}!={head_size}).")
         if is_neox_style is False:
             raise ValueError(
                 "`Phi3LongRoPEScaledRotaryEmbedding` only supports neox_style."
@@ -1508,7 +1507,7 @@ class DualChunkRotaryEmbedding(nn.Module):
         self.local_size = local_size
         self.dtype = dtype
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        (q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache) = (
+        q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache = (
             self._compute_cos_sin_cache()
         )
 
