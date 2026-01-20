@@ -142,3 +142,106 @@ def _mhc_fused_kernel(
         out,
         mask=(rm[:, None] < M) & (rn[None, :] < N),
     )
+
+
+@triton.jit
+def _sinkhorn_knopp_log_domain_kernel(
+    # Pointers
+    logits_ptr,     # Input: (M, N, N) raw logits
+    out_ptr,        # Output: (M, N, N) doubly stochastic matrices
+    # Dimensions
+    M,              # Batch size (number of matrices)
+    # Strides
+    stride_batch,   # Stride for batch dimension
+    stride_row,     # Stride for row dimension
+    stride_col,     # Stride for column dimension
+    # Meta-parameters
+    N: tl.constexpr,            # Matrix size (must be power of 2, max 64)
+    NUM_ITERS: tl.constexpr,    # Number of Sinkhorn iterations
+):
+    """
+    Log-domain Sinkhorn-Knopp kernel for projecting raw logits onto doubly stochastic matrices.
+
+    Computes doubly stochastic matrix P where all rows and columns sum to 1.
+
+    Grid: (M,) - one program per batch element
+
+    Reference algorithm (Exponential Domain)- Sinkhorn & Knopp (1967):
+    ──────────────────────────────────────────────────────
+        1. P = exp(A)                        # Ensure positivity
+        2. For each iteration:
+           - P = P / P.sum(axis=cols)        # Row normalize
+           - P = P / P.sum(axis=rows)        # Col normalize
+        3. Output: P
+
+        Problem: exp(large) → Inf, exp(-large) → 0, causing overflow/underflow.
+
+    Implementation algorithm (Log Domain):
+    ───────────────────────────────────────────────────────
+        1. log_u = 0, log_v = 0
+        2. For each iteration:
+           - log_u = -logsumexp(A + log_v, axis=cols)  # Row normalize
+           - log_v = -logsumexp(A + log_u, axis=rows)  # Col normalize
+        3. Output: P = exp(A + log_u + log_v)
+
+        Key insight: Division becomes subtraction in log space.
+        logsumexp uses stable formula: max(x) + log(Σ exp(x - max(x)))
+
+    """
+    batch_idx = tl.program_id(axis=0)
+
+    if batch_idx >= M:
+        return
+
+    # Base offset for this batch
+    batch_offset = batch_idx * stride_batch
+
+    # Compute flat indices within this batch's matrix
+    row_idx = tl.arange(0, N)[:, None]  # (N, 1)
+    col_idx = tl.arange(0, N)[None, :]  # (1, N)
+    flat_idx = row_idx * stride_row + col_idx * stride_col
+
+
+    # Load the NxN matrix (raw logits) in log domain
+    log_A = tl.load(logits_ptr + batch_offset + flat_idx).to(tl.float32)
+
+    # STEP 2: Initialize log scaling factors
+    # Initially u = v = 1 (no scaling), so log(1) = 0, 
+    log_u = tl.zeros((N,), dtype=tl.float32)  # Row scalings
+    log_v = tl.zeros((N,), dtype=tl.float32)  # Column scalings
+
+    #  Iterate and alternate between row and column normalization.
+    for _ in range(NUM_ITERS):
+        # Add column scaling: scaled[i,j] = log_A[i,j] + log_v[j]
+        scaled_row = log_A + log_v[None, :]  # (N, N)
+
+        # Compute max per row for numerical stability (prevents overflow in exp)
+        row_max = tl.max(scaled_row, axis=1)  # (N,)
+
+        # Compute logsumexp per row
+        exp_shifted = tl.exp(scaled_row - row_max[:, None])
+        row_sum_exp = tl.sum(exp_shifted, axis=1)  # (N,)
+        log_row_sums = row_max + tl.log(row_sum_exp)  # (N,)
+
+        # Update row scaling: log_u = -log(row_sum) to normalize rows to 1
+        log_u = -log_row_sums
+
+        # Add row scaling: scaled[i,j] = log_A[i,j] + log_u[i]
+        scaled_col = log_A + log_u[:, None]  # (N, N)
+
+        # Compute max per column for numerical stability
+        col_max = tl.max(scaled_col, axis=0)  # (N,)
+
+        # Compute logsumexp per column
+        exp_shifted = tl.exp(scaled_col - col_max[None, :])
+        col_sum_exp = tl.sum(exp_shifted, axis=0)  # (N,)
+        log_col_sums = col_max + tl.log(col_sum_exp)  # (N,)
+
+        # Update column scaling: log_v = -log(col_sum) to normalize cols to 1
+        log_v = -log_col_sums
+
+    # Combine base logits with accumulated scaling factors:
+    log_P = log_A + log_u[:, None] + log_v[None, :]
+    P = tl.exp(log_P)
+
+    tl.store(out_ptr + batch_offset + flat_idx, P.to(out_ptr.dtype.element_ty))
