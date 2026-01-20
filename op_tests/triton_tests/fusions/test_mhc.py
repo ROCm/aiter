@@ -410,11 +410,12 @@ def test_mhc_output_range():
 
     out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
-    # Split output into streams
+    # Split output into streams using correct layout:
+    # Pre: [0:n], Post: [n:2n], Res: [2n:2n+n²]
     n_squared = n * n
-    out_pre = out_triton[:, :n_squared]
-    out_post = out_triton[:, n_squared:n_squared + n]
-    out_res = out_triton[:, n_squared + n:]
+    out_pre = out_triton[:, :n]
+    out_post = out_triton[:, n:2*n]
+    out_res = out_triton[:, 2*n:]
 
     # Pre-stream: sigmoid output should be in [0, 1]
     assert torch.all(out_pre >= 0.0), "Pre-stream has values < 0"
@@ -426,7 +427,7 @@ def test_mhc_output_range():
     
     # Res-stream: no constraints (identity activation)
     # Just verify it exists
-    assert out_res.shape == (M, n), f"Res-stream shape mismatch"
+    assert out_res.shape == (M, n_squared), f"Res-stream shape mismatch"
 
 
 # =============================================================================
