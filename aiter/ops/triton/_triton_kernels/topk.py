@@ -11,7 +11,6 @@ import triton.language.core as core
 from triton.language.standard import _log2, zeros_like
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-
 _topk_kernel_repr = make_kernel_repr(
     "_topk_kernel",
     [
