@@ -83,7 +83,7 @@ def mhc(
         >>> # H contains: [H^pre (16 elements), H^post (4 elements), H^res (4 elements)]
     """
     _LOGGER.info(
-        f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha={alpha}"
+        f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
     )
     
     # Input shape extraction
