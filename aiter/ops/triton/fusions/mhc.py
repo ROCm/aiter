@@ -10,7 +10,13 @@ Implements equations 14-18 from the mHC paper in a single optimized kernel call.
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.fusions import _mhc_fused_kernel
+from aiter.ops.triton._triton_kernels.fusions import (
+    _mhc_fused_kernel,
+    _sinkhorn_knopp_log_domain_kernel,
+)
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 def mhc(
@@ -75,6 +81,10 @@ def mhc(
         >>> H.shape  # (32, 24)
         >>> # H contains: [H^pre (16 elements), H^post (4 elements), H^res (4 elements)]
     """
+    _LOGGER.info(
+        f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha={alpha}"
+    )
+    
     # Input shape extraction
     M, K = x.shape  # M: batch/sequence, K: nC (input features)
     K_phi, N = phi.shape  # K_phi: should match K, N: n² + 2n (output features)
@@ -134,6 +144,88 @@ def mhc(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+    )
+
+    return out
+
+
+def sinkhorn_knopp(
+    logits: torch.Tensor,
+    num_iters: int = 10,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Projects batched raw logits onto doubly stochastic matrices using log-domain Sinkhorn-Knopp.
+
+    A doubly stochastic matrix has:
+        - All rows sum to 1
+        - All columns sum to 1
+        - All entries are non-negative
+
+    This is used in mHC to constrain the mixing matrix W to the Birkhoff polytope,
+    ensuring stable training by preserving identity mapping properties.
+
+    Args:
+        logits (torch.Tensor): Input raw logits with shape (M, N, N), where:
+            - M is the batch size (e.g., number of layers or heads)
+            - N is the matrix size (e.g., n_streams, typically 4)
+            N must be a power of 2 and <= 64.
+        num_iters (int): Number of Sinkhorn-Knopp iterations. Default: 10.
+            More iterations = better convergence to doubly stochastic.
+            Typically 10-20 iterations suffice.
+        out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N, N).
+            If None, a new tensor is allocated.
+
+    Returns:
+        torch.Tensor: Doubly stochastic matrices with shape (M, N, N).
+            Each matrix in the batch has rows and columns summing to 1.
+
+    Example:
+        >>> logits = torch.randn(16, 4, 4, device='cuda')  # 16 matrices, 4x4 each
+        >>> P = sinkhorn_knopp(logits, num_iters=10)
+        >>> print(P.sum(dim=-1))  # Row sums ≈ 1
+        >>> print(P.sum(dim=-2))  # Col sums ≈ 1
+    """
+    _LOGGER.info(
+        f"Sinkhorn-Knopp: logits={tuple(logits.shape)} num_iters={num_iters}"
+    )
+
+    # Validate inputs
+    assert logits.dim() == 3, f"logits must be 3D (M, N, N), got {logits.dim()}D"
+
+    M, N, N2 = logits.shape
+    assert N == N2, f"Last two dimensions must be equal, got ({N}, {N2})"
+    # Cap N at 64 to avoid overflow in log domain
+    assert N <= 64, f"Matrix size N={N} exceeds maximum of 64"
+
+    # Check N is power of 2
+    N_pow2 = triton.next_power_of_2(N)
+    assert N == N_pow2, f"Matrix size N={N} must be a power of 2"
+
+    assert num_iters > 0, f"num_iters must be positive, got {num_iters}"
+
+    # Ensure contiguous
+    logits = logits.contiguous()
+
+    # Allocate output if not provided
+    if out is None:
+        out = torch.empty((M, N, N), dtype=logits.dtype, device=logits.device)
+    else:
+        assert out.shape == (M, N, N), f"out.shape {out.shape} must be ({M}, {N}, {N})"
+        out = out.contiguous()
+
+    # Grid: one program per batch element
+    grid = (M,)
+
+    _sinkhorn_knopp_log_domain_kernel[grid](
+        logits,
+        out,
+        M,
+        logits.stride(0),
+        logits.stride(1),
+        logits.stride(2),
+        N=N,
+        NUM_ITERS=num_iters,
     )
 
     return out
