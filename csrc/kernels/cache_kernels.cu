@@ -278,6 +278,8 @@ __global__ void reshape_and_cache_flash_kernel(
     const int n                 = num_heads * head_size;
     const float inverted_kscale = 1 / (*k_scale);
     const float inverted_vscale = 1 / (*v_scale);
+
+    #pragma unroll 4
     for(int i = threadIdx.x; i < n; i += blockDim.x)
     {
         const int64_t src_key_idx       = token_idx * key_stride + i;
