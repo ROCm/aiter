@@ -1405,7 +1405,7 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
     }
   }
  template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, 
-          vllm::Fp8KVCacheDataType q_dt, bool is_neox, bool is_nope_first=true>
+         vllm::Fp8KVCacheDataType q_dt, bool is_neox, bool is_nope_first=true, int32_t vec_size=4>
 inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
     const scalar_t* __restrict__ q_nope,  // [num_tokens, num_heads, kv_lora_rank]
     const scalar_t* __restrict__ q_pe,  // [num_tokens, num_heads, pe_dim]
@@ -1455,7 +1455,10 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
   static constexpr int32_t ooba_o = 4 / sizeof(cache_t);
   const int32_t oob_i             = (512 + ooba_i - 1) / ooba_i * ooba_i;
   const int32_t oob_o             = (512 + ooba_o - 1) / ooba_o * ooba_o;
-  static constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
+  // Auto-adjust vec_size based on scalar_t size to avoid exceeding 16-byte limit
+  // float (4 bytes): max vec_size=4 (16 bytes), half/bf16 (2 bytes): max vec_size=8 (16 bytes)
+  static constexpr int32_t max_vec_size = (sizeof(scalar_t) == 4) ? 4 : vec_size;
+  static constexpr int32_t vec_size_i = max_vec_size;
   static constexpr int32_t vec_size_o = vec_size_i;
   using vec_i = ck_tile::vec_t<scalar_t, vec_size_i>;
   using opus_vec_i = opus::vector_t<scalar_t, vec_size_i>;
@@ -1588,7 +1591,7 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
   }
 
 }
- template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt>
+ template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, int32_t vec_size=4>
 __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     const scalar_t* __restrict__ q_nope,  // [num_tokens, num_heads, kv_lora_rank]
     const scalar_t* __restrict__ q_pe,  // [num_tokens, num_heads, pe_dim]
@@ -1613,11 +1616,11 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     bool is_neox, bool is_nope_first
 ) {
   if (is_neox) {
-    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, 
+    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, true, true, vec_size>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, 
                                                   positions, cos_cache, sin_cache,block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, 
                                                   q_out_stride_0, q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, k_scale, q_scale);
   } else {
-    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, 
+    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, false, true, vec_size>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, 
                                                   positions, cos_cache, sin_cache,block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, 
                                                   q_out_stride_0, q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, k_scale, q_scale);
   }
@@ -2001,26 +2004,34 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       constexpr int32_t embed_dim = 32;
       
       // Phase 1: Process Q and K nope together for first num_kv_heads
-      // Load first vectors if thread is in range
+      // Calculate head indices once and maintain them as loop variables
+      uint32_t head_idx = vec_idx / kv_lora_vec;
+      uint32_t in_head_idx = vec_idx % kv_lora_vec;
       bool has_data = (vec_idx < num_kv_vecs);
+      
+      // Load first vectors if thread is in range
       if (has_data) {
-        uint32_t offset = vec_idx * vec_size_i;
-        vec_cur = buffer_i.template load<vec_size_i>(offset);  // K data in vec_cur initially
-        vec_nxt = q_buffer_i.template load<vec_size_i>(offset); // Q data in vec_nxt
+        // Calculate offset considering stride(1) for non-contiguous tensors
+        uint32_t kv_c_offset = head_idx * kv_c_stride_1 + in_head_idx * vec_size_i;
+        uint32_t q_nope_offset = head_idx * q_nope_stride_1 + in_head_idx * vec_size_i;
+        vec_cur = buffer_i.template load<vec_size_i>(kv_c_offset);  // K data in vec_cur initially
+        vec_nxt = q_buffer_i.template load<vec_size_i>(q_nope_offset); // Q data in vec_nxt
       }
       
       // Double buffering loop: process Q and K nope together
-      for (uint32_t next_idx = vec_idx + vec_stride; next_idx < num_kv_vecs; vec_idx = next_idx, next_idx += vec_stride)
+      for (uint32_t next_idx = vec_idx + vec_stride; next_idx < num_kv_vecs; next_idx += vec_stride)
       {
-        // Calculate indices once per iteration
-        uint32_t head_idx = vec_idx / kv_lora_vec;
-        uint32_t dst_idx = vec_idx % kv_lora_vec;
-        uint32_t store_offset = head_idx * kv_cache_stride_h + dst_idx * vec_size_o;
-        uint32_t q_store_offset = head_idx * q_out_stride_1 + dst_idx * vec_size_o;
+        // Calculate store offsets using current head_idx and in_head_idx
+        uint32_t store_offset = head_idx * kv_cache_stride_h + in_head_idx * vec_size_o;
+        uint32_t q_store_offset = head_idx * q_out_stride_1 + in_head_idx * vec_size_o;
         
-        // Prefetch next data
-        opus_vec_i k_nxt = buffer_i.template load<vec_size_i>(next_idx * vec_size_i);
-        opus_vec_i q_nxt = q_buffer_i.template load<vec_size_i>(next_idx * vec_size_i);
+        // Calculate next indices for prefetch
+        uint32_t next_head_idx = next_idx / kv_lora_vec;
+        uint32_t next_in_head_idx = next_idx % kv_lora_vec;
+        uint32_t next_kv_c_offset = next_head_idx * kv_c_stride_1 + next_in_head_idx * vec_size_i;
+        uint32_t next_q_nope_offset = next_head_idx * q_nope_stride_1 + next_in_head_idx * vec_size_i;
+        opus_vec_i k_nxt = buffer_i.template load<vec_size_i>(next_kv_c_offset);
+        opus_vec_i q_nxt = q_buffer_i.template load<vec_size_i>(next_q_nope_offset);
         
         // Store K data (vec_cur holds K)
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
@@ -2043,49 +2054,59 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         // Swap: next K goes to vec_cur, next Q goes to vec_nxt
         vec_cur = k_nxt;
         vec_nxt = q_nxt;
+        
+        // Update loop variables for next iteration
+        vec_idx = next_idx;
+        head_idx = next_head_idx;
+        in_head_idx = next_in_head_idx;
       }
       
-      // Store last vectors if we loaded data
+      // Store last vectors if we loaded data (use maintained head_idx and in_head_idx)
       if (has_data) {
-        uint32_t head_idx = vec_idx / kv_lora_vec;
-        uint32_t dst_idx = vec_idx % kv_lora_vec;
-        
         // Store last K
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-          buffer_o.template store<vec_size_o>(vec_cur, head_idx * kv_cache_stride_h + dst_idx * vec_size_o);
+          buffer_o.template store<vec_size_o>(vec_cur, head_idx * kv_cache_stride_h + in_head_idx * vec_size_o);
         } else {
           buffer_o.template store<vec_size_o>(ck_tile::bit_cast<opus_vec_o>(
               ck_tile::vec_convert<cache_t, scalar_t, vec_size_i>(
                   ck_tile::bit_cast<vec_i>(vec_cur), inverted_kscale)), 
-              head_idx * kv_cache_stride_h + dst_idx * vec_size_o);
+              head_idx * kv_cache_stride_h + in_head_idx * vec_size_o);
         }
         
         // Store last Q
         if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-          q_buffer_o.template store<vec_size_o>(vec_nxt, head_idx * q_out_stride_1 + dst_idx * vec_size_o);
+          q_buffer_o.template store<vec_size_o>(vec_nxt, head_idx * q_out_stride_1 + in_head_idx * vec_size_o);
         } else {
           q_buffer_o.template store<vec_size_o>(ck_tile::bit_cast<opus_vec_q>(
               ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(
                   ck_tile::bit_cast<vec_i>(vec_nxt), inverted_qscale)), 
-              head_idx * q_out_stride_1 + dst_idx * vec_size_o);
+              head_idx * q_out_stride_1 + in_head_idx * vec_size_o);
         }
       }
       
       // Phase 2: Process remaining Q nope only
       // Start from the next vector after num_kv_vecs
       uint32_t q_vec_idx = num_kv_vecs + threadIdx.x;
+      uint32_t q_head_idx = q_vec_idx / kv_lora_vec;
+      uint32_t q_in_head_idx = q_vec_idx % kv_lora_vec;
       
       // Load first Q vector if in range (num_heads > num_kv_heads case)
       if (q_vec_idx < num_vecs) {
-        vec_cur = q_buffer_i.template load<vec_size_i>(q_vec_idx * vec_size_i);
+        uint32_t q_nope_offset = q_head_idx * q_nope_stride_1 + q_in_head_idx * vec_size_i;
+        vec_cur = q_buffer_i.template load<vec_size_i>(q_nope_offset);
       }
       
       // Double buffering loop for remaining Q
-      for (uint32_t next_q_idx = q_vec_idx + vec_stride; next_q_idx < num_vecs; q_vec_idx = next_q_idx, next_q_idx += vec_stride)
+      for (uint32_t next_q_idx = q_vec_idx + vec_stride; next_q_idx < num_vecs; next_q_idx += vec_stride)
       {
-        vec_nxt = q_buffer_i.template load<vec_size_i>(next_q_idx * vec_size_i);
+        // Calculate next indices for prefetch
+        uint32_t next_head_idx = next_q_idx / kv_lora_vec;
+        uint32_t next_in_head_idx = next_q_idx % kv_lora_vec;
+        uint32_t next_q_nope_offset = next_head_idx * q_nope_stride_1 + next_in_head_idx * vec_size_i;
+        vec_nxt = q_buffer_i.template load<vec_size_i>(next_q_nope_offset);
         
-        uint32_t store_offset = (q_vec_idx / kv_lora_vec) * q_out_stride_1 + (q_vec_idx % kv_lora_vec) * vec_size_o;
+        // Calculate store offset using current q_head_idx and q_in_head_idx
+        uint32_t store_offset = q_head_idx * q_out_stride_1 + q_in_head_idx * vec_size_o;
         
         if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
           q_buffer_o.template store<vec_size_o>(vec_cur, store_offset);
@@ -2094,12 +2115,17 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
               ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(
                   ck_tile::bit_cast<vec_i>(vec_cur), inverted_qscale)), store_offset);
         }
+        
+        // Update loop variables
         vec_cur = vec_nxt;
+        q_vec_idx = next_q_idx;
+        q_head_idx = next_head_idx;
+        q_in_head_idx = next_in_head_idx;
       }
       
-      // Store last Q vector if loaded
+      // Store last Q vector if loaded (use maintained q_head_idx and q_in_head_idx)
       if (q_vec_idx < num_vecs) {
-        uint32_t store_offset = (q_vec_idx / kv_lora_vec) * q_out_stride_1 + (q_vec_idx % kv_lora_vec) * vec_size_o;
+        uint32_t store_offset = q_head_idx * q_out_stride_1 + q_in_head_idx * vec_size_o;
         if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
           q_buffer_o.template store<vec_size_o>(vec_cur, store_offset);
         } else {
@@ -2305,24 +2331,33 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       
       // ============ Nope Phase ============
       // Phase 1: Process Q and K nope together for first num_kv_heads
+      // Calculate head indices once and maintain them as loop variables
+      uint32_t head_idx = vec_idx / kv_lora_vec;
+      uint32_t in_head_idx = vec_idx % kv_lora_vec;
       bool has_data = (vec_idx < num_kv_vecs);
+      
       if (has_data) {
-        uint32_t offset = vec_idx * vec_size_i;
-        vec_cur = buffer_i.template load<vec_size_i>(offset);  // K data
-        vec_nxt = q_buffer_i.template load<vec_size_i>(offset); // Q data
+        // Calculate offset considering stride(1) for non-contiguous tensors
+        uint32_t kv_c_offset = head_idx * kv_c_stride_1 + in_head_idx * vec_size_i;
+        uint32_t q_nope_offset = head_idx * q_nope_stride_1 + in_head_idx * vec_size_i;
+        vec_cur = buffer_i.template load<vec_size_i>(kv_c_offset);  // K data
+        vec_nxt = q_buffer_i.template load<vec_size_i>(q_nope_offset); // Q data
       }
       
       // Double buffering loop: process Q and K nope together
-      for (uint32_t next_idx = vec_idx + vec_stride; next_idx < num_kv_vecs; vec_idx = next_idx, next_idx += vec_stride)
+      for (uint32_t next_idx = vec_idx + vec_stride; next_idx < num_kv_vecs; next_idx += vec_stride)
       {
-        uint32_t head_idx = vec_idx / kv_lora_vec;
-        uint32_t dst_idx = vec_idx % kv_lora_vec;
-        uint32_t store_offset = head_idx * kv_cache_stride_h + dst_idx * vec_size_o;
-        uint32_t q_store_offset = head_idx * q_out_stride_1 + dst_idx * vec_size_o;
+        // Calculate store offsets using current head_idx and in_head_idx
+        uint32_t store_offset = head_idx * kv_cache_stride_h + in_head_idx * vec_size_o;
+        uint32_t q_store_offset = head_idx * q_out_stride_1 + in_head_idx * vec_size_o;
         
-        // Prefetch next data
-        opus_vec_i k_nxt = buffer_i.template load<vec_size_i>(next_idx * vec_size_i);
-        opus_vec_i q_nxt = q_buffer_i.template load<vec_size_i>(next_idx * vec_size_i);
+        // Calculate next indices for prefetch
+        uint32_t next_head_idx = next_idx / kv_lora_vec;
+        uint32_t next_in_head_idx = next_idx % kv_lora_vec;
+        uint32_t next_kv_c_offset = next_head_idx * kv_c_stride_1 + next_in_head_idx * vec_size_i;
+        uint32_t next_q_nope_offset = next_head_idx * q_nope_stride_1 + next_in_head_idx * vec_size_i;
+        opus_vec_i k_nxt = buffer_i.template load<vec_size_i>(next_kv_c_offset);
+        opus_vec_i q_nxt = q_buffer_i.template load<vec_size_i>(next_q_nope_offset);
         
         // Store K data
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
@@ -2342,46 +2377,55 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
                   ck_tile::bit_cast<vec_i>(vec_nxt), inverted_qscale)), q_store_offset);
         }
         
+        // Update loop variables
         vec_cur = k_nxt;
         vec_nxt = q_nxt;
+        vec_idx = next_idx;
+        head_idx = next_head_idx;
+        in_head_idx = next_in_head_idx;
       }
       
-      // Store last vectors
+      // Store last vectors (use maintained head_idx and in_head_idx)
       if (has_data) {
-        uint32_t head_idx = vec_idx / kv_lora_vec;
-        uint32_t dst_idx = vec_idx % kv_lora_vec;
-        
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-          buffer_o.template store<vec_size_o>(vec_cur, head_idx * kv_cache_stride_h + dst_idx * vec_size_o);
+          buffer_o.template store<vec_size_o>(vec_cur, head_idx * kv_cache_stride_h + in_head_idx * vec_size_o);
         } else {
           buffer_o.template store<vec_size_o>(ck_tile::bit_cast<opus_vec_o>(
               ck_tile::vec_convert<cache_t, scalar_t, vec_size_i>(
                   ck_tile::bit_cast<vec_i>(vec_cur), inverted_kscale)), 
-              head_idx * kv_cache_stride_h + dst_idx * vec_size_o);
+              head_idx * kv_cache_stride_h + in_head_idx * vec_size_o);
         }
         
         if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-          q_buffer_o.template store<vec_size_o>(vec_nxt, head_idx * q_out_stride_1 + dst_idx * vec_size_o);
+          q_buffer_o.template store<vec_size_o>(vec_nxt, head_idx * q_out_stride_1 + in_head_idx * vec_size_o);
         } else {
           q_buffer_o.template store<vec_size_o>(ck_tile::bit_cast<opus_vec_q>(
               ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(
                   ck_tile::bit_cast<vec_i>(vec_nxt), inverted_qscale)), 
-              head_idx * q_out_stride_1 + dst_idx * vec_size_o);
+              head_idx * q_out_stride_1 + in_head_idx * vec_size_o);
         }
       }
       
       // Phase 2: Process remaining Q nope only (when num_heads > num_kv_heads)
       uint32_t q_vec_idx = num_kv_vecs + threadIdx.x;
+      uint32_t q_head_idx = q_vec_idx / kv_lora_vec;
+      uint32_t q_in_head_idx = q_vec_idx % kv_lora_vec;
       
       if (q_vec_idx < num_vecs) {
-        vec_cur = q_buffer_i.template load<vec_size_i>(q_vec_idx * vec_size_i);
+        uint32_t q_nope_offset = q_head_idx * q_nope_stride_1 + q_in_head_idx * vec_size_i;
+        vec_cur = q_buffer_i.template load<vec_size_i>(q_nope_offset);
       }
       
-      for (uint32_t next_q_idx = q_vec_idx + vec_stride; next_q_idx < num_vecs; q_vec_idx = next_q_idx, next_q_idx += vec_stride)
+      for (uint32_t next_q_idx = q_vec_idx + vec_stride; next_q_idx < num_vecs; next_q_idx += vec_stride)
       {
-        vec_nxt = q_buffer_i.template load<vec_size_i>(next_q_idx * vec_size_i);
+        // Calculate next indices for prefetch
+        uint32_t next_head_idx = next_q_idx / kv_lora_vec;
+        uint32_t next_in_head_idx = next_q_idx % kv_lora_vec;
+        uint32_t next_q_nope_offset = next_head_idx * q_nope_stride_1 + next_in_head_idx * vec_size_i;
+        vec_nxt = q_buffer_i.template load<vec_size_i>(next_q_nope_offset);
         
-        uint32_t store_offset = (q_vec_idx / kv_lora_vec) * q_out_stride_1 + (q_vec_idx % kv_lora_vec) * vec_size_o;
+        // Calculate store offset using current q_head_idx and q_in_head_idx
+        uint32_t store_offset = q_head_idx * q_out_stride_1 + q_in_head_idx * vec_size_o;
         
         if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
           q_buffer_o.template store<vec_size_o>(vec_cur, store_offset);
@@ -2390,11 +2434,17 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
               ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(
                   ck_tile::bit_cast<vec_i>(vec_cur), inverted_qscale)), store_offset);
         }
+        
+        // Update loop variables
         vec_cur = vec_nxt;
+        q_vec_idx = next_q_idx;
+        q_head_idx = next_head_idx;
+        q_in_head_idx = next_in_head_idx;
       }
       
+      // Store last Q vector if loaded (use maintained q_head_idx and q_in_head_idx)
       if (q_vec_idx < num_vecs) {
-        uint32_t store_offset = (q_vec_idx / kv_lora_vec) * q_out_stride_1 + (q_vec_idx % kv_lora_vec) * vec_size_o;
+        uint32_t store_offset = q_head_idx * q_out_stride_1 + q_in_head_idx * vec_size_o;
         if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
           q_buffer_o.template store<vec_size_o>(vec_cur, store_offset);
         } else {
@@ -2931,8 +2981,8 @@ void reshape_and_cache_flash(
                      num_tokens,                                    \
                      quant_block_size);
 
-#define CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA_OPT(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
- aiter::fuse_qk_rope_concat_and_cache_mla_per_head_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE>      \
+#define CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA_OPT(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, VEC_SIZE)   \
+ aiter::fuse_qk_rope_concat_and_cache_mla_per_head_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, VEC_SIZE>      \
        <<<grid, block, 0, stream>>>(                                                             \
          reinterpret_cast<KV_T*>(q_nope.data_ptr()),                                             \
          reinterpret_cast<KV_T*>(q_pe.data_ptr()),                                               \
@@ -3417,6 +3467,7 @@ void fused_qk_rope_concat_and_cache_mla(
   TORCH_CHECK(q_nope.size(1) == q_pe.size(1));
 
   TORCH_CHECK(q_out.size(2) == qk_lora_rank + pe_dim);
+  TORCH_CHECK(kv_lora_rank == qk_lora_rank, "kv_lora_rank and qk_lora_rank must be the same");
   int kv_c_stride = kv_c.stride(0);
   int k_pe_stride = k_pe.stride(0);
   int q_nope_stride_0 = q_nope.stride(0);
@@ -3460,6 +3511,8 @@ void fused_qk_rope_concat_and_cache_mla(
   if (kv_cache_dtype == "auto" && q_out_type == "fp8") {
     TORCH_CHECK(false, "kv cache data type is auto and q_out data type is fp8, which is not supported");
   }
+  TORCH_CHECK(kv_c.stride(-1) == 1, "kv_c stride(-1) must be equal to 1");
+  TORCH_CHECK(k_pe.stride(-1) == 1, "k_pe stride(-1) must be equal to 1");
   // ============================================================================
   // Kernel Dispatch Logic
   // ============================================================================
@@ -3474,8 +3527,18 @@ void fused_qk_rope_concat_and_cache_mla(
   
   // Determine if this is a decode or prefill scenario
   const bool is_decode = (kv_c.dim() == 2 && k_pe.dim() == 2);
+  
+  // For decode with single kv_head (dim=3 with size=1), check stride continuity
+  // Stride(1) should equal size(2) for contiguous storage
+  const bool kv_c_contiguous = (kv_c.dim() == 3 && kv_c.size(1) == 1) ? 
+                                (kv_c.stride(1) == kv_c.size(2)) : true;
+  const bool k_pe_contiguous = (k_pe.dim() == 3 && k_pe.size(1) == 1) ? 
+                                (k_pe.stride(1) == k_pe.size(2)) : true;
+  
   const bool is_decode_single_kv_head = (kv_c.dim() == 3 && k_pe.dim() == 3 && 
-                                          kv_c.size(1) == 1 && k_pe.size(1) == 1);
+                                          kv_c.size(1) == 1 && k_pe.size(1) == 1 &&
+                                          kv_c_contiguous && k_pe_contiguous);
+  
   const bool is_prefill_gqa = (kv_c.dim() == 3 && k_pe.dim() == 3 && 
                                kv_c.size(1) > 1);
   // ============================================================================
@@ -3496,10 +3559,27 @@ void fused_qk_rope_concat_and_cache_mla(
     if (use_per_head_kernel) {
       // Launch one block per (token, head) pair
       dim3 grid(num_tokens * num_heads);
-      dim3 block(std::min<int64_t>(kv_lora_rank, OPTIMIZED_KV_LORA_RANK) / 8);
       
-      DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
-                                        CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA_OPT);
+      // Determine vec_size: float must use 4, half/bfloat16 can use 8 for large tensors
+      const bool is_float = (kv_c.dtype() == torch::kFloat);
+      const bool use_vec4 = is_float || (kv_lora_rank >= 64 && kv_lora_rank <= 128);
+      
+      if (use_vec4) {
+        constexpr int vec_size = 4;
+        dim3 block(std::min<int64_t>(kv_lora_rank, OPTIMIZED_KV_LORA_RANK) / vec_size);
+        #define CALL_OPT_VEC4(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE) \
+          CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA_OPT(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, 4)
+        DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type, CALL_OPT_VEC4);
+        #undef CALL_OPT_VEC4
+      } else {
+        // Only half/bfloat16 with kv_lora_rank > 128 use vec_size=8
+        constexpr int vec_size = 8;
+        dim3 block(std::min<int64_t>(kv_lora_rank, OPTIMIZED_KV_LORA_RANK) / vec_size);
+        #define CALL_OPT_VEC8(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE) \
+          CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA_OPT(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, 8)
+        DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type, CALL_OPT_VEC8);
+        #undef CALL_OPT_VEC8
+      }
     }
     // Option 2: Optimized decode kernel for standard config with large workload
     // Best for: high throughput, standard DeepSeek config
@@ -3524,7 +3604,6 @@ void fused_qk_rope_concat_and_cache_mla(
       const int k_pe_stride_1 = (k_pe.dim() == 3) ? k_pe.stride(1) : 0;  // 0 for dim=2
       const int num_kv_heads = (kv_c.dim() == 3) ? kv_c.size(1) : 1;     // 1 for dim=2
       const int kv_cache_stride_h = (kv_cache.dim() >= 3) ? kv_cache.stride(2) : (kv_lora_rank + pe_dim);
-      
       // Dynamic block size based on workload
       dim3 grid(num_tokens);
       dim3 block(std::min<int64_t>(kv_lora_rank * num_heads, MAX_BLOCK_THREADS) / 8);
@@ -3563,16 +3642,12 @@ void fused_qk_rope_concat_and_cache_mla(
     // Best for: custom models, variable dimensions, different GQA ratios
     else {
       dim3 grid(num_tokens);
+
       dim3 block(std::min<int64_t>(kv_lora_rank * num_heads, MAX_BLOCK_THREADS) / 8);
-      
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA_GENERAL);
     }
   }
-  
-  // ============================================================================
-  // ERROR: Unsupported tensor dimensions
-  // ============================================================================
   else {
     TORCH_CHECK(false, 
                 "Unsupported tensor dimensions: kv_c.dim()=", kv_c.dim(), 
