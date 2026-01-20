@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+"""a8w8_blockscale_gemm instance gen for CK tile."""
+
 import argparse
 import os
 import shutil
@@ -13,10 +15,6 @@ from gemm_a8w8_blockscale_cktile_instance import (
     TileKernelInstance,
     candidate_kernels_cktile_dict,
 )
-
-"""
-a8w8_blockscale_gemm instance gen for CK tile
-"""
 
 
 class gemm_a8w8_blockscale_codegen:
@@ -220,7 +218,8 @@ torch::Tensor
 """
 
         with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_manifest.h"), "w"
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_manifest.h"),
+            "w",
         ) as f:
             f.write(MAINFEST_head)
             for _, k in kernels_dict.items():

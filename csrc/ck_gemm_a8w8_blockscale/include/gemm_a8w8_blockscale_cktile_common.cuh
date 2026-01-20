@@ -111,8 +111,8 @@ template <typename QDataType,
           typename GemmConfig,
           bool PadN,
           bool PadK,
-          bool isBpreshuffled,
-          bool useDoubleSmemBuffer = isBpreshuffled>
+          bool PreshuffleB,
+          bool UseDoubleSmemBuffer = PreshuffleB>
 void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 {
     using GemmShape = ck_tile::TileGemmShape<
@@ -128,7 +128,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                     PadN,
                                                     PadK,
                                                     false, // PreshuffleQuant, not support yet
-                                                    isBpreshuffled,
+                                                    PreshuffleB,
                                                     ALayout,
                                                     BLayout,
                                                     CLayout,
@@ -136,7 +136,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                     AQLayout,
                                                     BQLayout,
                                                     GemmConfig::TransposeC_v,
-                                                    useDoubleSmemBuffer>;
+                                                    UseDoubleSmemBuffer>;
 
     using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
                                                                  BDataType,
@@ -146,7 +146,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                  ComputeDataType>;
 
     using BaseGemmPipeline = std::conditional_t<
-        useDoubleSmemBuffer && isBpreshuffled,
+        UseDoubleSmemBuffer && PreshuffleB,
         ck_tile::BaseWeightPreshufflePipelineAGmemBGmemCRegV2<GemmPipelineProblem>,
         ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>>;
 
@@ -176,7 +176,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                     tail_number_v>;
 
         using GemmPipeline =
-            std::conditional_t<useDoubleSmemBuffer && isBpreshuffled,
+            std::conditional_t<UseDoubleSmemBuffer && PreshuffleB,
                                ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
                                ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>;
 
@@ -230,7 +230,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
 }
 
-template <typename QDataType, typename OutDataType, typename GemmConfig, bool isBpreshuffled>
+template <typename QDataType, typename OutDataType, typename GemmConfig, bool PreshuffleB>
 void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 {
     const bool pad_n = (args.N % BQuantGroupSize::kN != 0);
@@ -238,19 +238,19 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 
     if(pad_n && pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, true, isBpreshuffled>(args);
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, true, PreshuffleB>(args);
     }
     else if(pad_n && !pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, false, isBpreshuffled>(args);
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, false, PreshuffleB>(args);
     }
     else if(!pad_n && pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, true, isBpreshuffled>(args);
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, true, PreshuffleB>(args);
     }
     else
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, false, isBpreshuffled>(args);
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, false, PreshuffleB>(args);
     }
 }
 
@@ -260,7 +260,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
                                                                torch::Tensor& x_scale,
                                                                torch::Tensor& w_scale,
                                                                torch::Tensor& Y,
-							       bool isBpreshuffled)
+                                                               bool PreshuffleB)
 {
     // check
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
@@ -304,7 +304,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     args.stride_BQ = stride_BQ;
 
     // do tile GEMM
-    if(isBpreshuffled)
+    if(PreshuffleB)
     {
         TileGemmCompute<QDataType, OutDataType, GemmInstance, true>(args);
     }

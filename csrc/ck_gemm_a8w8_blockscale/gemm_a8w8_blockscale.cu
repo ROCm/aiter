@@ -10,7 +10,6 @@
 #include "gemm_common.h"
 
 #include "gemm_a8w8_blockscale_common.cuh"
-#include "gemm_a8w8_blockscale_common.h"
 #include "gemm_a8w8_blockscale_lookup.h"
 #include "gemm_a8w8_blockscale_manifest.h"
 

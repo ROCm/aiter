@@ -15,13 +15,13 @@ class TileKernelInstance:
     N_Warp_Tile: int
     K_Warp_Tile: int
 
-    Scheduler: str # Default, Intrawave, Interwave
+    Scheduler: str  # Default, Intrawave, Interwave
 
     TiledMMAPermuteN: bool
     TransposeC: bool
     UsePersistentKernel: bool
 
-    BlockPerCu: int # 1,2
+    BlockPerCu: int  # 1,2
 
     @property
     def name(self) -> str:
@@ -54,10 +54,14 @@ class TileKernelInstance:
                 ("x").join(
                     map(
                         lambda x: str(int(x)),
-                        [self.TiledMMAPermuteN, self.TransposeC, self.UsePersistentKernel],
+                        [
+                            self.TiledMMAPermuteN,
+                            self.TransposeC,
+                            self.UsePersistentKernel,
+                        ],
                     )
                 ),
-                str(self.BlockPerCu)
+                str(self.BlockPerCu),
             ]
         )
 
