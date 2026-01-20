@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -82,6 +82,7 @@ void mla_decode_stage1_asm_fwd(
 
     int stride_Q       = Q.stride(0) * Q.itemsize() * max_seqlen_q;
     int stride_Page    = KV.stride(0) * KV.itemsize();
+    std::cout << "stride_Q: " << stride_Q << " stride_Page: " << stride_Page << std::endl;
     uint32_t log2_page = (uint32_t)log2f(page_size);
 
     KernelArgs args;
@@ -157,7 +158,11 @@ void mla_decode_stage1_asm_fwd(
     AiterAsmKernel* impl_ptr = nullptr;
     TORCH_CHECK(Q.is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     TORCH_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
-    TORCH_CHECK(head_size == KV.size(3), __func__, ":only support head_size == KV.size(3) for now");
+
+    if (KV.dtype() != at::ScalarType::Byte && KV.dtype() != at::ScalarType::Char) {
+        TORCH_CHECK(head_size == KV.size(3), __func__, ":only support head_size == KV.size(3) for now");
+    }
+    
     int sub_Q;
     if(Q.dtype() == at::ScalarType::BFloat16)
     {
@@ -250,6 +255,17 @@ void mla_decode_stage1_asm_fwd(
                         impl_ptr = &impl_a16w8_bf16_ps;
                     }
                 }
+            }
+        } else if (KV.dtype() == at::ScalarType::Byte || KV.dtype() == at::ScalarType::Char)
+        {
+            if(persistent)
+            {
+                // todo:add support condition
+                static AiterAsmKernel impl_a16w8_bf16_ps(
+                    "mla_kernel_func",
+                    "/mla/mla.co");
+                impl_ptr = &impl_a16w8_bf16_ps;
+
             }
         }
     }

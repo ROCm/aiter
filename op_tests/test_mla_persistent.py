@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -100,9 +100,11 @@ def torch_mla_extend(
     is_causal=True,
     q_scale=None,
     kv_scale=None,
+    scale_dim=4,
 ):
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
+    is_uint8_kvc = kvc_cache.dtype == torch.uint8
 
     if is_fp8_q:
         q = q.to(torch.float)
@@ -110,6 +112,47 @@ def torch_mla_extend(
     if is_fp8_kvc:
         kvc_cache = kvc_cache.to(torch.float)
 
+    if is_uint8_kvc:
+        total_page_size, nhead_kv, _ = kvc_cache.shape
+        nope_bytes = kv_lora_rank * 1  # FP8: 1 byte/elem
+        scale_bytes = scale_dim * 4  # FP32: 4 bytes/elem
+        rope_bytes = qk_rope_head_dim * 2  # BF16: 2 bytes/elem
+
+        nope_raw = kvc_cache[..., :nope_bytes]
+        scale_raw = kvc_cache[..., nope_bytes : nope_bytes + scale_bytes]
+        rope_raw = kvc_cache[
+            ..., nope_bytes + scale_bytes : nope_bytes + scale_bytes + rope_bytes
+        ]
+
+        kv_nope_buffer_fp8 = (
+            nope_raw.contiguous()
+            .view(dtypes.fp8)
+            .reshape(total_page_size, nhead_kv, kv_lora_rank)
+        )
+        print(f"unpacked kv_nope_buffer_fp8: {kv_nope_buffer_fp8}")
+        kv_nope_scale_factors_fp32 = (
+            scale_raw.contiguous()
+            .view(torch.float32)
+            .reshape(total_page_size, nhead_kv, scale_dim)
+        )
+        kv_rope_buffer_bf16 = (
+            rope_raw.contiguous()
+            .view(torch.bfloat16)
+            .reshape(total_page_size, nhead_kv, qk_rope_head_dim)
+        )
+        kv_nope_buffer_fp32 = kv_nope_buffer_fp8.to(torch.float32).reshape(
+            total_page_size, nhead_kv, scale_dim, -1
+        ) * kv_nope_scale_factors_fp32.reshape(total_page_size, nhead_kv, scale_dim, 1)
+        kvc_cache = torch.cat(
+            [
+                kv_nope_buffer_fp32.reshape(total_page_size, nhead_kv, kv_lora_rank).to(
+                    torch.bfloat16
+                ),
+                kv_rope_buffer_bf16,
+            ],
+            dim=-1,
+        )
+        print(f"packed kvc_cache: {kvc_cache}")
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
@@ -157,6 +200,8 @@ def test_mla(
     decode_qlen,
     max_split_per_batch,
     non_persistent_mode,
+    paged_layout,
+    scale_dim,
 ):
     ret = {}
 
@@ -193,6 +238,34 @@ def test_mla(
         (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
         dtype=torch.bfloat16,
     )
+    kv_nope_scale_factors_fp32 = None
+    kv_nope_buffer_fp8 = None
+    kv_rope_buffer_bf16 = None
+    if paged_layout == "3BUFFER":
+        assert kv_lora_rank % scale_dim == 0
+        kv_nope_buffer_fp32 = torch.randn(
+            (num_page * page_size, 1, kv_lora_rank), dtype=torch.float32
+        )
+        kv_rope_buffer_bf16 = torch.randn(
+            (num_page * page_size, 1, qk_rope_head_dim),
+            dtype=torch.bfloat16,
+        )
+        kv_buffer = torch.cat(
+            [kv_nope_buffer_fp32.to(torch.bfloat16), kv_rope_buffer_bf16], dim=-1
+        )
+        scale_values = [1.0, 2.0, 4.0, 8.0]
+        scale_indices = torch.randint(
+            0, len(scale_values), size=(num_page * page_size, 1, scale_dim)
+        )
+        kv_nope_scale_factors_fp32 = torch.tensor(
+            [scale_values[idx] for idx in scale_indices.flatten()], dtype=torch.float32
+        ).reshape(num_page * page_size, 1, scale_dim)
+        kv_nope_scaled_buffer = kv_nope_buffer_fp32.reshape(
+            num_page * page_size, 1, scale_dim, kv_lora_rank // scale_dim
+        ) / kv_nope_scale_factors_fp32.reshape(num_page * page_size, 1, scale_dim, 1)
+        kv_nope_buffer_fp8 = kv_nope_scaled_buffer.reshape(
+            num_page * page_size, 1, kv_lora_rank
+        ).to(dtypes.fp8)
 
     # for none absorb (mha)
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
@@ -405,12 +478,87 @@ def test_mla(
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
+    def test_absorb_decode_3buffer():
+        # Initialize kv_last_page_lens based on work_info_set
+        num_works = work_info_set_size[0]
+        kv_last_page_lens = torch.empty(num_works, dtype=torch.int)
+
+        for i in range(num_works):
+            if work_info_set[i, 5] % page_size == 0:
+                kv_last_page_lens[i] = page_size
+            else:
+                kv_last_page_lens[i] = work_info_set[i, 5] % page_size
+
+        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
+
+        # convert to bytes
+        nope_bytes = kv_nope_buffer_fp8.view(torch.uint8)
+        scale_bytes = kv_nope_scale_factors_fp32.view(torch.uint8)
+        rope_bytes = kv_rope_buffer_bf16.view(torch.uint8)
+        kv_buffer_bytes = torch.cat([nope_bytes, scale_bytes, rope_bytes], dim=-1)
+
+        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+            q,
+            kv_buffer_bytes,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype=out_dtype,
+            is_causal=True,
+            scale_dim=scale_dim,
+        )
+        err_ref_fp8 = checkAllclose(
+            out_ref,
+            out_ref_fp8,
+            msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
+        )
+
+        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+            aiter.mla.mla_decode_fwd,
+            q,
+            kv_buffer_bytes.reshape(num_page, page_size, nhead_kv, -1),
+            out_asm,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            sm_scale,
+            num_kv_splits=max_split_per_batch,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            intra_batch_mode=non_persistent_mode,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            out_asm,
+            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
+        err_fp8 = checkAllclose(
+            out_ref_fp8,
+            out_asm,
+            msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
+        cal_diff(out_ref, out_asm, "out", True)
+        return err, us_asm_decode
+
     err = None
     us_asm_decode = 1e12
-    if dtype == torch.bfloat16:
-        err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8:
-        err, us_asm_decode = test_absorb_decode_fp8()
+    if paged_layout == "3BUFFER" and not non_persistent_mode:
+        err, us_asm_decode = test_absorb_decode_3buffer()
+    else:
+        if dtype == torch.bfloat16:
+            err, us_asm_decode = test_absorb_decode_bf16()
+        elif kvtype == dtypes.fp8:
+            err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
@@ -454,7 +602,7 @@ parser.add_argument(
     "-qn",
     "--qk_nope_head_dim",
     type=int,
-    default=128,
+    default=512,
     help="""qk nope head dim.
     e.g.: -qn 512""",
 )
@@ -478,7 +626,7 @@ parser.add_argument(
     "-blk",
     "--block_size",
     type=int,
-    default=1,
+    default=64,
     help="""Block size.
     e.g.: -blk 1""",
 )
@@ -552,7 +700,23 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
-
+parser.add_argument(
+    "-pl",
+    "--paged_layout",
+    type=str,
+    choices=["LEGACY", "3BUFFER"],
+    default="LEGACY",
+    help="""paged layout.
+    e.g.: -pl LEGACY""",
+)
+parser.add_argument(
+    "-sd",
+    "--scale_dim",
+    type=int,
+    default=4,
+    help="""scale dim.
+    e.g.: -sd 4""",
+)
 import pandas as pd
 
 args = parser.parse_args()
@@ -582,6 +746,8 @@ for nhead, decode_qlen in list_nhead:
                 decode_qlen=decode_qlen,
                 max_split_per_batch=max_split_per_batch,
                 non_persistent_mode=args.non_persistent_mode,
+                paged_layout=args.paged_layout,
+                scale_dim=args.scale_dim,
             )
             df.append(ret)
     df = pd.DataFrame(df)

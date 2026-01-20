@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # user interface
 
@@ -167,7 +167,11 @@ def mla_decode_fwd(
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
+    if kv_buffer.dtype != torch.uint8:
+        _, _, _, qk_head_dim = kv_buffer.shape
+    else:
+        _, _, qk_head_dim = q.shape
+
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
