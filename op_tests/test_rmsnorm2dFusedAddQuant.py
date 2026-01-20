@@ -207,6 +207,7 @@ def test_rmsnorm(
 
     read_datasize = calculateTensorsSize(input, weight, res, xscale)
 
+    atol = 1 if quant_dtype == dtypes.i8 else 1e-2
     ret = {}
     (a, res_a, yscale_a, _), avg_a = run_torch(
         input,
@@ -234,7 +235,7 @@ def test_rmsnorm(
             quant_type=quant_type,
         )
         err_ck = checkAllclose(
-            a.to(dtypes.fp32), b.to(dtypes.fp32), rtol=0, atol=1, msg="check ck out"
+            a.to(dtypes.fp32), b.to(dtypes.fp32), rtol=0, atol=atol, msg="check ck out"
         )
         if add_residual:
             checkAllclose(res_a, res_b, msg="check ck res")
@@ -253,7 +254,7 @@ def test_rmsnorm(
             a = fp4_utils.mxfp4_to_f32(a)
             c = fp4_utils.mxfp4_to_f32(c)
         err_hip = checkAllclose(
-            a.to(dtypes.fp32), c.to(dtypes.fp32), rtol=0, atol=1, msg="check hip out"
+            a.to(dtypes.fp32), c.to(dtypes.fp32), rtol=0, atol=atol, msg="check hip out"
         )
         if add_residual:
             checkAllclose(res_a, res_c, msg="check hip res")
