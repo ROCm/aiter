@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional, Dict
 import torch
@@ -14,7 +14,6 @@ from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import get_num_xcds
-
 
 _LOGGER = AiterTritonLogger()
 

@@ -62,7 +62,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         # Use provided config or get default config
         if config is None:
-            config = get_fwd_configs(False, seqlen_k=seqlen_k)
+            config = get_fwd_configs(
+                False, seqlen_q=seqlen_q, seqlen_k=seqlen_k, num_heads=num_q_heads
+            )
         # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
         # config = config[0].all_kwargs()
         BLKQ = config["BLOCK_M"]
@@ -391,7 +393,7 @@ def fav3_sage_func(
         sm_margin: SM margin parameter (not yet supported)
         inference_model: do not return softmax_lse
         layout: bshd or bhsd layout for the inputs
-        config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N, 
+        config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
 
     Returns:
@@ -409,7 +411,9 @@ def fav3_sage_func(
 
     # Use provided config or get default config
     if config is None:
-        config = get_fwd_configs(False, seqlen_k=seqlen_k)
+        config = get_fwd_configs(
+            False, seqlen_q=seqlen_q, seqlen_k=seqlen_k, num_heads=num_q_heads
+        )
     # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
     # config = config[0].all_kwargs()
     BLKQ = config["BLOCK_M"]

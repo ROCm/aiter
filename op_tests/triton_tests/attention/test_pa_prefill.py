@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
 import random
@@ -7,7 +7,6 @@ import pytest
 import torch
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-
 
 NUM_HEADS = [64]
 NUM_QUERIES_PER_KV = [1, 8, 64]

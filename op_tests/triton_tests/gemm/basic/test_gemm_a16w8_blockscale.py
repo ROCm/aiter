@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import triton
@@ -14,7 +14,6 @@ from aiter.ops.shuffle import shuffle_weight
 
 # from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
 import torch.nn.functional as F
-
 
 block_shape = (128, 128)
 
