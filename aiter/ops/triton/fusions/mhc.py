@@ -49,20 +49,20 @@ def mhc(
            nC is the input feature dimension (n × C in paper notation)
         phi: Projection matrix with shape (nC, n² + 2n) for transforming input
              to three output streams
-        alpha_pre: Scaling factor α^pre for pre-stream (first n² elements)
+        alpha_pre: Scaling factor α^pre for pre-stream (first n elements)
         alpha_post: Scaling factor α^post for post-stream (next n elements)
-        alpha_res: Scaling factor α^res for residual stream (last n elements)
+        alpha_res: Scaling factor α^res for residual stream (last n² elements)
         bias: Bias vector b with shape (n² + 2n,) applied after scaling
         n: Stream parameter - hyperparameter controlling manifold dimension.
-           Determines output size: n² (pre) + n (post) + n (res) = n² + 2n
+           Determines output size: n (pre) + n (post) + n² (res) = n² + 2n
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
         out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, n² + 2n)
 
     Returns:
         Output tensor H with shape (M, n² + 2n) containing three concatenated streams:
-        - H^pre: [0:n²] - manifold projection with sigmoid activation
-        - H^post: [n²:n²+n] - post-processing with scaled sigmoid activation
-        - H^res: [n²+n:n²+2n] - residual connection (identity, for later Sinkhorn-Knopp)
+        - H^pre: [0:n] - manifold projection with sigmoid activation (n elements, H^{pre} ∈ ℝ^{1×n})
+        - H^post: [n:2n] - post-processing with scaled sigmoid activation (n elements, H^{post} ∈ ℝ^{1×n})
+        - H^res: [2n:2n+n²] - residual connection (identity, for later Sinkhorn-Knopp) (n² elements, H^{res} ∈ ℝ^{n×n})
 
     Shape requirements:
         - x: (M, nC) where nC = n * C (flattened streams)
@@ -80,7 +80,7 @@ def mhc(
         >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
         >>> H = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
         >>> H.shape  # (32, 24)
-        >>> # H contains: [H^pre (16 elements), H^post (4 elements), H^res (4 elements)]
+        >>> # H contains: [H^pre (4 elements), H^post (4 elements), H^res (16 elements)]
     """
     _LOGGER.info(
         f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"

@@ -47,9 +47,9 @@ def _mhc_fused_kernel(
     Fused kernel for equations 14-18.
     
     Computes H = [H^pre, H^post, H^res] where:
-    - H^pre: n² elements with sigmoid activation
-    - H^post: n elements with 2*sigmoid activation  
-    - H^res: n elements with identity (no activation)
+    - H^pre: n elements with sigmoid activation (H^{pre} ∈ ℝ^{1×n})
+    - H^post: n elements with 2*sigmoid activation (H^{post} ∈ ℝ^{1×n})
+    - H^res: n² elements with identity (no activation) (H^{res} ∈ ℝ^{n×n})
     
     All operations fused in a single kernel pass for maximum efficiency.
     """
@@ -103,17 +103,15 @@ def _mhc_fused_kernel(
     
     # Eq 16: Apply stream-specific scaling and bias
     # Output is split into 3 contiguous streams:
-    #   Pre-stream:  indices [0, n²) - for manifold projection
-    #   Post-stream: indices [n², n²+n) - for post-processing
-    #   Res-stream:  indices [n²+n, n²+2n) - for residual connections
-    n_squared = n * n
-    n_pre_end = n_squared        # End of pre-stream
-    n_post_end = n_squared + n   # End of post-stream
+    #   Pre-stream:  indices [0, n) - n elements for manifold projection (H^{pre} ∈ ℝ^{1×n})
+    #   Post-stream: indices [n, 2n) - n elements for post-processing (H^{post} ∈ ℝ^{1×n})
+    #   Res-stream:  indices [2n, 2n+n²) - n² elements for residual connections (H^{res} ∈ ℝ^{n×n})
+    n_pre_end = n                # End of pre-stream
+    n_post_end = 2 * n           # End of post-stream
     
     # Create boolean masks to identify which stream each output column belongs to
     is_pre = rn < n_pre_end
     is_post = (rn >= n_pre_end) & (rn < n_post_end)
-    is_res = rn >= n_post_end
     
     # Select the appropriate scaling factor (alpha) for each stream
     # This creates a vector where each element has its stream-specific alpha

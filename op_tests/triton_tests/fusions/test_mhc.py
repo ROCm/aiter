@@ -16,9 +16,9 @@ Notation (from mHC paper arXiv:2512.24880v2):
     - x_l ∈ ℝ^(M×nC): Flattened n-stream residual (input)
     - φ ∈ ℝ^(nC×N): Projection matrix for transformation to 3 streams
     - H ∈ ℝ^(M×N): Output containing [H^pre, H^post, H^res]
-      - H^pre: [0:n²] manifold projection with sigmoid activation
-      - H^post: [n²:n²+n] post-processing with 2*sigmoid activation
-      - H^res: [n²+n:n²+2n] residual connection (identity activation)
+      - H^pre: [0:n] manifold projection with sigmoid activation (n elements, H^{pre} ∈ ℝ^{1×n})
+      - H^post: [n:2n] post-processing with 2*sigmoid activation (n elements, H^{post} ∈ ℝ^{1×n})
+      - H^res: [2n:2n+n²] residual connection (identity activation) (n² elements, H^{res} ∈ ℝ^{n×n})
 """
 
 import torch
@@ -57,18 +57,18 @@ def mhc_torch(
     Args:
         x: Input x_l with shape (M, nC) - flattened n-stream residual
         phi: Projection φ with shape (nC, n² + 2n)
-        alpha_pre: Scaling factor α^pre for pre-stream (n² elements)
+        alpha_pre: Scaling factor α^pre for pre-stream (n elements)
         alpha_post: Scaling factor α^post for post-stream (n elements)
-        alpha_res: Scaling factor α^res for residual stream (n elements)
+        alpha_res: Scaling factor α^res for residual stream (n² elements)
         bias: Bias vector b with shape (n² + 2n,)
         n: Stream parameter controlling manifold dimension
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
 
     Returns:
         H with shape (M, n² + 2n) containing three concatenated streams:
-        - H^pre: [0:n²] manifold projection with sigmoid
-        - H^post: [n²:n²+n] post-processing with 2*sigmoid
-        - H^res: [n²+n:n²+2n] residual connection (identity)
+        - H^pre: [0:n] manifold projection with sigmoid (n elements)
+        - H^post: [n:2n] post-processing with 2*sigmoid (n elements)
+        - H^res: [2n:2n+n²] residual connection (identity) (n² elements)
     """
     x_f32 = x.to(torch.float32)
     nC = x.shape[1]
@@ -84,15 +84,15 @@ def mhc_torch(
 
     # Split into three streams
     n_squared = n * n
-    H_tilde_pre = H_tilde[:, :n_squared]  # n² coefficients
-    H_tilde_post = H_tilde[:, n_squared:n_squared + n]  # n coefficients
-    H_tilde_res = H_tilde[:, n_squared + n:]  # n coefficients
+    H_tilde_pre = H_tilde[:, :n]  # n coefficients (H^{pre} ∈ ℝ^{1×n})
+    H_tilde_post = H_tilde[:, n:2*n]  # n coefficients (H^{post} ∈ ℝ^{1×n})
+    H_tilde_res = H_tilde[:, 2*n:]  # n² coefficients (H^{res} ∈ ℝ^{n×n})
 
     # Split bias
     bias_f32 = bias.to(torch.float32)
-    bias_pre = bias_f32[:n_squared]
-    bias_post = bias_f32[n_squared:n_squared + n]
-    bias_res = bias_f32[n_squared + n:]
+    bias_pre = bias_f32[:n]
+    bias_post = bias_f32[n:2*n]
+    bias_res = bias_f32[2*n:]
 
     # Eq 16: Apply stream-specific scaling and bias
     # Note: normalization already applied in x_norm above
