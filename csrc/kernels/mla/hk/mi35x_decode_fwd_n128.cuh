@@ -182,9 +182,7 @@ __device__ __forceinline__ void async_load_k_tile(const uintptr_t p_lds_kv_warp_
     {
         const uintptr_t p_lds_kv_lane =
             p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
-        // Use flat instruction here for easy synchronization.
-        // hkm::ds_write_b32(p_lds_kv_lane, 0, 0u);
-        *reinterpret_cast<uint32_t*>(p_lds_kv_lane) = 0u;
+        hkm::ds_write_b32(p_lds_kv_lane, 0, 0u);
     }
     else
     {
@@ -968,6 +966,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 4]);
         const int32_t kv_end = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5]);
+        const int32_t kv_len = kv_end - kv_start;
 
         comp_t row_max;
         comp_t row_sum_e;
@@ -977,24 +976,56 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         hk::load<2, T::kQkNopeHeadDim>(
             q_rope, params.query, {qo_start, 0, 0, 0}, {0, int32_t(warp_idx), 0, 0});
 
+        if(kv_len < T::kBlockN)
+        {
+            async_load_k<T, true>(p_lds_kv_curr,
+                                  params.p_kv_indices,
+                                  params.kv_buffer,
+                                  kv_ld_row_base_idx,
+                                  kv_ld_col_base,
+                                  kv_start,
+                                  ckt::min(kv_end, kv_start + T::kBlockN));
+        }
+        else
+        {
+            async_load_k<T, false>(p_lds_kv_curr,
+                                   params.p_kv_indices,
+                                   params.kv_buffer,
+                                   kv_ld_row_base_idx,
+                                   kv_ld_col_base,
+                                   kv_start,
+                                   ckt::min(kv_end, kv_start + T::kBlockN));
+        }
+
         auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_tile_start,
                                                              const int32_t kv_tile_end) {
-            if constexpr(kIsFirstIter == false)
-            {
-                __builtin_amdgcn_s_barrier();
-            }
-
-            async_load_k<T, kIsTail>(p_lds_kv_curr,
-                                     params.p_kv_indices,
-                                     params.kv_buffer,
-                                     kv_ld_row_base_idx,
-                                     kv_ld_col_base,
-                                     kv_tile_start,
-                                     kv_tile_end);
-
             __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
+
+            if((kIsTail == false) && (kv_tile_end < kv_end))
+            {
+                if((kv_tile_start + T::kBlockN - 1) < kv_end)
+                {
+                    async_load_k<T, false>(p_lds_kv_next,
+                                           params.p_kv_indices,
+                                           params.kv_buffer,
+                                           kv_ld_row_base_idx,
+                                           kv_ld_col_base,
+                                           kv_tile_start + T::kBlockN,
+                                           kv_tile_end + T::kBlockN);
+                }
+                else
+                {
+                    async_load_k<T, true>(p_lds_kv_next,
+                                          params.p_kv_indices,
+                                          params.kv_buffer,
+                                          kv_ld_row_base_idx,
+                                          kv_ld_col_base,
+                                          kv_tile_start + T::kBlockN,
+                                          kv_end);
+                }
+            }
 
             // GEMM on NoPE
             load_k_to_gpr<T, 0, 0>(kv_0, p_lds_kv_curr);
@@ -1145,7 +1176,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             std::swap(p_lds_kv_curr, p_lds_kv_next);
         };
 
-        const int32_t kv_len = kv_end - kv_start;
         if(kv_len < T::kBlockN)
         {
             mla_main.template operator()<true, true>(kv_start, kv_end);
