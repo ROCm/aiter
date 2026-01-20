@@ -131,7 +131,6 @@ def run_torch_fused(
     else:
         block_size = kv_cache.shape[1]
         num_tokens = k_nope.shape[0]
-        kv_lora_rank = k_nope.shape[-1]
         # Vectorized version - much faster than nested for loops
         # Concatenate k_nope and k_pe along the last dimension: [num_tokens, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
         k_concat = torch.cat([k_nope, k_pe], dim=-1)
@@ -354,7 +353,6 @@ def test_fused_rope_concat_and_cache_mla(
         device=q_nope.device,
     )
     is_nope_first = True
-    # is_neox = True
 
     ref_q_out = torch.empty(
         (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
