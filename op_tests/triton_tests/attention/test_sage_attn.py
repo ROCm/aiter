@@ -447,11 +447,12 @@ def test_sage_v2(
         triton_out,
         torch_out,
         fp8=True,
-        atol=0.01, rtol=1e-2,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
         max_diff_percentage=0.5,
     )
 
 
 if __name__ == "__main__":
-    test_sage_v2(1, 1024, 1024, 1, 1, 128, "bhsd")
+    test_sage_v2(1, 512, 2, 1, 1, 32, "bhsd")
     # test_sage(1, 512, 512, 1, 1, 128, "bhsd")

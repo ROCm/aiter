@@ -29,11 +29,11 @@ from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
+    fav3_sage,
     get_fwd_configs,
     sage_quant,
     sage_quant_v2
 )
-
 CAUSAL = False
 layout_converter = {
     "bshd": "NHD",
@@ -255,7 +255,7 @@ def fav3_sage_forward_func(
             causal=causal,
             inference_mode=inference_mode,
             layout=layout,
-            sage_version=1
+            sage_version=fav3_sage.Sage_version.V1
         )
     else:
         q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale = sage_quant_v2(
@@ -282,7 +282,7 @@ def fav3_sage_forward_func(
             inference_mode=True,
             layout=layout,
             config=config,
-            sage_version=2
+            sage_version=fav3_sage.Sage_version.V2
         )
 
 def create_benchmark_configs(args):

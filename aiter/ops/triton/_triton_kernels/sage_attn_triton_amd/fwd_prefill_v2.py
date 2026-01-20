@@ -29,10 +29,10 @@ def get_fwd_configs(autotune: bool, seqlen_k: int = None):
         return {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
-            "waves_per_eu": 1,
+            "waves_per_eu": 0,
             "PRE_LOAD_V": False,
-            "num_stages": 1,
-            "num_warps": 4,
+            "num_stages": 3,
+            "num_warps": 8,
         }
     elif arch == "gfx942":
         return {
@@ -89,7 +89,7 @@ def _sage_fwd_no_mask_v2(
     alibi_slope,
     q_descale,
     k_descale_base_ptr,
-    v_descale_base_ptr,
+    SM_SCALE: tl.constexpr,
     FP8_MAX,
     stride_k_descale_s,
     BLOCK_M: tl.constexpr,
@@ -139,7 +139,7 @@ def _sage_fwd_no_mask_v2(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
         # -- compute qk ----
-        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1")
+        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1") * SM_SCALE
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -282,7 +282,7 @@ def _sage_fwd_mask_v2(
     alibi_slope,
     q_descale,
     k_descale_base_ptr,
-    v_descale_base_ptr,
+    SM_SCALE: tl.constexpr,
     FP8_MAX,
     stride_k_descale_s,
     IS_CAUSAL: tl.constexpr,
@@ -354,8 +354,7 @@ def _sage_fwd_mask_v2(
             qk = tl.where(mask, qk, float("-inf"))
 
         # -- compute qk ----
-        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1")  #  * SM_SCALE
-
+        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1") * SM_SCALE
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1240,7 +1239,7 @@ def sage_fwd_v2(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            None,
+            SM_SCALE,
             FP8_MAX,
             stride_k_descale_s,
             IS_CAUSAL,
@@ -1308,7 +1307,7 @@ def sage_fwd_v2(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            None,
+            SM_SCALE,
             FP8_MAX,
             stride_k_descale_s,
             BLOCK_M,
@@ -1378,7 +1377,7 @@ def sage_fwd_v2(
             alibi_slope,
             q_descale,
             k_descale_ptr,
-            None,
+            SM_SCALE,
             FP8_MAX,
             stride_k_descale_s,
             IS_CAUSAL,  # Use actual causal flag
@@ -1849,6 +1848,9 @@ def fav3_sage_triton_impl_v2(
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     if config is None:
         config = get_fwd_configs(False, seqlen_k=max_seqlens_k)
+
+    if sm_scale == None:
+        sm_scale = (head_size_qk**(-0.5)) * 1.4426950408889634
     sage_fwd_v2[grid](
         q,
         k,
@@ -2005,13 +2007,9 @@ def sage_quant_v2(
         h_kv,
         K_NUM_BLKS,
         kv_len,
-        FP8_MAX=FP8_MAX,
         D=head_dim,
         BLK_K=BLKK,
     )
-    # TODO check the sm_scale multiplication accuracy
-    # q = q.to(torch.float32)
-    q *= sm_scale
 
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
@@ -2033,7 +2031,6 @@ def sage_quant_v_kernel(
     K_HEAD,
     K_NUM_BLKS,
     SEQLEN_K,
-    FP8_MAX: tl.constexpr,
     D: tl.constexpr,
     BLK_K: tl.constexpr,
 ):
@@ -2065,22 +2062,3 @@ def sage_quant_v_kernel(
     v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
     tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
-
-@triton.jit
-def _general_quant_kernel(
-    input_ptrs, output_ptrs, scale_ptrs, DTYPE_MAX, mask, sm_scale=None
-):
-    if mask is not None:
-        x = tl.load(input_ptrs, mask=mask, other=0.0)
-    else:
-        x = tl.load(input_ptrs)
-    x = x.to(tl.float32)
-    if sm_scale is not None:
-        x *= sm_scale
-    scale = tl.max(tl.abs(x)) / DTYPE_MAX
-    x_quant = x / scale
-    if output_ptrs.dtype.element_ty == tl.int8:
-        x_quant += 0.5 * tl.where(x_quant >= 0, 1, -1)
-    x_quant = x_quant.to(output_ptrs.dtype.element_ty)
-    tl.store(output_ptrs, x_quant, mask=mask)
-    tl.store(scale_ptrs, scale)
