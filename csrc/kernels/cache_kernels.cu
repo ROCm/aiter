@@ -1453,8 +1453,8 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
   //concat
   static constexpr int32_t ooba_i = 4 / sizeof(scalar_t);
   static constexpr int32_t ooba_o = 4 / sizeof(cache_t);
-  const int32_t oob_i             = (512 + ooba_i - 1) / ooba_i * ooba_i;
-  const int32_t oob_o             = (512 + ooba_o - 1) / ooba_o * ooba_o;
+  const int32_t oob_i             = (kv_lora_rank + ooba_i - 1) / ooba_i * ooba_i;
+  const int32_t oob_o             = (kv_lora_rank + ooba_o - 1) / ooba_o * ooba_o;
   // Auto-adjust vec_size based on scalar_t size to avoid exceeding 16-byte limit
   // float (4 bytes): max vec_size=4 (16 bytes), half/bf16 (2 bytes): max vec_size=8 (16 bytes)
   static constexpr int32_t max_vec_size = (sizeof(scalar_t) == 4) ? 4 : vec_size;
@@ -1470,12 +1470,11 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
       inv_qscale = 1.0f / *q_scale;
   }
   static constexpr int32_t q_ooba_o = 4 / sizeof(query_t);
-  const int32_t q_oob_o             = (kv_lora_rank + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
   auto const* q_ptr_i               = reinterpret_cast<scalar_t const*>(q_nope + token_idx * q_nope_stride_0 + head_idx * q_nope_stride_1);
   auto* q_ptr_o                     = reinterpret_cast<query_t*>(q_out + token_idx * q_out_stride_0 + head_idx * q_out_stride_1);
   // Use opus::make_gmem instead of ck_tile::make_buffer_view
   auto buffer_i = opus::make_gmem<scalar_t>(q_ptr_i, oob_i * sizeof(scalar_t));
-  auto buffer_o = opus::make_gmem<query_t>(q_ptr_o, q_oob_o * sizeof(query_t));
+  auto buffer_o = opus::make_gmem<query_t>(q_ptr_o, oob_o * sizeof(query_t));
   opus_vec_i vec_cur;  // Use opus_vec_i directly, no need to cast on load
   size_t vec_idx    = threadIdx.x;
   vec_cur = buffer_i.template load<vec_size_i>(vec_idx * vec_size_i);
@@ -3623,6 +3622,7 @@ void fused_qk_rope_concat_and_cache_mla(
     const int k_pe_stride_0 = k_pe.stride(0);
     const int k_pe_stride_1 = k_pe.stride(1);
     const int num_kv_heads = kv_c.size(1);
+    TORCH_CHECK(num_kv_heads <= num_heads, "num_kv_heads must be less than or equal to num_heads");
     const int kv_cache_stride_h = kv_cache.stride(2);
     
     // Option 1: Optimized prefill kernel for standard config

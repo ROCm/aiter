@@ -149,7 +149,7 @@ def run_torch_fused(
         if kv_cache_dtype == "fp8":
             kv_cache = (kv_cache.to(torch.float32) / k_scale.item()).to(out_dtype)
         else:
-            kv_cache = kv_cache
+            pass
     if is_nope_first:
         kv_cache_swapped = kv_cache
     else:
@@ -322,13 +322,12 @@ def test_fused_rope_concat_and_cache_mla(
     k_pe = torch.randn(
         num_tokens, num_kv_heads, qk_rope_head_dim, dtype=dtype, device=device
     )
-    q_nope = torch.ones(num_tokens, num_heads, kv_lora_rank, dtype=dtype, device=device)
+    q_nope = torch.randn(
+        num_tokens, num_heads, kv_lora_rank, dtype=dtype, device=device
+    )
     q_pe = torch.randn(
         num_tokens, num_heads, qk_rope_head_dim, dtype=dtype, device=device
     )
-    # q stride test
-    # base_tensor = torch.randn(12160, dtype=dtype, device=device)  # ??? torch.zeros, torch.ones ?
-    # q_pe = torch.as_strided(base_tensor, size=(num_tokens, num_heads, qk_rope_head_dim), stride=(3072, 192, 1))
     entry_size = kv_lora_rank + qk_rope_head_dim
     cos_cache, sin_cache = compute_cache(num_tokens, qk_rope_head_dim // 2, dtype)
     cos_cache = cos_cache.to(device)
@@ -381,52 +380,47 @@ def test_fused_rope_concat_and_cache_mla(
     ############################################################
     # triton test
     ############################################################
-    # reshaped_kv_c = kv_c.unsqueeze(1)
-    # reshaped_k_pe = k_pe.unsqueeze(1)
     # triton_q_out = torch.empty(
-    #    (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
-    #    dtype=q_out_dtype,
-    #    device=q_nope.device,
+    #   (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
+    #   dtype=q_out_dtype,
+    #   device=q_nope.device,
     # )
     # from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
 
-    #
     # triton_temp = torch.zeros(
-    #    (num_tokens, num_kv_heads, entry_size), dtype=cache_dtype, device=device
+    #   (num_tokens, num_kv_heads, entry_size), dtype=cache_dtype, device=device
     # )
-    #
     # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
-    #    (triton_q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out), triton_us = (
-    #        run_perftest(
-    #            fused_qk_rope_cat_and_cache_mla,
-    #            q_nope,
-    #            q_pe,
-    #            kv_c,
-    #            k_pe,
-    #            triton_temp,
-    #            slot_mapping,
-    #            pos,
-    #            cos_cache,
-    #            sin_cache,
-    #            scale,
-    #            is_neox,
-    #            0,
-    #            True if kv_cache_dtype == "fp8" else False,
-    #            triton_q_out,
-    #        )
-    #    )
+    #   (triton_q_out, _, _, _), triton_us = (
+    #       run_perftest(
+    #           fused_qk_rope_cat_and_cache_mla,
+    #           q_nope,
+    #           q_pe,
+    #           kv_c,
+    #           k_pe,
+    #           triton_temp,
+    #           slot_mapping,
+    #           pos,
+    #           cos_cache,
+    #           sin_cache,
+    #           scale,
+    #           is_neox,
+    #           0,
+    #           True if kv_cache_dtype == "fp8" else False,
+    #           triton_q_out,
+    #       )
+    #   )
     # else:
-    #    (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = (
-    #        triton_q_out,
-    #        None,
-    #        None,
-    #        triton_temp,
-    #    ), None
-    #
+    #   (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = (
+    #       triton_q_out,
+    #       None,
+    #       None,
+    #       triton_temp,
+    #   ), None
     # triton_temp = triton_temp.reshape(
-    #    num_tokens // block_size, block_size, num_kv_heads, entry_size
+    #   num_tokens // block_size, block_size, num_kv_heads, entry_size
     # )
-    ############################################################
+    #############################################################
     if num_kv_heads == 1:
         kv_c = kv_c.squeeze(1)
         k_pe = k_pe.squeeze(1)
@@ -464,18 +458,18 @@ def test_fused_rope_concat_and_cache_mla(
         err_q_out = checkAllclose(q_result_tmp, q_expected_tmp, atol=0.01, rtol=0.01)
         ### compare with qscale=1.0
         # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
-        #    err_triton_kv = checkAllclose(
-        #        triton_temp.to(torch.float32),
-        #        kv_expected_temp,
-        #        atol=0.01,
-        #        rtol=0.01,
-        #        msg="fp8 kv result compared with triton",
-        #    )
-        #    err_triton_q_out = checkAllclose(
-        #        triton_q_out.to(torch.float32) * q_scale,
-        #        q_expected_tmp,
-        #        msg="fp8 qout result compared with triton",
-        #    )
+        #   err_triton_kv = checkAllclose(
+        #       triton_temp.to(torch.float32),
+        #       kv_expected_temp,
+        #       atol=0.01,
+        #       rtol=0.01,
+        #       msg="fp8 kv result compared with triton",
+        #   )
+        #   err_triton_q_out = checkAllclose(
+        #       triton_q_out.to(torch.float32) * q_scale,
+        #       q_expected_tmp,
+        #       msg="fp8 qout result compared with triton",
+        #   )
     elif kv_cache_dtype == "fp8" and q_dtype == "auto":
         kv_result_temp = kv_cache.to(torch.float32)
         kv_expected_temp = ref_kv_cache.to(torch.float32)
@@ -490,14 +484,14 @@ def test_fused_rope_concat_and_cache_mla(
             q_out, ref_q_out, msg="bf16 qout result compared with ref"
         )
         # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
-        #    err_triton_q_out = checkAllclose(
-        #        triton_q_out, ref_q_out, msg="bf16 triton qout result compared with ref"
-        #    )
-        #    err_triton_kv = checkAllclose(
-        #        triton_temp.to(torch.float32),
-        #        kv_expected_temp,
-        #        msg="fp8 triton kv result compared with ref",
-        #    )
+        #   err_triton_q_out = checkAllclose(
+        #       triton_q_out, ref_q_out, msg="bf16 triton qout result compared with ref"
+        #   )
+        #   err_triton_kv = checkAllclose(
+        #       triton_temp.to(torch.float32),
+        #       kv_expected_temp,
+        #       msg="fp8 triton kv result compared with ref",
+        #   )
     else:
         print(
             f"kv_cache.shape={kv_cache.shape}, ref_kv_cache.shape={ref_kv_cache.shape}"
@@ -510,17 +504,17 @@ def test_fused_rope_concat_and_cache_mla(
         )
 
         # if block_size == 1 and is_nope_first and (num_heads % num_kv_heads == 0):
-        #    err_triton_q_out = checkAllclose(
-        #        triton_q_out, ref_q_out, msg="bf16 triton qout result compared with ref"
-        #    )
-        #    err_triton_kv = checkAllclose(
-        #        triton_temp, ref_kv_cache, msg="bf16 triton kv result compared with ref"
-        #    )
+        #   err_triton_q_out = checkAllclose(
+        #       triton_q_out, ref_q_out, msg="bf16 triton qout result compared with ref"
+        #   )
+        #   err_triton_kv = checkAllclose(
+        #       triton_temp, ref_kv_cache, msg="bf16 triton kv result compared with ref"
+        #   )
     # ret["triton_us"] = triton_us
     # ret['triton_kv_err'] = err_triton_kv
     # ret['triton_q_err'] = err_triton_q_out
     ret["fused_qk_us"] = avg_us
-    ret["unfused_us"] = ref_us
+    # ret["unfused_us"] = ref_us
     ret["hip_kv_err"] = err_kv
     ret["hip_q_err"] = err_q_out
     ####
@@ -607,7 +601,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=[128, 256, 512, 1024, 2048, 4096],  # , 8192, 16384,
+    default=[4, 128, 256, 512, 1024, 2048],  # , 4096 , 8192, 16384,
     help="""token nums.
     e.g.: -t 128""",
 )
@@ -616,7 +610,7 @@ parser.add_argument(
     "--head",
     type=int,
     nargs="*",
-    default=[1, 2, 4, 8],
+    default=[2, 8],
     help="""num heads.
     e.g.: -hd 1""",
 )
@@ -624,7 +618,8 @@ parser.add_argument(
     "-nkh",
     "--num_kv_heads",
     type=int,
-    default=1,
+    nargs="*",
+    default=[1, 2],
     help="""num kv heads.
     e.g.: -nkh 1""",
 )
@@ -688,26 +683,29 @@ if "fused_qk" in args.case:
     for num_token in args.token:
         num_blocks = num_token // args.block_size
         for num_heads in args.head:
-            for kv_cache_dtype in args.kv_dtype:
-                for is_neox in args.is_neox:
-                    for q_dtype in args.q_dtype:
-                        if q_dtype == "fp8" and kv_cache_dtype != "fp8":
-                            continue
-                        ret = test_fused_rope_concat_and_cache_mla(
-                            args.kv_lora_rank,
-                            args.qk_rope_head_dim,
-                            num_token,
-                            args.block_size,
-                            num_blocks,
-                            num_heads,
-                            args.num_kv_heads,
-                            args.dtype,
-                            args.device,
-                            kv_cache_dtype,
-                            q_dtype,
-                            is_neox,
-                        )
-                        df.append(ret)
+            for num_kv_heads in args.num_kv_heads:
+                for kv_cache_dtype in args.kv_dtype:
+                    for is_neox in args.is_neox:
+                        for q_dtype in args.q_dtype:
+                            if q_dtype == "fp8" and kv_cache_dtype != "fp8":
+                                continue
+                            if num_kv_heads > num_heads:
+                                continue
+                            ret = test_fused_rope_concat_and_cache_mla(
+                                args.kv_lora_rank,
+                                args.qk_rope_head_dim,
+                                num_token,
+                                args.block_size,
+                                num_blocks,
+                                num_heads,
+                                num_kv_heads,
+                                args.dtype,
+                                args.device,
+                                kv_cache_dtype,
+                                q_dtype,
+                                is_neox,
+                            )
+                            df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)
