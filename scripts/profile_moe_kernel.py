@@ -66,7 +66,17 @@ Kernel: {kernel_name}
 """
 
 import sys
-sys.path.insert(0, '/home/AMD/msaffari/workspace/aiter')
+from pathlib import Path
+
+# Dynamically find aiter root directory
+script_dir = Path(__file__).parent
+aiter_root = script_dir
+while aiter_root.name != 'aiter' and aiter_root != aiter_root.parent:
+    aiter_root = aiter_root.parent
+if aiter_root.name != 'aiter':
+    # Fallback: assume script is in aiter/scripts or subdirectory
+    aiter_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(aiter_root))
 
 import torch
 import aiter
@@ -170,7 +180,17 @@ Kernel: {kernel_name}
 """
 
 import sys
-sys.path.insert(0, '/home/AMD/msaffari/workspace/aiter')
+from pathlib import Path
+
+# Dynamically find aiter root directory
+script_dir = Path(__file__).parent
+aiter_root = script_dir
+while aiter_root.name != 'aiter' and aiter_root != aiter_root.parent:
+    aiter_root = aiter_root.parent
+if aiter_root.name != 'aiter':
+    # Fallback: assume script is in aiter/scripts or subdirectory
+    aiter_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(aiter_root))
 
 import torch
 import aiter
@@ -278,7 +298,17 @@ Kernel: {kernel_name}
 """
 
 import sys
-sys.path.insert(0, '/home/AMD/msaffari/workspace/aiter')
+from pathlib import Path
+
+# Dynamically find aiter root directory
+script_dir = Path(__file__).parent
+aiter_root = script_dir
+while aiter_root.name != 'aiter' and aiter_root != aiter_root.parent:
+    aiter_root = aiter_root.parent
+if aiter_root.name != 'aiter':
+    # Fallback: assume script is in aiter/scripts or subdirectory
+    aiter_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(aiter_root))
 
 import torch
 import aiter
@@ -382,7 +412,17 @@ Kernel: {kernel_name}
 """
 
 import sys
-sys.path.insert(0, '/home/AMD/msaffari/workspace/aiter')
+from pathlib import Path
+
+# Dynamically find aiter root directory
+script_dir = Path(__file__).parent
+aiter_root = script_dir
+while aiter_root.name != 'aiter' and aiter_root != aiter_root.parent:
+    aiter_root = aiter_root.parent
+if aiter_root.name != 'aiter':
+    # Fallback: assume script is in aiter/scripts or subdirectory
+    aiter_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(aiter_root))
 
 import torch
 import aiter
