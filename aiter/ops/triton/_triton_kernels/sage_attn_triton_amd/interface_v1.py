@@ -241,7 +241,7 @@ def fwd(
 
     if out is None:
         # NOTE: Using types that are lower precision than float32 such as bfloat16 for fp8 causes mismatches on a small set of tests.
-        out_dtype = torch.float16
+        out_dtype = torch.bfloat16
         if layout in ["bshd", "bhsd"]:
             out = torch.zeros(
                 q.shape[0],
