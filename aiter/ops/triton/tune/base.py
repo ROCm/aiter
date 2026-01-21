@@ -57,29 +57,33 @@ def benchmark_config(run, ground_truth, num_iters=10, atol=1e-1, rtol=1e-1):
         atol: Absolute tolerance for comparison.
         rtol: Relative tolerance for comparison.
     Returns:
-        Average latency in microseconds.
+        Average latency in ms.
     """
+    # First, run the kernel once to verify correctness and estimate time
     torch.cuda.synchronize()
-    # JIT compilation & warmup
-    for _ in range(5):
-        run()
-    torch.cuda.synchronize()
-
+    kernel_out = run()
+    torch.testing.assert_close(kernel_out, ground_truth, atol=atol, rtol=rtol)
+    
+    # Estimate the time per iteration
     start_event = torch.Event(enable_timing=True)
     end_event = torch.Event(enable_timing=True)
-
-    latencies: list[float] = []
-    for _ in range(num_iters):
-        torch.cuda.synchronize()
-        start_event.record()
-        kernel_out = run()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-        torch.testing.assert_close(kernel_out, ground_truth, atol=atol, rtol=rtol)
-    avg = sum(latencies) / (num_iters * 10) * 1000  # us
-    return avg
-
+    torch.cuda.synchronize()
+    start_event.record()
+    run()
+    end_event.record()
+    end_event.synchronize()
+    estimate_ms = start_event.elapsed_time(end_event)
+    
+    # Calculate repetition time based on desired number of iterations
+    # do_bench uses rep as time in ms, so we multiply estimate by num_iters
+    rep_time_ms = max(1, int(num_iters * estimate_ms))
+    
+    # Use do_bench with the calculated repetition time
+    ms = triton.testing.do_bench(
+        lambda: run(), warmup=25, rep=rep_time_ms
+    )
+    
+    return ms
 
 def get_search_space(small: bool = False):
     """

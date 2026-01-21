@@ -244,22 +244,22 @@ def main():
     save_path = AITER_TRITON_CONFIGS_PATH + "/moe/"
 
     # Tune for default (float16)
-    # tune_and_save_configs(
-    #     batch_sizes=batch_sizes,
-    #     N=N,
-    #     K=K,
-    #     topk=topk,
-    #     E=E,
-    #     routed_weight=False,
-    #     dtype=torch.float16,
-    #     fp8_w8a8=False,
-    #     int8_w8a16=False,
-    #     int4_w4a16=False,
-    #     search_space=search_space,
-    #     save_path=save_path,
-    #     device_name=dev,
-    #     tag="DEFAULT",
-    # )
+    tune_and_save_configs(
+        batch_sizes=batch_sizes,
+        N=N,
+        K=K,
+        topk=topk,
+        E=E,
+        routed_weight=False,
+        dtype=torch.float16,
+        fp8_w8a8=False,
+        int8_w8a16=False,
+        int4_w4a16=False,
+        search_space=search_space,
+        save_path=save_path,
+        device_name=dev,
+        tag="DEFAULT",
+    )
     # tune_and_save_configs(
     #     batch_sizes=batch_sizes,
     #     N=N,

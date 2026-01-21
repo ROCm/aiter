@@ -51,7 +51,8 @@ def routing_sigmoid_top1(
     topk_ids = torch.empty((M, _topk), device=x.device, dtype=torch.int32)
     topk_weights = torch.empty((M, _topk), device=x.device, dtype=torch.float32)
 
-    config = _get_config(M, N, K)
+    if not config:
+        config = _get_config(M, N, K)
 
     # Grid size
     def grid(META):
