@@ -10,7 +10,7 @@ from aiter.test_mha_common import (
     attention_ref,
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    get_fwd_configs as sage_fwd_configs,
+    get_sage_fwd_configs as sage_fwd_configs,
     sage_quant,
 )
 

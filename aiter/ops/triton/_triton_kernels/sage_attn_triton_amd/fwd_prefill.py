@@ -10,10 +10,7 @@ from .utils import (
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 
-def get_fwd_configs(
-    autotune: bool, seqlen_q: int = None, seqlen_k: int = None, num_heads: int = None
-):
-    assert not autotune, "Autotuning is not supported."
+def get_sage_fwd_configs():
     arch = get_arch()
     if arch == "gfx950":
         return {
@@ -71,7 +68,6 @@ def _sage_fwd_no_mask(
     off_z,
     off_h_q,
     offs_m,
-    offs_n,
     offs_d_qk,
     offs_d_v,
     block_min,
@@ -1261,7 +1257,6 @@ def sage_fwd(
             off_z,
             off_h_q,
             offs_m,
-            offs_n,
             offs_d_qk,
             offs_d_v,
             block_min,  # Start of range: 0
@@ -1797,9 +1792,7 @@ def fav3_sage_triton_impl(
         return (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
 
     if config is None:
-        config = get_fwd_configs(
-            False, seqlen_q=max_seqlens_q, seqlen_k=max_seqlens_k, num_heads=nheads_q
-        )
+        config = get_sage_fwd_configs()
     sage_fwd[grid](
         q,
         k,

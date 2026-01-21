@@ -30,7 +30,7 @@ from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    get_fwd_configs,
+    get_sage_fwd_configs,
     sage_quant,
 )
 
@@ -307,10 +307,7 @@ def fav3_sage_forward_func(
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
 ):
-    num_heads = q.shape[2] if layout == "bshd" else q.shape[1]
-    config = get_fwd_configs(
-        False, seqlen_q=q.shape[1], seqlen_k=k.shape[1], num_heads=num_heads
-    )
+    config = get_sage_fwd_configs()
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
