@@ -428,7 +428,7 @@ __device__ __forceinline__ void transpose_v(v8ui* p_v)
     }
 }
 
-template <bool kIsTail, uint32_t GPR>
+template <bool kCheckBoundary, uint32_t GPR>
 __device__ __forceinline__ void
 softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const float softmax_scale)
 {
@@ -437,7 +437,7 @@ softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const flo
     const uint32_t col_0_last_idx        = col_0_start_idx + num_elem_per_tile - 1;
     const uint32_t col_1_start_idx       = col_0_start_idx + 16;
     const uint32_t col_1_last_idx        = col_1_start_idx + num_elem_per_tile - 1;
-    if((kIsTail == false) || (col_1_last_idx < kv_end))
+    if((kCheckBoundary == false) || (col_1_last_idx < kv_end))
     {
         asm volatile("v_mul_f32_e32 v[%0], %8, v[%0]\n\t"
                      "v_mul_f32_e32 v[%1], %8, v[%1]\n\t"
@@ -602,7 +602,7 @@ softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const flo
     }
 }
 
-template <bool kIsFirstIter, bool kIsTail, uint32_t k_p_comp_begin, typename comp_t = float>
+template <bool kIsFirstIter, bool kCheckBoundary, uint32_t k_p_comp_begin, typename comp_t = float>
 __device__ __forceinline__ void softmax(comp_t* p_row_max,
                                         comp_t* p_row_sum_e,
                                         comp_t* p_rescale,
@@ -617,7 +617,8 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
 
     // Element-wise scale. Boundary problem is handled here as well.
     const uint32_t col_0_idx = lane_idx >> 4;
-    softmax_scale_p<kIsTail, k_p_comp_begin>(col_0_idx * 4 + kv_tile_start, kv_end, softmax_scale);
+    softmax_scale_p<kCheckBoundary, k_p_comp_begin>(
+        col_0_idx * 4 + kv_tile_start, kv_end, softmax_scale);
 
     // Get max of row
     comp_t local_max, tmp0, tmp1;
@@ -993,13 +994,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                    ckt::min(kv_end, kv_start + T::kBlockN));
         }
 
-        auto mla_main = [&]<bool kIsFirstIter, bool kIsTail>(const int32_t kv_tile_start,
-                                                             const int32_t kv_tile_end) {
+        auto mla_main = [&]<bool kIsFirstIter, bool kIsLastIter, bool kCheckBoundary>(
+                            const int32_t kv_tile_start, const int32_t kv_tile_end) {
+            static_assert((kCheckBoundary == false) || (kIsLastIter == true));
+
             __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
-            if((kIsTail == false) && (kv_tile_end < kv_end))
+            if constexpr(kIsLastIter == false)
             {
                 if((kv_tile_start + T::kBlockN - 1) < kv_end)
                 {
@@ -1089,13 +1092,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             });
 
             float rescale;
-            softmax<kIsFirstIter, kIsTail, k_p_comp_begin, comp_t>(&row_max,
-                                                                   &row_sum_e,
-                                                                   &rescale,
-                                                                   kv_tile_start,
-                                                                   kv_end,
-                                                                   params.softmax_scale,
-                                                                   params.p_dbg);
+            softmax<kIsFirstIter, kCheckBoundary, k_p_comp_begin, comp_t>(&row_max,
+                                                                          &row_sum_e,
+                                                                          &rescale,
+                                                                          kv_tile_start,
+                                                                          kv_end,
+                                                                          params.softmax_scale,
+                                                                          params.p_dbg);
 
             if constexpr(kIsFirstIter == false)
             {
@@ -1177,27 +1180,39 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 }
             });
 
-            std::swap(p_lds_kv_curr, p_lds_kv_next);
+            if constexpr(kIsLastIter == false)
+            {
+                std::swap(p_lds_kv_curr, p_lds_kv_next);
+            }
         };
 
         if(kv_len < T::kBlockN)
         {
-            mla_main.template operator()<true, true>(kv_start, kv_end);
+            mla_main.template operator()<true, true, true>(kv_start, kv_end);
+        }
+        else if(kv_len == T::kBlockN)
+        {
+            mla_main.template operator()<true, true, false>(kv_start, kv_end);
         }
         else
         {
             const int32_t kv_1st_end = kv_start + T::kBlockN;
-            mla_main.template operator()<true, false>(kv_start, kv_1st_end);
+            mla_main.template operator()<true, false, false>(kv_start, kv_1st_end);
 
             int32_t kv_idx = kv_1st_end;
-            for(; kv_idx < (kv_end + 1 - T::kBlockN); kv_idx += T::kBlockN)
+            while((kv_idx + T::kBlockN) < kv_end)
             {
-                mla_main.template operator()<false, false>(kv_idx, kv_idx + T::kBlockN);
+                mla_main.template operator()<false, false, false>(kv_idx, kv_idx + T::kBlockN);
+                kv_idx += T::kBlockN;
             }
 
-            if((kv_len % T::kBlockN) != 0)
+            if((kv_idx + T::kBlockN) == kv_end)
             {
-                mla_main.template operator()<false, true>(kv_idx, kv_end);
+                mla_main.template operator()<false, true, false>(kv_idx, kv_end);
+            }
+            else
+            {
+                mla_main.template operator()<false, true, true>(kv_idx, kv_end);
             }
         }
 
