@@ -1,7 +1,7 @@
 {
   "M_LEQ_16": {
     "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 16,
+    "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 128,
     "GROUP_SIZE_M": 1,
     "num_warps": 2,

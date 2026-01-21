@@ -374,18 +374,18 @@ def issue_buffer_load_to_lds(
 
     smem_a,
     smem_b,
-    smem_scale_a,
-    smem_scale_b,
+    # smem_scale_a,
+    # smem_scale_b,
 
     a_ptr,
     b_ptr,
-    a_scale_ptr,
-    b_scale_ptr,
+    # a_scale_ptr,
+    # b_scale_ptr,
 
     offs_a,
     offs_b,
-    offs_a_scale,
-    offs_b_scale,
+    # offs_a_scale,
+    # offs_b_scale,
 
     offs_am,
     offs_bn,
@@ -400,9 +400,9 @@ def issue_buffer_load_to_lds(
 
     stride_ak,
     stride_bk,
-    stride_ascale_k,
-    stride_bscale_k,
-    offs_ks_step,
+    # stride_ascale_k,
+    # stride_bscale_k,
+    # offs_ks_step,
 
     EVEN_K: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
@@ -412,8 +412,8 @@ def issue_buffer_load_to_lds(
     global_k = pid_k * num_k_iter + k
     offs_a_tmp = offs_a + BLOCK_SIZE_K * stride_ak * global_k
     offs_b_tmp = offs_b + BLOCK_SIZE_K * stride_bk * global_k
-    offs_a_scale_tmp = offs_a_scale + offs_ks_step * stride_ascale_k * global_k
-    offs_b_scale_tmp = offs_b_scale + offs_ks_step * stride_bscale_k * global_k
+    # offs_a_scale_tmp = offs_a_scale + offs_ks_step * stride_ascale_k * global_k
+    # offs_b_scale_tmp = offs_b_scale + offs_ks_step * stride_bscale_k * global_k
 
     if EVEN_K:
         mask_a=offs_am[:, None] < M
@@ -429,12 +429,12 @@ def issue_buffer_load_to_lds(
         mask=mask_a,
         cache_modifier=cache_modifier,
     )
-    cp.buffer_load_to_shared(
-        dest=smem_scale_a.index(k % num_stages),
-        ptr=a_scale_ptr,
-        offsets=offs_a_scale_tmp,
-        cache_modifier=cache_modifier,
-    )
+    # cp.buffer_load_to_shared(
+    #     dest=smem_scale_a.index(k % num_stages),
+    #     ptr=a_scale_ptr,
+    #     offsets=offs_a_scale_tmp,
+    #     cache_modifier=cache_modifier,
+    # )
     
     cp.buffer_load_to_shared(
         dest=smem_b.index(k % num_stages),
@@ -443,12 +443,12 @@ def issue_buffer_load_to_lds(
         mask=mask_b,
         cache_modifier=cache_modifier,
     )
-    cp.buffer_load_to_shared(
-        dest=smem_scale_b.index(k % num_stages),
-        ptr=b_scale_ptr,
-        offsets=offs_b_scale_tmp,
-        cache_modifier=cache_modifier,
-    )
+    # cp.buffer_load_to_shared(
+    #     dest=smem_scale_b.index(k % num_stages),
+    #     ptr=b_scale_ptr,
+    #     offsets=offs_b_scale_tmp,
+    #     cache_modifier=cache_modifier,
+    # )
 
     cp.commit_group()
     return k + 1
@@ -460,8 +460,8 @@ def load_from_lds_and_mfma(
 
     smem_a,
     smem_b,
-    smem_scale_a,
-    smem_scale_b,
+    cur_a_scale,
+    cur_b_scale,
 
     acc,
     zeros,
@@ -469,8 +469,8 @@ def load_from_lds_and_mfma(
     FP8_FORMAT: gl.constexpr,
     dot_a_layout: gl.constexpr,
     dot_b_layout: gl.constexpr,
-    mfma_layout: gl.constexpr,
     num_stages: gl.constexpr,
+    # mfma_layout: gl.constexpr,
 ):
     cur_a = smem_a.index(k % num_stages).load(layout=dot_a_layout)
     cur_b = smem_b.index(k % num_stages).load(layout=dot_b_layout)
@@ -490,7 +490,7 @@ def load_from_lds_and_mfma(
         acc=zeros,
     )
 
-    acc += mfma_out #* cur_a_scale[:, None] * cur_b_scale[None, :]
+    acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
 
     return k + 1
 
@@ -617,12 +617,12 @@ def _gemm_a8w8_blockscale_kernel(
     shared_b: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[0, 1]
     )
-    shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0]
-    )
-    shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0]
-    )
+    # shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
+    #     vec=16, per_phase=2, max_phase=8, order=[0]
+    # )
+    # shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
+    #     vec=16, per_phase=2, max_phase=8, order=[0]
+    # )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
     )
@@ -648,13 +648,13 @@ def _gemm_a8w8_blockscale_kernel(
         offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
         offs_bk_split = pid_k * SPLITK_BLOCK_SIZE + offs_bk
 
-        smem_scale_a = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty, [num_stages, BLOCK_SIZE_M], layout=shared_a_scale
-        )
+        # smem_scale_a = gl.allocate_shared_memory(
+        #     a_scale_ptr.type.element_ty, [num_stages, BLOCK_SIZE_M], layout=shared_a_scale
+        # )
 
-        smem_scale_b = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty, [num_stages, BLOCK_SIZE_N], layout=shared_b_scale
-        )
+        # smem_scale_b = gl.allocate_shared_memory(
+        #     b_scale_ptr.type.element_ty, [num_stages, BLOCK_SIZE_N], layout=shared_b_scale
+        # )
 
         offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
             0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk)
@@ -687,43 +687,75 @@ def _gemm_a8w8_blockscale_kernel(
         for _ in gl.static_range(num_stages - 1):
             k_load = issue_buffer_load_to_lds(
                 k_load,
-                smem_a, smem_b, smem_scale_a, smem_scale_b,
-                a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,
-                offs_a, offs_b, offs_a_scale, offs_b_scale,
+                smem_a, smem_b, #smem_scale_a, smem_scale_b,
+                a_ptr, b_ptr, #a_scale_ptr, b_scale_ptr,
+                offs_a, offs_b, #offs_a_scale, offs_b_scale,
                 offs_am, offs_bn, offs_ak, offs_bk,
                 M, N, K, pid_k, num_k_iter,
-                stride_ak, stride_bk, stride_ascale_k, stride_bscale_k, offs_ks_step,
+                stride_ak, stride_bk, #stride_ascale_k, stride_bscale_k, offs_ks_step,
                 EVEN_K, BLOCK_SIZE_K, num_stages, cache_modifier,
             )
+            
+
 
         for _ in range(pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - (num_stages - 1)):
             k_load = issue_buffer_load_to_lds(
                 k_load,
-                smem_a, smem_b, smem_scale_a, smem_scale_b,
-                a_ptr, b_ptr, a_scale_ptr, b_scale_ptr,
-                offs_a, offs_b, offs_a_scale, offs_b_scale,
+                smem_a, smem_b, #smem_scale_a, smem_scale_b,
+                a_ptr, b_ptr, #a_scale_ptr, b_scale_ptr,
+                offs_a, offs_b, #offs_a_scale, offs_b_scale,
                 offs_am, offs_bn, offs_ak, offs_bk,
                 M, N, K, pid_k, num_k_iter,
-                stride_ak, stride_bk, stride_ascale_k, stride_bscale_k, offs_ks_step,
+                stride_ak, stride_bk, #stride_ascale_k, stride_bscale_k, offs_ks_step,
                 EVEN_K, BLOCK_SIZE_K, num_stages, cache_modifier,
             )
             cp.wait_group(num_stages - 1)
+
+            a_scale = gl.amd.cdna4.buffer_load(
+                ptr=a_scale_ptr,
+                offsets=offs_a_scale,
+                cache=cache_modifier,
+            )
+            b_scale = gl.amd.cdna4.buffer_load(
+                ptr=b_scale_ptr,
+                offsets=offs_b_scale,
+                cache=cache_modifier,
+            )
+            a_scale = gl.convert_layout(a_scale, layout=gl.SliceLayout(1, mfma_layout))
+            b_scale = gl.convert_layout(b_scale, layout=gl.SliceLayout(0, mfma_layout))
             k_read = load_from_lds_and_mfma(
                 k_read,
-                smem_a, smem_b, smem_scale_a, smem_scale_b,
+                smem_a, smem_b, a_scale, b_scale,
                 acc, zeros,
-                FP8_FORMAT, dot_a_layout, dot_b_layout, mfma_layout, num_stages
+                FP8_FORMAT, dot_a_layout, dot_b_layout, num_stages
             )
+            a_scale_ptr += offs_ks_step * stride_ascale_k
+            b_scale_ptr += offs_ks_step * stride_bscale_k
         
         # ======= Epilogue ========    
         for i in gl.static_range(num_stages - 1):
             cp.wait_group(num_stages - 2 - i)
+            
+            a_scale = gl.amd.cdna4.buffer_load(
+                ptr=a_scale_ptr,
+                offsets=offs_a_scale,
+                cache=cache_modifier,
+            )
+            b_scale = gl.amd.cdna4.buffer_load(
+                ptr=b_scale_ptr,
+                offsets=offs_b_scale,
+                cache=cache_modifier,
+            )
+            a_scale = gl.convert_layout(a_scale, layout=gl.SliceLayout(1, mfma_layout))
+            b_scale = gl.convert_layout(b_scale, layout=gl.SliceLayout(0, mfma_layout))
             k_read = load_from_lds_and_mfma(
                 k_read,
-                smem_a, smem_b, smem_scale_a, smem_scale_b,
+                smem_a, smem_b, a_scale, b_scale,
                 acc, zeros,
-                FP8_FORMAT, dot_a_layout, dot_b_layout, mfma_layout, num_stages
+                FP8_FORMAT, dot_a_layout, dot_b_layout, num_stages
             )
+            a_scale_ptr += offs_ks_step * stride_ascale_k
+            b_scale_ptr += offs_ks_step * stride_bscale_k
 
         c = acc.to(c_ptr.type.element_ty)
 
