@@ -22,7 +22,9 @@ import triton.language as tl
 @triton.jit
 def _mhc_fused_kernel(
     x_ptr,
-    phi_ptr,
+    phi_pre_ptr,
+    phi_post_ptr,
+    phi_res_ptr,
     alpha_pre,
     alpha_post,
     alpha_res,
@@ -37,8 +39,12 @@ def _mhc_fused_kernel(
     eps: tl.constexpr, # epsilon for numerical stability in RMSNorm
     stride_xm,
     stride_xk,
-    stride_phik,
-    stride_phin,
+    stride_phi_pre_k,
+    stride_phi_pre_n,
+    stride_phi_post_k,
+    stride_phi_post_n,
+    stride_phi_res_k,
+    stride_phi_res_n,
     stride_pre_m,
     stride_pre_n,
     stride_post_m,
@@ -69,6 +75,12 @@ def _mhc_fused_kernel(
     # Eq 14 & 15: Compute matrix multiplication and RMS norm in single pass
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
+    # Stream boundaries
+    n_pre_end = n
+    n_post_end = 2 * n
+    n_squared = n * n
+    
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
 
@@ -78,11 +90,37 @@ def _mhc_fused_kernel(
             other=0.0,
         )
 
-        phi_tile = tl.load(
-            phi_ptr + rk[:, None] * stride_phik + rn[None, :] * stride_phin,
-            mask=(rk[:, None] < K) & (rn[None, :] < N),
+        # Load from all three phi tensors and select based on column index
+        # Pre-stream columns [0:n]
+        is_pre = rn < n_pre_end
+        rn_pre = rn
+        phi_pre_tile = tl.load(
+            phi_pre_ptr + rk[:, None] * stride_phi_pre_k + rn_pre[None, :] * stride_phi_pre_n,
+            mask=(rk[:, None] < K) & is_pre[None, :] & (rn_pre[None, :] < n),
             other=0.0,
         )
+        
+        # Post-stream columns [n:2n]
+        is_post = (rn >= n_pre_end) & (rn < n_post_end)
+        rn_post = rn - n
+        phi_post_tile = tl.load(
+            phi_post_ptr + rk[:, None] * stride_phi_post_k + rn_post[None, :] * stride_phi_post_n,
+            mask=(rk[:, None] < K) & is_post[None, :] & (rn_post[None, :] >= 0) & (rn_post[None, :] < n),
+            other=0.0,
+        )
+        
+        # Res-stream columns [2n:2n+n²]
+        is_res = rn >= n_post_end
+        rn_res = rn - (2 * n)
+        phi_res_tile = tl.load(
+            phi_res_ptr + rk[:, None] * stride_phi_res_k + rn_res[None, :] * stride_phi_res_n,
+            mask=(rk[:, None] < K) & is_res[None, :] & (rn_res[None, :] >= 0) & (rn_res[None, :] < n_squared),
+            other=0.0,
+        )
+        
+        # Combine tiles based on which stream each column belongs to
+        phi_tile = tl.where(is_pre[None, :], phi_pre_tile, 
+                           tl.where(is_post[None, :], phi_post_tile, phi_res_tile))
 
         # Eq 14: Accumulate matrix multiplication H̃ = x̃φ
         acc += tl.dot(x_tile, phi_tile)

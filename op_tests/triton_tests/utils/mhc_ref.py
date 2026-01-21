@@ -33,7 +33,9 @@ import torch
 
 def mhc_torch(
     x: torch.Tensor,
-    phi: torch.Tensor,
+    phi_pre: torch.Tensor,
+    phi_post: torch.Tensor,
+    phi_res: torch.Tensor,
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
@@ -56,7 +58,9 @@ def mhc_torch(
 
     Args:
         x: Input x_l with shape (M, nC) - flattened n-stream residual
-        phi: Projection φ with shape (nC, n² + 2n)
+        phi_pre: Projection φ^pre with shape (nC, n)
+        phi_post: Projection φ^post with shape (nC, n)
+        phi_res: Projection φ^res with shape (nC, n²)
         alpha_pre: Scaling factor α^pre for pre-stream (n elements)
         alpha_post: Scaling factor α^post for post-stream (n elements)
         alpha_res: Scaling factor α^res for residual stream (n² elements)
@@ -77,14 +81,14 @@ def mhc_torch(
     rms = torch.sqrt(mean_sq + eps)
     x_norm = x_f32 / rms
 
-    # Eq 14: H̃ = x̃φ
-    phi_f32 = phi.to(torch.float32)
-    H_tilde = x_norm @ phi_f32
-
-    # Split into three streams
-    H_tilde_pre = H_tilde[:, :n]  # n coefficients (H^{pre} ∈ ℝ^{1×n})
-    H_tilde_post = H_tilde[:, n:2*n]  # n coefficients (H^{post} ∈ ℝ^{1×n})
-    H_tilde_res = H_tilde[:, 2*n:]  # n² coefficients (H^{res} ∈ ℝ^{n×n})
+    # Eq 14: H̃ = x̃φ - compute each stream separately
+    phi_pre_f32 = phi_pre.to(torch.float32)
+    phi_post_f32 = phi_post.to(torch.float32)
+    phi_res_f32 = phi_res.to(torch.float32)
+    
+    H_tilde_pre = x_norm @ phi_pre_f32  # (M, n)
+    H_tilde_post = x_norm @ phi_post_f32  # (M, n)
+    H_tilde_res = x_norm @ phi_res_f32  # (M, n²)
 
     # Split bias
     bias_f32 = bias.to(torch.float32)
@@ -255,9 +259,11 @@ def generate_mhc_inputs(
         device: Device to create tensors on (default: 'cuda')
 
     Returns:
-        Tuple of (x, phi, alpha_pre, alpha_post, alpha_res, bias, n) where:
+        Tuple of (x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n) where:
         - x: (M, nC) flattened n-stream residual input
-        - phi: (nC, n² + 2n) projection matrix (Eq 10)
+        - phi_pre: (nC, n) pre-stream projection matrix
+        - phi_post: (nC, n) post-stream projection matrix
+        - phi_res: (nC, n²) residual stream projection matrix
         - alpha_pre: α^pre scaling factor for pre-stream (Eq 12)
         - alpha_post: α^post scaling factor for post-stream (Eq 12)
         - alpha_res: α^res scaling factor for residual stream (Eq 12)
@@ -270,8 +276,10 @@ def generate_mhc_inputs(
     # flattened n-stream residual
     x = torch.randn(M, nC, dtype=dtype, device=device)
 
-    # projection matrix (Eq 10)
-    phi = torch.randn(nC, N_total, dtype=dtype, device=device) * 0.1
+    # Separate projection matrices for each stream
+    phi_pre = torch.randn(nC, n, dtype=dtype, device=device) * 0.1
+    phi_post = torch.randn(nC, n, dtype=dtype, device=device) * 0.1
+    phi_res = torch.randn(nC, n * n, dtype=dtype, device=device) * 0.1
 
     # scaling factors (Eq 12)
     alpha_pre = 0.5 + torch.rand(1).item()
@@ -281,7 +289,7 @@ def generate_mhc_inputs(
     # bias (Eq 13)
     bias = torch.randn(N_total, dtype=torch.float32, device=device) * 0.1
 
-    return x, phi, alpha_pre, alpha_post, alpha_res, bias, n
+    return x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n
 
 
 # =============================================================================

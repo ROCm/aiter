@@ -22,7 +22,9 @@ _LOGGER = AiterTritonLogger()
 
 def mhc(
     x: torch.Tensor,
-    phi: torch.Tensor,
+    phi_pre: torch.Tensor,
+    phi_post: torch.Tensor,
+    phi_res: torch.Tensor,
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
@@ -50,8 +52,9 @@ def mhc(
     Args:
         x: Input tensor with shape (M, nC) where M is batch/sequence length and
            nC is the input feature dimension (n × C in paper notation)
-        phi: Projection matrix with shape (nC, n² + 2n) for transforming input
-             to three output streams
+        phi_pre: Pre-stream projection matrix with shape (nC, n)
+        phi_post: Post-stream projection matrix with shape (nC, n)
+        phi_res: Residual stream projection matrix with shape (nC, n²)
         alpha_pre: Scaling factor α^pre for pre-stream (first n elements)
         alpha_post: Scaling factor α^post for post-stream (next n elements)
         alpha_res: Scaling factor α^res for residual stream (last n² elements)
@@ -71,44 +74,56 @@ def mhc(
 
     Shape requirements:
         - x: (M, nC) where nC = n * C (flattened streams)
-        - phi: (nC, n² + 2n)
+        - phi_pre: (nC, n)
+        - phi_post: (nC, n)
+        - phi_res: (nC, n²)
         - bias: (n² + 2n,)
         - outputs: H_pre (M, n), H_post (M, n), H_res (M, n²)
 
     Example:
         >>> M, n, C = 32, 4, 1024
         >>> nC = n * C  # 4096 input features
-        >>> N_total = n * n + 2 * n  # 24 output features (16 + 4 + 4)
         >>> x = torch.randn(M, nC, dtype=torch.bfloat16, device='cuda')
-        >>> phi = torch.randn(nC, N_total, dtype=torch.bfloat16, device='cuda')
-        >>> bias = torch.randn(N_total, dtype=torch.float32, device='cuda')
+        >>> phi_pre = torch.randn(nC, n, dtype=torch.bfloat16, device='cuda')
+        >>> phi_post = torch.randn(nC, n, dtype=torch.bfloat16, device='cuda')
+        >>> phi_res = torch.randn(nC, n*n, dtype=torch.bfloat16, device='cuda')
+        >>> bias = torch.randn(n*n + 2*n, dtype=torch.float32, device='cuda')
         >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
         >>> 
         >>> # Full mHC with Sinkhorn-Knopp (Eq 14-19)
-        >>> H_pre, H_post, H_res = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+        >>> H_pre, H_post, H_res = mhc(x, phi_pre, phi_post, phi_res, 
+        ...                            alpha_pre, alpha_post, alpha_res, bias, n)
         >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
         >>> # H_res is doubly stochastic: rows and columns sum to 1
     """
     _LOGGER.info(
-        f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
+        f"MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
     )
     
     # Input shape extraction
     M, K = x.shape  # M: batch/sequence, K: nC (input features)
-    K_phi, N = phi.shape  # K_phi: should match K, N: n² + 2n (output features)
+    K_pre, n_pre = phi_pre.shape
+    K_post, n_post = phi_post.shape
+    K_res, n_squared = phi_res.shape
     N_total_expected = n * n + 2 * n
 
     # Validate tensor shapes
-    assert K == K_phi, f"Dimension mismatch: x has K={K}, phi has K={K_phi}"
-    assert N == N_total_expected, f"Dimension mismatch: phi has N={N}, expected {N_total_expected} (n²+2n with n={n})"
-    assert bias.shape[0] == N, f"Bias shape mismatch: expected ({N},), got {bias.shape}"
+    assert K == K_pre == K_post == K_res, (
+        f"Dimension mismatch: x has K={K}, but phi_pre={K_pre}, phi_post={K_post}, phi_res={K_res}"
+    )
+    assert n_pre == n, f"phi_pre shape mismatch: expected (K, {n}), got ({K_pre}, {n_pre})"
+    assert n_post == n, f"phi_post shape mismatch: expected (K, {n}), got ({K_post}, {n_post})"
+    assert n_squared == n * n, f"phi_res shape mismatch: expected (K, {n*n}), got ({K_res}, {n_squared})"
+    assert bias.shape[0] == N_total_expected, f"Bias shape mismatch: expected ({N_total_expected},), got {bias.shape}"
     
     # Validate devices
-    assert x.device == phi.device == bias.device, "All tensors must be on the same device"
+    assert x.device == phi_pre.device == phi_post.device == phi_res.device == bias.device, (
+        "All tensors must be on the same device"
+    )
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
 
-    # Calculate individual stream dimensions
-    n_squared = n * n
+    # Calculate total output dimension
+    N = n * n + 2 * n
     
     # Allocate outputs if not provided
     if out_pre is None:
@@ -142,26 +157,32 @@ def mhc(
 
     # Invoke the fused Triton kernel for equations 14-18
     _mhc_fused_kernel[grid](
-        x,           # Input tensor (M, nC)
-        phi,         # Projection matrix (nC, n²+2n)
-        alpha_pre,   # Scaling factor for pre-stream
-        alpha_post,  # Scaling factor for post-stream
-        alpha_res,   # Scaling factor for residual stream
-        bias,        # Bias vector (n²+2n,)
-        out_pre,     # Output tensor for pre-stream (M, n)
-        out_post,    # Output tensor for post-stream (M, n)
-        out_res,     # Output tensor for res-stream (M, n²)
+        x,                     # Input tensor (M, nC)
+        phi_pre,               # Pre-stream projection matrix (nC, n)
+        phi_post,              # Post-stream projection matrix (nC, n)
+        phi_res,               # Residual stream projection matrix (nC, n²)
+        alpha_pre,             # Scaling factor for pre-stream
+        alpha_post,            # Scaling factor for post-stream
+        alpha_res,             # Scaling factor for residual stream
+        bias,                  # Bias vector (n²+2n,)
+        out_pre,               # Output tensor for pre-stream (M, n)
+        out_post,              # Output tensor for post-stream (M, n)
+        out_res,               # Output tensor for res-stream (M, n²)
         # Shape parameters
-        M=M,         # Number of rows (batch/sequence dimension)
-        K=K,         # Input features (nC)
-        N=N,         # Output features (n²+2n)
-        n=n,         # Stream parameter
-        eps=eps,     # Numerical stability epsilon for RMSNorm
+        M=M,                   # Number of rows (batch/sequence dimension)
+        K=K,                   # Input features (nC)
+        N=N,                   # Output features (n²+2n)
+        n=n,                   # Stream parameter
+        eps=eps,               # Numerical stability epsilon for RMSNorm
         # Tensor strides for memory access
         stride_xm=x.stride(0),
         stride_xk=x.stride(1),
-        stride_phik=phi.stride(0),
-        stride_phin=phi.stride(1),
+        stride_phi_pre_k=phi_pre.stride(0),
+        stride_phi_pre_n=phi_pre.stride(1),
+        stride_phi_post_k=phi_post.stride(0),
+        stride_phi_post_n=phi_post.stride(1),
+        stride_phi_res_k=phi_res.stride(0),
+        stride_phi_res_n=phi_res.stride(1),
         stride_pre_m=out_pre.stride(0),
         stride_pre_n=out_pre.stride(1),
         stride_post_m=out_post.stride(0),
