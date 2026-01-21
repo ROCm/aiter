@@ -3,6 +3,7 @@
 
 import functools
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -22,6 +23,42 @@ from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
+
+
+_CK2STAGES_TILE_RE = re.compile(
+    r"moe_ck2stages_gemm(?P<stage>[12])_(?P<bs>\d+)x(?P<m>\d+)x(?P<n>\d+)x(?P<k>\d+)_"
+)
+_FMOE_STAGE1_TILE_RE = re.compile(r"_([0-9]+)x([0-9]+)_(?:[0-9]+)tg")
+
+def _ck_name_b16_to_f16(kernel_name: str) -> str:
+    """Convert CK kernel name suffix from BF16 (B16) to FP16 (F16) when applicable."""
+    s = str(kernel_name or "")
+    # CK codegen uses *_B16 for bf16 output and *_F16 for fp16 output.
+    # Only rewrite when the kernel name is CK 2stages style.
+    if "moe_ck2stages_" not in s:
+        return s
+    # Replace common suffix tokens; keep it conservative.
+    return s.replace("_B16", "_F16")
+
+
+def _parse_ck2stages_tiles(kernel_name: str) -> Optional[tuple[int, int, int]]:
+    """Parse CK kernelName to (MPerBlock, NPerBlock, KPerBlock) if possible."""
+    if not kernel_name:
+        return None
+    m = _CK2STAGES_TILE_RE.search(str(kernel_name))
+    if not m:
+        return None
+    return (int(m.group("m")), int(m.group("n")), int(m.group("k")))
+
+
+def _parse_fmoe_stage1_mn(kernel_name: str) -> Optional[tuple[int, int]]:
+    """Best-effort parse for mangled stage1 names like ..._64x128_2tg_... -> (M, N)."""
+    if not kernel_name:
+        return None
+    m = _FMOE_STAGE1_TILE_RE.search(str(kernel_name))
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
 
 
 def moe_sorting(
@@ -685,6 +722,33 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+
+    # ------------------------------------------------------------------
+    # FP16 output fallback:
+    # The tuned CSV often only contains BF16-output configs (dtype=torch.bfloat16).
+    # For FlyDSL/CK kernel selection we still want to reuse the same tiling/kernel
+    # choices, just switching kernelName output tag from B16 -> F16.
+    #
+    # NOTE: Only apply when the BF16 config is a CK 2stages kernel (not ASM 1stage),
+    # otherwise a blind rename would likely point to a non-existent symbol.
+    # ------------------------------------------------------------------
+    if cfg is None and str(dtype) == str(torch.float16) and cfg_2stages and use_cfg():
+        bf16_keys = list(keys)
+        bf16_keys[7] = str(torch.bfloat16)
+        bf16_keys = tuple(bf16_keys)
+        cfg_bf16 = cfg_2stages.get(bf16_keys, None)
+        if cfg_bf16 is not None:
+            k1 = str(cfg_bf16.get("kernelName1", "") or "")
+            k2 = str(cfg_bf16.get("kernelName2", "") or "")
+            # Only reuse CK 2stage kernels; skip ASM-1stage entries.
+            if ("moe_ck2stages_" in k1) or ("moe_ck2stages_" in k2):
+                cfg = dict(cfg_bf16)
+                cfg["kernelName1"] = _ck_name_b16_to_f16(cfg.get("kernelName1", ""))
+                cfg["kernelName2"] = _ck_name_b16_to_f16(cfg.get("kernelName2", ""))
+                logger.info(
+                    "[fused_moe] fp16 cfg missing; reuse bf16 tuned kernelName (B16->F16) for %s",
+                    bf16_keys,
+                )
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
         kernelName1 = ""
@@ -788,8 +852,39 @@ def get_2stage_cfgs(
         )
         use_flydsl_stage1 = use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
+
+        # Prefer deriving FlyDSL tiling from tuned CK kernel names when available.
+        # Note: CK's NPerBlock/KPerBlock dimensions are not always 1:1 with DSL semantics
+        # for stage1 across different fused epilogues, so keep robust fallbacks.
+        stage1_tile_n = None
+        stage1_tile_k = None
+        stage2_tile_n = None
+        stage2_tile_k = None
+        if cfg is not None:
+            kname1 = str(cfg.get("kernelName1", "") or "")
+            kname2 = str(cfg.get("kernelName2", "") or "")
+            t1 = _parse_ck2stages_tiles(kname1)
+            if t1 is not None:
+                _m1, _n1, _k1 = t1
+                stage1_tile_n = _n1
+                stage1_tile_k = _k1
+            else:
+                mn1 = _parse_fmoe_stage1_mn(kname1)
+                if mn1 is not None:
+                    _m1, _n1 = mn1
+                    stage1_tile_n = _n1
+            t2 = _parse_ck2stages_tiles(kname2)
+            if t2 is not None:
+                _m2, _n2, _k2 = t2
+                stage2_tile_n = _n2
+                stage2_tile_k = _k2
+
         stage1_func = (
-            functools.partial(flydsl_moe_stage1)
+            functools.partial(
+                flydsl_moe_stage1,
+                tile_n=stage1_tile_n,
+                tile_k=stage1_tile_k,
+            )
             if use_flydsl_stage1
             else functools.partial(
                 ck_moe_stage1,
@@ -802,6 +897,8 @@ def get_2stage_cfgs(
         stage2_func = (
             functools.partial(
                 flydsl_moe_stage2,
+                tile_n=stage2_tile_n,
+                tile_k=stage2_tile_k,
             )
             if use_flydsl_stage2
             else functools.partial(
@@ -812,14 +909,19 @@ def get_2stage_cfgs(
             )
         )
         
-        print("use_flydsl_stage2 = %s", use_flydsl_stage2)
-        print("use_flydsl_stage1 = %s", use_flydsl_stage1)
-        print("flydsl_block_m = %s", flydsl_block_m)
-        print("stage1_func = %s", stage1_func)
-        print("stage2_func = %s", stage2_func)
-        print("block_m = %s", block_m)
-        print("ksplit = %s", ksplit)
-        print("run_1stage = %s", run_1stage)
+        if os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1":
+            print("use_flydsl_stage2 = %s", use_flydsl_stage2)
+            print("use_flydsl_stage1 = %s", use_flydsl_stage1)
+            print("flydsl_block_m = %s", flydsl_block_m)
+            print("stage1_tile_n = %s", stage1_tile_n)
+            print("stage1_tile_k = %s", stage1_tile_k)
+            print("stage2_tile_n = %s", stage2_tile_n)
+            print("stage2_tile_k = %s", stage2_tile_k)
+            print("stage1_func = %s", stage1_func)
+            print("stage2_func = %s", stage2_func)
+            print("block_m = %s", block_m)
+            print("ksplit = %s", ksplit)
+            print("run_1stage = %s", run_1stage)
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -1540,18 +1642,25 @@ def flydsl_moe_stage1(
     w1_scale,
     sorted_weights=None,
     dtype=torch.bfloat16,
+    tile_n: Optional[int] = None,
+    tile_k: Optional[int] = None,
     **_kwargs,
 ):
     if a1_scale is None or w1_scale is None:
         raise RuntimeError("FlyDSL stage1 requires a1_scale and w1_scale")
-
+    tile_m = block_m if block_m is not None else 64
     token_num = hidden_states.shape[0]
     E, _, model_dim = w1.shape
     inter_dim = w2.shape[2]
 
-    tile_m = block_m if block_m is not None else 64
-    tile_n = 128
-    tile_k = 128
+    # Align default tiling with CK's common fp8 per-token kernels (seen in rocprof):
+    #   NPerBlock=64, KPerBlock=128 when no tuned cfg is available.
+    tile_n = int(tile_n) if tile_n is not None else 64
+    tile_k = int(tile_k) if tile_k is not None else 128
+    if os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1":
+        print("inside flydsl_moe_stage1, tile_m = %s", tile_m)
+        print("inside flydsl_moe_stage1, tile_n = %s", tile_n)
+        print("inside flydsl_moe_stage1, tile_k = %s", tile_k)
 
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
@@ -1560,7 +1669,7 @@ def flydsl_moe_stage1(
     blocks = int(size_expert_ids_total)
 
     if sorted_weights is None:
-        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        sorted_w = torch.empty((0,), dtype=dtypes.fp32, device=sorted_ids.device)
         doweight_stage1 = False
     else:
         sorted_w = sorted_weights
@@ -1683,6 +1792,8 @@ def flydsl_moe_stage2(
     a2_scale,
     block_m,
     sorted_weights=None,
+    tile_n: Optional[int] = None,
+    tile_k: Optional[int] = None,
     **_kwargs,
 ):
     if w2_scale is None or a2_scale is None:
@@ -1693,8 +1804,14 @@ def flydsl_moe_stage2(
     E = w2.shape[0]
 
     tile_m = block_m if block_m is not None else 64
-    tile_n = 256
-    tile_k = 128
+    # Align default tiling with CK's common fp8 per-token kernels (seen in rocprof):
+    #   NPerBlock=64, KPerBlock=128 when no tuned cfg is available.
+    tile_n = int(tile_n) if tile_n is not None else 64
+    tile_k = int(tile_k) if tile_k is not None else 128
+    if os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1":
+        print("inside flydsl_moe_stage2, tile_m = %s", tile_m)
+        print("inside flydsl_moe_stage2, tile_n = %s", tile_n)
+        print("inside flydsl_moe_stage2, tile_k = %s", tile_k)
 
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
@@ -1703,7 +1820,7 @@ def flydsl_moe_stage2(
     blocks = int(size_expert_ids_total)
 
     if sorted_weights is None:
-        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        sorted_w = torch.empty((0,), dtype=dtypes.fp32, device=sorted_ids.device)
     else:
         sorted_w = sorted_weights
 

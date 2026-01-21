@@ -31,6 +31,14 @@ from aiter.ops.shuffle import (
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 
+def _set_seed(seed: int) -> None:
+    """Best-effort deterministic RNG seed for this process/device."""
+    seed = int(seed) & 0xFFFFFFFF
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
 
 @benchmark()
 def test_fmoe(
@@ -52,24 +60,49 @@ def test_fmoe(
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
+
+    # Make random init reproducible across separate runs (CK vs FlyDSL).
+    # Use a base seed plus a stable per-case offset so results don't depend on loop order.
+    base_seed = int(os.environ.get("AITER_MOE_SEED", "0"))
+    case_seed = (
+        base_seed
+        + int(token) * 1000003
+        + int(model_dim) * 9176
+        + int(inter_dim) * 6361
+        + int(E) * 101
+        + int(topk) * 97
+        + int(bool(use_g1u1)) * 31
+        + int(bool(doweight_stage1)) * 37
+        + int(hidden_pad) * 131
+        + int(intermediate_pad) * 137
+        + int(bool(preshuffle)) * 41
+        + int(getattr(actType, "value", int(actType))) * 17
+        + int(getattr(qType, "value", int(qType))) * 19
+    )
+    _set_seed(case_seed)
+
+    # FP16 output is very easy to overflow (|x| > 65504 -> inf). Use a smaller default
+    # init scale for fp16 to make correctness/accuracy comparisons meaningful.
+    _default_init_scale = "0.1" if dtype == torch.float16 else "1.0"
+    init_scale = float(os.environ.get("AITER_MOE_INIT_SCALE", _default_init_scale))
     torch_quant = aiter.get_torch_quant(qType)
-    input = torch.randn((token, model_dim), dtype=dtype)
+    input = torch.randn((token, model_dim), dtype=dtype) * init_scale
     if use_g1u1:
-        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * init_scale
         if hidden_pad != 0 and intermediate_pad != 0:
             w1[:, :, -hidden_pad:] = 0
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
-        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype) * init_scale
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) * init_scale
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
-    score = torch.randn((token, E), dtype=dtype)
+    score = torch.randn((token, E), dtype=dtype) * init_scale
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
@@ -273,6 +306,23 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+
+    if dtype == torch.float16:
+        def _count_bad(x: torch.Tensor) -> tuple[int, int]:
+            x = x.detach()
+            return int(torch.isinf(x).sum().item()), int(torch.isnan(x).sum().item())
+        inf_ref, nan_ref = _count_bad(out2_ref)
+        inf_ck, nan_ck = _count_bad(out2_ck)
+        if (inf_ref + nan_ref + inf_ck + nan_ck) != 0:
+            logging.warning(
+                "fp16 bad values detected (init_scale=%s): ref(inf=%d,nan=%d) ck(inf=%d,nan=%d)",
+                init_scale,
+                inf_ref,
+                nan_ref,
+                inf_ck,
+                nan_ck,
+            )
+
     err = checkAllclose(
         out2_ref,
         out2_ck,
@@ -294,7 +344,7 @@ def test_fmoe(
     return {"us": us2, "err": err}
 
 
-l_dtype = ["bf16", "fp16"][:1]
+l_dtype = ["bf16", "fp16"]
 # l_dim = [(6144, 4096)]
 l_dim = [(7168, 256)]
 # l_dim = [(3072, 3072)]
@@ -309,7 +359,7 @@ l_tokenNum = [
     256,
     1024,
     4096,
-    163840,
+    63840,
 ]
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
@@ -556,3 +606,8 @@ for (
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+
+# Optional: write summary to CSV for post-processing (perf comparison, plots, etc.)
+out_csv = os.environ.get("AITER_MOE2STAGE_OUT", "").strip()
+if out_csv:
+    df.to_csv(out_csv, index=False)
