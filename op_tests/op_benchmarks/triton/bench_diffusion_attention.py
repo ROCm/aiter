@@ -33,6 +33,7 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     get_sage_fwd_configs,
     sage_quant,
 )
+from op_tests.triton_tests.utils.accuracy_analysis import compare_accuracy
 
 CAUSAL = False
 layout_converter = {
@@ -576,7 +577,8 @@ def bench_kernel(q, k, v, args, provider):
             reference_primary = reference_primary.permute(
                 0, 2, 1, 3
             )  # we do comparison in BSHD
-
+        
+        compare_accuracy(current_primary, reference_primary)
         check_attention_outputs(current_primary, reference_primary, fp8=False)
 
     q_element_size = 1 if args.fav3_fp8 or args.fav3_sage else q.element_size()
