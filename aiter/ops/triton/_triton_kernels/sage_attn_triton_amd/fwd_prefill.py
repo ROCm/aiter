@@ -46,7 +46,7 @@ def get_fwd_configs(
 
 
 @triton.jit
-def _attn_fwd_no_mask(
+def _sage_fwd_no_mask(
     acc,
     l_i,
     m_i,
@@ -234,7 +234,7 @@ def _attn_fwd_no_mask(
 
 
 @triton.jit
-def _attn_fwd_mask(
+def _sage_fwd_mask(
     acc,
     l_i,
     m_i,
@@ -887,7 +887,7 @@ def compute_block_masking(
 
 
 @triton.jit
-def attn_fwd(
+def sage_fwd(
     Q,
     K,
     V,
@@ -1171,7 +1171,7 @@ def attn_fwd(
 
         k_descale_ptr = k_descale_offset + n_front_skip_blocks * stride_ksblk
 
-        acc, l_i, m_i = _attn_fwd_mask(
+        acc, l_i, m_i = _sage_fwd_mask(
             acc,
             l_i,
             m_i,
@@ -1236,7 +1236,7 @@ def attn_fwd(
             + (n_front_skip_blocks + n_front_masked_blocks) * stride_ksblk
         )
 
-        acc, l_i, m_i = _attn_fwd_no_mask(
+        acc, l_i, m_i = _sage_fwd_no_mask(
             acc,
             l_i,
             m_i,
@@ -1302,7 +1302,7 @@ def attn_fwd(
             * stride_ksblk
         )
 
-        acc, l_i, m_i = _attn_fwd_mask(
+        acc, l_i, m_i = _sage_fwd_mask(
             acc,
             l_i,
             m_i,
@@ -1800,7 +1800,7 @@ def fav3_sage_triton_impl(
         config = get_fwd_configs(
             False, seqlen_q=max_seqlens_q, seqlen_k=max_seqlens_k, num_heads=nheads_q
         )
-    attn_fwd[grid](
+    sage_fwd[grid](
         q,
         k,
         v,
