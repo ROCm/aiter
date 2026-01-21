@@ -995,7 +995,7 @@ if __name__ == "__main__":
         acts = ["silu", "gelu"]
         routed_weight_l = [1, 2]
         general_quant_l = ["per_tensor", "per_token"]
-        preshuffle_mode_l = [False]
+        preshuffle_mode_l = [True, False]
         for (
             b_dtype,
             c_dtype,
@@ -1013,6 +1013,8 @@ if __name__ == "__main__":
         ):
             a_dtype = b_dtype if b_dtype != "i4" else "f8"
             quant = quant if b_dtype != "fp4x2" else "per_1x32"
+            # Only fp4x2 needs preshuffle_mode variation, others always use True
+            preshuffle_mode = preshuffle_mode if b_dtype == "fp4x2" else True
             codegen = ck_moe_2stage_gemm_codegen(
                 args.working_path,
                 a_dtype,
