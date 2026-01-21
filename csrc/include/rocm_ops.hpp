@@ -1554,7 +1554,8 @@ namespace py = pybind11;
           py::arg("return_kv"),                                      \
           py::arg("use_shuffle_layout"),                             \
           py::arg("block_size"),                                     \
-          py::arg("x"));
+          py::arg("x"));                                             \
+          m.def("fused_rope_rms_2way", &fused_rope_rms_2way);
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
     m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);
