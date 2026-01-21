@@ -768,6 +768,7 @@ def get_mla_metadata_info_v1(
 def get_mla_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
@@ -777,6 +778,7 @@ def get_mla_metadata_v1(
     reduce_indptr: torch.Tensor,
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
+    page_size: int = 1,
     kv_granularity: int = 16,
     max_seqlen_qo: int = -1,
     uni_seqlen_qo: int = -1,
@@ -790,11 +792,13 @@ def get_mla_metadata_v1(
     """
     Inputs:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
-        cumulated seqlens of k/v: (batch_size + 1), dtype torch.int32.
+        cumulated seqlens or page indices of k/v: (batch_size + 1), dtype torch.int32.
+        Length of last page of k/v: (batch_size), dtype torch.int32.
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
         Options: Detailed settings for spliting. All of them are optional.
+            page_size: default=1. The size of a page.
             kv_granularity: default=16. The granularity on kv sequence length when cutting batch.
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -446,6 +446,7 @@ def test_mla(
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
+        kv_last_page_lens,
         nhead // nhead_kv,
         nhead_kv,
         True,
@@ -455,6 +456,7 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        page_size=page_size,
         kv_granularity=max(page_size, 16),
         max_seqlen_qo=1,
         uni_seqlen_qo=1,
