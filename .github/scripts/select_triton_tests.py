@@ -127,6 +127,8 @@ def list_triton_source_files() -> (
 
 DEVICES: frozenset[str] = frozenset(["gfx942", "gfx950"])
 
+# Single letter placeholders for JSON config file template strings. You can add
+# more letters if necessary.
 MNK_PLACEHOLDERS: str = "MNK"
 NUM_PATTERN: str = r"\d+"
 
@@ -141,17 +143,40 @@ MOE_DTYPES: tuple[str, ...] = (
 
 
 def expand_mnk(json_string: str, config_files: list[Path]) -> list[str]:
+    """
+    Expands template strings containing M/N/K placeholders by matching them
+    against actual config file paths.
+
+    :param json_string: Template string that references kernel config JSON files.
+                        May contain M/N/K placeholders to be expanded.
+    :param config_files: All Triton kernel config JSON files available in the
+                         filesystem.
+    :return: List of template strings with expanded M/N/K placeholders or the
+             a list containing just the input template string as-is if there
+             are no M/N/K placeholders to be expanded.
+    """
+    # Early exit if no placeholders present.
     if not any(f"{{{p}}}" in json_string for p in MNK_PLACEHOLDERS):
         logging.debug("No M/N/K placeholders in [%s].", json_string)
         return [json_string]
+    # Strip `f"` prefix and `"` suffix, then escape special regex characters. For
+    # example, `f"gfx950-GEMM-N={N}-K={K}.json"` becomes `gfx950-GEMM-N=\{N\}-K=\{K\}.json`.
     pattern_str = re.escape(json_string[2:-1])
-    for p in MNK_PLACEHOLDERS:
+    # Replace each escaped placeholder with a named capture regex group.
+    for p in MNK_PLACEHOLDERS:  # `p` will be `M`, then `N`, then `K`.
+        # For instance, if `p` is `M` then `\{M\}` will be replaced by `(?P<M>\d+)`.
+        # Following the example:
+        # 1. there's no M, pattern is not changed.
+        # 2. `gfx950-GEMM-N=\{N\}-K=\{K\}.json` becomes `gfx950-GEMM-N=(?P<N>\d+)-K=\{K\}.json`
+        # 3. `gfx950-GEMM-N=(?P<N>\d+)-K=\{K\}.json` becomes `gfx950-GEMM-N=(?P<N>\d+)-K=(?P<K>\d+).json`
         pattern_str = pattern_str.replace(
             rf"\{{{p}\}}",
             rf"(?P<{p}>{NUM_PATTERN})",
         )
+    # Compile regex with anchors to match entire path.
     pattern = re.compile(f"^{pattern_str}$")
     logging.debug("M/N/K regex is [%s].", pattern.pattern)
+    # Return f-string representations of matching config paths.
     return [f'f"{path}"' for c in config_files if pattern.match(path := c.as_posix())]
 
 
