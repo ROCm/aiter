@@ -361,15 +361,13 @@ __device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt
         kNumElemsPerBlock / (sizeof(uint32_t) / sizeof(kv_t));                       // 32 / 4 = 8
     constexpr uint32_t kNumBlocksPerRow            = T::kVoHeadDim / kNumColsPerThr; // 512 / 8 = 64
     constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;           // 64 + 2 = 66
-    constexpr uint32_t kOffsetTlTr = kNumElemsPerBlock * 2 * sizeof(kv_t); // 32 * 2 * 1 = 64
     constexpr uint32_t kOffsetTlBl = 4 * kNumBlocksPerRowWithPadding * kNumElemsPerBlock *
-                                     sizeof(kv_t);              // 4 * 66 * 32 * 1 = 8448
-    constexpr uint32_t kOffsetTlBr = kOffsetTlTr + kOffsetTlBl; // 64 + 8448 = 8512
+                                     sizeof(kv_t); // 4 * 66 * 32 * 1 = 8448
 
     constexpr uint32_t kFixedColBlk      = kColOffset / kNumColsPerThr;
     constexpr uint32_t kFixedBlockOffset = kFixedColBlk * kNumElemsPerBlock * sizeof(kv_t);
 
-    static_assert(((kColOffset % 32) == 0) && (kColOffset < 512),
+    static_assert(((kColOffset % 16) == 0) && (kColOffset < 512),
                   "load_transpose_v_to_gpr(): Unsupported column offset!");
 
     const uint32_t lane_idx = ckt::get_lane_id();
@@ -388,8 +386,6 @@ __device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt
 
     hkm::ds_read_b32<GPR + 0>(p_lds_vt_ul_lane, kFixedBlockOffset);
     hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlBl);
-    hkm::ds_read_b32<GPR + 2>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlTr);
-    hkm::ds_read_b32<GPR + 3>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlBr);
 }
 
 template <uint32_t kPart>
@@ -1149,11 +1145,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_range_1>
                     oaccu_1;
 
-                load_transpose_v_to_gpr<T, idx.value * T::kBlockK * 2, k_kv_0_begin>(p_lds_vt);
-                load_transpose_v_to_gpr<T, idx.value * T::kBlockK * 2 + T::kBlockK, k_kv_1_begin>(
-                    p_lds_vt);
-                asm volatile("s_waitcnt lgkmcnt(0)");
+                constexpr uint32_t kColOffsetDelta = T::kBlockK / 2;
+                constexpr uint32_t kColOffset0     = idx.value * T::kBlockK * 2;
+                constexpr uint32_t kColOffset1     = kColOffset0 + kColOffsetDelta * 1;
+                constexpr uint32_t kColOffset2     = kColOffset0 + kColOffsetDelta * 2;
+                constexpr uint32_t kColOffset3     = kColOffset0 + kColOffsetDelta * 3;
 
+                load_transpose_v_to_gpr<T, kColOffset0, k_kv_0_begin>(p_lds_vt);
+                load_transpose_v_to_gpr<T, kColOffset1, k_kv_0_begin + 2>(p_lds_vt);
+                load_transpose_v_to_gpr<T, kColOffset2, k_kv_1_begin>(p_lds_vt);
+                load_transpose_v_to_gpr<T, kColOffset3, k_kv_1_begin + 2>(p_lds_vt);
+
+                asm volatile("s_waitcnt lgkmcnt(4)");
                 if constexpr(kIsFirstIter)
                 {
                     hk::mma_ABt(oaccu_0, kv_0, p_mfma);
@@ -1163,6 +1166,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
                 }
 
+                asm volatile("s_waitcnt lgkmcnt(0)");
                 if constexpr(kIsFirstIter)
                 {
                     hk::mma_ABt(oaccu_1, kv_1, p_mfma);
