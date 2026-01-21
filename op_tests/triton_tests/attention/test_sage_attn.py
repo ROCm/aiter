@@ -377,7 +377,7 @@ def test_sage_v2(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    config = get_sage_fwd_configs()
+    config = get_sage_fwd_configs(Sage_version.V2)
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
