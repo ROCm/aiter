@@ -222,7 +222,7 @@ def sinkhorn_knopp(
     # Cap N at 64 to avoid overflow in log domain
     assert N <= 64, f"Matrix size N={N} exceeds maximum of 64"
 
-    # Check N is power of 2
+    # Check N is power of 2 because Triton arange requires even number of sizes
     N_pow2 = triton.next_power_of_2(N)
     assert N == N_pow2, f"Matrix size N={N} must be a power of 2"
 
@@ -238,7 +238,7 @@ def sinkhorn_knopp(
         assert out.shape == (M, N, N), f"out.shape {out.shape} must be ({M}, {N}, {N})"
         out = out.contiguous()
 
-    # Grid: one program per batch element
+    # Grid: one program per batch element, need large batch size for optimal performance
     grid = (M,)
 
     _sinkhorn_knopp_log_domain_kernel[grid](
