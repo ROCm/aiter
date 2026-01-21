@@ -1284,6 +1284,253 @@ void fused_rope_rms_set_kv(T* qkv,
 #undef DISPATCH_NEOX
 }
 
+template <typename T, int HEAD_SIZE>
+__global__ void fused_rope_rms_neox_2way_kernel(
+    const T *q0_, const T *k0_, const T *q1_, const T *k1_,
+    const T *w_q0, const T *w_k0, const T *w_q1, const T *w_k1,
+    const T *cos_sin0, const T *cos_sin1,
+    int num_tokens0, int num_tokens1,
+    int num_heads_q, int num_heads_k,
+    float eps, int total_warps, T *out_q01_, T *out_k01_) {
+    constexpr int VEC_SIZE = HEAD_SIZE / WARP_SIZE;
+    constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int num_warps_per_block = blockDim.x / WARP_SIZE;
+    const int global_warp_id = blockIdx.x * num_warps_per_block + warp_id;
+    if (global_warp_id >= total_warps) {
+        return;
+    }
+    // batch_size, num_tokens, num_heads, head_size
+    int batch_id = blockIdx.y;
+    auto q0 = q0_ + batch_id * num_tokens0 * num_heads_q * HEAD_SIZE;
+    auto k0 = k0_ + batch_id * num_tokens0 * num_heads_k * HEAD_SIZE;
+    auto q1 = q1_ + batch_id * num_tokens1 * num_heads_q * HEAD_SIZE;
+    auto k1 = k1_ + batch_id * num_tokens1 * num_heads_k * HEAD_SIZE;
+    auto out_q01 = out_q01_ + batch_id * (num_tokens0 + num_tokens1) * num_heads_q * HEAD_SIZE;
+    auto out_k01 = out_k01_ + batch_id * (num_tokens0 + num_tokens1) * num_heads_k * HEAD_SIZE;
+    int warp_offset_q0 = 0;
+    int warp_offset_k0 = num_tokens0 * num_heads_q;
+    int warp_offset_q1 = num_tokens0 * (num_heads_q + num_heads_k);
+    int warp_offset_k1 = num_tokens0 * (num_heads_q + num_heads_k) + num_tokens1 * num_heads_q;
+
+    bool is_q0 = global_warp_id < warp_offset_k0;
+    bool is_k0 = !is_q0 && global_warp_id < warp_offset_q1;
+    bool is_q1 = !is_q0 && !is_k0 && global_warp_id < warp_offset_k1;
+    bool is_k1 = !is_q0 && !is_k0 && !is_q1;
+
+    int access_id_in_head = (threadIdx.x % WARP_SIZE) * VEC_SIZE;
+    int neighbor_offset = access_id_in_head < HALF_HEAD_SIZE ? HALF_HEAD_SIZE / VEC_SIZE : -HALF_HEAD_SIZE / VEC_SIZE;
+
+    int token_id;
+    int specialized_warp_id;
+    int head_id_in_token;
+    int data_offset;
+
+    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec;
+
+    if (is_q0) {
+        specialized_warp_id = global_warp_id - warp_offset_q0;
+        token_id = specialized_warp_id / num_heads_q;
+        head_id_in_token = specialized_warp_id % num_heads_q;
+        data_offset = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q0 + access_id_in_head);
+        x_vec.load(q0 + data_offset + access_id_in_head);
+        cos_sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head]);
+    } else if (is_k0) {
+        specialized_warp_id = global_warp_id - warp_offset_k0;
+        token_id = specialized_warp_id / num_heads_k;
+        head_id_in_token = specialized_warp_id % num_heads_k;
+        data_offset = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k0 + access_id_in_head);
+        x_vec.load(k0 + data_offset + access_id_in_head);
+        cos_sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head]);
+    } else if (is_q1) {
+        specialized_warp_id = global_warp_id - warp_offset_q1;
+        token_id = specialized_warp_id / num_heads_q;
+        head_id_in_token = specialized_warp_id % num_heads_q;
+        data_offset = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q1 + access_id_in_head);
+        x_vec.load(q1 + data_offset + access_id_in_head);
+        cos_sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head]);
+    } else {
+        specialized_warp_id = global_warp_id - warp_offset_k1;
+        token_id = specialized_warp_id / num_heads_k;
+        head_id_in_token = specialized_warp_id % num_heads_k;
+        data_offset = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k1 + access_id_in_head);
+        x_vec.load(k1 + data_offset + access_id_in_head);
+        cos_sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head]);
+    }
+
+    warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+    auto nb_cos_sin_vec = warp_shfl_sync_vec<T, VEC_SIZE>(cos_sin_vec, threadIdx.x + neighbor_offset);
+    auto nb_x_vec = warp_shfl_sync_vec<T, VEC_SIZE>(x_vec, threadIdx.x + neighbor_offset);
+
+    vec_t<T, VEC_SIZE> out_vec;
+    if (neighbor_offset > 0) {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+            out_vec[i] = (float)x_vec[i] * (float)cos_sin_vec[i] - (float)nb_x_vec[i] * (float)nb_cos_sin_vec[i]; // x0 * cos - x1 * sin
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+            out_vec[i] = (float)x_vec[i] * (float)nb_cos_sin_vec[i] + (float)nb_x_vec[i] * (float)cos_sin_vec[i]; // x1 * cos + x0 * sin
+        }
+    }
+
+    if (is_q0) {
+        out_vec.store(out_q01 + (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE + access_id_in_head);
+    } else if (is_k0) {
+        out_vec.store(out_k01 + (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE + access_id_in_head);
+    } else if (is_q1) {
+        out_vec.store(out_q01 + ((num_tokens0 + token_id) * num_heads_q + head_id_in_token) * HEAD_SIZE + access_id_in_head);
+    } else {
+        out_vec.store(out_k01 + ((num_tokens0 + token_id) * num_heads_k + head_id_in_token) * HEAD_SIZE + access_id_in_head);
+    }
+}
+
+template <typename T, int HEAD_SIZE>
+__global__ void fused_rope_rms_noneox_2way_kernel(
+    const T *q0_, const T *k0_, const T *q1_, const T *k1_,
+    const T *w_q0, const T *w_k0, const T *w_q1, const T *w_k1,
+    const T *cos_sin0, const T *cos_sin1,
+    int num_tokens0, int num_tokens1,
+    int num_heads_q, int num_heads_k,
+    float eps, int total_warps, T *out_q01_, T *out_k01_) {
+    constexpr int VEC_SIZE = HEAD_SIZE / WARP_SIZE;
+    constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int num_warps_per_block = blockDim.x / WARP_SIZE;
+    const int global_warp_id = blockIdx.x * num_warps_per_block + warp_id;
+    if (global_warp_id >= total_warps) {
+        return;
+    }
+    // batch_size, num_tokens, num_heads, head_size
+    int batch_id = blockIdx.y;
+    auto q0 = q0_ + batch_id * num_tokens0 * num_heads_q * HEAD_SIZE;
+    auto k0 = k0_ + batch_id * num_tokens0 * num_heads_k * HEAD_SIZE;
+    auto q1 = q1_ + batch_id * num_tokens1 * num_heads_q * HEAD_SIZE;
+    auto k1 = k1_ + batch_id * num_tokens1 * num_heads_k * HEAD_SIZE;
+    auto out_q01 = out_q01_ + batch_id * (num_tokens0 + num_tokens1) * num_heads_q * HEAD_SIZE;
+    auto out_k01 = out_k01_ + batch_id * (num_tokens0 + num_tokens1) * num_heads_k * HEAD_SIZE;
+    int warp_offset_q0 = 0;
+    int warp_offset_k0 = num_tokens0 * num_heads_q;
+    int warp_offset_q1 = num_tokens0 * (num_heads_q + num_heads_k);
+    int warp_offset_k1 = num_tokens0 * (num_heads_q + num_heads_k) + num_tokens1 * num_heads_q;
+
+    bool is_q0 = global_warp_id < warp_offset_k0;
+    bool is_k0 = !is_q0 && global_warp_id < warp_offset_q1;
+    bool is_q1 = !is_q0 && !is_k0 && global_warp_id < warp_offset_k1;
+    bool is_k1 = !is_q0 && !is_k0 && !is_q1;
+
+    int access_id_in_head = (threadIdx.x % WARP_SIZE) * VEC_SIZE;
+    int neighbor_offset = access_id_in_head < HALF_HEAD_SIZE ? HALF_HEAD_SIZE / VEC_SIZE : -HALF_HEAD_SIZE / VEC_SIZE;
+
+    int token_id;
+    int specialized_warp_id;
+    int head_id_in_token;
+    int data_offset;
+
+    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_vec, sin_vec;
+
+    if (is_q0) {
+        specialized_warp_id = global_warp_id - warp_offset_q0;
+        token_id = specialized_warp_id / num_heads_q;
+        head_id_in_token = specialized_warp_id % num_heads_q;
+        data_offset = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q0 + access_id_in_head);
+        x_vec.load(q0 + data_offset + access_id_in_head);
+        cos_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2]);
+        sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+    } else if (is_k0) {
+        specialized_warp_id = global_warp_id - warp_offset_k0;
+        token_id = specialized_warp_id / num_heads_k;
+        head_id_in_token = specialized_warp_id % num_heads_k;
+        data_offset = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k0 + access_id_in_head);
+        x_vec.load(k0 + data_offset + access_id_in_head);
+        cos_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2]);
+        sin_vec.load(&cos_sin0[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+    } else if (is_q1) {
+        specialized_warp_id = global_warp_id - warp_offset_q1;
+        token_id = specialized_warp_id / num_heads_q;
+        head_id_in_token = specialized_warp_id % num_heads_q;
+        data_offset = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q1 + access_id_in_head);
+        x_vec.load(q1 + data_offset + access_id_in_head);
+        cos_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2]);
+        sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+    } else {
+        specialized_warp_id = global_warp_id - warp_offset_k1;
+        token_id = specialized_warp_id / num_heads_k;
+        head_id_in_token = specialized_warp_id % num_heads_k;
+        data_offset = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k1 + access_id_in_head);
+        x_vec.load(k1 + data_offset + access_id_in_head);
+        cos_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2]);
+        sin_vec.load(&cos_sin1[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+    }
+
+    warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+
+    vec_t<T, VEC_SIZE> out_vec;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE / 2; ++i) {
+        out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] - (float)x_vec[2 * i + 1] * (float)sin_vec[i];
+        out_vec[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] + (float)x_vec[2 * i + 0] * (float)sin_vec[i];
+    }
+
+    if (is_q0) {
+        out_vec.store(out_q01 + (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE + access_id_in_head);
+    } else if (is_k0) {
+        out_vec.store(out_k01 + (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE + access_id_in_head);
+    } else if (is_q1) {
+        out_vec.store(out_q01 + ((num_tokens0 + token_id) * num_heads_q + head_id_in_token) * HEAD_SIZE + access_id_in_head);
+    } else {
+        out_vec.store(out_k01 + ((num_tokens0 + token_id) * num_heads_k + head_id_in_token) * HEAD_SIZE + access_id_in_head);
+    }
+}
+
+template <typename T>
+void fused_rope_rms_2way(
+    const T *q0, const T *k0, const T *q1, const T *k1,
+    const T *w_q0, const T *w_k0, const T *w_q1, const T *w_k1,
+    const T *cos_sin0, const T *cos_sin1,
+    int64_t batch_size, int64_t num_tokens0, int64_t num_tokens1,
+    int64_t num_heads_q, int64_t num_heads_k,
+    int64_t head_size, bool is_interleaved, double eps,
+    T *out_q01, T *out_k01,
+    hipStream_t stream) {
+    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    constexpr int block_size = 256;
+    auto total_warps = (num_tokens0 + num_tokens1) * (num_heads_q + num_heads_k);
+    auto num_warps_per_block = block_size / WARP_SIZE;
+    dim3 threadsPerBlock(block_size);
+    dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block, batch_size);
+#define DISPATCH_NEOX(HEAD_SIZE)                                                                                                                                 \
+    if (!is_interleaved) {                                                                                                                                       \
+        fused_rope_rms_neox_2way_kernel<T, HEAD_SIZE><<<numBlocks, threadsPerBlock, 0, stream>>>(                                                                \
+            q0, k0, q1, k1, w_q0, w_k0, w_q1, w_k1, cos_sin0, cos_sin1, num_tokens0, num_tokens1, num_heads_q, num_heads_k, eps, total_warps, out_q01, out_k01); \
+    } else {                                                                                                                                                     \
+        fused_rope_rms_noneox_2way_kernel<T, HEAD_SIZE><<<numBlocks, threadsPerBlock, 0, stream>>>(                                                              \
+            q0, k0, q1, k1, w_q0, w_k0, w_q1, w_k1, cos_sin0, cos_sin1, num_tokens0, num_tokens1, num_heads_q, num_heads_k, eps, total_warps, out_q01, out_k01); \
+    }
+    switch (head_size) {
+    case 64:
+        DISPATCH_NEOX(64)
+        break;
+    case 128:
+        DISPATCH_NEOX(128)
+        break;
+    case 256:
+        DISPATCH_NEOX(256)
+        break;
+    }
+
+#undef DISPATCH_NEOX
+}
+
 } // namespace rope_rms
 
 template <typename T>
@@ -1704,4 +1951,48 @@ void fused_rope_rms_set_kv(Tensor& qkv,
             }
         }
     });
+}
+
+void fused_rope_rms_2way(
+    Tensor &q0, Tensor &k0, Tensor &q1, Tensor &k1,
+    Tensor &w_q0, Tensor &w_k0, Tensor &w_q1, Tensor &w_k1,
+    Tensor &cos_sin0, Tensor &cos_sin1,
+    int64_t batch_size, int64_t num_tokens0, int64_t num_tokens1,
+    int64_t num_heads_q, int64_t num_heads_k,
+    int64_t head_size, bool is_interleaved, double eps,
+    Tensor &out_q01, Tensor &out_k01) {
+    TORCH_CHECK(q0.is_contiguous() && k0.is_contiguous() && q1.is_contiguous() && k1.is_contiguous());
+    TORCH_CHECK(w_q0.is_contiguous() && w_k0.is_contiguous() && w_q1.is_contiguous() && w_k1.is_contiguous());
+    TORCH_CHECK(cos_sin0.is_contiguous() && cos_sin1.is_contiguous());
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q0));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        kBFloat16,
+        kHalf,
+        q0.scalar_type(),
+        "fused_rope_rms_2way", [&] {
+            using T = KernelElementType<scalar_t>::type;
+            rope_rms::fused_rope_rms_2way<T>(
+                (T *)q0.data_ptr<scalar_t>(),
+                (T *)k0.data_ptr<scalar_t>(),
+                (T *)q1.data_ptr<scalar_t>(),
+                (T *)k1.data_ptr<scalar_t>(),
+                (T *)w_q0.data_ptr<scalar_t>(),
+                (T *)w_k0.data_ptr<scalar_t>(),
+                (T *)w_q1.data_ptr<scalar_t>(),
+                (T *)w_k1.data_ptr<scalar_t>(),
+                (T *)cos_sin0.data_ptr<scalar_t>(),
+                (T *)cos_sin1.data_ptr<scalar_t>(),
+                batch_size,
+                num_tokens0,
+                num_tokens1,
+                num_heads_q,
+                num_heads_k,
+                head_size,
+                is_interleaved,
+                eps,
+                (T *)out_q01.data_ptr<scalar_t>(),
+                (T *)out_k01.data_ptr<scalar_t>(),
+                stream);
+        });
 }

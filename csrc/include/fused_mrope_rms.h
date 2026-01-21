@@ -86,3 +86,12 @@ void fused_rope_rms_set_kv(Tensor& qkv,
                            bool use_shuffle_layout,
                            int64_t block_size,
                            int64_t x);
+
+void fused_rope_rms_2way(
+    Tensor &q0, Tensor &k0, Tensor &q1, Tensor &k1,
+    Tensor &w_q0, Tensor &w_k0, Tensor &w_q1, Tensor &w_k1,
+    Tensor &cos_sin0, Tensor &cos_sin1,
+    int64_t batch_size, int64_t num_tokens0, int64_t num_tokens1,
+    int64_t num_heads_q, int64_t num_heads_k,
+    int64_t head_size, bool is_interleaved, double eps,
+    Tensor &out_q01, Tensor &out_k01);

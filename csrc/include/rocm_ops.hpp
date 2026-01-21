@@ -1508,7 +1508,8 @@ namespace py = pybind11;
     m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms);               \
     m.def("fused_mrope_3d_rms_set_kv", &fused_mrope_3d_rms_set_kv); \
     m.def("fused_rope_rms", &fused_rope_rms);                       \
-    m.def("fused_rope_rms_set_kv", &fused_rope_rms_set_kv);
+    m.def("fused_rope_rms_set_kv", &fused_rope_rms_set_kv);         \
+    m.def("fused_rope_rms_2way", &fused_rope_rms_2way);
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
     m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);
