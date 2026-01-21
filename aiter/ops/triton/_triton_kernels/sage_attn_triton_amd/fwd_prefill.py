@@ -74,7 +74,7 @@ def _sage_fwd_no_mask(
     block_max,
     alibi_slope,
     q_descale,
-    ksbase_ptr,
+    k_descale_base_ptr,
     stride_ksblk,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -89,7 +89,7 @@ def _sage_fwd_no_mask(
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
-    k_descale_ptr = ksbase_ptr
+    k_descale_ptr = k_descale_base_ptr
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -263,7 +263,7 @@ def _sage_fwd_mask(
     n_extra_tokens,
     alibi_slope,
     q_descale,
-    ksbase_ptr,
+    k_descale_base_ptr,
     stride_ksblk,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -285,7 +285,7 @@ def _sage_fwd_mask(
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
 
-    k_descale_ptr = ksbase_ptr
+    k_descale_ptr = k_descale_base_ptr
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -1112,7 +1112,7 @@ def sage_fwd(
         Q_Descale
         + off_z * stride_qsz
         + off_h_q * stride_qsh
-        + cu_seqlens_q_start * stride_qsblk
+        + (start_m + cu_seqlens_q_start) * stride_qsblk
     )
     k_descale_offset = (
         K_Descale
