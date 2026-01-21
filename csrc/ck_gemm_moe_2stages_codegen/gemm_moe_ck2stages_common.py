@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import sys
 
@@ -399,7 +399,7 @@ def get_gemm1_kernels_list(
             tag = "a4w4_bns"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
-    kernels_list = gemm1_kernels_dict[tag]
+    kernels_list = {id: replace(kernel) for id, kernel in gemm1_kernels_dict[tag].items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.ActOP = ActOP == "silu"
@@ -467,7 +467,7 @@ def get_gemm2_kernels_list(
             tag = "a4w4_bns"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
-    kernels_list = gemm2_kernels_dict[tag]
+    kernels_list = {id: replace(kernel) for id, kernel in gemm2_kernels_dict[tag].items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.Nswizzle = Nswizzle

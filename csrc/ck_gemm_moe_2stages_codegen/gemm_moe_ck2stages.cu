@@ -64,10 +64,19 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt << " " << block_m.value() << std::endl;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
     at::hip::getCurrentHIPStream();
+
     int32_t splitk_local = splitk.has_value() ? splitk.value() : 1;
+    int tokens = hidden_states.size(0);
+    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
+    int E = w1.size(0);
+    int N = w1.size(1) / 2;
+    int K = hidden_states.size(-1);
+    int MPerBlock = block_m.value();
 
     if (splitk_local > 1)
     {
+        TORCH_CHECK(K == K / splitk_local * splitk_local,
+                    "Dim K must be a multiple of splitk!")
         TORCH_CHECK(out.dtype() == at::ScalarType::Float,
                     "Out dtype only support Float when splitk_local > 1!")
     }
@@ -76,13 +85,6 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                     "Out dtype only support BFloat16/Float16!")
     }
-
-    int tokens = hidden_states.size(0);
-    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
-    int E = w1.size(0);
-    int N = w1.size(1) / 2;
-    int K = hidden_states.size(-1);
-    int MPerBlock = block_m.value();
 
     void *hidden_states_ptr = hidden_states.data_ptr();
     void *w1_ptr = w1.transpose(1, 2).data_ptr();

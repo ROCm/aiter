@@ -52,7 +52,11 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     ck::index_t StrideB = K;
     ck::index_t SplitK  = splitk.has_value() ? splitk.value() : 1;
 
-    ck::index_t KBatch = SplitK > 1 ? K / (SplitK * KPerBlock) : 1;
+    static constexpr bool IsSplitK =
+            ck::is_same_v<CDEElementOp, MulABScaleExpertWeightA8W8blkscaleSplitk>;
+
+    ck::index_t KBatch = IsSplitK > 1 ? K / (SplitK * KPerBlock) : 1;
+
     if(KBatch > 1)
     {
         TORCH_CHECK((KBatch * KPerBlock * SplitK == K),
@@ -106,8 +110,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     static constexpr ck::index_t Scale_Block_M      = 1;
     static constexpr ck::index_t Scale_Block_N      = 128;
     static constexpr ck::index_t Scale_Block_K      = 128;
-    static constexpr bool IsSplitK =
-        std::is_same_v<CDEElementOp, MulABScaleExpertWeightA8W8blkscaleSplitk>;
+
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmBlockScale
         // clang-format off
           <     Row,  Col,  DsLayout, ELayout,
