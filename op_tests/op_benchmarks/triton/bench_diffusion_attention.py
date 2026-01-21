@@ -31,7 +31,7 @@ from aiter.ops.triton.attention.fav3_sage import (
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     fav3_sage,
-    get_fwd_configs,
+    get_sage_fwd_configs,
     sage_quant,
     sage_quant_v2
 )
@@ -307,11 +307,9 @@ def fav3_sage_forward_func(
     causal: bool,
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
+    sage_version=fav3_sage.Sage_version.V1
 ):
-    num_heads = q.shape[2] if layout == "bshd" else q.shape[1]
-    config = get_fwd_configs(
-        False, seqlen_q=q.shape[1], seqlen_k=k.shape[1], num_heads=num_heads
-    )
+    config = get_sage_fwd_configs(sage_version)
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
@@ -321,8 +319,7 @@ def fav3_sage_forward_func(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    sage_version = 2
-    if sage_version == 1:
+    if sage_version == fav3_sage.Sage_version.V1:
         q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
             q,
             k,
@@ -496,7 +493,7 @@ def primary_output(result):
     return result
 
 
-def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
+def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, sage_version=fav3_sage.Sage_version.V1):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
@@ -505,6 +502,7 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
             causal=False,
             inference_mode=True,
             layout=layout,
+            sage_version=sage_version
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -553,7 +551,9 @@ def bench_kernel(q, k, v, args, provider):
     else:  # bhsd
         BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
         _, HK, N_CTX_K, D_HEAD_V = v.shape
+    assert args.sage_version in [1, 2], f"Unsupported sage version {args.sage_version}"
 
+    sage_version = fav3_sage.Sage_version.V1 if args.sage_version == 1 else fav3_sage.Sage_version.V2
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = args.k_smooth
 
@@ -579,6 +579,7 @@ def bench_kernel(q, k, v, args, provider):
         k_smooth=k_smooth,
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
+        sage_version=sage_version
     )
     ms = triton.testing.do_bench(fn)
 
@@ -748,6 +749,7 @@ def str2bool(v):
 
 def parse_args():
     parser = get_parser(kernel_name="FlashAttention")
+    parser.add_argument("-sage_version", type=int, default=1)
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
@@ -778,12 +780,6 @@ def parse_args():
         default=False,
         help="Use asm fav3 bf16 kernel (instead of default fav3_sage)",
     )
-    # parser.add_argument(
-    #     "-fav3_sage",
-    #     action="store_true",
-    #     default=False,
-    #     help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.",
-    # )
     parser.add_argument("-k_smooth", action="store_true", default=True)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)

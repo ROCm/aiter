@@ -12,49 +12,6 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 
-def get_fwd_configs(autotune: bool, seqlen_k: int = None):
-    assert not autotune, "Autotuning is not supported."
-    arch = get_arch()
-    if arch == "gfx950":
-        if seqlen_k is not None and seqlen_k <= 512:
-            return {
-                "BLOCK_M": 128,
-                "BLOCK_N": 64,
-                "num_warps": 4,
-                "PRE_LOAD_V": True,
-                "num_stages": 2,
-                "waves_per_eu": 1,
-            }
-
-        return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 0,
-            "PRE_LOAD_V": False,
-            "num_stages": 3,
-            "num_warps": 8,
-        }
-    elif arch == "gfx942":
-        return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
-        }
-    else:
-        # return tuned config for MI300X by default
-        return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
-        }
-
-
 @triton.jit
 def _sage_fwd_no_mask_v2(
     acc,

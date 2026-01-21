@@ -10,7 +10,7 @@ from aiter.test_mha_common import (
     attention_ref,
 )
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    get_fwd_configs as sage_fwd_configs,
+    get_sage_fwd_configs,
     sage_quant,
     sage_quant_v2,
 )
@@ -285,9 +285,7 @@ def test_sage(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    config = sage_fwd_configs(
-        False, seqlen_q=SEQLEN_Q, seqlen_k=SEQLEN_K, num_heads=NUM_Q_HEADS
-    )
+    config = get_sage_fwd_configs()
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
@@ -379,7 +377,7 @@ def test_sage_v2(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    config = sage_fwd_configs(False)
+    config = get_sage_fwd_configs()
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 

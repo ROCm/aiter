@@ -2,6 +2,7 @@ import torch
 from typing import Optional, Tuple
 from .fwd_prefill import fav3_sage_triton_impl
 from .fwd_prefill_v2 import fav3_sage_triton_impl_v2
+from .sage_version import Sage_version
 
 from .utils import (
     DEBUG,
@@ -9,12 +10,6 @@ from .utils import (
     PHILOX_SEED,
     PHILOX_OFFSET,
 )
-from enum import Enum
-
-class Sage_version(Enum):
-    V1 = 1
-    V2 = 2
-    V3 = 3 # full fp4 supported in the future
 
 def fwd(
     q: torch.Tensor,

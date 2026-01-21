@@ -8,12 +8,10 @@ from .utils import (
     map_dims,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
+from .sage_version import Sage_version
 
 
-def get_fwd_configs(
-    autotune: bool, seqlen_q: int = None, seqlen_k: int = None, num_heads: int = None
-):
-    assert not autotune, "Autotuning is not supported."
+def _get_sage_v1_fwd_configs():
     arch = get_arch()
     if arch == "gfx950":
         return {
@@ -45,6 +43,27 @@ def get_fwd_configs(
         }
 
 
+def _get_sage_v2_fwd_configs():
+    arch = get_arch()
+    assert arch == "gfx950", "Sage attention mxfp4 only works on gfx950 or newer!"
+    return {
+        "BLOCK_M": 256,
+        "BLOCK_N": 128,
+        "waves_per_eu": 2,
+        "PRE_LOAD_V": False,
+        "num_stages": 3,
+        "num_warps": 8,
+    }
+
+
+def get_sage_fwd_configs(sage_version=Sage_version.V1):
+    return (
+        _get_sage_v1_fwd_configs()
+        if sage_version == Sage_version.V1
+        else _get_sage_v2_fwd_configs()
+    )
+
+
 @triton.jit
 def _sage_fwd_no_mask(
     acc,
@@ -71,7 +90,6 @@ def _sage_fwd_no_mask(
     off_z,
     off_h_q,
     offs_m,
-    offs_n,
     offs_d_qk,
     offs_d_v,
     block_min,
@@ -1261,7 +1279,6 @@ def sage_fwd(
             off_z,
             off_h_q,
             offs_m,
-            offs_n,
             offs_d_qk,
             offs_d_v,
             block_min,  # Start of range: 0
