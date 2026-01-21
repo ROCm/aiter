@@ -100,3 +100,28 @@ def fused_rope_rms_set_kv(
     block_size: int,
     x: int,
 ) -> None: ...
+
+
+@compile_ops("module_fused_mrope_rms")
+def fused_rope_rms_2way(
+    q0: Tensor,
+    k0: Tensor,
+    q1: Tensor,
+    k1: Tensor,
+    w_q0: Tensor,
+    w_k0: Tensor,
+    w_q1: Tensor,
+    w_k1: Tensor,
+    cos_sin0: Tensor,
+    cos_sin1: Tensor,
+    batch_size: int,
+    num_tokens0: int,
+    num_tokens1: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    out_q01: Tensor,
+    out_k01: Tensor,
+) -> None: ...
