@@ -318,7 +318,6 @@ def test_fmoe(
         # before stage2 quantization.
         out1_flir = torch.empty((token, topk, inter_dim), device="cuda", dtype=dtype)
         exe1 = compile_moe_gemm1(
-            tokens=token,
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=E,
@@ -326,18 +325,14 @@ def test_fmoe(
             tile_m=tile_m,
             tile_n=tile_n1,
             tile_k=tile_k1,
-            sorted_size=sorted_size,
-            size_expert_ids=size_expert_ids_total,
             doweight_stage1=bool(doweight_stage1),
             in_dtype="fp8",
             out_dtype="bf16" if dtype == torch.bfloat16 else "f16",
-            dynamic_blocks=True,
             use_cshuffle_epilog=False,
         )
 
         # Stage2 compile once (compile inside perftest can be unstable + distorts perf).
         exe2 = compile_moe_gemm2(
-            tokens=token,
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=E,
@@ -345,14 +340,11 @@ def test_fmoe(
             tile_m=tile_m,
             tile_n=tile_n2,
             tile_k=tile_k2,
-            sorted_size=sorted_size,
-            size_expert_ids=size_expert_ids_total,
             doweight_stage2=bool(not doweight_stage1),
             in_dtype="fp8",
             # For bf16 test configs, fp16 atomic accumulation can overflow to +/-inf.
             # Use fp32 atomics for correctness; cast to `dtype` for comparison below.
             out_dtype="f32" if dtype == torch.bfloat16 else "f16",
-            dynamic_blocks=True,
         )
         w2_flat = w2_shuf.contiguous().view(E * model_dim, inter_dim).contiguous()
         w2_scale_1d = w2_scale.view(-1).contiguous()
