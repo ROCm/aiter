@@ -48,7 +48,7 @@ def _sage_fwd_no_mask_v2(
     k_descale_base_ptr,
     SM_SCALE: tl.constexpr,
     FP8_MAX,
-    stride_k_descale_s,
+    stride_ksn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
@@ -82,7 +82,7 @@ def _sage_fwd_no_mask_v2(
             k = tl.load(k_ptrs)
 
         k_descale = tl.load(k_descale_ptr)
-        k_descale_ptr += stride_k_descale_s * BLOCK_N
+        k_descale_ptr += stride_ksn * BLOCK_N
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -241,7 +241,7 @@ def _sage_fwd_mask_v2(
     k_descale_base_ptr,
     SM_SCALE: tl.constexpr,
     FP8_MAX,
-    stride_k_descale_s,
+    stride_ksn,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -288,7 +288,7 @@ def _sage_fwd_mask_v2(
         k_descale = tl.load(
             k_descale_ptr, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
         )
-        k_descale_ptr += stride_k_descale_s * BLOCK_N
+        k_descale_ptr += stride_ksn * BLOCK_N
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
@@ -875,11 +875,11 @@ def sage_fwd_v2(
     stride_q_descale_z,
     stride_q_descale_h,
     stride_q_descale_s,
-    stride_k_descale_z,
-    stride_k_descale_h,
-    stride_k_descale_s,
-    stride_v_descale_z,
-    stride_v_descale_h,
+    stride_ksz,
+    stride_ksh,
+    stride_ksn,
+    stride_vsz,
+    stride_vsh,
     LSE,
     Out,
     SD_MASK,
@@ -1029,12 +1029,12 @@ def sage_fwd_v2(
         q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0
     )  # MHA: use q head index
 
-    k_descale_offset = off_z * stride_k_descale_z + off_h_k * stride_k_descale_h
+    k_descale_offset = off_z * stride_ksz + off_h_k * stride_ksh
 
     v_descale = tl.load(
         V_Descale
-        + off_z * stride_v_descale_z
-        + off_h_k * stride_v_descale_h
+        + off_z * stride_vsz
+        + off_h_k * stride_vsh
         + offs_d_v,
         mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
         other=0.0,
@@ -1158,7 +1158,7 @@ def sage_fwd_v2(
         k_descale_ptr = (
             K_Descale
             + k_descale_offset
-            + (block_min + offs_n[:, None]) * stride_k_descale_s
+            + (block_min + offs_n[:, None]) * stride_ksn
             + offs_d_qk_s[None, :]
         )
 
@@ -1198,7 +1198,7 @@ def sage_fwd_v2(
             k_descale_ptr,
             SM_SCALE,
             FP8_MAX,
-            stride_k_descale_s,
+            stride_ksn,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_N,
@@ -1227,7 +1227,7 @@ def sage_fwd_v2(
         k_descale_ptr = (
             K_Descale
             + k_descale_offset
-            + (block_min + offs_n[:, None]) * stride_k_descale_s
+            + (block_min + offs_n[:, None]) * stride_ksn
             + offs_d_qk_s[None, :]
         )
 
@@ -1266,7 +1266,7 @@ def sage_fwd_v2(
             k_descale_ptr,
             SM_SCALE,
             FP8_MAX,
-            stride_k_descale_s,
+            stride_ksn,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -1296,7 +1296,7 @@ def sage_fwd_v2(
         k_descale_ptr = (
             K_Descale
             + k_descale_offset
-            + (block_min + offs_n[:, None]) * stride_k_descale_s
+            + (block_min + offs_n[:, None]) * stride_ksn
             + offs_d_qk_s[None, :]
         )
 
@@ -1336,7 +1336,7 @@ def sage_fwd_v2(
             k_descale_ptr,
             SM_SCALE,
             FP8_MAX,
-            stride_k_descale_s,
+            stride_ksn,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_N,
@@ -1735,11 +1735,11 @@ def fav3_sage_triton_impl_v2(
     stride_q_descale_z, stride_q_descale_s, stride_q_descale_h, _ = map_dims(
         q_descale.stride(), bshd
     )
-    stride_k_descale_z, stride_k_descale_s, stride_k_descale_h, _ = map_dims(
+    stride_ksz, stride_ksn, stride_ksh, _ = map_dims(
         k_descale.stride(), bshd
     )
 
-    stride_v_descale_z, stride_v_descale_h, _ = v_descale.stride()
+    stride_vsz, stride_vsh, _ = v_descale.stride()
 
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
@@ -1820,11 +1820,11 @@ def fav3_sage_triton_impl_v2(
         stride_q_descale_z,
         stride_q_descale_h,
         stride_q_descale_s,
-        stride_k_descale_z,
-        stride_k_descale_h,
-        stride_k_descale_s,
-        stride_v_descale_z,
-        stride_v_descale_h,
+        stride_ksz,
+        stride_ksh,
+        stride_ksn,
+        stride_vsz,
+        stride_vsh,
         softmax_lse,
         o,
         sd_mask,
