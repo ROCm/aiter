@@ -55,14 +55,16 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
         _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
-        if sage_version == fav3_sage.Sage_version.V2:
-            head_dim *= 2
+
+        # not necessary here as q and v are not quantized yet
+        # if sage_version == fav3_sage.Sage_version.V2:
+        #     head_dim *= 2
 
         # Quantize K, V to int8, and convert v to float16
 
         # Use provided config or get default config
         if config is None:
-            config = get_sage_fwd_configs()
+            config = get_sage_fwd_configs(sage_version)
         # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
         # config = config[0].all_kwargs()
         BLKQ = config["BLOCK_M"]
