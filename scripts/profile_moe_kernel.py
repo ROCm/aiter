@@ -33,10 +33,36 @@ from aiter import QuantType, ActivationType
 import gemm_moe_tune
 from gemm_moe_tune import FmoeTuner
 
-# Essential counters
+# Comprehensive counters for detailed analysis
 COUNTERS = [
-    "TCC_HIT", "TCC_MISS", "LDSBankConflict", "OccupancyPercent", 
-    "MemUnitStalled", "MfmaUtil", "SQ_WAIT_INST_ANY", "TCC_TAG_STALL_sum",
+    # Cache and memory
+    "TCC_HIT", "TCC_MISS", "TCC_TAG_STALL_sum",
+    "TCC_EA0_RDREQ_sum", "TCC_EA0_WRREQ_sum",
+    "FETCH_SIZE", "WRITE_SIZE",
+    "TCP_PENDING_STALL_CYCLES_sum",
+    
+    # Compute utilization
+    "LDSBankConflict", "OccupancyPercent", "MemUnitStalled", "MfmaUtil",
+    "SQ_INSTS_MFMA", "SQ_VALU_MFMA_BUSY_CYCLES_sum",
+    "MfmaFlops", "MfmaFlopsF16", "MfmaFlopsF32", "MfmaFlopsBF16",
+    
+    # Wave execution
+    "SQ_WAVES_sum", "SQ_WAVE_CYCLES_sum", "SQ_BUSY_CU_CYCLES_sum",
+    "SQ_WAIT_INST_ANY", "SQ_ACTIVE_INST_ANY_sum",
+    
+    # Instruction breakdown
+    "SQ_INSTS_VALU_sum", "SQ_INSTS_VMEM_sum", "SQ_INSTS_LDS_sum",
+    "SQ_INSTS_SALU_sum", "SQ_INSTS_SMEM_sum",
+    "SQ_ACTIVE_INST_VALU_sum", "SQ_ACTIVE_INST_VMEM_sum", "SQ_ACTIVE_INST_LDS_sum",
+    
+    # LDS details
+    "SQ_LDS_BANK_CONFLICT_sum", "SQ_LDS_IDX_ACTIVE_sum",
+    
+    # GPU activity
+    "GRBM_GUI_ACTIVE_sum", "GRBM_COUNT_sum",
+    
+    # Hardware constants (will be same for all kernels but good to have)
+    "CU_NUM", "SIMD_NUM", "max_bandwidth",
 ]
 
 
