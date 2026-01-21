@@ -56,3 +56,7 @@ aiter_logs
 # artifacts
 aiter_meta
 aiter/install_mode
+
+# vim
+*.swo
+*.swp

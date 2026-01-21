@@ -343,7 +343,7 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
-        sage_version=sage_version
+        sage_version
     )
 
 
