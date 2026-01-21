@@ -1,330 +1,207 @@
 # Triton Kernel Tuning Guide
 
-This guide explains how to write tuning scripts for Triton kernels using the utility functions provided in [`aiter/aiter/ops/triton/tune/utils.py`](aiter/aiter/ops/triton/tune/utils.py:1).
+This guide explains how to tune Triton kernels for optimal performance on your GPU architecture.
 
-## Overview
+1. Install aiter:
+`cd $aiter_path`
+`python3 setup.py develop`
 
-The tuning utilities provide a framework for:
-- Defining a search space of kernel configurations
-- Benchmarking each configuration against a ground truth reference
-- Selecting the best-performing configuration
-- Saving the results to JSON files
+2. Configure GEMM shapes to tune:
 
-## Core Utility Functions
-
-### `tune_kernel()`
-
-The main tuning function that iterates through configurations and finds the best performer.
+Edit the tuning script to specify which dimensions you want to tune. For example, for `gemm_a8w8_blockscale` tuning, edit `aiter/ops/triton/tune/tune_a8w8_blockscale.py` and modify the `test_configs` list in the `main()` function (around line 410):
 
 ```python
-def tune_kernel(
-    search_space: List[Dict[str, Any]],
-    make_run_and_gt_fn: Callable[[Dict[str, Any]], Tuple[Callable[[], Any], Any]],
-    config_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-    num_iters: int = 10,
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
-) -> Dict[str, Any]
+test_configs = [
+    # (batch_sizes, N, K)
+    (
+        [16, 32, 64, 128, 256, 512, 2048, 4096],  # M dimensions to test
+        1024,  # N dimension
+        1024,  # K dimension
+    ),  # Standard attention head dims
+    (
+        [16, 32, 64, 128, 256, 512, 2048, 4096],
+        4096,  # N dimension
+        1024,  # K dimension
+    ),  # FFN intermediate
+    # Add more (batch_sizes, N, K) tuples as needed
+]
 ```
 
-**Parameters:**
-- `search_space`: List of configuration dictionaries to test
-- `make_run_and_gt_fn`: Callable that takes a config and returns `(run_fn, ground_truth)`
-- `config_callback`: Optional function to modify configs before use
-- `num_iters`: Number of iterations for benchmarking (default: 10)
-- `atol`: Absolute tolerance for output comparison (default: 1e-2)
-- `rtol`: Relative tolerance for output comparison (default: 1e-2)
+Each configuration tuple specifies:
+- `batch_sizes`: List of M (batch/sequence) dimensions to test
+- `N`: Output feature dimension
+- `K`: Input feature dimension
 
-**Returns:**
-- The best configuration dictionary (lowest average latency)
+3. Start tuning:
 
-### `benchmark_config()`
+Run the following command to start tuning. Please wait a few minutes as it will build kernels via JIT compilation:
 
-Benchmarks a single kernel configuration.
+`python3 aiter/ops/triton/tune/tune_a8w8_blockscale.py`
+
+The tuning process will:
+- Detect your GPU architecture automatically (e.g., `gfx942`, `gfx942`, `gfx1201`)
+- Test each configuration in the search space against a PyTorch reference implementation
+- Measure performance and select the best configuration for each category
+- Save results to JSON files in `aiter/configs/triton/gemm/`
+
+You will see output like:
+```
+Architecture: gfx1201
+Search space size: 3456 configurations
+Total test configurations: 5
+
+Running A8W8_BLOCKSCALE-N=1024-K=1024...
+Tuning A8W8_BLOCKSCALE-N=1024-K=1024: 100%|██████████| 8/8 [02:15<00:00, 16.92s/it]
+Tuning for A8W8_BLOCKSCALE-N=1024-K=1024 took 135.42 seconds
+```
+
+Results are saved with the naming pattern: `{device_name}-GEMM-{tag}.json`
+
+For example: `gfx942-GEMM-A8W8_BLOCKSCALE-N=1024-K=1024.json`
+
+The JSON files contain tuned configurations categorized by M dimension size:
+- `small`: M < 32
+- `medium_M32`, `medium_M64`, `medium_M128`: M <= 128 (specific power of 2)
+- `large`: M <= 256
+- `xlarge`: M > 256
+- `any`: Catch-all for the largest tested size
+
+Example output format:
+```json
+{
+    "small": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3,
+        "NUM_KSPLIT": 1,
+        "waves_per_eu": 2,
+        "kpack": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg"
+    },
+    "medium_M64": { ... },
+    "large": { ... }
+}
+```
+
+A default config file `{device_name}-GEMM-A8W8_BLOCKSCALE.json` is also created by selecting the most common configuration across all tested (N, K) shapes.
+
+4. Build tuned kernels and test:
+
+The tuned configurations are automatically picked up by the kernel when you run it. To test the performance:
+
+Modify the test instance in `op_tests/test_gemm_a8w8_blockscale.py` (or the relevant test file) and run:
+
+`python3 op_tests/test_gemm_a8w8_blockscale.py`
+
+The kernel will automatically load the tuned configuration from `aiter/configs/triton/gemm/{device_name}-GEMM-A8W8_BLOCKSCALE.json` and apply the appropriate configuration based on the input dimensions.
+
+If you have previously built Triton kernels and want to force a reload of the new tuned configurations, you may need to restart your Python process to clear the kernel cache.
+
+## More Options
+
+### Customizing Search Space
+
+The search space defines which kernel configurations will be tested during tuning. To customize it for your specific kernel needs, edit the `get_configs_compute_bound()` function in the tuning script.
+
+For `gemm_a8w8_blockscale`, the default search space explores:
 
 ```python
-def benchmark_config(
-    run: Callable[[], Any],
-    ground_truth: Any,
-    num_iters: int = 10,
-    atol: float = 1e-1,
-    rtol: float = 1e-1,
-) -> float
+for num_stages in [1, 2, 3, 4]:
+    for block_m in [32, 64, 128]:
+        for block_n in [32, 64, 128]:
+            for group_size_m in [1, 8, 16]:
+                for num_warps in [2, 4, 8]:
+                    for num_ksplit in [1, 2, 4]:
+                        for waves_per_eu in [2, 4, 8]:
+                            for kpack in [2]:
+                                for cache_modifier in ["", ".cg"]:
+                                    # Test this configuration
 ```
 
-**Parameters:**
-- `run`: Callable that executes the kernel (no arguments)
-- `ground_truth`: Expected output tensor for correctness verification
-- `num_iters`: Number of benchmark iterations (default: 10)
-- `atol`: Absolute tolerance for comparison (default: 1e-1)
-- `rtol`: Relative tolerance for comparison (default: 1e-1)
-
-**Returns:**
-- Average latency in microseconds
-
-**Behavior:**
-- Performs 5 warmup iterations
-- Records CUDA events for timing
-- Validates output against ground truth after each iteration
-- Handles `OutOfResources` and `AssertionError` exceptions gracefully
-
-### `get_search_space()`
-
-Generates a default search space for tuning.
-
-```python
-def get_search_space(small: bool = False) -> List[Dict[str, Any]]
-```
-
-**Parameters:**
-- `small`: If `True`, returns a reduced search space for testing
-
-**Returns:**
-- List of configuration dictionaries with parameters:
-  - `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, `BLOCK_SIZE_K`: Tile dimensions
-  - `GROUP_SIZE_M`: Group size for M dimension
-  - `num_warps`: Number of warps per block
-  - `num_stages`: Pipeline stages
-  - `waves_per_eu`: Waves per execution unit
-  - `matrix_instr_nonkdim`: Matrix instruction dimension
-
-### `save_configs_to_json()`
-
-Saves configuration dictionaries to a JSON file.
-
-```python
-def save_configs_to_json(
-    json_file_name: str,
-    save_path: str,
-    configs: Dict[str, Any],
-) -> None
-```
-
-**Parameters:**
-- `json_file_name`: Name of the JSON file
-- `save_path`: Directory path to save the file
-- `configs`: Dictionary of configurations to save
-
-## Writing a Tuning Script
-
-### Step 1: Define Input Generation
-
-Create a helper function to generate test inputs for your kernel. This function should accept all necessary parameters including the configuration dictionary.
-
-```python
-def input_helper(
-    *dimensions,
-    *kernel_specific_params,
-    config: dict,
-):
-    """
-    Generate input tensors for the kernel.
-    
-    Args:
-        *dimensions: Problem dimensions (e.g., M, N, K, etc.)
-        *kernel_specific_params: Kernel-specific parameters (e.g., quantization flags)
-        config: Configuration dictionary containing tuning parameters
-    
-    Returns:
-        Tuple of all input tensors and config
-    """
-    # Generate input tensors on CUDA
-    input_tensor = torch.randn(dims, dtype=dtype, device="cuda")
-    
-    # Generate output tensor(s)
-    output_tensor = torch.empty(output_dims, dtype=dtype, device="cuda")
-    
-    # Generate any additional tensors needed by the kernel
-    # This may include scales, routing information, etc.
-    
-    return (input_tensor, output_tensor, ..., config)
-```
-
-### Step 2: Create Reference Implementation
-
-Implement a reference (ground truth) version using PyTorch or another trusted implementation.
-
-```python
-# Reference implementation can be:
-# 1. Imported from existing test utilities
-from op_tests.triton_tests.your_kernel import your_kernel_ref
-
-# 2. Implemented inline using PyTorch operations
-def run_reference(*inputs, **kwargs):
-    # Compute the correct output using PyTorch
-    return torch_output
-```
-
-### Step 3: Create the `make_run_and_gt_fn` Factory
-
-Define a factory function that creates the `make_run_and_gt_fn` callable. This is the core pattern used in tuning scripts.
-
-```python
-def make_run_and_gt_fn_factory(
-    *dimensions,
-    *kernel_specific_params,
-):
-    """
-    Factory function to create run and ground truth functions.
-    
-    Args:
-        *dimensions: Problem dimensions
-        *kernel_specific_params: Kernel-specific parameters
-    
-    Returns:
-        Function that takes a config and returns (run_fn, ground_truth)
-    """
-    def make_run_and_gt(config):
-        # Generate fresh inputs for each configuration
-        inputs = input_helper(
-            *dimensions,
-            *kernel_specific_params,
-            config=config,
-        )
-        
-        def run():
-            torch.cuda.empty_cache()
-            # Call your Triton kernel here
-            result = your_kernel(*inputs, config)
-            return result
-        
-        # Generate ground truth using reference implementation
-        ground_truth = your_kernel_ref(*inputs)
-        
-        return run, ground_truth
-    
-    return make_run_and_gt
-```
-
-### Step 4: Implement the Tuning Function
-
-Create a function that orchestrates the tuning process for a specific set of parameters.
-
-```python
-def tune_your_kernel(
-    *dimensions,
-    *kernel_specific_params,
-    search_space: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    Tune the kernel for specific dimensions.
-    
-    Args:
-        *dimensions: Problem dimensions
-        *kernel_specific_params: Kernel-specific parameters
-        search_space: List of configuration dictionaries to test
-    
-    Returns:
-        Best configuration dictionary
-    """
-    make_run_and_gt = make_run_and_gt_fn_factory(
-        *dimensions,
-        *kernel_specific_params,
-    )
-    
-    best_config = tune_kernel(
-        search_space=search_space,
-        make_run_and_gt_fn=make_run_and_gt,
-    )
-    return best_config
-```
-
-### Step 5: Create Batch Tuning Function
-
-For tuning multiple configurations and categorizing results by problem size ranges:
-
-```python
-def tune_and_save_configs(
-    dimension_values: List[int],
-    *other_dimensions,
-    *kernel_specific_params,
-    search_space: List[Dict[str, Any]],
-    save_path: str,
-    device_name: str,
-):
-    """
-    Tune configurations for multiple dimension values and save results.
-    
-    Args:
-        dimension_values: List of values for the primary dimension to test
-        *other_dimensions: Fixed values for other dimensions
-        *kernel_specific_params: Kernel-specific parameters
-        search_space: List of configuration dictionaries
-        save_path: Path to save configuration files
-        device_name: Device/architecture name for file naming
-    """
-    start = time.time()
-    
-    benchmark_results = [
-        tune_your_kernel(
-            dim_value,
-            *other_dimensions,
-            *kernel_specific_params,
-            search_space=search_space,
-        )
-        for dim_value in tqdm(dimension_values)
-    ]
-    
-    # Categorize configs by dimension ranges
-    best_configs = {
-        (
-            "small" if dim_value <= 256
-            else "medium" if dim_value <= 2048
-            else "large"
-        ): config
-        for dim_value, config in zip(dimension_values, benchmark_results)
-    }
-    
-    json_file_name = f"{device_name}-KERNEL.json"
-    save_configs_to_json(json_file_name, save_path, best_configs)
-    
-    end = time.time()
-    print(f"Tuning took {end - start:.2f} seconds")
-```
-
-### Step 6: Define Custom Search Space (Optional)
-
-If the default search space from `get_search_space()` doesn't meet your needs, create a custom one:
-
-```python
-def get_custom_search_space() -> List[Dict[str, Any]]:
-    """
-    Generate configuration space for your kernel.
-    
-    Returns:
-        List of configuration dictionaries
-    """
-    configs = []
-    
-    # Define parameter ranges based on your kernel requirements
-    for num_stages in [1, 2, 3, 4]:
-        for block_m in [32, 64, 128]:
-            for block_n in [32, 64, 128]:
-                for block_k in [64, 128]:
-                    for num_warps in [2, 4, 8]:
-                        configs.append({
-                            "BLOCK_SIZE_M": block_m,
-                            "BLOCK_SIZE_N": block_n,
-                            "BLOCK_SIZE_K": block_k,
-                            "num_warps": num_warps,
-                            "num_stages": num_stages,
-                            # Add other kernel-specific parameters
-                        })
-    
-    return configs
-```
-
-## Configuration Parameters
-
-Common configuration parameters for Triton kernels:
+**Common Parameters:**
 
 | Parameter | Description | Typical Values |
 |-----------|-------------|----------------|
-| `BLOCK_SIZE_M` | Tile size for M dimension | 16, 32, 64, 128, 256 |
-| `BLOCK_SIZE_N` | Tile size for N dimension | 16, 32, 64, 128, 256 |
-| `BLOCK_SIZE_K` | Tile size for K dimension | 32, 64, 128 |
-| `GROUP_SIZE_M` | Group size for M dimension | 1, 8, 16, 32, 64 |
+| `BLOCK_SIZE_M` | Tile size for M dimension | 32, 64, 128 |
+| `BLOCK_SIZE_N` | Tile size for N dimension | 32, 64, 128 |
+| `BLOCK_SIZE_K` | Tile size for K dimension | 128 (fixed for blockscale) |
+| `GROUP_SIZE_M` | Group size for M dimension | 1, 8, 16 |
 | `num_warps` | Number of warps per thread block | 2, 4, 8 |
-| `num_stages` | Pipeline stages for software pipelining | 1, 2, 3, 4, 5 |
-| `waves_per_eu` | Waves per execution unit | 1, 2, 4, 6, 8 |
+| `num_stages` | Pipeline stages for software pipelining | 1, 2, 3, 4 |
+| `NUM_KSPLIT` | K dimension splitting factor | 1, 2, 4 |
+| `waves_per_eu` | Waves per execution unit | 2, 4, 8 |
+| `kpack` | K packing factor | 2 |
+| `cache_modifier` | Cache modifier hint | `""`, `".cg"` |
 | `matrix_instr_nonkdim` | Matrix instruction dimension | 16 |
+
+### Tuning Parameters
+
+You can adjust tuning behavior by modifying the `tune_kernel()` call in the tuning function:
+
+#### `num_iters`
+- **Type**: Integer
+- **Default**: `10`
+- **Description**: Number of benchmark iterations for each configuration. Higher values give more stable timing results but take longer.
+
+To modify, edit the `tune_gemm_a8w8_blockscale()` function and add:
+```python
+best_config = tune_kernel(
+    search_space=search_space,
+    make_run_and_gt_fn=make_run_and_gt,
+    num_iters=20,  # Increase for more stable results
+)
+```
+
+#### `atol` and `rtol`
+- **Type**: Float
+- **Default**: `atol=1e-2`, `rtol=1e-2`
+- **Description**: Absolute and relative tolerances for output correctness validation. Configurations that produce results outside these tolerances compared to the PyTorch reference are rejected.
+
+To modify:
+```python
+best_config = tune_kernel(
+    search_space=search_space,
+    make_run_and_gt_fn=make_run_and_gt,
+    atol=1e-1,  # Relax absolute tolerance
+    rtol=1e-1,  # Relax relative tolerance
+)
+```
+
+### Output Data Type
+
+The tuning script defaults to `torch.bfloat16` output. To change the output dtype, modify the `dtype` parameter in the `tune_and_save_configs()` call:
+
+```python
+best_configs = tune_and_save_configs(
+    batch_sizes=batch_sizes,
+    N=N,
+    K=K,
+    dtype=torch.float16,  # Use float16 instead of bfloat16
+    search_space=search_space,
+    save_path=save_path,
+    device_name=dev,
+    tag=tag,
+)
+```
+
+## Notes
+
+- **GPU Architecture Detection**: The tuning script automatically detects your GPU architecture using `arch_info.get_arch()`. Make sure you tune on the same GPU architecture where you plan to run the kernels.
+
+- **Search Space Size**: The default search space for `gemm_a8w8_blockscale` contains 3456 configurations. With 8 batch sizes per (N, K) tuple and 5 different (N, K) configurations, full tuning can take several hours. Consider reducing the search space or number of test configurations for faster iteration during development.
+
+- **Correctness Validation**: Each configuration is validated against a PyTorch reference implementation to ensure correctness. Configurations that fail validation are automatically skipped.
+
+- **Resource Limits**: Some configurations may fail with `OutOfResources` errors on smaller GPUs. These are automatically skipped during tuning.
+
+- **Triton Kernel Cache**: Triton caches compiled kernels. If you modify kernel source code or want to force recompilation with new tuned configs, restart your Python process to clear the cache.
+
+- **Multiple GPU Support**: The current tuning script runs on a single GPU. For multi-GPU tuning, you would need to modify the script to use `torch.cuda.set_device()` and run separate tuning processes for each GPU.
+
+- **Performance Metrics**: The tuning process optimizes for average latency (microseconds). Lower latency configurations are preferred. TFLOPS and bandwidth metrics are not currently computed but can be added to the benchmarking function if needed.
+
+- **Extending to Other Kernels**: To tune other Triton kernels, create a new tuning script following the pattern in `tune_a8w8_blockscale.py`, adapting the input generation, reference implementation, and kernel invocation for your specific kernel.
