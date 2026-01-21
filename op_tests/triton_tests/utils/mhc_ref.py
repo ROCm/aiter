@@ -65,10 +65,10 @@ def mhc_torch(
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
 
     Returns:
-        H with shape (M, n² + 2n) containing three concatenated streams:
-        - H^pre: [0:n] manifold projection with sigmoid (n elements)
-        - H^post: [n:2n] post-processing with 2*sigmoid (n elements)
-        - H^res: [2n:2n+n²] residual connection (identity) (n² elements)
+        Tuple of three tensors (H_pre, H_post, H_res):
+        - H_pre: (M, n) manifold projection with sigmoid
+        - H_post: (M, n) post-processing with 2*sigmoid
+        - H_res: (M, n²) residual connection (identity)
     """
     x_f32 = x.to(torch.float32)
     nC = x.shape[1]
@@ -112,10 +112,8 @@ def mhc_torch(
     # Preserves values for subsequent Sinkhorn-Knopp normalization (Eq 19)
     # H_res stays as is
     
-    # Concatenate streams
-    out = torch.cat([H_pre, H_post, H_res], dim=1)
-
-    return out.to(x.dtype)
+    # Return three separate streams
+    return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
 
 
 def sinkhorn_knopp_exp_domain_torch(

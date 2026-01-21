@@ -27,18 +27,24 @@ def _mhc_fused_kernel(
     alpha_post,
     alpha_res,
     bias_ptr,
-    out_ptr,
+    out_pre_ptr,
+    out_post_ptr,
+    out_res_ptr,
     M: tl.constexpr,   # rows: x.shape[0] - the batch/sequence dimension. Represents how many input vectors we're processing
     K: tl.constexpr,   # input features: nC = x.shape[1] - must match phi.shape[0]. Called nC in the paper (n × C where C is some latent dimension)
-    N: tl.constexpr,   # output features: n² + 2n - total output dimension split into 3 streams (pre: n², post: n, res: n). Must match phi.shape[1] and bias length
+    N: tl.constexpr,   # output features: n² + 2n - total output dimension split into 3 streams (pre: n, post: n, res: n²)
     n: tl.constexpr,   # stream parameter: n - Hyperparameter from paper controlling manifold dimension. Determines stream sizes
     eps: tl.constexpr, # epsilon for numerical stability in RMSNorm
     stride_xm,
     stride_xk,
     stride_phik,
     stride_phin,
-    stride_om,
-    stride_on,
+    stride_pre_m,
+    stride_pre_n,
+    stride_post_m,
+    stride_post_n,
+    stride_res_m,
+    stride_res_n,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -46,10 +52,10 @@ def _mhc_fused_kernel(
     """
     Fused kernel for equations 14-18.
     
-    Computes H = [H^pre, H^post, H^res] where:
-    - H^pre: n elements with sigmoid activation (H^{pre} ∈ ℝ^{1×n})
-    - H^post: n elements with 2*sigmoid activation (H^{post} ∈ ℝ^{1×n})
-    - H^res: n² elements with identity (no activation) (H^{res} ∈ ℝ^{n×n})
+    Computes three separate outputs:
+    - H^pre: (M, n) with sigmoid activation (H^{pre} ∈ ℝ^{1×n})
+    - H^post: (M, n) with 2*sigmoid activation (H^{post} ∈ ℝ^{1×n})
+    - H^res: (M, n²) with identity (no activation) (H^{res} ∈ ℝ^{n×n})
     
     All operations fused in a single kernel pass for maximum efficiency.
     """
@@ -124,21 +130,39 @@ def _mhc_fused_kernel(
     # acc is the matrix product H̃ from Eq 14
     out = rsigma[:, None] * alpha * acc + bias[None, :]
     
-    # Apply stream-specific activations
-    # Pre-stream (Eq 17): H^pre = σ(H^pre) - sigmoid activation
-    out = tl.where(is_pre[None, :], tl.sigmoid(out), out)
+    # Apply stream-specific activations and store to separate output buffers
     
-    # Post-stream (Eq 18): H^post = 2σ(H^post) - scaled sigmoid activation
-    out = tl.where(is_post[None, :], 2.0 * tl.sigmoid(out), out)
+    # Pre-stream (Eq 17): H^pre = σ(H^pre) - sigmoid activation
+    # Columns [0:n] go to out_pre
+    out_pre = tl.sigmoid(out)
+    rn_pre = rn  # Pre-stream columns [0:n]
+    tl.store(
+        out_pre_ptr + rm[:, None] * stride_pre_m + rn_pre[None, :] * stride_pre_n,
+        out_pre,
+        mask=(rm[:, None] < M) & is_pre[None, :] & (rn_pre[None, :] >= 0) & (rn_pre[None, :] < n),
+    )
+    
+    # Post-stream (Eq 18): H^post = 2σ(H^post) - scaled sigmoid activation  
+    # Columns [n:2n] go to out_post
+    out_post = 2.0 * tl.sigmoid(out)
+    rn_post = rn - n  # Map global column index to post-stream local index [0:n]
+    tl.store(
+        out_post_ptr + rm[:, None] * stride_post_m + rn_post[None, :] * stride_post_n,
+        out_post,
+        mask=(rm[:, None] < M) & is_post[None, :] & (rn_post[None, :] >= 0) & (rn_post[None, :] < n),
+    )
     
     # Res-stream: H^res remains unchanged (identity activation)
+    # Columns [2n:2n+n²] go to out_res
     # This preserves the values for subsequent Sinkhorn-Knopp normalization (Eq 19)
-
-    # Store result (cast back to input dtype)
+    is_res = rn >= n_post_end
+    n_squared = n * n
+    out_res = out
+    rn_res = rn - (2 * n)  # Map global column index to res-stream local index [0:n²]
     tl.store(
-        out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on,
-        out,
-        mask=(rm[:, None] < M) & (rn[None, :] < N),
+        out_res_ptr + rm[:, None] * stride_res_m + rn_res[None, :] * stride_res_n,
+        out_res,
+        mask=(rm[:, None] < M) & is_res[None, :] & (rn_res[None, :] >= 0) & (rn_res[None, :] < n_squared),
     )
 
 

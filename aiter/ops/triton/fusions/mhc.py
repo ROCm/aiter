@@ -29,8 +29,10 @@ def mhc(
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    out_pre: Optional[torch.Tensor] = None,
+    out_post: Optional[torch.Tensor] = None,
+    out_res: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute mHC projection mapping with all three streams (equations 14-18).
 
@@ -54,21 +56,23 @@ def mhc(
         alpha_res: Scaling factor α^res for residual stream (last n² elements)
         bias: Bias vector b with shape (n² + 2n,) applied after scaling
         n: Stream parameter - hyperparameter controlling manifold dimension.
-           Determines output size: n (pre) + n (post) + n² (res) = n² + 2n
+           Determines output sizes: n (pre) + n (post) + n² (res) = n² + 2n
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
-        out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, n² + 2n)
+        out_pre (Optional[torch.Tensor]): Pre-allocated output for H^pre with shape (M, n)
+        out_post (Optional[torch.Tensor]): Pre-allocated output for H^post with shape (M, n)
+        out_res (Optional[torch.Tensor]): Pre-allocated output for H^res with shape (M, n²)
 
     Returns:
-        Output tensor H with shape (M, n² + 2n) containing three concatenated streams:
-        - H^pre: [0:n] - manifold projection with sigmoid activation (n elements, H^{pre} ∈ ℝ^{1×n})
-        - H^post: [n:2n] - post-processing with scaled sigmoid activation (n elements, H^{post} ∈ ℝ^{1×n})
-        - H^res: [2n:2n+n²] - residual connection (identity, for later Sinkhorn-Knopp) (n² elements, H^{res} ∈ ℝ^{n×n})
+        Tuple of three tensors (H_pre, H_post, H_res):
+        - H_pre: (M, n) - manifold projection with sigmoid activation (H^{pre} ∈ ℝ^{M×n})
+        - H_post: (M, n) - post-processing with scaled sigmoid (H^{post} ∈ ℝ^{M×n})
+        - H_res: (M, n²) - residual connection, identity activation (H^{res} ∈ ℝ^{M×n²})
 
     Shape requirements:
         - x: (M, nC) where nC = n * C (flattened streams)
         - phi: (nC, n² + 2n)
         - bias: (n² + 2n,)
-        - output: (M, n² + 2n)
+        - outputs: H_pre (M, n), H_post (M, n), H_res (M, n²)
 
     Example:
         >>> M, n, C = 32, 4, 1024
@@ -78,9 +82,8 @@ def mhc(
         >>> phi = torch.randn(nC, N_total, dtype=torch.bfloat16, device='cuda')
         >>> bias = torch.randn(N_total, dtype=torch.float32, device='cuda')
         >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
-        >>> H = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-        >>> H.shape  # (32, 24)
-        >>> # H contains: [H^pre (4 elements), H^post (4 elements), H^res (16 elements)]
+        >>> H_pre, H_post, H_res = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+        >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
     """
     _LOGGER.info(
         f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
@@ -100,13 +103,27 @@ def mhc(
     assert x.device == phi.device == bias.device, "All tensors must be on the same device"
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
 
-    # Allocate output if not provided
-    if out is None:
-        out = torch.empty(M, N, dtype=x.dtype, device=x.device)
+    # Calculate individual stream dimensions
+    n_squared = n * n
+    
+    # Allocate outputs if not provided
+    if out_pre is None:
+        out_pre = torch.empty(M, n, dtype=x.dtype, device=x.device)
     else:
-        assert out.shape == (M, N), f"Output shape mismatch: expected ({M}, {N}), got {out.shape}"
-        assert out.dtype == x.dtype, f"Output dtype mismatch: expected {x.dtype}, got {out.dtype}"
-        assert out.device == x.device, f"Output device mismatch"
+        assert out_pre.shape == (M, n), f"out_pre shape mismatch: expected ({M}, {n}), got {out_pre.shape}"
+        assert out_pre.dtype == x.dtype and out_pre.device == x.device
+    
+    if out_post is None:
+        out_post = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    else:
+        assert out_post.shape == (M, n), f"out_post shape mismatch: expected ({M}, {n}), got {out_post.shape}"
+        assert out_post.dtype == x.dtype and out_post.device == x.device
+    
+    if out_res is None:
+        out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
+    else:
+        assert out_res.shape == (M, n_squared), f"out_res shape mismatch: expected ({M}, {n_squared}), got {out_res.shape}"
+        assert out_res.dtype == x.dtype and out_res.device == x.device
 
     # Determine block sizes for optimal performance
     # BLOCK_M: Row tile size - balance between occupancy and register pressure
@@ -127,7 +144,9 @@ def mhc(
         alpha_post,  # Scaling factor for post-stream
         alpha_res,   # Scaling factor for residual stream
         bias,        # Bias vector (n²+2n,)
-        out,         # Output tensor (M, n²+2n)
+        out_pre,     # Output tensor for pre-stream (M, n)
+        out_post,    # Output tensor for post-stream (M, n)
+        out_res,     # Output tensor for res-stream (M, n²)
         # Shape parameters
         M=M,         # Number of rows (batch/sequence dimension)
         K=K,         # Input features (nC)
@@ -139,15 +158,19 @@ def mhc(
         stride_xk=x.stride(1),
         stride_phik=phi.stride(0),
         stride_phin=phi.stride(1),
-        stride_om=out.stride(0),
-        stride_on=out.stride(1),
+        stride_pre_m=out_pre.stride(0),
+        stride_pre_n=out_pre.stride(1),
+        stride_post_m=out_post.stride(0),
+        stride_post_n=out_post.stride(1),
+        stride_res_m=out_res.stride(0),
+        stride_res_n=out_res.stride(1),
         # Block sizes for tiling
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
     )
 
-    return out
+    return out_pre, out_post, out_res
 
 
 def sinkhorn_knopp(
