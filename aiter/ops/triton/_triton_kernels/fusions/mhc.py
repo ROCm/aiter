@@ -66,8 +66,9 @@ def _mhc_fused_kernel(
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    # Eq 14: Compute matrix multiplication H̃ = x̃φ with deferred normalization
+    # Eq 14 & 15: Compute matrix multiplication and RMS norm in single pass
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
 
@@ -83,19 +84,10 @@ def _mhc_fused_kernel(
             other=0.0,
         )
 
+        # Eq 14: Accumulate matrix multiplication H̃ = x̃φ
         acc += tl.dot(x_tile, phi_tile)
-    
-    # Eq 15: Compute RMS norm r = ||x̃||₂ / √(nC)
-    # This computes r = sqrt(sum(x²) / K) where K = nC
-    # The .to(tl.float32) is critical for numerical stability in accumulation
-    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        rk = k + tl.arange(0, BLOCK_K)
-        x_tile = tl.load(
-            x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
-            mask=(rm[:, None] < M) & (rk[None, :] < K),
-            other=0.0,
-        )
+        
+        # Eq 15: Accumulate squared sum for RMS norm r = ||x̃||₂ / √(nC)
         x_tile_f32 = x_tile.to(tl.float32)
         acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
 
