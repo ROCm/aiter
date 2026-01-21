@@ -42,7 +42,7 @@ def mhc_torch(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
-    PyTorch reference implementation of mHC projection mapping (Eq 14-18).
+    PyTorch reference implementation of mHC projection mapping (Eq 14-19).
 
     This serves as ground truth for validating the Triton kernel implementation.
 
@@ -52,7 +52,7 @@ def mhc_torch(
     - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b (scaling)
     - Eq 17: H^pre = σ(H^pre) (sigmoid activation for pre-stream)
     - Eq 18: H^post = 2σ(H^post) (scaled sigmoid activation for post-stream)
-    - H^res: identity (no activation, ready for Eq 19: Sinkhorn-Knopp)
+    - Eq 19: H^res = Sinkhorn(H^res) (project residual stream onto doubly stochastic manifold)
 
     Args:
         x: Input x_l with shape (M, nC) - flattened n-stream residual
@@ -68,10 +68,9 @@ def mhc_torch(
         Tuple of three tensors (H_pre, H_post, H_res):
         - H_pre: (M, n) manifold projection with sigmoid
         - H_post: (M, n) post-processing with 2*sigmoid
-        - H_res: (M, n²) residual connection (identity)
+        - H_res: (M, n²) doubly stochastic residual connection
     """
     x_f32 = x.to(torch.float32)
-    nC = x.shape[1]
     
     # Eq 15: r = ||x̃||₂ / √(nC)
     mean_sq = torch.mean(x_f32 ** 2, dim=-1, keepdim=True)
@@ -83,7 +82,6 @@ def mhc_torch(
     H_tilde = x_norm @ phi_f32
 
     # Split into three streams
-    n_squared = n * n
     H_tilde_pre = H_tilde[:, :n]  # n coefficients (H^{pre} ∈ ℝ^{1×n})
     H_tilde_post = H_tilde[:, n:2*n]  # n coefficients (H^{post} ∈ ℝ^{1×n})
     H_tilde_res = H_tilde[:, 2*n:]  # n² coefficients (H^{res} ∈ ℝ^{n×n})
@@ -108,9 +106,12 @@ def mhc_torch(
     # H^post = 2σ(H^post)
     H_post = 2.0 * torch.sigmoid(H_post)
     
-    # H^res: identity activation (no change)
-    # Preserves values for subsequent Sinkhorn-Knopp normalization (Eq 19)
-    # H_res stays as is
+    # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint
+    # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn algorithm
+    M = H_res.shape[0]
+    H_res_3d = H_res.view(M, n, n)
+    H_res_ds = sinkhorn_knopp_log_domain_torch(H_res_3d)
+    H_res = H_res_ds.view(M, -1)  # Reshape back to (M, n²)
     
     # Return three separate streams
     return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)

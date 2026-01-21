@@ -34,7 +34,7 @@ def mhc(
     out_res: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute mHC projection mapping with all three streams (equations 14-18).
+    Compute mHC projection mapping with all three streams (equations 14-19).
 
     This function implements:
     - Eq 14: H̃ = x̃φ (matrix multiplication)
@@ -42,9 +42,10 @@ def mhc(
     - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
     - Eq 17: H^pre = σ(H^pre) - sigmoid activation for pre-stream
     - Eq 18: H^post = 2σ(H^post) - scaled sigmoid activation for post-stream
-    - H^res: identity (no activation, ready for Eq 19: Sinkhorn-Knopp)
+    - Eq 19: H^res = Sinkhorn(H^res) - project residual stream onto doubly stochastic
+             manifold (identity activation followed by iterative row/column normalization)
 
-    All operations are fused in a single Triton kernel for optimal performance.
+    All operations are fused in optimized Triton kernels for maximum performance.
 
     Args:
         x: Input tensor with shape (M, nC) where M is batch/sequence length and
@@ -66,7 +67,7 @@ def mhc(
         Tuple of three tensors (H_pre, H_post, H_res):
         - H_pre: (M, n) - manifold projection with sigmoid activation (H^{pre} ∈ ℝ^{M×n})
         - H_post: (M, n) - post-processing with scaled sigmoid (H^{post} ∈ ℝ^{M×n})
-        - H_res: (M, n²) - residual connection, identity activation (H^{res} ∈ ℝ^{M×n²})
+        - H_res: (M, n²) - doubly stochastic residual connection (H^{res} ∈ ℝ^{M×n²})
 
     Shape requirements:
         - x: (M, nC) where nC = n * C (flattened streams)
@@ -82,8 +83,11 @@ def mhc(
         >>> phi = torch.randn(nC, N_total, dtype=torch.bfloat16, device='cuda')
         >>> bias = torch.randn(N_total, dtype=torch.float32, device='cuda')
         >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
+        >>> 
+        >>> # Full mHC with Sinkhorn-Knopp (Eq 14-19)
         >>> H_pre, H_post, H_res = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
         >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
+        >>> # H_res is doubly stochastic: rows and columns sum to 1
     """
     _LOGGER.info(
         f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
@@ -169,6 +173,11 @@ def mhc(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
     )
+
+    # Apply Sinkhorn-Knopp (Equation 19) to make H_res doubly stochastic
+    # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn kernel
+    H_res_3d = out_res.view(M, n, n)
+    sinkhorn_knopp(H_res_3d, out=H_res_3d)
 
     return out_pre, out_post, out_res
 
