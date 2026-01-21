@@ -49,14 +49,14 @@ def cmdGenFunc_mha_fwd(
     filter = "*"
     if q.dtype == dtypes.fp16:
         md_name += "_fp16"
-        filter += "fp16*"
+        filter += "_fp16*"
     elif q.dtype == dtypes.bf16:
         md_name += "_bf16"
-        filter += "bf16*"
+        filter += "_bf16*"
     elif q.dtype == dtypes.fp8:
         if out is None or out.dtype == dtypes.bf16:
             md_name += "_fp8bf16"
-            filter += "fp8bf16*"
+            filter += "_fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if bias is not None:
@@ -73,7 +73,7 @@ def cmdGenFunc_mha_fwd(
         filter += "_nmask*"
     else:
         md_name += "_mask"
-        filter += "_mask*"
+        filter += "_m*"
     if return_softmax_lse:
         md_name += "_lse"
         filter += "_lse*"
@@ -342,12 +342,12 @@ def cmdGenFunc_mha_varlen_fwd(
         filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
         if q.dtype == dtypes.fp16:
             md_name += "_fp16"
-            filter_fwd_splitkv1 += "fp16*"
-            filter_fwd_splitkv2 += "fp16*"
+            filter_fwd_splitkv1 += "_fp16*"
+            filter_fwd_splitkv2 += "_fp16*"
         elif q.dtype == dtypes.bf16:
             md_name += "_bf16"
-            filter_fwd_splitkv1 += "bf16*"
-            filter_fwd_splitkv2 += "bf16*"
+            filter_fwd_splitkv1 += "_bf16*"
+            filter_fwd_splitkv2 += "_bf16*"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
             filter_fwd += "_logits*"
@@ -368,7 +368,7 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_nmask*"
         else:
             md_name += "_mask"
-            filter_fwd_splitkv2 += "_mask*"
+            filter_fwd_splitkv2 += "_m*"
         if return_softmax_lse:
             md_name += "_lse"
             filter_fwd_splitkv1 += "_lse*"
