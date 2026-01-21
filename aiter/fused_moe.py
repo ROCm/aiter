@@ -1712,8 +1712,7 @@ def flydsl_moe_stage2(
     w2_flat = w2.contiguous().view(E * model_dim, inter_dim)
     w2_scale_1d = w2_scale.view(-1).contiguous()
 
-    # NOTE: FlyDSL stage2 uses global atomics; bf16 atomics are not always supported/stable.
-    # Use fp32 atomics for bf16 outputs, then cast back to bf16.
+    # NOTE: FlyDSL stage2 uses global atomics; keep output dtype consistent with `out`.
     import sys
 
     DSL2_ROOT = os.environ.get("DSL2_ROOT", "/data/felix/dsl2")
@@ -1721,8 +1720,16 @@ def flydsl_moe_stage2(
         sys.path.insert(0, DSL2_ROOT)
     from kernels.moe_gemm_2stage import compile_moe_gemm2  # type: ignore
 
-    out_is_bf16 = out.dtype == dtypes.bf16
-    out_dtype = "f32" if out_is_bf16 else "f16"
+    if out.dtype == dtypes.bf16:
+        out_dtype = "bf16"
+    elif out.dtype == dtypes.fp16:
+        out_dtype = "f16"
+    elif out.dtype == dtypes.fp32:
+        out_dtype = "f32"
+    else:
+        raise ValueError(
+            f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
+        )
     exe2 = compile_moe_gemm2(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1735,12 +1742,8 @@ def flydsl_moe_stage2(
         in_dtype="fp8",
         out_dtype=out_dtype,
     )
-    out_tmp = (
-        torch.empty_like(out, dtype=dtypes.fp32) if out_is_bf16 else out
-    )
-    out_tmp.zero_()
     exe2(
-        out_tmp,
+        out,
         a2_qt_flat,
         w2_flat.view(-1),
         a2_scale_1d,
@@ -1754,8 +1757,6 @@ def flydsl_moe_stage2(
         inter_dim,
         int(blocks),
     )
-    if out_tmp is not out:
-        out.copy_(out_tmp.to(dtypes.bf16))
     return out
 
 
