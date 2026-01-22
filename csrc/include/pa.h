@@ -11,13 +11,12 @@ union PaWorkInfo
     {
         int32_t batch_idx;
         int32_t partial_qo_loc;
-        int32_t qo_start;      // global qo len idx
-        int32_t qo_end;        // global qo len idx
-        int32_t kv_start;      // global kv block idx
-        int32_t kv_end;        // global kv block idx
-        int32_t kv_offset;     // not used
-        int32_t q_head_range;  // q_head_start(low 16bits) | q_head_end(high 16bits)
-                               // for asm kernel & future divide qheads
+        int32_t qo_start;
+        int32_t qo_end;
+        int32_t kv_start;
+        int32_t kv_end;
+        int32_t kv_offset;
+        int32_t q_head_range;
     };
     uint32_t u32All[8];
 };

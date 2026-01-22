@@ -39,7 +39,7 @@ def cmdGenFunc_mha_fwd(
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
-    (_, seqlen_q, _, _) = q.shape
+    _, seqlen_q, _, _ = q.shape
     # causal=true is the same as causal=false in this case
     causal = is_causal
     if seqlen_q == 1 and alibi_slopes is None:
@@ -49,14 +49,14 @@ def cmdGenFunc_mha_fwd(
     filter = "*"
     if q.dtype == dtypes.fp16:
         md_name += "_fp16"
-        filter += "fp16*"
+        filter += "_fp16*"
     elif q.dtype == dtypes.bf16:
         md_name += "_bf16"
-        filter += "bf16*"
+        filter += "_bf16*"
     elif q.dtype == dtypes.fp8:
         if out is None or out.dtype == dtypes.bf16:
             md_name += "_fp8bf16"
-            filter += "fp8bf16*"
+            filter += "_fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     if bias is not None:
@@ -73,7 +73,7 @@ def cmdGenFunc_mha_fwd(
         filter += "_nmask*"
     else:
         md_name += "_mask"
-        filter += "_mask*"
+        filter += "_m*"
     if return_softmax_lse:
         md_name += "_lse"
         filter += "_lse*"
@@ -342,12 +342,12 @@ def cmdGenFunc_mha_varlen_fwd(
         filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
         if q.dtype == dtypes.fp16:
             md_name += "_fp16"
-            filter_fwd_splitkv1 += "fp16*"
-            filter_fwd_splitkv2 += "fp16*"
+            filter_fwd_splitkv1 += "_fp16*"
+            filter_fwd_splitkv2 += "_fp16*"
         elif q.dtype == dtypes.bf16:
             md_name += "_bf16"
-            filter_fwd_splitkv1 += "bf16*"
-            filter_fwd_splitkv2 += "bf16*"
+            filter_fwd_splitkv1 += "_bf16*"
+            filter_fwd_splitkv2 += "_bf16*"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
             filter_fwd += "_logits*"
@@ -368,7 +368,7 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_nmask*"
         else:
             md_name += "_mask"
-            filter_fwd_splitkv2 += "_mask*"
+            filter_fwd_splitkv2 += "_m*"
         if return_softmax_lse:
             md_name += "_lse"
             filter_fwd_splitkv1 += "_lse*"
@@ -1235,8 +1235,8 @@ def _flash_attn_forward(
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
-    (_, seqlen_q, nhead_q, hdim_q) = q.shape
-    (_, seqlen_k, nhead_k, hdim_v) = v.shape
+    _, seqlen_q, nhead_q, hdim_q = q.shape
+    _, seqlen_k, nhead_k, hdim_v = v.shape
     if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
         assert sink_ptr.shape[0] == nhead_q, "sink_ptr has incorrect shape"
@@ -1341,8 +1341,8 @@ def can_impl_fmha_v3_bwd(
     is_v3_atomic_fp32: Optional[bool] = True,
 ) -> bool:
 
-    (_, seqlen_q, nhead_q, hdim_q) = q.shape
-    (_, seqlen_k, nhead_k, hdim_v) = v.shape
+    _, seqlen_q, nhead_q, hdim_q = q.shape
+    _, seqlen_k, nhead_k, hdim_v = v.shape
     batch_stride_q = q.stride(0)
     stride_q = q.stride(1)
     nhead_stride_q = q.stride(2)
@@ -1591,9 +1591,8 @@ def _flash_attn_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
 
-    (_, seqlen_q, nhead_q, hdim_q) = q.shape
-    (_, seqlen_k, nhead_k, hdim_v) = v.shape
-    mask = causal and window_size_left == -1  # causal mask
+    _, seqlen_q, nhead_q, hdim_q = q.shape
+    _, seqlen_k, nhead_k, hdim_v = v.shape
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
@@ -1968,7 +1967,7 @@ def _flash_attn_varlen_forward(
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
-    (_, nhead_q, hdim_q) = q.shape
+    _, nhead_q, hdim_q = q.shape
 
     nhead_k = v.shape[-2]
     hdim_v = v.shape[-1]
@@ -2112,7 +2111,7 @@ def _flash_attn_varlen_backward(
     sink_ptr: Optional[Tensor] = None,
 ) -> torch.Tensor:
 
-    (_, nhead_q, hdim_q) = q.shape
+    _, nhead_q, hdim_q = q.shape
 
     nhead_k = v.shape[-2]
     hdim_v = v.shape[-1]

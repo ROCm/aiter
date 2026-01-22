@@ -153,7 +153,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        (cu_num, M, N, K) = info_keys
+        cu_num, M, N, K = info_keys
         kernels_num = len(candidate_kernels_cktile_dict)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 1, 2, 3]
@@ -206,7 +206,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        (cu_num, M, N, K) = info_keys
+        cu_num, M, N, K = info_keys
         kernels_num = len(candidate_kernels_dict)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 1, 2, 3]
