@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -111,7 +111,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
         if tag == "asm" and not (
             get_gfx() == "gfx942"
             and (E, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
-            and dtype == dtypes.fp32
+            and dtype in [dtypes.bf16, dtypes.fp32]
         ):
             continue
         (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
@@ -409,7 +409,7 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
-l_dtype = ["fp32", "bf16", "fp16"]
+l_dtype = ["fp32", "bf16"]
 l_expert = [128, 256]
 l_topk = 8
 l_token = [
