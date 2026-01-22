@@ -1548,7 +1548,6 @@ def flydsl_moe_stage1(
     token_num = hidden_states.shape[0]
     E, _, model_dim = w1.shape
     inter_dim = w2.shape[2]
-
     tile_m = block_m if block_m is not None else 64
     tile_n = 128
     tile_k = 128
@@ -1584,7 +1583,12 @@ def flydsl_moe_stage1(
 
     import sys
 
-    DSL2_ROOT = os.environ.get("DSL2_ROOT", "/data/felix/dsl2")
+    DSL2_ROOT = os.environ.get("DSL2_ROOT", None)
+    if not DSL2_ROOT:
+        raise RuntimeError(
+            "FlyDSL path not found. Please set environment variable, e.g. "
+            "`export DSL2_ROOT=/path/to/FlyDSL`"
+        )
     if DSL2_ROOT not in sys.path:
         sys.path.insert(0, DSL2_ROOT)
     from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
@@ -1715,7 +1719,12 @@ def flydsl_moe_stage2(
     # NOTE: FlyDSL stage2 uses global atomics; keep output dtype consistent with `out`.
     import sys
 
-    DSL2_ROOT = os.environ.get("DSL2_ROOT", "/data/felix/dsl2")
+    DSL2_ROOT = os.environ.get("DSL2_ROOT", None)
+    if not DSL2_ROOT:
+        raise RuntimeError(
+            "FlyDSL path not found. Please set environment variable, e.g. "
+            "`export DSL2_ROOT=/path/to/FlyDSL`"
+        )
     if DSL2_ROOT not in sys.path:
         sys.path.insert(0, DSL2_ROOT)
     from kernels.moe_gemm_2stage import compile_moe_gemm2  # type: ignore

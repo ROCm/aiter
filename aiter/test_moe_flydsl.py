@@ -261,7 +261,12 @@ def test_fmoe(
     if use_flir:
         import sys
 
-        DSL2_ROOT = os.environ.get("DSL2_ROOT", "/data/felix/dsl2")
+        DSL2_ROOT = os.environ.get("DSL2_ROOT", None)
+        if not DSL2_ROOT:
+            raise RuntimeError(
+                "FlyDSL path not found. Please set environment variable, e.g. "
+                "`export DSL2_ROOT=/path/to/FlyDSL`"
+            )
         if DSL2_ROOT not in sys.path:
             sys.path.insert(0, DSL2_ROOT)
 
