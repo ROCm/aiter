@@ -20,7 +20,8 @@ def input_helper(
     equal_seqlens=False,
     requires_grad=False,
 ):
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     if not equal_seqlens:
         max_extend_length = extend_length
@@ -164,7 +165,8 @@ def test_op_fwd(
     logit_cap=0.0,
     device="cuda",
 ):
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     torch.set_default_device(device)
     torch.set_default_dtype(dtype)
 

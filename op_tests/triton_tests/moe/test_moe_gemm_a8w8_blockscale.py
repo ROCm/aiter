@@ -58,7 +58,8 @@ def init_compute_data(
     is_x_blockscale=False,
     is_w_blockscale=False,
 ):
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
     x = (torch.randn(shape_x, dtype=torch.bfloat16, device=device) / 10).to(act_dtype)
@@ -256,7 +257,8 @@ def test_op(
     per_row_x_scale,
     device="cuda",
 ):
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     m, rdata, gindx, sindx = init_routing_data(
         m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device

@@ -17,7 +17,8 @@ def generate_batched_gemm_a16wfp4_inputs(B, M, N, K, dtype, layout="TN", output=
         - x_scales: (B, M, K // SCALE_GROUP_SIZE)
         - w_scales: (B, N, K // SCALE_GROUP_SIZE)
     """
-    torch.manual_seed(5)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(5)
     if layout[0] == "T":
         # 34 is two packed e2m1 values 0010 which is 1.0.
         x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")

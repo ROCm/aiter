@@ -284,7 +284,8 @@ def test_op_fwd_rope(
     device="cuda",
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
         input_helper(
@@ -386,7 +387,8 @@ def test_op_fwd_rope_neox(
     device="cuda",
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
         input_helper(
@@ -498,7 +500,8 @@ def test_op_fwd_rope_integration(
     device="cuda",
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
         input_helper(

@@ -83,7 +83,8 @@ def varlen_input_helper(
 @pytest.mark.parametrize("varlen", [True, False])
 def test_op_fwd(Z, H, SEQLEN, HEAD_DIM, causal, absorb, varlen, dtype=torch.float16):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     if varlen:
         q, k, v, b_seq_len, b_start_loc = varlen_input_helper(
             Z, SEQLEN, H, HEAD_DIM, dtype, absorb

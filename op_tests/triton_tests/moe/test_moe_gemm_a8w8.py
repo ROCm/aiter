@@ -69,7 +69,8 @@ def init_compute_data(
     has_y_gammas,
     device="cuda",
 ):
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
     x = alloc_rand(shape_x, device=device, dtype=act_dtype)
@@ -326,7 +327,8 @@ def test_op(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
             )
 
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     weight_mxfp8 = weight_dtype_str.startswith("mx")
     if weight_mxfp8:
