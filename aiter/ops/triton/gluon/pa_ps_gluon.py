@@ -414,9 +414,6 @@ def pa_ps_kernel(
     logits_head_size_offsets = gl.arange(
         0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
-    lse_query_group_size_offsets = gl.arange(
-        0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
-    )
 
     # ==================== PROGRAM ID AND INITIALIZATION ====================
     wg_idx = gl.program_id(0)
@@ -531,9 +528,7 @@ def pa_ps_kernel(
                 query_scale_value, layout=qk_linear_layout
             )
         for kv_block_idx in range(kv_block_start_idx, kv_block_end_idx):
-            qk_column_offsets = kv_block_idx * KV_BLOCK_SIZE + gl.arange(
-                0, KV_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
-            )
+            qk_column_offsets = kv_block_idx * KV_BLOCK_SIZE + kv_scale_offsets
 
             # Create mask for valid blocks
             kv_block_numbers = gl.load(
@@ -804,9 +799,9 @@ def pa_ps_kernel(
                 q_head_start + logits_query_group_size_offsets[:, None] < q_head_end
             ) & (logits_head_size_offsets[None, :] < head_size)
             split_lse_offsets = logits_idx * stride_lse_0 + (
-                q_head_start + lse_query_group_size_offsets
+                q_head_start + qk_row_offsets
             )
-            split_lse_mask = q_head_start + lse_query_group_size_offsets < q_head_end
+            split_lse_mask = q_head_start + qk_row_offsets < q_head_end
 
             lse = tl.math.log2(exp_sums) / LOG2_E + max_logits
             gl.amd.cdna3.buffer_store(
