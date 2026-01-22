@@ -1349,6 +1349,11 @@ def paged_attention_decode_sliding_window(
         query_converted = query_f32.to(COMPUTE_TYPE)
     else:
         query_converted = query_converted.to(COMPUTE_TYPE)
+    
+    if KV_QUANT_MODE == 0:
+        # Per-tensor quantization
+        key_scale_value = tl.load(key_scale)
+        value_scale_value = tl.load(value_scale)
 
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
@@ -1369,7 +1374,7 @@ def paged_attention_decode_sliding_window(
         )
 
         # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
-        key_tensor = gl.load(key_cache_ptr + key_block_offsets)
+        key_tensor = gl.load(key_cache_ptr + key_block_offsets, cache_modifier=".cg")
         # Prepare QK MFMA while key loads (these don't depend on key data)
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE),
@@ -1377,37 +1382,32 @@ def paged_attention_decode_sliding_window(
             layout=qk_mfma_layout,
         )
         # Load key quantization scales if needed (overlaps with key tensor load)
-        if KV_QUANT_MODE >= 0:
-            if KV_QUANT_MODE == 0:
-                # Per-tensor quantization
-                key_scale_value = tl.load(key_scale)
-                value_scale_value = tl.load(value_scale)
-            elif KV_QUANT_MODE == 1:
-                # Per-token quantization - prepare offsets while key loads
-                key_scale_offsets = (
-                    kv_block_numbers[:, None, None, None] * kv_scale_stride_0
-                    + kv_head_idx * kv_scale_stride_1
-                    + block_element_offsets[None, None, :, None]
-                )
-                # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
-                key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
-                value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
+        if KV_QUANT_MODE == 1:
+            # Per-token quantization - prepare offsets while key loads
+            key_scale_offsets = (
+                kv_block_numbers[:, None, None, None] * kv_scale_stride_0
+                + kv_head_idx * kv_scale_stride_1
+                + block_element_offsets[None, None, :, None]
+            )
+            # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
+            key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
+            value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
 
-                # Convert to required distributed layout for computation
-                key_scale_value_blocked = gl.reshape(
-                    key_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
-                )
-                key_scale_value = gl.convert_layout(
-                    key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
-                )
-                key_scale_value = key_scale_value[None, :]
-                value_scale_value_blocked = gl.reshape(
-                    value_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
-                )
-                value_scale_value = gl.convert_layout(
-                    value_scale_value_blocked,
-                    layout=gl.SliceLayout(0, qk_linear_layout),
-                )
+            # Convert to required distributed layout for computation
+            key_scale_value_blocked = gl.reshape(
+                key_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
+            )
+            key_scale_value = gl.convert_layout(
+                key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
+            )
+            key_scale_value = key_scale_value[None, :]
+            value_scale_value_blocked = gl.reshape(
+                value_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
+            )
+            value_scale_value = gl.convert_layout(
+                value_scale_value_blocked,
+                layout=gl.SliceLayout(0, qk_linear_layout),
+            )
 
         # Reshape key tensor for matrix multiplication
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
@@ -1460,7 +1460,7 @@ def paged_attention_decode_sliding_window(
             )
 
             # Schedule: Start value VMEM load, then QK MFMA
-            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+            value_tensor = gl.load(value_cache_ptr + value_block_offsets, cache_modifier=".cg")
             # Compute QK attention scores using MFMA (overlaps with value load)
             attention_scores = gl.amd.cdna3.mfma(
                 query_converted, key_converted, qk_accumulator
@@ -1609,6 +1609,7 @@ def paged_attention_decode_sliding_window(
             sinks_ptr + kv_head_idx * query_group_size + max_logits_group_idx_in_len,
             mask=qk_row_mask,
             other=float("-inf"),
+            cache_modifier=".cg",
         ).to(gl.float32)
         exp_sums += tl.math.exp2((sinks_values - max_logits) * LOG2_E)
 
@@ -1629,18 +1630,21 @@ def paged_attention_decode_sliding_window(
             ptr=max_logits_ptr,
             offsets=max_logits_offsets,
             mask=max_logits_group_mask,
+            cache=".cg"
         )
         gl.amd.cdna3.buffer_store(
             stored_value=exp_sums,
             ptr=exp_sums_ptr,
             offsets=max_logits_offsets,
             mask=max_logits_group_mask,
+            cache=".cg"
         )
         gl.amd.cdna3.buffer_store(
             stored_value=attention_accumulator,
             ptr=output_ptr,
             offsets=output_offsets,
             mask=output_mask,
+            cache=".cg"
         )
     else:
         # Reshape to 3D and store
@@ -1660,6 +1664,7 @@ def paged_attention_decode_sliding_window(
             ptr=output_ptr,
             offsets=output_offsets,
             mask=output_mask,
+            cache=".cg"
         )
 
 
@@ -3073,7 +3078,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 CDNA_VERSION=CDNA_VERSION,
                 ONE_SHOT=num_splits <= 1,
                 waves_per_eu=waves_per_eu,
-                num_stages=1,
+                num_stages=0,
             )
 
             return
