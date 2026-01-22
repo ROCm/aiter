@@ -89,7 +89,6 @@ def pa_ps_kernel(
     stride_value_2: int,
     stride_query_scale_0: int,
     stride_query_scale_1: int,
-    stride_query_scale_2: int,
     stride_kv_scale_0: int,
     stride_kv_scale_1: int,
     max_qlen: int,
@@ -438,9 +437,6 @@ def pa_ps_kernel(
         q_head_start = q_head_range & 0xFFFF
         q_head_end = (q_head_range >> 16) & 0xFFFF
 
-        query_seq_len = qo_end - qo_start
-        # kv_head_start_idx = q_head_start // query_group_size
-        # kv_head_end_idx = gl.cdiv(q_head_end, query_group_size)
         context_length = gl.load(context_lengths_ptr + sequence_idx)
         kv_start_idx = gl.load(kv_indptr + sequence_idx)
         max_logits = gl.full(
@@ -515,19 +511,14 @@ def pa_ps_kernel(
         if QUERY_QUANT_MODE == 1:
             # Per-token quantization
             query_scale_offsets = (
-                sequence_idx * stride_query_scale_0
-                + (qo_start + mtp_query_len_offsets[:, None, None])
-                * stride_query_scale_1
-                + kv_head_idx * stride_query_scale_2
+                (qo_start + mtp_query_len_offsets[:, None, None]) * stride_query_scale_0
+                + kv_head_idx * stride_query_scale_1
                 + mtp_query_group_size_offsets[None, :, None]
             )
-            query_scale_mask = (
-                qo_start + mtp_query_len_offsets[:, None, None] < qo_end
-            ) & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
             query_scale_value = gl.amd.cdna3.buffer_load(
                 ptr=query_scale,
                 offsets=query_scale_offsets,
-                mask=query_scale_mask,
+                mask=query_row_mask_3d,
             )
             query_scale_value = gl.reshape(
                 query_scale_value, [QUERY_GROUP_SIZE_POW2, 1]
@@ -722,27 +713,23 @@ def pa_ps_kernel(
 
             attention_scores = qk_scale_value * attention_scores
             # ==================== ATTENTION MASKING ====================
-            # Compute query token index (0 to query_seq_len-1)
             query_token_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
 
             # Apply causal masking if required
             if IS_CAUSAL:
                 # Compute causal mask based on sequence positions
-                sequence_position_extension = query_seq_len - 1 - query_token_idx
                 causal_mask = (
-                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
+                    causal_offset[:, None] + qk_column_offsets[None, :]
                     < sequence_end_idx
                 )
                 if SLIDING_WINDOW > 0:
                     causal_mask = causal_mask & (
-                        sequence_position_extension[:, None]
-                        + qk_column_offsets[None, :]
+                        causal_offset[:, None] + qk_column_offsets[None, :]
                         >= sequence_start_idx + query_token_idx[:, None] + 1
                     )
                 else:
                     causal_mask = causal_mask & (
-                        sequence_position_extension[:, None]
-                        + qk_column_offsets[None, :]
+                        causal_offset[:, None] + qk_column_offsets[None, :]
                         >= sequence_start_idx
                     )
             else:
@@ -1005,7 +992,6 @@ def pa_ps_gluon(
 
     stride_query_scale_0 = 0
     stride_query_scale_1 = 0
-    stride_query_scale_2 = 0
     key_scale_stride_0 = 0
     key_scale_stride_1 = 0
     query_quant_mode = -1
@@ -1026,7 +1012,6 @@ def pa_ps_gluon(
             query_quant_mode = 1
             stride_query_scale_0 = query_scale.stride(0)
             stride_query_scale_1 = query_scale.stride(1)
-            stride_query_scale_2 = query_scale.stride(2)
 
     if key_scale is not None and value_scale is not None:
         if key_scale.numel() == 1:
@@ -1079,7 +1064,6 @@ def pa_ps_gluon(
         value_cache.stride(2),
         stride_query_scale_0,
         stride_query_scale_1,
-        stride_query_scale_2,
         key_scale_stride_0,
         key_scale_stride_1,
         max_qlen=max_qlen,
