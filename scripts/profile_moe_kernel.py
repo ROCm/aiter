@@ -80,7 +80,7 @@ COUNTER_GROUPS = {
 
 def generate_asm_1stage_script(config_idx, kernel_name, token, model_dim, inter_dim,
                                 expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
-                                q_type_str, act_type_str, use_g1u1):
+                                q_type_str, act_type_str, use_g1u1, doweight_stage1):
     """Generate script for ASM 1-stage kernel using tuner.generate_data()."""
     return f'''#!/usr/bin/env python3
 """
@@ -127,6 +127,7 @@ q_dtype_w = {q_dtype_w_str}
 q_type = {q_type_str}
 act_type = {act_type_str}
 use_g1u1 = {use_g1u1}
+doweight_stage1 = {doweight_stage1}
 block_m = {block_m}
 
 print("\\nInitializing tuner...")
@@ -173,6 +174,9 @@ result = fused_moe_1stage(
     q_dtype_w=q_dtype_w,
     w1_scale=w1_scale,
     w2_scale=w2_scale,
+    doweight_stage1=doweight_stage1,
+    M=token,
+    device=input.device,
 )
 
 torch.cuda.synchronize()
@@ -561,7 +565,7 @@ def create_kernel_execution_script(row, script_path):
     if stage == "asm_1stage":
         code = generate_asm_1stage_script(config_idx, kernel_name, token, model_dim, inter_dim,
                                          expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
-                                         q_type_str, act_type_str, use_g1u1)
+                                         q_type_str, act_type_str, use_g1u1, doweight_stage1)
     elif kernel_type == "ck" and stage == "stage2":
         code = generate_ck_stage2_script(config_idx, kernel_name, token, model_dim, inter_dim,
                                          expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
