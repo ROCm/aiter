@@ -133,24 +133,24 @@ void mla_decode_stage1_asm_fwd(
     args.ptr_RP = output.data_ptr(); //final output
     
 
-    std::cout << "mla args" << std::endl;
-    std::cout << "ptr_R: " << args.ptr_R << std::endl;
-    std::cout << "ptr_LSE: " << args.ptr_LSE << std::endl;
-    std::cout << "ptr_Q: " << args.ptr_Q << std::endl;
-    std::cout << "ptr_KV: " << args.ptr_KV << std::endl;
-    std::cout << "ptr_LTP: " << args.ptr_LTP << std::endl;
-    std::cout << "ptr_LTD: " << args.ptr_LTD << std::endl;
-    std::cout << "ptr_LTL: " << args.ptr_LTL << std::endl;
-    std::cout << "scalar: " << args.scalar << std::endl;
-    std::cout << "s_MQA: " << args.s_MQA << std::endl;
-    std::cout << "s_kv_split: " << args.s_kv_split << std::endl;
-    std::cout << "s_Q_Bs: " << args.s_Q_Bs << std::endl;
-    std::cout << "s_Bs: " << args.s_Bs << std::endl;
-    std::cout << "s_log2_plen: " << args.s_log2_plen << std::endl;
-    std::cout << "ptr_RP: " << args.ptr_RP << std::endl;
-    std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
-    std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
-    std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
+    // std::cout << "mla args" << std::endl;
+    // std::cout << "ptr_R: " << args.ptr_R << std::endl;
+    // std::cout << "ptr_LSE: " << args.ptr_LSE << std::endl;
+    // std::cout << "ptr_Q: " << args.ptr_Q << std::endl;
+    // std::cout << "ptr_KV: " << args.ptr_KV << std::endl;
+    // std::cout << "ptr_LTP: " << args.ptr_LTP << std::endl;
+    // std::cout << "ptr_LTD: " << args.ptr_LTD << std::endl;
+    // std::cout << "ptr_LTL: " << args.ptr_LTL << std::endl;
+    // std::cout << "scalar: " << args.scalar << std::endl;
+    // std::cout << "s_MQA: " << args.s_MQA << std::endl;
+    // std::cout << "s_kv_split: " << args.s_kv_split << std::endl;
+    // std::cout << "s_Q_Bs: " << args.s_Q_Bs << std::endl;
+    // std::cout << "s_Bs: " << args.s_Bs << std::endl;
+    // std::cout << "s_log2_plen: " << args.s_log2_plen << std::endl;
+    // std::cout << "ptr_RP: " << args.ptr_RP << std::endl;
+    // std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
+    // std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
+    // std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -242,7 +242,15 @@ void mla_decode_stage1_asm_fwd(
             {
                 if(persistent)
                 {
-                    if(max_seqlen_q <= 4)
+                    if (page_size != 1) {
+                        std::cout << "page_size != 1" << std::endl;
+                        sub_Q = 128;
+                        args.ptr_KVSCALE = kv_scale.value().data_ptr();
+                        static AiterAsmKernel impl_a16w8_bf16_ps(
+                            "mla_kernel_func",
+                            "/mla/mla_page64.co");
+                        impl_ptr = &impl_a16w8_bf16_ps;
+                    } else if(max_seqlen_q <= 4)
                     {
                         sub_Q = 128;
                         assert(kv_scale.has_value());
@@ -260,6 +268,7 @@ void mla_decode_stage1_asm_fwd(
             if(persistent)
             {
                 // todo:add support condition
+                sub_Q = 128;
                 static AiterAsmKernel impl_a16w8_bf16_ps(
                     "mla_kernel_func",
                     "/mla/mla.co");

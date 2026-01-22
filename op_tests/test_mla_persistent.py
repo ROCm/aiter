@@ -311,7 +311,6 @@ def test_mla(
         else:
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
-    print(f"kv_last_page_lens: {kv_last_page_lens}")
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
     num_page = kv_indptr[-1].item()
     kv_indices = torch.randperm(num_page, dtype=torch.int)
@@ -450,13 +449,14 @@ def test_mla(
     )
 
     def test_absorb_decode_bf16():
-        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        # kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-
+        kv_buffer_fp8 = kv_buffer.to(kvtype)
+        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
-            kv_buffer,
+            kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
             qo_indptr,
             kv_indptr,
@@ -472,6 +472,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            kv_scale=kv_scale,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -562,6 +563,9 @@ def test_mla(
             print(
                 f"work_info_set[{i}, 0]: {work_info_set[i, 0]}, [{i}, 1]: {work_info_set[i, 1]}, [{i}, 2]: {work_info_set[i, 2]}, [{i}, 3]: {work_info_set[i, 3]}, [{i}, 4]: {work_info_set[i, 4]}, [{i}, 5]: {work_info_set[i, 5]}, [{i}, 6]: {work_info_set[i, 6]}"
             )
+            print(
+                f"work_info_set[{i}, 0]: {work_info_set[i, 0]}, [{i}, 1]: {work_info_set[i, 1]}, [{i}, 2]: {work_info_set[i, 2]}, [{i}, 3]: {work_info_set[i, 3]}, [{i}, 4]: {work_info_set[i, 4]}, [{i}, 5]: {work_info_set[i, 5]}, [{i}, 6]: {work_info_set[i, 6]}"
+            )
             # kv_last_page_lens[i] = page_size
             # bs_idx = work_info_set[i, 0]
             # bs_last_block = (bs_idx + 1) * num_page
@@ -597,7 +601,21 @@ def test_mla(
             out_ref_fp8,
             msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
         )
-
+        print(f"q.shape: {q.shape}, q.stride: {q.stride()}")
+        print(
+            f"kv_buffer_bytes.shape: {kv_buffer_bytes.shape}, kv_buffer_bytes.stride: {kv_buffer_bytes.stride()}"
+        )
+        print(f"out_asm.shape: {out_asm.shape}, out_asm.stride: {out_asm.stride()}")
+        print(
+            f"qo_indptr: {qo_indptr}, kv_indptr: {kv_indptr}, kv_indices: {kv_indices}"
+        )
+        print(
+            f"kv_last_page_lens: {kv_last_page_lens}, max_seqlen_qo: {max_seqlen_qo}, sm_scale: {sm_scale}, num_kv_splits: {max_split_per_batch}"
+        )
+        print(
+            f"work_meta_data: {work_meta_data}, work_indptr: {work_indptr}, work_info_set: {work_info_set}, reduce_indptr: {reduce_indptr}, reduce_final_map: {reduce_final_map}, reduce_partial_map: {reduce_partial_map}"
+        )
+        print(f"non_persistent_mode: {non_persistent_mode}")
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
@@ -634,12 +652,18 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
+    print(
+        f"kvtype: {kvtype}, dtype: {dtype}, paged_layout: {paged_layout}, non_persistent_mode: {non_persistent_mode}"
+    )
     if paged_layout == "3BUFFER" and not non_persistent_mode:
         err, us_asm_decode = test_absorb_decode_3buffer()
     else:
         if dtype == torch.bfloat16:
             err, us_asm_decode = test_absorb_decode_bf16()
         elif kvtype == dtypes.fp8:
+            import pdb
+
+            pdb.set_trace()
             err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
