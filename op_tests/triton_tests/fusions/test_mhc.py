@@ -71,8 +71,8 @@ def test_mhc_correctness(M, n, C, dtype):
     torch.testing.assert_close(
         H_res_triton.to(torch.float32),
         H_res_torch.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+        atol=1e-2 if C < 1024 else 5e-2,
+        rtol=1e-2 if C < 1024 else 5e-2,
     )
 
 
@@ -113,10 +113,10 @@ def test_mhc_preallocated_output(M, n, C):
     )
     # H_res uses relaxed tolerance because Sinkhorn-Knopp is an iterative algorithm
     torch.testing.assert_close(
-        out_res.to(torch.float32),
-        H_res_torch.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+        out_post.to(torch.float32),
+        H_post_torch.to(torch.float32),
+        atol=1e-2 if C < 1024 else 5e-2,
+        rtol=1e-2 if C < 1024 else 5e-2,
     )
 
 
@@ -145,8 +145,8 @@ def test_mhc_different_epsilon(eps, M, n, C):
     torch.testing.assert_close(
         H_res_triton.to(torch.float32),
         H_res_torch.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
@@ -217,8 +217,8 @@ def test_mhc_zero_input():
     torch.testing.assert_close(
         H_res_triton.to(torch.float32),
         H_res_torch.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
@@ -254,8 +254,8 @@ def test_mhc_large_values():
     torch.testing.assert_close(
         H_res_triton.to(torch.float32),
         H_res_torch.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
@@ -285,8 +285,8 @@ def test_mhc_small_shapes(M, n, C, dtype):
     torch.testing.assert_close(
         H_res_triton.to(torch.float32),
         H_res_torch.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
