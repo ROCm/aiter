@@ -1,5 +1,5 @@
 knl_name,co_name,subm,num_experts,topk,dtype
-_ZN5aiter19topksoftmax_4x128x6E,topksoftmax_4x128x6.co,4,128,4,fp32
+_ZN5aiter19topksoftmax_4x128x4E,topksoftmax_4x128x4.co,4,128,4,fp32
 _ZN5aiter19topksoftmax_4x128x6E,topksoftmax_4x128x6.co,4,128,6,fp32
 _ZN5aiter19topksoftmax_4x128x8E,topksoftmax_4x128x8.co,4,128,8,fp32
 _ZN5aiter19topksoftmax_4x256x6E,topksoftmax_4x256x6.co,4,256,6,fp32
