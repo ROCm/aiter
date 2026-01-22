@@ -760,12 +760,16 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
     
+    num_kernels = len(kernels)
+    num_counters = sum(len(c) for c in COUNTER_GROUPS.values())
+    original_col_count = len(kernels.columns)
+    
     print(f"\n{'='*80}")
     print("MULTI-ROUND PROFILING MODE")
     print(f"{'='*80}")
     print(f"Profiling rounds: {len(COUNTER_GROUPS)}")
-    print(f"Total counters: {sum(len(c) for c in COUNTER_GROUPS.values())}")
-    print(f"Kernels to profile: {len(kernels)}")
+    print(f"Total counters: {num_counters}")
+    print(f"Kernels to profile: {num_kernels}")
     print(f"Input: {args.input}")
     print(f"Output: {output_dir.absolute()}")
     print(f"Temp files: {'KEEP' if args.keep_temp_files else 'DELETE after use'}")
@@ -773,31 +777,28 @@ def main():
     
     output_file = output_dir / "kernels_with_counters.csv"
     
-    results = []
     skipped_count = 0
     profiled_count = 0
     
     for idx, (_, row) in enumerate(kernels.iterrows(), 1):
         error_value = str(row.get('error', '')).strip()
         if error_value == 'failed':
-            print(f"[{idx}/{len(kernels)}] Skipping failed kernel: {row['kernel_name'][:40]}")
+            print(f"[{idx}/{num_kernels}] Skipping failed kernel: {row['kernel_name'][:40]}")
             skipped_count += 1
             continue
         
         clear_gpu_memory()
         
-        print(f"[{idx}/{len(kernels)}]", end=" ")
+        print(f"[{idx}/{num_kernels}]", end=" ")
         counter_data = run_multi_round_profiling(row, output_dir, args.keep_temp_files)
         
-        clear_gpu_memory()
-        alloc_after, reserved_after = get_gpu_memory_info()
-        
         if idx % 10 == 0:
-            print(f"  GPU Memory: Allocated={alloc_after:.1f}MB, Reserved={reserved_after:.1f}MB")
+            clear_gpu_memory()
+            alloc, reserved = get_gpu_memory_info()
+            print(f"  GPU Memory: Allocated={alloc:.1f}MB, Reserved={reserved:.1f}MB")
         
         result_row = dict(row)
         result_row.update(counter_data)
-        results.append(result_row)
         profiled_count += 1
         
         pd.DataFrame([result_row]).to_csv(
@@ -807,20 +808,25 @@ def main():
             index=False
         )
     
-    results_df = pd.DataFrame(results)
+    # Read final results for summary
+    if profiled_count > 0:
+        results_df = pd.read_csv(output_file)
+        new_col_count = len(results_df.columns)
+    else:
+        new_col_count = original_col_count
     
     print(f"\n{'='*80}")
     print(f"RESULTS SUMMARY")
     print(f"{'='*80}")
     print(f"Output file: {output_file}")
-    print(f"Total kernels in input: {len(kernels)}")
+    print(f"Total kernels in input: {num_kernels}")
     print(f"Skipped (failed): {skipped_count}")
     print(f"Profiled: {profiled_count}")
-    print(f"Original columns: {len(kernels.columns)}")
-    print(f"Profiling columns added: {len(results_df.columns) - len(kernels.columns)}")
-    if len(results_df.columns) > len(kernels.columns):
+    print(f"Original columns: {original_col_count}")
+    print(f"Profiling columns added: {new_col_count - original_col_count}")
+    if profiled_count > 0 and new_col_count > original_col_count:
         print(f"New columns:")
-        for col in results_df.columns[len(kernels.columns):]:
+        for col in results_df.columns[original_col_count:]:
             print(f"  - {col}")
     print(f"{'='*80}\n")
 
