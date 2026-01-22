@@ -1644,6 +1644,7 @@ def fused_topk(
     )
 
     if (expert, topk) in [
+        (128, 4),
         (128, 6),
         (128, 8),
         (256, 6),
