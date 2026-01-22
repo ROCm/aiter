@@ -231,7 +231,8 @@ def test_mha_int64_strides(
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
     torch.cuda.empty_cache()
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     # use int64 strides.
     mha_set_use_int64_strides(
         True
@@ -334,7 +335,8 @@ def test_mha_varlen(
 ):
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -503,7 +505,8 @@ def test_mha_backward(
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
 
     # TODO: Enable these tests once this is fixed
     # As of torch 2.9.1+rocm7.1.1, these test cases aren't working
@@ -659,7 +662,8 @@ def test_mha_backward_varlen(
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     # pytest.skip("Backward accuracy issues due to Triton compiler")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
@@ -847,7 +851,8 @@ def test_mha_with_pe(
 
     # Generate tensors
     torch.cuda.empty_cache()
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     q = torch.randn(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
     )
@@ -921,7 +926,8 @@ def test_mha_varlen_with_pe(
 
     # Generate tensors
     torch.cuda.empty_cache()
-    torch.manual_seed(77)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(77)
     q = torch.randn(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
     )
@@ -1039,7 +1045,8 @@ def test_mha_backward_with_pe(
 
     # Generate tensors
     torch.cuda.empty_cache()
-    torch.manual_seed(63)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(63)
     q = torch.randn(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK),
         device=device,
@@ -1168,7 +1175,8 @@ def test_mha_backward_varlen_with_pe(
 
     # Generate tensors
     torch.cuda.empty_cache()
-    torch.manual_seed(133)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(133)
     q = torch.randn(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK),
         device=device,
@@ -1334,7 +1342,8 @@ def test_mha_with_sink(
 
     # Generate tensors
     torch.cuda.empty_cache()
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     q = torch.randn(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
         device=device,
@@ -1479,7 +1488,8 @@ def test_mha_varlen_with_sink(
 
     # Generate tensors
     torch.cuda.empty_cache()
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     q = torch.randn(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
         device=device,

@@ -132,7 +132,8 @@ def test_rmsnorm(M, N, in_dtype_str):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
     out_dtype = in_dtype
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x, weight = generate_rmsnorm_inputs(M, N, in_dtype)
 
@@ -183,7 +184,8 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
     out_dtype = in_dtype
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=in_dtype)
     weight = torch.randn(N, device="cuda", dtype=in_dtype)
@@ -239,7 +241,8 @@ def test_rmsnorm_smoothquant(M, N, in_dtype_str, scale_dtype_str):
     in_dtype = str_to_torch_dtype[in_dtype_str]
     scale_dtype = str_to_torch_dtype[scale_dtype_str]
 
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=in_dtype)
     weight = torch.randn(N, device="cuda", dtype=in_dtype)
@@ -267,7 +270,8 @@ def test_rmsnorm_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
     in_dtype = str_to_torch_dtype[in_dtype_str]
     scale_dtype = str_to_torch_dtype[scale_dtype_str]
 
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=in_dtype)
     weight = torch.randn(N, device="cuda", dtype=in_dtype)
@@ -292,7 +296,8 @@ def test_rmsnorm_fused_add_smoothquant(M, N, in_dtype_str, scale_dtype_str):
     in_dtype = str_to_torch_dtype[in_dtype_str]
     scale_dtype = str_to_torch_dtype[scale_dtype_str]
 
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=in_dtype)
     weight = torch.randn(N, device="cuda", dtype=in_dtype)
@@ -322,7 +327,8 @@ def test_rmsnorm_fused_add_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
     in_dtype = str_to_torch_dtype[in_dtype_str]
     scale_dtype = str_to_torch_dtype[scale_dtype_str]
 
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=in_dtype)
     weight = torch.randn(N, device="cuda", dtype=in_dtype)

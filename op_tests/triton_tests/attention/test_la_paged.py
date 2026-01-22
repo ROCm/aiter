@@ -56,7 +56,8 @@ def test_persistent_lean_attention(
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     # Long seqlen (>512K) can hit memory access fault. Suspect compiler issue
     # WA with shorter d and longer BLOCK_N
     if any(item > 524288 for item in n_ctx):

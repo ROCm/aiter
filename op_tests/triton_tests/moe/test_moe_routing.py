@@ -101,7 +101,8 @@ def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     device = "cuda"
-    torch.manual_seed(2)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(2)
     n_gates_raw = n_tokens * n_expts_act
     tri_logits = init_data(
         n_tokens, n_expts_tot, device=device, dtype=torch.float32
