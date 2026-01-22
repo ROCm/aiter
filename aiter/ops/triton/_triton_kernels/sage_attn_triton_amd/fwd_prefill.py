@@ -968,9 +968,9 @@ def sage_fwd(
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
 
     # compute offsets
-    off_z = tl.program_id(0)
+    start_m = tl.program_id(0)
     off_h_q = tl.program_id(1)
-    start_m = tl.program_id(2)
+    off_z = tl.program_id(2)
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
     if GROUP_SIZE != 1:
@@ -985,6 +985,23 @@ def sage_fwd(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
+    tl.multiple_of(offs_m, BLOCK_M),
+    # N dimension
+    offs_n = tl.arange(0, BLOCK_N)
+    tl.multiple_of(offs_n, BLOCK_N),
+
+    # D dimensions (MOST IMPORTANT)
+    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
+    offs_d_qk = tl.max_contiguous(
+        tl.multiple_of(offs_d_qk, BLOCK_DMODEL_QK),
+        BLOCK_DMODEL_QK
+    )
+
+    offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
+    offs_d_v = tl.max_contiguous(
+        tl.multiple_of(offs_d_v, BLOCK_DMODEL_V),
+        BLOCK_DMODEL_V
+    )
 
     # handle seqlen
     if IS_VARLEN:
@@ -1124,11 +1141,6 @@ def sage_fwd(
 
     q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
 
-    v_descale = tl.load(
-        v_descale_ptr,
-        mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
-        other=0.0,
-    )
 
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
@@ -1365,6 +1377,12 @@ def sage_fwd(
     else:
         invalid_mask = None
         l_recip = 1 / l_i[:, None]
+
+    v_descale = tl.load(
+        v_descale_ptr,
+        mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
+        other=0.0,
+    )
 
     acc = acc * l_recip * v_descale
     if ENABLE_DROPOUT:
@@ -1789,7 +1807,7 @@ def fav3_sage_triton_impl(
 
     # launch kernel
     def grid(META):
-        return (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
+        return (triton.cdiv(max_seqlens_q, META["BLOCK_M"]), nheads_q, batch)
 
     if config is None:
         config = get_sage_fwd_configs()
@@ -1985,6 +2003,8 @@ def sage_quant(
         D=head_dim,
         BLK_Q=BLKQ,
         BLK_K=BLKK,
+        num_stages=3,
+        num_warps=8,
     )
 
     return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
