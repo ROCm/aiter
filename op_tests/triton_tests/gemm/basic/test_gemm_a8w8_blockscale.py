@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from aiter.ops.shuffle import shuffle_weight
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
-
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -111,6 +110,11 @@ def get_x_vals():
         (64, 7168, 2304),
         (128, 7168, 2304),
     ]
+    # x_vals = [
+    #     # (16, 2112, 7168),
+    #     (64, 2112, 7168),
+    #     # (1024, 2112, 7168),
+    # ]
     # x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
@@ -173,7 +177,6 @@ def generate_gemm_a8w8_blockscale_inputs(
         y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
 
     return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
-    return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
 
 
 @pytest.mark.parametrize(
@@ -189,9 +192,9 @@ def generate_gemm_a8w8_blockscale_inputs(
 @pytest.mark.parametrize(
     "impl",
     [
-        # "gluon",
-        "triton",
-        "triton_shuffle",
+        "gluon",
+        # "triton",
+        # "triton_shuffle",
     ],
 )
 def test_gemm(dtype, M, N, K, layout, output, impl: str):
@@ -250,6 +253,17 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 
+    # from triton.testing import runtime
+
+    # di = runtime.driver.active.get_device_interface()
+    # cache = runtime.driver.active.get_empty_cache_for_benchmark()
+    # for _ in range(250):
+    #     cache.zero_()
+    #     di.synchronize()
+    #     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
+    #     di.synchronize()
+
+    # TODO check shape 16 16 128
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

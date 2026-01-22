@@ -95,9 +95,10 @@ def _gemm_a8w8_kernel(
         order=[0, 1],
     )
 
+    # TODO add a flag for if Triton version >= 3.6.0
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16],
+        instr_shape=[16, 16, 128],
         transposed=True,
         warps_per_cta=[2, NUM_WARPS // 2],
     )
