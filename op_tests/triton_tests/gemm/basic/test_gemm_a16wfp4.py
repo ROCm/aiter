@@ -22,7 +22,8 @@ def generate_gemm_a16wfp4_inputs(
     layout: str = "TN",
     shuffle: bool = False,
 ):
-    torch.manual_seed(5)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(5)
     # 34 is two packed e2m1 values 0010 which is 1.0.
     if layout[0] == "T":
         x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")

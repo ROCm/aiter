@@ -184,7 +184,8 @@ def torch_dynamic_mxfp4_quant(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
 
     if DEBUG_MODE:

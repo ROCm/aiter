@@ -96,7 +96,8 @@ def test_fp8_mqa_logits(
     head_dim: int,
     disable_cp: bool,
 ) -> None:
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     if s_q > s_k:
         pytest.skip()
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)

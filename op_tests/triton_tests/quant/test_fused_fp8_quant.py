@@ -26,7 +26,8 @@ import aiter as rocm_aiter
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
-torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
 
 def rmsnorm(input, weight, eps=1e-6):
