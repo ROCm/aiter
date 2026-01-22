@@ -830,6 +830,7 @@ def pa_ps_kernel(
             max_logits = new_max_logits
 
         # ==================== OUTPUT NORMALIZATION AND STORING ====================
+
         # Normalize attention output by softmax denominator
         exp_sums_reciprocal = 1.0 / exp_sums
         exp_sums_reciprocal_cvt = gl.convert_layout(
@@ -839,8 +840,10 @@ def pa_ps_kernel(
 
         # Store results to global memory
         if logits_idx >= 0:
+            # Compute log-sum-exp for reduce stage
+            lse = tl.math.log2(exp_sums) / LOG2_E + max_logits
             gl.amd.cdna3.buffer_store(
-                stored_value=max_logits,
+                stored_value=lse,
                 ptr=split_lse_ptr,
                 offsets=split_lse_offsets,
                 mask=split_lse_mask,
