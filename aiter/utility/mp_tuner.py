@@ -51,10 +51,18 @@ def worker(
             print(f"Warning: try run {max_retries} times, but still get 0!")
         torch.cuda.synchronize()
         if ref is not None:
+            # If kernel execution failed, run_perftest may return res=None.
+            # Don't attempt to index/compare; just mark as failed.
+            if res is None:
+                max_err_ratio = 1.0
+                return info, us, round(max_err_ratio, 4)
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
             if isinstance(res, torch.Tensor):
                 res = [res]
+            if not isinstance(res, (list, tuple)) or len(res) < len(ref):
+                max_err_ratio = 1.0
+                return info, us, round(max_err_ratio, 4)
             ref = [
                 (
                     el.to(device)
@@ -207,8 +215,14 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 *rest,
             )
 
-            # Run worker with explicit GPU ID
-            ret = worker(*work_args, printLog=verbose, tol_err_ratio=err_ratio)
+            # Run worker with explicit GPU ID.
+            # If rest already includes printLog / tol_err_ratio, don't pass duplicates.
+            if len(rest) >= 4:
+                ret = worker(*work_args)
+            elif len(rest) >= 3:
+                ret = worker(*work_args, tol_err_ratio=err_ratio)
+            else:
+                ret = worker(*work_args, printLog=verbose, tol_err_ratio=err_ratio)
             rets.append(ret)
         return rets
 

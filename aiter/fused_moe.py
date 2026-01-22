@@ -746,6 +746,8 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        use_non_temporal_load1 = cfg.get("use_non_temporal_load1", False)
+        use_non_temporal_load2 = cfg.get("use_non_temporal_load2", False)
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
@@ -841,14 +843,14 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 dtype=dtype,
                 splitk=ksplit,
-                use_non_temporal_load=use_non_temporal_load,
+                use_non_temporal_load=use_non_temporal_load1,
             ),
             functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
-                use_non_temporal_load=use_non_temporal_load,
+                use_non_temporal_load=use_non_temporal_load2,
             ),
             block_m,
             int(ksplit),
@@ -1475,7 +1477,7 @@ def ck_moe_stage1(
 ):
     token_num = hidden_states.shape[0]
     tmp_out = (
-        torch.zeros(
+        torch.empty(
             (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
         if splitk > 1

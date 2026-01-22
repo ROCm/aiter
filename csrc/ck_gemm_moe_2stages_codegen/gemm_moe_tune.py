@@ -6,6 +6,7 @@ import aiter
 import pandas as pd
 import os
 import sys
+import re
 from aiter import QuantType
 from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR, AITER_CONFIG_FMOE
 from aiter.fused_moe import (
@@ -131,6 +132,7 @@ class FmoeTuner(TunerCommon):
         ksplit,
         q_type,
         act_type,
+        use_non_temporal_load,
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
@@ -167,7 +169,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             act_type,
             ksplit,
-            False,
+            use_non_temporal_load,
             out.dtype,
         )
         if q_type == QuantType.per_1x128:
@@ -196,6 +198,7 @@ class FmoeTuner(TunerCommon):
         blockM,
         q_type,
         act_type,
+        use_non_temporal_load,
     ):
         model_dim = w2_qt_shffle_ck.shape[1]
         token_num = a2_qt.shape[0]
@@ -221,6 +224,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             q_type,
             act_type,
+            use_non_temporal_load=use_non_temporal_load,
         )
 
     @staticmethod
@@ -1604,6 +1608,8 @@ class FmoeTuner(TunerCommon):
             not doweight_stage1,
             False,  # bpreshuffle
         )
+        # NT (non-temporal load) is only meaningful for fp8 blockscale path.
+        nt_values = [0, 1] if q_type is QuantType.per_1x128 else [0]
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
                 for ksplit in ksplit_values:
@@ -1623,9 +1629,65 @@ class FmoeTuner(TunerCommon):
                             continue
                         if kernel.MPerBlock != blockM:
                             continue
+                        for nt in nt_values:
+                            tasks_ck.append(
+                                (
+                                    (info, "stage1", kernel.name, blockM, ksplit, nt),  # tag
+                                    FmoeTuner.generate_data_2stages,
+                                    (
+                                        token,
+                                        model_dim,
+                                        inter_dim,
+                                        expert,
+                                        topk,
+                                        act_type,
+                                        dtype,
+                                        q_dtype_a,
+                                        q_dtype_w,
+                                        q_type,
+                                        use_g1u1,
+                                        doweight_stage1,
+                                        blockM,
+                                        1,
+                                    ),
+                                    FmoeTuner.ck_moe_stage1_fwd_out,  # func
+                                    (
+                                        [0, 1, 2, 5, 6, 7, 8, 15, 14],
+                                        dtype,
+                                        topk,
+                                        kernel.name,
+                                        blockM,
+                                        ksplit,
+                                        q_type,
+                                        act_type,
+                                        bool(nt),
+                                    ),
+                                    {},
+                                    FmoeTuner.run_torch_moe_stage1,
+                                    (
+                                        # [a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
+                                        [0, 10, 11, 12, 13, 3, 4],
+                                        dtype,
+                                        act_type,
+                                        q_type,
+                                        doweight_stage1,
+                                        topk,
+                                    ),
+                                    {},
+                                    (None),
+                                    0.01,
+                                    0.01,
+                                    True,
+                                )
+                            )
+
+                for kernel in ck_stage2_kernels.values():
+                    if kernel.MPerBlock != blockM:
+                        continue
+                    for nt in nt_values:
                         tasks_ck.append(
                             (
-                                (info, "stage1", kernel.name, blockM, ksplit),  # tag
+                                (info, "stage2", kernel.name, blockM, 0, nt),  # tag
                                 FmoeTuner.generate_data_2stages,
                                 (
                                     token,
@@ -1641,29 +1703,26 @@ class FmoeTuner(TunerCommon):
                                     use_g1u1,
                                     doweight_stage1,
                                     blockM,
-                                    1,
+                                    2,
                                 ),
-                                FmoeTuner.ck_moe_stage1_fwd_out,  # func
+                                FmoeTuner.ck_moe_stage2_fwd_out,  # func
                                 (
                                     [0, 1, 2, 5, 6, 7, 8, 15, 14],
                                     dtype,
                                     topk,
                                     kernel.name,
                                     blockM,
-                                    ksplit,
                                     q_type,
                                     act_type,
+                                    bool(nt),
                                 ),
                                 {},
-                                FmoeTuner.run_torch_moe_stage1,
+                                FmoeTuner.run_torch_moe_stage2,
                                 (
-                                    # [a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
                                     [0, 10, 11, 12, 13, 3, 4],
                                     dtype,
-                                    act_type,
                                     q_type,
                                     doweight_stage1,
-                                    topk,
                                 ),
                                 {},
                                 (None),
@@ -1672,55 +1731,6 @@ class FmoeTuner(TunerCommon):
                                 True,
                             )
                         )
-
-                for kernel in ck_stage2_kernels.values():
-                    if kernel.MPerBlock != blockM:
-                        continue
-                    tasks_ck.append(
-                        (
-                            (info, "stage2", kernel.name, blockM, 0),  # tag
-                            FmoeTuner.generate_data_2stages,
-                            (
-                                token,
-                                model_dim,
-                                inter_dim,
-                                expert,
-                                topk,
-                                act_type,
-                                dtype,
-                                q_dtype_a,
-                                q_dtype_w,
-                                q_type,
-                                use_g1u1,
-                                doweight_stage1,
-                                blockM,
-                                2,
-                            ),
-                            FmoeTuner.ck_moe_stage2_fwd_out,  # func
-                            (
-                                [0, 1, 2, 5, 6, 7, 8, 15, 14],
-                                dtype,
-                                topk,
-                                kernel.name,
-                                blockM,
-                                q_type,
-                                act_type,
-                            ),
-                            {},
-                            FmoeTuner.run_torch_moe_stage2,
-                            (
-                                [0, 10, 11, 12, 13, 3, 4],
-                                dtype,
-                                q_type,
-                                doweight_stage1,
-                            ),
-                            {},
-                            (None),
-                            0.01,
-                            0.01,
-                            True,
-                        )
-                    )
         return tasks_ck
 
     def tune(
@@ -1852,16 +1862,17 @@ class FmoeTuner(TunerCommon):
             ) = key
             profileDF = []
             for info_tag, us, err in rets:
-                # info_tag: (stage, kernelName, block_m[, ksplit])
-                if len(info_tag) == 4:
+                # info_tag:
+                # - legacy: (stage, kernelName, block_m, ksplit, nt)
+                if len(info_tag) == 5:
+                    stage, kernelName, block_m, ksplit, use_non_temporal_load = info_tag
+                elif len(info_tag) == 4:
                     stage, kernelName, block_m, ksplit = info_tag
+                    use_non_temporal_load = 0
                 else:
                     stage, kernelName, block_m = info_tag
                     ksplit = 0
-                # if us == float("inf"):
-                #    continue
-                # if err > args.errRatio:
-                #    continue
+                    use_non_temporal_load = 0
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
                 profileDF.append(
                     [
@@ -1881,6 +1892,7 @@ class FmoeTuner(TunerCommon):
                         doweight_stage1,
                         block_m,
                         ksplit,
+                        int(use_non_temporal_load),
                         us,
                         kernelName,
                         err,
@@ -1894,7 +1906,16 @@ class FmoeTuner(TunerCommon):
                 columns=["stage"]
                 # + ["cu_num"]
                 + self.keys
-                + ["block_m", "ksplit", "us", "kernelName", "err", "tflops", "bw"],
+                + [
+                    "block_m",
+                    "ksplit",
+                    "use_non_temporal_load",
+                    "us",
+                    "kernelName",
+                    "err",
+                    "tflops",
+                    "bw",
+                ],
             )
             prorfiles.append(profileDF)
 
@@ -1905,7 +1926,7 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
             ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
-                ["stage", "block_m"], keep="first"
+                ["stage", "block_m", "use_non_temporal_load"], keep="first"
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage"], axis=1
@@ -1913,6 +1934,7 @@ class FmoeTuner(TunerCommon):
 
             stage1_profileDF = stage1_profileDF.rename(
                 columns={
+                    "use_non_temporal_load": "use_non_temporal_load1",
                     "kernelName": "kernelName1",
                     "err": "err1",
                     "us": "us1",
@@ -1925,6 +1947,7 @@ class FmoeTuner(TunerCommon):
             )
             stage2_profileDF = stage2_profileDF.rename(
                 columns={
+                    "use_non_temporal_load": "use_non_temporal_load2",
                     "kernelName": "kernelName2",
                     "err": "err2",
                     "us": "us2",
@@ -1960,6 +1983,12 @@ class FmoeTuner(TunerCommon):
             asm_1stage_profileDF = pd.concat(
                 [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
             )
+            asm_1stage_profileDF["use_non_temporal_load1"] = 0
+            asm_1stage_profileDF["use_non_temporal_load2"] = 0
+            if "use_non_temporal_load" in asm_1stage_profileDF.columns:
+                asm_1stage_profileDF = asm_1stage_profileDF.drop(
+                    columns=["use_non_temporal_load"]
+                )
             asm_1stage_profileDF["run_1stage"] = 1
             profileDF = pd.merge(
                 stage1_profileDF,
@@ -2004,6 +2033,9 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
+                        0,
+                        0,
+                        0,
                         0,
                         0,
                         self.INVALID_TIME,
@@ -2116,9 +2148,11 @@ if __name__ == "__main__":
     resultList = [
         "block_m",
         "ksplit",
+        "use_non_temporal_load1",
         "us1",
         "kernelName1",
         "err1",
+        "use_non_temporal_load2",
         "us2",
         "kernelName2",
         "err2",
