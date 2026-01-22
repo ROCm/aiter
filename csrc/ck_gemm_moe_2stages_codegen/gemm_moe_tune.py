@@ -1586,7 +1586,7 @@ class FmoeTuner(TunerCommon):
         ksplit_values = [1]
         if q_type is QuantType.per_1x128:
             # Split-k is only meaningful for blockscale path.
-            ksplit_values = list(range(1, 16))
+            ksplit_values = list(range(1, 2)) #TODO: Fix splitk for ck fp8 blockscale when tunning
             _, ck_stage1_kernels_splitk = get_gemm1_kernels_list(
                 dtype2str_dict[q_dtype_a],
                 dtype2str_dict[q_dtype_w],
