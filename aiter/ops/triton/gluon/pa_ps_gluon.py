@@ -99,7 +99,6 @@ def pa_ps_kernel(
     ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr,
     HEAD_SIZE_POW2: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
-    CONTEXT_PARTITION_SIZE: gl.constexpr,
     QUERY_QUANT_MODE: gl.constexpr,
     KV_QUANT_MODE: gl.constexpr,
     VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
@@ -135,10 +134,10 @@ def pa_ps_kernel(
         Uses AMD CDNA MFMA instructions; supported on gfx942/gfx950.
     """
     # ==================== VALIDATION CHECKS ====================
-    gl.static_assert(
-        KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64 or KV_BLOCK_SIZE == 1024,
-        f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64, 1024]",
-    )
+    # gl.static_assert(
+    #     KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64 or KV_BLOCK_SIZE == 1024,
+    #     f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64, 1024]",
+    # )
     # Data type validation
     gl.static_assert(
         query_ptr.dtype.is_fp8()
@@ -185,12 +184,6 @@ def pa_ps_kernel(
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
 
     K_HEAD_SIZE_SPLITS: gl.constexpr = HEAD_SIZE_POW2 // KV_16B_ELEMENT_COUNT
-    MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = (
-        CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE if KV_BLOCK_SIZE != 1024 else 1
-    )
-    CONTEXT_PARTITION_SIZE_PER_BLOCK: gl.constexpr = (
-        KV_BLOCK_SIZE // CONTEXT_PARTITION_SIZE if KV_BLOCK_SIZE == 1024 else 1
-    )
 
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access (2D)
@@ -223,16 +216,12 @@ def pa_ps_kernel(
     blocked_key_layout_fp8: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1, 1, KV_16B_ELEMENT_COUNT],
         threads_per_warp=[1, 4, 16, 1],
-        warps_per_cta=[4, 1, 1, 1],
+        warps_per_cta=[1, 1, 4, 1],
         order=[3, 2, 1, 0],
     )
-    if KV_BLOCK_SIZE == 1024:
-        KV_COMPUTE_BLOCK_SIZE: gl.constexpr = CONTEXT_PARTITION_SIZE
-    else:
-        KV_COMPUTE_BLOCK_SIZE: gl.constexpr = KV_BLOCK_SIZE
 
     key_warps_per_cta_f16: gl.constexpr = (
-        [4, 1, 1, 1] if KV_COMPUTE_BLOCK_SIZE == 16 else [1, 1, 4, 1]
+        [4, 1, 1, 1] if KV_BLOCK_SIZE == 16 else [1, 1, 4, 1]
     )
     blocked_key_layout_f16: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1, 1, KV_16B_ELEMENT_COUNT],
@@ -259,12 +248,29 @@ def pa_ps_kernel(
     )
 
     # Register allocation configuration based on group size and compute block size
+
     if QUERY_GROUP_SIZE_POW2 == 16:
-        register_bases: gl.constexpr = ((0, 1), (0, 2))
+        if KV_BLOCK_SIZE == 64:
+            register_bases: gl.constexpr = ((0, 1), (0, 2))
+        elif KV_BLOCK_SIZE == 256:
+            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
     elif QUERY_GROUP_SIZE_POW2 == 32:
-        register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
+        if KV_BLOCK_SIZE == 64:
+            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
+        elif KV_BLOCK_SIZE == 256:
+            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128), (16, 0))
     elif QUERY_GROUP_SIZE_POW2 == 64:
-        register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
+        if KV_BLOCK_SIZE == 64:
+            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
+        elif KV_BLOCK_SIZE == 256:
+            register_bases: gl.constexpr = (
+                (0, 1),
+                (0, 2),
+                (0, 64),
+                (0, 128),
+                (16, 0),
+                (32, 0),
+            )
 
     # Distributed layout for QK linear operations
     qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
@@ -272,14 +278,14 @@ def pa_ps_kernel(
         lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
         warp_bases=((0, 16), (0, 32)),
         block_bases=[],
-        shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
+        shape=[QUERY_GROUP_SIZE_POW2, KV_BLOCK_SIZE],
     )
 
     # Value cache layout configuration based on transpose flag
     if VALUE_TRANSPOSED:
         # Transposed value layout for better memory access patterns
         value_threads_per_warp: gl.constexpr = (
-            [4, 1, 16, 1] if KV_COMPUTE_BLOCK_SIZE == 16 else [1, 4, 16, 1]
+            [4, 1, 16, 1] if KV_BLOCK_SIZE == 16 else [1, 4, 16, 1]
         )
         blocked_value_layout_f16: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 1, 1, 8],
@@ -300,7 +306,7 @@ def pa_ps_kernel(
         )
         value_dim1_offsets = gl.arange(
             0,
-            KV_COMPUTE_BLOCK_SIZE // KV_16B_ELEMENT_COUNT,
+            KV_BLOCK_SIZE // KV_16B_ELEMENT_COUNT,
             layout=gl.SliceLayout(
                 0, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
             ),
@@ -322,7 +328,7 @@ def pa_ps_kernel(
     else:
         # Standard value layout
         value_threads_per_warp: gl.constexpr = (
-            [4, 16, 1] if KV_COMPUTE_BLOCK_SIZE == 16 else [1, 16, 4]
+            [4, 16, 1] if KV_BLOCK_SIZE == 16 else [1, 16, 4]
         )
         blocked_value_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 1, 16],
@@ -338,7 +344,7 @@ def pa_ps_kernel(
         )
         value_dim2_offsets = gl.arange(
             0,
-            KV_COMPUTE_BLOCK_SIZE,
+            KV_BLOCK_SIZE,
             layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_value_layout)),
         )
 
@@ -369,11 +375,6 @@ def pa_ps_kernel(
         0, gl.SliceLayout(1, mtp_blocked_query_layout)
     )
 
-    # Key layout slices
-    block_id_layout: gl.constexpr = gl.SliceLayout(
-        1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_key_layout))
-    )
-    block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
     head_size_split_layout: gl.constexpr = gl.SliceLayout(
         0, gl.SliceLayout(2, gl.SliceLayout(3, blocked_key_layout))
     )
@@ -397,8 +398,9 @@ def pa_ps_kernel(
     head_size_split_offsets = gl.arange(
         0, K_HEAD_SIZE_SPLITS, layout=head_size_split_layout
     )
-    block_element_offsets = gl.arange(
-        0, KV_COMPUTE_BLOCK_SIZE, layout=block_element_layout
+    block_element_offsets = gl.arange(0, KV_BLOCK_SIZE, layout=block_element_layout)
+    kv_scale_offsets = gl.arange(
+        0, KV_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
     )
     contiguous_kv_element_offsets = gl.arange(
         0, KV_16B_ELEMENT_COUNT, layout=contiguous_kv_elements_layout
@@ -456,19 +458,6 @@ def pa_ps_kernel(
             dtype=gl.float32,
             layout=pv_mfma_layout,
         )
-        logits_offsets = (
-            logits_idx * stride_logits_0
-            + (q_head_start + logits_query_group_size_offsets[:, None])
-            * stride_logits_2
-            + logits_head_size_offsets[None, :]
-        )
-        logits_mask = (
-            q_head_start + logits_query_group_size_offsets[:, None] < q_head_end
-        ) & (logits_head_size_offsets[None, :] < head_size)
-        split_lse_offsets = logits_idx * stride_lse_0 + (
-            q_head_start + lse_query_group_size_offsets
-        )
-        split_lse_mask = q_head_start + lse_query_group_size_offsets < q_head_end
 
         mtp_query_offsets = (
             (qo_start + mtp_query_len_offsets[:, None, None]) * stride_query_0
@@ -499,15 +488,30 @@ def pa_ps_kernel(
             query_tensor.dtype, query_tensor.shape, shared_query_layout, query_tensor
         )
         query_converted = query_shared.load(qk_lhs_operand_layout)
+        if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
+            # Quantize bf16 query to fp8
+            # Convert query to float32 for computation
+            query_f32 = query_converted.to(gl.float32)
+            # Compute max absolute value for scaling
+            query_abs = gl.abs(query_f32)
+            query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
+            # Compute scale factor: FP8_MAX_VALUE / max_abs_value
+            # Add epsilon to avoid division by zero
+            query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
+            # Quantize: scale query to fp8 range and convert to fp8 type
+            query_converted = query_f32.to(COMPUTE_TYPE)
+        else:
+            query_converted = query_converted.to(COMPUTE_TYPE)
+
         kv_head_idx = q_head_start // query_group_size
         if SLIDING_WINDOW > 0:
             sequence_start_idx = (
-                kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length - SLIDING_WINDOW
+                kv_start_idx * KV_BLOCK_SIZE + context_length - SLIDING_WINDOW
             )
-            sequence_end_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length
+            sequence_end_idx = kv_start_idx * KV_BLOCK_SIZE + context_length
         else:
-            sequence_start_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE
-            sequence_end_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length
+            sequence_start_idx = kv_start_idx * KV_BLOCK_SIZE
+            sequence_end_idx = kv_start_idx * KV_BLOCK_SIZE + context_length
         if QUERY_QUANT_MODE == 1:
             # Per-token quantization
             query_scale_offsets = (
@@ -527,36 +531,29 @@ def pa_ps_kernel(
                 query_scale_value, layout=qk_linear_layout
             )
         for kv_block_idx in range(kv_block_start_idx, kv_block_end_idx):
-            qk_column_offsets = kv_block_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
-                0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
+            qk_column_offsets = kv_block_idx * KV_BLOCK_SIZE + gl.arange(
+                0, KV_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
             )
-            page_offset = (
-                kv_block_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
-            ) * CONTEXT_PARTITION_SIZE
 
             # Create mask for valid blocks
-            kv_block_numbers = gl.amd.cdna3.buffer_load(
-                kv_page_indices,
-                offsets=kv_block_idx + block_indices,
+            kv_block_numbers = gl.load(
+                kv_page_indices + kv_block_idx,
             ).to(gl.int64)
 
             # ==================== KEY LOADING AND PROCESSING ====================
             # Calculate key cache offsets and load keys
             key_block_offsets = (
-                kv_block_numbers[:, None, None, None] * stride_key_0
+                kv_block_numbers * stride_key_0
                 + kv_head_idx * stride_key_1
                 + head_size_split_offsets[None, :, None, None] * stride_key_2
                 # Use runtime stride for KV block element (may be padded for large blocks).
-                + (page_offset + block_element_offsets)[None, None, :, None]
-                * stride_key_3
+                + block_element_offsets[None, None, :, None] * stride_key_3
                 + contiguous_kv_element_offsets[None, None, None, :]
             )
 
             # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
             if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
-                kv_token_global = (
-                    kv_block_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
-                )
+                kv_token_global = kv_block_idx * KV_BLOCK_SIZE + block_element_offsets
                 kv_in_window_mask = kv_token_global >= sequence_start_idx
                 key_tensor = gl.load(
                     key_cache_ptr + key_block_offsets,
@@ -567,7 +564,7 @@ def pa_ps_kernel(
                 key_tensor = gl.load(key_cache_ptr + key_block_offsets)
             # Prepare QK MFMA while key loads (these don't depend on key data)
             qk_accumulator = gl.zeros(
-                (QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE),
+                (QUERY_GROUP_SIZE_POW2, KV_BLOCK_SIZE),
                 dtype=gl.float32,
                 layout=qk_mfma_layout,
             )
@@ -575,47 +572,31 @@ def pa_ps_kernel(
             if KV_QUANT_MODE == 1:
                 # Per-token quantization - prepare offsets while key loads
                 key_scale_offsets = (
-                    kv_block_numbers[:, None, None, None] * stride_kv_scale_0
+                    kv_block_numbers * stride_kv_scale_0
                     + kv_head_idx * stride_kv_scale_1
-                    + (page_offset + block_element_offsets)[None, None, :, None]
+                    + kv_scale_offsets
                 )
                 # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
                 if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
-                    key_scale_value_blocked = gl.load(
+                    key_scale_value = gl.load(
                         key_scale + key_scale_offsets,
                         mask=kv_in_window_mask[None, None, :, None],
                         other=0.0,
                     )
-                    value_scale_value_blocked = gl.load(
+                    value_scale_value = gl.load(
                         value_scale + key_scale_offsets,
                         mask=kv_in_window_mask[None, None, :, None],
                         other=0.0,
                     )
                 else:
-                    key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
-                    value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
+                    key_scale_value = gl.load(key_scale + key_scale_offsets)
+                    value_scale_value = gl.load(value_scale + key_scale_offsets)
 
-                # Convert to required distributed layout for computation
-                key_scale_value_blocked = gl.reshape(
-                    key_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
-                )
-                key_scale_value = gl.convert_layout(
-                    key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
-                )
                 key_scale_value = key_scale_value[None, :]
-                value_scale_value_blocked = gl.reshape(
-                    value_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
-                )
-                value_scale_value = gl.convert_layout(
-                    value_scale_value_blocked,
-                    layout=gl.SliceLayout(0, qk_linear_layout),
-                )
 
             # Reshape key tensor for matrix multiplication
             key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
-            key_tensor = gl.reshape(
-                key_tensor, [HEAD_SIZE_POW2, CONTEXT_PARTITION_SIZE]
-            )
+            key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, KV_BLOCK_SIZE])
 
             # ==================== VALUE LOADING WITH QK MFMA OVERLAP ====================
             # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
@@ -624,20 +605,11 @@ def pa_ps_kernel(
 
             if VALUE_TRANSPOSED:
                 # Load values from transposed cache layout
-                kv_block_numbers_reshaped = gl.convert_layout(
-                    kv_block_numbers,
-                    layout=gl.SliceLayout(
-                        1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
-                    ),
-                )
 
                 value_block_offsets = (
-                    kv_block_numbers_reshaped[:, None, None, None] * stride_value_0
+                    kv_block_numbers * stride_value_0
                     + kv_head_idx * stride_value_1
-                    + (page_offset // KV_16B_ELEMENT_COUNT + value_dim1_offsets)[
-                        None, :, None, None
-                    ]
-                    * stride_value_2
+                    + value_dim1_offsets[None, :, None, None] * stride_value_2
                     + value_dim2_offsets[None, None, :, None] * KV_16B_ELEMENT_COUNT
                     + value_dim3_offsets[None, None, None, :]
                 )
@@ -658,22 +630,18 @@ def pa_ps_kernel(
                 value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
             else:
                 # Load values from standard cache layout
-                kv_block_numbers_reshaped = gl.convert_layout(
-                    kv_block_numbers,
-                    layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
-                )
 
                 value_block_offsets = (
-                    kv_block_numbers_reshaped[:, None, None] * stride_value_0
+                    kv_block_numbers * stride_value_0
                     + kv_head_idx * stride_value_1
                     + value_dim1_offsets[None, :, None] * stride_value_2
-                    + (page_offset + value_dim2_offsets)[None, None, :]
+                    + value_dim2_offsets[None, None, :]
                 )
 
                 # Schedule: Start value VMEM load, then QK MFMA
                 if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
                     value_token_global = (
-                        kv_block_idx * KV_COMPUTE_BLOCK_SIZE + value_dim2_offsets
+                        kv_block_idx * KV_BLOCK_SIZE + value_dim2_offsets
                     )
                     value_in_window_mask = value_token_global >= sequence_start_idx
                     value_tensor = gl.load(
@@ -691,12 +659,10 @@ def pa_ps_kernel(
                 # Permute and resape for matrix multiplication
                 value_tensor = gl.permute(value_tensor, [0, 2, 1])
 
-            value_tensor = gl.reshape(
-                value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
-            )
+            value_tensor = gl.reshape(value_tensor, [KV_BLOCK_SIZE, HEAD_SIZE_POW2])
 
             attention_scores = gl.reshape(
-                attention_scores, [QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE]
+                attention_scores, [QUERY_GROUP_SIZE_POW2, KV_BLOCK_SIZE]
             )
 
             # Apply quantization scaling to attention scores
@@ -828,6 +794,20 @@ def pa_ps_kernel(
         # Store results to global memory
         if logits_idx >= 0:
             # Compute log-sum-exp for reduce stage
+            logits_offsets = (
+                logits_idx * stride_logits_0
+                + (q_head_start + logits_query_group_size_offsets[:, None])
+                * stride_logits_2
+                + logits_head_size_offsets[None, :]
+            )
+            logits_mask = (
+                q_head_start + logits_query_group_size_offsets[:, None] < q_head_end
+            ) & (logits_head_size_offsets[None, :] < head_size)
+            split_lse_offsets = logits_idx * stride_lse_0 + (
+                q_head_start + lse_query_group_size_offsets
+            )
+            split_lse_mask = q_head_start + lse_query_group_size_offsets < q_head_end
+
             lse = tl.math.log2(exp_sums) / LOG2_E + max_logits
             gl.amd.cdna3.buffer_store(
                 stored_value=lse,
@@ -920,7 +900,7 @@ def pa_ps_gluon(
     # Extract tensor dimensions from input tensors
     # context_partition_size = 256
     # if sliding_window > 0:
-    context_partition_size = 64
+    # context_partition_size = 1024
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
 
@@ -960,11 +940,11 @@ def pa_ps_gluon(
     assert (
         equivalent_query_group_size <= 64
     ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
-    assert kv_block_size in [
-        16,
-        64,
-        1024,
-    ], f"kv_block_size == {kv_block_size} not in [16, 64, 1024]"
+    # assert kv_block_size in [
+    #     16,
+    #     64,
+    #     1024,
+    # ], f"kv_block_size == {kv_block_size} not in [16, 64, 1024]"
     assert (
         len(output.shape) == 3
     ), f"Expected 3D output tensor, but got shape {output.shape}"
@@ -1074,7 +1054,6 @@ def pa_ps_gluon(
         ONE_QUERY_GROUP_SIZE_POW2=max(16, triton.next_power_of_2(query_group_size)),
         HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
         KV_BLOCK_SIZE=kv_block_size,
-        CONTEXT_PARTITION_SIZE=context_partition_size,
         QUERY_QUANT_MODE=query_quant_mode,
         KV_QUANT_MODE=kv_quant_mode,
         VALUE_TRANSPOSED=value_transposed,
