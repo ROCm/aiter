@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """
-Profile MOE kernels using rocprofv3 with tuner integration - FIXED VERSION
+Profile MOE kernels using rocprofv3 with tuner integration - MULTI-ROUND VERSION
+
+Multi-round profiling mode:
+- Splits counters into groups to avoid rocprofv3 counter limits
+- Runs profiling multiple times with different counter sets
+- Merges results from all rounds
 
 CHANGES FROM ORIGINAL:
 1. Uses tuner.generate_data() for consistent data generation (matches benchmark)
-2. Stage2 runs actual stage1 to get real intermediate data (not fake random)
+2. Stage2 generates proper input data
 3. All moe_sorting calls include block_m parameter
 4. Matches benchmark_moe_kernels.py input handling exactly
+5. Multi-round profiling to collect comprehensive counter data
 
 For each kernel in sample.csv:
 1. Uses tuner to force execution of the specific kernel
-2. Runs under rocprofv3 to collect hardware counters
-3. Extracts FLOPS and bandwidth from profiling data
+2. Runs under rocprofv3 multiple times with different counter groups
+3. Merges counter data from all profiling rounds
 """
 
 import subprocess
 import sys
-import os
 from pathlib import Path
 import pandas as pd
 import torch
-import sqlite3
 
 # Add paths for tuner imports
 current_dir = Path(__file__).parent
@@ -33,37 +37,45 @@ from aiter import QuantType, ActivationType
 import gemm_moe_tune
 from gemm_moe_tune import FmoeTuner
 
-# Comprehensive counters for detailed analysis
-COUNTERS = [
-    # Cache and memory
-    "TCC_HIT", "TCC_MISS", "TCC_TAG_STALL_sum",
-    "TCC_EA0_RDREQ_sum", "TCC_EA0_WRREQ_sum",
-    "FETCH_SIZE", "WRITE_SIZE",
-    "TCP_PENDING_STALL_CYCLES_sum",
-    
-    # Compute utilization
-    "LDSBankConflict", "OccupancyPercent", "MemUnitStalled", "MfmaUtil",
-    "SQ_INSTS_MFMA", "SQ_VALU_MFMA_BUSY_CYCLES_sum",
-    "MfmaFlops", "MfmaFlopsF16", "MfmaFlopsF32", "MfmaFlopsBF16",
-    
-    # Wave execution
-    "SQ_WAVES_sum", "SQ_WAVE_CYCLES_sum", "SQ_BUSY_CU_CYCLES_sum",
-    "SQ_WAIT_INST_ANY", "SQ_ACTIVE_INST_ANY_sum",
-    
-    # Instruction breakdown
-    "SQ_INSTS_VALU_sum", "SQ_INSTS_VMEM_sum", "SQ_INSTS_LDS_sum",
-    "SQ_INSTS_SALU_sum", "SQ_INSTS_SMEM_sum",
-    "SQ_ACTIVE_INST_VALU_sum", "SQ_ACTIVE_INST_VMEM_sum", "SQ_ACTIVE_INST_LDS_sum",
-    
-    # LDS details
-    "SQ_LDS_BANK_CONFLICT_sum", "SQ_LDS_IDX_ACTIVE_sum",
-    
-    # GPU activity
-    "GRBM_GUI_ACTIVE_sum", "GRBM_COUNT_sum",
-    
-    # Hardware constants (will be same for all kernels but good to have)
-    "CU_NUM", "SIMD_NUM", "max_bandwidth",
-]
+# Split counters into manageable groups (8-10 per round)
+COUNTER_GROUPS = {
+    'r1': [
+        "FETCH_SIZE",  # Memory read size
+    ],
+
+    'r2': [
+        "WRITE_SIZE",  # Memory write size
+    ],
+
+    'r3': [
+        "TCC_HIT",  # L2 cache hits
+        "TCC_MISS",  # L2 cache misses
+        "TCC_TAG_STALL_sum",  # TCC tag stalls
+        "TCP_PENDING_STALL_CYCLES_sum",  # TCP pending stalls
+        "SQ_VALU_MFMA_BUSY_CYCLES",  # Raw counter (no _sum)
+        "SQ_INSTS_VALU_MFMA_MOPS_F8",
+        "SQ_INSTS_VALU_MFMA_MOPS_I8",
+        "SQ_INSTS_VALU_MFMA_MOPS_BF16",
+        "MfmaUtil",  # MFMA utilization percentage
+        "SQ_BUSY_CU_CYCLES",  # Compute unit busy cycles
+    ],
+
+    'r4': [
+        "SQ_WAIT_ANY",  # Total stall cycles
+        "MemUnitStalled",  # Memory unit stalls
+        "SQ_WAVES_sum",  # Total wavefronts
+        "SQ_WAVE_CYCLES",  # Wavefront execution cycles
+        "OccupancyPercent",  # Wave occupancy percentage
+        "GRBM_GUI_ACTIVE",  # GPU active cycles
+        "SQ_INSTS_VALU",  # VALU instructions executed
+        "SQ_INSTS_MFMA",  # MFMA instructions executed
+        "SQ_INSTS_LDS",  # LDS instructions
+        "SQ_LDS_BANK_CONFLICT",  # LDS bank conflicts
+        "LDSBankConflict",
+        "SQ_LDS_IDX_ACTIVE",  # Active LDS indices
+    ],
+
+}
 
 
 def generate_asm_1stage_script(config_idx, kernel_name, token, model_dim, inter_dim,
@@ -523,26 +535,7 @@ def get_kernels(csv_file):
     return pd.read_csv(csv_file)
 
 
-def find_best_stage1_kernel(kernels_df, config_idx, block_m, kernel_type):
-    """Find the best stage1 kernel for a given config to use when profiling stage2."""
-    # Filter to same config, block_m, kernel_type, and stage1 only
-    # IMPORTANT: Must match kernel_type to avoid mixing CK and ASM kernels!
-    stage1_kernels = kernels_df[
-        (kernels_df['config_idx'] == config_idx) &
-        (kernels_df['block_m'] == block_m) &
-        (kernels_df['kernel_type'] == kernel_type) &
-        (kernels_df['stage'] == 'stage1')
-    ]
-    
-    if len(stage1_kernels) == 0:
-        return None
-    
-    # Get the one with minimum time_us
-    best = stage1_kernels.loc[stage1_kernels['time_us'].idxmin()]
-    return best['kernel_name']
-
-
-def create_kernel_execution_script(row, script_path, kernels_df):
+def create_kernel_execution_script(row, script_path):
     """Create script using tuner.generate_data() for input generation."""
     config_idx = int(row['config_idx'])
     kernel_name = row['kernel_name']
@@ -570,7 +563,6 @@ def create_kernel_execution_script(row, script_path, kernels_df):
                                          expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
                                          q_type_str, act_type_str, use_g1u1)
     elif kernel_type == "ck" and stage == "stage2":
-        # Stage2 now generates its own data without needing stage1
         code = generate_ck_stage2_script(config_idx, kernel_name, token, model_dim, inter_dim,
                                          expert, topk, block_m, dtype_str, q_dtype_a_str, q_dtype_w_str,
                                          q_type_str, act_type_str, use_g1u1, doweight_stage1)
@@ -586,23 +578,19 @@ def create_kernel_execution_script(row, script_path, kernels_df):
     script_path.write_text(code)
 
 
-def run_rocprofv3(row, output_dir, kernels_df, keep_temp_files=False):
-    """Run rocprofv3 kernel-trace with optional counter collection."""
+def run_rocprofv3_round(row, script_path, output_dir, round_name, counters, keep_temp_files):
+    """Run rocprofv3 for a specific counter group using existing script."""
     config_idx = int(row['config_idx'])
     kernel_type = str(row['kernel_type'])
     stage = str(row['stage'])
     block_m = int(row['block_m'])
-    kernel_name = row['kernel_name'][:]
+    kernel_name = row['kernel_name']
     
-    base_name = f"cfg{config_idx}_{kernel_type}_{stage}_block{block_m}_{kernel_name}"
-    script_name = f"{base_name}.py"
-    script_path = output_dir / script_name
-    
-    create_kernel_execution_script(row, script_path, kernels_df)
-    
+    base_name = f"cfg{config_idx}_{kernel_type}_{stage}_block{block_m}_{kernel_name}_{round_name}"
     output_file = output_dir / base_name
     
-    counter_str = " ".join(COUNTERS)
+    counter_str = " ".join(counters)
+    
     cmd = [
         "rocprofv3",
         "--pmc", counter_str,
@@ -613,60 +601,47 @@ def run_rocprofv3(row, output_dir, kernels_df, keep_temp_files=False):
         sys.executable, str(script_path.absolute())
     ]
     
-    print(f"Config {config_idx}: Running rocprofv3 kernel-trace...")
-    
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
         hip_error_detected = False
         if result.stderr and "HIP error: an illegal memory access" in result.stderr:
             hip_error_detected = True
-            print(f"  ✗ KERNEL BUG: Illegal memory access detected!")
+            print(f"    ✗ KERNEL BUG: Illegal memory access detected!")
         
         if result.returncode == 0 and not hip_error_detected:
-            print(f"  ✓ Success!")
-            if not keep_temp_files:
-                script_path.unlink()
-            else:
-                print(f"  Test script: {script_path}")
+            return base_name
         else:
             if hip_error_detected:
-                print(f"  ✗ Failed: Kernel memory access bug")
+                print(f"    ✗ Failed: Kernel memory access bug")
             else:
-                print(f"  ✗ Failed (exit code {result.returncode})")
-            
-            print(f"  Test script: {script_path}")
+                print(f"    ✗ Failed (exit code {result.returncode})")
             
             if result.stderr and "HIP error" in result.stderr:
                 for line in result.stderr.split('\n'):
                     if "HIP error" in line or "illegal memory" in line:
-                        print(f"  Error: {line.strip()}")
+                        print(f"    Error: {line.strip()}")
                         break
             elif result.stderr:
                 stderr_lines = [l for l in result.stderr.split('\n') if l.strip()]
                 for line in stderr_lines[-5:]:
-                    print(f"  {line}")
-        
-        return base_name if (result.returncode == 0 and not hip_error_detected) else None
+                    print(f"    {line}")
+            
+            return None
     except subprocess.TimeoutExpired:
-        print(f"  ✗ Timeout: Kernel execution exceeded 300 seconds")
-        print(f"  Test script kept: {script_path}")
+        print(f"    ✗ Timeout: Kernel execution exceeded 300 seconds")
         return None
     except Exception as e:
-        print(f"  ✗ Exception: {e}")
-        print(f"  Test script kept: {script_path}")
+        print(f"    ✗ Exception: {e}")
         return None
 
 
-def parse_rocprofv3_output(config_name, output_dir, keep_temp_files=False):
+def parse_rocprofv3_output(config_name, output_dir, keep_temp_files, expected_counters):
     """Parse rocprofv3 PMC counter_collection CSV to extract counter values."""
     counter_file = output_dir / f"{config_name}_counter_collection.csv"
     
     if not counter_file.exists():
-        files = list(output_dir.glob("*counter_collection.csv"))
-        if not files:
-            return {}
-        counter_file = max(files, key=lambda p: p.stat().st_mtime)
+        return {}
     
     try:
         df = pd.read_csv(counter_file)
@@ -681,7 +656,7 @@ def parse_rocprofv3_output(config_name, output_dir, keep_temp_files=False):
         for _, row in target_rows.iterrows():
             counter_name = row['Counter_Name']
             counter_value = row['Counter_Value']
-            if counter_name in COUNTERS:
+            if counter_name in expected_counters:
                 counter_data[counter_name] = counter_value
         
         if not keep_temp_files:
@@ -696,7 +671,7 @@ def parse_rocprofv3_output(config_name, output_dir, keep_temp_files=False):
         return counter_data
         
     except Exception as e:
-        print(f"  Error parsing PMC data: {e}")
+        print(f"    Error parsing PMC data: {e}")
         return {}
 
 
@@ -718,12 +693,64 @@ def clear_gpu_memory():
         gc.collect()
 
 
+def run_multi_round_profiling(row, output_dir, keep_temp_files):
+    """Run profiling in multiple rounds with different counter groups, reusing script."""
+    config_idx = int(row['config_idx'])
+    kernel_type = str(row['kernel_type'])
+    stage = str(row['stage'])
+    block_m = int(row['block_m'])
+    kernel_name = row['kernel_name']
+    
+    print(f"Config {config_idx} {kernel_type} {stage}: {kernel_name[:40]}")
+    
+    # Create script once (will be reused across all rounds)
+    script_name = f"cfg{config_idx}_{kernel_type}_{stage}_block{block_m}_{kernel_name}.py"
+    script_path = output_dir / script_name
+    
+    print(f"  Creating execution script: {script_name}")
+    create_kernel_execution_script(row, script_path)
+    
+    merged_counters = {}
+    
+    # Run each counter group, reusing the same script
+    for round_idx, (round_name, counters) in enumerate(COUNTER_GROUPS.items(), 1):
+        print(f"  Round {round_idx}/{len(COUNTER_GROUPS)} ({round_name}): {len(counters)} counters...")
+        
+        clear_gpu_memory()
+        
+        config_name = run_rocprofv3_round(row, script_path, output_dir, round_name, counters, keep_temp_files)
+        
+        if config_name:
+            round_data = parse_rocprofv3_output(config_name, output_dir, keep_temp_files, counters)
+            merged_counters.update(round_data)
+            print(f"    ✓ Collected {len(round_data)} counters")
+        else:
+            print(f"    ✗ Failed to collect counters")
+    
+    # Clean up script after all rounds (unless keep_temp_files is True)
+    if not keep_temp_files:
+        script_path.unlink()
+    else:
+        print(f"  Kept execution script: {script_path}")
+    
+    # Calculate MFMA_FLOPS if we have the necessary counters
+    mfma_f8 = merged_counters.get('SQ_INSTS_VALU_MFMA_MOPS_F8', 0)
+    mfma_i8 = merged_counters.get('SQ_INSTS_VALU_MFMA_MOPS_I8', 0)
+    mfma_bf16 = merged_counters.get('SQ_INSTS_VALU_MFMA_MOPS_BF16', 0)
+    if mfma_f8 or mfma_i8 or mfma_bf16:
+        merged_counters['MFMA_FLOPS'] = (mfma_f8 + mfma_i8 + mfma_bf16) * 512
+    
+    print(f"  → Collected {len(merged_counters)} total counters\n")
+    
+    return merged_counters
+
+
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description="Profile MOE kernels with rocprofv3 - FIXED VERSION")
+    parser = argparse.ArgumentParser(description="Profile MOE kernels with rocprofv3 - Multi-round mode")
     parser.add_argument('-i', '--input', required=True, help='Input CSV file with kernel configs')
-    parser.add_argument('-o', '--output-dir', default='rocprofv3_results_fixed', help='Output directory')
+    parser.add_argument('-o', '--output-dir', default='profiling_multiround', help='Output directory')
     parser.add_argument('--keep-temp-files', action='store_true', 
                         help='Keep temporary Python scripts and rocprofv3 CSV files')
     
@@ -734,12 +761,15 @@ def main():
     output_dir.mkdir(exist_ok=True)
     
     print(f"\n{'='*80}")
-    print("FIXED VERSION - Uses tuner.generate_data() like benchmark")
+    print("MULTI-ROUND PROFILING MODE")
     print(f"{'='*80}")
-    print(f"Profiling {len(kernels)} kernels using rocprofv3")
+    print(f"Profiling rounds: {len(COUNTER_GROUPS)}")
+    print(f"Total counters: {sum(len(c) for c in COUNTER_GROUPS.values())}")
+    print(f"Kernels to profile: {len(kernels)}")
     print(f"Input: {args.input}")
-    print(f"Output directory: {output_dir.absolute()}")
-    print(f"Temp files: {'KEEP' if args.keep_temp_files else 'DELETE after use'}\n")
+    print(f"Output: {output_dir.absolute()}")
+    print(f"Temp files: {'KEEP' if args.keep_temp_files else 'DELETE after use'}")
+    print(f"{'='*80}\n")
     
     output_file = output_dir / "kernels_with_counters.csv"
     
@@ -750,15 +780,14 @@ def main():
     for idx, (_, row) in enumerate(kernels.iterrows(), 1):
         error_value = str(row.get('error', '')).strip()
         if error_value == 'failed':
-            print(f"Config {row['config_idx']}: Skipping failed kernel: {row['kernel_name'][:40]}")
+            print(f"[{idx}/{len(kernels)}] Skipping failed kernel: {row['kernel_name'][:40]}")
             skipped_count += 1
             continue
         
         clear_gpu_memory()
-        alloc_before, reserved_before = get_gpu_memory_info()
         
-        config_name = run_rocprofv3(row, output_dir, kernels, args.keep_temp_files)
-        counter_data = parse_rocprofv3_output(config_name, output_dir, args.keep_temp_files) if config_name else {}
+        print(f"[{idx}/{len(kernels)}]", end=" ")
+        counter_data = run_multi_round_profiling(row, output_dir, args.keep_temp_files)
         
         clear_gpu_memory()
         alloc_after, reserved_after = get_gpu_memory_info()
@@ -777,9 +806,6 @@ def main():
             header=(profiled_count == 1), 
             index=False
         )
-        
-        if len(kernels) > 1 and idx % max(1, len(kernels) // 5) == 0:
-            print(f"  Progress: {idx}/{len(kernels)}")
     
     results_df = pd.DataFrame(results)
     
@@ -789,7 +815,7 @@ def main():
     print(f"Output file: {output_file}")
     print(f"Total kernels in input: {len(kernels)}")
     print(f"Skipped (failed): {skipped_count}")
-    print(f"Profiled: {len(kernels) - skipped_count}")
+    print(f"Profiled: {profiled_count}")
     print(f"Original columns: {len(kernels.columns)}")
     print(f"Profiling columns added: {len(results_df.columns) - len(kernels.columns)}")
     if len(results_df.columns) > len(kernels.columns):
