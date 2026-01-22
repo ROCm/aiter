@@ -113,6 +113,9 @@ _BACKWARD_COMPAT_MAP = {
     "moe_op_silu_fused": "moe.moe_op_silu_fused",
     "moe_op": "moe.moe_op",
     "moe_routing_sigmoid_top1_fused": "moe.moe_routing_sigmoid_top1_fused",
+    "bitmatrix": "moe.moe_routing.bitmatrix",
+    "routing": "moe.moe_routing.routing",
+    "topk": "moe.moe_routing.topk",
     "quant_moe": "moe.quant_moe",
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
