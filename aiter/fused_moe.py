@@ -1643,11 +1643,12 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    if (
-        get_gfx() == "gfx942"
-        and (expert, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
-        and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
-    ):
+    if (expert, topk) in [
+        (128, 6),
+        (128, 8),
+        (256, 6),
+        (256, 8),
+    ] and gating_output.dtype in [dtypes.bf16, dtypes.fp32]:
         if topk_weights is None:
             topk_weights = torch.empty(
                 (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device
