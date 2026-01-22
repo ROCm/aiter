@@ -10,6 +10,7 @@ import ast
 import functools
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -126,68 +127,129 @@ def list_triton_source_files() -> (
 
 DEVICES: frozenset[str] = frozenset(["gfx942", "gfx950"])
 
+# Single letter placeholders for JSON config file template strings. You can add
+# more letters if necessary.
+MNK_PLACEHOLDERS: str = "MNK"
+NUM_PATTERN: str = r"\d+"
 
-def resolve_json_string_interpolation(json_string: str) -> list[str]:
-    resolved_strings = [json_string]
-    if json_string.startswith("f'") or json_string.startswith('f"'):
-        # f-string with variable interpolation.
-        # Resolve {AITER_TRITON_CONFIGS_PATH} interpolation:
-        if r"{AITER_TRITON_CONFIGS_PATH}" in json_string:
-            json_string = json_string.replace(
-                r"{AITER_TRITON_CONFIGS_PATH}",
-                str(triton_config_dir().relative_to(root_dir()).as_posix()),
-            )
-            logging.debug(
-                r"Resolved {AITER_TRITON_CONFIGS_PATH} in JSON string: [%s]",
-                json_string,
-            )
-        # Resolve {dev} interpolation:
-        if r"{dev}" in json_string:
-            resolved_strings = [json_string.replace(r"{dev}", dev) for dev in DEVICES]
-            logging.debug(r"Resolved {dev} in JSON string: %s", str(resolved_strings))
-        # Resolve MOE data type interpolation:
-        resolved_strings = [
-            replaced
-            for resolved_string in resolved_strings
-            for replaced in (
-                [
-                    resolved_string.replace(r"{dtype_str}", moe_dtype)
-                    for moe_dtype in [
-                        "DEFAULT",
-                        "FP8_W8A8",
-                        "INT8_W8A16",
-                        "INT8_W8A8",
-                        "INT4_W4A16",
-                        "MX_FP4",
-                    ]
-                ]
-                if r"MOE-{dtype_str}" in resolved_string
-                else [resolved_string]
-            )
-        ]
-        # Remove f-string delimiters if there's no more variable interpolation.
-        resolved_strings = [
-            s[2:-1] if not any(c in s for c in "{}") else s for s in resolved_strings
-        ]
-    return resolved_strings
+MOE_DTYPES: tuple[str, ...] = (
+    "DEFAULT",
+    "FP8_W8A8",
+    "INT8_W8A16",
+    "INT8_W8A8",
+    "INT4_W4A16",
+    "MX_FP4",
+)
 
 
-def resolve_json_strings(json_strings: list[str]) -> list[Path]:
-    json_strings = sorted(
-        resolved_json_strings
+def expand_mnk(json_string: str, config_files: list[Path]) -> list[str]:
+    """
+    Expands template strings containing M/N/K placeholders by matching them
+    against actual config file paths.
+
+    :param json_string: Template string that references kernel config JSON files.
+                        May contain M/N/K placeholders to be expanded.
+    :param config_files: All Triton kernel config JSON files available in the
+                         filesystem.
+    :return: List of template strings with expanded M/N/K placeholders or the
+             a list containing just the input template string as-is if there
+             are no M/N/K placeholders to be expanded.
+    """
+    # Early exit if no placeholders present.
+    if not any(f"{{{p}}}" in json_string for p in MNK_PLACEHOLDERS):
+        logging.debug("No M/N/K placeholders in [%s].", json_string)
+        return [json_string]
+    # Strip `f"` prefix and `"` suffix, then escape special regex characters. For
+    # example, `f"gfx950-GEMM-N={N}-K={K}.json"` becomes `gfx950-GEMM-N=\{N\}-K=\{K\}.json`.
+    pattern_str = re.escape(json_string[2:-1])
+    # Replace each escaped placeholder with a named capture regex group.
+    for p in MNK_PLACEHOLDERS:  # `p` will be `M`, then `N`, then `K`.
+        # For instance, if `p` is `M` then `\{M\}` will be replaced by `(?P<M>\d+)`.
+        # Following the example:
+        # 1. there's no M, pattern is not changed.
+        # 2. `gfx950-GEMM-N=\{N\}-K=\{K\}.json` becomes `gfx950-GEMM-N=(?P<N>\d+)-K=\{K\}.json`
+        # 3. `gfx950-GEMM-N=(?P<N>\d+)-K=\{K\}.json` becomes `gfx950-GEMM-N=(?P<N>\d+)-K=(?P<K>\d+).json`
+        pattern_str = pattern_str.replace(
+            rf"\{{{p}\}}",
+            rf"(?P<{p}>{NUM_PATTERN})",
+        )
+    # Compile regex with anchors to match entire path.
+    pattern = re.compile(f"^{pattern_str}$")
+    logging.debug("M/N/K regex is [%s].", pattern.pattern)
+    # Return f-string representations of matching config paths.
+    return [f'f"{path}"' for c in config_files if pattern.match(path := c.as_posix())]
+
+
+def expand_moe_dtypes(json_strings: list[str]) -> list[str]:
+    expanded_moe_dtypes: list[str] = []
+    for s in json_strings:
+        if r"MOE-{dtype_str}" in s:
+            expanded_moe_dtypes.extend(
+                s.replace(r"{dtype_str}", dtype) for dtype in MOE_DTYPES
+            )
+        else:
+            expanded_moe_dtypes.append(s)
+    return expanded_moe_dtypes
+
+
+def expand_interpolations(json_string: str, config_files: list[Path]) -> list[str]:
+    if not (json_string.startswith("f'") or json_string.startswith('f"')):
+        return [json_string]
+    # Replace config path placeholder
+    if r"{AITER_TRITON_CONFIGS_PATH}" in json_string:
+        json_string = json_string.replace(
+            r"{AITER_TRITON_CONFIGS_PATH}",
+            str(triton_config_dir().relative_to(root_dir()).as_posix()),
+        )
+        logging.debug("Resolved {AITER_TRITON_CONFIGS_PATH}: [%s]", json_string)
+    # Expand device variants
+    expanded = [json_string]
+    if r"{dev}" in json_string:
+        expanded = [s.replace(r"{dev}", dev) for s in expanded for dev in DEVICES]
+        logging.debug("Resolved {dev}: %s", expanded)
+    # Expand GEMM M-N-K patterns
+    expanded = [
+        expanded_mnk for s in expanded for expanded_mnk in expand_mnk(s, config_files)
+    ]
+    # Expand MOE data type variants
+    expanded = expand_moe_dtypes(expanded)
+    # Clean up f-string delimiters if no more interpolation needed
+    expanded = [s[2:-1] if not any(c in s for c in "{}") else s for s in expanded]
+    return expanded
+
+
+def resolve_path(json_string: str) -> Path | None:
+    p = Path(json_string)
+    # Try absolute path
+    if p.is_absolute() and p.exists() and p.is_file():
+        return p.relative_to(root_dir())
+    # Try relative to root
+    p = root_dir() / json_string
+    if p.exists() and p.is_file():
+        return p.relative_to(root_dir())
+    return None
+
+
+def resolve_json_strings(
+    json_strings: list[str], config_files: list[Path]
+) -> list[Path]:
+    # Expand all interpolations first
+    expanded_strings = [
+        expanded
         for json_string in json_strings
-        for resolved_json_strings in resolve_json_string_interpolation(json_string)
-    )
+        for expanded in expand_interpolations(json_string, config_files)
+    ]
+    # Sort and deduplicate
+    expanded_strings = sorted(set(expanded_strings))
+    # Resolve to actual paths
     resolved: list[Path] = []
     unresolved: list[str] = []
-    for json_string in json_strings:
-        p = Path(json_string)
-        if p.is_absolute() and p.exists() and p.is_file():
-            resolved.append(p.relative_to(root_dir()))
-        elif (p := root_dir() / json_string).exists() and p.is_file():
-            resolved.append(p.relative_to(root_dir()))
+    for json_string in expanded_strings:
+        if resolved_path := resolve_path(json_string):
+            resolved.append(resolved_path)
         else:
             unresolved.append(json_string)
+    # Log results
     if resolved:
         logging.debug("Resolved JSON config files:")
         log_file_list(logging.DEBUG, resolved)
@@ -214,10 +276,12 @@ def resolve_gemm_config_names(gemm_config_names: list[str]) -> list[Path]:
 
 
 def resolve_configs(
-    json_strings: list[str], gemm_config_names: list[str]
+    json_strings: list[str],
+    gemm_config_names: list[str],
+    config_files: list[Path],
 ) -> list[Path]:
     return sorted(
-        set(resolve_json_strings(json_strings)).union(
+        set(resolve_json_strings(json_strings, config_files)).union(
             resolve_gemm_config_names(gemm_config_names)
         )
     )
@@ -510,7 +574,9 @@ def parse_source_file(source_file: Path) -> tuple[list[Path], list[str], list[st
 def parse_source_file_recursively(
     graph: nx.DiGraph,
     source_file: Path,
+    config_files: list[Path],
     visited: set[Path],
+    deps_to_ignore: set[Path] = set(),
 ) -> None:
     stack = [source_file]
 
@@ -520,7 +586,7 @@ def parse_source_file_recursively(
             continue
 
         dependencies, json_strings, gemm_config_names = parse_source_file(current)
-        configs = resolve_configs(json_strings, gemm_config_names)
+        configs = resolve_configs(json_strings, gemm_config_names, config_files)
 
         # Add current node to the graph.
         current_str = str(current)
@@ -543,7 +609,11 @@ def parse_source_file_recursively(
             graph.add_edge(c_str, current_str)
             logging.debug("Added graph edge [%s]->[%s].", c_str, current_str)
 
-        stack.extend(d for d in dependencies if (root_dir() / d).is_file())
+        stack.extend(
+            d
+            for d in dependencies
+            if (rd := root_dir() / d).is_file() and rd not in deps_to_ignore
+        )
         visited.add(current)
 
 
@@ -568,25 +638,48 @@ def add_files_to_dependency_graph(
     graph: nx.DiGraph,
     files: list[Path],
     file_type: str,
+    config_files: list[Path],
     visited: set[Path],
+    deps_to_ignore: set[Path] = set(),
 ) -> None:
     for f in files:
-        parse_source_file_recursively(graph, f, visited)
+        parse_source_file_recursively(
+            graph, f, config_files, visited, deps_to_ignore=deps_to_ignore
+        )
         tag_node(graph, f, file_type)
 
 
 def build_dependency_graph(
     kernel_files: list[Path],
-    cofig_files: list[Path],
+    config_files: list[Path],
     test_files: list[Path],
     bench_files: list[Path],
 ) -> nx.DiGraph:
     graph: nx.DiGraph = nx.DiGraph()
     visited: set[Path] = set()
+    # These source files have dependencies that are hard to track and can be safely ignored for
+    # Triton test selection purposes:
+    deps_to_ignore: set[Path] = {
+        root_dir() / "aiter" / "jit" / "core.py",
+        root_dir() / "aiter" / "dist" / "utils.py",
+        root_dir() / "csrc" / "cpp_itfs" / "hsaco_launcher.py",
+    }
+    assert all(
+        d.is_file() and d.exists() for d in deps_to_ignore
+    ), "All ignored source file dependencies must exist in the filesystem."
     # Add files that tests depends on.
-    add_files_to_dependency_graph(graph, test_files, "test", visited)
+    add_files_to_dependency_graph(
+        graph, test_files, "test", config_files, visited, deps_to_ignore=deps_to_ignore
+    )
     # Add files that benchmarks depends on.
-    add_files_to_dependency_graph(graph, bench_files, "bench", visited)
+    add_files_to_dependency_graph(
+        graph,
+        bench_files,
+        "bench",
+        config_files,
+        visited,
+        deps_to_ignore=deps_to_ignore,
+    )
     logging.debug(
         "Built dependency graph of Triton source files with %d nodes and %d edges.",
         graph.number_of_nodes(),
@@ -594,10 +687,11 @@ def build_dependency_graph(
     )
     # Tag kernel files.
     for kernel_file in kernel_files:
-        tag_node(graph, kernel_file, "kernel")
+        if kernel_file.name != "__init__.py":
+            tag_node(graph, kernel_file, "kernel")
     # Tag config files.
-    for cofig_file in cofig_files:
-        tag_node(graph, cofig_file, "config")
+    for config_file in config_files:
+        tag_node(graph, config_file, "config")
     return graph
 
 
@@ -754,7 +848,7 @@ def parse_args() -> argparse.Namespace:
 # ------------------------------------------------------------------------------
 
 
-def main_logic(args: argparse.Namespace) -> int:
+def main_logic(args: argparse.Namespace) -> None:
     diff_files = get_filename_diff(args.source, args.target)
     all_files, kernel_files, config_files, test_files, bench_files = (
         list_triton_source_files()
@@ -766,7 +860,7 @@ def main_logic(args: argparse.Namespace) -> int:
         logging.info(
             "There are no Triton source files in diff, there's no need to run Triton tests."
         )
-        return 0
+        return
 
     logging.info(
         "There %s %d Triton source file%s in the diff:",
@@ -783,22 +877,20 @@ def main_logic(args: argparse.Namespace) -> int:
     tests_to_run = find_tests_to_run(graph, sorted_diff_inter_triton)
 
     if not tests_to_run:
-        return 1
+        return
 
     write_env_file(args.env_var, args.env_file, tests_to_run)
-    return 0
 
 
-def main() -> int:
+def main() -> None:
     start_timestamp = time.perf_counter()
     args = parse_args()
     logging.basicConfig(format="%(levelname)s|%(message)s", level=args.log_level)
-    exit_code = main_logic(args)
+    main_logic(args)
     end_timestamp = time.perf_counter()
     elapsed_time_s = end_timestamp - start_timestamp
     logging.info("Finished, execution took %.2f seconds.", elapsed_time_s)
-    return exit_code
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

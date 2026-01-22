@@ -224,6 +224,7 @@ def cmdGenFunc_ck_moe_stage(
     quant_type: int = 0,
     activation: int = 0,
     splitk: int = 1,
+    use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
 ):
 
@@ -262,6 +263,9 @@ def cmdGenFunc_ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    splitk: int = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: Optional[str] = None,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -298,6 +302,7 @@ def ck_moe_stage1(
     quant_type: int = 0,
     activation: int = 0,
     splitk: Optional[int] = 1,
+    use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
 ) -> None: ...
 
@@ -319,6 +324,9 @@ def ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    splitk: int = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: Optional[str] = None,
 ) -> None: ...
 
 
@@ -524,6 +532,7 @@ def ck_moe_stage1_fwd(
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
     splitk: Optional[int] = 1,
+    use_non_temporal_load: Optional[bool] = False,
     dst_type: Optional[torch.dtype] = None,
 ):
     ck_moe_stage1(
@@ -543,6 +552,7 @@ def ck_moe_stage1_fwd(
         quant_type.value,
         activation.value,
         int(splitk) if splitk is not None else splitk,
+        use_non_temporal_load,
         dtype2str_dict[dst_type],
     )
     return out
@@ -564,8 +574,8 @@ def ck_moe_stage2_fwd(
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
+    use_non_temporal_load: Optional[bool] = False,
 ):
-
     ck_moe_stage2(
         inter_states,
         w1,
@@ -582,5 +592,6 @@ def ck_moe_stage2_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
+        use_non_temporal_load=use_non_temporal_load,
     )
     return out

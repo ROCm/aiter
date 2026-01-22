@@ -470,9 +470,10 @@ parser.add_argument(
     "-o",
     "--otype",
     type=dtypes.str2Dtype,
+    nargs="*",
     default=[torch.float16, torch.bfloat16, torch.float32],
     help="""Data type of output.
-    e.g.: -d bf16""",
+    e.g.: -o bf16""",
 )
 parser.add_argument(
     "-sa",
