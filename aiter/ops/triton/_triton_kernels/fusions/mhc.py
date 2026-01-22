@@ -32,10 +32,10 @@ def _mhc_fused_kernel(
     out_pre_ptr,
     out_post_ptr,
     out_res_ptr,
-    M: tl.constexpr,   # rows: x.shape[0] - the batch/sequence dimension. Represents how many input vectors we're processing
-    K: tl.constexpr,   # input features: nC = x.shape[1] - must match phi.shape[0]. Called nC in the paper (n × C where C is some latent dimension)
-    N: tl.constexpr,   # output features: n² + 2n - total output dimension split into 3 streams (pre: n, post: n, res: n²)
-    n: tl.constexpr,   # stream parameter: n - Hyperparameter from paper controlling manifold dimension. Determines stream sizes
+    M: tl.constexpr,   # rows: x.shape[0] - the batch/sequence dimension
+    K: tl.constexpr,   # input features: nC = x.shape[1]
+    N: tl.constexpr,   # output features: n² + 2n - total output dimension
+    n: tl.constexpr,   # stream parameter controlling manifold dimension
     eps: tl.constexpr, # epsilon for numerical stability in RMSNorm
     stride_xm,
     stride_xk,
@@ -56,143 +56,110 @@ def _mhc_fused_kernel(
     BLOCK_K: tl.constexpr,
 ):
     """
-    Fused kernel for equations 14-18.
+    Fused kernel for equations 14-18 with stream-aware grid.
     
     Computes three separate outputs:
-    - H^pre: (M, n) with sigmoid activation (H^{pre} ∈ ℝ^{1×n})
-    - H^post: (M, n) with 2*sigmoid activation (H^{post} ∈ ℝ^{1×n})
-    - H^res: (M, n²) with identity (no activation) (H^{res} ∈ ℝ^{n×n})
+    - H^pre: (M, n) with sigmoid activation (Eq 17)
+    - H^post: (M, n) with 2*sigmoid activation (Eq 18)
+    - H^res: (M, n²) with identity (no activation, for Eq 19)
     
-    All operations fused in a single kernel pass for maximum efficiency.
+    Grid structure:
+    - The grid is organized per-stream so each program processes exactly one stream
+    - pid_n maps to: [0, n_blocks_pre) = pre, [n_blocks_pre, n_blocks_pre+post) = post, rest = res
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # Row and column indices
+    # Row indices
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    # Eq 14 & 15: Compute matrix multiplication and RMS norm in single pass
+    
+    # Compute stream block counts
+    n_squared = n * n
+    n_blocks_pre = tl.cdiv(n, BLOCK_N)
+    n_blocks_post = n_blocks_pre # post stream has the same number of blocks as pre stream
+    
+    # Determine stream type from pid_n, each program processes exactly one stream
+    is_pre_program = pid_n < n_blocks_pre
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
+    # is_res_program implied when neither pre nor post
+    
+    # Compute local block index within the stream
+    local_pid_n = tl.where(is_pre_program, pid_n,
+                           tl.where(is_post_program, pid_n - n_blocks_pre,
+                                    pid_n - n_blocks_pre - n_blocks_post))
+    
+    # Local column indices within the stream
+    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Global column index (for bias lookup)
+    col_offset = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
+    rn_global = rn_local + col_offset
+    
+    # Output dimension for this stream
+    n_out = tl.where(is_pre_program, n, tl.where(is_post_program, n, n_squared))
+    
+    # MATMUL (Eq 14) + RMS ACCUMULATION (Eq 15)
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-    
-    # Stream boundaries
-    n_pre_end = n
-    n_post_end = 2 * n
-    n_squared = n * n
+
+    # Select phi pointers and strides based on stream type
+    phi_ptr = tl.where(is_pre_program, phi_pre_ptr,
+                       tl.where(is_post_program, phi_post_ptr, phi_res_ptr))
+    stride_phi_k = tl.where(is_pre_program, stride_phi_pre_k,
+                       tl.where(is_post_program, stride_phi_post_k, stride_phi_res_k))
+    stride_phi_n = tl.where(is_pre_program, stride_phi_pre_n,
+                       tl.where(is_post_program, stride_phi_post_n, stride_phi_res_n))
     
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
-
+        
+        # Load x tile
         x_tile = tl.load(
             x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
             mask=(rm[:, None] < M) & (rk[None, :] < K),
             other=0.0,
         )
-
-        # Load from all three phi tensors and select based on column index
-        # Pre-stream columns [0:n]
-        is_pre = rn < n_pre_end
-        rn_pre = rn
-        phi_pre_tile = tl.load(
-            phi_pre_ptr + rk[:, None] * stride_phi_pre_k + rn_pre[None, :] * stride_phi_pre_n,
-            mask=(rk[:, None] < K) & is_pre[None, :] & (rn_pre[None, :] < n),
+        
+        # SINGLE PHI LOAD         
+        phi_tile = tl.load(
+            phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
+            mask=(rk[:, None] < K) & (rn_local[None, :] >= 0) & (rn_local[None, :] < n_out),
             other=0.0,
         )
         
-        # Post-stream columns [n:2n]
-        is_post = (rn >= n_pre_end) & (rn < n_post_end)
-        rn_post = rn - n
-        phi_post_tile = tl.load(
-            phi_post_ptr + rk[:, None] * stride_phi_post_k + rn_post[None, :] * stride_phi_post_n,
-            mask=(rk[:, None] < K) & is_post[None, :] & (rn_post[None, :] >= 0) & (rn_post[None, :] < n),
-            other=0.0,
-        )
-        
-        # Res-stream columns [2n:2n+n²]
-        is_res = rn >= n_post_end
-        rn_res = rn - (2 * n)
-        phi_res_tile = tl.load(
-            phi_res_ptr + rk[:, None] * stride_phi_res_k + rn_res[None, :] * stride_phi_res_n,
-            mask=(rk[:, None] < K) & is_res[None, :] & (rn_res[None, :] >= 0) & (rn_res[None, :] < n_squared),
-            other=0.0,
-        )
-        
-        # Combine tiles based on which stream each column belongs to
-        phi_tile = tl.where(is_pre[None, :], phi_pre_tile, 
-                           tl.where(is_post[None, :], phi_post_tile, phi_res_tile))
-
-        # Eq 14: Accumulate matrix multiplication H̃ = x̃φ
         acc += tl.dot(x_tile, phi_tile)
-        
-        # Eq 15: Accumulate squared sum for RMS norm r = ||x̃||₂ / √(nC)
         x_tile_f32 = x_tile.to(tl.float32)
         acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
-
+    
+    # RMS NORMALIZATION (Eq 15)
     rms = tl.sqrt(acc_sq / K + eps)
-    # Performance optimization: compute 1/r once instead of dividing N times
-    # Division is ~10x slower than multiplication on GPUs
     rsigma = 1.0 / rms
     
-    # Load bias
-    bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
-    
-    # Eq 16: Apply stream-specific scaling and bias
-    # Output is split into 3 contiguous streams:
-    #   Pre-stream:  indices [0, n) - n elements for manifold projection (H^{pre} ∈ ℝ^{1×n})
-    #   Post-stream: indices [n, 2n) - n elements for post-processing (H^{post} ∈ ℝ^{1×n})
-    #   Res-stream:  indices [2n, 2n+n²) - n² elements for residual connections (H^{res} ∈ ℝ^{n×n})
-    n_pre_end = n                # End of pre-stream
-    n_post_end = 2 * n           # End of post-stream
-    
-    # Create boolean masks to identify which stream each output column belongs to
-    is_pre = rn < n_pre_end
-    is_post = (rn >= n_pre_end) & (rn < n_post_end)
-    
-    # Select the appropriate scaling factor (alpha) for each stream
-    # This creates a vector where each element has its stream-specific alpha
-    alpha = tl.where(is_pre, alpha_pre, 
-                     tl.where(is_post, alpha_post, alpha_res))
+    # BIAS + ALPHA SCALING (Eq 16)
+    bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
+    alpha_val = tl.where(is_pre_program, alpha_pre,
+                        tl.where(is_post_program, alpha_post, alpha_res))
     
     # Apply Eq 16: H = (1/r) * α * H̃ + b
-    # rsigma[:, None] broadcasts 1/r across columns (per-row normalization)
-    # alpha is per-column (stream-specific scaling)
-    # acc is the matrix product H̃ from Eq 14
-    out = rsigma[:, None] * alpha * acc + bias[None, :]
+    out = rsigma[:, None] * alpha_val * acc + bias[None, :]
     
-    # Apply stream-specific activations and store to separate output buffers
-    
-    # Pre-stream (Eq 17): H^pre = σ(H^pre) - sigmoid activation
-    # Columns [0:n] go to out_pre
-    out_pre = tl.sigmoid(out)
-    rn_pre = rn  # Pre-stream columns [0:n]
-    tl.store(
-        out_pre_ptr + rm[:, None] * stride_pre_m + rn_pre[None, :] * stride_pre_n,
-        out_pre,
-        mask=(rm[:, None] < M) & is_pre[None, :] & (rn_pre[None, :] >= 0) & (rn_pre[None, :] < n),
+    # Apply stream-specific activation
+    out_activated = tl.where(
+        is_pre_program, tl.sigmoid(out),
+        tl.where(is_post_program, 2.0 * tl.sigmoid(out), out)
     )
+
+    out_ptr = tl.where(is_pre_program, out_pre_ptr,
+                       tl.where(is_post_program, out_post_ptr, out_res_ptr))
+    stride_out_m = tl.where(is_pre_program, stride_pre_m,
+                       tl.where(is_post_program, stride_post_m, stride_res_m))
+    stride_out_n = tl.where(is_pre_program, stride_pre_n,
+                       tl.where(is_post_program, stride_post_n, stride_res_n))
     
-    # Post-stream (Eq 18): H^post = 2σ(H^post) - scaled sigmoid activation  
-    # Columns [n:2n] go to out_post
-    out_post = 2.0 * tl.sigmoid(out)
-    rn_post = rn - n  # Map global column index to post-stream local index [0:n]
     tl.store(
-        out_post_ptr + rm[:, None] * stride_post_m + rn_post[None, :] * stride_post_n,
-        out_post,
-        mask=(rm[:, None] < M) & is_post[None, :] & (rn_post[None, :] >= 0) & (rn_post[None, :] < n),
-    )
-    
-    # Res-stream: H^res remains unchanged (identity activation)
-    # Columns [2n:2n+n²] go to out_res
-    # This preserves the values for subsequent Sinkhorn-Knopp normalization (Eq 19)
-    is_res = rn >= n_post_end
-    n_squared = n * n
-    out_res = out
-    rn_res = rn - (2 * n)  # Map global column index to res-stream local index [0:n²]
-    tl.store(
-        out_res_ptr + rm[:, None] * stride_res_m + rn_res[None, :] * stride_res_n,
-        out_res,
-        mask=(rm[:, None] < M) & is_res[None, :] & (rn_res[None, :] >= 0) & (rn_res[None, :] < n_squared),
+        out_ptr + rm[:, None] * stride_out_m + rn_local[None, :] * stride_out_n,
+        out_activated,
+        mask=(rm[:, None] < M) & (rn_local[None, :] >= 0) & (rn_local[None, :] < n_out),
     )
 
 

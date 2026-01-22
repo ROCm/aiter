@@ -152,8 +152,14 @@ def mhc(
     BLOCK_N = min(128, triton.next_power_of_2(N))
     BLOCK_K = min(128, triton.next_power_of_2(K))
 
-    # Launch 2D grid: one thread block per (BLOCK_M x BLOCK_N) output tile
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    # Stream-aware grid: Each program processes exactly one stream
+    n_blocks_pre = triton.cdiv(n, BLOCK_N)
+    n_blocks_post = triton.cdiv(n, BLOCK_N)
+    n_blocks_res = triton.cdiv(n * n, BLOCK_N)
+    total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
+    
+    # Launch 2D grid: (row blocks, stream-aware column blocks)
+    grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
 
     # Invoke the fused Triton kernel for equations 14-18
     _mhc_fused_kernel[grid](
