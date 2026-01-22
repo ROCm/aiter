@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import importlib.util
 import sys
@@ -42,7 +42,7 @@ if _COMMS_AVAILABLE:
     )
 
 """
-These following help implement backward-compatibility 
+These following help implement backward-compatibility
 for modules that were reorganized so that external repos (like sglang for example),
 which depend on the old module names, can still import it the old "way" of importing.
 """
@@ -78,6 +78,7 @@ _BACKWARD_COMPAT_MAP = {
     "fused_gemm_afp4wfp4_a16w16": "gemm.fused.fused_gemm_afp4wfp4_a16w16",
     "fused_gemm_afp4wfp4_mul_add": "gemm.fused.fused_gemm_afp4wfp4_mul_add",
     "fused_gemm_afp4wfp4_split_cat": "gemm.fused.fused_gemm_afp4wfp4_split_cat",
+    "fused_gemm_a8w8_blockscale_split_cat": "gemm.fused.fused_gemm_a8w8_blockscale_split_cat",
     # Attention modules (attention/)
     "chunked_pa_prefill": "attention.chunked_pa_prefill",
     "extend_attention": "attention.extend_attention",

@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
 import torch
 import triton
 
 from aiter.ops.triton.attention.lean_atten import _persistent_lean_attention
-
 
 configs = []
 configs.append(

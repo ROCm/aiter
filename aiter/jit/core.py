@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 import importlib
@@ -200,7 +200,11 @@ class AITER_CONFIG(object):
                 df_list.append(df)
             else:
                 logger.info(f"path {i+1}: {path} (not exist)")
-        merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+        merge_df = (
+            pd.concat([df for df in df_list if not df.empty], ignore_index=True)
+            if df_list
+            else pd.DataFrame()
+        )
         ## get keys from untuned file to drop_duplicates
         untuned_name = (
             re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
@@ -305,7 +309,7 @@ sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
 gfxs = get_gfx_list()
-AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{get_gfx()}/"
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 
 CK_3RDPARTY_DIR = os.environ.get(
@@ -317,7 +321,7 @@ CK_DIR = CK_3RDPARTY_DIR
 
 @functools.lru_cache(maxsize=1)
 def get_asm_dir():
-    return AITER_ASM_DIR
+    return os.path.join(AITER_ASM_DIR, get_gfx())
 
 
 @functools.lru_cache(maxsize=1)
@@ -814,7 +818,7 @@ def compile_ops(
                 if module is None:
                     try:
                         module = get_module(md_name)
-                    except Exception as e:
+                    except Exception:
                         md = custom_build_args.get("md_name", md_name)
                         module = get_module(md)
             except ModuleNotFoundError:

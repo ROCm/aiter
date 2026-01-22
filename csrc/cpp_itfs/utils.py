@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
 import shutil
@@ -54,13 +54,6 @@ AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
-LOG_LEVEL = {
-    0: logging.ERROR,
-    1: logging.WARNING,
-    2: logging.INFO,
-    3: logging.DEBUG,
-}
-logger.setLevel(LOG_LEVEL[AITER_LOG_MORE])
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
@@ -72,8 +65,7 @@ if not os.path.exists(BUILD_DIR):
 
 CK_DIR = os.environ.get("CK_DIR", f"{AITER_CORE_DIR}/3rdparty/composable_kernel")
 
-makefile_template = Template(
-    """
+makefile_template = Template("""
 CXX=hipcc
 TARGET=lib.so
 
@@ -88,8 +80,7 @@ build: $(OBJS)
 
 clean:
 	rm -f $(TARGET) $(OBJS)
-"""
-)
+""")
 
 
 def mp_lock(

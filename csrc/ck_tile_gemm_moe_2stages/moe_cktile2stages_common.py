@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 import os
 import sys
@@ -15,7 +15,6 @@ else:
 sys.path.insert(0, AITER_CORE_DIR)
 
 from chip_info import get_gfx  # noqa: E402
-
 
 act_dict = {
     "no": -1,
