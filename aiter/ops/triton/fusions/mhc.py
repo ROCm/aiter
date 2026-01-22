@@ -4,7 +4,9 @@
 """
 High-level Python wrapper for mHC (manifold-constrained Hyper Connection).
 
-Implements equations 14-18 from the mHC paper in a single optimized kernel call.
+Provides two main functions:
+- fused_mhc(): Low-level interface for equations 14-18 (fused kernel only)
+- mhc(): Complete pipeline implementing equations 14-19 (kernel + Sinkhorn-Knopp)
 """
 
 from typing import Optional
@@ -20,7 +22,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-def mhc(
+def fused_mhc(
     x: torch.Tensor,
     phi_pre: torch.Tensor,
     phi_post: torch.Tensor,
@@ -36,7 +38,8 @@ def mhc(
     out_res: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute mHC projection mapping with all three streams (equations 14-19).
+    Fused Triton kernel inferface for mHC projection mapping (equations 14-18).
+
 
     This function implements:
     - Eq 14: H̃ = x̃φ (matrix multiplication)
@@ -44,10 +47,8 @@ def mhc(
     - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
     - Eq 17: H^pre = σ(H^pre) - sigmoid activation for pre-stream
     - Eq 18: H^post = 2σ(H^post) - scaled sigmoid activation for post-stream
-    - Eq 19: H^res = Sinkhorn(H^res) - project residual stream onto doubly stochastic
-             manifold (identity activation followed by iterative row/column normalization)
 
-    All operations are fused in optimized Triton kernels for maximum performance.
+    All operations are fused in an optimized Triton kernel for maximum performance.
 
     Args:
         x: Input tensor with shape (M, nC) where M is batch/sequence length and
@@ -70,7 +71,7 @@ def mhc(
         Tuple of three tensors (H_pre, H_post, H_res):
         - H_pre: (M, n) - manifold projection with sigmoid activation (H^{pre} ∈ ℝ^{M×n})
         - H_post: (M, n) - post-processing with scaled sigmoid (H^{post} ∈ ℝ^{M×n})
-        - H_res: (M, n²) - doubly stochastic residual connection (H^{res} ∈ ℝ^{M×n²})
+        - H_res: (M, n²) - raw residual stream (identity activation, NOT doubly stochastic)
 
     Shape requirements:
         - x: (M, nC) where nC = n * C (flattened streams)
@@ -89,15 +90,12 @@ def mhc(
         >>> phi_res = torch.randn(nC, n*n, dtype=torch.bfloat16, device='cuda')
         >>> bias = torch.randn(n*n + 2*n, dtype=torch.float32, device='cuda')
         >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
-        >>> 
-        >>> # Full mHC with Sinkhorn-Knopp (Eq 14-19)
-        >>> H_pre, H_post, H_res = mhc(x, phi_pre, phi_post, phi_res, 
-        ...                            alpha_pre, alpha_post, alpha_res, bias, n)
+        >>> H_pre, H_post, H_res = fused_mhc(x, phi_pre, phi_post, phi_res, 
+        ...                                   alpha_pre, alpha_post, alpha_res, bias, n)
         >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
-        >>> # H_res is doubly stochastic: rows and columns sum to 1
     """
     _LOGGER.info(
-        f"MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
+        f"FUSED_MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
     )
     
     # Input shape extraction
@@ -201,17 +199,110 @@ def mhc(
         BLOCK_K=BLOCK_K,
     )
 
+    return out_pre, out_post, out_res
+
+
+def mhc(
+    x: torch.Tensor,
+    phi_pre: torch.Tensor,
+    phi_post: torch.Tensor,
+    phi_res: torch.Tensor,
+    alpha_pre: float,
+    alpha_post: float,
+    alpha_res: float,
+    bias: torch.Tensor,
+    n: int,
+    eps: float = 1e-6,
+    sinkhorn_iters: int = 20,
+    out_pre: Optional[torch.Tensor] = None,
+    out_post: Optional[torch.Tensor] = None,
+    out_res: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute mHC projection mapping with all three streams (equations 14-19 from the paper).
+
+    This function implements:
+    - Eq 14: H̃ = x̃φ (matrix multiplication)
+    - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
+    - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
+    - Eq 17: H^pre = σ(H^pre) - sigmoid activation for pre-stream
+    - Eq 18: H^post = 2σ(H^post) - scaled sigmoid activation for post-stream
+    - Eq 19: H^res = Sinkhorn(H^res) - project residual stream onto doubly stochastic
+             manifold (identity activation followed by iterative row/column normalization)
+
+    All operations are fused in optimized Triton kernels for maximum performance.
+
+    Args:
+        x: Input tensor with shape (M, nC) where M is batch/sequence length and
+           nC is the input feature dimension (n × C in paper notation)
+        phi_pre: Pre-stream projection matrix with shape (nC, n)
+        phi_post: Post-stream projection matrix with shape (nC, n)
+        phi_res: Residual stream projection matrix with shape (nC, n²)
+        alpha_pre: Scaling factor α^pre for pre-stream (first n elements)
+        alpha_post: Scaling factor α^post for post-stream (next n elements)
+        alpha_res: Scaling factor α^res for residual stream (last n² elements)
+        bias: Bias vector b with shape (n² + 2n,) applied after scaling
+        n: Stream parameter - hyperparameter controlling manifold dimension.
+           Determines output sizes: n (pre) + n (post) + n² (res) = n² + 2n
+        eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
+        sinkhorn_iters: Number of Sinkhorn-Knopp iterations for Eq 19 (default: 10)
+        out_pre (Optional[torch.Tensor]): Pre-allocated output for H^pre with shape (M, n)
+        out_post (Optional[torch.Tensor]): Pre-allocated output for H^post with shape (M, n)
+        out_res (Optional[torch.Tensor]): Pre-allocated output for H^res with shape (M, n²)
+
+    Returns:
+        Tuple of three tensors (H_pre, H_post, H_res):
+        - H_pre: (M, n) - manifold projection with sigmoid activation (H^{pre} ∈ ℝ^{M×n})
+        - H_post: (M, n) - post-processing with scaled sigmoid (H^{post} ∈ ℝ^{M×n})
+        - H_res: (M, n²) - doubly stochastic residual connection (H^{res} ∈ ℝ^{M×n²})
+
+    Shape requirements:
+        - x: (M, nC) where nC = n * C (flattened streams)
+        - phi_pre: (nC, n)
+        - phi_post: (nC, n)
+        - phi_res: (nC, n²)
+        - bias: (n² + 2n,)
+        - outputs: H_pre (M, n), H_post (M, n), H_res (M, n²)
+
+    Example:
+        >>> M, n, C = 32, 4, 1024
+        >>> nC = n * C  # 4096 input features
+        >>> x = torch.randn(M, nC, dtype=torch.bfloat16, device='cuda')
+        >>> phi_pre = torch.randn(nC, n, dtype=torch.bfloat16, device='cuda')
+        >>> phi_post = torch.randn(nC, n, dtype=torch.bfloat16, device='cuda')
+        >>> phi_res = torch.randn(nC, n*n, dtype=torch.bfloat16, device='cuda')
+        >>> bias = torch.randn(n*n + 2*n, dtype=torch.float32, device='cuda')
+        >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
+        >>> 
+        >>> # Full mHC with Sinkhorn-Knopp (Eq 14-19)
+        >>> H_pre, H_post, H_res = mhc(x, phi_pre, phi_post, phi_res, 
+        ...                            alpha_pre, alpha_post, alpha_res, bias, n)
+        >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
+    """
+    _LOGGER.info(
+        f"MHC: calling fused_mhc() then sinkhorn_knopp() with {sinkhorn_iters} iterations"
+    )
+    
+    # Call fused_mhc function (Eq 14-18)
+    out_pre, out_post, out_res = fused_mhc(
+        x, phi_pre, phi_post, phi_res,
+        alpha_pre, alpha_post, alpha_res,
+        bias, n, eps,
+        out_pre=out_pre, out_post=out_post, out_res=out_res
+    )
+    
     # Apply Sinkhorn-Knopp (Equation 19) to make H_res doubly stochastic
     # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn kernel
+    M = out_res.shape[0]
     H_res_3d = out_res.view(M, n, n)
-    sinkhorn_knopp(H_res_3d, out=H_res_3d)
-
+    sinkhorn_knopp(H_res_3d, num_iters=sinkhorn_iters, out=H_res_3d)
+    
     return out_pre, out_post, out_res
 
 
 def sinkhorn_knopp(
     logits: torch.Tensor,
-    num_iters: int = 10,
+    num_iters: int = 20,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """

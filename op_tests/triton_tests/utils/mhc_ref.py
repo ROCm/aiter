@@ -5,7 +5,7 @@
 PyTorch reference implementations for mHC (manifold-constrained Hyper Connection).
 
 This module provides reference implementations for validating Triton kernels:
-- mhc_torch: Reference for mHC projection mapping (Eq 14-18)
+- mhc_torch: Reference for mHC projection mapping (Eq 14-19)
 - sinkhorn_knopp_exp_domain_torch: Sinkhorn-Knopp in exponential domain
 - sinkhorn_knopp_log_domain_torch: Sinkhorn-Knopp in log domain
 - is_doubly_stochastic: Helper to validate doubly stochastic matrices
@@ -112,9 +112,10 @@ def mhc_torch(
     
     # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint
     # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn algorithm
+    # Note: Use 20 iterations to match the default in the Triton mhc() implementation
     M = H_res.shape[0]
     H_res_3d = H_res.view(M, n, n)
-    H_res_ds = sinkhorn_knopp_log_domain_torch(H_res_3d)
+    H_res_ds = sinkhorn_knopp_log_domain_torch(H_res_3d, num_iters=20)
     H_res = H_res_ds.view(M, -1)  # Reshape back to (M, n²)
     
     # Return three separate streams

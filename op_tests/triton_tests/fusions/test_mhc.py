@@ -23,7 +23,7 @@ Notation (from mHC paper arXiv:2512.24880v2):
 
 import torch
 import pytest
-from aiter.ops.triton.fusions.mhc import mhc, sinkhorn_knopp
+from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
 from op_tests.triton_tests.utils.mhc_ref import (
     mhc_torch,
     sinkhorn_knopp_exp_domain_torch,
@@ -44,7 +44,7 @@ from op_tests.triton_tests.utils.mhc_ref import (
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_correctness(M, n, C, dtype):
     """
-    Test that Triton kernel matches PyTorch reference for equations 14-18.
+    Test that Triton mhc() matches PyTorch reference for equations 14-19.
     
     Validates correctness across various shapes and data types.
     """
@@ -68,8 +68,6 @@ def test_mhc_correctness(M, n, C, dtype):
         atol=1e-2,
         rtol=1e-2,
     )
-    # Relaxed tolerance for H_res due to Sinkhorn-Knopp iterative algorithm
-    # which amplifies small numerical differences, especially with bfloat16
     torch.testing.assert_close(
         H_res_triton.to(torch.float32),
         H_res_torch.to(torch.float32),
@@ -81,7 +79,7 @@ def test_mhc_correctness(M, n, C, dtype):
 @pytest.mark.parametrize("M, n, C", get_test_shapes())
 def test_mhc_preallocated_output(M, n, C):
     """
-    Test mHC with pre-allocated output tensors.
+    Test mhc() with pre-allocated output tensors.
     
     Verifies that the kernel correctly writes to user-provided output buffers.
     """
@@ -113,7 +111,7 @@ def test_mhc_preallocated_output(M, n, C):
         atol=1e-2,
         rtol=1e-2,
     )
-    # Relaxed tolerance for H_res due to Sinkhorn-Knopp iterative algorithm
+    # H_res uses relaxed tolerance because Sinkhorn-Knopp is an iterative algorithm
     torch.testing.assert_close(
         out_res.to(torch.float32),
         H_res_torch.to(torch.float32),
@@ -126,7 +124,7 @@ def test_mhc_preallocated_output(M, n, C):
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024)])
 def test_mhc_different_epsilon(eps, M, n, C):
     """
-    Test mHC with different epsilon values for RMSNorm (Eq 15).
+    Test mhc() with different epsilon values for RMSNorm (Eq 15).
     
     Validates numerical stability parameter handling.
     """
@@ -137,23 +135,25 @@ def test_mhc_different_epsilon(eps, M, n, C):
     H_pre_torch, H_post_torch, H_res_torch = mhc_torch(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams, eps=eps)
     H_pre_triton, H_post_triton, H_res_triton = mhc(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams, eps=eps)
 
-    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton), (H_res_torch, H_res_triton)]:
-        # Use relaxed tolerance for H_res due to Sinkhorn-Knopp
-        is_res = torch_out is H_res_torch
-        atol = 5e-2 if is_res else 1e-2
-        rtol = 5e-2 if is_res else 1e-2
+    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton)]:
         torch.testing.assert_close(
             triton_out.to(torch.float32),
             torch_out.to(torch.float32),
-            atol=atol,
-            rtol=rtol,
+            atol=1e-2,
+            rtol=1e-2,
         )
+    torch.testing.assert_close(
+        H_res_triton.to(torch.float32),
+        H_res_torch.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 @pytest.mark.parametrize("alpha_scale", [0.1, 0.5, 1.0, 2.0, 10.0])
 def test_mhc_different_alpha(alpha_scale):
     """
-    Test mHC with different scaling factors α (Eq 16).
+    Test mhc() with different scaling factors α (Eq 16).
     
     Validates stream-specific scaling behavior across range of α values.
     """
@@ -170,22 +170,24 @@ def test_mhc_different_alpha(alpha_scale):
     H_pre_torch, H_post_torch, H_res_torch = mhc_torch(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams)
     H_pre_triton, H_post_triton, H_res_triton = mhc(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
-    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton), (H_res_torch, H_res_triton)]:
-        # Use relaxed tolerance for H_res due to Sinkhorn-Knopp
-        is_res = torch_out is H_res_torch
-        atol = 5e-2 if is_res else 1e-2
-        rtol = 5e-2 if is_res else 1e-2
+    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton)]:
         torch.testing.assert_close(
             triton_out.to(torch.float32),
             torch_out.to(torch.float32),
-            atol=atol,
-            rtol=rtol,
+            atol=1e-2,
+            rtol=1e-2,
         )
+    torch.testing.assert_close(
+        H_res_triton.to(torch.float32),
+        H_res_torch.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 def test_mhc_zero_input():
     """
-    Test mHC with zero input (edge case for RMSNorm).
+    Test mhc() with zero input (edge case for RMSNorm).
     
     When x = 0, RMS norm → ε, testing numerical stability of Eq 15.
     """
@@ -205,22 +207,24 @@ def test_mhc_zero_input():
     H_pre_torch, H_post_torch, H_res_torch = mhc_torch(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n)
     H_pre_triton, H_post_triton, H_res_triton = mhc(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n)
 
-    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton), (H_res_torch, H_res_triton)]:
-        # Use relaxed tolerance for H_res due to Sinkhorn-Knopp
-        is_res = torch_out is H_res_torch
-        atol = 5e-2 if is_res else 1e-2
-        rtol = 5e-2 if is_res else 1e-2
+    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton)]:
         torch.testing.assert_close(
             triton_out.to(torch.float32),
             torch_out.to(torch.float32),
-            atol=atol,
-            rtol=rtol,
+            atol=1e-2,
+            rtol=1e-2,
         )
+    torch.testing.assert_close(
+        H_res_triton.to(torch.float32),
+        H_res_torch.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 def test_mhc_large_values():
     """
-    Test numerical stability with large input values.
+    Test mhc() numerical stability with large input values.
     
     Validates that float32 accumulation prevents overflow/underflow.
     """
@@ -240,24 +244,26 @@ def test_mhc_large_values():
     H_pre_torch, H_post_torch, H_res_torch = mhc_torch(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n)
     H_pre_triton, H_post_triton, H_res_triton = mhc(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n)
 
-    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton), (H_res_torch, H_res_triton)]:
-        # Use even more relaxed tolerance for large values + Sinkhorn-Knopp
-        is_res = torch_out is H_res_torch
-        atol = 0.2 if is_res else 0.1
-        rtol = 0.1 if is_res else 0.05
+    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton)]:
         torch.testing.assert_close(
             triton_out.to(torch.float32),
             torch_out.to(torch.float32),
-            atol=atol,
-            rtol=rtol,
+            atol=1e-2,
+            rtol=1e-2,
         )
+    torch.testing.assert_close(
+        H_res_triton.to(torch.float32),
+        H_res_torch.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_small_shapes(M, n, C, dtype):
     """
-    Quick smoke test with representative shapes.
+    Quick smoke test for mhc() with representative shapes.
     
     Subset of test_mhc_correctness for faster validation during development.
     """
@@ -269,27 +275,29 @@ def test_mhc_small_shapes(M, n, C, dtype):
     H_pre_torch, H_post_torch, H_res_torch = mhc_torch(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams)
     H_pre_triton, H_post_triton, H_res_triton = mhc(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
-    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton), (H_res_torch, H_res_triton)]:
-        # Use relaxed tolerance for H_res due to Sinkhorn-Knopp
-        is_res = torch_out is H_res_torch
-        atol = 5e-2 if is_res else 1e-2
-        rtol = 5e-2 if is_res else 1e-2
+    for torch_out, triton_out in [(H_pre_torch, H_pre_triton), (H_post_torch, H_post_triton)]:
         torch.testing.assert_close(
             triton_out.to(torch.float32),
             torch_out.to(torch.float32),
-            atol=atol,
-            rtol=rtol,
+            atol=1e-2,
+            rtol=1e-2,
         )
+    torch.testing.assert_close(
+        H_res_triton.to(torch.float32),
+        H_res_torch.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
 
 
 def test_mhc_output_range():
     """
-    Validate output value ranges for each stream.
+    Validate output value ranges for mhc().
     
     Verifies activation functions produce expected bounds:
     - Pre-stream (Eq 17): σ(·) ∈ [0, 1]
     - Post-stream (Eq 18): 2σ(·) ∈ [0, 2]
-    - Res-stream: No constraints (identity activation)
+    - Res-stream (Eq 19): Doubly stochastic - values in [0, 1], rows/cols sum to 1
     """
     torch.cuda.empty_cache()
 
@@ -306,10 +314,16 @@ def test_mhc_output_range():
     assert torch.all(H_post >= 0.0), "Post-stream has values < 0"
     assert torch.all(H_post <= 2.0), "Post-stream has values > 2"
     
-    # Res-stream: no constraints (identity activation)
-    # Just verify it exists
+    # Res-stream (Eq 19): doubly stochastic
     n_squared = n * n
     assert H_res.shape == (M, n_squared), f"Res-stream shape mismatch"
+    
+    # Verify doubly stochastic numerical accuracy against the reference implementation.
+    H_res_3d = H_res.view(M, n, n).to(torch.float32)
+    assert is_doubly_stochastic(H_res_3d, tol=5e-2), (
+        f"Res-stream is not doubly stochastic. "
+        f"Row sums: {H_res_3d.sum(dim=-1)}, Col sums: {H_res_3d.sum(dim=-2)}"
+    )
 
 
 # =============================================================================
@@ -395,7 +409,7 @@ def test_sk_batch_sizes(M):
     N = 4  # Typical mHC stream count
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
 
-    out = sinkhorn_knopp(logits, num_iters=10)
+    out = sinkhorn_knopp(logits, num_iters=20)
 
     assert out.shape == (M, N, N)
     # Use relaxed tolerance for large batch sizes due to bfloat16 precision
