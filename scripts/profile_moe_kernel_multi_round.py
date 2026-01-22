@@ -35,7 +35,6 @@ COUNTER_GROUPS = {
     'round2_compute': [
         "LDSBankConflict", "OccupancyPercent", "MemUnitStalled", "MfmaUtil",
         "SQ_INSTS_MFMA", "SQ_VALU_MFMA_BUSY_CYCLES",
-        "MfmaFlops", "MfmaFlopsF16",
     ],
     
     'round3_waves': [
@@ -67,12 +66,11 @@ COUNTER_GROUPS = {
     ],
     
     'round6_mfma_hw': [
-        "MfmaFlopsBF16",  # Derived expression
-        "MfmaFlopsF32",  # Derived expression
         "SQ_VALU_MFMA_BUSY_CYCLES",  # Raw counter (no _sum)
-        "CU_NUM",  # Derived expression
-        "SIMD_NUM",  # Derived expression
-        "max_bandwidth",  # Constant
+        "SQ_INSTS_VALU_MFMA_MOPS_F8",
+        "SQ_INSTS_VALU_MFMA_MOPS_I8",
+        "SQ_INSTS_VALU_MFMA_MOPS_BF16",
+        # "max_bandwidth",  # Constant
     ],
 
     'round7_fetch_only': [
@@ -259,9 +257,16 @@ def main():
             else:
                 print(f"    ✗ Failed to collect counters")
         
+        # Calculate MFMA_FLOPS
+        mfma_f8 = merged_counters.get('SQ_INSTS_VALU_MFMA_MOPS_F8', 0)
+        mfma_i8 = merged_counters.get('SQ_INSTS_VALU_MFMA_MOPS_I8', 0)
+        mfma_bf16 = merged_counters.get('SQ_INSTS_VALU_MFMA_MOPS_BF16', 0)
+        mfma_flops = (mfma_f8 + mfma_i8 + mfma_bf16) * 512
+        
         # Merge with kernel info
         result_row = dict(row)
         result_row.update(merged_counters)
+        result_row['MFMA_FLOPS'] = mfma_flops
         all_results.append(result_row)
         
         # Save incrementally
