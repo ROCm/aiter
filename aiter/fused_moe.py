@@ -776,13 +776,14 @@ def get_2stage_cfgs(
             torch.uint32,
             dtypes.fp4x2,
             dtypes.fp8,
+            dtypes.i8,
         ]
     ):
         use_flydsl_stage2 = (
             os.environ.get("AITER_USE_FLYDSL_MOE", "1") in ("1", "true", "True", "YES", "yes")
             and q_type == QuantType.per_Token
-            and q_dtype_a == dtypes.fp8
-            and q_dtype_w == dtypes.fp8
+            and q_dtype_a in (dtypes.fp8, dtypes.i8)
+            and q_dtype_w in (dtypes.fp8, dtypes.i8)
             and use_g1u1
             and activation == ActivationType.Silu
         )
@@ -811,15 +812,15 @@ def get_2stage_cfgs(
                 quant_type=q_type,
             )
         )
-        
-        print("use_flydsl_stage2 = %s", use_flydsl_stage2)
-        print("use_flydsl_stage1 = %s", use_flydsl_stage1)
-        print("flydsl_block_m = %s", flydsl_block_m)
-        print("stage1_func = %s", stage1_func)
-        print("stage2_func = %s", stage2_func)
-        print("block_m = %s", block_m)
-        print("ksplit = %s", ksplit)
-        print("run_1stage = %s", run_1stage)
+        if os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1":
+            logger.info("use_flydsl_stage2=%s", use_flydsl_stage2)
+            logger.info("use_flydsl_stage1=%s", use_flydsl_stage1)
+            logger.info("flydsl_block_m=%s", flydsl_block_m)
+            logger.info("stage1_func=%s", stage1_func)
+            logger.info("stage2_func=%s", stage2_func)
+            logger.info("block_m=%s", block_m)
+            logger.info("ksplit=%s", ksplit)
+            logger.info("run_1stage=%s", run_1stage)
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -907,6 +908,23 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
     )
+
+    # SmoothQuant integration for FlyDSL int8 path:
+    # When using flydsl 2-stage, callers may pass per-expert smooth scales via a1_scale/a2_scale
+    # (shapes [E, model_dim] and [E, inter_dim] respectively). We must NOT pass these as "static"
+    # quant scales into per-token quant; instead:
+    # - stage1: build per-(token,slot) int8 X + per-(token,slot) scale_x
+    # - stage2: optionally apply smooth scale to a2 (per expert) before dynamic quantization.
+    is_flydsl_stage1 = getattr(metadata.stage1, "func", None) is flydsl_moe_stage1
+    smooth_a1 = None
+    smooth_a2 = None
+    if quant_type == QuantType.per_Token and is_flydsl_stage1:
+        if a1_scale is not None and a1_scale.numel() == E * model_dim and a1_scale.shape[-1] == model_dim:
+            smooth_a1 = a1_scale.view(E, model_dim).to(dtypes.fp32)
+            a1_scale = None
+        if a2_scale is not None and a2_scale.numel() == E * inter_dim and a2_scale.shape[-1] == inter_dim:
+            smooth_a2 = a2_scale.view(E, inter_dim).to(dtypes.fp32)
+            a2_scale = None
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -954,12 +972,26 @@ def fused_moe_2stages(
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
-        a1, a1_scale = quant_func(
-            hidden_states,
-            scale=a1_scale,
-            quant_dtype=q_dtype_a,
-            num_rows=num_local_tokens,
-        )
+        if smooth_a1 is not None and q_dtype_a == dtypes.i8:
+            # Build per-(token,slot) X route tensor then dynamic per-route int8 quant.
+            # Layout must match (t*topk + slot) so FlyDSL stage1 can index X by token-slot.
+            x_fp32 = hidden_states.to(dtypes.fp32)
+            x_route = x_fp32[:, None, :].expand(token_num, topk, model_dim)
+            # Per-route smooth scaling by expert id.
+            x_route = x_route * smooth_a1[topk_ids.to(torch.int64)]
+            # Dynamic per-route int8 quant (scale per (t,slot)).
+            amax = torch.amax(torch.abs(x_route), dim=-1, keepdim=True)  # [t,slot,1]
+            a1_scale = amax / 127.0
+            a1_scale[a1_scale == 0] = 1.0
+            a1 = (x_route / a1_scale).to(dtypes.i8).contiguous().view(token_num * topk, model_dim)
+            a1_scale = a1_scale.view(-1).contiguous()  # [t*slot]
+        else:
+            a1, a1_scale = quant_func(
+                hidden_states,
+                scale=a1_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+            )
     else:
         assert (
             a1_scale is not None or quant_type == QuantType.No
@@ -989,6 +1021,9 @@ def fused_moe_2stages(
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
+    if is_flydsl_stage1:
+        # FlyDSL stage1 needs the original token count (it may receive X already expanded to token*topk).
+        extra_stage1_args["tokens"] = token_num
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1062,13 +1097,25 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     else:
-        a2, a2_scale = quant_func(
-            a2,
-            scale=a2_scale,
-            quant_dtype=q_dtype_a,
-            num_rows=num_local_tokens,
-            num_rows_factor=topk,
-        )
+        if smooth_a2 is not None and q_dtype_a == dtypes.i8:
+            # Apply per-expert smooth scale to stage2 input before dynamic per-route quant.
+            a2_scaled = a2.view(token_num, topk, inter_dim)
+            a2_scaled = a2_scaled * smooth_a2[topk_ids.to(torch.int64)].to(a2_scaled.dtype)
+            a2, a2_scale = quant_func(
+                a2_scaled,
+                scale=None,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+                num_rows_factor=topk,
+            )
+        else:
+            a2, a2_scale = quant_func(
+                a2,
+                scale=a2_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+                num_rows_factor=topk,
+            )
         a2 = a2.view(token_num, topk, inter_dim)
 
     metadata.stage2(
@@ -1545,7 +1592,10 @@ def flydsl_moe_stage1(
     if a1_scale is None or w1_scale is None:
         raise RuntimeError("FlyDSL stage1 requires a1_scale and w1_scale")
 
-    token_num = hidden_states.shape[0]
+    # `tokens` is the original token count. For smoothquant int8 we may receive X already expanded
+    # to [tokens*topk, model_dim].
+    tokens = int(_kwargs.get("tokens", hidden_states.shape[0]))
+    token_num = tokens
     E, _, model_dim = w1.shape
     inter_dim = w2.shape[2]
 
@@ -1577,7 +1627,10 @@ def flydsl_moe_stage1(
             tile_m,
         )
 
-    x_q = hidden_states.contiguous().view(token_num, model_dim)
+    # Infer in_dtype: fp8 / int8 / int8smooth (expanded X + per-route scale).
+    x_rows = int(hidden_states.shape[0])
+    is_token_slot = x_rows == (token_num * int(topk))
+    x_q = hidden_states.contiguous().view(x_rows, model_dim)
     scale_x_1d = a1_scale.view(-1).contiguous()
     w1_flat = w1.contiguous().view(E * (2 * inter_dim), model_dim)
     w1_scale_1d = w1_scale.view(-1).contiguous()
@@ -1589,7 +1642,14 @@ def flydsl_moe_stage1(
         sys.path.insert(0, DSL2_ROOT)
     from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
 
-    out_dtype = "bf16" if dtype == torch.bfloat16 else "f16"
+    out_dtype = "bf16" if dtype == torch.bfloat16 else "fp16"
+    if w1.dtype == dtypes.fp8:
+        in_dtype = "fp8"
+    elif w1.dtype == dtypes.i8:
+        in_dtype = "int8smooth" if is_token_slot else "int8"
+    else:
+        raise ValueError(f"FlyDSL stage1 unsupported w1 dtype: {w1.dtype}")
+
     exe1 = compile_moe_gemm1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1599,7 +1659,7 @@ def flydsl_moe_stage1(
         tile_n=tile_n,
         tile_k=tile_k,
         doweight_stage1=bool(doweight_stage1),
-        in_dtype="fp8",
+        in_dtype=in_dtype,
         out_dtype=out_dtype,
         use_cshuffle_epilog=False,
     )
@@ -1723,13 +1783,20 @@ def flydsl_moe_stage2(
     if out.dtype == dtypes.bf16:
         out_dtype = "bf16"
     elif out.dtype == dtypes.fp16:
-        out_dtype = "f16"
+        out_dtype = "fp16"
     elif out.dtype == dtypes.fp32:
         out_dtype = "f32"
     else:
         raise ValueError(
             f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
         )
+    if w2.dtype == dtypes.fp8:
+        in_dtype = "fp8"
+    elif w2.dtype == dtypes.i8:
+        in_dtype = "int8"
+    else:
+        raise ValueError(f"FlyDSL stage2 unsupported w2 dtype: {w2.dtype}")
+
     exe2 = compile_moe_gemm2(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1739,7 +1806,7 @@ def flydsl_moe_stage2(
         tile_n=tile_n,
         tile_k=tile_k,
         doweight_stage2=bool(sorted_weights is not None),
-        in_dtype="fp8",
+        in_dtype=in_dtype,
         out_dtype=out_dtype,
     )
     exe2(

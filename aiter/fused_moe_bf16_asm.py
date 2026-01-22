@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 import torch
 import torch.nn.functional as F
 from typing import Optional
@@ -177,6 +178,35 @@ def asm_moe(
         )
     else:
         # a8w8 fmoe, opt: smooth quant
+        # Prefer FlyDSL 2-stage for int8 smoothquant g1u1 when enabled.
+        # This path goes through `aiter.fused_moe.fused_moe` (which will dispatch to flydsl stage1/2),
+        # so correctness is checked against the torch reference in op_tests.
+        use_flydsl = os.environ.get("AITER_USE_FLYDSL_MOE", "1") in ("1", "true", "True", "YES", "yes")
+        is_g1u1 = (w2.shape[2] * 2 * lastdim_mul) == w1.shape[1]
+        if (
+            use_flydsl
+            and is_g1u1
+            and (w1.dtype == dtypes.i8)
+            and (fc1_scale is not None)
+            and (fc2_scale is not None)
+            and (fc1_smooth_scale is not None)
+        ):
+            return fused_moe(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                expert_mask=expert_mask,
+                activation=activation,
+                quant_type=QuantType.per_Token,
+                doweight_stage1=False,
+                w1_scale=fc1_scale,
+                w2_scale=fc2_scale,
+                a1_scale=fc1_smooth_scale,
+                a2_scale=fc2_smooth_scale,
+                use_flydsl=True,
+            )
         a8_type = (
             w1.dtype
             if w1.dtype != dtypes.i32 and w1.dtype != torch.uint32
