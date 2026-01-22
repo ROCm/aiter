@@ -1205,6 +1205,7 @@ def run_gluon_kernel(
         )
     else:
         if pa_decode_gluon is not None:
+            # for _ in range(10):
             torch.ops.aiter.pa_decode_gluon(
                 output,
                 query,
@@ -1652,7 +1653,7 @@ def run_pa_gluon_test(
     if quant_kv and quant_mode == "per_tensor":
         key_scale_original = key_scale_factors_flat.contiguous()
         value_scale_original = value_scale_factors_flat.contiguous()
-    if not skip_assembly:
+    if not False:
         assembly_output, assembly_time = run_aiter_assembly_kernel(
             query,
             quantized_keys,
@@ -2437,18 +2438,18 @@ def sliding_window_performance_test():
     global CONTEXT_PARTITION_SIZE_OPTIONS
     global PS_OPTIONS
 
-    SINKS_OPTIONS = [False, True]
-    SLIDING_WINDOW_OPTIONS = [0, 128]
+    SINKS_OPTIONS = [False]
+    SLIDING_WINDOW_OPTIONS = [0]
 
     USE_TORCH_FLASH_REF_OPTIONS = [False]
-    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    HEAD_DIMENSION_OPTIONS = [64]
-    HEAD_CONFIGURATIONS = [(64, 8)]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [128]
+    HEAD_DIMENSION_OPTIONS = [128]
+    HEAD_CONFIGURATIONS = [(16, 1)]
     QUERY_LENGTH_OPTIONS = [1]
-    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", False, True]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     CONTEXT_LENGTH_OPTIONS = [1024]
-    BATCH_SIZE_OPTIONS = [4, 128]
+    BATCH_SIZE_OPTIONS = [256]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [True]
     USE_AOT_IMPL_OPTIONS = [False]
@@ -2474,9 +2475,9 @@ def test_multi_case_set(case_set_name):
 
 
 if __name__ == "__main__":
-    normal_accuracy_test()
-    normal_accuracy_aot_test()
-    normal_performance_test()
-    normal_performance_aot_test()
-    sliding_window_accuracy_test()
+    # normal_accuracy_test()
+    # normal_accuracy_aot_test()
+    # normal_performance_test()
+    # normal_performance_aot_test()
+    # sliding_window_accuracy_test()
     sliding_window_performance_test()

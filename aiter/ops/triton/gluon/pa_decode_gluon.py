@@ -1119,6 +1119,14 @@ def paged_attention_decode_sliding_window(
         0, gl.SliceLayout(1, gl.SliceLayout(2, blocked_key_layout))
     )
 
+    # ==================== EARLY PROGRAM ID AND CONTEXT LENGTH LOAD ====================
+    # Load context_length early to allow memory latency hiding with subsequent instructions
+    sequence_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
+    sequence_split_idx = gl.program_id(2)
+    # Issue scalar load early - subsequent gl.arange operations will execute while load is in flight
+    context_length = gl.load(context_lengths_ptr + sequence_idx)
+
     # Coordinate offsets for various dimensions
     # MTP offsets (for 3D layout)
     mtp_query_len_offsets = gl.arange(
@@ -1164,13 +1172,6 @@ def paged_attention_decode_sliding_window(
     output_head_size_offsets = gl.arange(
         0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
-
-    # ==================== PROGRAM ID AND INITIALIZATION ====================
-    sequence_idx = gl.program_id(0)
-    kv_head_idx = gl.program_id(1)
-    sequence_split_idx = gl.program_id(2)
-
-    context_length = gl.load(context_lengths_ptr + sequence_idx)
 
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
@@ -1320,6 +1321,20 @@ def paged_attention_decode_sliding_window(
         sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
 
     max_num_kv_blocks = gl.cdiv(context_length, KV_BLOCK_SIZE)
+    # ==================== PREFETCH BLOCK NUMBERS ====================
+    block_table_start_ptr = block_tables_ptr + sequence_idx * stride_block_table_seq
+    block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
+
+    prefetch_offset_0 = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+    prefetch_valid_0 = (sequence_partition_start_idx < sequence_partition_end_idx) & (
+        block_indices < (max_num_kv_blocks - prefetch_offset_0)
+    )
+    prefetch_masked_0 = gl.where(prefetch_valid_0, block_indices, 0)
+    kv_block_numbers_pre = gl.amd.cdna3.buffer_load(
+        ptr=block_table_start_ptr + prefetch_offset_0, offsets=prefetch_masked_0
+    ).to(gl.int64)
+    kv_block_start_idx = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+    
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
         # Quantize bf16 query to fp8
         # Convert query to float32 for computation
@@ -1338,24 +1353,10 @@ def paged_attention_decode_sliding_window(
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
-        kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
-
-        num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
-
+        kv_block_numbers = kv_block_numbers_pre
         qk_column_offsets = kv_block_start_idx * KV_BLOCK_SIZE + gl.arange(
             0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
-        # Load KV block indices from block table
-        block_indices = gl.arange(
-            0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout
-        )
-        # Create mask for valid blocks
-        valid_block_mask = block_indices < num_kv_blocks
-        masked_block_indices = gl.where(valid_block_mask, block_indices, 0)
-        block_table_start_ptr = block_tables_ptr + sequence_idx * stride_block_table_seq
-        kv_block_numbers = gl.amd.cdna3.buffer_load(
-            ptr=block_table_start_ptr + kv_block_start_idx, offsets=masked_block_indices
-        ).to(gl.int64)
 
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
@@ -1524,6 +1525,15 @@ def paged_attention_decode_sliding_window(
 
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
+
+        next_partition_valid = (sequence_partition_idx + 1) < sequence_partition_end_idx
+        kv_block_start_idx = (sequence_partition_idx + 1) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+        num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
+        valid_block_mask = (block_indices < num_kv_blocks) & next_partition_valid
+        masked_block_indices = gl.where(valid_block_mask, block_indices, 0)
+        kv_block_numbers_pre = gl.amd.cdna3.buffer_load(
+            ptr=block_table_start_ptr + kv_block_start_idx, offsets=masked_block_indices, mask=next_partition_valid
+        ).to(gl.int64)
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
