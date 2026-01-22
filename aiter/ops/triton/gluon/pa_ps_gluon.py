@@ -261,27 +261,11 @@ def pa_ps_kernel(
 
     # Register allocation configuration based on group size and compute block size
     if QUERY_GROUP_SIZE_POW2 == 16:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
+        register_bases: gl.constexpr = ((0, 1), (0, 2))
     elif QUERY_GROUP_SIZE_POW2 == 32:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128), (16, 0))
+        register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
     elif QUERY_GROUP_SIZE_POW2 == 64:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0), (32, 0))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = (
-                (0, 1),
-                (0, 2),
-                (0, 64),
-                (0, 128),
-                (16, 0),
-                (32, 0),
-            )
+        register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
 
     # Distributed layout for QK linear operations
     qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
@@ -437,6 +421,10 @@ def pa_ps_kernel(
     wg_idx = gl.program_id(0)
     work_start_idx = gl.load(work_indptr + wg_idx)
     work_end_idx = gl.load(work_indptr + wg_idx + 1)
+    if QUERY_QUANT_MODE == 0:
+        # Per-tensor quantization
+        query_scale_value = tl.load(query_scale)
+
     for i in range(work_start_idx, work_end_idx):
         work_info_item = work_info + i * 8
         sequence_idx = gl.load(work_info_item)
@@ -451,23 +439,10 @@ def pa_ps_kernel(
         q_head_end = (q_head_range >> 16) & 0xFFFF
 
         query_seq_len = qo_end - qo_start
-        kv_head_start_idx = q_head_start // query_group_size
-        kv_head_end_idx = gl.cdiv(q_head_end, query_group_size)
+        # kv_head_start_idx = q_head_start // query_group_size
+        # kv_head_end_idx = gl.cdiv(q_head_end, query_group_size)
         context_length = gl.load(context_lengths_ptr + sequence_idx)
         kv_start_idx = gl.load(kv_indptr + sequence_idx)
-        qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
-            0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
-        )
-        # max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
-        if SLIDING_WINDOW > 0:
-            sequence_start_idx = (
-                kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length - SLIDING_WINDOW
-            )
-            sequence_end_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length
-        else:
-            sequence_start_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE
-            sequence_end_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length
-
         max_logits = gl.full(
             (QUERY_GROUP_SIZE_POW2,),
             float("-inf"),
@@ -485,31 +460,6 @@ def pa_ps_kernel(
             dtype=gl.float32,
             layout=pv_mfma_layout,
         )
-        attention_scores = gl.zeros(
-            (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2),
-            dtype=gl.float32,
-            layout=pv_mfma_layout,
-        )
-        mtp_query_offsets = (
-            (qo_start + mtp_query_len_offsets[:, None, None]) * stride_query_0
-            + mtp_query_group_size_offsets[None, :, None] * stride_query_1
-            + mtp_head_size_offsets[None, None, :]
-        )
-        mtp_query_mask = (
-            ((qo_start + mtp_query_len_offsets[:, None, None]) < qo_end)
-            & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
-            & (mtp_head_size_offsets[None, None, :] < head_size)
-        )
-        query_row_mask_3d = (
-            qo_start + mtp_query_len_offsets[:, None, None] < qo_end
-        ) & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
-        query_row_mask_1d = gl.reshape(query_row_mask_3d, [QUERY_GROUP_SIZE_POW2])
-        qk_row_mask = gl.convert_layout(
-            query_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
-        )
-        pv_row_mask = gl.convert_layout(
-            query_row_mask_1d, layout=gl.SliceLayout(1, pv_mfma_layout)
-        )
         logits_offsets = (
             logits_idx * stride_logits_0
             + (q_head_start + logits_query_group_size_offsets[:, None])
@@ -523,6 +473,23 @@ def pa_ps_kernel(
             q_head_start + lse_query_group_size_offsets
         )
         split_lse_mask = q_head_start + lse_query_group_size_offsets < q_head_end
+
+        mtp_query_offsets = (
+            (qo_start + mtp_query_len_offsets[:, None, None]) * stride_query_0
+            + mtp_query_group_size_offsets[None, :, None] * stride_query_1
+            + mtp_head_size_offsets[None, None, :]
+        )
+        query_row_mask_3d = (
+            qo_start + mtp_query_len_offsets[:, None, None] < qo_end
+        ) & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
+
+        mtp_query_mask = query_row_mask_3d & (
+            mtp_head_size_offsets[None, None, :] < head_size
+        )
+        query_row_mask_1d = gl.reshape(query_row_mask_3d, [QUERY_GROUP_SIZE_POW2])
+        qk_row_mask = gl.convert_layout(
+            query_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
+        )
         mtp_query_tensor = gl.amd.cdna3.buffer_load(
             ptr=query_ptr, offsets=mtp_query_offsets, mask=mtp_query_mask
         )
@@ -535,20 +502,53 @@ def pa_ps_kernel(
         query_shared = gl.allocate_shared_memory(
             query_tensor.dtype, query_tensor.shape, shared_query_layout, query_tensor
         )
-
-        page_offset = (
-            kv_block_start_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
-        ) * CONTEXT_PARTITION_SIZE
-
-        # Create mask for valid blocks
-        kv_block_numbers = gl.amd.cdna3.buffer_load(
-            kv_page_indices,
-            offsets=kv_block_start_idx + block_indices,
-            mask=(kv_block_start_idx + block_indices) < kv_block_end_idx,
-        ).to(gl.int64)
-
         query_converted = query_shared.load(qk_lhs_operand_layout)
-        for kv_head_idx in range(kv_head_start_idx, kv_head_end_idx):
+        kv_head_idx = q_head_start // query_group_size
+        if SLIDING_WINDOW > 0:
+            sequence_start_idx = (
+                kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length - SLIDING_WINDOW
+            )
+            sequence_end_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length
+        else:
+            sequence_start_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE
+            sequence_end_idx = kv_start_idx * KV_COMPUTE_BLOCK_SIZE + context_length
+        if QUERY_QUANT_MODE == 1:
+            # Per-token quantization
+            query_scale_offsets = (
+                sequence_idx * stride_query_scale_0
+                + (qo_start + mtp_query_len_offsets[:, None, None])
+                * stride_query_scale_1
+                + kv_head_idx * stride_query_scale_2
+                + mtp_query_group_size_offsets[None, :, None]
+            )
+            query_scale_mask = (
+                qo_start + mtp_query_len_offsets[:, None, None] < qo_end
+            ) & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
+            query_scale_value = gl.amd.cdna3.buffer_load(
+                ptr=query_scale,
+                offsets=query_scale_offsets,
+                mask=query_scale_mask,
+            )
+            query_scale_value = gl.reshape(
+                query_scale_value, [QUERY_GROUP_SIZE_POW2, 1]
+            )
+            query_scale_value = gl.convert_layout(
+                query_scale_value, layout=qk_linear_layout
+            )
+        for kv_block_idx in range(kv_block_start_idx, kv_block_end_idx):
+            qk_column_offsets = kv_block_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
+                0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
+            )
+            page_offset = (
+                kv_block_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
+            ) * CONTEXT_PARTITION_SIZE
+
+            # Create mask for valid blocks
+            kv_block_numbers = gl.amd.cdna3.buffer_load(
+                kv_page_indices,
+                offsets=kv_block_idx + block_indices,
+            ).to(gl.int64)
+
             # ==================== KEY LOADING AND PROCESSING ====================
             # Calculate key cache offsets and load keys
             key_block_offsets = (
@@ -564,7 +564,7 @@ def pa_ps_kernel(
             # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
             if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
                 kv_token_global = (
-                    kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
+                    kv_block_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
                 )
                 kv_in_window_mask = kv_token_global >= sequence_start_idx
                 key_tensor = gl.load(
@@ -682,7 +682,7 @@ def pa_ps_kernel(
                 # Schedule: Start value VMEM load, then QK MFMA
                 if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
                     value_token_global = (
-                        kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + value_dim2_offsets
+                        kv_block_idx * KV_COMPUTE_BLOCK_SIZE + value_dim2_offsets
                     )
                     value_in_window_mask = value_token_global >= sequence_start_idx
                     value_tensor = gl.load(
@@ -839,9 +839,8 @@ def pa_ps_kernel(
 
         # Store results to global memory
         if logits_idx >= 0:
-            lse = tl.math.log(exp_sums + 1e-20) + max_logits
             gl.amd.cdna3.buffer_store(
-                stored_value=lse,
+                stored_value=max_logits,
                 ptr=split_lse_ptr,
                 offsets=split_lse_offsets,
                 mask=split_lse_mask,
@@ -931,7 +930,7 @@ def pa_ps_gluon(
     # Extract tensor dimensions from input tensors
     # context_partition_size = 256
     # if sliding_window > 0:
-    context_partition_size = 128
+    context_partition_size = 64
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
 
