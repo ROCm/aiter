@@ -3365,6 +3365,7 @@ def pa_decode_gluon(
             "This version triton is not support gluon jit mode, please upgrade to 3.5.0 or higher!"
         )
     from aiter.ops.triton.utils.types import torch_to_triton_dtype
+
     cdna_version = get_cdna_version()
     assert cdna_version in [
         3,

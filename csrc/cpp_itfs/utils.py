@@ -65,7 +65,8 @@ if not os.path.exists(BUILD_DIR):
 
 CK_DIR = os.environ.get("CK_DIR", f"{AITER_CORE_DIR}/3rdparty/composable_kernel")
 
-makefile_template = Template("""
+makefile_template = Template(
+    """
 CXX=hipcc
 TARGET=lib.so
 
@@ -80,7 +81,8 @@ build: $(OBJS)
 
 clean:
 	rm -f $(TARGET) $(OBJS)
-""")
+"""
+)
 
 
 def mp_lock(
