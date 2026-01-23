@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "aiter_hip_common.h"
-#include "custom_all_reduce.cuh"
-#include "mla.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <sstream>
 #include <torch/python.h>
+#include "aiter_hip_common.h"
+#include "custom_all_reduce.cuh"
+#include "mla.h"
 
 template <int32_t kSizeDV_, int32_t kNumHeadQ_, int32_t kNumThreadGroupPerSeq_>
 struct MlaReduceKernelV1Traits
