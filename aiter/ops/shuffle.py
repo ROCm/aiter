@@ -130,3 +130,126 @@ def shuffle_weight_cktile(
     x_ = x_.view(x_type)
     x_.is_shuffled = True
     return x_
+
+def shuffle_bq(
+    scale: torch.Tensor,
+    block_bq_k: int,
+) -> torch.Tensor:
+    """
+    Shuffle B quantization scale tensor for preshuffleQuant optimization.
+    
+    This is a direct port of the shuffle_bq function from Composable Kernel.
+    It rearranges the scale tensor to match the memory access patterns of
+    the GPU warps when using preshuffleQuant optimization.
+    
+    Args:
+        scale: Input scale tensor
+               - 2D: [bqk, n] where bqk = K // quant_group_k
+               - 5D: [n, nrepeat, nwarp, n_warp_tile, bqk] (TilePermuteN case)
+        block_bq_k: Block size for B quantization along K dimension.
+                    This is typically derived from the warp tile configuration.
+    
+    Returns:
+        Shuffled scale tensor with the same shape but rearranged for optimal access.
+    
+    Note:
+        The shuffle pattern matches the TileGemmQuantTraits with PreshuffleQuant=true
+        in CK Tile. The exact permutation depends on the tensor rank:
+        - 2D: permute {1, 0, 2} after reshaping
+        - 5D: permute {4, 0, 1, 2, 3, 5} after reshaping
+    
+    Reference:
+        Composable Kernel PR #3629: [CK_Tile] Adding support for preshuffleQuant
+        in AB quant Block Scale Gemm
+    """
+    scale_type = scale.dtype
+    original_shape = scale.shape
+    rank = scale.dim()
+    
+    if rank == 2:
+        # Input: [bqk, n] where bqk = K // quant_group_k
+        bqk, n = scale.shape
+        
+        if bqk % block_bq_k != 0:
+            raise ValueError(
+                f"shuffle_bq needs bqk dimension ({bqk}) to be a multiple of "
+                f"block_bq_k ({block_bq_k})."
+            )
+        
+        # Step 1: Transpose to [n, bqk]
+        # Step 2: Reshape to [n, bqk // block_bq_k, block_bq_k]
+        scale_view = scale.t().contiguous().view(n, bqk // block_bq_k, block_bq_k)
+        
+        # Step 3: Permute with {1, 0, 2} -> [bqk // block_bq_k, n, block_bq_k]
+        scale_shuffled = scale_view.permute(1, 0, 2).contiguous()
+        
+        # Reshape back to original shape [bqk, n]
+        scale_shuffled = scale_shuffled.view(original_shape)
+        
+    elif rank == 5:
+        # Input: [n, nrepeat, nwarp, n_warp_tile, bqk] (TilePermuteN case)
+        n, nrepeat, nwarp, n_warp_tile, bqk = scale.shape
+        
+        if bqk % block_bq_k != 0:
+            raise ValueError(
+                f"shuffle_bq needs bqk dimension ({bqk}) to be a multiple of "
+                f"block_bq_k ({block_bq_k})."
+            )
+        
+        # Reshape: [n, nrepeat, nwarp, n_warp_tile, bqk // block_bq_k, block_bq_k]
+        scale_view = scale.view(
+            n, nrepeat, nwarp, n_warp_tile, bqk // block_bq_k, block_bq_k
+        )
+        
+        # Permute with {4, 0, 1, 2, 3, 5}
+        # -> [bqk // block_bq_k, n, nrepeat, nwarp, n_warp_tile, block_bq_k]
+        scale_shuffled = scale_view.permute(4, 0, 1, 2, 3, 5).contiguous()
+        
+        # Reshape back to original shape [n, nrepeat, nwarp, n_warp_tile, bqk]
+        scale_shuffled = scale_shuffled.view(original_shape)
+        
+    else:
+        raise ValueError(
+            f"shuffle_bq expects either rank-2 or rank-5 tensor, got rank {rank}"
+        )
+    
+    # Mark as shuffled for downstream checks
+    scale_shuffled.is_bq_shuffled = True
+    
+    return scale_shuffled.to(scale_type)
+
+
+def shuffle_b_scale_blockscale(
+    b_scale: torch.Tensor,
+    block_bq_k: int,
+) -> torch.Tensor:
+    """
+    Pre-shuffle B (weight) quantization scales for blockscale GEMM.
+    
+    This is a convenience wrapper around shuffle_bq for the common case
+    where the B scale tensor is 2D with shape [N, K // quant_group_k].
+    
+    Args:
+        b_scale: Input B scale tensor of shape [N, K // quant_group_k].
+                 Note: This expects the scale in [N, bqk] format, which
+                 needs to be transposed to [bqk, N] before calling shuffle_bq.
+        block_bq_k: Block size for B quantization along K dimension.
+    
+    Returns:
+        Shuffled B scale tensor optimized for preshuffleQuant access pattern.
+    
+    Example:
+        >>> # For a GEMM with K=4096, quant_group_k=128, N=8192
+        >>> # b_scale shape: [8192, 32] (N, K // quant_group_k)
+        >>> b_scale_shuffled = shuffle_b_scale_blockscale(b_scale, block_bq_k=4)
+    """
+    # b_scale is typically [N, bqk], but shuffle_bq expects [bqk, n]
+    # So we transpose first
+    b_scale_t = b_scale.t().contiguous()
+    
+    # Apply shuffle_bq
+    b_scale_shuffled = shuffle_bq(b_scale_t, block_bq_k)
+    
+    # Transpose back to [N, bqk]
+    return b_scale_shuffled.t().contiguous()
+
