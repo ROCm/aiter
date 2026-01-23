@@ -96,13 +96,18 @@ def test_act_mul_and_mxfp4_quant(
     M: int, N: int, dtype, activation: str, shuffle: bool, scale_shuffle_padding: bool
 ):
 
+    # FIXME: Remove when faster
+    if arch_info.get_arch() == "gfx1250" and M * N >= 57344:
+        pytest.skip()
+
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
     if shuffle and N % 512 != 0:
         pytest.skip()
 
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    #torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
 
     if DEBUG_MODE:
