@@ -60,10 +60,9 @@ def _sage_fwd_no_mask_v2(
     USE_EXP2: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
 ):
-    if USE_EXP2:
-        RCP_LN2: tl.constexpr = 1.4426950408889634
-
     k_descale_ptr = k_descale_base_ptr
 
     # loop over k, v, and update accumulator
@@ -95,7 +94,7 @@ def _sage_fwd_no_mask_v2(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
         # -- compute qk ----
-        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1") * SM_SCALE
+        qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * SM_SCALE
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -257,10 +256,9 @@ def _sage_fwd_mask_v2(
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
     ACCUMULATOR_TYPE,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
 ):
-    if USE_EXP2:
-        RCP_LN2: tl.constexpr = 1.4426950408889634
-
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
 
@@ -310,7 +308,7 @@ def _sage_fwd_mask_v2(
             qk = tl.where(mask, qk, float("-inf"))
 
         # -- compute qk ----
-        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1") * SM_SCALE
+        qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * SM_SCALE
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -919,8 +917,8 @@ def sage_fwd_v2(
     dropout_p,
     philox_seed,
     philox_offset_base,
-    Q_HEAD_DIM_DIVISOR: tl.constexpr,
-    K_HEAD_DIM_DIVISOR: tl.constexpr,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
     RETURN_LSE: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -946,6 +944,8 @@ def sage_fwd_v2(
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
 ):
+    Q_HEAD_DIM_DIVISOR: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
+    K_HEAD_DIM_DIVISOR: tl.constexpr = 2 if K_DTYPE_STR == "e2m1" else 1
     # set params
     ACCUMULATOR_TYPE: tl.constexpr = tl.float32  # for q*k product
     SCALE_GROUP_SIZE: tl.constexpr = 32
@@ -1217,6 +1217,8 @@ def sage_fwd_v2(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            Q_DTYPE_STR=Q_DTYPE_STR,
+            K_DTYPE_STR=K_DTYPE_STR,
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1281,6 +1283,8 @@ def sage_fwd_v2(
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            Q_DTYPE_STR=Q_DTYPE_STR,
+            K_DTYPE_STR=K_DTYPE_STR,
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1355,6 +1359,8 @@ def sage_fwd_v2(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            Q_DTYPE_STR=Q_DTYPE_STR,
+            K_DTYPE_STR=K_DTYPE_STR,
         )
 
     # ============================================================
@@ -1870,8 +1876,8 @@ def fav3_sage_triton_impl_v2(
         cu_seqlens_k,
         seqused_q,
         seqused_k,  # Pass seqused tensors
-        Q_HEAD_DIM_DIVISOR=2 if is_q_fp4 else 1,
-        K_HEAD_DIM_DIVISOR=2 if is_k_fp4 else 1,
+        Q_DTYPE_STR="e2m1" if is_q_fp4 else "e4m3",
+        K_DTYPE_STR="e2m1" if is_k_fp4 else "e4m3",
         dropout_p=dropout_p,
         philox_seed=philox_seed,
         philox_offset_base=philox_offset,
@@ -1978,8 +1984,11 @@ def sage_quant_v2(
         BLK_K=BLKK,
     )
 
-    q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
+    # q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
+    q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+    # k_fp4, k_scale = downcast_to_mxfp(k, aiter.dtypes.fp8, axis=-1)
+
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
 

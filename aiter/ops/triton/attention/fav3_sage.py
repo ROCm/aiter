@@ -56,12 +56,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
         _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
 
-        # not necessary here as q and v are not quantized yet
-        # if sage_version == fav3_sage.Sage_version.V2:
-        #     head_dim *= 2
-
         # Quantize K, V to int8, and convert v to float16
-
         # Use provided config or get default config
         if config is None:
             config = get_sage_fwd_configs(sage_version)
@@ -99,11 +94,6 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                 BLKK=BLKK,
                 layout=layout,
             )
-
-        # For GQA/MQA: quantize query with grouped scaling
-        # group_size = (
-        #    num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
-        # )
 
         # Verify descale shapes for GQA/MQA
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
@@ -402,11 +392,12 @@ def fav3_sage_func(
 
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
+    _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
 
     if sage_version == fav3_sage.Sage_version.V2:
-        head_dim *= 2
+        if q.dtype == torch.uint8:
+            head_dim *= 2
 
-    _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
     # Quantize K, V to int8, and convert v to float16
 
     # Use provided config or get default config
@@ -421,8 +412,8 @@ def fav3_sage_func(
         assert q.dtype == torch.int8, f"expected dtype of q to be int8, got {q.dtype}"
         assert k.dtype == torch.int8, f"expected dtype of k to be int8, got {k.dtype}"
     elif sage_version == fav3_sage.Sage_version.V2:
-        assert q.dtype == torch.uint8, f"expected dtype of q to be uint8, got {q.dtype}"
-        assert k.dtype == torch.uint8, f"expected dtype of k to be uint8, got {k.dtype}"
+        assert q.dtype in [torch.uint8, aiter.dtypes.fp8], f"expected dtype of q to be uint8 or fp8, got {q.dtype}"
+        assert k.dtype in [torch.uint8, aiter.dtypes.fp8], f"expected dtype of k to be uint8 or fp8, got {k.dtype}"
 
 
     # Verify descale shapes for GQA/MQA
