@@ -206,6 +206,9 @@ struct mha_fwd_args
     ck_tile::index_t nhead_stride_randval;
     ck_tile::index_t nhead_stride_lse;
     ck_tile::index_t nhead_stride_o;
+    ck_tile::index_t nhead_stride_q_descale;
+    ck_tile::index_t nhead_stride_k_descale;
+    ck_tile::index_t nhead_stride_v_descale;
     ck_tile::index_t batch_stride_q;
     ck_tile::index_t batch_stride_k;
     ck_tile::index_t batch_stride_v;
@@ -213,6 +216,9 @@ struct mha_fwd_args
     ck_tile::index_t batch_stride_randval;
     ck_tile::index_t batch_stride_lse;
     ck_tile::index_t batch_stride_o;
+    ck_tile::index_t batch_stride_q_descale;
+    ck_tile::index_t batch_stride_k_descale;
+    ck_tile::index_t batch_stride_v_descale;
 
     ck_tile::index_t window_size_left;
     ck_tile::index_t window_size_right;

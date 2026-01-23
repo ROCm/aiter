@@ -150,6 +150,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         nhead_stride_randval,
                         nhead_stride_lse,
                         nhead_stride_o,
+                        0, // nhead_stride_q_descale
+                        0, // nhead_stride_k_descale
+                        0, // nhead_stride_v_descale
                         batch_stride_q,
                         batch_stride_k,
                         batch_stride_v,
@@ -157,6 +160,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         batch_stride_randval,
                         batch_stride_lse,
                         batch_stride_o,
+                        0, // batch_stride_q_descale
+                        0, // batch_stride_k_descale
+                        0, // batch_stride_v_descale
                         mask.left,
                         mask.right,
                         mask.sink,
