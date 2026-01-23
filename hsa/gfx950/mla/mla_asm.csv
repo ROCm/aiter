@@ -19,3 +19,4 @@ fp8,fp8,1,1,0,1,1,_ZN5aiter40mla_pfl_qh192_vh128_m32x8_n128x1_causal1E,mla_pfl_q
 fp8,fp8,1,1,0,1,0,_ZN5aiter40mla_pfl_qh192_vh128_m32x8_n128x1_causal0E,mla_pfl_qh192_vh128_m32x8_n128x1_causal0.co
 bf16,bf16,32,0,0,0,0,_ZN5aiter39mla_a16w16_qh16_m64x1_n16x1_coex0_mask1E,MLA_A16W16_1TG_4W_32mx1_16nx1_Coex0_Msk1_QH16.co
 bf16,bf16,64,0,0,0,0,_ZN5aiter39mla_a16w16_qh16_m64x1_n16x1_coex0_mask1E,MLA_A16W16_1TG_4W_64mx1_16nx1_Coex0_Msk1_QH16.co
+fp8,fp8,32,1,4,0,0,mla_kernel_func,mla.co

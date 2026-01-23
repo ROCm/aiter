@@ -287,6 +287,11 @@ void mla_decode_stage1_asm_fwd(
                 config_max_seqlen_q = 0;
                 sub_Q = 64;
             }
+        }else if (q_type == "fp8"){
+            if((max_seqlen_q == 4) && persistent){
+                config_max_seqlen_q = 4;
+                SUB_Q = 128;
+            }
         }
     } else if (gqa_ratio == 64){
         if (q_type == "bf16" && kv_type == "bf16"){
