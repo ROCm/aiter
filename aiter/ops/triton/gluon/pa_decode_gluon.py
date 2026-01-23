@@ -5,7 +5,6 @@ from functools import lru_cache
 import torch
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 import triton
 import triton.language as tl
@@ -3365,6 +3364,7 @@ def pa_decode_gluon(
         raise RuntimeError(
             "This version triton is not support gluon jit mode, please upgrade to 3.5.0 or higher!"
         )
+    from aiter.ops.triton.utils.types import torch_to_triton_dtype
     cdna_version = get_cdna_version()
     assert cdna_version in [
         3,
