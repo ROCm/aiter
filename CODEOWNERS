@@ -1,0 +1,14 @@
+# This is a comment.
+# Each line is a file pattern followed by one or more owners.
+
+# These owners will be the default owners for everything in
+# the repo
+* @ROCm/TEAM_AITER
+
+# Triton files/bench/tests
+/aiter/ops/triton/ @vgokhale @azaidy
+/op_tests/triton_tests/ @vgokhale @azaidy
+/op_tests/op_benchmarks/triton/ @vgokhale @azaidy
+
+# Gluon files
+/aiter/ops/triton/gluon/ @vgokhale @azaidy @coderfeli
