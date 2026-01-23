@@ -31,7 +31,6 @@ import time
 import multiprocessing as mp
 import gc
 
-aiter.rocb_create_extension()
 aiter.hipb_create_extension()
 
 
@@ -178,7 +177,7 @@ if __name__ == "__main__":
             process = mp.Process(target=runGemmTuner, args=(), daemon=False)
             process.start()
             process.join()
-            if process.exitcode != 0:
+            if process.exitcode > 1:
                 time.sleep(0.5 * retries)
                 print(
                     "!Error when run GemmTuner process exitcode is ", process.exitcode

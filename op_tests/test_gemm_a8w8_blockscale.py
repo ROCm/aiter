@@ -2,7 +2,11 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import itertools
+import sys
+import os
+
+# Add parent directory to path to ensure we use local aiter module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import torch
@@ -57,27 +61,46 @@ def run_gemm_bpreshuffle_ck(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf1
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, preshuffle=False):
+def test_gemm(dtype, m, n, k, ck_preshuffle=True):
+    ret = {}
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
+    scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = (torch.rand((m, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
-    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
+    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
+
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_x_scale = x_scale_t if preshuffle else x_scale
-    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffle else weight
-    run_func = run_gemm_bpreshuffle_ck if preshuffle else run_gemm_ck
+    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
+    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
+    run_func = run_gemm_bpreshuffle_ck if ck_preshuffle else run_gemm_ck
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
-    failed = checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
+    err_ck = checkAllclose(a, b, msg="ck")
+    ret["ck us"] = avg_b
+    ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
+    ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
+    ret["ck err"] = err_ck
 
-    return {"us": avg_b, "failed": failed}
+    tag = "asm"
+    weight_asm = shuffle_weight(weight, layout=(32, 16))
+    # kernel_name = "_ZN5aiter43fp8gemm_bf16_blockscale_BpreShuffle_128x128E"
+    # c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype, kernel_name=kernel_name)
+    c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
+
+    err_asm = checkAllclose(a, c, msg=f"{tag}")
+    ret[f"{tag} us"] = avg_c
+    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+    ret[f"{tag} err"] = err_asm
+    ret["asm/ck"] = avg_c / avg_b
+
+    return ret
 
 
 @perftest(num_iters=5)
@@ -101,51 +124,12 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.flatmm_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, dtype)
+def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
+    m, k = x.shape
+    n, _ = weight.shape
+    out = torch.empty((m, n), dtype=dtype, device=x.device)
+    return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
 
-
-@benchmark()
-def test_gemm_asm(dtype, m, n, k):
-    dim = (m, n, k)
-    block_shape_n, block_shape_k = block_shape
-    scale_m = m
-    scale_n = (n + block_shape_n - 1) // block_shape_n
-    scale_k = (k + block_shape_k - 1) // block_shape_k
-
-    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-
-    x_scale = torch.rand([scale_k, scale_m], dtype=dtypes.fp32, device="cuda")
-    w_scale = torch.rand([scale_k, scale_n], dtype=dtypes.fp32, device="cuda")
-
-    x_scale_trans = torch.transpose(x_scale, 0, 1)
-    w_scale_trans = torch.transpose(w_scale, 0, 1)
-
-    flat_weight = weight.view(n // 16, 16, k // 64, 4, 16)
-    flat_weight = flat_weight.permute(0, 2, 3, 1, 4).contiguous()
-    flat_weight = flat_weight.view(n, -1)
-
-    a, avg_a = run_torch2(x, weight, x_scale_trans, w_scale_trans, dtype)
-    b, avg_b = run_asm(x, flat_weight, x_scale, w_scale, dtype)
-
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
-
-
-l_dtype = ["bf16"]
-l_m = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]
-l_nk = [
-    (1536, 7168),
-    (3072, 1536),
-    (576, 7168),
-    (7168, 256),
-    (7168, 2048),
-    (4608, 7168),
-    (7168, 2304),
-    (512, 7168),
-    (4096, 512),
-]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -154,62 +138,132 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
+    metavar="{bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    choices=[
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        96,
+        128,
+        160,
+        192,
+        224,
+        256,
+        288,
+        320,
+        352,
+        384,
+        416,
+        448,
+        480,
+        512,
+        1024,
+        2048,
+        4096,
+        6144,
+        8192,
+        10240,
+    ],
+    default=[
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        96,
+        128,
+        160,
+        192,
+        224,
+        256,
+        288,
+        320,
+        352,
+        384,
+        416,
+        448,
+        480,
+        512,
+        1024,
+        2048,
+        4096,
+        6144,
+        8192,
+        10240,
+    ],
     help="""M of mnk.
     e.g.: -m 32""",
 )
 parser.add_argument(
     "-nk",
     type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    choices=[
+        (24576, 1536),
+        # (32768, 512),
+        # (7168, 16384),
+        # (36864, 7168),
+    ],
+    default=[
+        (24576, 1536),
+        # (32768, 512),
+        # (7168, 16384),
+        # (36864, 7168),
+    ],
     help="""N&K of mnk.
-    e.g.: -nk 4096,512""",
+    e.g.: -nk 24576,1536""",
 )
 parser.add_argument(
-    "--preshuffle",
-    nargs="?",
+    "--ck_preshuffle",
+    type=dtypes.str2bool,
+    nargs="*",
     default=[True, False],
-    help="weight preshuffle or not",
+    help="""weight ck_preshuffle or not.
+    e.g.: --ck_preshuffle True
+        or --ck_preshuffle False
+    """,
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.nk is not None:
-    l_nk = [args.nk]
-l_preshuffle: List[bool] = args.preshuffle
 
 df = []
-for dtype, m, (n, k), preshuffle in itertools.product(l_dtype, l_m, l_nk, l_preshuffle):
+for dtype in args.dtype:
     # deepseek-r1
-    ret = test_gemm(dtype, m, n, k, preshuffle)
-    df.append(ret)
+    for m in args.m:
+        for n, k in args.nk:
+            for ck_p in args.ck_preshuffle:
+                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+                df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
-# for dtype in [dtypes.fp16]:
-#     # deepseek-r1
-#     for m in [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]:
-#         for (n, k) in [(1536,7168), (3072,1536), (7168, 256), (7168, 2048), (4608, 7168), (7168, 2304), (512, 7168), (4096, 512)][1:2]:
-#             test_gemm_asm(dtype, m, n, k)
-#             break
-if df["failed"].any():
-    print("Failed cases:", df[df["failed"] > 0], sep="\n")
+
+# Configure pandas to show all columns without truncation
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", None)
+pd.set_option("display.max_colwidth", None)
+pd.set_option("display.expand_frame_repr", False)
+
+print("\n" + "=" * 150)
+print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
+print("=" * 150)
+print(df.to_string(index=False))
+print("=" * 150)
+
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)

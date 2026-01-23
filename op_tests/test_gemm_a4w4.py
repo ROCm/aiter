@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, benchmark, perftest, run_perftest
-from aiter import dtypes
-from aiter.utility import fp4_utils
-from aiter.ops.shuffle import shuffle_weight
 import argparse
+
 import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -44,7 +46,7 @@ def run_gemm_ck(x, weight, x_scale, w_scale, out):
 
 @perftest()
 def run_triton(x, w, x_scales, w_scales, out, dtype=dtypes.bf16):
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
 
     gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
     return out
@@ -98,13 +100,10 @@ def test_gemm(dtype, M, N, K):
     x, x_scales_shuffle = quant_func(x, shuffle=True)
     w, w_scales_shuffle = quant_func(w, shuffle=True)
     wshuffle = shuffle_weight(w, layout=(16, 16))
-    out1 = torch.empty(M, N, dtype=dtype)
-    out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
-    out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
-    bias_f32 = None
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
     a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
+    # out1 = torch.empty(M, N, dtype=dtype)
     # b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
     # b, avg_b = a, 0
     # err_b = checkAllclose(a, b, msg="triton        ")
@@ -115,23 +114,23 @@ def test_gemm(dtype, M, N, K):
         wshuffle,
         x_scales_shuffle,
         w_scales_shuffle,
-        out2,
         bpreshuffle=True,
     )
-    err = checkAllclose(a, c[:M], msg="unified api")
+    err = checkAllclose(a, c, msg="unified api")
     ret["us"] = us
     ret["TFLOPS"] = M * N * K * 2 / us / 1e6
     ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
     ret["err"] = err
 
-    # kernelName = ""  # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
+    # kernelName = "" # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
     # log2_k_split = 1
+    # out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     # d, us = run_gemm_asm(
     #     x,
     #     wshuffle,
     #     x_scales_shuffle,
     #     w_scales_shuffle,
-    #     out3,
+    #     out2,
     #     kernelName,
     #     bias_f32,
     #     bpreshuffle=True,
@@ -144,6 +143,7 @@ def test_gemm(dtype, M, N, K):
     # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
     # ret[f"err {tag}"] = err
 
+    # out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     # e, us = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
     # err = checkAllclose(a, e[:M], msg="ck            ")
     # tag = "ck"
@@ -155,83 +155,6 @@ def test_gemm(dtype, M, N, K):
     return ret
 
 
-l_dtype = ["bf16"]
-l_mnk = [
-    # pure_compute
-    (256, 2048, 8192),
-    (2048, 8192, 8192),
-    (16384, 16384, 16384),
-    (32768, 106496, 16384),
-    (32768, 16384, 53248),
-    (32768, 18432, 16384),
-    (32768, 16384, 16384),
-    (128, 106496, 16384),
-    (128, 16384, 53248),
-    (128, 18432, 16384),
-    (128, 16384, 16384),
-    (64, 106496, 16384),
-    (64, 16384, 53248),
-    (64, 18432, 16384),
-    (64, 16384, 16384),
-    (64, 106496, 16384),
-    (32, 106496, 16384),
-    (32, 16384, 53248),
-    (32, 18432, 16384),
-    (32, 16384, 16384),
-    # qkv_proj
-    (1, 1280, 8192),
-    (64, 1280, 8192),
-    (127, 1280, 8192),
-    (129, 1280, 8192),
-    (65, 1280, 8192),
-    (32, 1280, 8192),
-    (64, 1280, 8192),
-    (128, 1280, 8192),
-    (192, 1280, 8192),
-    (256, 1280, 8192),
-    (320, 1280, 8192),
-    (512, 1280, 8192),
-    (1024, 1280, 8192),
-    (2048, 1280, 8192),
-    (4096, 1280, 8192),
-    (8192, 1280, 8192),
-    # attn_out
-    (1, 8192, 1024),
-    (32, 8192, 1024),
-    (64, 8192, 1024),
-    (128, 8192, 1024),
-    (192, 8192, 1024),
-    (256, 8192, 1024),
-    (320, 8192, 1024),
-    (512, 8192, 1024),
-    (1024, 8192, 1024),
-    (2048, 8192, 1024),
-    (4096, 8192, 1024),
-    (8192, 8192, 1024),
-    (16384, 8192, 1024),
-    # tune
-    (1552, 8192, 8192),
-    (1664, 8192, 8192),
-    (1792, 8192, 8192),
-    (1920, 8192, 8192),
-    (3072, 8192, 8192),
-    (1552, 10240, 8192),
-    (1664, 10240, 8192),
-    (1792, 10240, 8192),
-    (1920, 10240, 8192),
-    (3072, 10240, 8192),
-    (1552, 57344, 8192),
-    (1664, 57344, 8192),
-    (1792, 57344, 8192),
-    (1920, 57344, 8192),
-    (3072, 57344, 8192),
-    (1552, 8192, 28672),
-    (1664, 8192, 28672),
-    (1792, 8192, 28672),
-    (1920, 8192, 28672),
-    (3072, 8192, 28672),
-]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -239,11 +162,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    nargs="*",
+    choices=[dtypes.d_dtypes["bf16"]],
+    metavar="{bf16}",
+    default=[dtypes.d_dtypes["bf16"]],
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -251,25 +174,93 @@ parser.add_argument(
     "-mnk",
     "--shape",
     type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[
+        # pure_compute
+        (256, 2048, 8192),
+        (2048, 8192, 8192),
+        (16384, 16384, 16384),
+        (32768, 106496, 16384),
+        (32768, 16384, 53248),
+        (32768, 18432, 16384),
+        (32768, 16384, 16384),
+        (128, 106496, 16384),
+        (128, 16384, 53248),
+        (128, 18432, 16384),
+        (128, 16384, 16384),
+        (64, 106496, 16384),
+        (64, 16384, 53248),
+        (64, 18432, 16384),
+        (64, 16384, 16384),
+        (64, 106496, 16384),
+        (32, 106496, 16384),
+        (32, 16384, 53248),
+        (32, 18432, 16384),
+        (32, 16384, 16384),
+        # qkv_proj
+        (1, 1280, 8192),
+        (64, 1280, 8192),
+        (127, 1280, 8192),
+        (129, 1280, 8192),
+        (65, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        # attn_out
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+        # tune
+        (1552, 8192, 8192),
+        (1664, 8192, 8192),
+        (1792, 8192, 8192),
+        (1920, 8192, 8192),
+        (3072, 8192, 8192),
+        (1552, 10240, 8192),
+        (1664, 10240, 8192),
+        (1792, 10240, 8192),
+        (1920, 10240, 8192),
+        (3072, 10240, 8192),
+        (1552, 57344, 8192),
+        (1664, 57344, 8192),
+        (1792, 57344, 8192),
+        (1920, 57344, 8192),
+        (3072, 57344, 8192),
+        (1552, 8192, 28672),
+        (1664, 8192, 28672),
+        (1792, 8192, 28672),
+        (1920, 8192, 28672),
+        (3072, 8192, 28672),
+    ],
     help="""Shape of mnk.
     e.g. -mnk 1280,8192,1024""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.shape is not None:
-    l_mnk = [args.shape]
 
 df = []
-for dtype in l_dtype:
-    for m, n, k in l_mnk:
+for dtype in args.dtype:
+    for m, n, k in args.shape:
         ret = test_gemm(dtype, m, n, k)
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)

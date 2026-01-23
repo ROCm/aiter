@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter import dtypes
-import random
-import itertools
 import argparse
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+import itertools
+import random
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -16,6 +17,12 @@ torch.set_printoptions(sci_mode=False)
 # current supported case in decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16, nhead128
 # qdtype fp8, kdtype fp8: nhead16, nhead128
+
+
+def check_support(dtype, kv_dtype, nhead):
+    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    return True
 
 
 def cal_diff(
@@ -124,6 +131,7 @@ def test_mla(
     page_size,
     varlen,
     decode_qlen,
+    split_per_batch=None,
 ):
     ret = {}
 
@@ -297,7 +305,7 @@ def test_mla(
 
     us_asm = None
     if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16
+        dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128]
     ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
@@ -377,6 +385,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
+            num_kv_splits=split_per_batch,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -423,6 +432,7 @@ def test_mla(
             sm_scale,
             q_scale=q_scale,
             kv_scale=kv_scale,
+            num_kv_splits=split_per_batch,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -441,11 +451,16 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [16, 128]:
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+        16,
+        32,
+        64,
+        128,
+    ]:
         err, us_asm_decode = test_absorb_decode_bf16()
-
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
+
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
@@ -463,15 +478,6 @@ def test_mla(
 
     return ret
 
-
-kv_lora_rank = 512
-qk_nope_head_dim = 128
-qk_rope_head_dim = 64
-v_head_dim = 128
-block_size = 1
-list_dtype = ["bf16", "fp8"]
-l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -520,20 +526,22 @@ parser.add_argument(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=["bf16", "fp8"],
+    type=dtypes.str2Dtype,
     nargs="*",
-    default=["bf16"],
+    default="bf16,",
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+    metavar="{bf16, fp8}",
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-kvd",
     "--kv_dtype",
-    type=str,
-    choices=["bf16", "fp8"],
     nargs="*",
-    default=["bf16"],
+    type=dtypes.str2Dtype,
+    default="bf16,",
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+    metavar="{bf16, fp8}",
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
@@ -559,12 +567,21 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=list_nhead,
-    nargs="?",
+    choices=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    nargs="*",
     const=None,
-    default=None,
+    default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
     help="""Number of nhead and decode_qlen.
     e.g.: -n 16,1""",
+)
+parser.add_argument(
+    "-splits",
+    "--split_per_batch",
+    type=int,
+    nargs="*",
+    default=[None],
+    help="""kv seqlens split num for per batch.
+    e.g.: -ms 32""",
 )
 parser.add_argument(
     "--varlen",
@@ -573,34 +590,32 @@ parser.add_argument(
     --varlen # True""",
 )
 
-import pandas as pd
 
 args = parser.parse_args()
-list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
-l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
-if args.nhead is not None:
-    list_nhead = [args.nhead]
 
-for nhead, decode_qlen in list_nhead:
+for nhead, decode_qlen in args.nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
+    for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
+        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
     ):
-        ret = test_mla(
-            ctx_len,
-            batch_size,
-            nhead,
-            args.kv_lora_rank,
-            args.qk_nope_head_dim,
-            args.qk_rope_head_dim,
-            args.v_head_dim,
-            dtype,
-            kvtype,
-            args.block_size,
-            varlen=args.varlen,
-            decode_qlen=decode_qlen,
-        )
-        df.append(ret)
+        if check_support(dtype, kvtype, nhead):
+            ret = test_mla(
+                ctx_len,
+                batch_size,
+                nhead,
+                args.kv_lora_rank,
+                args.qk_nope_head_dim,
+                args.qk_rope_head_dim,
+                args.v_head_dim,
+                dtype,
+                kvtype,
+                args.block_size,
+                varlen=args.varlen,
+                decode_qlen=decode_qlen,
+                split_per_batch=split_per_batch,
+            )
+            df.append(ret)
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mla summary (markdown):\n%s", df_md)

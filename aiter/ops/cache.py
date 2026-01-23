@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
@@ -114,4 +114,23 @@ def cp_gather_indexer_k_quant_cache(
     dst_scale: Tensor,
     block_table: Tensor,
     cu_seq_lens: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_cache")
+def fused_qk_rope_concat_and_cache_mla(
+    q_nope: Tensor,
+    q_pe: Tensor,  # [num_tokens, num_heads, pe_dim]
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank] or [num_tokens, k_num_heads, kv_lora_rank]
+    k_pe: Tensor,  # [num_tokens, pe_dim] or [num_tokens, k_num_heads, pe_dim]
+    kv_cache: Tensor,  # [num_blocks, block_size, (kv_lora_rank + pe_dim)] or [num_blocks, block_size, k_num_heads, kv_lora_rank + pe_dim)]
+    q_out: Tensor,  # [num_tokens, num_heads, qk_lora_rank+pe_dim]
+    slot_mapping: Tensor,
+    k_scale: Tensor,
+    q_scale: Tensor,
+    positions: Tensor,  # [num_tokens]
+    cos_cache: Tensor,  # [max_position, rot_dim//2]
+    sin_cache: Tensor,  # [max_position, rot_dim//2]
+    is_neox: bool,
+    is_nope_first: bool,
 ) -> None: ...

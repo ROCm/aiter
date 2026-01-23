@@ -266,6 +266,7 @@ class CustomAllreduce:
         inp: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        use_new: bool = True,
         open_fp8_quant: bool = False,
         registered: bool = False,
     ):
@@ -281,13 +282,14 @@ class CustomAllreduce:
             self._ptr,
             inp,
             out,
+            use_new,
             open_fp8_quant,
             None if registered else self.buffer,
         )
         return out
 
     def custom_all_reduce(
-        self, input: torch.Tensor, open_fp8_quant: bool = False
+        self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -295,20 +297,49 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce(
-                    input, open_fp8_quant=open_fp8_quant, registered=True
+                    input,
+                    use_new=use_new,
+                    open_fp8_quant=open_fp8_quant,
+                    registered=True,
                 )
             else:
                 # if warm up, mimic the allocation pattern
                 # since custom allreduce is out-of-place
-                return torch.empty_like(input)
+                return torch.zeros_like(input)
         else:
             # note: outside of cuda graph context,
             # custom allreduce incurs a cost of cudaMemcpy, which should
             # be small(<=1% of overall latency) compared to the performance
             # gains of using custom kernels
             return self.all_reduce(
-                input, open_fp8_quant=open_fp8_quant, registered=False
+                input, use_new=use_new, open_fp8_quant=open_fp8_quant, registered=False
             )
+
+    def reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        registered: bool = False,
+    ):
+        ops.reduce_scatter(
+            self._ptr,
+            inp,
+            out,
+            None if registered else self.buffer,
+        )
+
+    def custom_reduce_scatter(
+        self, input: torch.Tensor, output: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        # when custom allreduce is disabled, this will be None
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.reduce_scatter(input, output, registered=True)
+        else:
+            return self.reduce_scatter(input, output, registered=False)
 
     def all_gather_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
         if out is None:
@@ -332,14 +363,16 @@ class CustomAllreduce:
                 return self.all_gather_reg(inp)
             else:
                 print("allgather capture hipgraph error")
-                return torch.empty_like(inp)
+                return torch.zeros_like(inp)
         else:
             return self.all_gather_unreg(inp)
 
     def fused_ar_rms(
         self,
         inp: torch.Tensor,
+        res_inp: torch.Tensor,
         *,
+        res_out: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         w: torch.Tensor,
         eps: float,
@@ -347,29 +380,41 @@ class CustomAllreduce:
     ):
         if out is None:
             out = torch.empty_like(inp)
+        if res_out is None:
+            res_out = torch.empty_like(inp)
         ops.fused_allreduce_rmsnorm(
             self._ptr,
             inp,
+            res_inp,
+            res_out,
             out,
             w,
             eps,
             None if registered else self.buffer,
         )
-        return out
+        return out, res_out
 
     def custom_fused_ar_rms(
-        self, input: torch.Tensor, weight: torch.Tensor, eps: float
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.fused_ar_rms(input, w=weight, eps=eps, registered=True)
+                return self.fused_ar_rms(
+                    input, residual_inp, w=weight, eps=eps, registered=True
+                )
             else:
-                return torch.empty_like(input)
+                return torch.zeros_like(input), torch.zeros_like(input)
         else:
-            return self.fused_ar_rms(input, w=weight, eps=eps, registered=False)
+            return self.fused_ar_rms(
+                input, residual_inp, w=weight, eps=eps, registered=False
+            )
 
     def close(self):
         if not self.disabled and self._ptr:

@@ -21,14 +21,19 @@ mha_varlen_fwd(at::Tensor& q,                                 // [total_q, hq, d
                bool is_causal,
                int window_size_left,
                int window_size_right,
+               int sink_size,
                bool return_softmax_lse,
                bool return_dropout_randval,
                std::optional<at::Tensor> out,                // [total_q, hq, d]
                std::optional<const at::Tensor> block_table,  // [hq] or [b, hq]
                std::optional<const at::Tensor> bias,         // [total_q, max_seqlen_k]
                std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
+               std::optional<const at::Tensor> q_descale,    // [1]
+               std::optional<const at::Tensor> k_descale,    // [1]
+               std::optional<const at::Tensor> v_descale,    // [1]
                std::optional<at::Generator> gen,
                std::optional<const at::Tensor> cu_seqlens_q_padded = std::nullopt,
-               std::optional<const at::Tensor> cu_seqlens_k_padded = std::nullopt);
+               std::optional<const at::Tensor> cu_seqlens_k_padded = std::nullopt,
+               std::optional<const at::Tensor> sink_ptr = std::nullopt);
 } // namespace torch_itfs
 } // namespace aiter

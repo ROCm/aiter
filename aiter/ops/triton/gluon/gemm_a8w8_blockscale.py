@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
 import functools
@@ -120,7 +120,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16],
+        instr_shape=[16, 16, 32],  # V_MFMA_F32_16X16X32_FP8_FP8 instruction
         transposed=True,
         warps_per_cta=[NUM_WARPS // 2, 2],
     )
@@ -426,8 +426,8 @@ def _get_config(
     K: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
-        if int(dev.split("MI")[1].replace("X", "")) < 350:
+        dev = arch_info.get_arch()
+        if int(dev.split("gfx")[1]) < 950:
             raise ValueError(
                 "Gluon implementation is not supported on this device (requires CDNA4)."
             )
@@ -441,7 +441,7 @@ def _get_config(
 
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
-        dev = arch_info.get_device()
+        dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:

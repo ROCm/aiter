@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
+from ..ops.enum import QuantType
 import argparse
 
 defaultDtypes = {
@@ -55,17 +56,41 @@ def str2bool(v):
 
 
 def str2tuple(v):
+    """
+    Convert string to int or tuple of ints.
+    - "512" -> 512 (single value without comma returns int)
+    - "512," -> (512,) (trailing comma returns tuple)
+    - "512,1024" -> (512, 1024) (multiple values return tuple)
+    """
     try:
-        parts = v.strip("()").split(",")
-
-        return tuple(int(p.strip()) for p in parts)
+        parts = [int(p.strip()) for p in v.strip("()").split(",") if p.strip()]
+        # Return single value if only one element and no comma; otherwise return tuple
+        if "," not in v and len(parts) == 1:
+            return parts[0]
+        return tuple(parts)
     except Exception as e:
         raise argparse.ArgumentTypeError(f"invalid format of input: {v}") from e
 
 
 def str2Dtype(v):
+    def _convert(s):
+        if s.lower() == "none":
+            return None
+        elif s in d_dtypes:
+            return d_dtypes[s]
+        else:
+            # Case-insensitive lookup for QuantType
+            s_lower = s.lower()
+            for name in dir(QuantType):
+                if not name.startswith("_") and name.lower() == s_lower:
+                    return getattr(QuantType, name)
+            raise ValueError(f"'{s}' not in d_dtypes or QuantType")
+
     try:
-        parts = v.strip("()").split(",")
-        return list(d_dtypes[p.strip()] for p in parts)
+        parts = [p.strip() for p in v.strip("()").split(",") if p.strip()]
+        # Return single value if only one element and no comma; otherwise return tuple
+        if len(parts) == 1 and "," not in v:
+            return _convert(parts[0])
+        return tuple(_convert(p) for p in parts)
     except Exception as e:
-        raise argparse.ArgumentTypeError(f"invalid format of data type: {v}") from e
+        raise argparse.ArgumentTypeError(f"invalid format of type: {v}") from e

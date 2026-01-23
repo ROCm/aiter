@@ -9,6 +9,7 @@
 #include "aiter_hip_common.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
+#include "pa.h"
 
 
 CK_TILE_HOST_DEVICE int32_t cal_cost(
@@ -56,6 +57,7 @@ struct MlaMetadataV1KernelParameter
     const int32_t* p_seqlens_qo_indptr;
     const int32_t* p_seqlens_kv_indptr;
     int32_t        num_batches;
+    int32_t        fixed_num_batches;
     int32_t        num_heads;
     int32_t        num_cu;
     int32_t        reduce_indptr_size;
@@ -65,7 +67,21 @@ struct MlaMetadataV1KernelParameter
     int32_t        ori_seqlen_qo;
     int32_t        topk;
     int32_t        qk_batch_ratio;
+    int32_t        num_splits;
     bool           is_causal;
+};
+
+struct PaMetadataV1KernelParameter: MlaMetadataV1KernelParameter
+{
+    // Inputs
+    const int32_t* p_pages_kv_indptr;
+    const int32_t* p_context_lens;
+    int32_t        block_size;
+    int32_t        blocks_per_unit;
+    int32_t        num_heads_k;
+    int32_t        gqa_ratio;
+    int32_t        qhead_granularity;
+    int32_t        qlen_granularity;
 };
 
 template <typename T>
@@ -236,7 +252,7 @@ public:
         p_seqlens_qo_indptr_(p_seqlens_qo_indptr)
     { }
 
-    CK_TILE_DEVICE constexpr bool is_unique()
+    CK_TILE_HOST_DEVICE static constexpr bool is_unique()
     {
         return Traits::kUniSeqlenQo >= 0;
     }
@@ -293,6 +309,12 @@ public:
         {
             return Traits::kUniSeqlenQo * (batch_idx + 1);
         }
+    }
+
+    CK_TILE_DEVICE int32_t get_q_head_range(
+        const int32_t q_head_start, const int32_t q_head_end) {
+        int32_t q_head_range = (q_head_end << 16) | (q_head_start & 0xFFFF);
+        return q_head_range;
     }
 
 private:

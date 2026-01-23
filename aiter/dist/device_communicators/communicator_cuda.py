@@ -19,6 +19,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
     ):
+        self._all2all_manager = None
+        self._all2all_manager_created = False
+
         super().__init__(cpu_group, device, device_group, unique_name)
         if "tp" not in unique_name:
             # custom allreduce or torch symm mem can be used only by tp
@@ -46,10 +49,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 PyNcclCommunicator,
             )
 
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group,
-                device=self.device,
-            )
+            try:
+                self.pynccl_comm = PyNcclCommunicator(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize PyNcclCommunicator for group "
+                    f"{self.unique_name}. Exception: {e}"
+                )
             # if is_symmetric_memory_enabled():
             #     register_nccl_symmetric_ops(self.pynccl_comm)
 
@@ -84,41 +93,61 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # currently be an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
-        if self.use_all2all:
+    @property
+    def all2all_manager(self):
+        # Lazily create all2all_manager to avoid tp/dp/ep group haven't been created yet
+        if not self._all2all_manager_created and self.use_all2all:
+            self._all2all_manager_created = True
+
             if self.all2all_backend == "naive":
                 from .all2all import NaiveAll2AllManager
 
-                self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
+                self._all2all_manager = NaiveAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "allgather_reducescatter":
                 from .all2all import AgRsAll2AllManager
 
-                self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+                self._all2all_manager = AgRsAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "pplx":
                 from .all2all import PPLXAll2AllManager
 
-                self.all2all_manager = PPLXAll2AllManager(self.cpu_group)
+                self._all2all_manager = PPLXAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "deepep_high_throughput":
                 from .all2all import DeepEPHTAll2AllManager
 
-                self.all2all_manager = DeepEPHTAll2AllManager(self.cpu_group)
+                self._all2all_manager = DeepEPHTAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "deepep_low_latency":
                 from .all2all import DeepEPLLAll2AllManager
 
-                self.all2all_manager = DeepEPLLAll2AllManager(self.cpu_group)
+                self._all2all_manager = DeepEPLLAll2AllManager(self.cpu_group)
+            elif self.all2all_backend == "mori":
+                from .all2all import MoriAll2AllManager
+
+                self._all2all_manager = MoriAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "flashinfer_all2allv":
                 from .all2all import FlashInferAllToAllManager
 
-                self.all2all_manager = FlashInferAllToAllManager(self.cpu_group)
+                self._all2all_manager = FlashInferAllToAllManager(self.cpu_group)
             else:
                 raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
 
             if is_global_first_rank():
                 logger.info(
                     "Using %s all2all manager.",
-                    self.all2all_manager.__class__.__name__,
+                    self._all2all_manager.__class__.__name__,
                 )
+        # if self._all2all_manager is None:
+        #     raise ValueError(f"all2all_manager is None for {self.unique_name}")
+        return self._all2all_manager
 
-    def all_reduce(self, input_, ca_fp8_quant: bool = False) -> torch.Tensor:
+    @all2all_manager.setter
+    def all2all_manager(self, value):
+        self._all2all_manager = value
+        if value is not None:
+            self._all2all_manager_created = True
+
+    def all_reduce(
+        self, input_, use_new: bool = True, ca_fp8_quant: bool = False
+    ) -> torch.Tensor:
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -126,6 +155,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             qr_comm is not None
             and not qr_comm.disabled
             and qr_comm.should_quick_allreduce(input_)
+            # input shape estimated at 2 * max concurrency for now. if performance issues, subject to change
         ):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
@@ -137,7 +167,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
-            out = ca_comm.custom_all_reduce(input_, ca_fp8_quant)
+            out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
             assert out is not None
             return out
         symm_mem_comm = self.symm_mem_comm
@@ -158,10 +188,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
-    def fused_allreduce_rmsnorm(self, input_, weight_, eps) -> torch.Tensor:
+    def fused_allreduce_rmsnorm(
+        self, input_, res_inp_, weight_, eps
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         can_use_fuse_ar_rms = (
-            n <= 16384 and input_.numel() * input_.element_size() < 8 * 1024 * 8192
+            n <= 16384
+            and input_.numel() * input_.element_size() < 8 * 1024 * 8192
+            and self.world_size != 6
         )
         ca_comm = self.ca_comm
         if (
@@ -170,11 +204,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_)
             and can_use_fuse_ar_rms
         ):
-            out = ca_comm.custom_fused_ar_rms(input_, weight_, eps)
+            out, res_out = ca_comm.custom_fused_ar_rms(input_, res_inp_, weight_, eps)
             assert out is not None
-            return out
+            assert res_out is not None
+            return out, res_out
         # call split kernel
-        ar_out = all_reduce(input_)
+        ar_out = self.all_reduce(input_)
         out = torch.empty_like(ar_out)
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
@@ -182,38 +217,45 @@ class CudaCommunicator(DeviceCommunicatorBase):
         rmsnorm2d_fwd_with_add(
             out,
             ar_out,
-            input_,
+            res_inp_,
             residual_out,
             weight_,
             eps,
             0,
         )
-        return out
+        return out, residual_out
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+    def reduce_scatter(
+        self, input_: torch.Tensor, output_: torch.Tensor, dim: int = -1
+    ):
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+        ):
+            ca_comm.custom_reduce_scatter(input_, output_)
+        else:
+            pynccl_comm = self.pynccl_comm
+            assert pynccl_comm is not None
+            if dim < 0:
+                # Convert negative dim to positive.
+                dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+            # Note: This will produce an incorrect answer if we don't make
+            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+            input_tensor = input_.movedim(0, dim).contiguous()
 
-        assert input_tensor.shape[0] % world_size == 0
-        chunk_size = input_tensor.shape[0] // world_size
-        output_shape = (chunk_size,) + input_tensor.shape[1:]
+            assert input_tensor.shape[0] % world_size == 0
+            chunk_size = input_tensor.shape[0] // world_size
+            output_shape = (chunk_size,) + input_tensor.shape[1:]
+            output_.reshape(output_shape)
 
-        output = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+            pynccl_comm.reduce_scatter(output_, input_tensor)
 
-        pynccl_comm.reduce_scatter(output, input_tensor)
-
-        # Reshape before returning
-        return output.movedim(0, dim).contiguous()
+            # Reshape before returning
+            output_.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
