@@ -458,12 +458,13 @@ def pa_ps_kernel(
 
         mtp_query_offsets = (
             (qo_start + mtp_query_len_offsets[:, None, None]) * stride_query_0
-            + mtp_query_group_size_offsets[None, :, None] * stride_query_1
+            + (q_head_start + mtp_query_group_size_offsets[None, :, None])
+            * stride_query_1
             + mtp_head_size_offsets[None, None, :]
         )
         query_row_mask_3d = (
             qo_start + mtp_query_len_offsets[:, None, None] < qo_end
-        ) & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
+        ) & ((q_head_start + mtp_query_group_size_offsets[None, :, None]) < q_head_end)
 
         mtp_query_mask = query_row_mask_3d & (
             mtp_head_size_offsets[None, None, :] < head_size
@@ -473,7 +474,9 @@ def pa_ps_kernel(
             query_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
         )
         mtp_query_tensor = gl.amd.cdna3.buffer_load(
-            ptr=query_ptr, offsets=mtp_query_offsets, mask=mtp_query_mask
+            ptr=query_ptr,
+            offsets=mtp_query_offsets,
+            mask=mtp_query_mask,
         )
         mtp_query_tensor = gl.reshape(
             mtp_query_tensor,
@@ -485,6 +488,7 @@ def pa_ps_kernel(
             query_tensor.dtype, query_tensor.shape, shared_query_layout, query_tensor
         )
         query_converted = query_shared.load(qk_lhs_operand_layout)
+
         if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
             # Quantize bf16 query to fp8
             # Convert query to float32 for computation
@@ -514,6 +518,7 @@ def pa_ps_kernel(
             query_scale_offsets = (
                 (qo_start + mtp_query_len_offsets[:, None, None]) * stride_query_scale_0
                 + kv_head_idx * stride_query_scale_1
+                + q_head_start
                 + mtp_query_group_size_offsets[None, :, None]
             )
             query_scale_value = gl.amd.cdna3.buffer_load(
@@ -707,7 +712,7 @@ def pa_ps_kernel(
 
             boundary_mask = qk_row_mask[:, None] & causal_mask
             # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-            attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
+            attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
 
             # ==================== SOFTMAX COMPUTATION ====================
             # Update running maximum for numerical stability
@@ -752,6 +757,7 @@ def pa_ps_kernel(
             probs_converted = gl.convert_layout(
                 attention_probs, layout=pv_lhs_operand_layout
             )
+
             values_converted = gl.convert_layout(
                 value_tensor, layout=pv_rhs_operand_layout
             )
@@ -775,6 +781,7 @@ def pa_ps_kernel(
                 attention_accumulator += probability_scale * attention_output
             else:
                 attention_accumulator += attention_output
+
             max_logits = new_max_logits
 
         # ==================== OUTPUT NORMALIZATION AND STORING ====================
@@ -785,7 +792,6 @@ def pa_ps_kernel(
             exp_sums_reciprocal[:, None], layout=pv_mfma_layout
         )
         attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
-
         # Store results to global memory
         if logits_idx >= 0:
             # Compute log-sum-exp for reduce stage
@@ -796,26 +802,28 @@ def pa_ps_kernel(
                 + logits_head_size_offsets[None, :]
             )
             logits_mask = (
-                q_head_start + logits_query_group_size_offsets[:, None] < q_head_end
+                (q_head_start + logits_query_group_size_offsets[:, None]) < q_head_end
             ) & (logits_head_size_offsets[None, :] < head_size)
             split_lse_offsets = logits_idx * stride_lse_0 + (
                 q_head_start + qk_row_offsets
             )
-            split_lse_mask = q_head_start + qk_row_offsets < q_head_end
+            split_lse_mask = (q_head_start + qk_row_offsets) < q_head_end
 
             lse = tl.math.log2(exp_sums) / LOG2_E + max_logits
-            gl.amd.cdna3.buffer_store(
-                stored_value=lse,
-                ptr=split_lse_ptr,
-                offsets=split_lse_offsets,
-                mask=split_lse_mask,
-            )
+
             gl.amd.cdna3.buffer_store(
                 stored_value=attention_accumulator,
                 ptr=logits_ptr,
                 offsets=logits_offsets,
                 mask=logits_mask,
             )
+            gl.amd.cdna3.buffer_store(
+                stored_value=lse,
+                ptr=split_lse_ptr,
+                offsets=split_lse_offsets,
+                mask=split_lse_mask,
+            )
+
         else:
             output = gl.reshape(
                 attention_accumulator,
