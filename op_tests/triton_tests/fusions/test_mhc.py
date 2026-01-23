@@ -304,7 +304,7 @@ def test_mhc_output_range():
     M, n, C = 64, 4, 1024
     x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
 
-    H_pre, H_post, H_res = mhc(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    H_pre, H_post, H_res = mhc(x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams, sinkhorn_iters=50)
 
     # Pre-stream (Eq 17): sigmoid output should be in [0, 1]
     assert torch.all(H_pre >= 0.0), "Pre-stream has values < 0"

@@ -204,13 +204,17 @@ def _sinkhorn_knopp_log_domain_kernel(
         3. Output: P = exp(A + log_u + log_v)
 
         Key insight: Division becomes subtraction in log space.
-        logsumexp uses stable formula: max(x) + log(Σ exp(x - max(x)))
+        logsumexp uses stable formula: max(x) + log2(Σ exp2((x - max(x)) * log2(e))) * ln(2)
 
     """
     batch_idx = tl.program_id(axis=0)
 
     if batch_idx >= M:
         return
+
+    # Constants for exp2/log2 conversion (faster on GPU hardware)
+    LOG2_E: tl.constexpr = 1.4426950408889634  # 1/ln(2), for exp(x) = exp2(x * LOG2_E)
+    LN_2: tl.constexpr = 0.6931471805599453    # ln(2), for log(x) = log2(x) * LN_2
 
     # Base offset for this batch
     batch_offset = batch_idx * stride_batch
@@ -236,10 +240,10 @@ def _sinkhorn_knopp_log_domain_kernel(
         # Compute max per row for numerical stability (prevents overflow in exp)
         row_max = tl.max(scaled_row, axis=1)  # (N,)
 
-        # Compute logsumexp per row
-        exp_shifted = tl.exp(scaled_row - row_max[:, None])
+        # Compute logsumexp per row (using exp2/log2 for faster GPU execution)
+        exp_shifted = tl.exp2((scaled_row - row_max[:, None]) * LOG2_E)
         row_sum_exp = tl.sum(exp_shifted, axis=1)  # (N,)
-        log_row_sums = row_max + tl.log(row_sum_exp)  # (N,)
+        log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2  # (N,)
 
         # Update row scaling: log_u = -log(row_sum) to normalize rows to 1
         log_u = -log_row_sums
@@ -250,16 +254,16 @@ def _sinkhorn_knopp_log_domain_kernel(
         # Compute max per column for numerical stability
         col_max = tl.max(scaled_col, axis=0)  # (N,)
 
-        # Compute logsumexp per column
-        exp_shifted = tl.exp(scaled_col - col_max[None, :])
+        # Compute logsumexp per column (using exp2/log2 for faster GPU execution)
+        exp_shifted = tl.exp2((scaled_col - col_max[None, :]) * LOG2_E)
         col_sum_exp = tl.sum(exp_shifted, axis=0)  # (N,)
-        log_col_sums = col_max + tl.log(col_sum_exp)  # (N,)
+        log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2  # (N,)
 
         # Update column scaling: log_v = -log(col_sum) to normalize cols to 1
         log_v = -log_col_sums
 
     # Combine base logits with accumulated scaling factors:
     log_P = log_A + log_u[:, None] + log_v[None, :]
-    P = tl.exp(log_P)
+    P = tl.exp2(log_P * LOG2_E)
 
     tl.store(out_ptr + batch_offset + flat_idx, P.to(out_ptr.dtype.element_ty))
