@@ -12,7 +12,7 @@ import sys
 import argparse
 import torch
 import triton
-from aiter.ops.triton.fusions.mhc import mhc, fused_mhc
+from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
 from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
@@ -72,7 +72,7 @@ def get_benchmark_configs(args):
 def run_benchmark(args):
     """Run mHC benchmark with specified configuration."""
     dtype = arg_to_torch_dtype[args.dtype]
-    with_sinkhorn = not args.no_sinkhorn
+    mode = args.mode
     sinkhorn_iters = args.sinkhorn_iters
     
     configs = get_benchmark_configs(args)
@@ -97,10 +97,12 @@ def run_benchmark(args):
         line_vals = [metric_map.get(args.metric, "throughput(TFLOPS)")]
     
     benchmark_name = get_caller_name_no_ext()
-    if with_sinkhorn:
-        benchmark_name += f"_sinkhorn{sinkhorn_iters}"
-    else:
+    if mode == "full":
+        benchmark_name += f"_full_sinkhorn{sinkhorn_iters}"
+    elif mode == "fused":
         benchmark_name += "_fused_only"
+    elif mode == "sinkhorn":
+        benchmark_name += f"_sinkhorn_only_{sinkhorn_iters}iters"
     
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -146,11 +148,14 @@ def run_benchmark(args):
         # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
         # Each normalization: sum (n ops) + divide (n ops) = 2n ops per row/col
         # Total per iteration: 2 * 2 * M * n * n ops
-        flops_sinkhorn = 0.0
-        if with_sinkhorn:
-            flops_sinkhorn = 4.0 * M * n * n * sinkhorn_iters
+        flops_sinkhorn = 4.0 * M * n * n * sinkhorn_iters
         
-        total_flops = flops_matmul + flops_rms + flops_scale + flops_activation + flops_sinkhorn
+        if mode == "full":
+            total_flops = flops_matmul + flops_rms + flops_scale + flops_activation + flops_sinkhorn
+        elif mode == "fused":
+            total_flops = flops_matmul + flops_rms + flops_scale + flops_activation
+        elif mode == "sinkhorn":
+            total_flops = flops_sinkhorn
         
         # Compute memory traffic
         elem_size = 2  # bf16/fp16 = 2 bytes
@@ -178,29 +183,43 @@ def run_benchmark(args):
             M * n * n * elem_size  # out_res
         )
         
-        # Sinkhorn-Knopp adds minimal memory traffic (in-place operations)
-        if with_sinkhorn:
-            # Read/write H_res multiple times during iterations
-            mem_sinkhorn = 2 * M * n * n * elem_size * sinkhorn_iters
+        # Sinkhorn-Knopp memory traffic (in-place operations)
+        mem_sinkhorn = 2 * M * n * n * elem_size * sinkhorn_iters
+        
+        if mode == "full":
             mem_read += mem_sinkhorn / 2
             mem_write += mem_sinkhorn / 2
-        
-        total_mem = mem_read + mem_write
+            total_mem = mem_read + mem_write
+        elif mode == "fused":
+            total_mem = mem_read + mem_write
+        elif mode == "sinkhorn":
+            # Sinkhorn-only: read/write H_res matrix
+            total_mem = mem_sinkhorn
         
         # Create benchmark function
-        if with_sinkhorn:
+        if mode == "full":
             fn = lambda: mhc(
                 x, phi_pre, phi_post, phi_res,
                 alpha_pre, alpha_post, alpha_res,
                 bias, n_streams,
                 sinkhorn_iters=sinkhorn_iters
             )
-        else:
+        elif mode == "fused":
             fn = lambda: fused_mhc(
                 x, phi_pre, phi_post, phi_res,
                 alpha_pre, alpha_post, alpha_res,
                 bias, n_streams
             )
+        elif mode == "sinkhorn":
+            # Sinkhorn-only: benchmark just the Sinkhorn-Knopp kernel
+            # Pre-generate H_res for fair comparison
+            _, _, H_res_input = fused_mhc(
+                x, phi_pre, phi_post, phi_res,
+                alpha_pre, alpha_post, alpha_res,
+                bias, n_streams
+            )
+            H_res_3d = H_res_input.view(M, n, n)
+            fn = lambda: sinkhorn_knopp(H_res_3d, num_iters=sinkhorn_iters, out=H_res_3d)
         
         # Benchmark
         ms = triton.testing.do_bench(fn)
@@ -256,10 +275,11 @@ def parse_args():
         help="Data type for computation"
     )
     parser.add_argument(
-        "--no_sinkhorn",
-        action="store_true",
-        default=False,
-        help="Benchmark fused_mhc only (skip Sinkhorn-Knopp)"
+        "--mode",
+        type=str,
+        default="full",
+        choices=["full", "fused", "sinkhorn"],
+        help="Benchmark mode: 'full' (fused+sinkhorn), 'fused' (fused kernel only), 'sinkhorn' (sinkhorn-only)"
     )
     parser.add_argument(
         "-sinkhorn_iters",

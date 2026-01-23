@@ -81,10 +81,10 @@ for C in ${HIDDEN_DIMS[@]}; do
 done
 
 # ========================================
-# 4. Fused-only vs Full Pipeline Comparison
+# 4. Mode Comparison: Fused / Sinkhorn / Full Pipeline
 # ========================================
 echo "=========================================="
-echo "4. Fused-only vs Full Pipeline"
+echo "4. Mode Comparison: Fused / Sinkhorn / Full Pipeline"
 echo "=========================================="
 
 echo "--- Fused mHC only (no Sinkhorn-Knopp) ---"
@@ -93,15 +93,26 @@ run_cmd python op_tests/op_benchmarks/triton/bench_mhc.py \
     -n 4 \
     -C 1024 \
     --dtype bf16 \
-    --no_sinkhorn
+    --mode fused
 
 echo ""
-echo "--- Full mHC (with Sinkhorn-Knopp, 20 iters) ---"
+echo "--- Sinkhorn-Knopp only (20 iters) ---"
 run_cmd python op_tests/op_benchmarks/triton/bench_mhc.py \
     -M 1024 \
     -n 4 \
     -C 1024 \
-    --dtype bf16
+    --dtype bf16 \
+    --mode sinkhorn \
+    -sinkhorn_iters 20
+
+echo ""
+echo "--- Full mHC (Fused + Sinkhorn-Knopp, 20 iters) ---"
+run_cmd python op_tests/op_benchmarks/triton/bench_mhc.py \
+    -M 1024 \
+    -n 4 \
+    -C 1024 \
+    --dtype bf16 \
+    --mode full
 
 echo ""
 
