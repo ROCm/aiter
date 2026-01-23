@@ -872,9 +872,9 @@ def sage_fwd_v2(
     K_Descale,
     V_Descale,
     FP8_MAX,
-    stride_q_descale_z,
-    stride_q_descale_h,
-    stride_q_descale_s,
+    stride_qsz,
+    stride_qsh,
+    stride_qsm,
     stride_ksz,
     stride_ksh,
     stride_ksn,
@@ -1019,9 +1019,9 @@ def sage_fwd_v2(
 
     q_descale_ptrs = (
         Q_Descale
-        + off_z * stride_q_descale_z
-        + off_h_q * stride_q_descale_h
-        + offs_m[:, None] * stride_q_descale_s
+        + off_z * stride_qsz
+        + off_h_q * stride_qsh
+        + offs_m[:, None] * stride_qsm
         + offs_d_qk_s[None, :]
     )
 
@@ -1732,7 +1732,7 @@ def fav3_sage_triton_impl_v2(
             torch.float32,
         ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
 
-    stride_q_descale_z, stride_q_descale_s, stride_q_descale_h, _ = map_dims(
+    stride_qsz, stride_qsm, stride_qsh, _ = map_dims(
         q_descale.stride(), bshd
     )
     stride_ksz, stride_ksn, stride_ksh, _ = map_dims(
@@ -1818,9 +1818,9 @@ def fav3_sage_triton_impl_v2(
         k_descale,
         v_descale,
         FP8_MAX,
-        stride_q_descale_z,
-        stride_q_descale_h,
-        stride_q_descale_s,
+        stride_qsz,
+        stride_qsh,
+        stride_qsm,
         stride_ksz,
         stride_ksh,
         stride_ksn,
