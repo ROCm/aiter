@@ -1,16 +1,15 @@
-import os
+import aiter
 import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
 from .utils import (
     compute_alibi_block,
-    get_arch,
     map_dims,
 )
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid_3d
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs
 
 @triton.jit
 def _sage_fwd_no_mask_v2(
@@ -39,7 +38,7 @@ def _sage_fwd_no_mask_v2(
     off_h_q,
     offs_m,
     offs_n,
-    offs_d_qk,
+    offs_d_k,
     offs_d_v,
     block_min,
     block_max,
@@ -55,7 +54,7 @@ def _sage_fwd_no_mask_v2(
     ENABLE_DROPOUT: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr,
     PADDED_HEAD_V: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_K: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -76,7 +75,7 @@ def _sage_fwd_no_mask_v2(
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
         # Load K
         if PADDED_HEAD_QK:
-            k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
+            k_mask = offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_K
             k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         else:
             k = tl.load(k_ptrs)
@@ -231,7 +230,7 @@ def _sage_fwd_mask_v2(
     off_h_q,
     offs_m,
     offs_n,
-    offs_d_qk,
+    offs_d_k,
     offs_d_v,
     block_min,
     block_max,
@@ -249,7 +248,7 @@ def _sage_fwd_mask_v2(
     ENABLE_DROPOUT: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr,
     PADDED_HEAD_V: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_K: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -279,7 +278,7 @@ def _sage_fwd_mask_v2(
         k_mask = kv_offs_n[None, :] < seqlen_k
         v_mask = kv_offs_n[:, None] < seqlen_k
         if PADDED_HEAD_QK:
-            k_mask = k_mask & (offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK)
+            k_mask = k_mask & (offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_K)
         if PADDED_HEAD_V:
             v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
 
@@ -920,6 +919,8 @@ def sage_fwd_v2(
     dropout_p,
     philox_seed,
     philox_offset_base,
+    Q_HEAD_DIM_DIVISOR: tl.constexpr,
+    K_HEAD_DIM_DIVISOR: tl.constexpr,
     RETURN_LSE: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -966,7 +967,8 @@ def sage_fwd_v2(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK // 2)  # we fit 2 fp4 elements per int8
+    offs_d_q = tl.arange(0, BLOCK_DMODEL_QK // Q_HEAD_DIM_DIVISOR)  # we fit 2 fp4 elements per int8
+    offs_d_k = tl.arange(0, BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR)  # we fit 2 fp4 elements per int8
     offs_d_qk_s = tl.arange(0, BLOCK_DMODEL_QK // SCALE_GROUP_SIZE)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
 
@@ -1111,11 +1113,11 @@ def sage_fwd_v2(
     q_offset = (
         Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
     )
-    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
+    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_q[None, :] * stride_qk
     k_offset = (
         K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
     )
-    k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[None, :] * stride_kn
+    k_ptrs = k_offset + offs_d_k[:, None] * stride_kk + offs_n[None, :] * stride_kn
     v_offset = (
         V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     )
@@ -1146,7 +1148,7 @@ def sage_fwd_v2(
     # Q is loaded once at the beginning and shared by all N blocks.
     q_ptrs_mask = offs_m[:, None] < seqlen_q
     if PADDED_HEAD_QK:
-        q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :] < ACTUAL_BLOCK_DMODEL_QK)
+        q_ptrs_mask = q_ptrs_mask & (offs_d_q[None, :] < ACTUAL_BLOCK_DMODEL_QK // Q_HEAD_DIM_DIVISOR)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
     # ========== Process MASKED K Blocks in the front ==========
@@ -1188,7 +1190,7 @@ def sage_fwd_v2(
             off_h_q,
             offs_m,
             offs_n,
-            offs_d_qk,
+            offs_d_k,
             offs_d_v,
             block_min,  # Start of front masked blocks
             block_max,  # End of front masked blocks
@@ -1206,7 +1208,7 @@ def sage_fwd_v2(
             ENABLE_DROPOUT,
             PADDED_HEAD_QK,
             PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR,
             ACTUAL_BLOCK_DMODEL_V,
             USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
@@ -1257,7 +1259,7 @@ def sage_fwd_v2(
             off_h_q,
             offs_m,
             offs_n,
-            offs_d_qk,
+            offs_d_k,
             offs_d_v,
             block_min,  # Start of range: 0
             block_max,  # End of range: n_full_blocks * BLOCK_N
@@ -1273,7 +1275,7 @@ def sage_fwd_v2(
             ENABLE_DROPOUT,
             PADDED_HEAD_QK,
             PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR,
             ACTUAL_BLOCK_DMODEL_V,
             USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
@@ -1326,7 +1328,7 @@ def sage_fwd_v2(
             off_h_q,
             offs_m,
             offs_n,
-            offs_d_qk,
+            offs_d_k,
             offs_d_v,
             block_min,  # Start of range: n_full_blocks * BLOCK_N
             block_max,  # End of range: n_visible_k_blocks * BLOCK_N
@@ -1344,7 +1346,7 @@ def sage_fwd_v2(
             ENABLE_DROPOUT,
             PADDED_HEAD_QK,
             PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR,
             ACTUAL_BLOCK_DMODEL_V,
             USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
@@ -1541,13 +1543,20 @@ def fav3_sage_triton_impl_v2(
         q.is_cuda and q.device.index == current_device
     ), f"Device mismatch: Kernel will launch on cuda:{current_device}, but tensors are on {q.device}"
 
+    head_size_q = q.shape[-1]
+    head_size_k = k.shape[-1]
+    is_q_fp4 = q.dtype == torch.uint8
+    is_k_fp4 = k.dtype == torch.uint8
+    if is_q_fp4:
+        head_size_q *= 2
+    if is_k_fp4:
+        head_size_k *= 2
+
     # get shapes and strides
     if IS_VARLEN:
         # shape
-        total_seqlen_q, nheads_q, head_size_q = q.shape
-        head_size_q *= 2
-        total_seqlen_k, nheads_k, head_size_k = k.shape
-        head_size_k *= 2
+        total_seqlen_q, nheads_q, _ = q.shape
+        total_seqlen_k, nheads_k, _ = k.shape
         total_seqlen_v, nheads_v, head_size_v = v.shape
 
         # assert shapes
@@ -1654,12 +1663,10 @@ def fav3_sage_triton_impl_v2(
     else:
         bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         # shapes
-        batch_q, seqlen_q, nheads_q, head_size_q = map_dims(q.shape, bshd)
-        batch_k, seqlen_k, nheads_k, head_size_k = map_dims(k.shape, bshd)
+        batch_q, seqlen_q, nheads_q, _ = map_dims(q.shape, bshd)
+        batch_k, seqlen_k, nheads_k, _ = map_dims(k.shape, bshd)
         batch_v, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd)
 
-        head_size_q *= 2
-        head_size_k *= 2
         # assert batch dimensions
         assert (
             batch_q == batch_k == batch_v
@@ -1804,7 +1811,7 @@ def fav3_sage_triton_impl_v2(
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     if config is None:
-        config = get_fwd_configs(False, seqlen_k=max_seqlens_k)
+        config = get_sage_fwd_configs(False, seqlen_k=max_seqlens_k)
 
     if sm_scale == None:
         sm_scale = head_size_qk**(-0.5)
@@ -1863,6 +1870,8 @@ def fav3_sage_triton_impl_v2(
         cu_seqlens_k,
         seqused_q,
         seqused_k,  # Pass seqused tensors
+        Q_HEAD_DIM_DIVISOR=2 if is_q_fp4 else 1,
+        K_HEAD_DIM_DIVISOR=2 if is_k_fp4 else 1,
         dropout_p=dropout_p,
         philox_seed=philox_seed,
         philox_offset_base=philox_offset,
