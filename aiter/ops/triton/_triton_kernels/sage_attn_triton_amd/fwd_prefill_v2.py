@@ -1807,7 +1807,8 @@ def fav3_sage_triton_impl_v2(
         config = get_fwd_configs(False, seqlen_k=max_seqlens_k)
 
     if sm_scale == None:
-        sm_scale = (head_size_qk**(-0.5)) * 1.4426950408889634
+        sm_scale = head_size_qk**(-0.5)
+    sm_scale *= 1.4426950408889634
     sage_fwd_v2[grid](
         q,
         k,
