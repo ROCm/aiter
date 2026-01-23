@@ -1155,8 +1155,8 @@ class MRotaryEmbedding(RotaryEmbedding):
 class AiterFusedSetKVBufferArg:
     kv_cache: Tuple[torch.Tensor, torch.Tensor]
     cache_loc: torch.Tensor
-    k_scale: float
-    v_scale: float
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
     return_kv: bool = False  # Whether to return k_out and v_out
     use_shuffle_layout: bool = False  # Whether to use shuffle layout for KV cache
     block_size: int = 0  # Block size for shuffle layout
