@@ -37,7 +37,6 @@ from aiter.ops.triton.gmm import (
     nptgmm as triton_nptgmm,
 )
 
-
 # Benchmark.
 # ------------------------------------------------------------------------------
 
