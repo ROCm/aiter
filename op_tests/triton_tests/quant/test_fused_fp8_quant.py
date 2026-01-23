@@ -9,16 +9,10 @@ from aiter.ops.triton.quant.fused_fp8_quant import (
     fused_silu_mul_fp8_per_tensor_static_quant,
 )
 
-from aiter import (
-    rmsnorm2d_fwd,
-    silu_and_mul,
-)
-
 from aiter.test_common import (
     checkAllclose,
 )
 
-from aiter.ops.quant import per_tensor_quant_hip
 import aiter
 import torch.nn.functional as F
 
@@ -199,17 +193,11 @@ def test_fused_rms_fp8_group_quant(M: int, N1: int, N2: int, dtype):
     torch.testing.assert_close(y1_upcast_torch, y1_upcast_triton, atol=0.1, rtol=0.1)
 
 
-def rmsnorm2d_fwd_(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
-) -> torch.Tensor:
-    ori_shape = x.shape
-    x = x.reshape(-1, dim)
-    return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
-
-
-def rmsnorm_fp8_quantization_ref(x, w, x_scale, eps, n, rocm_fp8_dtype):
-    rms_out = rmsnorm2d_fwd_(x, w, eps, n)
-    quant_out, _ = per_tensor_quant_hip(rms_out, x_scale, rocm_fp8_dtype)
+def rmsnorm_fp8_quantization_ref(x, w, x_scale, eps, rocm_fp8_dtype):
+    rms_out = rmsnorm(x.to(torch.float32), w.to(torch.float32), eps).to(x.dtype)
+    quant_out = per_tensor_fp8_static_quant(
+        rms_out.to(torch.float32), rocm_fp8_dtype, x_scale.to(torch.float32)
+    )
     return quant_out, rms_out
 
 
@@ -249,14 +237,14 @@ def test_rmsnorm_quant_fuse(m, n):
     )
 
     # calculate the correct scale value
-    rms_out = rmsnorm2d_fwd_(x, w, eps, n)
+    rms_out = rmsnorm(x.to(torch.float32), w.to(torch.float32), eps)
     rms_out_abs = torch.abs(rms_out)
     rms_out_abs_max = torch.max(rms_out_abs)
     scale_val = rms_out_abs_max / DTYPE_MAX
     x_scale = torch.tensor((scale_val), dtype=torch.float32, device="cuda")
 
     fp8_x_ref, rms_out_ref = rmsnorm_fp8_quantization_ref(
-        x, w, x_scale, eps, n, rocm_fp8_dtype
+        x, w, x_scale, eps, rocm_fp8_dtype
     )
     fp8_x, rms_out = triton_rmsnorm_fp8_quantization_fuse(
         x, w, x_scale, eps, rocm_fp8_dtype
@@ -659,9 +647,13 @@ def silu_mul_fp8_quantization_ref(x, x_scale, rocm_fp8_dtype):
     m, n2 = x.shape
     assert n2 % 2 == 0
     n = n2 // 2
-    silu_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    silu_and_mul(silu_out, x)
-    quant_out, _ = per_tensor_quant_hip(silu_out, x_scale, rocm_fp8_dtype)
+    x1, x2 = x.split([n, n], dim=-1)
+    silu_out = (
+        (F.silu(x1.to(torch.float32)) * x2.to(torch.float32))
+        .to(x.dtype)
+        .to(torch.float32)
+    )
+    quant_out = per_tensor_fp8_static_quant(silu_out, rocm_fp8_dtype, x_scale)
     return quant_out
 
 
@@ -689,8 +681,12 @@ def test_silu_mul_quant_fuse(m, n):
     )
 
     # calculate the correct scale value
-    silu_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    silu_and_mul(silu_out, x)
+    x1, x2 = x.split([n, n], dim=-1)
+    silu_out = (
+        (F.silu(x1.to(torch.float32)) * x2.to(torch.float32))
+        .to(x.dtype)
+        .to(torch.float32)
+    )
     silu_out_abs = torch.abs(silu_out)
     silu_out_abs_max = torch.max(silu_out_abs)
     scale_val = silu_out_abs_max / DTYPE_MAX
