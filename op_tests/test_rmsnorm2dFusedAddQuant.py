@@ -15,7 +15,7 @@ import pandas as pd
 torch.set_default_device("cuda")
 
 
-@perftest()
+@perftest(num_warmup=0, num_iters=10)
 def run_torch(
     input,
     weight,
@@ -319,7 +319,14 @@ if __name__ == "__main__":
         help="""N of mnk.
     e.g.: -n 1024""",
     )
-
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        default=[dtypes.d_dtypes["bf16"]],
+        nargs="*",
+        choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
+    )
     args = parser.parse_args()
     if args.mode == 1:
         test_rmsnorm_func = partial(
@@ -357,9 +364,10 @@ if __name__ == "__main__":
     df = []
     for n in args.n:
         for m in args.m:
-            ret = test_rmsnorm_func(
-                m, n, quant_dtype=args.quant_dtype if args.mode not in [1, 2] else None
-            )
+            for dtype in args.dtype:
+                ret = test_rmsnorm_func(
+                    m, n, dtype=dtype, quant_dtype=args.quant_dtype if args.mode not in [1, 2] else None
+                )
             df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)

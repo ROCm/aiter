@@ -4,7 +4,7 @@
  * Crafting the micro standard templates for AI Operators on ROCm
  *
  * MIT License
- * Copyright (C) 2025 carlus.huang@amd.com
+ * Copyright (C) 2025-2026 carlus.huang@amd.com
  *
  **************************************************************************************************/
 #pragma once
@@ -961,10 +961,10 @@ struct gmem {
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
         static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must be same for the data to be stored" );
         if constexpr (is_dtype_v<V> && (vec * vector_size) % vector_traits<V>::size() == 0) {
-            _store<vec>(make_repeated_vector(x, number<vec * vector_size / vector_traits<V>::size()>{}), v_os * sizeof(T));
+            _store<vec>(make_repeated_vector(x, number<vec * vector_size / vector_traits<V>::size()>{}), v_os * sizeof(T), s_os * sizeof(T), number<aux>{});
         } else {
             static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
-            _store<vec>(x, v_os * sizeof(T));
+            _store<vec>(x, v_os * sizeof(T), s_os * sizeof(T), number<aux>{});
         }
     }
 
