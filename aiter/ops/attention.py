@@ -566,6 +566,8 @@ def mla_decode_stage1_asm_fwd(
     work_indptr: Optional[torch.Tensor],
     work_info_set: Optional[torch.Tensor],
     max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
     softmax_scale: float,
     # [batch_size, num_kv_splits, num_heads, v_head_dim]
     splitData: torch.Tensor,

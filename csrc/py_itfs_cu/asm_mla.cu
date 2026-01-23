@@ -51,7 +51,7 @@ struct __attribute__((packed)) KernelArgs
 
 void mla_decode_stage1_asm_fwd(
     torch::Tensor& Q,                    //   [num_seqs, num_heads, head_size]
-    torch::Tensor& KV,                   //   [num_page, page_size, num_kv_heads, head_size]
+    torch::Tensor& KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
     torch::Tensor& qo_indptr,            //   [batch_size+1]
     torch::Tensor& kv_indptr,            //   [batch_size+1]
     torch::Tensor& kv_page_indices,      //   [num_page_used]
@@ -61,6 +61,8 @@ void mla_decode_stage1_asm_fwd(
     std::optional<torch::Tensor>& work_indptr,            //   metadata
     std::optional<torch::Tensor>& work_info_set,          //   [batch_size+1]
     int max_seqlen_q,
+    int page_size,
+    int nhead_kv,
     float softmax_scale,
     // following are output
     torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
@@ -73,8 +75,7 @@ void mla_decode_stage1_asm_fwd(
     int batch           = qo_indptr.size(0) - 1;
     int num_heads       = Q.size(1);
     int head_size       = Q.size(2);
-    int page_size       = KV.size(1);
-    int num_kv_heads    = KV.size(2);
+    int num_kv_heads    = nhead_kv;
     int kv_split        = splitData.size(1);
     const int gqa_ratio = num_heads / num_kv_heads;
 
@@ -82,7 +83,9 @@ void mla_decode_stage1_asm_fwd(
 
     int stride_Q       = Q.stride(0) * Q.itemsize() * max_seqlen_q;
     int stride_Page    = KV.stride(0) * KV.itemsize();
-    std::cout << "stride_Q: " << stride_Q << " stride_Page: " << stride_Page << std::endl;
+    // std::cout << "stride_Page: " << stride_Page << "KV stride: " << KV.stride(0) << "KV itemsize: " << KV.itemsize() << std::endl;
+    // std::cout << "page_size " << page_size << std::endl;
+    // std::cout << "nhead_kv " << nhead_kv << std::endl;
     uint32_t log2_page = (uint32_t)log2f(page_size);
 
     KernelArgs args;
@@ -107,6 +110,7 @@ void mla_decode_stage1_asm_fwd(
     {
         if (work_meta_data.has_value())
         {
+            // std::cout << "work_meta_data: " << std::endl;
             args.ptr_STP = work_meta_data.value().data_ptr();
         }
         else
@@ -243,7 +247,6 @@ void mla_decode_stage1_asm_fwd(
                 if(persistent)
                 {
                     if (page_size != 1) {
-                        std::cout << "page_size != 1" << std::endl;
                         sub_Q = 128;
                         args.ptr_KVSCALE = kv_scale.value().data_ptr();
                         static AiterAsmKernel impl_a16w8_bf16_ps(

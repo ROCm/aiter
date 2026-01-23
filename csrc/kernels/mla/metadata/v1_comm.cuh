@@ -3,13 +3,13 @@
 
 #pragma once
 
-#include <torch/python.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "pa.h"
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <torch/python.h>
 
 CK_TILE_HOST_DEVICE int32_t cal_cost(const int32_t qo_len, const int32_t kv_len)
 {
@@ -60,6 +60,7 @@ struct MlaMetadataV1KernelParameter
     int32_t qk_batch_ratio;
     int32_t num_splits;
     bool is_causal;
+    int32_t k_fixed_over_head_num_blocks;
 };
 
 struct PaMetadataV1KernelParameter : MlaMetadataV1KernelParameter

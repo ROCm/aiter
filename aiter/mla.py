@@ -149,6 +149,8 @@ def mla_decode_fwd(
     kv_indices,
     kv_last_page_lens,
     max_seqlen_q,
+    page_size=1,
+    nhead_kv=1,
     sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
     logit_cap=0.0,
     num_kv_splits=None,  # for experts only!!!
@@ -230,6 +232,8 @@ def mla_decode_fwd(
             None,
             None,
             max_seqlen_q,
+            page_size,
+            nhead_kv,
             sm_scale,
             logits,
             attn_lse,
@@ -322,6 +326,8 @@ def mla_decode_fwd(
             work_indptr,
             work_info_set,
             max_seqlen_q,
+            page_size,
+            nhead_kv,
             sm_scale,
             logits,
             attn_lse,

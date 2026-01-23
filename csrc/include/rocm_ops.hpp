@@ -57,6 +57,8 @@ namespace py = pybind11;
           py::arg("work_indptr"),              \
           py::arg("work_info_set"),            \
           py::arg("max_seqlen_q"),             \
+          py::arg("page_size"),                \
+          py::arg("nhead_kv"),                 \
           py::arg("softmax_scale"),            \
           py::arg("splitData"),                \
           py::arg("splitLse"),                 \
