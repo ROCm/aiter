@@ -46,7 +46,7 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
-            runner: aiter-1gpu-runner
+            runner: aiter-mi355-1gpu
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
