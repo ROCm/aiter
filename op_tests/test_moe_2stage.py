@@ -49,6 +49,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=False,
 ):
+    torch.manual_seed(42)
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
@@ -70,6 +71,9 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    # w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
+    # w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype)
+    # print(input[:16,:128] @ w1.view(-1, model_dim)[:16, :128].transpose(0,1))
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -170,6 +174,7 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
+        print(w1_qt_aiter.view(torch.int64))
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -198,6 +203,8 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
     )
+    print(out1_ref)
+    print(out1_ref.view(-1, inter_dim)[:16,:128] @ w2.view(-1, inter_dim)[:16, :128].transpose(0,1))
 
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_128x128:
@@ -247,8 +254,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
-        num_iters=5,
-        num_warmup=2,
+        num_iters=100,
+        num_warmup=50,
     )
     err = checkAllclose(
         out2_ref,

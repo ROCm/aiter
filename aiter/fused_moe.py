@@ -224,7 +224,7 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    bf16_fp8_bound = 512
+    bf16_fp8_bound = 16
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -1547,7 +1547,7 @@ def cktile_moe_stage1(
         else out
     )
 
-    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
+    print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
@@ -1572,6 +1572,113 @@ def cktile_moe_stage1(
             aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
         else:
             aiter.gelu_and_mul(out, tmp_out)
+    # print(out)
+    out_tmp = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
+
+    token_num = hidden_states.shape[0]
+    E, _, model_dim_pack = w1.shape
+    model_dim = model_dim_pack * 2 if w1.dtype == dtypes.fp4x2 else model_dim_pack 
+    inter_dim = w2.shape[2] * 2 if w1.dtype == dtypes.fp4x2 else w2.shape[2]
+
+    tile_m = block_m if block_m is not None else 64
+    tile_n = 128
+    tile_k = 128
+
+    # import pdb;pdb.set_trace()
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    sorted_size = int(sorted_ids.numel())
+    size_expert_ids_total = int(sorted_eids.numel())
+    blocks = int(size_expert_ids_total)
+
+    if sorted_weights is None:
+        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        doweight_stage1 = False
+    else:
+        sorted_w = sorted_weights
+        doweight_stage1 = True
+
+    debug_flydsl = os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1"
+    if debug_flydsl:
+        logger.info(
+            "[flydsl] stage1 inputs: tokens=%d topk=%d model_dim=%d inter_dim=%d block_m=%d",
+            token_num,
+            topk,
+            model_dim,
+            inter_dim,
+            tile_m,
+        )
+
+    if w1.dtype is not dtypes.fp4x2:
+        x_q = hidden_states.contiguous().view(token_num, model_dim)
+        scale_x_1d = a1_scale.view(-1).contiguous()
+        w1_flat = w1.contiguous().view(E * (2 * inter_dim), model_dim)
+        w1_scale_1d = w1_scale.view(-1).contiguous()
+    else:
+        x_q = hidden_states.contiguous().view(token_num, model_dim)
+        scale_x_1d = a1_scale.view(-1).contiguous()
+        w1_flat = w1.contiguous()
+        w1_scale_1d = w1_scale.view(-1).contiguous()
+
+
+    import sys
+
+    DSL2_ROOT = os.environ.get("DSL2_ROOT", "/data/felix/dsl2")
+    if DSL2_ROOT not in sys.path:
+        sys.path.insert(0, DSL2_ROOT)
+
+    if w1.dtype == dtypes.fp8:
+        from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
+    elif w1.dtype == dtypes.fp4x2:
+        from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm1  # type: ignore
+
+    # out.zero_()
+    out_dtype = "bf16" if dtype == torch.bfloat16 else "f16"
+    exe1 = compile_moe_gemm1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        # tile_m=tile_m,
+        # tile_n=tile_n,
+        # tile_k=tile_k,
+        tile_m=block_m,
+        tile_n=256,
+        tile_k=256,
+        doweight_stage1=bool(doweight_stage1),
+        # in_dtype="fp8",
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype=out_dtype,
+        use_cshuffle_epilog=False,
+        enable_bias=bias1 is not None,
+        # enable_bias=False,
+    )
+
+    out.zero_()
+    exe1(
+        out,
+        x_q,
+        w1_flat,
+        scale_x_1d,
+        w1_scale_1d,
+        sorted_ids,
+        sorted_eids,
+        sorted_w.view(-1).contiguous(),
+        num_valid_ids,
+        bias1,
+        token_num,
+        inter_dim,
+        model_dim,
+        int(blocks),
+        # int(blocks) - 1,
+    )
+    # from aiter.test_common import checkAllclose, benchmark, run_perftest
+    # checkAllclose(out, out_tmp)
+    # for i in range(out.shape[0]):
+    #     print(checkAllclose(out[i], out_tmp[i]))
+    # print(out_tmp)
+    # import pdb;pdb.set_trace()
     return out
 
 
@@ -1596,6 +1703,9 @@ def cktile_moe_stage2(
 ):
     token_num = a2.shape[0]
     D = w2.shape[1]
+    token_num, _, inter_dim = a2.shape
+    model_dim = w2.shape[1]
+    E = w2.shape[0]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
     # out = torch.empty(
@@ -1605,7 +1715,39 @@ def cktile_moe_stage2(
     # )
     # if zeros_out:
     #     out.fill_(0)
+
     # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
+    # sorted_weights = torch.ones_like(sorted_weights, dtype=dtypes.fp32)
+    # sorted_token_ids = torch.zeros_like(sorted_token_ids, dtype=dtypes.i32)
+
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    sorted_size = int(sorted_ids.numel())
+    size_expert_ids_total = int(sorted_eids.numel())
+    blocks = int(size_expert_ids_total)
+    if sorted_weights is None:
+        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+    else:
+        sorted_w = sorted_weights
+
+    from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2 as compile_moe_gemm2  # type: ignore
+
+    if out.dtype == dtypes.bf16:
+        out_dtype = "bf16"
+    elif out.dtype == dtypes.fp16:
+        out_dtype = "f16"
+    elif out.dtype == dtypes.fp32:
+        out_dtype = "f32"
+    else:
+        raise ValueError(
+            f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
+        )
+    # bias2 = torch.zeros_like(bias2, dtype=dtypes.fp32)
+    # a2 = torch.ones_like(a2, dtype=dtypes.fp8)
+    # w2 = torch.ones_like(w2, dtype=dtypes.i8)
+    # w2 = w2.view(dtypes.fp4x2)
+    # w2_scale = torch.ones_like(w2_scale, dtype=dtypes.fp8_e8m0)
+
     aiter.moe_cktile2stages_gemm2(
         a2,
         w2,
@@ -1623,6 +1765,49 @@ def cktile_moe_stage2(
         activation,
         block_m,
     )
+    exe2 = compile_moe_gemm2(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        #tile_m=tile_m,
+        #tile_n=tile_n,
+        #tile_k=tile_k,
+        tile_m=block_m,
+        tile_n=128,
+        tile_k=256,
+        # doweight_stage2=bool(sorted_weights is not None),
+        doweight_stage2=True,
+        # in_dtype="fp8",
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        enable_bias=bias2 is not None,
+    )
+    # print(out)
+    # import pdb;pdb.set_trace()
+    out.zero_()
+    out_tmp = torch.zeros_like(out, dtype=torch.bfloat16)
+    exe2(
+        out,
+        a2,
+        w2,
+        a2_scale,
+        w2_scale,
+        sorted_ids,
+        sorted_eids,
+        sorted_w.view(-1).contiguous(),
+        num_valid_ids,
+        bias2,
+        token_num,
+        model_dim,
+        inter_dim,
+        int(blocks),
+    )
+    from aiter.test_common import checkAllclose, benchmark, run_perftest
+    # checkAllclose(out, out_tmp)
+    # print(out_tmp)
+    # import pdb;pdb.set_trace()
     return out
 
 
