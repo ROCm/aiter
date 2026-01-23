@@ -1982,6 +1982,8 @@ def sage_quant_v2(
         kv_len,
         D=head_dim,
         BLK_K=BLKK,
+        num_stages=3,
+        num_warps=8
     )
 
     # q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
