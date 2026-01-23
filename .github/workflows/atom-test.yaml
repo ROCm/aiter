@@ -1,0 +1,184 @@
+name: Atom Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  ATOM_BRANCH: "main"
+  ATOM_REPOSITORY_URL: "ROCm/ATOM"
+  BASE_IMAGE: "rocm/atom:latest"
+  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/Aiter.git' }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  atom_benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model_name: "DeepSeek-R1-0528"
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
+            extraArgs: "--kv_cache_dtype fp8 -tp 8"
+            env_vars: ""
+            runner: aiter-8gpu-runner
+          - model_name: "gpt-oss-120b"
+            model_path: "openai/gpt-oss-120b"
+            extraArgs: "--kv_cache_dtype fp8"
+            env_vars: |
+              ATOM_GPT_OSS_MODEL=1
+            runner: aiter-1gpu-runner
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ATOM_REPOSITORY_URL }}
+          branch: ${{ env.ATOM_BRANCH }}
+
+      - name: Download the ATOM base image
+        run: |
+          docker pull ${{ env.BASE_IMAGE }}
+
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.BASE_IMAGE }}
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y amd-aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          RUN rm -rf /app/aiter-test
+          RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \\
+              cd /app/aiter-test && \\
+              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
+              git submodule sync && git submodule update --init --recursive && \\
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+          EOF
+
+      - name: Build the ATOM test image
+        run: |
+          docker build --network=host \
+            --no-cache \
+            -t rocm/aiter-ci:atom-test \
+            -f Dockerfile.mod .
+
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=atom_test | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          cat > /tmp/env_file.txt << 'EOF'
+          ${{ matrix.env_vars }}
+          EOF
+
+          echo "Starting container: rocm/aiter-ci:atom-test"
+          echo "Model-specific environment variables for ${{ matrix.model_name }}:"
+          cat /tmp/env_file.txt
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+          -w /workspace \
+          --ipc=host --group-add video \
+          --shm-size=16G \
+          --privileged \
+          --cap-add=SYS_PTRACE \
+          --env-file /tmp/env_file.txt \
+          --security-opt seccomp=unconfined \
+          --ulimit memlock=-1 \
+          --ulimit stack=67108864 \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name atom_test \
+          rocm/aiter-ci:atom-test
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Check shm size
+        run: |
+          df -h /dev/shm
+          docker exec atom_test df -h /dev/shm
+    
+      - name: Check version
+        run: |
+          docker exec atom_test bash -lc "pip show amd-aiter atom && pip list"
+
+      - name: Run ATOM simple inference
+        timeout-minutes: 30
+        run: |
+          # Run the inference and capture output
+          set -euo pipefail
+          echo ""
+          echo "========== Running test =========="
+  
+          model_path="${{ matrix.model_path }}"
+          echo "Model path: $model_path"
+
+          docker exec atom_test bash -lc "
+            set -euo pipefail
+            python3 -m atom.examples.simple_inference \
+              --model \"$model_path\" \
+              ${{ matrix.extraArgs }} \
+              --temperature 0 \
+            | grep -E '^Prompt: |^Completion:'
+          " > atom_test_output.txt
+          
+          echo ""
+          echo "========== Showing test output below =========="
+          cat atom_test_output.txt
+        
+      - name: Run ATOM accuracy test
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========== Launching ATOM server =========="
+          model_path="${{ matrix.model_path }}"
+          docker exec atom_test bash -lc "
+            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
+          "
+          echo ""
+          echo "========== Running accuracy test =========="
+          docker exec atom_test bash -lc "
+            .github/scripts/atom_test.sh accuracy $model_path
+          "
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.model_name }}_atom_test_output.txt
+          path: atom_test_output.txt
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker stop atom_test || true
+          docker rm atom_test || true
