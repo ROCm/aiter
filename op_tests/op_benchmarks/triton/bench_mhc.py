@@ -10,6 +10,7 @@ and configurations, reporting time, throughput (TFLOPS), and bandwidth.
 
 import sys
 import argparse
+from itertools import product
 import torch
 import triton
 from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
@@ -39,32 +40,10 @@ def get_benchmark_configs(args):
         #   M: batch/sequence length
         #   n: stream parameter (manifold dimension)
         #   C: hidden dimension per stream
-        configs = [
-            # Small batch, typical streams
-            (32, 4, 1024),
-            (64, 4, 1024),
-            (128, 4, 1024),
-            (256, 4, 1024),
-            
-            # Larger batch
-            (512, 4, 1024),
-            (1024, 4, 1024),
-            (2048, 4, 1024),
-            
-            # Different stream counts
-            (128, 2, 1024),
-            (128, 8, 1024),
-            (128, 16, 1024),
-            
-            # Different hidden dimensions
-            (128, 4, 512),
-            (128, 4, 2048),
-            (128, 4, 4096),
-            
-            # Large configurations
-            (4096, 4, 1024),
-            (8192, 4, 1024),
-        ]
+        Ms = [2**i for i in range(10, 15)]
+        n = 4
+        Cs = [128, 512, 4096, 2**15]
+        configs.extend(list(product(Ms, [n], Cs)))
     
     return configs
 

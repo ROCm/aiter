@@ -22,6 +22,21 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
+def get_fused_mhc_config():
+    return {
+        "waves_per_eu": 4,
+        "num_stages": 1,
+        "num_warps": 8,
+    }
+
+
+def get_sinkhorn_knopp_config():
+    return {
+        "waves_per_eu": 4,
+        "num_stages": 1,
+        "num_warps": 8,
+    }
+
 def fused_mhc(
     x: torch.Tensor,
     phi_pre: torch.Tensor,
@@ -147,9 +162,9 @@ def fused_mhc(
     # BLOCK_N: Column tile size - should align with output dimension
     # BLOCK_K: Reduction tile size - affects memory reuse in matmul
     BLOCK_M = 64 if M >= 64 else 32
-    BLOCK_N = min(128, triton.next_power_of_2(N))
-    BLOCK_K = min(128, triton.next_power_of_2(K))
-
+    BLOCK_N = n_squared
+    BLOCK_K = min(64, triton.next_power_of_2(K))
+    config = get_fused_mhc_config()
     # Stream-aware grid: Each program processes exactly one stream
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
     n_blocks_post = triton.cdiv(n, BLOCK_N)
@@ -158,7 +173,6 @@ def fused_mhc(
     
     # Launch 2D grid: (row blocks, stream-aware column blocks)
     grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-
     # Invoke the fused Triton kernel for equations 14-18
     _mhc_fused_kernel[grid](
         x,                     # Input tensor (M, nC)
@@ -197,6 +211,7 @@ def fused_mhc(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        **config,
     )
 
     return out_pre, out_post, out_res
@@ -365,6 +380,8 @@ def sinkhorn_knopp(
         assert out.shape == (M, N, N), f"out.shape {out.shape} must be ({M}, {N}, {N})"
         out = out.contiguous()
 
+    config = get_sinkhorn_knopp_config()
+
     # Grid: one program per batch element, need large batch size for optimal performance
     grid = (M,)
 
@@ -377,6 +394,7 @@ def sinkhorn_knopp(
         logits.stride(2),
         N=N,
         NUM_ITERS=num_iters,
+        **config,
     )
 
     return out
