@@ -370,7 +370,67 @@ def _gemm_a8w8_blockscale_kernel_old(
 
 
 @gluon.jit
-def issue_buffer_load_to_lds(
+def async_buffer_load_to_lds(
+    k,
+    smem_a,
+    smem_b,
+    a_ptr,
+    b_ptr,
+    offs_a,
+    offs_b,
+    offs_am,
+    offs_bn,
+    offs_ak,
+    offs_bk,
+    M,
+    N,
+    K,
+    pid_k,
+    num_k_iter,
+    stride_ak,
+    stride_bk,
+    EVEN_K: gl.constexpr,
+    BLOCK_SIZE_K: gl.constexpr,
+    num_stages: gl.constexpr,
+    cache_modifier: gl.constexpr,
+):
+    # global_k = pid_k * num_k_iter + k
+    offs_a_tmp = offs_a + BLOCK_SIZE_K * stride_ak * k
+    offs_b_tmp = offs_b + BLOCK_SIZE_K * stride_bk * k
+
+    # EVEN_K is always True for now
+    if EVEN_K:
+        mask_a = offs_am[:, None] < M
+        mask_b = offs_bn[None, :] < N
+    # else:
+    #     mask_a = (offs_ak[None, :] < K - (global_k * BLOCK_SIZE_K)) & (
+    #         offs_am[:, None] < M
+    #     )
+    #     mask_b = (offs_bk[:, None] < K - (global_k * BLOCK_SIZE_K)) & (
+    #         offs_bn[None, :] < N
+    #     )
+
+    cp.buffer_load_to_shared(
+        dest=smem_a.index(k % num_stages),
+        ptr=a_ptr,
+        offsets=offs_a_tmp,
+        mask=mask_a,
+        cache_modifier=cache_modifier,
+    )
+
+    cp.buffer_load_to_shared(
+        dest=smem_b.index(k % num_stages),
+        ptr=b_ptr,
+        offsets=offs_b_tmp,
+        mask=mask_b,
+        cache_modifier=cache_modifier,
+    )
+    cp.commit_group()
+    return k + 1
+
+
+@gluon.jit
+def buffer_load_to_lds(
     k,
     smem_a,
     smem_b,
@@ -402,6 +462,7 @@ def issue_buffer_load_to_lds(
         mask_a = offs_am[:, None] < M
         mask_b = offs_bn[None, :] < N
     else:
+        global_k = pid_k * num_k_iter + k
         mask_a = (offs_ak[None, :] < K - (global_k * BLOCK_SIZE_K)) & (
             offs_am[:, None] < M
         )
@@ -409,23 +470,26 @@ def issue_buffer_load_to_lds(
             offs_bn[None, :] < N
         )
 
-    cp.buffer_load_to_shared(
-        dest=smem_a.index(k % num_stages),
+    a = gl.amd.cdna4.buffer_load(
         ptr=a_ptr,
         offsets=offs_a_tmp,
         mask=mask_a,
-        cache_modifier=cache_modifier,
+        cache=cache_modifier,
     )
-
-    cp.buffer_load_to_shared(
-        dest=smem_b.index(k % num_stages),
+    b = gl.amd.cdna4.buffer_load(
         ptr=b_ptr,
         offsets=offs_b_tmp,
         mask=mask_b,
-        cache_modifier=cache_modifier,
+        cache=cache_modifier,
     )
 
-    cp.commit_group()
+    # for a and b tensor, converting layout using LDS (ds_read/ds_write) is faster than convert_layout on vgpr (ds_bpermute_b32), the perf diff is large, upto 25%
+    smem_a.index(k % num_stages).store(a)
+    smem_b.index(k % num_stages).store(b)
+    # cur_a = gl.convert_layout(a, layout=dot_a_layout)
+    # cur_b = gl.convert_layout(b, layout=dot_b_layout)
+    # offs_a += BLOCK_SIZE_K * stride_ak
+    # offs_b += BLOCK_SIZE_K * stride_bk
     return k + 1
 
 
@@ -499,6 +563,8 @@ def load_from_lds_and_mfma(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "USE_ASYNC_LOAD": lambda args: args["num_stages"] > 1
+        and args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
 @gluon.jit
@@ -540,6 +606,7 @@ def _gemm_a8w8_blockscale_kernel(
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    USE_ASYNC_LOAD: gl.constexpr,
     cache_modifier: gl.constexpr,
     num_stages: gl.constexpr,
     FP8_FORMAT: gl.constexpr = "e4m3",
@@ -571,8 +638,6 @@ def _gemm_a8w8_blockscale_kernel(
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        # remap_xcd(pid, GRID_MN)
-
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -634,7 +699,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
-        # SPLITK_BLOCK_SIZE = gl.cdiv(K, NUM_KSPLIT)
+
         num_k_iter = gl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
         smem_a = gl.allocate_shared_memory(
@@ -689,9 +754,14 @@ def _gemm_a8w8_blockscale_kernel(
 
         k_load = 0
         k_read = 0
+        if USE_ASYNC_LOAD:
+            buffer_load_func: gl.constexpr = async_buffer_load_to_lds
+        else:
+            buffer_load_func: gl.constexpr = buffer_load_to_lds
+
         # ======= Prologue ========
         for _ in gl.static_range(num_stages - 1):
-            k_load = issue_buffer_load_to_lds(
+            k_load = buffer_load_func(
                 k_load,
                 smem_a,
                 smem_b,
@@ -717,67 +787,33 @@ def _gemm_a8w8_blockscale_kernel(
             )
 
         # ======= Main Loop ========
-        for _ in range(
-            pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - (num_stages - 1)
-        ):
-            if num_stages > 1:
-                k_load = issue_buffer_load_to_lds(
-                    k_load,
-                    smem_a,
-                    smem_b,
-                    a_ptr,
-                    b_ptr,
-                    offs_a,
-                    offs_b,
-                    offs_am,
-                    offs_bn,
-                    offs_ak,
-                    offs_bk,
-                    M,
-                    N,
-                    K,
-                    pid_k,
-                    num_k_iter,
-                    stride_ak,
-                    stride_bk,
-                    EVEN_K,
-                    BLOCK_SIZE_K,
-                    num_stages,
-                    cache_modifier,
-                )
+        for _ in range(0, num_k_iter - (num_stages - 1)):
+            k_load = buffer_load_func(
+                k_load,
+                smem_a,
+                smem_b,
+                a_ptr,
+                b_ptr,
+                offs_a,
+                offs_b,
+                offs_am,
+                offs_bn,
+                offs_ak,
+                offs_bk,
+                M,
+                N,
+                K,
+                pid_k,
+                num_k_iter,
+                stride_ak,
+                stride_bk,
+                EVEN_K,
+                BLOCK_SIZE_K,
+                num_stages,
+                cache_modifier,
+            )
+            if USE_ASYNC_LOAD:
                 cp.wait_group(num_stages - 1)
-            else:
-                if EVEN_K:
-                    mask_a = offs_am[:, None] < M
-                    mask_b = offs_bn[None, :] < N
-                else:
-                    mask_a = (offs_ak[None, :] < K - (pid_k * k * BLOCK_SIZE_K)) & (
-                        offs_am[:, None] < M
-                    )
-                    mask_b = (offs_bk[:, None] < K - (pid_k * k * BLOCK_SIZE_K)) & (
-                        offs_bn[None, :] < N
-                    )
-
-                a = gl.amd.cdna4.buffer_load(
-                    ptr=a_ptr,
-                    offsets=offs_a,
-                    mask=mask_a,
-                    cache=cache_modifier,
-                )
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=b_ptr,
-                    offsets=offs_b,
-                    mask=mask_b,
-                    cache=cache_modifier,
-                )
-
-                # for a and b tensor, converting layout using LDS (ds_read/ds_write) is faster than convert_layout on vgpr (ds_bpermute_b32), the perf diff is large, upto 25%
-                smem_a.index(0).store(a)
-                smem_b.index(0).store(b)
-                # cur_a = gl.convert_layout(a, layout=dot_a_layout)
-                # cur_b = gl.convert_layout(b, layout=dot_b_layout)
-                offs_a += BLOCK_SIZE_K * stride_ak
-                offs_b += BLOCK_SIZE_K * stride_bk
 
             a_scale, b_scale, a_scale_ptr, b_scale_ptr = load_scales_and_advance_ptrs(
                 a_scale_ptr,
@@ -806,7 +842,8 @@ def _gemm_a8w8_blockscale_kernel(
 
         # ======= Epilogue ========
         for i in gl.static_range(num_stages - 1):
-            cp.wait_group(num_stages - 2 - i)
+            if USE_ASYNC_LOAD:
+                cp.wait_group(num_stages - 2 - i)
 
             a_scale, b_scale, a_scale_ptr, b_scale_ptr = load_scales_and_advance_ptrs(
                 a_scale_ptr,
@@ -979,20 +1016,31 @@ def _get_config(
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
             config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
             break
-        else:
-            config = _get_config._config_dict[key]["any"]
+    else:
+        config = _get_config._config_dict[key]["any"]
 
     config = (
         config.copy()
     )  # avoid later inplace modification from interacting with cached config
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+    config["BLOCK_SIZE_K"] = (config["BLOCK_SIZE_K"] + 127) // 128 * 128
 
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+    while (
+        config["BLOCK_SIZE_K"] >= config["SPLITK_BLOCK_SIZE"] * 2
+        and config["NUM_KSPLIT"] > 1
+    ):
+        config["NUM_KSPLIT"] = config["NUM_KSPLIT"] // 2
+        config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+
+    # config["SPLITK_BLOCK_SIZE"] = (config["SPLITK_BLOCK_SIZE"] + 127) // 128 * 128
+    # while config["SPLITK_BLOCK_SIZE"] > triton.cdiv(K, config["NUM_KSPLIT"]) and config["NUM_KSPLIT"] != triton.cdiv(K, config["SPLITK_BLOCK_SIZE"]):
+    #     config["NUM_KSPLIT"] = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
+
+    num_k_itr = triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+    if num_k_itr == 1:
+        config["num_stages"] = 1
+    # config["num_stages"] = 1
 
     return config
 
@@ -1058,7 +1106,10 @@ def gemm_a8w8_blockscale(
     else:
         y_pp = None
 
-    # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+    # print()
+    # for k, v in config.items():
+    #     print(k, v)
+    # print()
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]

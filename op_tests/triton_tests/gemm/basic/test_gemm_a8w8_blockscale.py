@@ -111,9 +111,9 @@ def get_x_vals():
         (128, 7168, 2304),
     ]
     # x_vals = [
-    #     # (16, 2112, 7168),
-    #     (64, 2112, 7168),
-    #     # (1024, 2112, 7168),
+    #     (16, 16, 128*10+57),
+    #     (16, 16, 128*10+128),
+    #     (16, 7168, 2304),
     # ]
     # x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
@@ -262,8 +262,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     #     di.synchronize()
     #     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
     #     di.synchronize()
-
-    # TODO check shape 16 16 128
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
