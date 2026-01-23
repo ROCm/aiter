@@ -32,6 +32,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   atom_benchmark:
+    needs: [check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -40,7 +41,7 @@ jobs:
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
-            runner: aiter-8gpu-runner
+            runner: aiter-mi355-8gpu
           - model_name: "gpt-oss-120b"
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8"
