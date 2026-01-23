@@ -134,6 +134,7 @@ class FmoeTuner(TunerCommon):
         act_type,
         use_non_temporal_load,
     ):
+        torch.cuda.synchronize()
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
         out = torch.empty(
@@ -141,9 +142,10 @@ class FmoeTuner(TunerCommon):
             dtype=dtype,
             device=a1_qt.device,
         )
+        torch.cuda.synchronize()
         # Split-k path produces a pre-activation buffer (2*inter_dim); apply activation + mul.
         tmp_out = (
-            torch.zeros(
+            torch.empty(
                 (token_num, topk, inter_dim * 2),
                 dtype=dtypes.fp32,
                 device=out.device,
@@ -151,6 +153,7 @@ class FmoeTuner(TunerCommon):
             if ksplit and int(ksplit) > 1
             else out
         )
+        torch.cuda.synchronize()
         # Use the python wrapper to keep argument order/types stable for pybind.
         ck_moe_stage1_fwd(
             a1_qt,
@@ -172,6 +175,16 @@ class FmoeTuner(TunerCommon):
             use_non_temporal_load,
             out.dtype,
         )
+        torch.cuda.synchronize()
+
+        if ksplit and int(ksplit) > 1:
+            # ck split-k produces pre-activation fp32 buffer. Apply activation + mul into `out`.
+            if act_type == ActivationType.Silu:
+                aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
+            else:
+                aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+            torch.cuda.synchronize()
+
         if q_type == QuantType.per_1x128:
             quant_func = aiter.get_hip_quant(q_type)
             a2, a2_scale = quant_func(
@@ -179,6 +192,7 @@ class FmoeTuner(TunerCommon):
                 quant_dtype=a1_qt.dtype,
             )
             out = a2
+        torch.cuda.synchronize()
         return out
 
     @staticmethod
@@ -1586,7 +1600,7 @@ class FmoeTuner(TunerCommon):
         ksplit_values = [1]
         if q_type is QuantType.per_1x128:
             # Split-k is only meaningful for blockscale path.
-            ksplit_values = list(range(1, 2)) #TODO: Fix splitk for ck fp8 blockscale when tunning
+            ksplit_values = list(range(1, 16)) #TODO: Fix splitk for ck fp8 blockscale when tunning
             _, ck_stage1_kernels_splitk = get_gemm1_kernels_list(
                 dtype2str_dict[q_dtype_a],
                 dtype2str_dict[q_dtype_w],
@@ -1629,6 +1643,21 @@ class FmoeTuner(TunerCommon):
                             continue
                         if kernel.MPerBlock != blockM:
                             continue
+                        # Only apply splitk tuner for per_1x128 + v1 kernels.
+                        if ksplit > 1:
+                            if "_v1_" not in kernel.name:
+                                continue
+                            # Split-k additional constraint:
+                            # K(model_dim) must be a multiple of (KPerBlock * splitk).
+                            m = re.search(
+                                r"moe_ck2stages_gemm1_(\d+)x(\d+)x(\d+)x(\d+)",
+                                kernel.name,
+                            )
+                            if m:
+                                k_per_block = int(m.group(4))
+                                print(f'{model_dim=} {k_per_block=} {ksplit=} {int(model_dim) % (k_per_block * int(ksplit))=}')
+                                if (int(model_dim) % (k_per_block * int(ksplit))) != 0:
+                                    continue
                         for nt in nt_values:
                             tasks_ck.append(
                                 (
