@@ -179,6 +179,8 @@ struct mha_fwd_args
                                            // array [batch + 1]. (Used with padding)
     const void* cu_seqlen_k_ptr = nullptr; // Cumulative logical (excluding padding) sequence length
                                            // array [batch + 1]. (Used with padding)
+    const void* block_scale_seqstart_q_ptr;
+    const void* block_scale_seqstart_k_ptr;
     const void* sink_ptr;
 
     ck_tile::index_t seqlen_q;
@@ -232,6 +234,9 @@ struct mha_fwd_args
 
     std::variant<std::pair<uint64_t, uint64_t>, std::pair<const void*, const void*>>
         drop_seed_offset;
+
+    ck_tile::index_t block_scale_size_q;
+    ck_tile::index_t block_scale_size_kv;
 };
 
 using mha_fwd_splitkv_args   = fmha_fwd_splitkv_args;

@@ -277,10 +277,12 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.seqstart_k_ptr,
                        a.seqlen_q_ptr,
                        a.seqlen_k_ptr,
-                       a.cu_seqlen_q_ptr,
-                       a.cu_seqlen_k_ptr,
-                       a.sink_ptr,
-                       a.seqlen_q,
+                      a.cu_seqlen_q_ptr,
+                      a.cu_seqlen_k_ptr,
+                      a.block_scale_seqstart_q_ptr,
+                      a.block_scale_seqstart_k_ptr,
+                      a.sink_ptr,
+                      a.seqlen_q,
                        a.seqlen_k,
                        a.batch,
                        a.max_seqlen_q,
@@ -321,9 +323,11 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.sink_size,
                        a.mask_type,
                        a.min_seqlen_q,
-                       a.p_drop,
-                       a.s_randval,
-                       a.drop_seed_offset};
+                      a.p_drop,
+                      a.s_randval,
+                      a.drop_seed_offset,
+                      a.block_scale_size_q,
+                      a.block_scale_size_kv};
 
     return fmha_fwd(traits, args, s);
 }

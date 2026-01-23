@@ -124,10 +124,12 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         nullptr, // seqstart_k_ptr
                         nullptr, // seqlen_q_ptr
                         nullptr, // seqlen_k_ptr
-                        cu_seqlen_q_ptr, // cu_seqlen_q_ptr
-                        cu_seqlen_kv_ptr, // cu_seqlen_k_ptr
-                        sink_ptr, // sink_ptr
-                        seqlen_q,
+                       cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                       cu_seqlen_kv_ptr, // cu_seqlen_k_ptr
+                       nullptr, // block_scale_seqstart_q_ptr
+                       nullptr, // block_scale_seqstart_k_ptr
+                       sink_ptr, // sink_ptr
+                       seqlen_q,
                         seqlen_k,
                         b,
                         seqlen_q,      // max_seqlen_q
@@ -167,10 +169,12 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         mask.right,
                         mask.sink,
                         static_cast<ck_tile::index_t>(mask.type),
-                        0, // min_seqlen_q
-                        p_dropout,
-                        has_dropout_randval,
-                        drop_seed_offset};
+                      0, // min_seqlen_q
+                      p_dropout,
+                      has_dropout_randval,
+                      drop_seed_offset,
+                      128, // block_scale_size_q (per-block quantization block size)
+                      128}; // block_scale_size_kv (per-block quantization block size)
 }
 
 std::vector<at::Tensor>
