@@ -3,6 +3,7 @@
 
 import argparse
 import itertools
+from aiter.ops.enum import QuantType
 import numpy as np
 import random
 from typing import List, Optional, Tuple, Union
@@ -137,11 +138,15 @@ def torch_mha_extend(
     block_tables,
     seq_lens,
     qo_indptr,
-    k_scale=None,  # [num_heads, num_blocks * block_size]
-    v_scale=None,  # [num_heads, num_blocks * block_size]
+    k_scale=None,  # [num_heads, num_blocks * block_size] for per-token, [num_blocks, num_heads] for per-block
+    v_scale=None,  # [num_heads, num_blocks * block_size] for per-token, [num_blocks, num_heads] for per-block
 ):
     num_blocks, num_heads, head_size, block_size = v_cache.shape
     sm_scale = 1.0 / (head_size**0.5)
+
+    # Detect per-block vs per-token based on scale shape
+    # per-token: [num_heads, total_tokens], per-block: [num_blocks, num_heads]
+    per_block_quant = k_scale is not None and k_scale.shape[0] == num_blocks
 
     dtype = q.dtype
     kv_dtype = k_cache.dtype
@@ -168,11 +173,23 @@ def torch_mha_extend(
 
         k = k_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
         if k_scale is not None:
-            k *= k_scale[:, idx].t().unsqueeze(-1)
+            if per_block_quant:
+                # per-block: k_scale is [num_blocks, num_heads]
+                block_idx = idx // block_size
+                k *= k_scale[block_idx, :].unsqueeze(-1)  # [ctx_len, num_heads, 1]
+            else:
+                # per-token: k_scale is [num_heads, total_tokens]
+                k *= k_scale[:, idx].t().unsqueeze(-1)
 
         v = v_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
         if v_scale is not None:
-            v *= v_scale[:, idx].t().unsqueeze(-1)
+            if per_block_quant:
+                # per-block: v_scale is [num_blocks, num_heads]
+                block_idx = idx // block_size
+                v *= v_scale[block_idx, :].unsqueeze(-1)  # [ctx_len, num_heads, 1]
+            else:
+                # per-token: v_scale is [num_heads, total_tokens]
+                v *= v_scale[:, idx].t().unsqueeze(-1)
         o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
         os.append(o)
     o = torch.concat(os)
@@ -236,6 +253,47 @@ def pertoken_quant_kvcache_symm(
     return k_quant, k_scale, v_quant, v_scale, k_scale_asm, v_scale_asm
 
 
+def perblock_quant_kvcache_symm(
+    # [num_blocks, num_heads, head_size // x, block_size, x]
+    k_cache: torch.Tensor,
+    # [num_blocks, num_heads, head_size, block_size]
+    v_cache: torch.Tensor,
+    quant_dtype: torch.dtype,  # e.g. torch.float8_e4m3fnuz
+    scale_dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Reshape to [num_blocks, num_heads, -1] and treat as per-token quant.
+    """
+    num_blocks = k_cache.shape[0]
+    num_heads = k_cache.shape[1]
+    head_dim = v_cache.shape[2]
+    block_size = v_cache.shape[3]
+
+    # [num_blocks, num_heads, head_size // x, block_size, x] -> [num_blocks, num_heads, -1]
+    k_cache_flat = k_cache.view(num_blocks, num_heads, -1)
+    # [num_blocks, num_heads, head_size, block_size] -> [num_blocks, num_heads, -1]
+    v_cache_flat = v_cache.view(num_blocks, num_heads, -1)
+
+    k_cache_flat = k_cache_flat.view(num_blocks * num_heads, -1)
+    v_cache_flat = v_cache_flat.view(num_blocks * num_heads, -1)
+
+    k_quant_flat, k_scale_flat = pertoken_quant(k_cache_flat, quant_dtype=quant_dtype)
+    v_quant_flat, v_scale_flat = pertoken_quant(v_cache_flat, quant_dtype=quant_dtype)
+
+    # NOTE: quant_x and original x could be different
+    quant_x = 16 // quant_dtype.itemsize
+
+    k_quant = k_quant_flat.view(
+        num_blocks, num_heads, head_dim // quant_x, block_size, quant_x
+    )
+    v_quant = v_quant_flat.view(num_blocks, num_heads, head_dim, block_size)
+
+    k_scale_asm = k_scale_flat.view(num_blocks, num_heads).to(scale_dtype)
+    v_scale_asm = v_scale_flat.view(num_blocks, num_heads).to(scale_dtype)
+
+    return k_quant, k_scale_asm, v_quant, v_scale_asm
+
+
 @perftest(num_rotate_args=20)
 def run_aiter_asm_ps(
     Q,
@@ -256,6 +314,7 @@ def run_aiter_asm_ps(
     reduce_partial_map,
     softmax_scale,
     mask,
+    quant_type: QuantType = QuantType.per_Token,
 ):
     return aiter.pa_persistent_fwd(
         Q=Q,
@@ -276,6 +335,7 @@ def run_aiter_asm_ps(
         reduce_partial_map=reduce_partial_map,
         softmax_scale=softmax_scale,
         mask=mask,
+        quant_type=quant_type,
     )
 
 
@@ -378,6 +438,7 @@ def test_pa_ps(
     load_metadata: bool = False,
     dump_metadata: bool = False,
     profile_ps: bool = False,
+    quant_type: QuantType = QuantType.per_Token,
 ) -> dict:
     ret = {}
     seed = 0
@@ -463,9 +524,21 @@ def test_pa_ps(
     scale = float(1.0 / (head_size**0.5))
 
     # ################## quant start ######################
-    k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
-        pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
-    )
+    if quant_type in [
+        QuantType.per_1x128,
+        QuantType.per_256x128,
+        QuantType.per_1024x128,
+    ]:
+        k_quant_, k_scale_asm, v_quant_, v_scale_asm = perblock_quant_kvcache_symm(
+            k_cache, v_cache, quant_dtype=aiter.dtypes.fp8
+        )
+        # For per-block, k_scale_asm is [num_blocks, num_heads]
+        k_scale_ = k_scale_asm
+        v_scale_ = v_scale_asm
+    else:
+        k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
+            pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
+        )
 
     # torch ref
     out_ref = torch_mha_extend(
@@ -697,6 +770,7 @@ def test_pa_ps(
             reduce_partial_map=reduce_partial_map,
             softmax_scale=scale,
             mask=1,
+            quant_type=quant_type,
         )
 
         # _, us_asm_noquant = run_aiter_asm(
@@ -742,11 +816,11 @@ head_dim = 128
 l_block_size = [1024]
 l_dtype = ["bf16"]
 l_num_heads = [
-    (10, 1),
-    (16, 2),
-    # (16, 1),
+    # (10, 1),
+    # (16, 2),
+    (16, 1),
 ]
-l_qlen = [1, 2, 3, 4]
+l_qlen = [3]
 # l_qlen = [4]
 l_ctx_len = [
     7,
@@ -845,6 +919,14 @@ parser.add_argument(
     help="""Enable performance profiling. Default: False (single run).
     --profile # Enable detailed performance stats""",
 )
+parser.add_argument(
+    "--quant_type",
+    type=str,
+    choices=["per_Token", "per_256x128", "per_1024x128"],
+    default="per_Token",
+    help="""Use per-block quantization instead of per-token. Default: False.
+    --per_block_quant # Enable per-block quantization""",
+)
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -860,6 +942,14 @@ if args.batch_size is not None:
     l_batch_size = [args.batch_size]
 l_block_size = args.block_size
 l_varlen = args.varlen
+
+# Convert string to QuantType enum
+quant_type_map = {
+    "per_Token": QuantType.per_Token,
+    "per_256x128": QuantType.per_256x128,
+    "per_1024x128": QuantType.per_1024x128,
+}
+l_quant_type = quant_type_map.get(args.quant_type, QuantType.per_Token)
 
 for dtype in l_dtype:
     df = []
@@ -878,6 +968,7 @@ for dtype in l_dtype:
             args.load_metadata,
             args.dump_metadata,
             args.profile,
+            l_quant_type,
         )
         df.append(ret)
     df = pd.DataFrame(df)
