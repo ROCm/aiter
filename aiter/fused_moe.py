@@ -973,18 +973,25 @@ def fused_moe_2stages(
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
         if smooth_a1 is not None and q_dtype_a == dtypes.i8:
-            # Build per-(token,slot) X route tensor then dynamic per-route int8 quant.
-            # Layout must match (t*topk + slot) so FlyDSL stage1 can index X by token-slot.
-            x_fp32 = hidden_states.to(dtypes.fp32)
-            x_route = x_fp32[:, None, :].expand(token_num, topk, model_dim)
-            # Per-route smooth scaling by expert id.
-            x_route = x_route * smooth_a1[topk_ids.to(torch.int64)]
-            # Dynamic per-route int8 quant (scale per (t,slot)).
-            amax = torch.amax(torch.abs(x_route), dim=-1, keepdim=True)  # [t,slot,1]
-            a1_scale = amax / 127.0
-            a1_scale[a1_scale == 0] = 1.0
-            a1 = (x_route / a1_scale).to(dtypes.i8).contiguous().view(token_num * topk, model_dim)
-            a1_scale = a1_scale.view(-1).contiguous()  # [t*slot]
+            # Align with aiter asm path: use device kernel `moe_smoothquant_fwd` to build
+            # per-(token,slot) int8 activations + per-(token,slot) scale_x.
+            if topk_ids is None:
+                raise RuntimeError("FlyDSL int8smooth requires topk_ids")
+            # `moe_smoothquant_fwd` expects:
+            # - out: [token*topk, model_dim] int8
+            # - input: [token, model_dim] bf16/fp16
+            # - x_scale: [E, model_dim] (or [E,1,model_dim]) fp32
+            # - topk_ids: [token, topk] i32
+            # - y_scale: [token*topk] fp32
+            a1 = torch.empty((token_num * topk, model_dim), dtype=dtypes.i8, device=device)
+            a1_scale = torch.empty((token_num * topk), dtype=dtypes.fp32, device=device)
+            aiter.moe_smoothquant_fwd(
+                a1,
+                hidden_states,
+                smooth_a1.contiguous(),
+                topk_ids.to(dtypes.i32),
+                a1_scale,
+            )
         else:
             a1, a1_scale = quant_func(
                 hidden_states,
@@ -1610,7 +1617,7 @@ def flydsl_moe_stage1(
     blocks = int(size_expert_ids_total)
 
     if sorted_weights is None:
-        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        sorted_w = torch.empty((0,), dtype=dtypes.fp32, device=sorted_ids.device)
         doweight_stage1 = False
     else:
         sorted_w = sorted_weights
