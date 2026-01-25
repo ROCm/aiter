@@ -108,3 +108,12 @@ By gradlib, we can confirm the parameter of GEMMs with best performance in the s
       -v              # Short form
       ```
 3. then run your test as normal~
+
+## hipBLASLt Online Tuning
+
+The hipBLASLt GEMM online tuning feature can be enabled by setting environment variable HIP_ONLINE_TUNING.
+```bash
+export HIP_ONLINE_TUNING=1
+```
+The one-time overhead of online tuning will take several minutes. The result of hipBLASLt online tuning will be saved at hip_online_tuning_res.csv.
+
