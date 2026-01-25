@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import sys
 import argparse
 import torch
 import pandas as pd
@@ -117,6 +118,7 @@ class TunerCommon:
         self.parser.add_argument(
             "--sort",
             action="store_true",
+            default=defaults.get("sort", False),
             required=False,
             help="Arranged according to the keys",
         )
@@ -410,6 +412,9 @@ class TunerCommon:
         if not self.remain_untuned.empty:
             logger.info("untuned shapes:")
             print(self.remain_untuned)
+        if not self.remain_untuned.empty or not self.failed.empty:
+            logger.info("\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details")
+            sys.exit(1)
 
     @abstractmethod
     def result_to_csv(self, results, file, concat=False):
@@ -479,6 +484,11 @@ class TunerCommon:
 
 
 class GemmCommonTuner(TunerCommon):
+
+    ARG_DEFAULTS = {
+        **TunerCommon.ARG_DEFAULTS,
+        "sort": True,  # Enable sorting by default for GEMM tuners
+    }
 
     def __init__(
         self,

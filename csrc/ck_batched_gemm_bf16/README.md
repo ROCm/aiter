@@ -40,8 +40,8 @@ If you have built batched_gemm_bf16 kernels before tuning new GEMM shapes, pleas
 
 #### `--sort`
 - **Type**: Flag (boolean)
-- **Default**: `False`
-- **Description**: Sort the output file according to the key columns (e.g., `cu_num`, `B`, `N`, `M`, `K` for GEMM). Useful for maintaining consistent ordering in result files.
+- **Default**: `True` (enabled by default for GEMM tuners)
+- **Description**: Sort the output file according to the key columns (e.g., `cu_num`, `B`, `N`, `M`, `K` for GEMM). Useful for maintaining consistent ordering in result files. The flag is enabled by default to ensure results are always sorted.
 
 
 **Example**:
