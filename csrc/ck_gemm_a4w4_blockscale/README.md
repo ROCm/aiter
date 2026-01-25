@@ -42,8 +42,8 @@ If you have built gemm_a4w4 kernels before tuning new GEMM shapes, please add `A
 
 #### `--sort`
 - **Type**: Flag (boolean)
-- **Default**: `False`
-- **Description**: Sort the output file according to the key columns(e.g., `cu_num`, `N`, `M`, `K` for GEMM). Useful for maintaining consistent ordering in result files.
+- **Default**: `True` (enabled by default for GEMM tuners)
+- **Description**: Sort the output file according to the key columns(e.g., `cu_num`, `N`, `M`, `K` for GEMM). Useful for maintaining consistent ordering in result files. The flag is enabled by default to ensure results are always sorted.
 
 **Example**:
 ```bash
