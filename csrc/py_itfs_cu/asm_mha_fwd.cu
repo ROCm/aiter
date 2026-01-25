@@ -111,12 +111,12 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         nullptr, // seqstart_k_ptr
                         nullptr, // seqlen_q_ptr
                         nullptr, // seqlen_k_ptr
-                       nullptr, // cu_seqlen_q_ptr
-                       nullptr, // cu_seqlen_k_ptr
-                       nullptr, // block_scale_seqstart_q_ptr
-                       nullptr, // block_scale_seqstart_k_ptr
-                       nullptr, //sink_ptr
-                       seqlen_q,
+                        nullptr, // cu_seqlen_q_ptr
+                        nullptr, // cu_seqlen_k_ptr
+                        nullptr, // block_scale_seqstart_q_ptr
+                        nullptr, // block_scale_seqstart_k_ptr
+                        nullptr, //sink_ptr
+                        seqlen_q,
                         seqlen_k,
                         b,
                         seqlen_q,      // max_seqlen_q
@@ -135,33 +135,33 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         nhead_stride_q,
                         nhead_stride_k,
                         nhead_stride_v,
-                       0, // nhead_stride_bias
-                       nhead_stride_randval,
-                       nhead_stride_lse,
-                       nhead_stride_o,
-                       0, // nhead_stride_q_descale
-                       0, // nhead_stride_k_descale
-                       0, // nhead_stride_v_descale
-                       batch_stride_q,
+                        0, // nhead_stride_bias
+                        nhead_stride_randval,
+                        nhead_stride_lse,
+                        nhead_stride_o,
+                        0, // nhead_stride_q_descale
+                        0, // nhead_stride_k_descale
+                        0, // nhead_stride_v_descale
+                        batch_stride_q,
                         batch_stride_k,
                         batch_stride_v,
-                       0, // batch_stride_bias
-                       batch_stride_randval,
-                       batch_stride_lse,
-                       batch_stride_o,
-                       0, // batch_stride_q_descale
-                       0, // batch_stride_k_descale
-                       0, // batch_stride_v_descale
-                       mask.left,
+                        0, // batch_stride_bias
+                        batch_stride_randval,
+                        batch_stride_lse,
+                        batch_stride_o,
+                        0, // batch_stride_q_descale
+                        0, // batch_stride_k_descale
+                        0, // batch_stride_v_descale
+                        mask.left,
                         mask.right,
                         0, // sink_size
                         static_cast<ck_tile::index_t>(mask.type),
-                      0, // min_seqlen_q
-                      p_dropout,
-                      has_dropout_randval,
-                      drop_seed_offset,
-                      128, // block_scale_size_q (per-block quantization block size)
-                      128}; // block_scale_size_kv (per-block quantization block size)
+                        0, // min_seqlen_q
+                        p_dropout,
+                        has_dropout_randval,
+                        drop_seed_offset,
+                        128, // block_scale_size_q (per-block quantization block size)
+                        128}; // block_scale_size_kv (per-block quantization block size)
 }
 
 std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]

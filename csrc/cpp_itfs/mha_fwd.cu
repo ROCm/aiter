@@ -323,11 +323,11 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.sink_size,
                        a.mask_type,
                        a.min_seqlen_q,
-                      a.p_drop,
-                      a.s_randval,
-                      a.drop_seed_offset,
-                      a.block_scale_size_q,
-                      a.block_scale_size_kv};
+                       a.p_drop,
+                       a.s_randval,
+                       a.drop_seed_offset,
+                       a.block_scale_size_q,
+                       a.block_scale_size_kv};
 
     return fmha_fwd(traits, args, s);
 }
