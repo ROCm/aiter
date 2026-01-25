@@ -10,7 +10,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-pd.set_option("future.no_silent_downcasting", True)
+# pd.set_option("future.no_silent_downcasting", True)
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.basename(this_dir)
