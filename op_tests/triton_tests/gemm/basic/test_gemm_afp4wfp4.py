@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
 import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
-    gemm_afp4wfp4,
+    gemm_afp4wfp4 as triton_gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffle,
 )
+from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight
+
+DEVICE_ARCH = arch_info.get_arch()
 
 
 def shuffle_scales(scales: torch.Tensor):
@@ -128,7 +131,6 @@ def generate_gemm_afp4wfp4_inputs(
 
 
 def get_x_vals():
-
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
     x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
     x_vals += [
@@ -223,6 +225,12 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
+def run_triton(
+    x, w, x_scales, w_scales, dtype=torch.bfloat16, y=None, skip_reduce=False, impl=None
+):
+    return impl(x, w, x_scales, w_scales, dtype, y, skip_reduce=skip_reduce)
+
+
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
@@ -232,9 +240,26 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     [True, False],
 )
 @pytest.mark.parametrize("skip_reduce", [True, False])
+@pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
-    M: int, N: int, K: int, dtype, layout, output, shuffle_weight_scales, skip_reduce
+    M: int,
+    N: int,
+    K: int,
+    dtype,
+    layout,
+    output,
+    shuffle_weight_scales,
+    skip_reduce,
+    impl,
 ):
+    if impl == "gluon" and DEVICE_ARCH != "gfx950":
+        pytest.skip(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
+        )
+
+    if impl == "gluon" and shuffle_weight_scales:
+        pytest.skip("Gluon kernel does not have a preshuffled implementation.")
+
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
@@ -303,8 +328,15 @@ def test_gemm_afp4_wfp4(
         #         x, w_triton, x_scales_triton, w_scales_triton, dtype
         #     )
     else:
+        if impl == "triton":
+            impl = triton_gemm_afp4wfp4
+        elif impl == "gluon":
+            impl = gluon_gemm_afp4wfp4
+        else:
+            raise ValueError(f"Unknown implementation: {impl}")
+
         if output:
-            triton_out = gemm_afp4wfp4(
+            triton_out = run_triton(
                 x,
                 w_triton,
                 x_scales_triton,
@@ -312,15 +344,17 @@ def test_gemm_afp4_wfp4(
                 dtype,
                 y,
                 skip_reduce=skip_reduce,
+                impl=impl,
             )
         else:
-            triton_out = gemm_afp4wfp4(
+            triton_out = run_triton(
                 x,
                 w_triton,
                 x_scales_triton,
                 w_scales_triton,
                 dtype,
                 skip_reduce=skip_reduce,
+                impl=impl,
             )
 
     if triton_out.dim() == 3:

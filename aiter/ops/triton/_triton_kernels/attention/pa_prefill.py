@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # The kernels in this file are adapted from LightLLM's context_attention_fwd:
 # https://github.com/ModelTC/lightllm/blob/main/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py
@@ -10,7 +10,6 @@
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 
 _fwd_kernel_repr = make_kernel_repr(
     "_fwd_kernel",

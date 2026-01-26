@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
@@ -15,7 +15,6 @@ import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()

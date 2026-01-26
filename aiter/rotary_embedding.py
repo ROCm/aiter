@@ -2,8 +2,8 @@
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.33.2/src/transformers/models/llama/modeling_llama.py
-# Copyright (C) 2023-2025 The vLLM team.
-# Copyright (C) 2022-2025 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+# Copyright (C) 2023-2026 The vLLM team.
+# Copyright (C) 2022-2026 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
 # and OPT implementations in this library. It has been modified from its
@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rotary Positional Embeddings."""
+
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -696,10 +697,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         super().__init__()
 
         if rotary_dim != head_size:
-            raise ValueError(
-                f"`Phi3LongRoPEScaledRotaryEmbedding` does not support \
-                    rotary_dim != head_size ({rotary_dim}!={head_size})."
-            )
+            raise ValueError(f"`Phi3LongRoPEScaledRotaryEmbedding` does not support \
+                    rotary_dim != head_size ({rotary_dim}!={head_size}).")
         if is_neox_style is False:
             raise ValueError(
                 "`Phi3LongRoPEScaledRotaryEmbedding` only supports neox_style."
@@ -1300,7 +1299,7 @@ class DualChunkRotaryEmbedding(nn.Module):
         self.local_size = local_size
         self.dtype = dtype
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        (q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache) = (
+        q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache = (
             self._compute_cos_sin_cache()
         )
 

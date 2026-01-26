@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
 import torch
@@ -11,7 +11,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-
 
 _LOGGER = AiterTritonLogger()
 

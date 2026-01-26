@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # The kernels in this file are adapted from LightLLM's context_attention_fwd:
 # https://github.com/ModelTC/lightllm/blob/main/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py
@@ -85,10 +85,8 @@ def context_attention_fwd(
     if (
         torch.finfo(k_cache.dtype).bits == 8 or torch.finfo(v_cache.dtype).bits == 8
     ) and kv_cache_dtype == "auto":
-        raise ValueError(
-            "kv_cache_dtype='auto' unsupported for\
-            FP8 KV Cache prefill kernel"
-        )
+        raise ValueError("kv_cache_dtype='auto' unsupported for\
+            FP8 KV Cache prefill kernel")
 
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]

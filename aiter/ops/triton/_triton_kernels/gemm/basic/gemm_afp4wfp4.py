@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -712,8 +712,9 @@ def _get_config(
     K: int,
     shuffle: bool = False,
 ):
-    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
-    config_name = f"GEMM-AFP4WFP4{shuffle_suffix}"
-
     # Note: Config files use K=2*K in their naming
-    return get_gemm_config(config_name, M, N, 2 * K)
+    K = 2 * K
+    if shuffle:
+        return get_gemm_config("GEMM-AFP4WFP4_PRESHUFFLED", M, N, K)
+    else:
+        return get_gemm_config("GEMM-AFP4WFP4", M, N, K)

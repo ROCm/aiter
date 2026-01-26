@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
 from ..ops.enum import QuantType
@@ -58,9 +58,9 @@ def str2bool(v):
 def str2tuple(v):
     """
     Convert string to int or tuple of ints.
-    - "512" → 512 (single value without comma returns int)
-    - "512," → (512,) (trailing comma returns tuple)
-    - "512,1024" → (512, 1024) (multiple values return tuple)
+    - "512" -> 512 (single value without comma returns int)
+    - "512," -> (512,) (trailing comma returns tuple)
+    - "512,1024" -> (512, 1024) (multiple values return tuple)
     """
     try:
         parts = [int(p.strip()) for p in v.strip("()").split(",") if p.strip()]

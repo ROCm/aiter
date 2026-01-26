@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py

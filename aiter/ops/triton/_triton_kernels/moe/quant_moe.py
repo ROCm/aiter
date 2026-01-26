@@ -405,7 +405,7 @@ def _upcast_from_mxfp(
         # 3) x is zero, do nothing
         dst_tensor = tl.interleave(x0, x1).to(dst_dtype, bitcast=True)
 
-    # Reshape for proper broadcasting: the scale was stored with a 32‐sized “inner” grouping.
+    # Reshape for proper broadcasting: the scale was stored with a 32-sized "inner" grouping.
     dst_tensor = dst_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32])
     dst_scale = dst_scale.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 1])
     scale = scale.reshape(dst_scale.shape)

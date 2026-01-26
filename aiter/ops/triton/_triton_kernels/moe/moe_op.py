@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils._triton.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 
 # Source:
 # MoE Kernel adapted from VLLM
