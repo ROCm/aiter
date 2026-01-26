@@ -447,10 +447,6 @@ def test_pa_ps(
     num_query_heads, num_kv_heads = num_heads
 
     assert num_query_heads % num_kv_heads == 0
-    max_seq_len = 16384
-    max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
-    num_blocks = max_num_blocks_per_seq * batch_size
-    num_blocks_per_seq = (ctx_lens + block_size - 1) // block_size
 
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
@@ -464,6 +460,7 @@ def test_pa_ps(
     seq_lens_qo = torch.randint(
         1, 5, (batch_size,), dtype=torch.int, device=device
     ).fill_(qlen)
+    # seq_lens_kv = torch.tensor([10240] * (batch_size - 1) + [30720], dtype=torch.int, device=device)
     # print(seq_lens_qo)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_qo = qo_indptr[-1].item()
@@ -481,14 +478,11 @@ def test_pa_ps(
     query.uniform_(*uniform_range)
 
     # Create the block tables.
-    block_tables_lst: List[List[int]] = []
-    for _ in range(batch_size):
-        block_table = [
-            random.randint(0, num_blocks - 1) for _ in range(num_blocks_per_seq)
-        ]
-        block_tables_lst.append(block_table)
-
-    block_tables = torch.tensor(block_tables_lst, dtype=torch.int)
+    max_kv_len = seq_lens_kv.max().item()
+    max_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    max_blocks = max_blocks_per_seq * batch_size
+    block_tables = torch.randperm(max_blocks, dtype=torch.int).reshape(batch_size, -1)
+    block_tables_lst = block_tables.tolist()
 
     # convert input for pa persistent interface
     actual_blocks = (seq_lens_kv + block_size - 1) // block_size
@@ -500,7 +494,7 @@ def test_pa_ps(
 
     # Create the KV caches.
     k_caches, v_caches = kv_cache_factory(
-        num_blocks,
+        max_blocks,
         block_size,
         1,
         num_kv_heads,
@@ -975,6 +969,3 @@ for dtype in l_dtype:
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
     df.to_csv("pa_ps.csv")
-    pd.set_option("display.width", None)
-    pd.set_option("display.max_colwidth", None)
-    print(df)
