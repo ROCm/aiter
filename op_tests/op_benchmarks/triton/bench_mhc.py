@@ -43,7 +43,8 @@ def get_benchmark_configs(args):
         Ms = [2**i for i in range(10, 15)]
         n = 4
         Cs = [128, 512, 4096, 2**15]
-        configs.extend(list(product(Ms, [n], Cs)))
+        # Sort by C (hidden dimension) to show scaling across C values
+        configs = sorted(list(product(Ms, [n], Cs)), key=lambda x: (x[2], x[0]))
     
     return configs
 
@@ -106,33 +107,27 @@ def run_benchmark(args):
         nC = n * C
         N = n * n + 2 * n
         
-        # Eq 14: Matrix multiplication x @ phi for 3 streams
-        # Each matmul: (M, nC) @ (nC, n_out) requires 2*M*nC*n_out FLOPs
-        flops_pre = 2.0 * M * nC * n
-        flops_post = 2.0 * M * nC * n
-        flops_res = 2.0 * M * nC * (n * n)
-        flops_matmul = flops_pre + flops_post + flops_res
+        # Standard GEMM FLOPs (2*M*N*K for matrix multiply)
+        # Eq 14: x @ phi for 3 streams
+        # - x @ phi_pre: (M, nC) @ (nC, n) = 2*M*nC*n
+        # - x @ phi_post: (M, nC) @ (nC, n) = 2*M*nC*n  
+        # - x @ phi_res: (M, nC) @ (nC, n*n) = 2*M*nC*n*n
+        flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * (n * n)
         
         # Eq 15: RMS normalization - M rows, each with nC elements
-        # sqrt(sum(x^2)/K) requires ~2*nC ops per row (square + sum)
-        flops_rms = 2.0 * M * nC
+        # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
+        flops_rms = 4.0 * M * nC
         
-        # Eq 16: Scaling and bias - negligible compared to matmul
-        flops_scale = M * N
-        
-        # Eq 17-18: Activations (sigmoid) - ~10 FLOPs per element
-        flops_activation = 10.0 * M * (n + n)
-        
-        # Eq 19: Sinkhorn-Knopp (if enabled)
+        # Eq 19: Sinkhorn-Knopp (separate kernel)
         # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
-        # Each normalization: sum (n ops) + divide (n ops) = 2n ops per row/col
-        # Total per iteration: 2 * 2 * M * n * n ops
+        # Per normalization: sum + divide ≈ 2n ops per row/col
+        # Total per iteration: 2 * 2 * M * n * n = 4 * M * n * n ops
         flops_sinkhorn = 4.0 * M * n * n * sinkhorn_iters
         
         if mode == "full":
-            total_flops = flops_matmul + flops_rms + flops_scale + flops_activation + flops_sinkhorn
+            total_flops = flops_matmul + flops_rms + flops_sinkhorn
         elif mode == "fused":
-            total_flops = flops_matmul + flops_rms + flops_scale + flops_activation
+            total_flops = flops_matmul + flops_rms
         elif mode == "sinkhorn":
             total_flops = flops_sinkhorn
         
