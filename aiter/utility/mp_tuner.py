@@ -197,6 +197,11 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             )
 
             ref = ref if ref_noused is None else ref_noused
+
+            # Extract rtol, atol from rest if available, otherwise use defaults
+            rtol = rest[0] if len(rest) > 0 else 1e-2
+            atol = rest[1] if len(rest) > 1 else 1e-2
+
             work_args = (
                 gpu_id,
                 info,
@@ -204,11 +209,14 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 new_args,
                 kwargs,
                 ref,
-                *rest,
+                rtol,
+                atol,
+                verbose,  # Use the verbose from work_group parameter
+                err_ratio,  # Use the err_ratio from work_group parameter
             )
 
             # Run worker with explicit GPU ID
-            ret = worker(*work_args, printLog=verbose, tol_err_ratio=err_ratio)
+            ret = worker(*work_args)
             rets.append(ret)
         return rets
 
