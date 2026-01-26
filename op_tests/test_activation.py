@@ -21,11 +21,15 @@ def triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype):
     return quant_out
 
 
-def scaled_silu_mul_fp8_quantization(m, n, x, x_scale, dtype_quant=aiter.dtypes.fp8):
+def aiter_scaled_silu_mul(m, n, x, x_scale, dtype_quant=aiter.dtypes.fp8):
     silu_out = torch.empty((m, n // 2), dtype=dtype_quant, device=x.device)
     aiter.scaled_silu_and_mul(silu_out, x, x_scale)
     return silu_out
 
+def aiter_silu_and_mul(m, n, x, out_type):
+    silu_out = torch.empty((m, n // 2), dtype=out_type, device=x.device)
+    aiter.silu_and_mul(silu_out, x)
+    return silu_out
 
 @benchmark()
 def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
@@ -44,7 +48,7 @@ def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
     ref = (F.silu(x) * y / scale).to(out_dtype)
 
     out, us_aiter = run_perftest(
-        scaled_silu_mul_fp8_quantization, m, n, input, scale, out_dtype
+        aiter_scaled_silu_mul, m, n, input, scale, out_dtype
     )
     fp8_x, us_triton = run_perftest(
         triton_silu_mul_fp8_quantization_fuse, input, scale, aiter.dtypes.fp8
@@ -81,19 +85,15 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     """
     input = torch.randn(m, n, dtype=dtype, device="cuda")
     out_dtype = output_dtype if output_dtype is not None else dtype
-    out = torch.empty((m, n // 2), dtype=out_dtype, device="cuda")
 
     # Reference: compute in input dtype, convert to output dtype if needed
     ref = torch_silu_and_mul(input)
     if output_dtype is not None:
         ref = ref.to(output_dtype)
 
-    _, us_aiter = run_perftest(
-        aiter.silu_and_mul,
-        out,
-        input,
+    out, us_aiter = run_perftest(
+        aiter_silu_and_mul, m, n, input, out_dtype
     )
-
     # Check if the results are close
     err = checkAllclose(ref, out)
 
@@ -117,18 +117,15 @@ def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
     """Test fp32 input with fp16/bf16 output for scaled activation"""
     input = torch.randn(m, n, dtype=input_dtype, device="cuda")
     scale = torch.max(input).to(torch.float32)
-    out = torch.empty((m, n // 2), dtype=output_dtype, device="cuda")
+    #out = torch.empty((m, n // 2), dtype=output_dtype, device="cuda")
 
     # Reference: compute in fp32, scale, convert to output dtype
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
     ref = (F.silu(x) * y / scale).to(output_dtype)
 
-    _, us_aiter = run_perftest(
-        aiter.scaled_silu_and_mul,
-        out,
-        input,
-        scale,
+    out, us_aiter = run_perftest(
+        aiter_scaled_silu_mul, m, n, input, scale, output_dtype
     )
     err = checkAllclose(ref.to(torch.float), out.to(torch.float))
     dtype_map = {
@@ -169,8 +166,8 @@ parser.add_argument(
     "-m",
     type=int,
     nargs="*",
-    choices=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 16384, 32768],
-    default=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 16384, 32768],
+    choices=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840],
+    default=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840],
     help="""M of mnk.
     e.g.: -m 32""",
 )
@@ -178,8 +175,8 @@ parser.add_argument(
     "-n",
     type=int,
     nargs="*",
-    choices=[1024, 4096, 8192, 16384],
-    default=[1024, 4096, 8192, 16384],
+    choices=[1024, 4096, 6400, 8192],
+    default=[1024, 4096, 6400, 8192],
     help="""N of mnk.
     e.g.: -n 1024""",
 )
