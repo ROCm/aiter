@@ -50,7 +50,9 @@ def fwd(
     return_lse: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    sage_version: Sage_version = Sage_version.V1
+    sage_version: Sage_version = Sage_version.V1,
+    q_descale_pre: Optional[torch.Tensor] = None,
+    k_descale_pre: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sage Attention v1 forward pass compatible interface for AMD Triton implementation.
@@ -141,9 +143,19 @@ def fwd(
             q_descale.shape if q_descale is not None else None,
         )
         print(
+            "q_descale_pre:",
+            q_descale_pre.dtype if q_descale_pre is not None else None,
+            q_descale_pre.shape if q_descale_pre is not None else None,
+        )
+        print(
             "k_descale:",
             k_descale.dtype if k_descale is not None else None,
             k_descale.shape if k_descale is not None else None,
+        )
+        print(
+            "k_descale_pre:",
+            k_descale_pre.dtype if k_descale_pre is not None else None,
+            k_descale_pre.shape if k_descale_pre is not None else None,
         )
         print(
             "v_descale:",
@@ -309,6 +321,10 @@ def fwd(
     # print("sage_version", sage_version)
     # print(sage_version == Sage_version.V1)
     sage_func = fav3_sage_triton_impl if sage_version == Sage_version.V1 else fav3_sage_triton_impl_v2
+    extra_args = {} if sage_version == Sage_version.V1 else {
+        "q_descale_pre": q_descale_pre,
+        "k_descale_pre": k_descale_pre,
+    }
 
     sage_func(
         q,
@@ -344,6 +360,7 @@ def fwd(
         rotary_interleaved=rotary_interleaved,
         seqlens_rotary=seqlens_rotary,
         config=config,
+        **extra_args,
     )
 
     if DEBUG:

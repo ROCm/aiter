@@ -361,7 +361,9 @@ def fav3_sage_func(
     inference_mode: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    sage_version: fav3_sage.Sage_version = fav3_sage.Sage_version.V1
+    sage_version: fav3_sage.Sage_version = fav3_sage.Sage_version.V1,
+    q_descale_pre: Optional[torch.Tensor] = None,
+    k_descale_pre: Optional[torch.Tensor] = None,
 ):
     """
     SageAttention v1.
@@ -432,6 +434,7 @@ def fav3_sage_func(
             num_k_blocks,
         ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
     elif sage_version == fav3_sage.Sage_version.V2:
+        assert q_descale_pre is not None and k_descale_pre is not None, f"q_descale_pre and k_descale_pre shouldn't be None"
         assert map_dims(q_descale.shape, bshd) == [
             batch,
             seqlen_q,
@@ -444,6 +447,16 @@ def fav3_sage_func(
             num_kv_heads,
             head_dim // 32
         ], f"k_descale shape {map_dims(k_descale.shape, bshd)} != expected {(batch, seqlen_k, num_kv_heads, head_dim // 32)}"
+        assert q_descale_pre.shape == (
+            batch,
+            num_q_heads,
+            num_q_blocks,
+        ), f"q_descale_pre shape {q_descale.shape} != expected {(batch, num_q_heads, num_q_blocks)}"
+        assert k_descale_pre.shape == (
+            batch,
+            num_kv_heads,
+            num_k_blocks,
+        ), f"k_descale_pre shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
 
 
     # Validate unsupported features
@@ -497,7 +510,9 @@ def fav3_sage_func(
         return_lse,
         layout,
         config,
-        sage_version=sage_version
+        sage_version=sage_version,
+        q_descale_pre=q_descale_pre,
+        k_descale_pre=k_descale_pre,
     )
 
     return out

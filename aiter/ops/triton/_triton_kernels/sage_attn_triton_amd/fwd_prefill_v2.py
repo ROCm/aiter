@@ -9,7 +9,7 @@ from .utils import (
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs, _general_quant_kernel
 
 @triton.jit
 def _sage_fwd_no_mask_v2(
@@ -44,7 +44,9 @@ def _sage_fwd_no_mask_v2(
     block_max,
     alibi_slope,
     q_descale,
+    q_descale_pre,
     k_descale_base_ptr,
+    k_descale_pre_base_ptr,
     SM_SCALE: tl.constexpr,
     FP8_MAX,
     stride_ksn,
@@ -64,6 +66,7 @@ def _sage_fwd_no_mask_v2(
     K_DTYPE_STR: tl.constexpr,
 ):
     k_descale_ptr = k_descale_base_ptr
+    k_descale_pre_ptr = k_descale_pre_base_ptr
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -79,8 +82,13 @@ def _sage_fwd_no_mask_v2(
         else:
             k = tl.load(k_ptrs)
 
-        k_descale = tl.load(k_descale_ptr)
+        #k_descale = tl.load(k_descale_ptr)
+        k_descale = tl.load(
+            k_descale_ptr, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
+        )
         k_descale_ptr += stride_ksn * BLOCK_N
+        k_descale_pre = tl.load(k_descale_pre_ptr)
+        k_descale_pre_ptr += 1
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -94,7 +102,7 @@ def _sage_fwd_no_mask_v2(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
         # -- compute qk ----
-        qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * SM_SCALE
+        qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * (q_descale_pre * k_descale_pre)
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -236,7 +244,9 @@ def _sage_fwd_mask_v2(
     n_extra_tokens,
     alibi_slope,
     q_descale,
+    q_descale_pre,
     k_descale_base_ptr,
+    k_descale_pre_base_ptr,
     SM_SCALE: tl.constexpr,
     FP8_MAX,
     stride_ksn,
@@ -263,6 +273,7 @@ def _sage_fwd_mask_v2(
     seqlen_delta_qk = seqlen_k - seqlen_q
 
     k_descale_ptr = k_descale_base_ptr
+    k_descale_pre_ptr = k_descale_pre_base_ptr
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -286,6 +297,8 @@ def _sage_fwd_mask_v2(
             k_descale_ptr, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
         )
         k_descale_ptr += stride_ksn * BLOCK_N
+        k_descale_pre = tl.load(k_descale_pre_ptr)
+        k_descale_pre_ptr += 1
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
@@ -308,7 +321,7 @@ def _sage_fwd_mask_v2(
             qk = tl.where(mask, qk, float("-inf"))
 
         # -- compute qk ----
-        qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * SM_SCALE
+        qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * (q_descale_pre * k_descale_pre)
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -866,15 +879,21 @@ def sage_fwd_v2(
     V,
     bias,
     Q_Descale,
+    Q_Descale_Pre,
     K_Descale,
+    K_Descale_Pre,
     V_Descale,
     FP8_MAX,
     stride_qsz,
     stride_qsh,
     stride_qsm,
+    stride_qspz,
+    stride_qsph,
     stride_ksz,
     stride_ksh,
     stride_ksn,
+    stride_kspz,
+    stride_ksph,
     stride_vsz,
     stride_vsh,
     LSE,
@@ -1031,7 +1050,23 @@ def sage_fwd_v2(
         q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0
     )  # MHA: use q head index
 
+    q_descale_pre_ptr = (
+        Q_Descale_Pre
+        + off_z * stride_qspz
+        + off_h_q * stride_qsph
+        + start_m + cu_seqlens_q_start
+    )
+
+    q_descale_pre = tl.load(q_descale_pre_ptr)
+
     k_descale_offset = off_z * stride_ksz + off_h_k * stride_ksh
+
+    k_descale_pre_offset = (
+        K_Descale_Pre
+        + off_z * stride_kspz
+        + off_h_k * stride_ksph
+        + cu_seqlens_k_start
+    )
 
     v_descale = tl.load(
         V_Descale
@@ -1164,6 +1199,8 @@ def sage_fwd_v2(
             + offs_d_qk_s[None, :]
         )
 
+        k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks
+
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
             l_i,
@@ -1197,7 +1234,9 @@ def sage_fwd_v2(
             0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
             alibi_slope,
             q_descale,
+            q_descale_pre,
             k_descale_ptr,
+            k_descale_pre_ptr,
             SM_SCALE,
             FP8_MAX,
             stride_ksn,
@@ -1235,6 +1274,8 @@ def sage_fwd_v2(
             + offs_d_qk_s[None, :]
         )
 
+        k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks
+
         acc, l_i, m_i = _sage_fwd_no_mask_v2(
             acc,
             l_i,
@@ -1267,7 +1308,9 @@ def sage_fwd_v2(
             block_max,  # End of range: n_full_blocks * BLOCK_N
             alibi_slope,
             q_descale,
+            q_descale_pre,
             k_descale_ptr,
+            k_descale_pre_ptr,
             SM_SCALE,
             FP8_MAX,
             stride_ksn,
@@ -1306,6 +1349,8 @@ def sage_fwd_v2(
             + offs_d_qk_s[None, :]
         )
 
+        k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
+
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
             l_i,
@@ -1339,7 +1384,9 @@ def sage_fwd_v2(
             n_extra_tokens,  # Padding tokens in last block
             alibi_slope,
             q_descale,
+            q_descale_pre,
             k_descale_ptr,
+            k_descale_pre_ptr,
             SM_SCALE,
             FP8_MAX,
             stride_ksn,
@@ -1530,6 +1577,8 @@ def fav3_sage_triton_impl_v2(
     rotary_interleaved: bool = False,
     seqlens_rotary: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    q_descale_pre: Optional[torch.Tensor] = None,
+    k_descale_pre: Optional[torch.Tensor] = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1754,6 +1803,9 @@ def fav3_sage_triton_impl_v2(
 
     stride_vsz, stride_vsh, _ = v_descale.stride()
 
+    stride_qspz, stride_qsph, _ = q_descale_pre.stride()
+    stride_kspz, stride_ksph, _ = k_descale_pre.stride()
+
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
 
@@ -1828,15 +1880,21 @@ def fav3_sage_triton_impl_v2(
         v,
         bias,
         q_descale,
+        q_descale_pre,
         k_descale,
+        k_descale_pre,
         v_descale,
         FP8_MAX,
         stride_qsz,
         stride_qsh,
         stride_qsm,
+        stride_qspz,
+        stride_qsph,
         stride_ksz,
         stride_ksh,
         stride_ksn,
+        stride_kspz,
+        stride_ksph,
         stride_vsz,
         stride_vsh,
         softmax_lse,
@@ -1912,6 +1970,7 @@ def sage_quant_v2(
     v,
     FP8_TYPE,
     FP8_MAX,
+    PRE_SCALE_MAX=6.0,
     BLKQ=128,
     BLKK=64,
     sm_scale=None,
@@ -1941,16 +2000,21 @@ def sage_quant_v2(
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
     if layout == "bhsd":
-        b, h_kv, kv_len, head_dim = k.shape
+        b, h_qo, qo_len, head_dim = q.shape
+        _, h_kv, kv_len, _ = k.shape
 
+        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
 
     elif layout == "bshd":
-        b, kv_len, h_kv, head_dim = k.shape
+        b, qo_len, h_qo, head_dim = q.shape
+        _, kv_len, h_kv, _ = k.shape
 
+        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
+    Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
     # Apply K tensor smoothing following SageAttention approach
@@ -1986,13 +2050,147 @@ def sage_quant_v2(
         num_warps=8
     )
 
-    # q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
-    q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
-    k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+    ## quantize q and k
+    q_bf16 = torch.empty_like(q, dtype=torch.bfloat16, device=q.device)
+    k_bf16 = torch.empty_like(k, dtype=torch.bfloat16, device=k.device)
+    q_scale_pre = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
+    k_scale_pre = torch.empty((b, h_kv, K_NUM_BLKS), device=k.device, dtype=torch.float32)
+
+    q_task_count = b * h_qo * Q_NUM_BLKS
+    k_task_count = b * h_kv * K_NUM_BLKS
+
+    grid = (q_task_count + k_task_count,)
+
+    sage_v2_pre_quant_kernel[grid](
+        q,
+        q_bf16,
+        q_scale_pre,
+        k,
+        k_bf16,
+        k_scale_pre,
+        stride_bz_q,
+        stride_h_q,
+        stride_seq_q,
+        stride_bz_k,
+        stride_h_k,
+        stride_seq_k,
+        q_scale_pre.stride(0),
+        q_scale_pre.stride(1),
+        k_scale_pre.stride(0),
+        k_scale_pre.stride(1),
+        (sm_scale * 1.4426950408889634),
+        q_task_count,
+        b,
+        h_qo,
+        h_kv,
+        Q_NUM_BLKS,
+        K_NUM_BLKS,
+        qo_len,
+        kv_len,
+        triton.next_power_of_2(kv_len),
+        PRE_SCALE_MAX=PRE_SCALE_MAX,
+        D=head_dim,
+        BLK_Q=BLKQ,
+        BLK_K=BLKK,
+    )
+
+
+    q_fp4, q_scale = downcast_to_mxfp(q_bf16, torch.uint8, axis=-1)
+    # q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
+    k_fp4, k_scale = downcast_to_mxfp(k_bf16, torch.uint8, axis=-1)
     # k_fp4, k_scale = downcast_to_mxfp(k, aiter.dtypes.fp8, axis=-1)
 
+    return q_fp4, q_scale, q_scale_pre, k_fp4, k_scale, k_scale_pre, v_fp8, v_scale
 
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
+
+@triton.jit
+def sage_v2_pre_quant_kernel(
+    Q_Input,
+    Q_Output,
+    Q_Scale,
+    K_Input,
+    K_Output,
+    K_Scale,
+    stride_qz,
+    stride_qh,
+    stride_qn,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_qsz,
+    stride_qsh,
+    stride_ksz,
+    stride_ksh,
+    sm_scale,
+    q_task_count,
+    BATCH,
+    Q_HEAD,
+    K_HEAD,
+    Q_NUM_BLKS,
+    K_NUM_BLKS,
+    SEQLEN_Q,
+    SEQLEN_K,
+    SEQLEN_K_PADDED: tl.constexpr,
+    PRE_SCALE_MAX: tl.constexpr,
+    D: tl.constexpr,
+    BLK_Q: tl.constexpr,
+    BLK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    offs_blk_q = tl.arange(0, BLK_Q)
+    offs_blk_k = tl.arange(0, BLK_K)
+    offs_d = tl.arange(0, D)
+
+    if pid < q_task_count:
+        # here we do Q
+        off_blk, off_h, off_b = pid_grid_3d(pid, Q_NUM_BLKS, Q_HEAD, BATCH)
+        offs_qn = off_blk * BLK_Q + offs_blk_q
+
+        q_offs = (
+            off_b * stride_qz
+            + off_h * stride_qh
+            + offs_qn[:, None] * stride_qn
+            + offs_d[None, :]
+        )
+
+        q_input_ptrs = Q_Input + q_offs
+        q_output_ptrs = Q_Output + q_offs
+        q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
+
+        _general_quant_kernel(
+            q_input_ptrs,
+            q_output_ptrs,
+            q_scale_ptrs,
+            PRE_SCALE_MAX,
+            offs_qn[:, None] < SEQLEN_Q,
+            sm_scale=sm_scale,
+        )
+    else:
+        # here we do K
+        _pid = pid - q_task_count
+        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
+
+        offs_kn = off_blk * BLK_K + offs_blk_k
+
+        k_offs = (
+            off_b * stride_kz
+            + off_h * stride_kh
+            + offs_kn[:, None] * stride_kn
+            + offs_d[None, :]
+        )
+
+        k_input_ptrs = K_Input + k_offs
+        k_output_ptrs = K_Output + k_offs
+        k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
+
+        _general_quant_kernel(
+            k_input_ptrs,
+            k_output_ptrs,
+            k_scale_ptrs,
+            PRE_SCALE_MAX,
+            offs_kn[:, None] < SEQLEN_K,
+        )
 
 
 @triton.jit

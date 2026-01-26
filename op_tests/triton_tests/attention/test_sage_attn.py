@@ -245,7 +245,7 @@ def input_helper_v2(
     )
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
-    q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale = sage_quant_v2(
+    q_fp4, q_descale, q_descale_pre, k_fp4, k_descale, k_descale_pre, v_fp8, v_descale = sage_quant_v2(
         q,
         k,
         v,
@@ -257,7 +257,7 @@ def input_helper_v2(
         layout=layout,
     )
 
-    return q, k, v, q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale
+    return q, k, v, q_fp4, q_descale, q_descale_pre, k_fp4, k_descale, k_descale_pre, v_fp8, v_descale
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
@@ -381,7 +381,7 @@ def test_sage_v2(
     BLKQ = config["BLOCK_M"]
     BLKK = config["BLOCK_N"]
 
-    q, k, v, q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale = input_helper_v2(
+    q, k, v, q_fp4, q_descale, q_descale_pre, k_fp4, k_descale, k_descale_pre, v_fp8, v_descale = input_helper_v2(
         BATCH,
         NUM_Q_HEADS,
         NUM_K_HEADS,
@@ -408,18 +408,20 @@ def test_sage_v2(
         inference_mode=True,
         layout=layout,
         config=config,
-        sage_version=Sage_version.V2
+        sage_version=Sage_version.V2,
+        q_descale_pre=q_descale_pre,
+        k_descale_pre=k_descale_pre,
     )
 
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
-    q_dequant = upcast_from_mxfp(q_fp4, q_descale, torch.bfloat16, -1)
-    k_dequant = upcast_from_mxfp(k_fp4, k_descale, torch.bfloat16, -1)
-    check_kernel_only = True
-    if check_kernel_only:
-        q = q_dequant
-        k = k_dequant
+    #q_dequant = upcast_from_mxfp(q_fp4, q_descale, torch.bfloat16, -1)
+    #k_dequant = upcast_from_mxfp(k_fp4, k_descale, torch.bfloat16, -1)
+    #check_kernel_only = True
+    #if check_kernel_only:
+    #    q = q_dequant
+    #    k = k_dequant
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
