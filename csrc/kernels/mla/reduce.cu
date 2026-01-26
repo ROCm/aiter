@@ -123,10 +123,10 @@ enum class MlaReduceProblemSize : uint8_t
 };
 
 template <typename T, MlaReduceProblemSize kProblemSize>
-class LocalLseLds
+class LocalLse
 {
     public:
-    CK_TILE_DEVICE LocalLseLds(T* p_local_lse, const int32_t group_size, const int32_t idx_in_group)
+    CK_TILE_DEVICE LocalLse(T* p_local_lse, const int32_t group_size, const int32_t idx_in_group)
         : p_local_lse_(p_local_lse), group_size_(group_size), idx_in_group_(idx_in_group)
     {
     }
@@ -406,9 +406,24 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& pa
                                                const int32_t tile_idx,
                                                const int32_t reduce_tile_start,
                                                const int32_t reduce_tile_end,
-                                               const int32_t* p_lds_reduce_partial_map,
-                                               float* p_lds_lse_scale)
+                                               int32_t* p_lds)
 {
+    int32_t* p_lds_reduce_partial_map = p_lds;
+    float* p_lds_lse_scale = reinterpret_cast<float*>(p_lds + params.max_splits);
+    float* p_lds_local_lse = p_lds_lse_scale + params.max_splits;
+    LocalLse<float, kProblemSize> local_lse(
+        p_lds_local_lse, ck_tile::get_warp_size(), ck_tile::get_lane_id());
+
+    // load reduce partial map from VRAM to LDS
+    const int32_t num_splits = reduce_tile_end - reduce_tile_start;
+    for(int32_t i = threadIdx.x; i < num_splits; i += Traits::kNumThreads)
+    {
+        p_lds_reduce_partial_map[i] = params.p_reduce_partial_map[reduce_tile_start + i];
+    }
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_sched_barrier(0);
+
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
     const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
     const MlaPartialTileInfo final_loc = [&]() {
@@ -464,9 +479,6 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& pa
         const float* p_partial_output_seq_base =
             p_partial_output_base + local_seqlen_idx * Traits::kNumHeadQ * Traits::kSizeDV;
 
-        float* p_local_lse = p_lds_lse_scale + params.max_splits;
-        LocalLseLds<float, kProblemSize> local_lse(
-            p_local_lse, ck_tile::get_warp_size(), ck_tile::get_lane_id());
         reduce_lse_massive<Traits, kProblemSize>(params,
                                                  seq_idx,
                                                  reduce_tile_start,
@@ -501,8 +513,21 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& par
                                               const int32_t tile_idx,
                                               const int32_t reduce_tile_start,
                                               const int32_t reduce_tile_end,
-                                              const int32_t* p_lds_reduce_partial_map)
+                                              int32_t* p_lds)
 {
+    int32_t* p_lds_reduce_partial_map = p_lds;
+    float* p_lds_lse = reinterpret_cast<float*>(p_lds + params.max_splits);
+
+    // load reduce partial map from VRAM to LDS
+    const int32_t num_splits = reduce_tile_end - reduce_tile_start;
+    for(int32_t i = threadIdx.x; i < num_splits; i += Traits::kNumThreads)
+    {
+        p_lds_reduce_partial_map[i] = params.p_reduce_partial_map[reduce_tile_start + i];
+    }
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_sched_barrier(0);
+
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
     const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
     const MlaPartialTileInfo final_loc = [&]() {
@@ -598,15 +623,15 @@ template <typename Traits, typename lse_t, typename out_t>
 __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
     void kn_mla_reduce_v1_ps(const MlaReduceKernelV1Params params)
 {
-    extern __shared__ int32_t p_lds_reduce_partial_map[];
-    float* p_lds_lse_scale = reinterpret_cast<float*>(p_lds_reduce_partial_map + params.max_splits);
+    extern __shared__ int32_t p_lds[];
 
     const int32_t last_reduce_tile =
         __builtin_amdgcn_readfirstlane(params.p_reduce_indptr[params.num_reduce_tile]);
     const int32_t tot_work =
         Traits::kNumHeadQ * Traits::kNumThreadGroupPerBh * params.num_reduce_tile;
-    for(int32_t work_idx = blockIdx.x; work_idx < tot_work; work_idx += gridDim.x)
-    {
+
+    // break if returns false
+    auto main_loop = [&](const int32_t work_idx) -> bool {
         const int32_t head_idx  = work_idx % Traits::kNumHeadQ;
         const int32_t temp_idx  = work_idx / Traits::kNumHeadQ;
         const int32_t block_idx = temp_idx % Traits::kNumThreadGroupPerBh;
@@ -619,20 +644,10 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
 
         if(reduce_tile_start == last_reduce_tile)
         {
-            break;
+            return false;
         }
 
         const int32_t num_splits = reduce_tile_end - reduce_tile_start;
-
-        // load reduce partial map from VRAM to LDS
-        __builtin_amdgcn_s_barrier();
-        for(int32_t i = threadIdx.x; i < num_splits; i += Traits::kNumThreads)
-        {
-            p_lds_reduce_partial_map[i] = params.p_reduce_partial_map[reduce_tile_start + i];
-        }
-        __builtin_amdgcn_s_waitcnt(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
 
         if(num_splits >= Traits::kMassiveThreshold)
         {
@@ -647,8 +662,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   tile_idx,
                                                   reduce_tile_start,
                                                   reduce_tile_end,
-                                                  p_lds_reduce_partial_map,
-                                                  p_lds_lse_scale);
+                                                  p_lds);
             }
             else if(num_splits <= 256)
             {
@@ -661,8 +675,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   tile_idx,
                                                   reduce_tile_start,
                                                   reduce_tile_end,
-                                                  p_lds_reduce_partial_map,
-                                                  p_lds_lse_scale);
+                                                  p_lds);
             }
             else
             {
@@ -675,8 +688,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   tile_idx,
                                                   reduce_tile_start,
                                                   reduce_tile_end,
-                                                  p_lds_reduce_partial_map,
-                                                  p_lds_lse_scale);
+                                                  p_lds);
             }
         }
         // In theory, we can handle the case that #split = 1. However, it is meaningless and
@@ -689,7 +701,29 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                             tile_idx,
                                                             reduce_tile_start,
                                                             reduce_tile_end,
-                                                            p_lds_reduce_partial_map);
+                                                            p_lds);
+        }
+
+        return true;
+    };
+
+    int32_t work_idx = blockIdx.x;
+    if (work_idx < tot_work)
+    {
+        bool continue_flag = main_loop(work_idx);
+        if (continue_flag)
+        {
+            work_idx += gridDim.x;
+            while(work_idx < tot_work)
+            {
+                __builtin_amdgcn_s_barrier();
+                continue_flag = main_loop(work_idx);
+                if (continue_flag == false)
+                {
+                    break;
+                }
+                work_idx += gridDim.x;
+            }
         }
     }
 }
@@ -698,8 +732,7 @@ template <typename Traits, typename lse_t, typename out_t>
 __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
     void kn_mla_reduce_v1(const MlaReduceKernelV1Params params)
 {
-    extern __shared__ int32_t p_lds_reduce_partial_map[];
-    float* p_lds_lse_scale = reinterpret_cast<float*>(p_lds_reduce_partial_map + params.max_splits);
+    extern __shared__ int32_t p_lds[];
 
     const int32_t head_idx  = blockIdx.x;
     const int32_t block_idx = blockIdx.y;
@@ -712,15 +745,6 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
 
     const int32_t num_splits = reduce_tile_end - reduce_tile_start;
 
-    // load reduce partial map from VRAM to LDS
-    for(int32_t i = threadIdx.x; i < num_splits; i += Traits::kNumThreads)
-    {
-        p_lds_reduce_partial_map[i] = params.p_reduce_partial_map[reduce_tile_start + i];
-    }
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
-
     if(num_splits >= Traits::kMassiveThreshold)
     {
         if(num_splits <= 64)
@@ -732,8 +756,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 tile_idx,
                 reduce_tile_start,
                 reduce_tile_end,
-                p_lds_reduce_partial_map,
-                p_lds_lse_scale);
+                p_lds);
         }
         else if(num_splits <= 256)
         {
@@ -744,8 +767,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 tile_idx,
                 reduce_tile_start,
                 reduce_tile_end,
-                p_lds_reduce_partial_map,
-                p_lds_lse_scale);
+                p_lds);
         }
         else
         {
@@ -756,8 +778,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 tile_idx,
                 reduce_tile_start,
                 reduce_tile_end,
-                p_lds_reduce_partial_map,
-                p_lds_lse_scale);
+                p_lds);
         }
     }
     // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata
@@ -770,7 +791,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                         tile_idx,
                                                         reduce_tile_start,
                                                         reduce_tile_end,
-                                                        p_lds_reduce_partial_map);
+                                                        p_lds);
     }
 }
 
@@ -884,8 +905,13 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     const int32_t lds_size = params.max_splits * sizeof(int32_t) +
                              params.max_splits * sizeof(float) +
                              max(0, params.max_splits - 256) * sizeof(float);
-    if(lds_size <= (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
+    if(lds_size <= dev_prop.maxSharedMemoryPerMultiProcessor)
     {
+        if (lds_size > (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
+        {
+            TORCH_WARN("kn_mla_reduce_v1: The number of splits is too high, adversely affecting occupancy.");
+        }
+
         const int32_t ps_grid_size = num_cu * Traits::kOccupancy * 2;
         if(Traits::kNumHeadQ * Traits::kNumThreadGroupPerBh * params.num_reduce_tile <=
            ps_grid_size)
@@ -904,7 +930,7 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     }
     else
     {
-        TORCH_CHECK(false, "kn_mla_reduce_v1: There are too much splits. We cannot handle them.");
+        TORCH_CHECK(false, "kn_mla_reduce_v1: The number of splits exceeds what kernel can handle.");
     }
 }
 
