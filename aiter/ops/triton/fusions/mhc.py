@@ -24,15 +24,15 @@ _LOGGER = AiterTritonLogger()
 
 def get_fused_mhc_config():
     return {
-        "waves_per_eu": 4,
+        "waves_per_eu": 1,
         "num_stages": 1,
-        "num_warps": 8,
+        "num_warps": 4
     }
 
 
 def get_sinkhorn_knopp_config():
     return {
-        "BLOCK_M": 256,
+        "BLOCK_M": 1,
         "waves_per_eu": 2,
         "num_stages": 1,
         "num_warps": 4,
