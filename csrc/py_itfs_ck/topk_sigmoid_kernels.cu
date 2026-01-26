@@ -35,12 +35,12 @@ __device__ __forceinline__ void warp_reduce_argmax(float& val_o, int& idx)
 {
     float val = val_o;
 
-    DPP_REDUCE_STEP(0xb1);
-    DPP_REDUCE_STEP(0x4e);
-    DPP_REDUCE_STEP(0x114);
-    DPP_REDUCE_STEP(0x118);
-    DPP_REDUCE_STEP(0x142);
-    DPP_REDUCE_STEP(0x143);
+    DPP_REDUCE_STEP(DPP_QUAD_PERM_1032);
+    DPP_REDUCE_STEP(DPP_QUAD_PERM_2301);
+    DPP_REDUCE_STEP(DPP_ROW_SHR_4);
+    DPP_REDUCE_STEP(DPP_ROW_SHR_8);
+    DPP_REDUCE_STEP(DPP_ROW_BCAST_15);
+    DPP_REDUCE_STEP(DPP_ROW_BCAST_31);
 
     val_o = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), 63));
     idx   = __builtin_amdgcn_readlane(idx, 63);
@@ -277,6 +277,16 @@ void topk_sigmoid(torch::Tensor topk_weights,
     const int num_experts = gating_output.size(1);
     const int topk        = topk_weights.size(1);
     const auto dtype      = gating_output.scalar_type();
+
+    TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32,
+                "topk_weights must be float32, got ",
+                topk_weights.scalar_type());
+    TORCH_CHECK(topk_indices.scalar_type() == torch::kInt32,
+                "topk_indices must be int32, got ",
+                topk_indices.scalar_type());
+
+    TORCH_CHECK(
+        topk <= num_experts, "topk (", topk, ") cannot exceed num_experts (", num_experts, ")");
 
     if(is_gfx9_arch())
     {
