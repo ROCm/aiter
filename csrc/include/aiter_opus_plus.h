@@ -11,10 +11,9 @@ namespace aiter {
 
     using index_t = int;
 
-    template <typename T, int vec_size, int aux = 0, bool interleave = false>
-    __device__ opus::vector_t<T, vec_size> load_vector_nx128b(opus::gmem<T>& buffer, int row_offset) {
-        static_assert(vec_size * sizeof(T) % 16 == 0, "vec_size * sizeof(T) must be a multiple of 16");
-        static constexpr index_t chunk_bytes = 16;
+    template <typename T, int vec_size, int chunk_bytes, int aux = 0, bool interleave = false>
+    __device__ opus::vector_t<T, vec_size> load_vector_nbytes(opus::gmem<T>& buffer, int row_offset) {
+        static_assert(vec_size * sizeof(T) % chunk_bytes == 0, "vec_size * sizeof(T) must be a multiple of chunk_bytes");
         static constexpr index_t num_chunks = vec_size * sizeof(T) / chunk_bytes;
         constexpr index_t chunk_size_elements = chunk_bytes / sizeof(T);
 

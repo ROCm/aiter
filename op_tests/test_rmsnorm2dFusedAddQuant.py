@@ -66,11 +66,11 @@ def run_ck(
         y_scale = None
         if residual is None:
             residual_out = None
-            output = aiter.rms_norm(input, weight, eps)
+            output = aiter.rmsnorm2d_fwd_ck(input, weight, eps)
         elif residual is not None:
             residual_out = torch.empty_like(input)
             output = torch.empty_like(input)
-            aiter.rmsnorm2d_fwd_with_add(
+            aiter.rmsnorm2d_fwd_with_add_ck(
                 output, input, residual, residual_out, weight, eps
             )
     elif x_scale is None:
@@ -78,12 +78,12 @@ def run_ck(
         output = torch.empty(input.shape, dtype=q_dtype)
         if residual is None:
             residual_out = None
-            aiter.rmsnorm2d_fwd_with_dynamicquant(
+            aiter.rmsnorm2d_fwd_with_dynamicquant_ck(
                 output, input, y_scale, weight, eps, model_sensitive
             )
         elif residual is not None:
             residual_out = torch.empty_like(input)
-            aiter.rmsnorm2d_fwd_with_add_dynamicquant(
+            aiter.rmsnorm2d_fwd_with_add_dynamicquant_ck(
                 output,
                 input,
                 residual,
@@ -306,7 +306,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-m",
         type=int,
-        default=[8, 256, 32768],
+        default=[8, 256, 256 * 8, 256 * 10, 32768],
         nargs="*",
         help="""M of mnk.
     e.g.: -m 32""",
@@ -366,7 +366,10 @@ if __name__ == "__main__":
         for m in args.m:
             for dtype in args.dtype:
                 ret = test_rmsnorm_func(
-                    m, n, dtype=dtype, quant_dtype=args.quant_dtype if args.mode not in [1, 2] else None
+                    m,
+                    n,
+                    dtype=dtype,
+                    quant_dtype=args.quant_dtype if args.mode not in [1, 2] else None,
                 )
             df.append(ret)
     df = pd.DataFrame(df)
