@@ -37,7 +37,8 @@ def moe_sorting(
     try:
         device = topk_ids.device
         M, topk = topk_ids.shape
-        max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
+        # max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
+        max_num_tokens_padded = topk_ids.numel() + num_experts * block_size
 
         max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
         sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
@@ -224,7 +225,8 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    bf16_fp8_bound = 16
+    # bf16_fp8_bound = 15
+    bf16_fp8_bound = 0
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -1052,7 +1054,8 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
-        a2 = a2.to(dtypes.fp8)
+        if a2.type != dtypes.fp8:
+            a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
@@ -1100,6 +1103,9 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    # import pdb;pdb.set_trace()
+
+    a2_scale = a1_scale
     metadata.stage2(
         a2,
         w1,
@@ -1538,42 +1544,47 @@ def cktile_moe_stage1(
     if w1.dtype is torch.uint32:
         D = D * 8
 
-    out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
-    tmp_out = (
-        torch.zeros(
-            (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
-        )
-        if split_k > 1
-        else out
-    )
+    # out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
+    # tmp_out = (
+    #     torch.zeros(
+    #         (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
+    #     )
+    #     if split_k > 1
+    #     else out
+    # )
 
+    # # w1 = w1.view(dtypes.i8).fill_(1).view(dtypes.fp4x2)
+    # # bias1 = bias1.zero_()
     print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
-    aiter.moe_cktile2stages_gemm1(
-        hidden_states,
-        w1,
-        tmp_out,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        topk,
-        n_pad_zeros,
-        k_pad_zeros,
-        sorted_weights,
-        a1_scale,
-        w1_scale,
-        bias1,
-        activation,
-        block_m,
-        split_k,
-    )
+    # aiter.moe_cktile2stages_gemm1(
+    #     hidden_states,
+    #     w1,
+    #     tmp_out,
+    #     sorted_token_ids,
+    #     sorted_expert_ids,
+    #     num_valid_ids,
+    #     topk,
+    #     n_pad_zeros,
+    #     k_pad_zeros,
+    #     sorted_weights,
+    #     a1_scale,
+    #     w1_scale,
+    #     bias1,
+    #     activation,
+    #     block_m,
+    #     split_k,
+    # )
 
-    if split_k > 1:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
-        else:
-            aiter.gelu_and_mul(out, tmp_out)
+    # if split_k > 1:
+    #     if activation == ActivationType.Silu:
+    #         aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
+    #     else:
+    #         aiter.gelu_and_mul(out, tmp_out)
+
+    # if hidden_states.dtype == dtypes.fp8:
     # print(out)
-    out_tmp = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
+    out_tmp = torch.empty((token_num, topk, D), dtype=dtypes.fp8, device=hidden_states.device)
+    # out_tmp = torch.empty((token_num, topk, D), dtype=dtypes.bf16, device=hidden_states.device)
 
     token_num = hidden_states.shape[0]
     E, _, model_dim_pack = w1.shape
@@ -1649,15 +1660,25 @@ def cktile_moe_stage1(
         # in_dtype="fp8",
         a_dtype="fp8",
         b_dtype="fp4",
-        out_dtype=out_dtype,
-        use_cshuffle_epilog=False,
+        # out_dtype=out_dtype,
+        # use_cshuffle_epilog=False,
+        out_dtype="fp8",
+        use_cshuffle_epilog=True,
         enable_bias=bias1 is not None,
+        model_dim_pad=k_pad_zeros,
+        inter_dim_pad=n_pad_zeros,
         # enable_bias=False,
     )
 
-    out.zero_()
+    # print(f"{model_dim=}")
+    # print(f"{inter_dim=}")
+    # print(f"{sorted_ids=}")
+    # print(f"{sorted_ids.shape=}")
+    # print(f"{blocks=}")
+    # import pdb;pdb.set_trace()
+    # out.zero_()
     exe1(
-        out,
+        out_tmp,
         x_q,
         w1_flat,
         scale_x_1d,
@@ -1674,12 +1695,12 @@ def cktile_moe_stage1(
         # int(blocks) - 1,
     )
     # from aiter.test_common import checkAllclose, benchmark, run_perftest
-    # checkAllclose(out, out_tmp)
-    # for i in range(out.shape[0]):
-    #     print(checkAllclose(out[i], out_tmp[i]))
-    # print(out_tmp)
+    # checkAllclose(out.to(dtypes.fp8).to(dtypes.fp32), out_tmp.to(dtypes.fp32))
+    # # for i in range(out.shape[0]):
+    # #     print(checkAllclose(out[i], out_tmp[i]))
+    # # print(out_tmp)
     # import pdb;pdb.set_trace()
-    return out
+    return out_tmp
 
 
 def cktile_moe_stage2(
@@ -1716,10 +1737,15 @@ def cktile_moe_stage2(
     # if zeros_out:
     #     out.fill_(0)
 
-    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
+    print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     # sorted_weights = torch.ones_like(sorted_weights, dtype=dtypes.fp32)
     # sorted_token_ids = torch.zeros_like(sorted_token_ids, dtype=dtypes.i32)
 
+    # w2 = w2.view(dtypes.i8).fill_(1).view(dtypes.fp4x2)
+    # bias2 = bias2.zero_()
+
+    # if a2.dtype == dtypes.fp8:
+    # out_tmp = torch.zeros_like(out, dtype=dtypes.bf16)
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
     sorted_size = int(sorted_ids.numel())
@@ -1732,39 +1758,6 @@ def cktile_moe_stage2(
 
     from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2 as compile_moe_gemm2  # type: ignore
 
-    if out.dtype == dtypes.bf16:
-        out_dtype = "bf16"
-    elif out.dtype == dtypes.fp16:
-        out_dtype = "f16"
-    elif out.dtype == dtypes.fp32:
-        out_dtype = "f32"
-    else:
-        raise ValueError(
-            f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
-        )
-    # bias2 = torch.zeros_like(bias2, dtype=dtypes.fp32)
-    # a2 = torch.ones_like(a2, dtype=dtypes.fp8)
-    # w2 = torch.ones_like(w2, dtype=dtypes.i8)
-    # w2 = w2.view(dtypes.fp4x2)
-    # w2_scale = torch.ones_like(w2_scale, dtype=dtypes.fp8_e8m0)
-
-    aiter.moe_cktile2stages_gemm2(
-        a2,
-        w2,
-        out,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        topk,
-        n_pad_zeros,
-        k_pad_zeros,
-        sorted_weights,
-        a2_scale,
-        w2_scale,
-        bias2,
-        activation,
-        block_m,
-    )
     exe2 = compile_moe_gemm2(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1786,8 +1779,8 @@ def cktile_moe_stage2(
     )
     # print(out)
     # import pdb;pdb.set_trace()
-    out.zero_()
-    out_tmp = torch.zeros_like(out, dtype=torch.bfloat16)
+    # out.zero_()
+    # out_tmp = torch.zeros_like(out, dtype=torch.bfloat16)
     exe2(
         out,
         a2,
@@ -1804,10 +1797,29 @@ def cktile_moe_stage2(
         inter_dim,
         int(blocks),
     )
-    from aiter.test_common import checkAllclose, benchmark, run_perftest
+    # aiter.moe_cktile2stages_gemm2(
+    #     a2,
+    #     w2,
+    #     out,
+    #     sorted_token_ids,
+    #     sorted_expert_ids,
+    #     num_valid_ids,
+    #     topk,
+    #     n_pad_zeros,
+    #     k_pad_zeros,
+    #     sorted_weights,
+    #     a2_scale,
+    #     w2_scale,
+    #     bias2,
+    #     activation,
+    #     block_m,
+    # )
+    # from aiter.test_common import checkAllclose, benchmark, run_perftest
     # checkAllclose(out, out_tmp)
-    # print(out_tmp)
+    # # print(out_tmp)
     # import pdb;pdb.set_trace()
+    # return out
+
     return out
 
 
