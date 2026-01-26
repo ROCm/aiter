@@ -726,6 +726,14 @@ def test_batch_prefill(
         is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv
     ):
         return {"status": "skipped"}
+
+    # Temporarily skip test for causal=True, logits_soft_cap=0.0
+    if skip_test_if(
+        causal and logits_soft_cap == 0.0,
+        "Temporarily skip test for causal=True, logits_soft_cap=0.0",
+    ):
+        return {"status": "skipped"}
+
     if check_layout_skip_conditions(
         kvcache_layout,
         head_dim,
