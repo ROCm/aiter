@@ -569,6 +569,7 @@ def gemm_a8w8_blockscale(
     ):
         return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
 
+    # Get tuned config for gemm_a8w8_blockscale
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
@@ -609,13 +610,14 @@ def gemm_a8w8_blockscale(
     else:
         config_preshuffle = preshuffleB
 
-    # Use requested preshuffleB if config matches, otherwise use config's preshuffleB
+    # Use config's preshuffleB if config matches, otherwise use requested preshuffleB
     effective_preshuffle = (
-        preshuffleB
+        config_preshuffle
         if (config is None or config_preshuffle == preshuffleB)
-        else config_preshuffle
-    )
-
+        else preshuffleB
+    ) 
+    
+    # Call the appropriate kernel based on the library type and preshuffle setting
     return (
         call_cktile(effective_preshuffle)
         if use_cktile

@@ -15,7 +15,7 @@ from einops import rearrange
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
-from aiter.ops.shuffle import shuffle_weight, shuffle_weight_cktile
+from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -108,8 +108,8 @@ def generate_data(m, n, k, seed, device="cuda"):
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
     ck_weight_shuffle = shuffle_weight(weight, layout=(16, 16))
-    cktile_weight_shuffle_16x16 = shuffle_weight_cktile(weight, layout=(16, 16))
-    cktile_weight_shuffle_32x32 = shuffle_weight_cktile(weight, layout=(32, 32))
+    cktile_weight_shuffle_16x16 = shuffle_weight(weight, layout=(16, 16))
+    cktile_weight_shuffle_32x32 = shuffle_weight(weight, layout=(32, 32))
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     return (
@@ -348,7 +348,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
-
+        print(ret)
         return ret
 
     def result_to_df(self, results):

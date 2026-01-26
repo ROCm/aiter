@@ -112,21 +112,3 @@ def shuffle_scale_a16w4(
     # print("shf_scale shape:", shfl_scale.shape)
     return shfl_scale.view(*src.shape).contiguous()
 
-
-def shuffle_weight_cktile(
-    x: torch.Tensor, layout=(16, 16), use_int4=False
-) -> torch.Tensor:
-    # Hardcode BLOCK_K and BLOCK_N
-    x_type = x.dtype
-
-    IN, IK = layout
-    divisor = 4 if IN == 32 else 2
-
-    x_ = x
-    x_ = x_.view(x.shape[-2] // IN, IN, x.shape[-1] // IK, divisor, IK // divisor)
-    x_ = x_.permute(0, 2, 3, 1, 4)
-    x_ = x_.contiguous()
-    x_ = x_.view(*x.shape)
-    x_ = x_.view(x_type)
-    x_.is_shuffled = True
-    return x_
