@@ -83,7 +83,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                 layout=layout,
             )
         elif sage_version == fav3_sage.Sage_version.V2:
-            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant_v2(
+            q_quantized, q_descale, q_descale_pre, k_quantized, k_descale, k_descale_pre, v_quantized, v_descale = sage_quant_v2(
                 q,
                 k,
                 v,
@@ -111,6 +111,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                 num_k_blocks,
             ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
         elif sage_version == fav3_sage.Sage_version.V2:
+            assert q_descale_pre is not None and k_descale_pre is not None, f"q_descale_pre and k_descale_pre shouldn't be None"
             assert map_dims(q_descale.shape, bshd) == [
                 batch,
                 seqlen_q,
@@ -123,6 +124,16 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                 num_kv_heads,
                 head_dim // 32
             ], f"k_descale shape {map_dims(k_descale.shape, bshd)} != expected {(batch, seqlen_k, num_kv_heads, head_dim // 32)}"
+            assert q_descale_pre.shape == (
+                batch,
+                num_q_heads,
+                num_q_blocks,
+            ), f"q_descale_pre shape {q_descale.shape} != expected {(batch, num_q_heads, num_q_blocks)}"
+            assert k_descale_pre.shape == (
+                batch,
+                num_kv_heads,
+                num_k_blocks,
+            ), f"k_descale_pre shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
 
 
         # Validate unsupported features
@@ -182,7 +193,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse,
             layout,
             config,
-            sage_version=sage_version
+            sage_version=sage_version,
+            q_descale_pre=q_descale_pre,
+            k_descale_pre=k_descale_pre,
         )
 
         if not return_lse:
