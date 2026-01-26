@@ -3,12 +3,12 @@
 
 import aiter
 import argparse
-import itertools
 import numpy as np
 import pandas as pd
 import pytest
 import random
 import torch
+from typing import Callable
 
 from aiter import dtypes
 from aiter.test_common import benchmark, run_perftest
@@ -17,10 +17,157 @@ torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 
+@pytest.fixture(scope="session")
+def results_collector():
+    results = []
+    yield results
+    df = pd.DataFrame(results)
+    aiter.logger.info(f"summary:\n{df}")
+    df.to_csv("attn_ps.csv", index=False)
+
+
+def calculate_pass_rate(df):
+    if "acc result" not in df.columns:
+        return
+
+    num_tests = df["acc result"].value_counts().sum()
+    if "passed" in df["acc result"].value_counts():
+        num_passed = df["acc result"].value_counts()["passed"]
+    else:
+        num_passed = 0
+    if "warning" in df["acc result"].value_counts():
+        num_warning = df["acc result"].value_counts()["warning"]
+    else:
+        num_warning = 0
+    if "failed" in df["acc result"].value_counts():
+        num_failed = df["acc result"].value_counts()["failed"]
+    else:
+        num_failed = 0
+    aiter.logger.info(
+        f"\033[32mpassed {num_passed}/{num_tests}({num_passed / num_tests * 100:.2f}%) \
+        \033[33mwarning {num_warning}/{num_tests}({num_warning / num_tests * 100:.2f}%) \
+        \033[31mfailed {num_failed}/{num_tests}({num_failed / num_tests * 100:.2f}%) \033[0m"
+    )
+
+
+class AttnParams:
+    B: int  # batch_size
+    Hq: int  # number of query heads
+    Hkv: int  # number of kv heads
+    GQA: int  # GQA = Hq / Hkv
+    Tq: int  # query tokens used
+    Tk: int  # key tokens used (effective)
+    Dqk: int  # QK dim
+    Dv: int  # V dim(mla: Dqk != Dv)
+    partial_tiles: int  # reduce source tiles(if split kv)
+    final_tiles: int  # reduce target tiles(if split kv)
+    is_causal: bool
+    is_prefill: bool
+
+    def __init__(
+        self,
+        B: int,
+        Hq: int,
+        Hkv: int,
+        GQA: int,
+        Tq: int,
+        Tk: int,
+        Dqk: int,
+        Dv: int,
+        partial_tiles: int,
+        final_tiles: int,
+        is_causal: bool,
+        is_prefill: bool,
+    ):
+        self.B = B
+        self.Hq = Hq
+        self.Hkv = Hkv
+        self.GQA = GQA
+        self.Tq = Tq
+        self.Tk = Tk
+        self.Dqk = Dqk
+        self.Dv = Dv
+        self.partial_tiles = partial_tiles
+        self.final_tiles = final_tiles
+        self.is_causal = is_causal
+        self.is_prefill = is_prefill
+
+
+def get_tensor_bytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+    # return tensor.untyped_storage().nbytes()  # same for contiguous tensors
+
+
+def calculate_attn_tflops(params: AttnParams, us_attn: float) -> float:
+    def get_qk_pairs(params: AttnParams) -> int:
+        # non-causal or decode(ignore causal)
+        if not (params.is_causal and params.is_prefill):
+            return params.Tq * params.Tk
+        # dense prefill
+        elif params.Tk >= params.Tq:
+            return params.Tq * (params.Tq + 1) // 2
+        # sparse prefill(sliding-window attention, KV cache capped)
+        else:
+            return (
+                params.Tk * (params.Tk + 1) // 2 + (params.Tq - params.Tk) * params.Tk
+            )
+
+    gemm_count = 2  # mul & accumulate
+    qk_pairs = get_qk_pairs(params)
+    attn_ops = gemm_count * params.B * params.Hq * qk_pairs * (params.Dqk + params.Dv)
+    attn_tflops = (attn_ops / 1e12) / (us_attn / 1e6)
+    return attn_tflops
+
+
+def calculate_attn_bw(params: AttnParams, us_attn: float) -> float:
+    # input: Q, K, V
+    input_bytes = (
+        params.B * params.Hq * params.Tq * params.Dqk * params.bytes_q
+        + params.B * params.Hkv * params.Tk * params.Dqk * params.bytes_k
+        + params.B * params.Hkv * params.Tk * params.Dv * params.bytes_v
+    )
+    # output: final_out, final_lse, partial_out, partial_lse(add partial if split kv)
+    output_bytes = (
+        params.B * params.Hq * params.Tq * params.Dv * params.bytes_out
+        + params.B * params.Hq * params.Tq * params.bytes_lse
+    )
+
+    if params.partial_tiles is not None:
+        output_bytes += (
+            params.partial_tiles * params.qlen_granularity * params.Hq * params.Dv
+            + params.partial_tiles * params.qlen_granularity * params.Hq
+        ) * params.bytes_partial  # 4(FP32)
+
+    attn_bytes = input_bytes + output_bytes
+    attn_bw = (attn_bytes / 1e12) / (us_attn / 1e6)
+    return attn_bw
+
+
+def calculate_reduce_bw(params: AttnParams, us_reduce: float) -> float:
+    # input: fp32 partial_out & partial_lse + int32 reduce_indptr, reduce_final_map & reduce_partial_map
+    input_bytes = (
+        params.partial_tiles * params.qlen_granularity * params.Hq * (params.Dv + 1)
+        + (params.final_tiles + 1)
+        + (params.final_tiles * 2)
+        + params.partial_tiles
+    ) * params.bytes_partial  # 4(FP32 & INT32)
+    # output: final_out & final_lse
+    output_bytes = (
+        params.final_tiles
+        * params.qlen_granularity
+        * params.Hq
+        * (params.Dv + 1)
+        * params.bytes_out
+    )
+    reduce_bytes = input_bytes + output_bytes
+    reduce_bw = (reduce_bytes / 1e12) / (us_reduce / 1e6)
+    return reduce_bw
+
+
 def generate_inputs(
     batch_size: int,
-    max_qlen: int,
-    ctx_lens: int,
+    max_qolen: int,
+    max_kvlen: int,
     block_size: int,
     varlen: bool = False,
     is_prefill: bool = False,
@@ -29,16 +176,16 @@ def generate_inputs(
     seq_lens_kv = torch.zeros(batch_size, dtype=torch.int)
     if varlen:
         for i in range(batch_size):
-            seq_lens_qo[i] = random.uniform(5, max_qlen)
+            seq_lens_qo[i] = random.uniform(5, max_qolen)
             seq_lens_kv[i] = (
-                seq_lens_qo[i] if is_prefill else random.uniform(5, ctx_lens)
+                seq_lens_qo[i] if is_prefill else random.uniform(5, max_kvlen)
             )
     else:
-        seq_lens_qo.fill_(max_qlen)
+        seq_lens_qo.fill_(max_qolen)
         if is_prefill:
-            seq_lens_kv.fill_(max_qlen)
+            seq_lens_kv.fill_(max_qolen)
         else:
-            seq_lens_kv.fill_(ctx_lens)
+            seq_lens_kv.fill_(max_kvlen)
 
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -69,6 +216,7 @@ def test_attn_ps(
     is_prefill: bool = False,
     load_metadata: bool = False,
     dump_metadata: bool = False,
+    skip_reference: bool = False,
     attn_func: callable = None,
     attn_kwargs: dict = {},
     reduce_func: callable = None,
@@ -80,10 +228,10 @@ def test_attn_ps(
     assert num_head_q % num_head_kv == 0
     gqa_ratio = num_head_q // num_head_kv
 
-    max_qlen = seq_lens_qo.max().item()
+    max_qolen = seq_lens_qo.max().item()
 
     qhead_granularity = gqa_ratio
-    qlen_granularity = tile_q // qhead_granularity  # prefill: tile_q, decode: max_qlen
+    qlen_granularity = tile_q // qhead_granularity  # prefill: tile_q, decode: max_qolen
     kvlen_granularity = max(tile_kv, block_size)  # prefill: tile_kv, decode: block_size
     (
         (work_meta_data_size, work_meta_data_type),
@@ -95,7 +243,7 @@ def test_attn_ps(
     ) = aiter.get_ps_metadata_info_v1(
         batch_size=batch_size,
         num_head_k=num_head_kv,
-        max_qlen=max_qlen,
+        max_qolen=max_qolen,
         qlen_granularity=qlen_granularity,
     )
     work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
@@ -175,9 +323,9 @@ def test_attn_ps(
         )
         end_event.record()
         end_event.synchronize()
-        us_metadata = start_event.elapsed_time(end_event) * 1000  # ms to us
+        metadata_us = start_event.elapsed_time(end_event) * 1000  # ms to us
 
-        ret["us_metadata"] = us_metadata
+        ret["metadata_us"] = metadata_us
 
     if dump_metadata:
         # TODO: enhance metadata print
@@ -189,8 +337,19 @@ def test_attn_ps(
             )
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
-    if attn_func is not None:
-        attn_output, us_attn = run_perftest(
+    # TODO: enhance attn_params
+    attn_params = AttnParams(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        qlen=max_qolen,
+        max_kvlen=seq_lens_kv.max().item(),
+        block_size=block_size,
+        varlen=varlen,
+        is_causal=is_causal,
+        is_prefill=is_prefill,
+    )
+    if attn_func and reduce_func is not None:
+        attn_output, attn_us = run_perftest(
             attn_func,
             qo_indptr,
             kv_page_indptr,
@@ -200,14 +359,25 @@ def test_attn_ps(
             is_causal,
             **attn_kwargs,
         )
-        ret["us_attn"] = us_attn
 
-    if reduce_func is not None:
-        reduce_output, us_reduce = run_perftest(
+        reduce_output, reduce_us = run_perftest(
             reduce_func,
             **reduce_kwargs,
         )
-        ret["us_reduce"] = us_reduce
+
+        attn_ps_us = ret["attn_us"] + ret["reduce_us"]
+        ret["attn_ps_us"] = attn_ps_us
+        ret["attn_us"] = attn_us
+        ret["attn_ratio"] = attn_us / attn_ps_us
+        ret["attn_tflops"] = calculate_attn_tflops(attn_params, attn_us)
+        ret["attn_bw"] = calculate_attn_bw(attn_params, attn_us)
+        ret["reduce_us"] = reduce_us
+        ret["reduce_ratio"] = reduce_us / attn_ps_us
+        ret["reduce_bw"] = calculate_reduce_bw(attn_params, reduce_us)
+
+    if not skip_reference:
+        pass
+        # TODO: add reference implementation
 
     return ret
 
@@ -215,7 +385,7 @@ def test_attn_ps(
 @pytest.mark.parametrize("batch_size", [416])
 @pytest.mark.parametrize("num_heads", [(10, 1)])
 @pytest.mark.parametrize("qlen", [4])
-@pytest.mark.parametrize("ctx_lens", [30720])
+@pytest.mark.parametrize("max_kvlen", [30720])
 @pytest.mark.parametrize("block_size", [256])
 @pytest.mark.parametrize("varlen", [False])
 @pytest.mark.parametrize("is_causal", [True])
@@ -223,19 +393,20 @@ def test_attn_ps(
 def test_pa_decode_ps(
     batch_size: int,
     num_heads: tuple[int, int],
-    qlen: int,
-    ctx_lens: int,
+    max_qolen: int,
+    max_kvlen: int,
     block_size: int,
     varlen: bool,
     is_causal: bool,
     is_prefill: bool,
     load_metadata: bool = False,
     dump_metadata: bool = False,
+    results_collector: Callable = None,
 ):
     qo_indptr, kv_page_indptr, seq_lens_qo, seq_lens_kv = generate_inputs(
         batch_size=batch_size,
-        max_qlen=max_qlen,
-        ctx_lens=ctx_lens,
+        max_qolen=max_qolen,
+        max_kvlen=max_kvlen,
         block_size=block_size,
         varlen=varlen,
         is_prefill=is_prefill,
@@ -265,8 +436,8 @@ def test_pa_decode_ps(
 
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("num_heads", [(1, 1)])
-@pytest.mark.parametrize("max_qlen", [16384])
-@pytest.mark.parametrize("ctx_lens", [16384])
+@pytest.mark.parametrize("max_qolen", [16384])
+@pytest.mark.parametrize("max_kvlen", [16384])
 @pytest.mark.parametrize("block_size", [1])
 @pytest.mark.parametrize("varlen", [False])
 @pytest.mark.parametrize("is_causal", [True])
@@ -274,8 +445,8 @@ def test_pa_decode_ps(
 def test_mla_prefill_ps(
     batch_size: int,
     num_heads: tuple[int, int],
-    max_qlen: int,
-    ctx_lens: int,
+    max_qolen: int,
+    max_kvlen: int,
     block_size: int,
     varlen: bool,
     is_causal: bool,
@@ -285,8 +456,8 @@ def test_mla_prefill_ps(
 ):
     qo_indptr, kv_page_indptr, seq_lens_qo, seq_lens_kv = generate_inputs(
         batch_size=batch_size,
-        max_qlen=max_qlen,
-        ctx_lens=ctx_lens,
+        max_qolen=max_qolen,
+        max_kvlen=max_kvlen,
         block_size=block_size,
         varlen=varlen,
         is_prefill=is_prefill,
@@ -310,8 +481,8 @@ def test_mla_prefill_ps(
 # TODO: add ut test
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("num_heads", [(1, 1)])
-@pytest.mark.parametrize("max_qlen", [16384])
-@pytest.mark.parametrize("ctx_lens", [16384])
+@pytest.mark.parametrize("max_qolen", [16384])
+@pytest.mark.parametrize("max_kvlen", [16384])
 @pytest.mark.parametrize("block_size", [1])
 @pytest.mark.parametrize("varlen", [False])
 @pytest.mark.parametrize("is_causal", [True])
@@ -323,8 +494,8 @@ def test_mla_decode_ps():
 # TODO: add ut test
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("num_heads", [(1, 1)])
-@pytest.mark.parametrize("max_qlen", [16384])
-@pytest.mark.parametrize("ctx_lens", [16384])
+@pytest.mark.parametrize("max_qolen", [16384])
+@pytest.mark.parametrize("max_kvlen", [16384])
 @pytest.mark.parametrize("block_size", [1])
 @pytest.mark.parametrize("varlen", [False])
 @pytest.mark.parametrize("is_causal", [True])
@@ -463,42 +634,42 @@ if __name__ == "__main__":
     ret = test_pa_decode_ps()
     df.append(ret)
 
-    ret = test_mla_prefill_ps()
-    df.append(ret)
+    # ret = test_mla_prefill_ps()
+    # df.append(ret)
 
-    ret = test_mla_decode_ps()
-    df.append(ret)
+    # ret = test_mla_decode_ps()
+    # df.append(ret)
 
-    ret = test_sparse_mla_decode_ps()
-    df.append(ret)
+    # ret = test_sparse_mla_decode_ps()
+    # df.append(ret)
 
     # other cases
-    for is_prefill in l_is_prefill:
-        for is_causal in l_is_causal:
-            for (
-                batch_size,
-                num_heads,
-                max_qlen,
-                ctx_len,
-                block_size,
-                varlen,
-            ) in itertools.product(
-                l_batch_size, l_num_heads, l_qlen, l_ctx_len, l_block_size, l_varlen
-            ):
-                ret = test_attn_ps(
-                    batch_size=batch_size,
-                    num_heads=num_heads,
-                    max_qlen=max_qlen,
-                    ctx_lens=ctx_len,
-                    block_size=block_size,
-                    is_prefill=is_prefill,
-                    is_causal=is_causal,
-                    varlen=varlen,
-                    load_metadata=args.load_metadata,
-                    dump_metadata=args.dump_metadata,
-                )
-                df.append(ret)
+    # for is_prefill in l_is_prefill:
+    #     for is_causal in l_is_causal:
+    #         for (
+    #             batch_size,
+    #             num_heads,
+    #             max_qolen,
+    #             ctx_len,
+    #             block_size,
+    #             varlen,
+    #         ) in itertools.product(
+    #             l_batch_size, l_num_heads, l_qlen, l_ctx_len, l_block_size, l_varlen
+    #         ):
+    #             ret = test_attn_ps(
+    #                 batch_size=batch_size,
+    #                 num_heads=num_heads,
+    #                 max_qolen=max_qolen,
+    #                 max_kvlen=ctx_len,
+    #                 block_size=block_size,
+    #                 is_prefill=is_prefill,
+    #                 is_causal=is_causal,
+    #                 varlen=varlen,
+    #                 load_metadata=args.load_metadata,
+    #                 dump_metadata=args.dump_metadata,
+    #             )
+    #             df.append(ret)
 
-    df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
-    df.to_csv("attn_ps.csv")
+    # df = pd.DataFrame(df)
+    # aiter.logger.info(f"summary:\n{df}")
+    # df.to_csv("attn_ps.csv")
