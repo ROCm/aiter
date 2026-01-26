@@ -409,8 +409,8 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& pa
                                                int32_t* p_lds)
 {
     int32_t* p_lds_reduce_partial_map = p_lds;
-    float* p_lds_lse_scale = reinterpret_cast<float*>(p_lds + params.max_splits);
-    float* p_lds_local_lse = p_lds_lse_scale + params.max_splits;
+    float* p_lds_lse_scale            = reinterpret_cast<float*>(p_lds + params.max_splits);
+    float* p_lds_local_lse            = p_lds_lse_scale + params.max_splits;
     LocalLse<float, kProblemSize> local_lse(
         p_lds_local_lse, ck_tile::get_warp_size(), ck_tile::get_lane_id());
 
@@ -516,7 +516,7 @@ CK_TILE_DEVICE void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& par
                                               int32_t* p_lds)
 {
     int32_t* p_lds_reduce_partial_map = p_lds;
-    float* p_lds_lse = reinterpret_cast<float*>(p_lds + params.max_splits);
+    float* p_lds_lse                  = reinterpret_cast<float*>(p_lds + params.max_splits);
 
     // load reduce partial map from VRAM to LDS
     const int32_t num_splits = reduce_tile_end - reduce_tile_start;
@@ -695,30 +695,25 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
         // metadata should be in charge of getting rid of this kind of scenario.
         else if(num_splits > 1)
         {
-            mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(params,
-                                                            head_idx,
-                                                            block_idx,
-                                                            tile_idx,
-                                                            reduce_tile_start,
-                                                            reduce_tile_end,
-                                                            p_lds);
+            mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
+                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
 
         return true;
     };
 
     int32_t work_idx = blockIdx.x;
-    if (work_idx < tot_work)
+    if(work_idx < tot_work)
     {
         bool continue_flag = main_loop(work_idx);
-        if (continue_flag)
+        if(continue_flag)
         {
             work_idx += gridDim.x;
             while(work_idx < tot_work)
             {
                 __builtin_amdgcn_s_barrier();
                 continue_flag = main_loop(work_idx);
-                if (continue_flag == false)
+                if(continue_flag == false)
                 {
                     break;
                 }
@@ -750,93 +745,70 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
         if(num_splits <= 64)
         {
             mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpTo64Splits, lse_t, out_t>(
-                params,
-                head_idx,
-                block_idx,
-                tile_idx,
-                reduce_tile_start,
-                reduce_tile_end,
-                p_lds);
+                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
         else if(num_splits <= 256)
         {
             mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpTo256Splits, lse_t, out_t>(
-                params,
-                head_idx,
-                block_idx,
-                tile_idx,
-                reduce_tile_start,
-                reduce_tile_end,
-                p_lds);
+                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
         else
         {
             mla_reduce_v1_impl_massive<Traits, MlaReduceProblemSize::kUpToLdsLimit, lse_t, out_t>(
-                params,
-                head_idx,
-                block_idx,
-                tile_idx,
-                reduce_tile_start,
-                reduce_tile_end,
-                p_lds);
+                params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
         }
     }
     // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata
     // should be in charge of getting rid of this kind of scenario.
     else if(num_splits > 1)
     {
-        mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(params,
-                                                        head_idx,
-                                                        block_idx,
-                                                        tile_idx,
-                                                        reduce_tile_start,
-                                                        reduce_tile_end,
-                                                        p_lds);
+        mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
+            params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
     }
 }
 
-#define MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_BH_C, NAME, ...)                \
-    {                                                                                            \
-        constexpr int32_t NumHeads    = (NUM_HEAD_C);                                            \
-        constexpr int32_t HeadDim     = (HEAD_DIM_C);                                            \
+#define MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_BH_C, NAME, ...)               \
+    {                                                                                          \
+        constexpr int32_t NumHeads   = (NUM_HEAD_C);                                           \
+        constexpr int32_t HeadDim    = (HEAD_DIM_C);                                           \
         constexpr int32_t NumWgPerBh = (NUM_WG_PER_BH_C);                                      \
-        using Traits                  = MlaReduceKernelV1Traits<HeadDim, NumHeads, NumWgPerBh>; \
-        __VA_ARGS__;                                                                             \
+        using Traits                 = MlaReduceKernelV1Traits<HeadDim, NumHeads, NumWgPerBh>; \
+        __VA_ARGS__;                                                                           \
     }
 
 // NRFM: No Reduce Final Map
-#define MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_BH, NAME, ...)                   \
-    if((NUM_WG_PER_BH) == 1)                                                                \
+#define MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_BH, NAME, ...)                    \
+    if((NUM_WG_PER_BH) == 1)                                                                 \
         MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 1, NAME, __VA_ARGS__)                   \
-    else if((NUM_WG_PER_BH) == 2)                                                           \
+    else if((NUM_WG_PER_BH) == 2)                                                            \
         MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 2, NAME, __VA_ARGS__)                   \
-    else if((NUM_WG_PER_BH) == 4)                                                           \
+    else if((NUM_WG_PER_BH) == 4)                                                            \
         MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 4, NAME, __VA_ARGS__)                   \
-    else if((NUM_WG_PER_BH) == 8)                                                           \
+    else if((NUM_WG_PER_BH) == 8)                                                            \
         MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 8, NAME, __VA_ARGS__)                   \
-    else if((NUM_WG_PER_BH) == 16)                                                          \
+    else if((NUM_WG_PER_BH) == 16)                                                           \
         MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 16, NAME, __VA_ARGS__)                  \
-    else if((NUM_WG_PER_BH) == 64)                                                          \
+    else if((NUM_WG_PER_BH) == 64)                                                           \
         MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 64, NAME, __VA_ARGS__)                  \
-    else if((NUM_WG_PER_BH) == 256)                                                         \
+    else if((NUM_WG_PER_BH) == 256)                                                          \
         MLA_REDUCE_CASE_IMPL(NUM_HEAD_C, HEAD_DIM_C, 256, NAME, __VA_ARGS__)                 \
     else                                                                                     \
     {                                                                                        \
         std::stringstream ss;                                                                \
-        ss << "NUM_WG_PER_BH=" << (NUM_WG_PER_BH);                                         \
+        ss << "NUM_WG_PER_BH=" << (NUM_WG_PER_BH);                                           \
         TORCH_CHECK(                                                                         \
             false, NAME " doesn't support the specified settings: ", ss.str().c_str(), "."); \
     }
 
 #define MLA_REDUCE_CASE_IF(NUM_HEAD, NUM_HEAD_C, HEAD_DIM, HEAD_DIM_C, NUM_WG_PER_BH, NAME, ...) \
-    if(((NUM_HEAD) == (NUM_HEAD_C)) && ((HEAD_DIM) == (HEAD_DIM_C)))                              \
-    {                                                                                             \
+    if(((NUM_HEAD) == (NUM_HEAD_C)) && ((HEAD_DIM) == (HEAD_DIM_C)))                             \
+    {                                                                                            \
         MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_BH, NAME, __VA_ARGS__)                \
     }
 
 #define MLA_REDUCE_CASE_EF(NUM_HEAD, NUM_HEAD_C, HEAD_DIM, HEAD_DIM_C, NUM_WG_PER_BH, NAME, ...) \
-    else if(((NUM_HEAD) == (NUM_HEAD_C)) && ((HEAD_DIM) == (HEAD_DIM_C)))                         \
-    {                                                                                             \
+    else if(((NUM_HEAD) == (NUM_HEAD_C)) && ((HEAD_DIM) == (HEAD_DIM_C)))                        \
+    {                                                                                            \
         MLA_REDUCE_CASE(NUM_HEAD_C, HEAD_DIM_C, NUM_WG_PER_BH, NAME, __VA_ARGS__)                \
     }
 
@@ -863,7 +835,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
     else MLA_REDUCE_ERROR(NUM_HEAD, HEAD_DIM, NAME);
 
 #define DISPATCH_MLA_REDUCE_KERNEL(                                                              \
-    LSE_TYPE, OUT_TYPE, NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, ...)                           \
+    LSE_TYPE, OUT_TYPE, NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, ...)                            \
     switch((LSE_TYPE))                                                                           \
     {                                                                                            \
     case at::ScalarType::Float: {                                                                \
@@ -872,12 +844,12 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
         {                                                                                        \
         case at::ScalarType::BFloat16: {                                                         \
             using out_t = ck_tile::bf16_t;                                                       \
-            MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, __VA_ARGS__)             \
+            MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, __VA_ARGS__)              \
         }                                                                                        \
         break;                                                                                   \
         case at::ScalarType::Half: {                                                             \
             using out_t = ck_tile::fp16_t;                                                       \
-            MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, __VA_ARGS__)             \
+            MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, __VA_ARGS__)              \
         }                                                                                        \
         break;                                                                                   \
         default:                                                                                 \
@@ -907,9 +879,10 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
                              max(0, params.max_splits - 256) * sizeof(float);
     if(lds_size <= dev_prop.maxSharedMemoryPerMultiProcessor)
     {
-        if (lds_size > (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
+        if(lds_size > (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
         {
-            TORCH_WARN("kn_mla_reduce_v1: The number of splits is too high, adversely affecting occupancy.");
+            TORCH_WARN("kn_mla_reduce_v1: The number of splits is too high, adversely affecting "
+                       "occupancy.");
         }
 
         const int32_t ps_grid_size = num_cu * Traits::kOccupancy * 2;
@@ -930,7 +903,8 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     }
     else
     {
-        TORCH_CHECK(false, "kn_mla_reduce_v1: The number of splits exceeds what kernel can handle.");
+        TORCH_CHECK(false,
+                    "kn_mla_reduce_v1: The number of splits exceeds what kernel can handle.");
     }
 }
 
@@ -944,7 +918,7 @@ int32_t get_num_work_group_per_bh(const int32_t num_reduce_tile,
 
     const int32_t num_workloads = num_reduce_tile * num_heads;
 
-    using DummyTraits = MlaReduceKernelV1Traits<128, 1, 1>;
+    using DummyTraits         = MlaReduceKernelV1Traits<128, 1, 1>;
     const int32_t hw_capacity = num_cu * DummyTraits::kOccupancy;
 
     // the factor is empirical
@@ -1001,13 +975,13 @@ void mla_reduce_v1(
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
-    const bool output_lse          = final_lse.has_value();
-    const bool no_reduce_final_map = (reduce_final_map.has_value() == false);
-    const int32_t num_reduce_tile  = reduce_indptr.size(0) - 1;
-    const int32_t num_heads        = partial_output.size(-2);
-    const int32_t head_dim         = final_output.size(-1);
-    const int32_t num_work_group_per_bh =
-        get_num_work_group_per_bh(num_reduce_tile, max_seqlen_q, num_heads, dev_prop.multiProcessorCount); 
+    const bool output_lse               = final_lse.has_value();
+    const bool no_reduce_final_map      = (reduce_final_map.has_value() == false);
+    const int32_t num_reduce_tile       = reduce_indptr.size(0) - 1;
+    const int32_t num_heads             = partial_output.size(-2);
+    const int32_t head_dim              = final_output.size(-1);
+    const int32_t num_work_group_per_bh = get_num_work_group_per_bh(
+        num_reduce_tile, max_seqlen_q, num_heads, dev_prop.multiProcessorCount);
 
     if(num_reduce_tile > 0)
     {
