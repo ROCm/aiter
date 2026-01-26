@@ -12,6 +12,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
+  # TODO: Revert to rocm/pytorch:latest once CK adds ROCm 7.2 support
   DOCKER_IMAGE: "rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208"
 
 jobs:
