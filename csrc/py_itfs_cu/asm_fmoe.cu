@@ -122,6 +122,10 @@ class FMoeKernel
         uint32_t sub_GU     = this->sub_GU;
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
+        if(out.scalar_type() == at::ScalarType::Float)
+        {
+            O_elemSize *= 2;
+        }
 
         int stride_X  = input.stride(0) * input.element_size();
         int stride_GU = dim * I_elemSize;
@@ -605,6 +609,8 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
             config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_gelu;
         else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_silu;
+        else if(out.dtype() == at::ScalarType::Float && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp32_pertokenInt8_g1u1_silu;
         else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else

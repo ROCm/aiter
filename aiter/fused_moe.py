@@ -34,42 +34,33 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
 ):
-    try:
-        device = topk_ids.device
-        M, topk = topk_ids.shape
-        max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
+    device = topk_ids.device
+    M, topk = topk_ids.shape
+    max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
 
-        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-        sorted_weights = torch.empty(
-            max_num_tokens_padded, dtype=dtypes.fp32, device=device
-        )
-        sorted_expert_ids = torch.empty(
-            max_num_m_blocks, dtype=dtypes.i32, device=device
-        )
-        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
-        aiter.moe_sorting_fwd(
-            topk_ids,
-            topk_weights,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            num_experts,
-            block_size,
-            expert_mask,
-            num_local_tokens,
-            dispatch_policy,
-        )
-    except Exception as e:
-        logger.error(f"Error in moe_sorting: {e}")
-        logger.error(
-            f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
-        )
-        raise e
+    aiter.moe_sorting_fwd(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        num_experts,
+        block_size,
+        expert_mask,
+        num_local_tokens,
+        dispatch_policy,
+    )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
@@ -258,7 +249,7 @@ def fused_moe_(
         topk_weight,
         global_E,
         model_dim,
-        dtype,
+        dtypes.fp32 if (isG1U1 and q_dtype_a == dtypes.i8) else dtype,
         block_size_M,
         expert_mask,
         num_local_tokens,
@@ -266,7 +257,7 @@ def fused_moe_(
     )
 
     if metadata.run_1stage:
-        return metadata.stage1(
+        out = metadata.stage1(
             hidden_states,
             w1,
             w2,
@@ -292,7 +283,7 @@ def fused_moe_(
             doweight_stage1=doweight_stage1,
         )
     else:
-        return fused_moe_2stages(
+        out = fused_moe_2stages(
             hidden_states,
             w1,
             w2,
@@ -320,6 +311,7 @@ def fused_moe_(
             bias1=bias1,
             bias2=bias2,
         )
+    return out.to(dtype)
 
 
 def fused_moe_1stage(
@@ -486,14 +478,6 @@ def get_block_size_M(token, topk, expert, inter_dim):
 
 
 @functools.lru_cache(maxsize=2048)
-def use_nt(token, topk, e):
-    use_nt = int(os.environ.get("AITER_USE_NT", "-1"))
-    if use_nt != -1:
-        return bool(use_nt)
-    return (token * topk // e) < 64
-
-
-@functools.lru_cache(maxsize=2048)
 def get_ksplit(token, topk, expert, inter_dim, model_dim):
     aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
     if aiter_ksplit != 0:
@@ -530,6 +514,7 @@ fused_moe_1stage_dict = {
         (ActivationType.Silu,          QuantType.No,  dtypes.fp16,   dtypes.fp16,   dtypes.fp16,   False,   False) : aiter.fmoe,
         (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,   dtypes.i4x2,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Silu,    QuantType.per_1x32,  dtypes.bf16,  dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_Token,  dtypes.fp32,     dtypes.i8,     dtypes.i8,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_g1u1,
@@ -581,7 +566,6 @@ class MOEMetadata:
     ksplit: int
     run_1stage: bool = False
     has_bias: bool = False
-    use_non_temporal_load: bool = True
 
 
 @functools.lru_cache(maxsize=2048)
@@ -693,7 +677,6 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
-    use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
         kernelName1 = ""
@@ -709,7 +692,6 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 256 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
@@ -736,10 +718,6 @@ def get_2stage_cfgs(
                 else ksplit
             )
         )
-        use_non_temporal_load = use_nt(token, topk, expert)
-        aiter.logger.info(
-            f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
-        )
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
@@ -747,6 +725,7 @@ def get_2stage_cfgs(
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
 
+    kernelName1 = "_ZN5aiter50fmoe_fp32_pertokenInt8_g1u1_vs_smf_silu_1tg_32x384E"
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
@@ -841,14 +820,12 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 dtype=dtype,
                 splitk=ksplit,
-                use_non_temporal_load=use_non_temporal_load,
             ),
             functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
-                use_non_temporal_load=use_non_temporal_load,
             ),
             block_m,
             int(ksplit),
@@ -913,7 +890,7 @@ def fused_moe_2stages(
     token_num_quant_moe_sort_switch = 1024
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    dtype = moe_out.dtype
+    dtype = hidden_states.dtype
     device = hidden_states.device
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
@@ -1470,7 +1447,6 @@ def ck_moe_stage1(
     quant_type=aiter.QuantType.No,
     activation=ActivationType.Gelu,
     splitk=1,
-    use_non_temporal_load=False,
     dtype=None,
 ):
     token_num = hidden_states.shape[0]
@@ -1497,8 +1473,7 @@ def ck_moe_stage1(
         sorted_weights,
         quant_type,
         activation,
-        splitk,
-        use_non_temporal_load,
+        int(splitk),
         out.dtype,
     )
     if splitk > 1:
@@ -1643,13 +1618,11 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    if (expert, topk) in [
-        (128, 4),
-        (128, 6),
-        (128, 8),
-        (256, 6),
-        (256, 8),
-    ] and gating_output.dtype in [dtypes.bf16, dtypes.fp32]:
+    if (
+        get_gfx() == "gfx942"
+        and (expert, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
+        and gating_output.dtype == dtypes.fp32
+    ):
         if topk_weights is None:
             topk_weights = torch.empty(
                 (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device
