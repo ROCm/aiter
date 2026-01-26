@@ -503,20 +503,36 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
             impl_ptr = result.first->second.get();
         }
     }
-    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
-                                               input,
-                                               gate,
-                                               down,
-                                               sorted_token_ids,
-                                               sorted_weights,
-                                               sorted_expert_ids,
-                                               num_valid_ids,
-                                               topk,
-                                               // quant args
-                                               input_scale,
-                                               fc1_scale,
-                                               fc2_scale,
-                                               fc2_smooth_scale);
+    if(out.dtype() == at::ScalarType::Float)
+        impl_ptr->launch_kernel<uint8_t, float>(out,
+                                                input,
+                                                gate,
+                                                down,
+                                                sorted_token_ids,
+                                                sorted_weights,
+                                                sorted_expert_ids,
+                                                num_valid_ids,
+                                                topk,
+                                                // quant args
+                                                input_scale,
+                                                fc1_scale,
+                                                fc2_scale,
+                                                fc2_smooth_scale);
+    else
+        impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
+                                                   input,
+                                                   gate,
+                                                   down,
+                                                   sorted_token_ids,
+                                                   sorted_weights,
+                                                   sorted_expert_ids,
+                                                   num_valid_ids,
+                                                   topk,
+                                                   // quant args
+                                                   input_scale,
+                                                   fc1_scale,
+                                                   fc2_scale,
+                                                   fc2_smooth_scale);
 }
 void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
                torch::Tensor& input,             // [token_cnt, dim] M,K

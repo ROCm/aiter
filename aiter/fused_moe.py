@@ -725,7 +725,6 @@ def get_2stage_cfgs(
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
 
-    kernelName1 = "_ZN5aiter50fmoe_fp32_pertokenInt8_g1u1_vs_smf_silu_1tg_32x384E"
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
