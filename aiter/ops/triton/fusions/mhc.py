@@ -32,9 +32,10 @@ def get_fused_mhc_config():
 
 def get_sinkhorn_knopp_config():
     return {
-        "waves_per_eu": 4,
+        "BLOCK_M": 256,
+        "waves_per_eu": 2,
         "num_stages": 1,
-        "num_warps": 8,
+        "num_warps": 4,
     }
 
 def fused_mhc(
@@ -383,7 +384,7 @@ def sinkhorn_knopp(
     config = get_sinkhorn_knopp_config()
 
     # Grid: one program per batch element, need large batch size for optimal performance
-    grid = (M,)
+    grid = (triton.cdiv(M, config["BLOCK_M"]),)
 
     _sinkhorn_knopp_log_domain_kernel[grid](
         logits,

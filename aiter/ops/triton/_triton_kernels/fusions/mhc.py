@@ -175,15 +175,16 @@ def _sinkhorn_knopp_log_domain_kernel(
     stride_row,     # Stride for row dimension
     stride_col,     # Stride for column dimension
     # Meta-parameters
-    N: tl.constexpr,            # Matrix size (must be power of 2, max 64)
+    N: tl.constexpr,            # Matrix size (must be power of 2)
     NUM_ITERS: tl.constexpr,    # Number of Sinkhorn iterations
+    BLOCK_M: tl.constexpr,      # Batch elements per program
 ):
     """
     Log-domain Sinkhorn-Knopp kernel for projecting raw logits onto doubly stochastic matrices.
 
     Computes doubly stochastic matrix P where all rows and columns sum to 1.
 
-    Grid: (M,) - one program per batch element
+    Grid: (cdiv(M, BLOCK_M),) - one program per BLOCK_M batch elements
 
     Reference algorithm (Exponential Domain)- Sinkhorn & Knopp (1967):
     ──────────────────────────────────────────────────────
@@ -207,63 +208,63 @@ def _sinkhorn_knopp_log_domain_kernel(
         logsumexp uses stable formula: max(x) + log2(Σ exp2((x - max(x)) * log2(e))) * ln(2)
 
     """
-    batch_idx = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0)
+    batch_start = pid_m * BLOCK_M
 
-    if batch_idx >= M:
-        return
-
-    # Constants for exp2/log2 conversion (faster on GPU hardware)
+    # Constants for exp2/log2 conversion
     LOG2_E: tl.constexpr = 1.4426950408889634  # 1/ln(2), for exp(x) = exp2(x * LOG2_E)
     LN_2: tl.constexpr = 0.6931471805599453    # ln(2), for log(x) = log2(x) * LN_2
 
-    # Base offset for this batch
-    batch_offset = batch_idx * stride_batch
-
-    # Compute flat indices within this batch's matrix
+    # Compute flat indices within each batch's matrix (shared across all batches)
     row_idx = tl.arange(0, N)[:, None]  # (N, 1)
     col_idx = tl.arange(0, N)[None, :]  # (1, N)
     flat_idx = row_idx * stride_row + col_idx * stride_col
 
-    # Load the NxN matrix (raw logits) in log domain
-    log_A = tl.load(logits_ptr + batch_offset + flat_idx).to(tl.float32)
+    # Loop over batch elements in this block
+    for batch_local in range(BLOCK_M):
+        batch_idx = batch_start + batch_local
+        if batch_idx < M:
+            # Base offset for this batch
+            batch_offset = batch_idx * stride_batch
 
-    # Initialize log scaling factors
-    # Initially u = v = 1 (no scaling), so log(1) = 0, 
-    log_u = tl.zeros((N,), dtype=tl.float32)  # Row scalings
-    log_v = tl.zeros((N,), dtype=tl.float32)  # Column scalings
+            # Load the NxN matrix (raw logits) in log domain
+            log_A = tl.load(logits_ptr + batch_offset + flat_idx).to(tl.float32)
 
-    #  Iterate and alternate between row and column normalization.
-    for _ in range(NUM_ITERS):
-        # Add column scaling: scaled[i,j] = log_A[i,j] + log_v[j]
-        scaled_row = log_A + log_v[None, :]  # (N, N)
+            # Initialize log scaling factors
+            # Initially u = v = 1 (no scaling), so log(1) = 0,
+            log_u = tl.zeros((N,), dtype=tl.float32)  # Row scalings
+            log_v = tl.zeros((N,), dtype=tl.float32)  # Column scalings
 
-        # Compute max per row for numerical stability (prevents overflow in exp)
-        row_max = tl.max(scaled_row, axis=1)  # (N,)
+            # Iterate and alternate between row and column normalization.
+            for _ in range(NUM_ITERS):
+                # Add column scaling: scaled[i,j] = log_A[i,j] + log_v[j]
+                scaled_row = log_A + log_v[None, :]  # (N, N)
 
-        # Compute logsumexp per row (using exp2/log2 for faster GPU execution)
-        exp_shifted = tl.exp2((scaled_row - row_max[:, None]) * LOG2_E)
-        row_sum_exp = tl.sum(exp_shifted, axis=1)  # (N,)
-        log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2  # (N,)
+                row_max = tl.max(scaled_row, axis=1)  # (N,)
 
-        # Update row scaling: log_u = -log(row_sum) to normalize rows to 1
-        log_u = -log_row_sums
+                # Compute logsumexp per row
+                exp_shifted = tl.exp2((scaled_row - row_max[:, None]) * LOG2_E)
+                row_sum_exp = tl.sum(exp_shifted, axis=1)  # (N,)
+                log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2  # (N,)
 
-        # Add row scaling: scaled[i,j] = log_A[i,j] + log_u[i]
-        scaled_col = log_A + log_u[:, None]  # (N, N)
+                # Update row scaling: log_u = -log(row_sum) to normalize rows to 1
+                log_u = -log_row_sums
 
-        # Compute max per column for numerical stability
-        col_max = tl.max(scaled_col, axis=0)  # (N,)
+                # Add row scaling: scaled[i,j] = log_A[i,j] + log_u[i]
+                scaled_col = log_A + log_u[:, None]  # (N, N)
 
-        # Compute logsumexp per column (using exp2/log2 for faster GPU execution)
-        exp_shifted = tl.exp2((scaled_col - col_max[None, :]) * LOG2_E)
-        col_sum_exp = tl.sum(exp_shifted, axis=0)  # (N,)
-        log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2  # (N,)
+                col_max = tl.max(scaled_col, axis=0)  # (N,)
 
-        # Update column scaling: log_v = -log(col_sum) to normalize cols to 1
-        log_v = -log_col_sums
+                # Compute logsumexp per column
+                exp_shifted = tl.exp2((scaled_col - col_max[None, :]) * LOG2_E)
+                col_sum_exp = tl.sum(exp_shifted, axis=0)  # (N,)
+                log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2  # (N,)
 
-    # Combine base logits with accumulated scaling factors:
-    log_P = log_A + log_u[:, None] + log_v[None, :]
-    P = tl.exp2(log_P * LOG2_E)
+                # Update column scaling: log_v = -log(col_sum) to normalize cols to 1
+                log_v = -log_col_sums
 
-    tl.store(out_ptr + batch_offset + flat_idx, P.to(out_ptr.dtype.element_ty))
+            # Combine base logits with accumulated scaling factors:
+            log_P = log_A + log_u[:, None] + log_v[None, :]
+            P = tl.exp2(log_P * LOG2_E)
+
+            tl.store(out_ptr + batch_offset + flat_idx, P.to(out_ptr.dtype.element_ty))
