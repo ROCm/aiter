@@ -14,6 +14,19 @@ def torch_silu_and_mul(input: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype):
+    quant_out = aiter.ops.triton.quant.fused_fp8_quant.fused_silu_mul_fp8_per_tensor_static_quant(
+        x, x_scale, dtype_quant=rocm_fp8_dtype, silu_convert_to_inp_type=True
+    )
+    return quant_out
+
+
+def scaled_silu_mul_fp8_quantization(m, n, x, x_scale, dtype_quant=aiter.dtypes.fp8):
+    silu_out = torch.empty((m, n // 2), dtype=dtype_quant, device=x.device)
+    aiter.scaled_silu_and_mul(silu_out, x, x_scale)
+    return silu_out
+
+
 @benchmark()
 def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
     """
@@ -24,23 +37,21 @@ def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
     input = torch.randn(m, n, dtype=dtype, device="cuda")
     scale = torch.max(input).to(torch.float32)
     out_dtype = output_dtype if output_dtype is not None else dtypes.fp8
-    out = torch.empty((m, n // 2), dtype=out_dtype, device="cuda")
 
     # Reference: compute, scale, convert to output dtype
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
     ref = (F.silu(x) * y / scale).to(out_dtype)
 
-    _, us_aiter = run_perftest(
-        aiter.scaled_silu_and_mul,
-        out,
-        input,
-        scale,
+    out, us_aiter = run_perftest(
+        scaled_silu_mul_fp8_quantization, m, n, input, scale, out_dtype
+    )
+    fp8_x, us_triton = run_perftest(
+        triton_silu_mul_fp8_quantization_fuse, input, scale, aiter.dtypes.fp8
     )
 
-    # Check if the results are close
     err = checkAllclose(ref.to(torch.float), out.to(torch.float))
-
+    err_triton = checkAllclose(ref.to(torch.float), fp8_x.to(torch.float))
     # Record input/output types for clarity
     dtype_map = {
         torch.float32: "fp32",
@@ -52,11 +63,13 @@ def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
     ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
     ret["M"] = m
     ret["N"] = n
-    ret["us"] = us_aiter
+    ret["hip us"] = us_aiter
+    ret["triton us"] = us_triton
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
     ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
     ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
     ret["err"] = err
+    ret["err_triton"] = err_triton
     return ret
 
 
@@ -117,7 +130,6 @@ def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
         input,
         scale,
     )
-
     err = checkAllclose(ref.to(torch.float), out.to(torch.float))
     dtype_map = {
         torch.float32: "fp32",
@@ -157,8 +169,8 @@ parser.add_argument(
     "-m",
     type=int,
     nargs="*",
-    choices=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840],
-    default=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840],
+    choices=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 16384, 32768],
+    default=[1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 16384, 32768],
     help="""M of mnk.
     e.g.: -m 32""",
 )
@@ -166,8 +178,8 @@ parser.add_argument(
     "-n",
     type=int,
     nargs="*",
-    choices=[1024, 4096, 6400, 8192],
-    default=[1024, 4096, 6400, 8192],
+    choices=[1024, 4096, 8192, 16384],
+    default=[1024, 4096, 8192, 16384],
     help="""N of mnk.
     e.g.: -n 1024""",
 )
@@ -182,11 +194,22 @@ for dtype in args.dtype:
             df.append(ret)
 df = pd.DataFrame(df)
 df = df[
-    ["M", "N", "input_dtype", "output_dtype", "us", "TB/s", "RD TB/s", "WR TB/s", "err"]
+    [
+        "M",
+        "N",
+        "input_dtype",
+        "output_dtype",
+        "hip us",
+        "triton us",
+        "TB/s",
+        "RD TB/s",
+        "WR TB/s",
+        "err",
+        "err_triton",
+    ]
 ]
 df_md = df.to_markdown(index=False)
 aiter.logger.info("scaled_silu_and_mul summary (markdown):\n%s", df_md)
-
 df = []
 for dtype in args.dtype:
     for m in args.m:

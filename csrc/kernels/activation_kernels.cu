@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -14,12 +14,13 @@
 #include "hip_compat.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
+#include "opus.hpp"
 #include <hip/hip_bf16.h>
 
 using fp8_type = ck_tile::fp8_t;
 
 static constexpr int32_t max_vec_size = 8;
-static constexpr int32_t max_wave_num = 8;
+static constexpr int32_t max_wave_num = 16;
 
 // Type trait for computation type (all compute in native type)
 
@@ -185,18 +186,18 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
     using vec_i                     = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
+    using opus_vec_i                = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (d + ooba_i - 1) / ooba_i * ooba_i;
 
-    auto buffer_x = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_x, oob_i);
-    auto buffer_y = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_y, oob_i);
-    buffer_x.init_raw();
-    buffer_y.init_raw();
+    // Use opus::make_gmem instead of ck_tile::make_buffer_view, size in BYTES
+    auto buffer_x = opus::make_gmem<DTYPE_I>(ptr_x, oob_i * sizeof(DTYPE_I));
+    auto buffer_y = opus::make_gmem<DTYPE_I>(ptr_y, oob_i * sizeof(DTYPE_I));
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
-        vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
-        vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
+        auto x = buffer_x.template load<VEC_SIZE_I, 2>(idx); // 2: NT1
+        auto y = buffer_y.template load<VEC_SIZE_I, 2>(idx); // 2: NT1
 
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
@@ -209,11 +210,11 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                 float y0       = ck_tile::type_convert<float>(y[j]);
                 float y1       = ck_tile::type_convert<float>(y[j + 1]);
 
-                float2 act_vals   = {act_x0, act_x1};
-                float2 y_vals     = {y0, y1};
+                float2 act_vals = {act_x0, act_x1};
+                float2 y_vals   = {y0, y1};
                 float2 scale_vals = {scale, scale};
                 float2 result;
-
+                
                 asm volatile("v_pk_mul_f32 %0, %1, %2\n\t"
                              "v_pk_mul_f32 %0, %0, %3"
                              : "=v"(result)
@@ -221,9 +222,7 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
 
                 out[token_idx * d + idx + j]     = ck_tile::type_convert<DTYPE_O>(result.x);
                 out[token_idx * d + idx + j + 1] = ck_tile::type_convert<DTYPE_O>(result.y);
-            }
-            else
-            {
+            } else {
                 DTYPE_I x_val = x[j];
                 float r       = ACT_FN(x_val) * ck_tile::type_convert<float>(y[j]) * scale;
                 out[token_idx * d + idx + j] = ck_tile::type_convert<DTYPE_O>(r);
