@@ -11,7 +11,6 @@ from aiter.utility import fp4_utils
 from functools import partial
 import pandas as pd
 
-
 torch.set_default_device("cuda")
 
 
