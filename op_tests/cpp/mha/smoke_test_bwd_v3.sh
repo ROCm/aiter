@@ -147,8 +147,39 @@ run_gfx950_group_bwd_v3() {
     done
 }
 
+# Comprehensive coverage test for bottom-right causal mask with asymmetric head dim (d=192, d_v=128)
+# This is specifically for testing the cas_br_kb kernel (bwd_hd192_128_*_causal_br_a32_pssk.co)
+# Combines: matrix coverage, edge cases, kernel balance boundaries, and bf16 convert options
+run_gfx950_hd192_128_causal_br_bwd_v3() {
+    echo "===== Comprehensive coverage: bottom-right causal mask with hdim 192+128 (batch mode) ====="
+    
+    hdim=192
+    hdim_v=128
+    
+    # ===== PART 1: Matrix coverage with non-64-aligned seqlens =====
+    echo "--- Part 1: Matrix coverage ---"
+    for prec in "bf16" "fp16" ; do
+    for perm in 0 1 ; do
+    for batch in 1 2 3 ; do
+    for head in 1 2 4 ; do
+    for sq in 62 174 299 577 ; do
+    for sk in 65 174 299 577 ; do
+
+    $EXE -prec=$prec -b=$batch -h=$head -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=2 -bwd_v3=1 -v3_atomic_fp32=1 -mode=0 -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+    done
+}
+
 # run_batch_mode_tests
 # run_group_mode_tests
 # run_swa_tests
 run_gfx950_group_bwd_v3
 run_gfx950_bwd_v3
+
+# Bottom-right causal mask with hdim 192+128 tests (cas_br_kb kernel)
+run_gfx950_hd192_128_causal_br_bwd_v3
