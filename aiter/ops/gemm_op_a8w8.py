@@ -7,6 +7,7 @@ from typing import Optional
 import functools
 import pandas as pd
 from aiter import logger
+from aiter.ops.shuffle import shuffle_weight, shuffle_weight_cktile
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
@@ -163,6 +164,7 @@ def gemm_a8w8_blockscale_cktile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    preshuffleB: bool = True,
 ) -> torch.Tensor: ...
 
 
@@ -529,7 +531,7 @@ def gemm_a8w8_blockscale_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    isBpreshuffled=False,
+    preshuffleB=False,
 ) -> torch.Tensor:
     m = XQ.shape[0]
     n = WQ.shape[0]
@@ -544,7 +546,8 @@ def gemm_a8w8_blockscale(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    isBpreshuffled: bool = False,
+    preshuffleB: bool = False,
+    is_default_cktile: bool = False,
 ) -> torch.Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -556,24 +559,68 @@ def gemm_a8w8_blockscale(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     from aiter.jit.utils.chip_info import get_gfx
 
-    if isBpreshuffled:
-        if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
-            return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
-        else:
-            assert 0, "asm kernel only support B preshuffle and m >= 16"
-    else:
-        config = get_CKGEMM_config(
-            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+    # give the priority to gfx950 asm when possible
+    if (
+        preshuffleB
+        and get_gfx() == "gfx950"
+        and m >= 16
+        and k >= 512
+        and dtype == dtypes.bf16
+    ):
+        return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+
+    config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+    )
+
+    # Helper functions for kernel calls based on preshuffleB parameter
+    def call_cktile(preshuffle: bool) -> torch.Tensor:
+        return gemm_a8w8_blockscale_cktile(
+            XQ,
+            shuffle_weight_cktile(WQ, layout=(16, 16)) if preshuffle else WQ,
+            x_scale,
+            w_scale,
+            Y,
+            preshuffle,
         )
-        if config is not None:
-            libtype = config["libtype"]
-            if libtype == "ck":
-                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
-            elif libtype == "cktile":
-                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
-            else:
-                assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+
+    def call_ck(preshuffle: bool) -> torch.Tensor:
+        if preshuffle:
+            return gemm_a8w8_blockscale_bpreshuffle_ck(
+                XQ,
+                shuffle_weight(WQ, layout=(16, 16)),
+                x_scale.transpose(0, 1).contiguous().view(*x_scale.shape),
+                w_scale,
+                Y,
+            )
+        else:
+            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+
+    # Determine which kernel library to use (cktile or ck)
+    use_cktile = config is not None and config["libtype"] == "cktile"
+    if config is None:
+        use_cktile = is_default_cktile
+
+    # Parse config preshuffleB if available (could be string "True"/"False" or boolean)
+    if config is not None:
+        config_preshuffle = config["preshuffleB"]
+        if isinstance(config_preshuffle, str):
+            config_preshuffle = config_preshuffle.lower() == "true"
+    else:
+        config_preshuffle = preshuffleB
+
+    # Use requested preshuffleB if config matches, otherwise use config's preshuffleB
+    effective_preshuffle = (
+        preshuffleB
+        if (config is None or config_preshuffle == preshuffleB)
+        else config_preshuffle
+    )
+
+    return (
+        call_cktile(effective_preshuffle)
+        if use_cktile
+        else call_ck(effective_preshuffle)
+    )
 
 
 def flatmm_a8w8_blockscale_ASM(
@@ -708,6 +755,7 @@ def gemm_a8w8_blockscale_cktile_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    preshuffleB: bool = True,
 ) -> torch.Tensor: ...
 
 

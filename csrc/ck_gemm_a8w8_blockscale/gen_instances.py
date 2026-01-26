@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+"""a8w8_blockscale_gemm instance gen for CK Legacy."""
+
 import argparse
 import os
 import shutil
@@ -13,10 +15,6 @@ from gemm_a8w8_blockscale_instance import (
     KernelInstance,
     candidate_kernels_dict,
 )
-
-"""
-a8w8_blockscale_gemm instance gen for legacy CK
-"""
 
 
 class gemm_a8w8_blockscale_codegen:
