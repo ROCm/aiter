@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  DOCKER_IMAGE: "rocm/pytorch:latest"
+  DOCKER_IMAGE: "rocm/pytorch:latest@sha256:7ac43a3fcb1a9f46fd7575701a587154ad478cc6cf2c19d170f8378ecdb540d9"
 
 jobs:
   check-signal:
