@@ -60,13 +60,14 @@ If you have built gemm_a8w8_bpreshuffle kernels before tuning new GEMM shapes, p
 ```
 
 #### `--sort`
-- **Type**: Flag (boolean)
+- **Type**: Boolean (True/False)
 - **Default**: `True` (enabled by default for GEMM tuners)
 - **Description**: Sort the output file according to the key columns (e.g., `cu_num`, `N`, `M`, `K` for GEMM). Useful for maintaining consistent ordering in result files. The flag is enabled by default to ensure results are always sorted.
 
 **Example**:
 ```bash
---sort
+--sort True   # Enable sorting (default)
+--sort False  # Disable sorting
 ```
 
 ### Tuning Configuration

@@ -117,10 +117,10 @@ class TunerCommon:
         )
         self.parser.add_argument(
             "--sort",
-            action="store_true",
+            type=dtypes.str2bool,
             default=defaults.get("sort", False),
             required=False,
-            help="Arranged according to the keys",
+            help="Arranged according to the keys (True/False)",
         )
         self.parser.add_argument(
             "--errRatio",
@@ -413,7 +413,9 @@ class TunerCommon:
             logger.info("untuned shapes:")
             print(self.remain_untuned)
         if not self.remain_untuned.empty or not self.failed.empty:
-            logger.info("\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details")
+            logger.error(
+                "\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details"
+            )
             sys.exit(1)
 
     @abstractmethod
