@@ -336,7 +336,11 @@ __global__ void add_rmsnorm_quant_kernel(
         if (group_size == 0) { \
             ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 32, ADD_RESIDUAL, FUSE_QUANT); \
         } else { \
-            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 1024, 8, ADD_RESIDUAL, FUSE_QUANT); \
+            if (cu_num < 160) { \
+                ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 512, 16, ADD_RESIDUAL, FUSE_QUANT); \
+            } else { \
+                ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 1024, 8, ADD_RESIDUAL, FUSE_QUANT); \
+            } \
         } \
     } else { \
         TORCH_CHECK(false, __func__, " not support n: ", n); \
