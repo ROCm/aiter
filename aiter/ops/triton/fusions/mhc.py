@@ -15,8 +15,8 @@ import triton
 
 from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_fused_kernel,
-    _mhc_split_kernel,
-    _mhc_reduce_kernel,
+    _mhc_fused_split_kernel,
+    _mhc_fused_reduce_kernel,
     _sinkhorn_knopp_log_domain_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -194,7 +194,7 @@ def fused_mhc(
         
         # Launch split kernel with 3D grid: (M_blocks, N_blocks_total, NUM_KSPLIT)
         grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
-        _mhc_split_kernel[grid_split](
+        _mhc_fused_split_kernel[grid_split](
             x,
             phi_pre,
             phi_post,
@@ -240,7 +240,7 @@ def fused_mhc(
         
         # Launch reduce kernel with 2D grid: (M_blocks, N_blocks_total)
         grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-        _mhc_reduce_kernel[grid_reduce](
+        _mhc_fused_reduce_kernel[grid_reduce](
             acc_pre_partial,
             acc_post_partial,
             acc_res_partial,
