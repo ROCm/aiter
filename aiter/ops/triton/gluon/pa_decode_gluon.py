@@ -36,6 +36,25 @@ def get_cdna_version():
         return -1
 
 
+def get_occupancy() -> int:
+    # Keep consistent with the packaged aiter API used by ATOM.
+    return 2
+
+
+def get_recommended_splits(num_sequences: int, num_kv_heads: int) -> int:
+    """Recommend max context partition splits for decode kernels.
+
+    This helper is imported by ATOM (`atom/model_ops/attention_mha.py`) and is
+    part of the public API surface in the packaged aiter version.
+    """
+    props = torch.cuda.get_device_properties()
+    num_sm = props.multi_processor_count * get_occupancy()
+    max_context_partition_num = min(
+        16, triton.cdiv(num_sm, num_sequences * num_kv_heads)
+    )
+    return max_context_partition_num
+
+
 @gluon.jit
 def transpose_query_gluon_kernel(
     input_ptr,  # Input tensor pointer

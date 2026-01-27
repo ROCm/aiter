@@ -485,7 +485,7 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
-def get_pa_metadata_info_v1(
+def _get_pa_metadata_info_v1_new(
     batch_size: int,
     max_seqlen_qo: int,
     num_head_qo: int,
@@ -524,6 +524,53 @@ def get_pa_metadata_info_v1(
     else:
         max_work = tile_cnt * cu_num
         max_split_tiles = tile_cnt * cu_num
+
+    return (
+        ((2), torch.uint64),  # work_metadata_ptrs
+        ((cu_num + 1), torch.int32),  # work_indptr
+        ((max_work, 8), torch.int32),  # work_info_set
+        ((tile_cnt + 1), torch.int32),  # reduce_indptr
+        ((tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_split_tiles, torch.int32),  # reduce_partial_map
+    )
+
+
+def get_pa_metadata_info_v1(*args, **kwargs):
+    """Backward-compatible metadata sizing helper for paged attention.
+
+    Packaged aiter (used by ATOM) historically exposed:
+      get_pa_metadata_info_v1(batch_size: int, num_head_k: int = 1)
+
+    Newer aiter versions add a richer signature for sparse/MTP cases.
+    To keep ATOM compatible with the local checkout, we support BOTH:
+    - Legacy (2-arg) API: (batch_size, num_head_k=1)
+    - New API: forwards to `_get_pa_metadata_info_v1_new`
+    """
+    # New-style: detect by presence of required fields / arg count.
+    if (
+        ("max_seqlen_qo" in kwargs)
+        or ("num_head_qo" in kwargs)
+        or ("q_dtype" in kwargs)
+        or ("kv_dtype" in kwargs)
+        or ("is_sparse" in kwargs)
+        or (len(args) >= 6)
+    ):
+        # Forward to the new implementation (supports positional or keyword usage).
+        return _get_pa_metadata_info_v1_new(*args, **kwargs)
+
+    # Legacy-style:
+    if len(args) == 0:
+        raise TypeError("get_pa_metadata_info_v1() missing required positional argument: 'batch_size'")
+    batch_size = int(args[0])
+    num_head_k = int(args[1]) if len(args) >= 2 else int(kwargs.get("num_head_k", 1))
+
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+
+    tile_cnt = batch_size
+    max_work = (tile_cnt + cu_num - 1) * num_head_k
+    max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs

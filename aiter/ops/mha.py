@@ -2484,7 +2484,12 @@ def flash_attn_varlen_func(
     out=None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
+    sink_ptr: Optional[torch.Tensor] = None,
 ):
+    # NOTE: `sink_ptr` is accepted for API compatibility with packaged aiter.
+    # This local checkout does not require it in this wrapper; kernels may infer
+    # sink behavior from `window_size` (third element).
+    _ = sink_ptr
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
     ):
