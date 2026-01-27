@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+ # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
@@ -440,10 +440,25 @@ def fused_moe_1stage(
             )
             return moe_buf
 
+        if isG1U1 and quant_type == QuantType.per_Token and (q_dtype_w == dtypes.i8 or q_dtype_w == torch.int8):
+            if a1_scale is not None and a1_scale.ndim == 1:
+                a1_scale = a1_scale.view(M, 1).contiguous().view(dtypes.fp32)
+            if w1_scale is not None and w1_scale.dim() != 3 and w1_scale.numel() == E * inter_dim:
+                w1_scale = w1_scale.view(E, 1, inter_dim).contiguous().view(dtypes.fp32)
+            if w2_scale is not None and w2_scale.dim() != 3 and w2_scale.numel() == E * model_dim:
+                w2_scale = w2_scale.view(E, 1, model_dim).contiguous().view(dtypes.fp32)
         if isG1U1 and activation == ActivationType.Silu and quant_type == QuantType.per_Token and moe_buf.dtype == dtypes.fp32 and (q_dtype_w == dtypes.i8 or q_dtype_w == torch.int8):
             fc2_smooth_scale_ = torch.ones((E, 1, inter_dim), device=w2.device, dtype=dtypes.fp32)
         else:
             fc2_smooth_scale_ = getattr(aiter, "FC2_SMOOTH_SCALE", None) if isG1U1 else None
+        moe_buf = moe_buf.contiguous()
+        a1 = a1.contiguous()
+        w1 = w1.contiguous()
+        w2 = w2.contiguous()
+        sorted_ids = sorted_ids.contiguous()
+        sorted_weights = sorted_weights.contiguous()
+        sorted_expert_ids = sorted_expert_ids.contiguous()
+        num_valid_ids = num_valid_ids.contiguous()
         fmoe_func(
             moe_buf,
             a1,

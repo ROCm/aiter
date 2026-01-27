@@ -122,12 +122,13 @@ class FMoeKernel
         uint32_t sub_GU     = this->sub_GU;
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
+
+        int stride_X = input.stride(0) * input.element_size();
         if(out.scalar_type() == at::ScalarType::Float)
         {
-            O_elemSize *= 2;
+            stride_X *= 2;
         }
 
-        int stride_X  = input.stride(0) * input.element_size();
         int stride_GU = dim * I_elemSize;
         int stride_D  = inter_dim * I_elemSize;
         if(is_int4)
@@ -215,25 +216,25 @@ class FMoeKernel
             gdy = sub_X_cnt;
             gdz = 1;
         }
-        // std::cout << "sub_GU: " << sub_GU << std::endl;
-        // std::cout << "args.dim: " << args.dim << std::endl;
-        // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
-        // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
-        // std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
-        // std::cout << "args.stride_X: " << args.Xs << std::endl;
-        // std::cout << "args.stride_GU: " << args.GUs << std::endl;
-        // std::cout << "args.stride_D: " << args.Ds << std::endl;
-        // std::cout << "args.stride_O: " << args.Os << std::endl;
-        // std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
-        // std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
-        // std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
-        // std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
-        // std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
-        // std::cout << "args.topk: " << args.topk << std::endl;
-        // std::cout << "args.ps_deno: " << args.ps_deno << std::endl;
-        // std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
-        // std::cout << "gdx: " << gdx << std::endl;
-        // std::cout << "gdy: " << gdy << std::endl;
+        std::cout << "sub_GU: " << sub_GU << std::endl;
+        std::cout << "args.dim: " << args.dim << std::endl;
+        std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
+        std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
+        std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
+        std::cout << "args.stride_X: " << args.Xs << std::endl;
+        std::cout << "args.stride_GU: " << args.GUs << std::endl;
+        std::cout << "args.stride_D: " << args.Ds << std::endl;
+        std::cout << "args.stride_O: " << args.Os << std::endl;
+        std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
+        std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
+        std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
+        std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
+        std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
+        std::cout << "args.topk: " << args.topk << std::endl;
+        std::cout << "args.ps_deno: " << args.ps_deno << std::endl;
+        std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
+        std::cout << "gdx: " << gdx << std::endl;
+        std::cout << "gdy: " << gdy << std::endl;
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -654,20 +655,36 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
         TORCH_CHECK(false, __func__, ": unsupport current input type:", input.scalar_type());
     }
 
-    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
-                                               input,
-                                               gate,
-                                               down,
-                                               sorted_token_ids,
-                                               sorted_weights,
-                                               sorted_expert_ids,
-                                               num_valid_ids,
-                                               topk,
-                                               // quant args
-                                               input_scale,
-                                               fc1_scale,
-                                               fc2_scale,
-                                               fc2_smooth_scale);
+    if(out.dtype() == at::ScalarType::Float)
+        impl_ptr->launch_kernel<uint8_t, float>(out,
+                                                input,
+                                                gate,
+                                                down,
+                                                sorted_token_ids,
+                                                sorted_weights,
+                                                sorted_expert_ids,
+                                                num_valid_ids,
+                                                topk,
+                                                // quant args
+                                                input_scale,
+                                                fc1_scale,
+                                                fc2_scale,
+                                                fc2_smooth_scale);
+    else
+        impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
+                                                   input,
+                                                   gate,
+                                                   down,
+                                                   sorted_token_ids,
+                                                   sorted_weights,
+                                                   sorted_expert_ids,
+                                                   num_valid_ids,
+                                                   topk,
+                                                   // quant args
+                                                   input_scale,
+                                                   fc1_scale,
+                                                   fc2_scale,
+                                                   fc2_smooth_scale);
 }
 
 void fmoe_g1u1_tkw1(torch::Tensor& out,               // [token_cnt, dim]
@@ -715,20 +732,62 @@ void fmoe_g1u1_tkw1(torch::Tensor& out,               // [token_cnt, dim]
             TORCH_CHECK(false, __func__, ": unsupport current activation type");
     }
     impl_ptr = get_heuristic_kernel(inter_dim, estimated_sub_X_cnt, config_map, 0, kernel_name);
-    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
-                                               input,
-                                               gate,
-                                               down,
-                                               sorted_token_ids,
-                                               sorted_weights,
-                                               sorted_expert_ids,
-                                               num_valid_ids,
-                                               topk,
-                                               // quant args
-                                               input_scale,
-                                               fc1_scale,
-                                               fc2_scale,
-                                               fc2_smooth_scale);
+    TORCH_CHECK(out.is_contiguous() && input.is_contiguous() && gate.is_contiguous() &&
+                    down.is_contiguous() && sorted_token_ids.is_contiguous() &&
+                    sorted_weights.is_contiguous() && sorted_expert_ids.is_contiguous() &&
+                    num_valid_ids.is_contiguous(),
+                __func__,
+                ": tensors must be contiguous");
+    TORCH_CHECK(input_scale.dim() == 2 && input_scale.size(0) == input.size(0) &&
+                    input_scale.size(1) == 1,
+                __func__,
+                ": input_scale shape must be [token_cnt,1]");
+    TORCH_CHECK(fc1_scale.dim() == 3 && fc1_scale.size(0) == gate.size(0) &&
+                    fc1_scale.size(1) == 1 && fc1_scale.size(2) == inter_dim,
+                __func__,
+                ": fc1_scale shape must be [E,1,inter_dim]");
+    TORCH_CHECK(fc2_scale.dim() == 3 && fc2_scale.size(0) == down.size(0) &&
+                    fc2_scale.size(1) == 1 && fc2_scale.size(2) == model_dim,
+                __func__,
+                ": fc2_scale shape must be [E,1,model_dim]");
+    if(fc2_smooth_scale.has_value())
+    {
+        auto& s = fc2_smooth_scale.value();
+        TORCH_CHECK(s.dim() == 3 && s.size(0) == gate.size(0) && s.size(1) == 1 &&
+                        s.size(2) == inter_dim,
+                    __func__,
+                    ": fc2_smooth_scale shape must be [E,1,inter_dim]");
+    }
+    if(out.dtype() == at::ScalarType::Float)
+        impl_ptr->launch_kernel<uint8_t, float>(out,
+                                                input,
+                                                gate,
+                                                down,
+                                                sorted_token_ids,
+                                                sorted_weights,
+                                                sorted_expert_ids,
+                                                num_valid_ids,
+                                                topk,
+                                                // quant args
+                                                input_scale,
+                                                fc1_scale,
+                                                fc2_scale,
+                                                fc2_smooth_scale);
+    else
+        impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
+                                                   input,
+                                                   gate,
+                                                   down,
+                                                   sorted_token_ids,
+                                                   sorted_weights,
+                                                   sorted_expert_ids,
+                                                   num_valid_ids,
+                                                   topk,
+                                                   // quant args
+                                                   input_scale,
+                                                   fc1_scale,
+                                                   fc2_scale,
+                                                   fc2_smooth_scale);
 }
 
 void fmoe_int8_g1u0_a16(torch::Tensor& out,               // [token_cnt, dim]
