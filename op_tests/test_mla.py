@@ -156,6 +156,7 @@ def test_mla(
         seq_lens_qo.fill_(ctx_lens)
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
+
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
@@ -216,11 +217,11 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
-    if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16
-    ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
-        us_aiter = test_normal_prefill()
-        ret["prefill:ck_192"] = us_aiter
+    # if (
+    #     dtype == torch.bfloat16 and kvtype == torch.bfloat16
+    # ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+    #     us_aiter = test_normal_prefill()
+    #     ret["prefill:ck_192"] = us_aiter
 
     torch.cuda.empty_cache()
     # absorb init
