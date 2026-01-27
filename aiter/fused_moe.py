@@ -440,7 +440,10 @@ def fused_moe_1stage(
             )
             return moe_buf
 
-        fc2_smooth_scale_ = getattr(aiter, "FC2_SMOOTH_SCALE", None) if isG1U1 else None
+        if isG1U1 and activation == ActivationType.Silu and quant_type == QuantType.per_Token and moe_buf.dtype == dtypes.fp32 and (q_dtype_w == dtypes.i8 or q_dtype_w == torch.int8):
+            fc2_smooth_scale_ = torch.ones((E, 1, inter_dim), device=w2.device, dtype=dtypes.fp32)
+        else:
+            fc2_smooth_scale_ = getattr(aiter, "FC2_SMOOTH_SCALE", None) if isG1U1 else None
         fmoe_func(
             moe_buf,
             a1,
