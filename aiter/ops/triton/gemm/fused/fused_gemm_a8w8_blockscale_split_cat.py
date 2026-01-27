@@ -252,6 +252,9 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     K = K // 16
     M, D, S3 = y.shape
 
+    # assert N % 16 == 0, f"{N=} has to be divisible by 16"
+    assert K % 128 == 0, f"{K=} has to be divisible by 128"
+
     # Check constraints.
     assert x.shape[1] == w.shape[1] // 16, "Incompatible dimensions!!!"
     assert y.shape[0] == x.shape[0], "Incompatible dimensions!!!"

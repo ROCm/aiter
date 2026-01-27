@@ -352,7 +352,10 @@ def _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel(
         offs_k_shuffle = pid_k * (SPLITK_BLOCK_SIZE // 2) * 16 + offs_k_shuffle_arr
 
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)) % N
+        # because weight has to be padded to multiple of 32, so that % (N // 16) is no longer required for weight
+        offs_bn = pid_n * (BLOCK_SIZE_N // 16) + tl.arange(
+            0, BLOCK_SIZE_N // 16
+        )  # % (N // 16)
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
@@ -361,9 +364,10 @@ def _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel(
         )
 
         # Create pointers for the first block of A and B scales
-        offs_asn = (
-            pid_n * (BLOCK_SIZE_N // 32) + tl.arange(0, (BLOCK_SIZE_N // 32))
-        ) % N
+        # because weight has to be padded to multiple of 32, so that % (N // 32) is no longer required for weight_scale
+        offs_asn = pid_n * (BLOCK_SIZE_N // 32) + tl.arange(
+            0, (BLOCK_SIZE_N // 32)
+        )  # % (N // 32)
         offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE) * 32) + tl.arange(
             0, BLOCK_SIZE_K // SCALE_GROUP_SIZE * 32
         )
