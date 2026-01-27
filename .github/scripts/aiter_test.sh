@@ -3,6 +3,9 @@ set -euo pipefail
 
 MULTIGPU=${MULTIGPU:-FALSE}
 
+# Suggestion: configure HIP allocator to reduce fragmentation
+export PYTORCH_HIP_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256,garbage_collect_threshold:0. 0"
+
 files=()
 failedFiles=()
 
