@@ -26,10 +26,10 @@ _LOGGER = AiterTritonLogger()
 
 def get_fused_mhc_config():
     return {
-        "waves_per_eu": 1,
+        "waves_per_eu": 2,
         "num_stages": 1,
         "num_warps": 4,
-        "NUM_KSPLIT": 1,
+        "NUM_KSPLIT": 2,
     }
 
 
