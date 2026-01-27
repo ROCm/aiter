@@ -104,9 +104,9 @@ def worker(
     except Exception as e:
         if printLog:
             print(f"Unexpected Error in process:{pid} info:{info}: {e}")
-        # import traceback
+            import traceback
 
-        # traceback.print_exc()
+            traceback.print_exc()
         us = -1  # float("inf")
         max_err_ratio = 1.0
 
