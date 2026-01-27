@@ -235,6 +235,26 @@ class FMoeKernel
         std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
         std::cout << "gdx: " << gdx << std::endl;
         std::cout << "gdy: " << gdy << std::endl;
+      
+            auto stp_cpu = sorted_token_ids.to(at::kCPU, sorted_token_ids.scalar_type());
+            auto sep_cpu = sorted_expert_ids.to(at::kCPU, sorted_expert_ids.scalar_type());
+            long long stp_min = stp_cpu.min().item<long long>();
+            long long stp_max = stp_cpu.max().item<long long>();
+            long long sep_min = sep_cpu.min().item<long long>();
+            long long sep_max = sep_cpu.max().item<long long>();
+            std::cout << __func__ << ": STP min=" << stp_min << " max=" << stp_max
+                      << " SEP min=" << sep_min << " max=" << sep_max << std::endl;
+            auto out_pre = out.to(at::kCPU, out.scalar_type());
+            float out_pre_sum = out_pre.abs().sum().item<float>();
+            std::cout << __func__ << ": pre_launch out_sum=" << out_pre_sum << std::endl;
+   
+        if constexpr(std::is_same<T, uint8_t>::value)
+        {
+            float xq_sum = input_dqn.value().abs().sum().item<float>();
+            float guq_sum = w1_dqn.value().abs().sum().item<float>();
+            float dq_sum = w2_dqn.value().abs().sum().item<float>();
+            std::cout << __func__ << ": DQN sums XQ=" << xq_sum << " GUQ=" << guq_sum << " DQ=" << dq_sum << std::endl;
+        }
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -504,7 +524,8 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
             impl_ptr = result.first->second.get();
         }
     }
-    if(out.dtype() == at::ScalarType::Float)
+
+    if(out.scalar_type() == at::ScalarType::Float)
         impl_ptr->launch_kernel<uint8_t, float>(out,
                                                 input,
                                                 gate,
@@ -519,6 +540,11 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
                                                 fc1_scale,
                                                 fc2_scale,
                                                 fc2_smooth_scale);
+        {
+            auto out_cpu = out.to(at::kCPU, out.scalar_type());
+            float out_sum = out_cpu.abs().sum().item<float>();
+            std::cout << __func__ << ": post_launch out_sum=" << out_sum << std::endl;
+        }
     else
         impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
                                                    input,
@@ -655,6 +681,18 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
         TORCH_CHECK(false, __func__, ": unsupport current input type:", input.scalar_type());
     }
 
+    {
+        int sub_GU = impl_ptr->get_sub_GU();
+        int num_persistent_tgs = impl_ptr->get_num_persistent_tgs();
+        int ps_deno = (inter_dim + sub_GU - 1) / sub_GU;
+        int total_tgs = (num_persistent_tgs != 0 && (num_persistent_tgs % ps_deno) == 0) ? (num_persistent_tgs / ps_deno * ps_deno) : 0;
+        int bdx = 256;
+        int gdx = (total_tgs > 0) ? num_persistent_tgs : ps_deno;
+        int gdy = (total_tgs > 0) ? 1 : sub_X_cnt;
+        int gdz = 1;
+        int token_cnt = input.size(0);
+        int estimated_sub_X_cnt = (token_cnt * topk + 32 - 1) / 32;
+    }
     if(out.dtype() == at::ScalarType::Float)
         impl_ptr->launch_kernel<uint8_t, float>(out,
                                                 input,

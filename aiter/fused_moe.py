@@ -442,11 +442,11 @@ def fused_moe_1stage(
 
         if isG1U1 and quant_type == QuantType.per_Token and (q_dtype_w == dtypes.i8 or q_dtype_w == torch.int8):
             if a1_scale is not None and a1_scale.ndim == 1:
-                a1_scale = a1_scale.view(M, 1).contiguous().view(dtypes.fp32)
+                a1_scale = a1_scale.view(M, 1).contiguous().to(dtypes.fp32)
             if w1_scale is not None and w1_scale.dim() != 3 and w1_scale.numel() == E * inter_dim:
-                w1_scale = w1_scale.view(E, 1, inter_dim).contiguous().view(dtypes.fp32)
+                w1_scale = w1_scale.view(E, 1, inter_dim).contiguous().to(dtypes.fp32)
             if w2_scale is not None and w2_scale.dim() != 3 and w2_scale.numel() == E * model_dim:
-                w2_scale = w2_scale.view(E, 1, model_dim).contiguous().view(dtypes.fp32)
+                w2_scale = w2_scale.view(E, 1, model_dim).contiguous().to(dtypes.fp32)
         if isG1U1 and activation == ActivationType.Silu and quant_type == QuantType.per_Token and moe_buf.dtype == dtypes.fp32 and (q_dtype_w == dtypes.i8 or q_dtype_w == torch.int8):
             fc2_smooth_scale_ = torch.ones((E, 1, inter_dim), device=w2.device, dtype=dtypes.fp32)
         else:
@@ -459,6 +459,19 @@ def fused_moe_1stage(
         sorted_weights = sorted_weights.contiguous()
         sorted_expert_ids = sorted_expert_ids.contiguous()
         num_valid_ids = num_valid_ids.contiguous()
+        dbg = {
+            "a1_sum": float(a1.abs().sum().item()),
+            "w1_sum": float(w1.abs().sum().item()),
+            "w2_sum": float(w2.abs().sum().item()),
+            "a1_scale_sum": float(a1_scale.abs().sum().item()) if a1_scale is not None else None,
+            "w1_scale_sum": float(w1_scale.abs().sum().item()) if w1_scale is not None else None,
+            "w2_scale_sum": float(w2_scale.abs().sum().item()) if w2_scale is not None else None,
+            "sorted_weights_sum": float(sorted_weights.abs().sum().item()),
+            "num_valid_ids": int(num_valid_ids.item()) if num_valid_ids.numel() == 1 else int(num_valid_ids.view(-1)[0].item()),
+        }
+        print("[fused_moe.debug]", dbg, flush=True)
+        print("[fused_moe.sentinel.pre] moe_buf_sum=", float(moe_buf.abs().sum().item()), flush=True)
+        moe_buf.fill_(1.0)
         fmoe_func(
             moe_buf,
             a1,
@@ -476,6 +489,7 @@ def fused_moe_1stage(
             fc2_smooth_scale=fc2_smooth_scale_,
             activation=activation,
         )
+        print("[fused_moe.debug.after] moe_buf_sum=", float(moe_buf.abs().sum().item()), flush=True)
     return moe_buf
 
 
