@@ -124,10 +124,10 @@ class FMoeKernel
         uint32_t O_elemSize = sizeof(T_O);
 
         int stride_X = input.stride(0) * input.element_size();
-        if(out.scalar_type() == at::ScalarType::Float)
-        {
-            stride_X *= 2;
-        }
+        // if(out.scalar_type() == at::ScalarType::Float)
+        // {
+        //     stride_X *= 2;
+        // }
 
         int stride_GU = dim * I_elemSize;
         int stride_D  = inter_dim * I_elemSize;
