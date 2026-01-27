@@ -11,6 +11,8 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs, _general_quant_kernel
 
+from .visualize_sage_distributions import visualize_sage_quant_distributions
+
 @triton.jit
 def _sage_fwd_no_mask_v2(
     acc,
@@ -2099,6 +2101,13 @@ def sage_quant_v2(
     # q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k_bf16, torch.uint8, axis=-1)
     # k_fp4, k_scale = downcast_to_mxfp(k, aiter.dtypes.fp8, axis=-1)
+
+    visualize_sage_quant_distributions(
+        q, k,  # Original tensors
+        q_fp4, q_scale, q_scale_pre,
+        k_fp4, k_scale, k_scale_pre,
+        output_path='my_distributions.png'
+    )
 
     return q_fp4, q_scale, q_scale_pre, k_fp4, k_scale, k_scale_pre, v_fp8, v_scale
 
