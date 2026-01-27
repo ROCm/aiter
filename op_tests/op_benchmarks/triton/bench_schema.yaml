@@ -65,3 +65,15 @@ benchmarks:
   rmsnorm:
     input_columns: [model_name, M, N]
     output_columns: [Bandwidth_(GB/s)]
+  fused-attention-fwd-d128-layoutbhsd-causal0-typebf16:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
+  fused-attention-fwd-d128-layoutbhsd-causal1-typebf16:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
+  fused-attention-fwd-d128-layoutbhsd-causal0-typefp16:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
+  fused-attention-fwd-d128-layoutbhsd-causal1-typefp16:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
