@@ -81,22 +81,22 @@ def _mhc_fused_kernel(
     # Determine stream type from pid_n, each program processes exactly one stream
     is_pre_program = pid_n < n_blocks_pre
     is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
-    # is_res_program implied when neither pre nor post
+    is_res_program = ~is_pre_program & ~is_post_program
     
-    # Compute local block index within the stream
-    local_pid_n = tl.where(is_pre_program, pid_n,
-                           tl.where(is_post_program, pid_n - n_blocks_pre,
-                                    pid_n - n_blocks_pre - n_blocks_post))
+    # Compute local block index within the stream using arithmetic
+    # is_post gives 0 or 1, is_res gives 0 or 1
+    stream_offset = is_post_program.to(tl.int32) * n_blocks_pre + is_res_program.to(tl.int32) * (n_blocks_pre + n_blocks_post)
+    local_pid_n = pid_n - stream_offset
     
     # Local column indices within the stream
     rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     
-    # Global column index (for bias lookup)
-    col_offset = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
+    # Global column index (for bias lookup) - use arithmetic instead of nested tl.where
+    col_offset = n * (is_post_program.to(tl.int32) + 2 * is_res_program.to(tl.int32))
     rn_global = rn_local + col_offset
     
-    # Output dimension for this stream
-    n_out = tl.where(is_pre_program, n, tl.where(is_post_program, n, n_squared))
+    # Output dimension for this stream - use arithmetic
+    n_out = n + n * (n - 1) * is_res_program.to(tl.int32)  # n for pre/post, n*n for res
     
     # MATMUL (Eq 14) + RMS ACCUMULATION (Eq 15)
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -123,7 +123,7 @@ def _mhc_fused_kernel(
         # SINGLE PHI LOAD         
         phi_tile = tl.load(
             phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
-            mask=(rk[:, None] < K) & (rn_local[None, :] >= 0) & (rn_local[None, :] < n_out),
+            mask=(rk[:, None] < K) & (rn_local[None, :] < n_out),
             other=0.0,
         )
         
@@ -137,16 +137,22 @@ def _mhc_fused_kernel(
     
     # BIAS + ALPHA SCALING (Eq 16)
     bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
-    alpha_val = tl.where(is_pre_program, alpha_pre,
-                        tl.where(is_post_program, alpha_post, alpha_res))
+    # Use arithmetic blending for alpha selection
+    alpha_val = (is_pre_program.to(tl.float32) * alpha_pre +
+                 is_post_program.to(tl.float32) * alpha_post +
+                 is_res_program.to(tl.float32) * alpha_res)
     
     # Apply Eq 16: H = (1/r) * α * H̃ + b
     out = rsigma[:, None] * alpha_val * acc + bias[None, :]
     
     # Apply stream-specific activation
+    # Compute sigmoid once and reuse
+    sigmoid_out = tl.sigmoid(out)
+    # pre: sigmoid (1x), post: 2*sigmoid, res: identity
     out_activated = tl.where(
-        is_pre_program, tl.sigmoid(out),
-        tl.where(is_post_program, 2.0 * tl.sigmoid(out), out)
+        is_pre_program | is_post_program,
+        sigmoid_out * (1.0 + is_post_program.to(tl.float32)),
+        out
     )
 
     out_ptr = tl.where(is_pre_program, out_pre_ptr,
