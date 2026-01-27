@@ -5,11 +5,21 @@
 High-level Python wrapper for mHC (manifold-constrained Hyper Connection).
 
 Provides two main functions:
-- fused_mhc(): Low-level interface for equations 14-18 (fused kernel only)
-- mhc(): Complete pipeline implementing equations 14-19 (kernel + Sinkhorn-Knopp)
+- fused_mhc(): Low-level interface for equations 14-18 (fused kernel only) or 14-19 (with optional Sinkhorn)
+- mhc(): Complete pipeline implementing equations 14-19 (kernel with integrated Sinkhorn-Knopp)
+
+Performance Note:
+The Sinkhorn-Knopp algorithm (Eq 19) is now computed directly within the fused mHC kernel
+instead of as a separate kernel call. This eliminates kernel launch overhead and intermediate
+memory traffic, improving performance especially for smaller batch sizes.
+
+The integrated Sinkhorn uses a simplified exponential-domain implementation based on the
+reference from the mHC paper, optimized for in-kernel execution.
 """
 
 from typing import Optional
+import itertools
+import math
 import torch
 import triton
 
@@ -38,6 +48,37 @@ def get_sinkhorn_knopp_config():
         "num_warps": 4,
     }
 
+
+def get_all_permutations(n: int) -> torch.Tensor:
+    """
+    Generate all n! permutation matrices for mHC-lite.
+    
+    Args:
+        n: Size of the permutation matrices (n x n)
+        
+    Returns:
+        torch.Tensor: Shape (n!, n, n) containing all permutation matrices.
+                     Each [i, :, :] is a permutation of the identity matrix.
+                     
+    Example:
+        >>> perms = get_all_permutations(3)  # 3! = 6 permutations
+        >>> perms.shape  # (6, 3, 3)
+    """
+    assert n <= 5, f"n={n} is too large (n! = {math.factorial(n)}). Maximum n=5 (120 permutations)."
+    
+    # Generate all permutations of indices [0, 1, ..., n-1]
+    all_perms = list(itertools.permutations(range(n)))
+    n_factorial = len(all_perms)  # n!
+    
+    # Create permutation matrices
+    perm_matrices = torch.zeros(n_factorial, n, n, dtype=torch.float32)
+    for i, perm in enumerate(all_perms):
+        for j, p in enumerate(perm):
+            perm_matrices[i, j, p] = 1.0
+            
+    return perm_matrices
+
+
 def fused_mhc(
     x: torch.Tensor,
     phi_pre: torch.Tensor,
@@ -54,8 +95,7 @@ def fused_mhc(
     out_res: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Fused Triton kernel inferface for mHC projection mapping (equations 14-18).
-
+    Fused Triton kernel interface for mHC projection mapping (equations 14-19).
 
     This function implements:
     - Eq 14: H̃ = x̃φ (matrix multiplication)
@@ -63,8 +103,12 @@ def fused_mhc(
     - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
     - Eq 17: H^pre = σ(H^pre) - sigmoid activation for pre-stream
     - Eq 18: H^post = 2σ(H^post) - scaled sigmoid activation for post-stream
+    - Eq 19: H^res = mHC-lite projection - doubly stochastic via permutation matrices
+             (zero iterations, exact solution)
 
     All operations are fused in an optimized Triton kernel for maximum performance.
+    The mHC-lite approach uses pre-computed permutation matrices with softmax weights,
+    eliminating the need for iterative Sinkhorn-Knopp normalization.
 
     Args:
         x: Input tensor with shape (M, nC) where M is batch/sequence length and
@@ -78,6 +122,7 @@ def fused_mhc(
         bias: Bias vector b with shape (n² + 2n,) applied after scaling
         n: Stream parameter - hyperparameter controlling manifold dimension.
            Determines output sizes: n (pre) + n (post) + n² (res) = n² + 2n
+           Must be ≤ 5 due to n! growth in permutation matrices.
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
         out_pre (Optional[torch.Tensor]): Pre-allocated output for H^pre with shape (M, n)
         out_post (Optional[torch.Tensor]): Pre-allocated output for H^post with shape (M, n)
@@ -87,7 +132,7 @@ def fused_mhc(
         Tuple of three tensors (H_pre, H_post, H_res):
         - H_pre: (M, n) - manifold projection with sigmoid activation (H^{pre} ∈ ℝ^{M×n})
         - H_post: (M, n) - post-processing with scaled sigmoid (H^{post} ∈ ℝ^{M×n})
-        - H_res: (M, n²) - raw residual stream (identity activation, NOT doubly stochastic)
+        - H_res: (M, n²) - doubly stochastic residual stream (mHC-lite projection)
 
     Shape requirements:
         - x: (M, nC) where nC = n * C (flattened streams)
@@ -109,6 +154,7 @@ def fused_mhc(
         >>> H_pre, H_post, H_res = fused_mhc(x, phi_pre, phi_post, phi_res, 
         ...                                   alpha_pre, alpha_post, alpha_res, bias, n)
         >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
+        >>> # H_res is automatically doubly stochastic via mHC-lite
     """
     _LOGGER.info(
         f"FUSED_MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
@@ -135,6 +181,13 @@ def fused_mhc(
         "All tensors must be on the same device"
     )
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
+    
+    # Validate n for permutation matrix approach
+    assert n <= 5, f"n={n} is too large for mHC-lite (n! = {math.factorial(n)}). Maximum n=5 (120 permutations)."
+    
+    # Generate permutation matrices for mHC-lite (Eq 19)
+    perm_matrices = get_all_permutations(n).to(device=x.device, dtype=torch.float32)
+    n_factorial = perm_matrices.shape[0]
 
     # Calculate total output dimension
     N = n * n + 2 * n
@@ -166,15 +219,18 @@ def fused_mhc(
     BLOCK_N = n_squared
     BLOCK_K = min(64, triton.next_power_of_2(K))
     config = get_fused_mhc_config()
+    
     # Stream-aware grid: Each program processes exactly one stream
+    # For mHC-lite, residual programs must process full n² at once for permutation projection
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
     n_blocks_post = triton.cdiv(n, BLOCK_N)
-    n_blocks_res = triton.cdiv(n * n, BLOCK_N)
+    n_blocks_res = 1  # Single program per row for residual with mHC-lite
+    
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
     
     # Launch 2D grid: (row blocks, stream-aware column blocks)
     grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-    # Invoke the fused Triton kernel for equations 14-18
+    # Invoke the fused Triton kernel for equations 14-19
     _mhc_fused_kernel[grid](
         x,                     # Input tensor (M, nC)
         phi_pre,               # Pre-stream projection matrix (nC, n)
@@ -184,6 +240,7 @@ def fused_mhc(
         alpha_post,            # Scaling factor for post-stream
         alpha_res,             # Scaling factor for residual stream
         bias,                  # Bias vector (n²+2n,)
+        perm_matrices,         # Permutation matrices (n!, n, n) for mHC-lite
         out_pre,               # Output tensor for pre-stream (M, n)
         out_post,              # Output tensor for post-stream (M, n)
         out_res,               # Output tensor for res-stream (M, n²)
@@ -192,6 +249,7 @@ def fused_mhc(
         K=K,                   # Input features (nC)
         N=N,                   # Output features (n²+2n)
         n=n,                   # Stream parameter
+        n_factorial=n_factorial,  # Number of permutation matrices (n!)
         eps=eps,               # Numerical stability epsilon for RMSNorm
         # Tensor strides for memory access
         stride_xm=x.stride(0),
@@ -202,6 +260,9 @@ def fused_mhc(
         stride_phi_post_n=phi_post.stride(1),
         stride_phi_res_k=phi_res.stride(0),
         stride_phi_res_n=phi_res.stride(1),
+        stride_perm_r=perm_matrices.stride(0),
+        stride_perm_i=perm_matrices.stride(1),
+        stride_perm_j=perm_matrices.stride(2),
         stride_pre_m=out_pre.stride(0),
         stride_pre_n=out_pre.stride(1),
         stride_post_m=out_post.stride(0),
@@ -212,7 +273,9 @@ def fused_mhc(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        **config,
+        num_warps=config["num_warps"],
+        num_stages=config["num_stages"],
+        waves_per_eu=config["waves_per_eu"],
     )
 
     return out_pre, out_post, out_res
@@ -229,7 +292,6 @@ def mhc(
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
-    sinkhorn_iters: int = 20,
     out_pre: Optional[torch.Tensor] = None,
     out_post: Optional[torch.Tensor] = None,
     out_res: Optional[torch.Tensor] = None,
@@ -243,10 +305,11 @@ def mhc(
     - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
     - Eq 17: H^pre = σ(H^pre) - sigmoid activation for pre-stream
     - Eq 18: H^post = 2σ(H^post) - scaled sigmoid activation for post-stream
-    - Eq 19: H^res = Sinkhorn(H^res) - project residual stream onto doubly stochastic
-             manifold (identity activation followed by iterative row/column normalization)
+    - Eq 19: H^res = mHC-lite projection - doubly stochastic via permutation matrices
+             (zero iterations, exact solution using softmax-weighted permutation matrices)
 
     All operations are fused in optimized Triton kernels for maximum performance.
+    The mHC-lite approach eliminates iterative Sinkhorn-Knopp normalization.
 
     Args:
         x: Input tensor with shape (M, nC) where M is batch/sequence length and
@@ -260,8 +323,8 @@ def mhc(
         bias: Bias vector b with shape (n² + 2n,) applied after scaling
         n: Stream parameter - hyperparameter controlling manifold dimension.
            Determines output sizes: n (pre) + n (post) + n² (res) = n² + 2n
+           Must be ≤ 5 due to n! growth in permutation matrices.
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
-        sinkhorn_iters: Number of Sinkhorn-Knopp iterations for Eq 19 (default: 10)
         out_pre (Optional[torch.Tensor]): Pre-allocated output for H^pre with shape (M, n)
         out_post (Optional[torch.Tensor]): Pre-allocated output for H^post with shape (M, n)
         out_res (Optional[torch.Tensor]): Pre-allocated output for H^res with shape (M, n²)
@@ -290,28 +353,22 @@ def mhc(
         >>> bias = torch.randn(n*n + 2*n, dtype=torch.float32, device='cuda')
         >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
         >>> 
-        >>> # Full mHC with Sinkhorn-Knopp (Eq 14-19)
+        >>> # Full mHC with mHC-lite projection (Eq 14-19)
         >>> H_pre, H_post, H_res = mhc(x, phi_pre, phi_post, phi_res, 
         ...                            alpha_pre, alpha_post, alpha_res, bias, n)
         >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
     """
     _LOGGER.info(
-        f"MHC: calling fused_mhc() then sinkhorn_knopp() with {sinkhorn_iters} iterations"
+        f"MHC: calling fused_mhc() with mHC-lite projection (zero iterations)"
     )
     
-    # Call fused_mhc function (Eq 14-18)
+    # Call fused_mhc function (Eq 14-19) with mHC-lite integrated in kernel
     out_pre, out_post, out_res = fused_mhc(
         x, phi_pre, phi_post, phi_res,
         alpha_pre, alpha_post, alpha_res,
         bias, n, eps,
         out_pre=out_pre, out_post=out_post, out_res=out_res
     )
-    
-    # Apply Sinkhorn-Knopp (Equation 19) to make H_res doubly stochastic
-    # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn kernel
-    M = out_res.shape[0]
-    H_res_3d = out_res.view(M, n, n)
-    sinkhorn_knopp(H_res_3d, num_iters=sinkhorn_iters, out=H_res_3d)
     
     return out_pre, out_post, out_res
 

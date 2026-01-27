@@ -53,7 +53,6 @@ def run_benchmark(args):
     """Run mHC benchmark with specified configuration."""
     dtype = arg_to_torch_dtype[args.dtype]
     mode = args.mode
-    sinkhorn_iters = args.sinkhorn_iters
     
     configs = get_benchmark_configs(args)
     x_vals_list = configs
@@ -78,11 +77,11 @@ def run_benchmark(args):
     
     benchmark_name = get_caller_name_no_ext()
     if mode == "full":
-        benchmark_name += f"_full_sinkhorn{sinkhorn_iters}"
+        benchmark_name += "_full_mhc_lite"
     elif mode == "fused":
         benchmark_name += "_fused_only"
     elif mode == "sinkhorn":
-        benchmark_name += f"_sinkhorn_only_{sinkhorn_iters}iters"
+        benchmark_name += "_sinkhorn_only"
     
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -118,17 +117,21 @@ def run_benchmark(args):
         # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
         flops_rms = 4.0 * M * nC
         
-        # Eq 19: Sinkhorn-Knopp (separate kernel)
-        # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
-        # Per normalization: sum + divide ≈ 2n ops per row/col
-        # Total per iteration: 2 * 2 * M * n * n = 4 * M * n * n ops
-        flops_sinkhorn = 4.0 * M * n * n * sinkhorn_iters
+        # Eq 19: mHC-lite projection (zero iterations!)
+        # Softmax over n! weights: ~4 * n! ops per sample
+        # Weighted sum of n! permutation matrices: n! * n² multiplications per sample
+        n_factorial = 1
+        for i in range(1, n + 1):
+            n_factorial *= i
+        flops_mhc_lite = M * (4.0 * n_factorial + n_factorial * n * n)
         
         if mode == "full":
-            total_flops = flops_matmul + flops_rms + flops_sinkhorn
+            total_flops = flops_matmul + flops_rms + flops_mhc_lite
         elif mode == "fused":
             total_flops = flops_matmul + flops_rms
         elif mode == "sinkhorn":
+            # Standalone Sinkhorn uses 20 iterations by default
+            flops_sinkhorn = 4.0 * M * n * n * 20
             total_flops = flops_sinkhorn
         
         # Compute memory traffic
@@ -157,26 +160,26 @@ def run_benchmark(args):
             M * n * n * elem_size  # out_res
         )
         
-        # Sinkhorn-Knopp memory traffic (in-place operations)
-        mem_sinkhorn = 2 * M * n * n * elem_size * sinkhorn_iters
+        # mHC-lite: permutation matrices (n!, n, n) in fp32
+        n_factorial = 1
+        for i in range(1, n + 1):
+            n_factorial *= i
+        mem_perm = n_factorial * n * n * 4  # fp32
         
         if mode == "full":
-            mem_read += mem_sinkhorn / 2
-            mem_write += mem_sinkhorn / 2
-            total_mem = mem_read + mem_write
+            total_mem = mem_read + mem_write + mem_perm
         elif mode == "fused":
-            total_mem = mem_read + mem_write
+            total_mem = mem_read + mem_write + mem_perm
         elif mode == "sinkhorn":
-            # Sinkhorn-only: read/write H_res matrix
-            total_mem = mem_sinkhorn
+            # Sinkhorn-only: read/write H_res matrix (20 iterations)
+            total_mem = 2 * M * n * n * elem_size * 20
         
         # Create benchmark function
         if mode == "full":
             fn = lambda: mhc(
                 x, phi_pre, phi_post, phi_res,
                 alpha_pre, alpha_post, alpha_res,
-                bias, n_streams,
-                sinkhorn_iters=sinkhorn_iters
+                bias, n_streams
             )
         elif mode == "fused":
             fn = lambda: fused_mhc(
@@ -193,7 +196,8 @@ def run_benchmark(args):
                 bias, n_streams
             )
             H_res_3d = H_res_input.view(M, n, n)
-            fn = lambda: sinkhorn_knopp(H_res_3d, num_iters=sinkhorn_iters, out=H_res_3d)
+            # Use default 20 iterations for standalone Sinkhorn benchmark
+            fn = lambda: sinkhorn_knopp(H_res_3d, num_iters=20, out=H_res_3d)
         
         # Benchmark
         ms = triton.testing.do_bench(fn)
@@ -253,13 +257,7 @@ def parse_args():
         type=str,
         default="full",
         choices=["full", "fused", "sinkhorn"],
-        help="Benchmark mode: 'full' (fused+sinkhorn), 'fused' (fused kernel only), 'sinkhorn' (sinkhorn-only)"
-    )
-    parser.add_argument(
-        "-sinkhorn_iters",
-        type=int,
-        default=20,
-        help="Number of Sinkhorn-Knopp iterations (default: 20)"
+        help="Benchmark mode: 'full' (mHC with mHC-lite), 'fused' (fused kernel only), 'sinkhorn' (standalone Sinkhorn kernel)"
     )
     
     # Output options
