@@ -660,7 +660,6 @@ template <index_t vec, typename Layout>
 OPUS_H_D constexpr auto layout_to_vectorized_issue_space() {
     constexpr auto issue_space = layout_to_issue_space<Layout>();
     constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-    static_assert(size<decltype(issue_space_vec)>() == Layout::coord_rank);
     return issue_space_vec;
 }
 
@@ -829,7 +828,7 @@ template<typename T> constexpr bool is_dtype_v = is_dtype<remove_cvref_t<T>>::va
 
 REGISTER_DTYPE(fp32, float)
 REGISTER_DTYPE(bf16, unsigned short)
-REGISTER_DTYPE(fp16, _Float16)
+REGISTER_DTYPE(fp16, __fp16)
 REGISTER_DTYPE(fp8 , _BitInt(8))
 REGISTER_DTYPE(bf8 , unsigned _BitInt(8))
 REGISTER_DTYPE(i32 , int32_t)
@@ -915,7 +914,7 @@ template<> OPUS_D float       min<float>(const float&a, const float&b) { return 
 
 template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = max(a, b); return max(max_0, max(min_0, c)); }
 template<> OPUS_D float       med3<float>(const float&a, const float&b, const float&c) { return __builtin_amdgcn_fmed3f(a, b, c); }
-template<> OPUS_D _Float16    med3<_Float16>(const _Float16&a, const _Float16&b, const _Float16&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
+template<> OPUS_D __fp16      med3<__fp16>(const __fp16&a, const __fp16&b, const __fp16&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // buffer load/store related
 OPUS_D constexpr auto buffer_default_config() {
@@ -981,6 +980,16 @@ struct gmem {
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
     OPUS_D void async_load(__shared__ void* dst, int v_os, int s_os = 0, number<aux> = {}) { _async_load<vec>(dst, v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
+
+    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load(__shared__ void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
+        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        scalar_type* smem_ptr = reinterpret_cast<scalar_type*>(smem_base);
+        static_ford(issue_space_vec, [&](auto... ids) {
+            async_load<vec>(smem_ptr + u_smem(ids...), u_gmem(ids...), s_os, number<aux>{});
+        });
+    }
 
     template<index_t vec = 1, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>   // os in unit of T and cast to vector with vec
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
@@ -1513,7 +1522,7 @@ OPUS_D decltype(auto) make_tiled_mma(ES, TS, WS, WA&& = {}, TA&& = {}) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 template<index_t cached_vec = 0, typename L, typename D, typename S, typename C, std::enable_if_t<is_layout_v<L> && is_tuple_v<D> && is_tuple_v<S> && is_tuple_v<C>, bool> = true>
 OPUS_D constexpr auto partition_layout(L&& layout, D&& dims, S&& shapes, C&& p_coord) {
-    static_assert(L::rank == D::size());  OPUS_KP_(dims);
+    OPUS_KP_(dims);
     return make_layout<cached_vec>(std::forward<S>(shapes), unfold_x_stride(std::forward<D>(dims), std::forward<S>(shapes), layout.stride()), unfold_p_coord(std::forward<D>(dims), p_coord));
 }
 // partition, use cached_vec to dispatch which layout implementation. cached_vec < 0 : "layout", cached_vec == 0 : "layout_linear", cached_vec > 0 : "layout_cached"
