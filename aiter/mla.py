@@ -276,7 +276,7 @@ def mla_decode_fwd(
         if num_kv_splits is None:
             num_kv_splits = get_cu_num()
         if nhead == 16 or (
-            nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
+            (nhead == 128 or nhead == 32) and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
         ):
             # Natively support cases
             pass
@@ -307,6 +307,35 @@ def mla_decode_fwd(
             else None
         )
 
+        def print_ptr(name, t: torch.Tensor):
+            addr = t.data_ptr()
+            size = t.numel() * t.element_size()
+            print(
+                f"{name}: [{hex(addr)}, {hex(addr + size)})",
+                f" numel={t.numel()}, elem_size={t.element_size()}, shape={t.shape}",
+            )
+
+        print("=== Persistent Mode Tensor Info ===")
+        for name, t in [
+            ("q", q),
+            ("kv_buffer", kv_buffer),
+            ("qo_indptr", qo_indptr),
+            ("kv_indptr", kv_indptr),
+            ("kv_indices", kv_indices),
+            ("kv_last_page_lens", kv_last_page_lens),
+            ("num_kv_splits_indptr", num_kv_splits_indptr),
+            ("work_meta_data", work_meta_data),
+            ("work_indptr", work_indptr),
+            ("work_info_set", work_info_set),
+            ("logits", logits),
+            ("attn_lse", attn_lse),
+            ("o", o),
+        ]:
+            if t is not None:
+                print_ptr(name, t)
+
+        print("====================================")
+        
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,

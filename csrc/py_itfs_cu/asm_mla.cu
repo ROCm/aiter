@@ -173,24 +173,24 @@ void mla_decode_stage1_asm_fwd(
     args.ptr_RP = output.data_ptr(); //final output
     
 
-    // std::cout << "mla args" << std::endl;
-    // std::cout << "ptr_R: " << args.ptr_R << std::endl;
-    // std::cout << "ptr_LSE: " << args.ptr_LSE << std::endl;
-    // std::cout << "ptr_Q: " << args.ptr_Q << std::endl;
-    // std::cout << "ptr_KV: " << args.ptr_KV << std::endl;
-    // std::cout << "ptr_LTP: " << args.ptr_LTP << std::endl;
-    // std::cout << "ptr_LTD: " << args.ptr_LTD << std::endl;
-    // std::cout << "ptr_LTL: " << args.ptr_LTL << std::endl;
-    // std::cout << "scalar: " << args.scalar << std::endl;
-    // std::cout << "s_MQA: " << args.s_MQA << std::endl;
-    // std::cout << "s_kv_split: " << args.s_kv_split << std::endl;
-    // std::cout << "s_Q_Bs: " << args.s_Q_Bs << std::endl;
-    // std::cout << "s_Bs: " << args.s_Bs << std::endl;
-    // std::cout << "s_log2_plen: " << args.s_log2_plen << std::endl;
-    // std::cout << "ptr_RP: " << args.ptr_RP << std::endl;
-    // std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
-    // std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
-    // std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
+    std::cout << "mla args" << std::endl;
+    std::cout << "ptr_R: " << args.ptr_R << std::endl;
+    std::cout << "ptr_LSE: " << args.ptr_LSE << std::endl;
+    std::cout << "ptr_Q: " << args.ptr_Q << std::endl;
+    std::cout << "ptr_KV: " << args.ptr_KV << std::endl;
+    std::cout << "ptr_LTP: " << args.ptr_LTP << std::endl;
+    std::cout << "ptr_LTD: " << args.ptr_LTD << std::endl;
+    std::cout << "ptr_LTL: " << args.ptr_LTL << std::endl;
+    std::cout << "scalar: " << args.scalar << std::endl;
+    std::cout << "s_MQA: " << args.s_MQA << std::endl;
+    std::cout << "s_kv_split: " << args.s_kv_split << std::endl;
+    std::cout << "s_Q_Bs: " << args.s_Q_Bs << std::endl;
+    std::cout << "s_Bs: " << args.s_Bs << std::endl;
+    std::cout << "s_log2_plen: " << args.s_log2_plen << std::endl;
+    std::cout << "ptr_RP: " << args.ptr_RP << std::endl;
+    std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
+    std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
+    std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -287,10 +287,14 @@ void mla_decode_stage1_asm_fwd(
                 config_max_seqlen_q = 0;
                 sub_Q = 64;
             }
-        }else if (q_type == "fp8"){
+        }else if (q_type == "fp8" && kv_type == "fp8"){
             if((max_seqlen_q == 4) && persistent){
                 config_max_seqlen_q = 4;
-                SUB_Q = 128;
+                sub_Q = 128;
+            } else {
+                TORCH_CHECK(false, __func__, 
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=4 in persistent mode. "
+                    "Got decode_qlen=", max_seqlen_q, ", persistent=", persistent);
             }
         }
     } else if (gqa_ratio == 64){

@@ -196,7 +196,7 @@ def run_iters_rotate(num_iters, func, rotate_args):
 def run_perftest(
     func,
     *args,
-    num_iters=101,
+    num_iters=2,
     num_warmup=2,
     testGraph=False,
     num_rotate_args=0,

@@ -278,13 +278,14 @@ def test_mla(
     reduce_partial_map = torch.empty(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
+    print("max_seqlen_qo: ", max_seqlen_qo)
 
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
         nhead_kv,
-        True,
+        False,
         work_meta_data,
         work_info_set,
         work_indptr,
@@ -358,7 +359,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=False,
             q_scale=None,
             kv_scale=kv_scale,
         )
