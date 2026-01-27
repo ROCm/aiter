@@ -988,12 +988,8 @@ def fused_moe_2stages(
             a1 = torch.empty((token_num * topk, model_dim), dtype=dtypes.i8, device=device)
             a1_scale = torch.empty((token_num * topk), dtype=dtypes.fp32, device=device)
             topk_ids_sq = topk_ids
-            # Expert-parallel mode may pass per-local-expert smooth scales while `topk_ids` are global.
-            # Remap to local expert ids (matches asm_moe behavior) when needed.
             if expert_mask is not None and smooth_a1.shape[0] != expert_mask.numel():
-                local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
-                local_expert_hash[local_expert_hash > 0] -= 1
-                topk_ids_sq = local_expert_hash[topk_ids_sq]
+                topk_ids_sq = _get_local_expert_hash(expert_mask)[topk_ids_sq]
 
             aiter.moe_smoothquant_fwd(
                 a1,
@@ -1133,9 +1129,7 @@ def fused_moe_2stages(
             a2_scale = torch.empty((token_num, topk, 1), dtype=dtypes.fp32, device=device)
             topk_ids_sq2 = topk_ids
             if expert_mask is not None and smooth_a2.shape[0] != expert_mask.numel():
-                local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
-                local_expert_hash[local_expert_hash > 0] -= 1
-                topk_ids_sq2 = local_expert_hash[topk_ids_sq2]
+                topk_ids_sq2 = _get_local_expert_hash(expert_mask)[topk_ids_sq2]
 
             aiter.smooth_per_token_scaled_quant(
                 a2_out,
@@ -1618,6 +1612,19 @@ _FLYDSL_COMPILE_MOE_GEMM2 = None
 _FLYDSL_MOE_GEMM1_CACHE = {}
 _FLYDSL_MOE_GEMM2_CACHE = {}
 _FLYDSL_SCRATCH_CACHE = {}
+_LOCAL_EXPERT_HASH_CACHE = {}
+
+
+def _get_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
+    """Cache global->local expert id map for EP."""
+    key = (int(expert_mask.device.index), int(expert_mask.numel()), int(expert_mask.data_ptr()))
+    cached = _LOCAL_EXPERT_HASH_CACHE.get(key)
+    if cached is not None and cached.device == expert_mask.device:
+        return cached
+    local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+    local_expert_hash[local_expert_hash > 0] -= 1
+    _LOCAL_EXPERT_HASH_CACHE[key] = local_expert_hash
+    return local_expert_hash
 
 
 def _get_flydsl_compile_fns():
@@ -1729,6 +1736,7 @@ def flydsl_moe_stage1(
         "YES",
         "yes",
     )
+    keep_fp16_for_stage2 = True #hack here, bf16 out is slow. temp use fp16, todo fix bf16 atomic
     out_kernel = out
     out_dtype_kernel = out_dtype
     if stage1_fp16_out and dtype == torch.bfloat16:
@@ -1791,6 +1799,9 @@ def flydsl_moe_stage1(
         int(blocks),
     )
     if out_kernel is not out:
+        if keep_fp16_for_stage2:
+            # Downstream stage2 smoothquant/quant will consume fp16 directly.
+            return out_kernel
         out.copy_(out_kernel.to(dtypes.bf16))
     return out
 
