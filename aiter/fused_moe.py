@@ -440,6 +440,7 @@ def fused_moe_1stage(
             )
             return moe_buf
 
+        fc2_smooth_scale_ = getattr(aiter, "FC2_SMOOTH_SCALE", None) if isG1U1 else None
         fmoe_func(
             moe_buf,
             a1,
@@ -454,7 +455,7 @@ def fused_moe_1stage(
             w1_scale,
             w2_scale,
             kernelName,
-            fc2_smooth_scale=None,
+            fc2_smooth_scale=fc2_smooth_scale_,
             activation=activation,
         )
     return moe_buf
