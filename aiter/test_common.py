@@ -124,6 +124,11 @@ def perftest(
 def benchmark():
     def decorator(func):
         def wrapper(*args, **kwargs):
+            print("before emptying cache summary")
+            print(torch.cuda.memory_summary(device=None))
+            torch.cuda.empty_cache()
+            print("after emptying cache summary")
+            print(torch.cuda.memory_summary(device=None))
             callargs = log_args(func, *args, **kwargs)
             ret = func(*args, **kwargs)
             if ret is not None:
