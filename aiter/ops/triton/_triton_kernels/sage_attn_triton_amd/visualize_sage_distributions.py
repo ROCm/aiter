@@ -39,17 +39,18 @@ def unpack_fp4_to_fp32(uint8_tensor):
     mantissa = (fp4_values & 0x1).astype(np.float32)
     
     # Convert to float
-    # For e2m1: value = (-1)^sign * 2^(exp-1) * (1 + mantissa)
+    # For e2m1: value = (-1)^sign * 2^(exp-1) * (1 + mantissa * 0.5)
+    # The mantissa bit represents 0.5, so mantissa=0 → 1.0, mantissa=1 → 1.5
     # Special cases: exp=0 means subnormal or zero
     fp32_values = np.zeros_like(sign, dtype=np.float32)
     
     # Normal numbers (exp != 0)
     normal_mask = exp != 0
-    fp32_values[normal_mask] = (1 - 2 * sign[normal_mask]) * np.power(2.0, exp[normal_mask] - 1) * (1 + mantissa[normal_mask])
+    fp32_values[normal_mask] = (1 - 2 * sign[normal_mask]) * np.power(2.0, exp[normal_mask] - 1) * (1 + mantissa[normal_mask] * 0.5)
     
     # Subnormal numbers (exp == 0, mantissa != 0)
     subnormal_mask = (exp == 0) & (mantissa != 0)
-    fp32_values[subnormal_mask] = (1 - 2 * sign[subnormal_mask]) * np.power(2.0, -1) * mantissa[subnormal_mask]
+    fp32_values[subnormal_mask] = (1 - 2 * sign[subnormal_mask]) * np.power(2.0, -1) * (mantissa[subnormal_mask] * 0.5)
     
     # Reshape to [..., 2*D]
     new_shape = list(original_shape)
