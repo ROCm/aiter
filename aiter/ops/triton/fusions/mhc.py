@@ -15,6 +15,8 @@ import triton
 
 from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_fused_kernel,
+    _mhc_split_kernel,
+    _mhc_reduce_kernel,
     _sinkhorn_knopp_log_domain_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -26,7 +28,8 @@ def get_fused_mhc_config():
     return {
         "waves_per_eu": 1,
         "num_stages": 1,
-        "num_warps": 4
+        "num_warps": 4,
+        "NUM_KSPLIT": 1,
     }
 
 
@@ -110,8 +113,12 @@ def fused_mhc(
         ...                                   alpha_pre, alpha_post, alpha_res, bias, n)
         >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
     """
+    # Get config
+    config = get_fused_mhc_config()
+    num_ksplit = config.pop("NUM_KSPLIT")
+    
     _LOGGER.info(
-        f"FUSED_MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res}"
+        f"FUSED_MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} num_ksplit={num_ksplit}"
     )
     
     # Input shape extraction
@@ -129,6 +136,7 @@ def fused_mhc(
     assert n_post == n, f"phi_post shape mismatch: expected (K, {n}), got ({K_post}, {n_post})"
     assert n_squared == n * n, f"phi_res shape mismatch: expected (K, {n*n}), got ({K_res}, {n_squared})"
     assert bias.shape[0] == N_total_expected, f"Bias shape mismatch: expected ({N_total_expected},), got {bias.shape}"
+    assert num_ksplit >= 1, f"num_ksplit must be >= 1, got {num_ksplit}"
     
     # Validate devices
     assert x.device == phi_pre.device == phi_post.device == phi_res.device == bias.device, (
@@ -165,55 +173,160 @@ def fused_mhc(
     BLOCK_M = 64 if M >= 64 else 32
     BLOCK_N = n_squared
     BLOCK_K = min(64, triton.next_power_of_2(K))
-    config = get_fused_mhc_config()
+    
     # Stream-aware grid: Each program processes exactly one stream
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
     n_blocks_post = triton.cdiv(n, BLOCK_N)
     n_blocks_res = triton.cdiv(n * n, BLOCK_N)
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
     
-    # Launch 2D grid: (row blocks, stream-aware column blocks)
-    grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-    # Invoke the fused Triton kernel for equations 14-18
-    _mhc_fused_kernel[grid](
-        x,                     # Input tensor (M, nC)
-        phi_pre,               # Pre-stream projection matrix (nC, n)
-        phi_post,              # Post-stream projection matrix (nC, n)
-        phi_res,               # Residual stream projection matrix (nC, n²)
-        alpha_pre,             # Scaling factor for pre-stream
-        alpha_post,            # Scaling factor for post-stream
-        alpha_res,             # Scaling factor for residual stream
-        bias,                  # Bias vector (n²+2n,)
-        out_pre,               # Output tensor for pre-stream (M, n)
-        out_post,              # Output tensor for post-stream (M, n)
-        out_res,               # Output tensor for res-stream (M, n²)
-        # Shape parameters
-        M=M,                   # Number of rows (batch/sequence dimension)
-        K=K,                   # Input features (nC)
-        N=N,                   # Output features (n²+2n)
-        n=n,                   # Stream parameter
-        eps=eps,               # Numerical stability epsilon for RMSNorm
-        # Tensor strides for memory access
-        stride_xm=x.stride(0),
-        stride_xk=x.stride(1),
-        stride_phi_pre_k=phi_pre.stride(0),
-        stride_phi_pre_n=phi_pre.stride(1),
-        stride_phi_post_k=phi_post.stride(0),
-        stride_phi_post_n=phi_post.stride(1),
-        stride_phi_res_k=phi_res.stride(0),
-        stride_phi_res_n=phi_res.stride(1),
-        stride_pre_m=out_pre.stride(0),
-        stride_pre_n=out_pre.stride(1),
-        stride_post_m=out_post.stride(0),
-        stride_post_n=out_post.stride(1),
-        stride_res_m=out_res.stride(0),
-        stride_res_n=out_res.stride(1),
-        # Block sizes for tiling
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        **config,
-    )
+    if num_ksplit > 1:
+        # Split-K path: use split and reduce kernels
+        splitk_block_size = triton.cdiv(K, num_ksplit)
+        actual_ksplit = triton.cdiv(K, splitk_block_size)
+        max_ksplit = triton.next_power_of_2(num_ksplit)
+        
+        # Allocate intermediate buffers (float32 for precision)
+        acc_pre_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
+        acc_post_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
+        acc_res_partial = torch.empty((num_ksplit, M, n_squared), dtype=torch.float32, device=x.device)
+        acc_sq_partial = torch.empty((num_ksplit, M), dtype=torch.float32, device=x.device)
+        
+        # Launch split kernel with 3D grid: (M_blocks, N_blocks_total, NUM_KSPLIT)
+        grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
+        _mhc_split_kernel[grid_split](
+            x,
+            phi_pre,
+            phi_post,
+            phi_res,
+            acc_pre_partial,
+            acc_post_partial,
+            acc_res_partial,
+            acc_sq_partial,
+            # Dimensions
+            M=M,
+            K=K,
+            N=N,
+            n=n,
+            # Input strides
+            stride_xm=x.stride(0),
+            stride_xk=x.stride(1),
+            stride_phi_pre_k=phi_pre.stride(0),
+            stride_phi_pre_n=phi_pre.stride(1),
+            stride_phi_post_k=phi_post.stride(0),
+            stride_phi_post_n=phi_post.stride(1),
+            stride_phi_res_k=phi_res.stride(0),
+            stride_phi_res_n=phi_res.stride(1),
+            # Intermediate buffer strides
+            stride_acc_pre_k=acc_pre_partial.stride(0),
+            stride_acc_pre_m=acc_pre_partial.stride(1),
+            stride_acc_pre_n=acc_pre_partial.stride(2),
+            stride_acc_post_k=acc_post_partial.stride(0),
+            stride_acc_post_m=acc_post_partial.stride(1),
+            stride_acc_post_n=acc_post_partial.stride(2),
+            stride_acc_res_k=acc_res_partial.stride(0),
+            stride_acc_res_m=acc_res_partial.stride(1),
+            stride_acc_res_n=acc_res_partial.stride(2),
+            stride_acc_sq_k=acc_sq_partial.stride(0),
+            stride_acc_sq_m=acc_sq_partial.stride(1),
+            # Block sizes
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            NUM_KSPLIT=num_ksplit,
+            SPLITK_BLOCK_SIZE=splitk_block_size,
+            **config,
+        )
+        
+        # Launch reduce kernel with 2D grid: (M_blocks, N_blocks_total)
+        grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
+        _mhc_reduce_kernel[grid_reduce](
+            acc_pre_partial,
+            acc_post_partial,
+            acc_res_partial,
+            acc_sq_partial,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            out_pre,
+            out_post,
+            out_res,
+            # Dimensions
+            M=M,
+            K=K,
+            N=N,
+            n=n,
+            eps=eps,
+            # Intermediate buffer strides
+            stride_acc_pre_k=acc_pre_partial.stride(0),
+            stride_acc_pre_m=acc_pre_partial.stride(1),
+            stride_acc_pre_n=acc_pre_partial.stride(2),
+            stride_acc_post_k=acc_post_partial.stride(0),
+            stride_acc_post_m=acc_post_partial.stride(1),
+            stride_acc_post_n=acc_post_partial.stride(2),
+            stride_acc_res_k=acc_res_partial.stride(0),
+            stride_acc_res_m=acc_res_partial.stride(1),
+            stride_acc_res_n=acc_res_partial.stride(2),
+            stride_acc_sq_k=acc_sq_partial.stride(0),
+            stride_acc_sq_m=acc_sq_partial.stride(1),
+            # Output strides
+            stride_pre_m=out_pre.stride(0),
+            stride_pre_n=out_pre.stride(1),
+            stride_post_m=out_post.stride(0),
+            stride_post_n=out_post.stride(1),
+            stride_res_m=out_res.stride(0),
+            stride_res_n=out_res.stride(1),
+            # Block sizes
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            ACTUAL_KSPLIT=actual_ksplit,
+            MAX_KSPLIT=max_ksplit,
+            **config,
+        )
+    else:
+        # Launch 2D grid: (row blocks, stream-aware column blocks)
+        grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
+        # Invoke the fused Triton kernel for equations 14-18
+        _mhc_fused_kernel[grid](
+            x,                     # Input tensor (M, nC)
+            phi_pre,               # Pre-stream projection matrix (nC, n)
+            phi_post,              # Post-stream projection matrix (nC, n)
+            phi_res,               # Residual stream projection matrix (nC, n²)
+            alpha_pre,             # Scaling factor for pre-stream
+            alpha_post,            # Scaling factor for post-stream
+            alpha_res,             # Scaling factor for residual stream
+            bias,                  # Bias vector (n²+2n,)
+            out_pre,               # Output tensor for pre-stream (M, n)
+            out_post,              # Output tensor for post-stream (M, n)
+            out_res,               # Output tensor for res-stream (M, n²)
+            # Shape parameters
+            M=M,                   # Number of rows (batch/sequence dimension)
+            K=K,                   # Input features (nC)
+            N=N,                   # Output features (n²+2n)
+            n=n,                   # Stream parameter
+            eps=eps,               # Numerical stability epsilon for RMSNorm
+            # Tensor strides for memory access
+            stride_xm=x.stride(0),
+            stride_xk=x.stride(1),
+            stride_phi_pre_k=phi_pre.stride(0),
+            stride_phi_pre_n=phi_pre.stride(1),
+            stride_phi_post_k=phi_post.stride(0),
+            stride_phi_post_n=phi_post.stride(1),
+            stride_phi_res_k=phi_res.stride(0),
+            stride_phi_res_n=phi_res.stride(1),
+            stride_pre_m=out_pre.stride(0),
+            stride_pre_n=out_pre.stride(1),
+            stride_post_m=out_post.stride(0),
+            stride_post_n=out_post.stride(1),
+            stride_res_m=out_res.stride(0),
+            stride_res_n=out_res.stride(1),
+            # Block sizes for tiling
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            **config,
+        )
 
     return out_pre, out_post, out_res
 
@@ -261,7 +374,7 @@ def mhc(
         n: Stream parameter - hyperparameter controlling manifold dimension.
            Determines output sizes: n (pre) + n (post) + n² (res) = n² + 2n
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
-        sinkhorn_iters: Number of Sinkhorn-Knopp iterations for Eq 19 (default: 10)
+        sinkhorn_iters: Number of Sinkhorn-Knopp iterations for Eq 19 (default: 20)
         out_pre (Optional[torch.Tensor]): Pre-allocated output for H^pre with shape (M, n)
         out_post (Optional[torch.Tensor]): Pre-allocated output for H^post with shape (M, n)
         out_res (Optional[torch.Tensor]): Pre-allocated output for H^res with shape (M, n²)

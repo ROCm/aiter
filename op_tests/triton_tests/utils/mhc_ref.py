@@ -42,6 +42,7 @@ def mhc_torch(
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
+    return_with_sinkhorn: bool = True,
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of mHC projection mapping (Eq 14-19).
@@ -113,10 +114,13 @@ def mhc_torch(
     # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint
     # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn algorithm
     # Note: Use 20 iterations to match the default in the Triton mhc() implementation
-    M = H_res.shape[0]
-    H_res_3d = H_res.view(M, n, n)
-    H_res_ds = sinkhorn_knopp_log_domain_torch(H_res_3d, num_iters=20)
-    H_res = H_res_ds.view(M, -1)  # Reshape back to (M, n²)
+    if return_with_sinkhorn:
+        M = H_res.shape[0]
+        H_res_3d = H_res.view(M, n, n)
+        H_res_ds = sinkhorn_knopp_log_domain_torch(H_res_3d, num_iters=20)
+        H_res = H_res_ds.view(M, -1)  # Reshape back to (M, n²)
+    else:
+        H_res = H_res.to(torch.float32)
     
     # Return three separate streams
     return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)

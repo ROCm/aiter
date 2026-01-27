@@ -170,6 +170,310 @@ def _mhc_fused_kernel(
 
 
 @triton.jit
+def _mhc_split_kernel(
+    x_ptr,
+    phi_pre_ptr,
+    phi_post_ptr,
+    phi_res_ptr,
+    # Intermediate output buffers (float32)
+    acc_pre_ptr,      # (NUM_KSPLIT, M, n)
+    acc_post_ptr,     # (NUM_KSPLIT, M, n)
+    acc_res_ptr,      # (NUM_KSPLIT, M, n²)
+    acc_sq_ptr,       # (NUM_KSPLIT, M)
+    M: tl.constexpr,   # rows: x.shape[0] - the batch/sequence dimension
+    K: tl.constexpr,   # input features: nC = x.shape[1]
+    N: tl.constexpr,   # output features: n² + 2n - total output dimension
+    n: tl.constexpr,   # stream parameter controlling manifold dimension
+    stride_xm,
+    stride_xk,
+    stride_phi_pre_k,
+    stride_phi_pre_n,
+    stride_phi_post_k,
+    stride_phi_post_n,
+    stride_phi_res_k,
+    stride_phi_res_n,
+    # Strides for intermediate buffers
+    stride_acc_pre_k,
+    stride_acc_pre_m,
+    stride_acc_pre_n,
+    stride_acc_post_k,
+    stride_acc_post_m,
+    stride_acc_post_n,
+    stride_acc_res_k,
+    stride_acc_res_m,
+    stride_acc_res_n,
+    stride_acc_sq_k,
+    stride_acc_sq_m,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Split-K kernel for mHC - computes partial results for equations 14-15.
+    
+    Each program processes a portion of the K dimension and writes partial
+    dot products and sum-of-squares to intermediate buffers.
+    
+    Grid structure: (M_blocks, N_blocks_total, NUM_KSPLIT)
+    - pid_m: row block index
+    - pid_n: stream-aware column block index  
+    - pid_k: K-split index
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    # Row indices
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    
+    # Compute stream block counts
+    n_squared = n * n
+    n_blocks_pre = tl.cdiv(n, BLOCK_N)
+    n_blocks_post = n_blocks_pre
+    
+    # Determine stream type from pid_n
+    is_pre_program = pid_n < n_blocks_pre
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
+    
+    # Compute local block index within the stream
+    local_pid_n = tl.where(is_pre_program, pid_n,
+                           tl.where(is_post_program, pid_n - n_blocks_pre,
+                                    pid_n - n_blocks_pre - n_blocks_post))
+    
+    # Local column indices within the stream
+    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Output dimension for this stream
+    n_out = tl.where(is_pre_program, n, tl.where(is_post_program, n, n_squared))
+    
+    # Calculate K range for this split
+    split_k_start = pid_k * SPLITK_BLOCK_SIZE
+    split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+    
+    # Early exit if this split has no work
+    if split_k_start >= K:
+        return
+    
+    # Initialize accumulators
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # Select phi pointers and strides based on stream type
+    phi_ptr = tl.where(is_pre_program, phi_pre_ptr,
+                       tl.where(is_post_program, phi_post_ptr, phi_res_ptr))
+    stride_phi_k = tl.where(is_pre_program, stride_phi_pre_k,
+                       tl.where(is_post_program, stride_phi_post_k, stride_phi_res_k))
+    stride_phi_n = tl.where(is_pre_program, stride_phi_pre_n,
+                       tl.where(is_post_program, stride_phi_post_n, stride_phi_res_n))
+    
+    # Loop over this split's K range
+    k_span = split_k_end - split_k_start
+    num_k_iter = tl.cdiv(k_span, BLOCK_K)
+    
+    for k_idx in range(num_k_iter):
+        k = split_k_start + k_idx * BLOCK_K
+        rk = k + tl.arange(0, BLOCK_K)
+        
+        # Load x tile
+        x_tile = tl.load(
+            x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
+            mask=(rm[:, None] < M) & (rk[None, :] < split_k_end),
+            other=0.0,
+        )
+        
+        # Load phi tile
+        phi_tile = tl.load(
+            phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
+            mask=(rk[:, None] < split_k_end) & (rn_local[None, :] >= 0) & (rn_local[None, :] < n_out),
+            other=0.0,
+        )
+        
+        acc += tl.dot(x_tile, phi_tile)
+        x_tile_f32 = x_tile.to(tl.float32)
+        acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
+    
+    # Store partial results to intermediate buffers
+    # Select output buffer based on stream type
+    acc_ptr = tl.where(is_pre_program, acc_pre_ptr,
+                       tl.where(is_post_program, acc_post_ptr, acc_res_ptr))
+    stride_acc_k = tl.where(is_pre_program, stride_acc_pre_k,
+                       tl.where(is_post_program, stride_acc_post_k, stride_acc_res_k))
+    stride_acc_m = tl.where(is_pre_program, stride_acc_pre_m,
+                       tl.where(is_post_program, stride_acc_post_m, stride_acc_res_m))
+    stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n,
+                       tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n))
+    
+    # Store partial dot product
+    tl.store(
+        acc_ptr + pid_k * stride_acc_k + rm[:, None] * stride_acc_m + rn_local[None, :] * stride_acc_n,
+        acc,
+        mask=(rm[:, None] < M) & (rn_local[None, :] >= 0) & (rn_local[None, :] < n_out),
+    )
+    
+    # Store partial acc_sq only from pre-stream programs (to avoid redundant writes)
+    # All streams compute the same acc_sq value, so we only need to store once
+    if is_pre_program:
+        # Only the first N-block of pre-stream stores acc_sq
+        if local_pid_n == 0:
+            tl.store(
+                acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
+                acc_sq,
+                mask=rm < M,
+            )
+
+
+@triton.jit
+def _mhc_reduce_kernel(
+    # Intermediate buffers (input)
+    acc_pre_ptr,      # (NUM_KSPLIT, M, n)
+    acc_post_ptr,     # (NUM_KSPLIT, M, n)
+    acc_res_ptr,      # (NUM_KSPLIT, M, n²)
+    acc_sq_ptr,       # (NUM_KSPLIT, M)
+    # Parameters for post-processing
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    bias_ptr,
+    # Final outputs
+    out_pre_ptr,
+    out_post_ptr,
+    out_res_ptr,
+    # Dimensions
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    n: tl.constexpr,
+    eps: tl.constexpr,
+    # Strides for intermediate buffers
+    stride_acc_pre_k,
+    stride_acc_pre_m,
+    stride_acc_pre_n,
+    stride_acc_post_k,
+    stride_acc_post_m,
+    stride_acc_post_n,
+    stride_acc_res_k,
+    stride_acc_res_m,
+    stride_acc_res_n,
+    stride_acc_sq_k,
+    stride_acc_sq_m,
+    # Strides for final outputs
+    stride_pre_m,
+    stride_pre_n,
+    stride_post_m,
+    stride_post_n,
+    stride_res_m,
+    stride_res_n,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ACTUAL_KSPLIT: tl.constexpr,
+    MAX_KSPLIT: tl.constexpr,
+):
+    """
+    Reduce kernel for mHC - combines partial results and applies post-processing.
+    
+    Sums partial dot products and sum-of-squares across K-splits, then applies:
+    - RMS normalization (Eq 15)
+    - Bias + alpha scaling (Eq 16)
+    - Stream-specific activations (Eq 17-18)
+    
+    Grid structure: (M_blocks, N_blocks_total)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Row indices
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    
+    # Compute stream block counts
+    n_squared = n * n
+    n_blocks_pre = tl.cdiv(n, BLOCK_N)
+    n_blocks_post = n_blocks_pre
+    
+    # Determine stream type from pid_n
+    is_pre_program = pid_n < n_blocks_pre
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
+    
+    # Compute local block index within the stream
+    local_pid_n = tl.where(is_pre_program, pid_n,
+                           tl.where(is_post_program, pid_n - n_blocks_pre,
+                                    pid_n - n_blocks_pre - n_blocks_post))
+    
+    # Local column indices within the stream
+    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Global column index (for bias lookup)
+    col_offset = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
+    rn_global = rn_local + col_offset
+    
+    # Output dimension for this stream
+    n_out = tl.where(is_pre_program, n, tl.where(is_post_program, n, n_squared))
+    
+    # Select intermediate buffer based on stream type
+    acc_ptr = tl.where(is_pre_program, acc_pre_ptr,
+                       tl.where(is_post_program, acc_post_ptr, acc_res_ptr))
+    stride_acc_k = tl.where(is_pre_program, stride_acc_pre_k,
+                       tl.where(is_post_program, stride_acc_post_k, stride_acc_res_k))
+    stride_acc_m = tl.where(is_pre_program, stride_acc_pre_m,
+                       tl.where(is_post_program, stride_acc_post_m, stride_acc_res_m))
+    stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n,
+                       tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n))
+    
+    # Sum partial dot products across K-splits
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for ks in range(ACTUAL_KSPLIT):
+        acc_partial = tl.load(
+            acc_ptr + ks * stride_acc_k + rm[:, None] * stride_acc_m + rn_local[None, :] * stride_acc_n,
+            mask=(rm[:, None] < M) & (rn_local[None, :] >= 0) & (rn_local[None, :] < n_out),
+            other=0.0,
+        )
+        acc += acc_partial
+    
+    # Sum partial acc_sq across K-splits
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for ks in range(ACTUAL_KSPLIT):
+        acc_sq_partial = tl.load(
+            acc_sq_ptr + ks * stride_acc_sq_k + rm * stride_acc_sq_m,
+            mask=rm < M,
+            other=0.0,
+        )
+        acc_sq += acc_sq_partial
+    
+    # RMS NORMALIZATION (Eq 15)
+    rms = tl.sqrt(acc_sq / K + eps)
+    rsigma = 1.0 / rms
+    
+    # BIAS + ALPHA SCALING (Eq 16)
+    bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
+    alpha_val = tl.where(is_pre_program, alpha_pre,
+                        tl.where(is_post_program, alpha_post, alpha_res))
+    
+    # Apply Eq 16: H = (1/r) * α * H̃ + b
+    out = rsigma[:, None] * alpha_val * acc + bias[None, :]
+    
+    # Apply stream-specific activation
+    out_activated = tl.where(
+        is_pre_program, tl.sigmoid(out),
+        tl.where(is_post_program, 2.0 * tl.sigmoid(out), out)
+    )
+
+    out_ptr = tl.where(is_pre_program, out_pre_ptr,
+                       tl.where(is_post_program, out_post_ptr, out_res_ptr))
+    stride_out_m = tl.where(is_pre_program, stride_pre_m,
+                       tl.where(is_post_program, stride_post_m, stride_res_m))
+    stride_out_n = tl.where(is_pre_program, stride_pre_n,
+                       tl.where(is_post_program, stride_post_n, stride_res_n))
+    
+    tl.store(
+        out_ptr + rm[:, None] * stride_out_m + rn_local[None, :] * stride_out_n,
+        out_activated,
+        mask=(rm[:, None] < M) & (rn_local[None, :] >= 0) & (rn_local[None, :] < n_out),
+    )
+
+
+@triton.jit
 def _sinkhorn_knopp_log_domain_kernel(
     # Pointers
     logits_ptr,     # Input: (M, N, N) raw logits

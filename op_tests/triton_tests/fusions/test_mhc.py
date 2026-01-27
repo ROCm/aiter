@@ -327,6 +327,282 @@ def test_mhc_output_range():
 
 
 # =============================================================================
+# Split-K Tests
+# =============================================================================
+
+from unittest.mock import patch
+import sys
+
+
+def _make_split_k_config(num_ksplit):
+    """Helper to create config with specified NUM_KSPLIT."""
+    return {
+        "waves_per_eu": 1,
+        "num_stages": 1,
+        "num_warps": 4,
+        "NUM_KSPLIT": num_ksplit,
+    }
+
+
+@pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
+@pytest.mark.parametrize("num_ksplit", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_split_k_correctness(M, n, C, num_ksplit, dtype):
+    """
+    Test that split-K implementation matches the original fused kernel.
+    
+    Validates that splitting the K dimension across multiple programs produces
+    the same results as processing K in a single program.
+    """
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    # import aiter.ops.triton.fusions.mhc module
+    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, dtype)
+
+    # Reference: PyTorch implementation
+    H_pre_ref, H_post_ref, H_res_ref = mhc_torch(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams,
+        return_with_sinkhorn=False
+    )
+    
+    # Test: split-K kernel with patched config
+    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(num_ksplit)):
+        H_pre_split, H_post_split, H_res_split = fused_mhc(
+            x, phi_pre, phi_post, phi_res, 
+            alpha_pre, alpha_post, alpha_res, 
+            bias, n_streams
+        )
+
+    torch.testing.assert_close(
+        H_pre_split.to(torch.float32),
+        H_pre_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_post_split.to(torch.float32),
+        H_post_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_res_split.to(torch.float32),
+        H_res_ref.to(torch.float32),
+        atol=1e-2 if C < 1024 else 5e-2,
+        rtol=1e-2 if C < 1024 else 5e-2,
+    )
+
+
+@pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048)])
+@pytest.mark.parametrize("num_ksplit", [2, 4])
+def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
+    """
+    Test split-K with the full mhc() pipeline including Sinkhorn-Knopp.
+    
+    Validates that split-K works correctly when combined with the
+    Sinkhorn-Knopp post-processing step.
+    """
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    # import aiter.ops.triton.fusions.mhc module
+    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
+
+    # Reference: PyTorch implementation
+    H_pre_ref, H_post_ref, H_res_ref = mhc_torch(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams,
+        return_with_sinkhorn=True
+    )
+    
+    # Test: split-K kernel with full mhc pipeline
+    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(num_ksplit)):
+        H_pre_split, H_post_split, H_res_split = mhc(
+            x, phi_pre, phi_post, phi_res, 
+            alpha_pre, alpha_post, alpha_res, 
+            bias, n_streams
+        )
+
+    torch.testing.assert_close(
+        H_pre_split.to(torch.float32),
+        H_pre_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_post_split.to(torch.float32),
+        H_post_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_res_split.to(torch.float32),
+        H_res_ref.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.parametrize("num_ksplit", [1, 2, 4, 8])
+def test_split_k_various_splits(num_ksplit):
+    """
+    Test split-K with various split counts.
+    
+    Validates that the kernel handles different numbers of K-splits correctly,
+    including edge cases where num_ksplit may not evenly divide K.
+    """
+    torch.cuda.empty_cache()
+    # import aiter.ops.triton.fusions.mhc module
+    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
+
+    M, n, C = 32, 4, 1024
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
+
+    # Reference: PyTorch implementation
+    H_pre_torch, H_post_torch, H_res_torch = mhc_torch(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams, 
+        return_with_sinkhorn=False
+    )
+    
+    # Test: split-K kernel
+    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(num_ksplit)):
+        H_pre_split, H_post_split, H_res_split = fused_mhc(
+            x, phi_pre, phi_post, phi_res, 
+            alpha_pre, alpha_post, alpha_res, 
+            bias, n_streams
+        )
+
+    torch.testing.assert_close(
+        H_pre_split.to(torch.float32),
+        H_pre_torch.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_post_split.to(torch.float32),
+        H_post_torch.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("M, n, C", [(16, 4, 512), (32, 4, 1024)])
+def test_split_k_preallocated_output(M, n, C):
+    """
+    Test split-K with pre-allocated output tensors.
+    
+    Verifies that split-K correctly writes to user-provided output buffers.
+    """
+    torch.cuda.empty_cache()
+    # import aiter.ops.triton.fusions.mhc module
+    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
+    n_squared = n * n
+    out_pre = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    out_post = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
+
+    # Reference without split-K
+    H_pre_ref, H_post_ref, H_res_ref = mhc_torch(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams, 
+        return_with_sinkhorn=False
+    )
+    
+    # Test with split-K and pre-allocated outputs
+    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(2)):
+        result_pre, result_post, result_res = fused_mhc(
+            x, phi_pre, phi_post, phi_res, 
+            alpha_pre, alpha_post, alpha_res, 
+            bias, n_streams,
+            out_pre=out_pre, out_post=out_post, out_res=out_res
+        )
+
+    assert result_pre is out_pre
+    assert result_post is out_post
+    assert result_res is out_res
+
+    torch.testing.assert_close(
+        out_pre.to(torch.float32),
+        H_pre_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        out_post.to(torch.float32),
+        H_post_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        out_res.to(torch.float32),
+        H_res_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_split_k_large_k():
+    """
+    Test split-K with large K dimension where split-K should be beneficial.
+    
+    Validates correctness for typical mHC usage with large input features.
+    """
+    torch.cuda.empty_cache()
+    # import aiter.ops.triton.fusions.mhc module
+    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
+
+    M, n, C = 64, 4, 2048  # K = n * C = 8192
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
+
+    # Reference
+    H_pre_ref, H_post_ref, H_res_ref = mhc_torch(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams, 
+        return_with_sinkhorn=False
+    )
+    
+    # Test with 4-way split
+    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(4)):
+        H_pre_split, H_post_split, H_res_split = fused_mhc(
+            x, phi_pre, phi_post, phi_res, 
+            alpha_pre, alpha_post, alpha_res, 
+            bias, n_streams
+        )
+
+    # Use slightly relaxed tolerance for larger K due to more accumulation steps
+    torch.testing.assert_close(
+        H_pre_split.to(torch.float32),
+        H_pre_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_post_split.to(torch.float32),
+        H_post_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_res_split.to(torch.float32),
+        H_res_ref.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+# =============================================================================
 # Sinkhorn-Knopp Tests
 # =============================================================================
 
