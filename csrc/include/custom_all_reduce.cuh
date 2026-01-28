@@ -1,7 +1,7 @@
 #pragma once
 /*
  * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (C) 2024-2025, The vLLM team.
+ * Copyright (C) 2024-2026, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -541,15 +541,16 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(RankData* _dp,
-                                                                     RankSignals sg,
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage_write_mode(RankData* _dp,
+                                          RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+                                          volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+                                          Signal* self_sg,
+                                          T* __restrict__ result,
+                                          int rank,
+                                          int size)
 {
     constexpr int pack_size = packed_t<T>::P::size;
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
@@ -573,16 +574,16 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
         tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[rank];
- 
+
     // stage1: write local rank data to remote rank
-    int start        = warp_id * part;
-    int end          = warp_id == ngpus - 1 ? size : start + part;
+    int start = warp_id * part;
+    int end   = warp_id == ngpus - 1 ? size : start + part;
     for(int idx = start + tid; idx < end; idx += stride)
     {
         tmps[warp_id][rank * part + idx - start] = ptrs[rank][idx];
     }
     start_sync<ngpus>(sg, self_sg, rank);
- 
+
     // stage 2: reduce scatter & write result to remote rank
     for(int idx = tid; idx < part; idx += stride)
     {
@@ -619,10 +620,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
         }
         __syncthreads();
         // send data to remote rank
-        tmps[warp_id][rank * part + idx + stage3_offset] = *(reinterpret_cast<P*>(&res_smem[0]) + lane_id);
+        tmps[warp_id][rank * part + idx + stage3_offset] =
+            *(reinterpret_cast<P*>(&res_smem[0]) + lane_id);
     }
     end_sync<ngpus>(sg, self_sg, rank);
- 
+
     // stage 3: get the output from tmp_buffer
     for(int idx = threadIdx.x + blockIdx.x * blockDim.x; idx < size; idx += gridDim.x * blockDim.x)
     {
@@ -828,12 +830,12 @@ struct AbsMaxFunctor
     }
 };
 
-template <template <typename> class functor, typename T, int reduce_range>
+template <template <typename> class functor, typename T, int reduce_range, int stop_stride = 0>
 DINLINE T warpReduce(T val)
 {
     auto op = functor<T>();
 #pragma unroll
-    for(int stride = reduce_range / 2; stride > 0; stride >>= 1)
+    for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
     {
         T tmp = __shfl_xor(val, stride, reduce_range);
         val   = op(val, tmp);
@@ -1611,7 +1613,7 @@ class CustomAllreduce
         hipDeviceProp_t dev_prop;
         hipGetDevice(&dev);
         hipGetDeviceProperties(&dev_prop, dev);
-        std::string arch = dev_prop.gcnArchName;
+        std::string arch    = dev_prop.gcnArchName;
         bool use_write_mode = false;
 
         int blocks       = 16;
@@ -1639,10 +1641,12 @@ class CustomAllreduce
         }
         else if(call_2stage)
         {
-            blocks = std::min(kMaxBlocks,   
+            blocks = std::min(kMaxBlocks,
                               (size / world_size_ + (threads / world_size_) - 1) /
                                   (threads / world_size_));
-            if (world_size_ == 8 && bytes > 512 * 4096 * 2 && arch.find("gfx942") != std::string::npos) {
+            if(world_size_ == 8 && bytes > 512 * 4096 * 2 &&
+               arch.find("gfx942") != std::string::npos)
+            {
                 use_write_mode = true;
             }
         }
@@ -1655,12 +1659,14 @@ class CustomAllreduce
     {                                                     \
         if(bytes % (ngpus * 16) == 0 && world_size_ != 6) \
         {                                                 \
-            if (use_write_mode) {                          \
+            if(use_write_mode)                            \
+            {                                             \
                 KL(ngpus, name##_write_mode);             \
-            }                                               \
-            else {                                          \
-                KL(ngpus, name);                            \
-            }                                               \
+            }                                             \
+            else                                          \
+            {                                             \
+                KL(ngpus, name);                          \
+            }                                             \
         }                                                 \
         else                                              \
         {                                                 \
