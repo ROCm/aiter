@@ -31,7 +31,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
-    name: Triton Tests${{ matrix.labels && format(' ({0})', matrix.labels) || '' }}
+    name: Triton Tests ${{ matrix.label_suffix }}
     runs-on: ${{ matrix.runner }}
     needs: [check-signal]
     strategy:
@@ -40,6 +40,7 @@ jobs:
         include:
           - runner: aiter-1gpu-runner
             labels: MI325 1 GPU
+            label_suffix: (MI325 1 GPU)
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
