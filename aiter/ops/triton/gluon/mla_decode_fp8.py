@@ -624,6 +624,14 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         operand_index=1, parent=mfma_layout_kv, k_width=16
     )
 
+    kv_itt_layout: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=[[1, 0], [2, 0], [0, 1], [0, 2], [0, 4], [0, 8]],
+                lane_bases=[[0, 16], [0, 32], [4, 0], [8, 0], [16, 0], [32, 0]],
+                warp_bases=[[0, 64], [0, 128]],
+                block_bases=[],
+                shape=[64, 256],
+                )
+
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: gl.constexpr = BLOCK_H
     else:
@@ -820,16 +828,16 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     gl.amd.cdna3.sched_barrier(0x0)
     smem_kv1 = smem_kv1._reinterpret(
         K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
-    kv1_transpose = tl.trans(kv1)
+    kv1_transpose = gl.convert_layout(kv1, kv_itt_layout)
     gl.amd.cdna3.sched_barrier(0x0)
 
-    smem_kv1.store(kv1_transpose.T)
+    smem_kv1.store(kv1_transpose)
     smem_kv2 = smem_kv2._reinterpret(
         K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
-    kv2_transpose = tl.trans(kv2)
+    kv2_transpose = gl.convert_layout(kv2, kv_itt_layout)
     gl.amd.cdna3.sched_barrier(0x0)
 
-    smem_kv2.store(kv2_transpose.T)
+    smem_kv2.store(kv2_transpose)
 
     smem_k_rope.store(k_pe.T)
     gl.amd.cdna3.sched_barrier(0x0)
@@ -931,19 +939,19 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         e_max = n_e_max
 
         cur_k1 = smem_kv1.load(layout=dot_k_layout)
-        kv1_transpose = tl.trans(kv1)
+        kv1_transpose = gl.convert_layout(kv1, kv_itt_layout)
         gl.amd.cdna3.sched_barrier(0x0)
         smem_kv1 = smem_kv1._reinterpret(
             K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
 
-        smem_kv1.store(kv1_transpose.T)
+        smem_kv1.store(kv1_transpose)
         cur_k2 = smem_kv2.load(layout=dot_k_layout)
 
-        kv2_transpose = tl.trans(kv2)
+        kv2_transpose = gl.convert_layout(kv2, kv_itt_layout)
         gl.amd.cdna3.sched_barrier(0x0)
         smem_kv2 = smem_kv2._reinterpret(
             K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
-        smem_kv2.store(kv2_transpose.T)
+        smem_kv2.store(kv2_transpose)
 
     # smem_kv1 = smem_kv1._reinterpret(
     #     K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
