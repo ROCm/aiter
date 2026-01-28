@@ -46,7 +46,6 @@ def get_sage_fwd_configs():
         }
 
 
-
 class _FAv3SageWrapperFunc(torch.autograd.Function):
     """
     Sage Attention v1 wrapper that maintains high-precision inputs/outputs.
