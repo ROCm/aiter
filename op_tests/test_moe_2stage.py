@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 import torch
 import itertools
 import aiter
@@ -48,6 +49,7 @@ def test_fmoe(
     hidden_pad=0,
     intermediate_pad=0,
     preshuffle=False,
+    dsl=False,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -231,15 +233,36 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
+    # use_flydsl = (
+    #     qType == aiter.QuantType.per_Token
+    #     and AQDType == dtypes.fp8
+    #     and WQDType == dtypes.fp8
+    #     and bool(use_g1u1)
+    #     and actType == aiter.ActivationType.Silu
+    # )
+    # if os.environ.get("AITER_USE_FLYDSL_MOE", "1") not in (
+    #     "1",
+    #     "true",
+    #     "True",
+    #     "YES",
+    #     "yes",
+    # ):
+    #     use_flydsl = False
+
+    # FlyDSL expects pre-shuffled weights/scales (same as CK path).
+    w1_call = w1_qt_aiter
+    w2_call = w2_qt_aiter
+    w1_scale_call = w1_scale_aiter
+    w2_scale_call = w2_scale_aiter
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
-        w1_qt_aiter,
-        w2_qt_aiter,
+        w1_call,
+        w2_call,
         topk_weights,
         topk_ids,
-        w1_scale=w1_scale_aiter,
-        w2_scale=w2_scale_aiter,
+        w1_scale=w1_scale_call,
+        w2_scale=w2_scale_call,
         quant_type=qType,
         activation=actType,
         doweight_stage1=doweight_stage1,
@@ -247,6 +270,7 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
+        use_flydsl=dsl,
         num_iters=5,
         num_warmup=2,
     )
@@ -410,6 +434,12 @@ parser.add_argument(
     -p t    # True.""",
 )
 
+parser.add_argument(
+    "-dsl",
+    action="store_true",
+    help="""use DSL moe 2stage""",
+)
+
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -462,6 +492,7 @@ for (
                     doweight_stage1=doweight_stage1,
                     hidden_pad=hidden_pad,
                     intermediate_pad=intermediate_pad,
+                    dsl=args.dsl,
                 )
                 df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
@@ -486,6 +517,7 @@ for (
                     doweight_stage1=doweight_stage1,
                     hidden_pad=hidden_pad,
                     intermediate_pad=intermediate_pad,
+                    dsl=args.dsl,
                 )
                 df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
@@ -512,6 +544,7 @@ for (
                         preshuffle=preshuffle,
                         hidden_pad=0,
                         intermediate_pad=0,
+                        dsl=args.dsl,
                     )
                     df.append(ret)
     else:
@@ -530,6 +563,7 @@ for (
                     wq_dtype,
                     use_g1u1=True,
                     doweight_stage1=doweight_stage1,
+                    dsl=args.dsl,
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
