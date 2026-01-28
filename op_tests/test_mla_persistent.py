@@ -279,6 +279,8 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
+    kv_granularity = (2**30) if (nhead == 32 and max_seqlen_qo == 4 and dtype == dtypes.fp8 and kvtype == dtypes.fp8) else max(page_size, 16)
+
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -291,9 +293,7 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        kv_granularity=(
-            (2**30) if nhead == 32 else max(page_size, 16)
-        ),  # for qh32 kv split is disabled
+        kv_granularity=kv_granularity,  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,

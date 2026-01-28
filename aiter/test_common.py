@@ -427,7 +427,6 @@ def checkAllclose(
             delta = (a_msked - b_msked).abs()
         if percent > tol_err_ratio:
             logger.info(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
-
     a    : {a.shape}
            {a_msked[:printNum]}
     b    : {b.shape}
