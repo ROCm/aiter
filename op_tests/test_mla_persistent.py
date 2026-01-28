@@ -278,7 +278,6 @@ def test_mla(
     reduce_partial_map = torch.empty(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
-    print("max_seqlen_qo: ", max_seqlen_qo)
 
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
@@ -292,7 +291,9 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        kv_granularity=max(page_size, 16),
+        kv_granularity=(
+            (2**30) if nhead == 32 else max(page_size, 16)
+        ),  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,
@@ -437,7 +438,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)]
+list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2), (32, 4)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

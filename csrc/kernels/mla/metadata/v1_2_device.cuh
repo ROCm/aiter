@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "v1_comm.cuh"
 
@@ -29,7 +29,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     using QoState = QoState<Traits>;
 
     const int32_t ori_seqlen_qo = [&]() {
-        if constexpr (Traits::kIsSparse)
+        if constexpr(Traits::kIsSparse)
         {
             return params.p_seqlens_qo_indptr[1] - params.p_seqlens_qo_indptr[0];
         }
@@ -40,7 +40,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }();
 
     const int32_t num_batches = [&]() {
-        if constexpr (Traits::kIsSparse)
+        if constexpr(Traits::kIsSparse)
         {
             return params.num_batches * ori_seqlen_qo;
         }
@@ -77,9 +77,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     int32_t sum_blocks = 0;
     for(int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
     {
-        const int32_t bid_ori = Traits::kIsSparse
-                                    ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
-                                    : (bid / params.qk_batch_ratio);
+        const int32_t bid_ori = Traits::kIsSparse ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
+                                                  : (bid / params.qk_batch_ratio);
         const int32_t kv_end  = params.p_seqlens_kv_indptr[bid_ori + 1];
         const int32_t seqlen_kv =
             Traits::kIsSparse ? min(kv_end - params.p_seqlens_kv_indptr[bid_ori], params.topk)
@@ -168,14 +167,16 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
                     if constexpr(!Traits::kIsSparse)
                     {
-                        if (params.qk_batch_ratio != 1)
+                        if(params.qk_batch_ratio != 1)
                         {
-                            batch_tail = num_qo_tiles - (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
+                            batch_tail =
+                                num_qo_tiles -
+                                (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
                         }
                     }
-                    work_info.kv_end   = ck_tile::min(
-                        work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
-                        curr_kv_end - batch_tail);
+                    work_info.kv_end    = ck_tile::min(work_info.kv_start +
+                                                        (remain_kv_blocks * params.kv_granularity),
+                                                    curr_kv_end - batch_tail);
                     work_info.kv_offset = curr_kv_end - work_info.kv_end;
 
                     // split related info
@@ -242,11 +243,11 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             }
                             else
                             {
-                                const int32_t bid_ori = Traits::kIsSparse
-                                                            ? (curr_batch / ori_seqlen_qo /
-                                                               params.qk_batch_ratio)
-                                                            : (curr_batch / params.qk_batch_ratio);
-                                curr_kv_seqlen        = params.p_seqlens_kv_indptr[bid_ori + 1] -
+                                const int32_t bid_ori =
+                                    Traits::kIsSparse
+                                        ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
+                                        : (curr_batch / params.qk_batch_ratio);
+                                curr_kv_seqlen = params.p_seqlens_kv_indptr[bid_ori + 1] -
                                                  params.p_seqlens_kv_indptr[bid_ori];
                                 curr_kv_seqlen = Traits::kIsSparse
                                                      ? min(curr_kv_seqlen, params.topk)
@@ -284,9 +285,12 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
                         if constexpr(!Traits::kIsSparse)
                         {
-                            if (params.qk_batch_ratio != 1)
+                            if(params.qk_batch_ratio != 1)
                             {
-                                batch_tail = num_qo_tiles - (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
+                                batch_tail =
+                                    num_qo_tiles -
+                                    (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo -
+                                    1;
                             }
                         }
                         work_info.kv_end = ck_tile::min(
@@ -371,7 +375,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    constexpr int32_t kPackedQoLenPerWg = 128;
+    const hipStream_t stream            = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -404,7 +409,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         num_batches *= qk_batch_ratio;
     }
 
-    TORCH_CHECK((num_heads == 16) || (num_heads == 128) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8),
+    TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
+                    ((num_heads == 32) && q_is_fp8 && kv_is_fp8),
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).")
@@ -436,17 +442,15 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.qk_batch_ratio               = qk_batch_ratio;
 
     // launch kernel
-    MLA_NUM_HEADS_DISPATCHER(
-        num_heads_per_head_k,
-        MLA_METADATA_DISPATCHER(
-            max_seqlen_qo * num_heads_per_head_k,
-            kPackedQoLenPerWg,
-            params.uni_seqlen_qo,
-            topk,
-            dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
-                params,
-                stream,
-                max_seqlen_qo,
-                dev_prop.warpSize,
-                dev_prop.maxSharedMemoryPerMultiProcessor)));
+    MLA_METADATA_DISPATCHER(
+        max_seqlen_qo * num_heads_per_head_k,
+        kPackedQoLenPerWg,
+        params.uni_seqlen_qo,
+        topk,
+        dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
+            params,
+            stream,
+            max_seqlen_qo,
+            dev_prop.warpSize,
+            dev_prop.maxSharedMemoryPerMultiProcessor));
 }
