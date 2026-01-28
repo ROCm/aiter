@@ -1,27 +1,40 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-torch::Tensor all_reduce_asm(torch::Tensor &input,
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+// This header is included by multiple HIP/C++ translation units (including .cu).
+// Ensure torch::Tensor and std::tuple are visible for the function declarations below.
+#include <cstdint>
+#include <torch/extension.h>
+#include <tuple>
+
+torch::Tensor all_reduce_asm(torch::Tensor& input,
                              int64_t _ca,
-                             torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph);
+                             torch::Tensor& reg_sig,
+                             torch::Tensor& reg_buffer,
+                             bool isGraph);
 
 std::tuple<torch::Tensor, torch::Tensor>       // out, residual_out
-all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
-                   torch::Tensor &residual_in, // [m ,n]
-                   torch::Tensor &weight,      // [1 ,n]
-                   torch::Tensor &bias,        // [1 ,n]
+all_reduce_rmsnorm(torch::Tensor& input,       // [m ,n]
+                   torch::Tensor& residual_in, // [m ,n]
+                   torch::Tensor& weight,      // [1 ,n]
+                   torch::Tensor& bias,        // [1 ,n]
                    float epsilon,
                    // following are fused_allreduce args
                    int64_t _ca,
-                   torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph);
+                   torch::Tensor& reg_sig,
+                   torch::Tensor& reg_buffer,
+                   bool isGraph);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> // out, residual_out, yscale
-all_reduce_rmsnorm_quant(torch::Tensor &input,          // [m ,n]
-                         torch::Tensor &residual_in,    // [m ,n]
-                         torch::Tensor &xscale,         // [1 ,n]
-                         torch::Tensor &weight,         // [1 ,n]
-                         torch::Tensor &bias,           // [1 ,n]
+all_reduce_rmsnorm_quant(torch::Tensor& input,          // [m ,n]
+                         torch::Tensor& residual_in,    // [m ,n]
+                         torch::Tensor& xscale,         // [1 ,n]
+                         torch::Tensor& weight,         // [1 ,n]
+                         torch::Tensor& bias,           // [1 ,n]
                          float epsilon,
                          // following are fused_allreduce args
                          int64_t _ca,
-                         torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph);
+                         torch::Tensor& reg_sig,
+                         torch::Tensor& reg_buffer,
+                         bool isGraph);
