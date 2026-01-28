@@ -216,31 +216,32 @@ class FMoeKernel
             gdy = sub_X_cnt;
             gdz = 1;
         }
-        std::cout << "sub_GU: " << sub_GU << std::endl;
-        std::cout << "args.dim: " << args.dim << std::endl;
-        std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
-        std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
-        std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
-        std::cout << "args.stride_X: " << args.Xs << std::endl;
-        std::cout << "args.stride_GU: " << args.GUs << std::endl;
-        std::cout << "args.stride_D: " << args.Ds << std::endl;
-        std::cout << "args.stride_O: " << args.Os << std::endl;
-        std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
-        std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
-        std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
-        std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
-        std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
-        std::cout << "args.topk: " << args.topk << std::endl;
-        std::cout << "args.ps_deno: " << args.ps_deno << std::endl;
-        std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
-        std::cout << "gdx: " << gdx << std::endl;
-        std::cout << "gdy: " << gdy << std::endl;
-   
+
+        // std::cout << "sub_GU: " << sub_GU << std::endl;
+        // std::cout << "args.dim: " << args.dim << std::endl;
+        // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
+        // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
+        // std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
+        // std::cout << "args.stride_X: " << args.Xs << std::endl;
+        // std::cout << "args.stride_GU: " << args.GUs << std::endl;
+        // std::cout << "args.stride_D: " << args.Ds << std::endl;
+        // std::cout << "args.stride_O: " << args.Os << std::endl;
+        // std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
+        // std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
+        // std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
+        // std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
+        // std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
+        // std::cout << "args.topk: " << args.topk << std::endl;
+        // std::cout << "args.ps_deno: " << args.ps_deno << std::endl;
+        // std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
+        // std::cout << "gdx: " << gdx << std::endl;
+        // std::cout << "gdy: " << gdy << std::endl;
+
         if constexpr(std::is_same<T, uint8_t>::value)
         {
-            float xq_sum = input_dqn.value().abs().sum().item<float>();
+            float xq_sum  = input_dqn.value().abs().sum().item<float>();
             float guq_sum = w1_dqn.value().abs().sum().item<float>();
-            float dq_sum = w2_dqn.value().abs().sum().item<float>();
+            float dq_sum  = w2_dqn.value().abs().sum().item<float>();
         }
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
