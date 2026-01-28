@@ -22,16 +22,12 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.attention.test_sage_attn import check_attention_outputs
+from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outputs
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
 from aiter.ops.triton.attention.fav3_sage import (
-    fav3_sage_func,
-)
-from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    get_sage_fwd_configs,
-    sage_quant,
+    fav3_sage_wrapper_func,
 )
 from op_tests.triton_tests.utils.accuracy_analysis import compare_accuracy
 
@@ -308,37 +304,16 @@ def fav3_sage_forward_func(
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
 ):
-    config = get_sage_fwd_configs()
-    BLKQ = config["BLOCK_M"]
-    BLKK = config["BLOCK_N"]
-
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
 
-    fp8_dtype = aiter.dtypes.fp8
-    FP8_MAX = torch.finfo(fp8_dtype).max
-
-    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
+    return lambda: fav3_sage_wrapper_func(
         q,
         k,
         v,
-        fp8_dtype,
-        FP8_MAX,
-        sm_scale=softmax_scale,
-        BLKQ=BLKQ,
-        BLKK=BLKK,
-        layout=layout,
-    )
-    return lambda: fav3_sage_func(
-        q_int8,
-        k_int8,
-        v_fp8,
-        q_descale,
-        k_descale,
-        v_descale,
-        FP8_MAX,
-        causal=causal,
-        inference_mode=inference_mode,
+        softmax_scale,
+        causal=False,
+        inference_mode=True,
         layout=layout,
     )
 

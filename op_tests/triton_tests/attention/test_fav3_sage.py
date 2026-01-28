@@ -9,14 +9,7 @@ import math
 from aiter.test_mha_common import (
     attention_ref,
 )
-from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    get_sage_fwd_configs,
-    sage_quant,
-)
-
-from aiter.ops.triton.attention.fav3_sage import (
-    fav3_sage_func,
-)
+from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -142,10 +135,7 @@ def input_helper(
     D_HEAD,
     D_HEAD_V,
     dtype,
-    softmax_scale,
     layout,
-    BLKQ,
-    BLKK,
 ):
     # Generate base inputs in BHSD layout which is the layout used in wan model.
     # Set up tensor shapes based on layout
@@ -165,22 +155,7 @@ def input_helper(
     k.requires_grad = False
     v.requires_grad = False
 
-    fp8_dtype = aiter.dtypes.fp8
-    FP8_MAX = torch.finfo(fp8_dtype).max
-
-    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
-        q,
-        k,
-        v,
-        fp8_dtype,
-        FP8_MAX,
-        sm_scale=softmax_scale,
-        BLKQ=BLKQ,
-        BLKK=BLKK,
-        layout=layout,
-    )
-
-    return q, k, v, q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale
+    return q, k, v
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -206,14 +181,8 @@ def test_sage(
     torch.cuda.empty_cache()
 
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
-    fp8_dtype = aiter.dtypes.fp8
-    FP8_MAX = torch.finfo(fp8_dtype).max
 
-    config = get_sage_fwd_configs()
-    BLKQ = config["BLOCK_M"]
-    BLKK = config["BLOCK_N"]
-
-    q, k, v, q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = input_helper(
+    q, k, v = input_helper(
         BATCH,
         NUM_Q_HEADS,
         NUM_K_HEADS,
@@ -222,24 +191,17 @@ def test_sage(
         HEAD_SZ,
         HEAD_SZ,
         dtype,
-        softmax_scale,
         layout,
-        BLKQ,
-        BLKK,
     )
 
-    triton_out = fav3_sage_func(
-        q_int8,
-        k_int8,
-        v_fp8,
-        q_descale,
-        k_descale,
-        v_descale,
-        FP8_MAX,
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
         causal=False,
         inference_mode=True,
         layout=layout,
-        config=config,
     )
 
     if DEBUG_MODE:

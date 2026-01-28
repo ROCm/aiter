@@ -5,17 +5,13 @@ from __future__ import annotations
 from typing import Optional, Tuple
 import torch
 import aiter
-
-from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
-    fav3_sage,
+import triton
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     get_sage_fwd_configs,
-)
-
-from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import (
+    sage_quant,
+    sage_fwd,
     map_dims,
 )
-
-from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import sage_quant
 
 
 class _FAv3SageWrapperFunc(torch.autograd.Function):
@@ -36,146 +32,104 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        k_mean: torch.Tensor | None,
         softmax_scale: float | None,
         causal: bool,
-        qv: Optional[torch.Tensor],
         window_size: Tuple[int, int],
         attention_chunk: int,
         softcap: float,
-        num_splits: int,
-        pack_gqa: Optional[bool],
         deterministic: bool,
         sm_margin: int,
         return_lse: bool = True,
         layout: str = "bshd",
         config: Optional[dict] = None,
     ):
-        bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-        batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
-        _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
+        # 1. Dimension Mapping & Config Setup
+        bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+        batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd_map)
+        _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd_map)
 
-        # Quantize K, V to int8, and convert v to float16
-
-        # Use provided config or get default config
         if config is None:
             config = get_sage_fwd_configs()
-        # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
-        # config = config[0].all_kwargs()
-        BLKQ = config["BLOCK_M"]
-        BLKK = config["BLOCK_N"]
 
-        softmax_scale = head_dim**-0.5
-        ## following quantization already considered softmax scale and RCP_LN2
+        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+
+        # 2. Validation: Early Exit for unsupported features
+        if attention_chunk not in (0, 1):
+            raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
+        if softcap != 0.0 or sm_margin != 0:
+            raise NotImplementedError(
+                "softcap/sm_margin not supported in FP8 high-precision API"
+            )
+
+        if (q.requires_grad or k.requires_grad or v.requires_grad) and not return_lse:
+            raise ValueError(
+                "return_lse must be True during training (requires_grad=True)"
+            )
+
+        # 3. Quantization
+        # Note: softmax_scale is integrated into quantization descaling
+        softmax_scale = softmax_scale or (head_dim**-0.5)
         fp8_dtype = aiter.dtypes.fp8
-        FP8_MAX = torch.finfo(fp8_dtype).max
+        fp8_max = torch.finfo(fp8_dtype).max
 
         q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
             q,
             k,
             v,
             fp8_dtype,
-            FP8_MAX,
+            fp8_max,
             sm_scale=softmax_scale,
             BLKQ=BLKQ,
             BLKK=BLKK,
             layout=layout,
         )
 
-        # For GQA/MQA: quantize query with grouped scaling
-        # group_size = (
-        #    num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
-        # )
-
-        # Verify descale shapes for GQA/MQA
+        # 4. Verify Descale Shapes (Grouped scaling for GQA/MQA)
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
         num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-        assert q_descale.shape == (
-            batch,
-            num_q_heads,
-            num_q_blocks,
-        ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, num_q_blocks)}"
-        assert k_descale.shape == (
-            batch,
-            num_kv_heads,
-            num_k_blocks,
-        ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
+        expected_q_ds = (batch, num_q_heads, num_q_blocks)
+        expected_k_ds = (batch, num_kv_heads, num_k_blocks)
 
-        # Validate unsupported features
-        if attention_chunk not in (0, 1):
-            raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
-        if softcap != 0.0:
-            raise NotImplementedError(
-                "softcap not implemented in FP8 high-precision API"
-            )
-        if sm_margin != 0:
-            raise NotImplementedError(
-                "sm_margin != 0 not supported in FP8 high-precision API"
-            )
+        assert (
+            q_descale.shape == expected_q_ds
+        ), f"q_descale shape {q_descale.shape} != {expected_q_ds}"
+        assert (
+            k_descale.shape == expected_k_ds
+        ), f"k_descale shape {k_descale.shape} != {expected_k_ds}"
 
-        if q.requires_grad or k.requires_grad or v.requires_grad:
-            assert (
-                return_lse
-            ), f"in train mode, return_lse is expected to be True, got {return_lse}"
-
-        # Call flash attention forward
-        out, softmax_lse = fav3_sage.fwd(
+        # 5. Execution
+        out, softmax_lse = fav3_sage_func(
             q_int8,
             k_int8,
             v_fp8,
-            None,
-            None,
-            None,
-            None,  # k_new, v_new, qv, out
-            None,
-            None,
-            None,  # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
-            None,
-            None,
-            None,
-            None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
-            None,
-            None,
-            None,  # page_table, kv_batch_idx, leftpad_k
-            None,
-            None,
-            None,  # rotary_cos, rotary_sin, seqlens_rotary
             q_descale,
             k_descale,
-            v_descale,  # v_descale
-            FP8_MAX,
+            v_descale,
             softmax_scale,
             causal,
-            int(window_size[0]),
-            int(window_size[1]),
+            window_size,
             attention_chunk,
             softcap,
-            False,  # rotary_interleaved
-            None,
-            1,
-            None,
-            sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+            sm_margin,
             return_lse,
             layout,
             config,
         )
 
-        if not return_lse:
-            return out
-
-        # Save tensors needed for backward
-        ctx.save_for_backward(
-            q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
-        )
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.window_size = window_size
-        ctx.softcap = softcap
-        ctx.deterministic = deterministic
-        ctx.sm_margin = sm_margin
-        ctx.input_dtype = q.dtype
-        ctx.layout = layout
+        # 6. Context Saving for Backward
+        if return_lse:
+            ctx.save_for_backward(
+                q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
+            )
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.deterministic = deterministic
+            ctx.sm_margin = sm_margin
+            ctx.input_dtype = q.dtype
+            ctx.layout = layout
 
         return out
 
@@ -187,17 +141,14 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # v
             None,  # softmax_scale
             None,  # causal
-            None,  # qv
-            None,  # q_descale
-            None,  # k_descale
-            None,  # v_descale
             None,  # window_size
             None,  # attention_chunk
             None,  # softcap
-            None,  # num_splits
-            None,  # pack_gqa
             None,  # deterministic
             None,  # sm_margin
+            None,  # return_lse
+            None,  # layout
+            None,  # config
         )
 
 
@@ -205,15 +156,11 @@ def fav3_sage_wrapper_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    k_mean: torch.Tensor = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    qv: Optional[torch.Tensor] = None,
     window_size: Tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
-    num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     sm_margin: int = 0,
     inference_mode: bool = True,
@@ -276,35 +223,22 @@ def fav3_sage_wrapper_func(
         torch.float32,
     ], f"sage_attn_v1_func expects high-precision inputs (fp16/bf16/fp32), got v.dtype={v.dtype}. "
 
-    if qv is not None:
-        raise NotImplementedError("qv not supported in Sage Attention v1 API")
-    if softcap != 0.0:
-        raise NotImplementedError("softcap not supported in Sage Attention v1 API")
-    if num_splits != 1:
-        raise NotImplementedError(
-            "num_splits != 1 not supported in Sage Attention v1 API"
-        )
-    if pack_gqa is not None:
-        raise NotImplementedError("pack_gqa not supported in Sage Attention v1 API")
     if sm_margin != 0:
         raise NotImplementedError(
             "sm_margin != 0 not supported in Sage Attention v1 API"
         )
 
     return_lse = not inference_mode
+
     return _FAv3SageWrapperFunc.apply(
         q,
         k,
         v,
-        k_mean,
         softmax_scale,
         causal,
-        qv,
         window_size,
         attention_chunk,
         softcap,
-        num_splits,
-        pack_gqa,
         deterministic,
         sm_margin,
         return_lse,
@@ -320,19 +254,13 @@ def fav3_sage_func(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
-    FP8_MAX: float = 240.0,
-    k_mean: torch.Tensor = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    qv: Optional[torch.Tensor] = None,
     window_size: Tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
     softcap: float = 0.0,
-    num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
-    deterministic: bool = False,
     sm_margin: int = 0,
-    inference_mode: bool = True,
+    return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
 ):
@@ -363,92 +291,165 @@ def fav3_sage_func(
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
     """
 
-    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-    batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd)
-    _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd)
-    # Quantize K, V to int8, and convert v to float16
+    # --- 1. Layout & Dimension Mapping ---
+    # bshd: [0,1,2,3], bhsd: [0,2,1,3]
+    bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
-    # Use provided config or get default config
+    batch, seqlen_q, nheads_q, head_size_qk = map_dims(q.shape, bshd_map)
+    _, seqlen_k, nheads_k, _ = map_dims(k.shape, bshd_map)
+    _, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd_map)
+
+    # --- 2. Feature & Input Validation ---
+    if attention_chunk not in (0, 1) or softcap != 0.0 or sm_margin != 0:
+        raise NotImplementedError(
+            "Feature (chunking/softcap/sm_margin) not supported in this API."
+        )
+
+    assert q.dtype == torch.int8 and k.dtype == torch.int8, "Q and K must be int8"
+    assert seqlen_k == seqlen_v, f"K/V seqlen mismatch: {seqlen_k} vs {seqlen_v}"
+    assert nheads_k == nheads_v, f"K/V head mismatch: {nheads_k} vs {nheads_v}"
+    assert (
+        nheads_q % nheads_k == 0
+    ), f"GQA/MQA error: {nheads_q} not divisible by {nheads_k}"
+
+    # --- 3. Configuration & Descale Setup ---
     if config is None:
         config = get_sage_fwd_configs()
-    # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
-    # config = config[0].all_kwargs()
-    BLKQ = config["BLOCK_M"]
-    BLKK = config["BLOCK_N"]
 
-    # Check that inputs are high precision
-    assert q.dtype == torch.int8, f"expected dtype of q to be int8, got {q.dtype}"
-    assert k.dtype == torch.int8, f"expected dtype of k to be int8, got {k.dtype}"
-    # assert v.dtype in [torch.float16, torch.bfloat16], (
-    #     f"sage_attn_v1_func expects high-precision inputs (fp16/bf16), got v.dtype={v.dtype}. "
-    # )
-
-    # Verify descale shapes for GQA/MQA
+    BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
     num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
     num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-    assert q_descale.shape == (
-        batch,
-        num_q_heads,
-        num_q_blocks,
-    ), f"q_descale shape {q_descale.shape} != expected {(batch, num_q_heads, num_q_blocks)}"
-    assert k_descale.shape == (
-        batch,
-        num_kv_heads,
-        num_k_blocks,
-    ), f"k_descale shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
+    assert q_descale.shape == (batch, nheads_q, num_q_blocks)
+    assert k_descale.shape == (batch, nheads_k, num_k_blocks)
 
-    # Validate unsupported features
-    if attention_chunk not in (0, 1):
-        raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
-    if softcap != 0.0:
-        raise NotImplementedError("softcap not implemented in FP8 high-precision API")
-    if sm_margin != 0:
-        raise NotImplementedError(
-            "sm_margin != 0 not supported in FP8 high-precision API"
+    # --- 4. Output Allocation ---
+    out_dtype = torch.bfloat16
+    if layout == "thd":
+        out = torch.zeros(
+            (q.shape[0], q.shape[1], v.shape[-1]), dtype=out_dtype, device=q.device
+        )
+        softmax_lse = (
+            torch.zeros((nheads_q, q.shape[0]), device=q.device, dtype=torch.float32)
+            if return_lse
+            else None
+        )
+    else:
+        out_shape = (q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
+        out = torch.zeros(out_shape, dtype=out_dtype, device=q.device)
+        softmax_lse = (
+            torch.zeros(
+                (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+            )
+            if return_lse
+            else None
         )
 
-    return_lse = not inference_mode
-    # Call flash attention forward
-    out, _ = fav3_sage.fwd(
+    # --- 5. Stride Extraction ---
+    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd_map)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd_map)
+    stride_vb, stride_vn, stride_vh, stride_vd = map_dims(v.stride(), bshd_map)
+    stride_ob, stride_om, stride_oh, stride_od = map_dims(out.stride(), bshd_map)
+
+    stride_lse_z, stride_lse_h, stride_lse_m = (
+        softmax_lse.stride() if return_lse else (0, 0, 0)
+    )
+    stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
+    stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
+    stride_vsz, stride_vsh, _ = v_descale.stride()
+
+    # --- 6. Padding & Metadata ---
+    padded_d_model_qk = max(16, 1 << (head_size_qk - 1).bit_length())
+    padded_d_model_v = max(16, 1 << (head_size_v - 1).bit_length())
+
+    window_size_left, window_size_right = int(window_size[0]), int(window_size[1])
+    use_sliding_window = window_size_left != -1 or window_size_right != -1
+
+    # --- 7. Kernel Launch ---
+    def grid(META):
+        return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
+
+    sage_fwd[grid](
         q,
         k,
         v,
         None,
-        None,
-        None,
-        None,  # k_new, v_new, qv, out
-        None,
-        None,
-        None,  # cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new
-        None,
-        None,
-        None,
-        None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
-        None,
-        None,
-        None,  # page_table, kv_batch_idx, leftpad_k
-        None,
-        None,
-        None,  # rotary_cos, rotary_sin, seqlens_rotary
         q_descale,
         k_descale,
-        v_descale,  # v_descale
-        FP8_MAX,
-        softmax_scale,
-        causal,
-        int(window_size[0]),
-        int(window_size[1]),
-        attention_chunk,
-        softcap,
-        False,  # rotary_interleaved
+        v_descale,
+        stride_qsz,
+        stride_qsh,
+        stride_qsblk,
+        stride_ksz,
+        stride_ksh,
+        stride_ksblk,
+        stride_vsz,
+        stride_vsh,
+        softmax_lse,
+        out,
         None,
-        1,
         None,
-        sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
-        return_lse,
-        layout,
-        config,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        stride_vd,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_od,
+        0,
+        0,
+        0,
+        0,  # stride_bz, stride_bh, stride_bm, stride_bn
+        0,
+        0,  # stride_az, stride_ah
+        0,
+        0,
+        0,
+        0,  # stride_sz, stride_sh, stride_sm, stride_sn
+        stride_lse_z,
+        stride_lse_h,
+        stride_lse_m,
+        None,
+        None,
+        None,
+        None,
+        dropout_p=0.0,
+        philox_seed=None,
+        philox_offset_base=None,
+        RETURN_LSE=return_lse,
+        HQ=nheads_q,
+        HK=nheads_k,
+        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
+        MAX_SEQLENS_Q=seqlen_q,
+        MAX_SEQLENS_K=seqlen_k,
+        SM_SCALE=softmax_scale,
+        IS_CAUSAL=causal,
+        USE_SLIDING_WINDOW=use_sliding_window,
+        WINDOW_SIZE_LEFT=window_size_left,
+        WINDOW_SIZE_RIGHT=window_size_right,
+        IS_VARLEN=False,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        BLOCK_DMODEL_V=padded_d_model_v,
+        USE_BIAS=False,
+        USE_ALIBI=False,
+        ENABLE_DROPOUT=False,
+        USE_EXP2=True,
+        RETURN_SCORES=False,
+        USE_SEQUSED=False,
+        **config,
     )
 
-    return out
+    if return_lse:
+        return out, softmax_lse
+    else:
+        return out, None
