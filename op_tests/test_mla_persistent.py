@@ -697,11 +697,6 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_3buffer():
-        num_works = work_indptr[-1].item()
-        for i in range(num_works):
-            print(
-                f"work_info_set[{i}, 0]: {work_info_set[i, 0]}, [{i}, 1]: {work_info_set[i, 1]}, [{i}, 2]: {work_info_set[i, 2]}, [{i}, 3]: {work_info_set[i, 3]}, [{i}, 4]: {work_info_set[i, 4]}, [{i}, 5]: {work_info_set[i, 5]}, [{i}, 6]: {work_info_set[i, 6]}"
-            )
 
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
@@ -736,11 +731,6 @@ def test_mla(
             out_ref_fp8,
             msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
         )
-        # print(f"kv_buffer_bytes shape: {kv_buffer_bytes.shape}, kv_buffer_bytes stride: {kv_buffer_bytes.stride()}, kv_buffer_bytes: {kv_buffer_bytes[0:1,]}")
-        # print(f"q shape: {q.shape}, q stride: {q.stride()}, q: {q[0:1,]}")
-        # print(f"qo_indptr: {qo_indptr}, qo_indptr stride: {qo_indptr.stride()}, qo_indptr: {qo_indptr[0:1,]}")
-        # print(f"kv_indptr: {kv_indptr}, kv_indptr stride: {kv_indptr.stride()}, kv_indptr: {kv_indptr[0:1,]}")
-        # print(f"kv_indices: {kv_indices}, kv_indices stride: {kv_indices.stride()}, kv_indices: {kv_indices[0:1,]}")
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,

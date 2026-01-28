@@ -406,7 +406,6 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_partial_map)
 {
     constexpr int32_t kPackedQoLenPerWg = 128;
-    // constexpr int32_t kPageSize = page_size;
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
