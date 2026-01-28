@@ -290,7 +290,7 @@ def test_mla(
         else max(page_size, 16)
     )
 
-    meta = aiter.get_mla_metadata_v1(
+    aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
