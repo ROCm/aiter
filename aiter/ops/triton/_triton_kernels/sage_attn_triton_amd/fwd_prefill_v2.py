@@ -1963,6 +1963,64 @@ def fav3_sage_triton_impl_v2(
         **config,
     )
 
+import numpy as np
+def unpack_fp4_to_fp32(uint8_tensor):
+    """
+    Unpack uint8 tensor containing packed e2m1 fp4 values into fp32.
+    Each uint8 contains two 4-bit e2m1 values (2-bit exponent, 1-bit mantissa).
+
+    Args:
+        uint8_tensor: torch.Tensor with dtype uint8, shape [..., D]
+
+    Returns:
+        torch.Tensor with dtype float32, shape [..., 2*D]
+    """
+    # Move to CPU for processing
+    uint8_np = uint8_tensor.detach().cpu().numpy()
+    original_shape = uint8_np.shape
+
+    # Flatten to process
+    uint8_flat = uint8_np.flatten()
+
+    # Extract two 4-bit values from each uint8
+    # Lower 4 bits
+    low_nibble = uint8_flat & 0x0F
+    # Upper 4 bits
+    high_nibble = (uint8_flat >> 4) & 0x0F
+
+    # Interleave them to maintain order
+    fp4_values = np.empty(len(uint8_flat) * 2, dtype=np.uint8)
+    fp4_values[0::2] = low_nibble
+    fp4_values[1::2] = high_nibble
+
+    # Convert e2m1 fp4 to fp32
+    # e2m1 format: [sign:1][exp:2][mantissa:1]
+    sign = ((fp4_values >> 3) & 0x1).astype(np.float32)
+    exp = ((fp4_values >> 1) & 0x3).astype(np.int32)
+    mantissa = (fp4_values & 0x1).astype(np.float32)
+
+    # Convert to float
+    # For e2m1: value = (-1)^sign * 2^(exp-1) * (1 + mantissa * 0.5)
+    # The mantissa bit represents 0.5, so mantissa=0 → 1.0, mantissa=1 → 1.5
+    # Special cases: exp=0 means subnormal or zero
+    fp32_values = np.zeros_like(sign, dtype=np.float32)
+
+    # Normal numbers (exp != 0)
+    normal_mask = exp != 0
+    fp32_values[normal_mask] = (1 - 2 * sign[normal_mask]) * np.power(2.0, exp[normal_mask] - 1) * (1 + mantissa[normal_mask] * 0.5)
+
+    # Subnormal numbers (exp == 0, mantissa != 0)
+    subnormal_mask = (exp == 0) & (mantissa != 0)
+    fp32_values[subnormal_mask] = (1 - 2 * sign[subnormal_mask]) * np.power(2.0, -1) * (mantissa[subnormal_mask] * 0.5)
+
+    # Reshape to [..., 2*D]
+    new_shape = list(original_shape)
+    new_shape[-1] = new_shape[-1] * 2
+    fp32_values = fp32_values.reshape(new_shape)
+
+    return torch.from_numpy(fp32_values).to(uint8_tensor.device)
+
+
 
 def sage_quant_v2(
     q,
@@ -2088,17 +2146,102 @@ def sage_quant_v2(
         qo_len,
         kv_len,
         triton.next_power_of_2(kv_len),
-        PRE_SCALE_MAX=PRE_SCALE_MAX,
+        PRE_SCALE_MAX=3,
         D=head_dim,
         BLK_Q=BLKQ,
         BLK_K=BLKK,
     )
 
-
-    q_fp4, q_scale = downcast_to_mxfp(q_bf16, torch.uint8, axis=-1)
+    q_fp4, q_scale, q_scale_fp32 = downcast_to_mxfp(q_bf16, torch.uint8, axis=-1)    
     # q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
-    k_fp4, k_scale = downcast_to_mxfp(k_bf16, torch.uint8, axis=-1)
+    k_fp4, k_scale, k_scale_fp32 = downcast_to_mxfp(k_bf16, torch.uint8, axis=-1)
     # k_fp4, k_scale = downcast_to_mxfp(k, aiter.dtypes.fp8, axis=-1)
+
+    # I want to do evalution where does the most of the quantization error come from
+    # so do the ref q*k, q_fp4*k_fp4 * q_scale * k_scale, and q_fp4*k_fp4 * q_scale_fp32 * k_scale_fp32
+    # you need to reshape the scales to broadcast correctly, e.g. for bshd layout
+    
+    """
+    print("q shape:", q.shape)
+    print("k shape:", k.shape)
+    print("q fp4 shape:", q_fp4.shape)
+    print("k fp4 shape:", k_fp4.shape)
+    print("q scale shape:", q_scale.shape)
+    print("k scale shape:", k_scale.shape)
+    q shape: torch.Size([1, 5, 75352, 128])
+    k shape: torch.Size([1, 5, 75352, 128])
+    q scale shape: torch.Size([1, 5, 75352, 4])
+    k scale shape: torch.Size([1, 5, 75352, 4])
+    
+    """
+
+    # Convert uint8 exponent back to fp32 scale values
+    q_scale_fp32_expanded = torch.pow(2.0, q_scale.to(torch.float32))
+    k_scale_fp32_expanded = torch.pow(2.0, k_scale.to(torch.float32))
+
+    ref = torch.einsum("bshd,bthd->bsht", q.to(torch.float32), k.to(torch.float32))
+    
+    q_fp4_unpacked = unpack_fp4_to_fp32(q_fp4)
+    k_fp4_unpacked = unpack_fp4_to_fp32(k_fp4)
+    
+    print("Unpacked Q FP4 shape:", q_fp4_unpacked.shape)
+    print("Unpacked K FP4 shape:", k_fp4_unpacked.shape)
+    print("q scale fp32 expanded shape:", q_scale_fp32_expanded.shape)
+    print("k scale fp32 expanded shape:", k_scale_fp32_expanded.shape)
+
+    # Apply grouped scaling (groups of 32) for quantized computation
+    group_size = 32
+    num_groups = head_dim // group_size
+    
+    quantized = torch.zeros_like(ref)
+    
+    for group_idx in range(num_groups):
+        start_idx = group_idx * group_size
+        end_idx = (group_idx + 1) * group_size
+        
+        # Extract group slices
+        q_group = q_fp4_unpacked[:, :, :, start_idx:end_idx]
+        k_group = k_fp4_unpacked[:, :, :, start_idx:end_idx]
+        q_scale_group = q_scale_fp32_expanded[:, :, :, group_idx:group_idx+1]
+        k_scale_group = k_scale_fp32_expanded[:, :, :, group_idx:group_idx+1]
+        """
+        
+        
+        group q shapes torch.Size([1, 5, 75352, 32]) torch.Size([1, 5, 75352, 32])
+        group scale shapes torch.Size([1, 5, 75352, 1]) torch.Size([1, 5, 75352, 1])
+        """
+        print("group q shapes", q_group.shape, k_group.shape)
+        print("group scale shapes", q_scale_group.shape, k_scale_group.shape)
+        group_descale = (q_scale_group * k_scale_group.permute(0, 1, 3, 2))
+        print("group descale shape", group_descale.shape)
+        # Compute grouped matmul with broadcasting
+        group_result = torch.einsum(
+            "bhsg,bhtg->bhst",
+            q_group.to(torch.float32),
+            k_group.to(torch.float32),
+        )
+        print("group result shape", group_result.shape)
+        group_result = group_result * group_descale
+        
+        quantized += group_result
+    
+    print("Sage V2 Quantization Debug Info:")
+    print(f"Quantization FP4 Error: {torch.mean((ref - quantized)**2).item()}")
+    # quantized = torch.einsum(
+    #     "bshd,bthd->bsht",
+    #     q_fp4_unpacked.to(torch.float32),
+    #     k_fp4_unpacked.to(torch.float32),
+    # ) * q_scale_fp32_expanded.unsqueeze(2) * k_scale_fp32_expanded.unsqueeze(1)
+    quantized_fp32_scale = torch.einsum(
+        "bshd,bthd->bsht",
+        q_fp4.to(torch.float32),
+        k_fp4.to(torch.float32),
+    ) * q_scale_fp32.unsqueeze(2) * k_scale_fp32.unsqueeze(1)
+
+
+    
+    print(f"Quantization FP4 + FP32 Scale Error: {torch.mean((ref - quantized_fp32_scale)**2).item()}")
+
 
     return q_fp4, q_scale, q_scale_pre, k_fp4, k_scale, k_scale_pre, v_fp8, v_scale
 

@@ -318,8 +318,7 @@ def fwd(
     # sd_mask is not returned in v3 interface
     sd_mask = None
 
-    # print("sage_version", sage_version)
-    # print(sage_version == Sage_version.V1)
+    # print("Running sage_version: ", sage_version)
     sage_func = fav3_sage_triton_impl if sage_version == Sage_version.V1 else fav3_sage_triton_impl_v2
     extra_args = {} if sage_version == Sage_version.V1 else {
         "q_descale_pre": q_descale_pre,

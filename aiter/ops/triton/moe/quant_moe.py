@@ -86,10 +86,18 @@ def downcast_to_mxfp(
 
     out_quant_tensor = src_tensor.new_empty(out_shape, dtype=out_quant_type)
     out_scale = src_tensor.new_empty(out_scale_shape, dtype=torch.uint8)
+    
+ 
+    out_scale_fp32 = src_tensor.new_empty(out_scale_shape, dtype=torch.float32)
+
 
     kernel_src_tensor = src_tensor.reshape(-1, src_tensor.shape[-1])
     kernel_quant_tensor = out_quant_tensor.view(-1, out_quant_tensor.shape[-1])
     kernel_scale = out_scale.view(-1, out_scale.shape[-1])
+    
+   
+    kernel_scale_fp32 = out_scale_fp32.view(-1, out_scale_fp32.shape[-1])
+
 
     BLOCK_OUT_DIM = 128
     BLOCK_QUANT_DIM = 32
@@ -100,7 +108,9 @@ def downcast_to_mxfp(
         kernel_quant_tensor,
         *kernel_quant_tensor.stride(),
         kernel_scale,
+        kernel_scale_fp32,
         *kernel_scale.stride(),
+        *kernel_scale_fp32.stride(),
         kernel_src_tensor,
         *kernel_src_tensor.stride(),
         *kernel_src_tensor.shape,
@@ -112,7 +122,9 @@ def downcast_to_mxfp(
 
     out_quant_tensor = out_quant_tensor.transpose(axis, src_tensor.ndim - 1)
     out_scale = out_scale.transpose(axis, src_tensor.ndim - 1)
-    return out_quant_tensor, out_scale
+    out_scale_fp32 = out_scale_fp32.transpose(axis, src_tensor.ndim - 1)
+
+    return out_quant_tensor, out_scale, out_scale_fp32
 
 
 def upcast_from_mxfp(

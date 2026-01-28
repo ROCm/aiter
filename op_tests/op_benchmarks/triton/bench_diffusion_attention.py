@@ -333,6 +333,7 @@ def fav3_sage_forward_func(
             BLKK=BLKK,
             layout=layout,
         )
+        
         return lambda: fav3_sage_func(
             q_int8,
             k_int8,
@@ -616,7 +617,7 @@ def bench_kernel(q, k, v, args, provider):
             )  # we do comparison in BSHD
         
         compare_accuracy(current_primary, reference_primary)
-        check_attention_outputs(current_primary, reference_primary, fp8=False)
+        check_attention_outputs(current_primary, reference_primary, fp8=True)
 
     q_element_size = 1 if args.fav3_fp8 or args.fav3_sage else q.element_size()
     k_element_size = 1 if args.fav3_fp8 or args.fav3_sage else k.element_size()
