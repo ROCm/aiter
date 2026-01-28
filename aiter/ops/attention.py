@@ -817,10 +817,10 @@ def get_mla_metadata_info_v1(
         if num_head_qo == 16
         or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
         or (
-           num_head_qo == 32
-           and kv_dtype == dtypes.fp8
-           and q_dtype == dtypes.fp8
-           and max_seqlen_qo == 4
+            num_head_qo == 32
+            and kv_dtype == dtypes.fp8
+            and q_dtype == dtypes.fp8
+            and max_seqlen_qo == 4
         )
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
