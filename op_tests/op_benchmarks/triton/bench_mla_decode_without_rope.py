@@ -555,8 +555,8 @@ def run_benchmark(args: argparse.Namespace):
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
         )
 
-        import pdb;pdb.set_trace()
-        cal_diff(out_ref, out_tri, "out", True)
+        #import pdb;pdb.set_trace()
+        #cal_diff(out_ref, out_tri, "out", True)
 
         # Return exactly one scalar depending on which metric is active
         tflops = total_flops / ms * 1e-9
