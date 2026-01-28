@@ -604,10 +604,10 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     )
 
     mfma_layout_qk: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
     )
     mfma_layout_kv: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
     )
 
     dot_q_layout: gl.constexpr = gl.DotOperandLayout(
