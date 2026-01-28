@@ -2097,7 +2097,7 @@ def sage_quant_v2(
 
     q_fp4, q_scale = downcast_to_mxfp(q_bf16, torch.uint8, axis=-1)
     # q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
-    k_fp4, k_scale = downcast_to_mxfp(k_bf16, torch.uint8, axis=-1)
+    k_fp4, k_scale = downcast_to_mxfp_rne(k_bf16, torch.uint8, axis=-1)
     # k_fp4, k_scale = downcast_to_mxfp(k, aiter.dtypes.fp8, axis=-1)
 
     return q_fp4, q_scale, q_scale_pre, k_fp4, k_scale, k_scale_pre, v_fp8, v_scale
