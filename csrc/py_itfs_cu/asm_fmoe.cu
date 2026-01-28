@@ -259,8 +259,12 @@ class FMoeKernel
     };
 };
 
-FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "")
+FMoeKernel* get_heuristic_kernel(int inter_dim,
+                                 int sub_X_cnt,
+                                 CFG* cfgs,
+                                 int smf                 = 0,
+                                 std::string kernel_name = "",
+                                 int vskip_override      = -1)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -273,9 +277,14 @@ FMoeKernel* get_heuristic_kernel(
     int vskip                   = 1;
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
 
-    const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
-    if(vs_env_value != nullptr && std::string(vs_env_value) == "0")
-        vskip = 0;
+    if(vskip_override >= 0)
+        vskip = vskip_override;
+    else
+    {
+        const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
+        if(vs_env_value != nullptr && std::string(vs_env_value) == "0")
+            vskip = 0;
+    }
     if(selectedKl.empty())
     {
         for(const auto& el : *cfgs)
@@ -620,7 +629,9 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
+        int vskip_override = (out.dtype() == at::ScalarType::Float) ? 1 : -1;
+        impl_ptr           = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name, vskip_override);
         impl_ptr->set_4bit(true);
     }
 #endif
