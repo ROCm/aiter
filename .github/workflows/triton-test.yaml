@@ -31,7 +31,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
-    name: Triton Tests
+    name: Triton Tests (${{ matrix.labels }})
     runs-on: ${{ matrix.runner }}
     needs: [check-signal]
     strategy:

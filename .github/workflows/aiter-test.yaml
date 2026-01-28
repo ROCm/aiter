@@ -63,7 +63,7 @@ jobs:
   #         echo "Multipe: ${{ steps.machines.outputs.multigpu_runners }}"
 
   standard:
-    name: Standard Tests
+    name: Standard Tests (${{ matrix.labels }})
     needs: check-signal
     strategy:
       fail-fast: false
@@ -165,7 +165,7 @@ jobs:
           ./.github/scripts/clean_up_rocm.sh
 
   multi-gpu:
-    name: Multi-GPU Tests
+    name: Multi-GPU Tests (${{ matrix.labels }})
     needs: check-signal
     # only run multi-gpu tests on main branch due to limited multi-gpu resources
     if: github.ref == 'refs/heads/main' 
