@@ -2020,7 +2020,78 @@ def unpack_fp4_to_fp32(uint8_tensor):
 
     return torch.from_numpy(fp32_values).to(uint8_tensor.device)
 
+def accuracy_analysis(q_fp4, k_fp4, q_scale, k_scale, q_scale_fp32, k_scale_fp32, q_bf16, k_bf16):
+    
+    # Convert uint8 exponent back to fp32 scale values
+    q_scale_fp32_expanded = torch.pow(2.0, q_scale.to(torch.float32) - 127.0)
+    k_scale_fp32_expanded = torch.pow(2.0, k_scale.to(torch.float32) - 127.0)
 
+    ref = torch.einsum("bhsd,bhtd->bhst", q_bf16.to(torch.float32), k_bf16.to(torch.float32))
+    
+    q_fp4_unpacked = unpack_fp4_to_fp32(q_fp4)
+    k_fp4_unpacked = unpack_fp4_to_fp32(k_fp4)
+
+    print("q_fp4_unpacked.max()", q_fp4_unpacked.max().item())
+    print("k_fp4_unpacked.max()", k_fp4_unpacked.max().item())
+
+    print("q_bf16 max", q_bf16.max().item())
+    print("(q_fp4_unpacked * q_scale_fp32_expanded.repeat_interleave(32,dim=-1)) max", (q_fp4_unpacked * q_scale_fp32_expanded.repeat_interleave(32,dim=-1)).max().item())
+    print("(q_fp4_unpacked * q_scale_fp32.repeat_interleave(32,dim=-1)) max", (q_fp4_unpacked * q_scale_fp32.repeat_interleave(32,dim=-1)).max().item())
+    q_error = torch.mean(torch.abs(q_bf16.to(torch.float32) - (q_fp4_unpacked * q_scale_fp32_expanded.repeat_interleave(32,dim=-1))))
+    print(f"Q e8m0 descale error: {q_error.item()}")
+    q_error_fp32_scale = torch.mean(torch.abs(q_bf16.to(torch.float32) - (q_fp4_unpacked * q_scale_fp32.repeat_interleave(32,dim=-1))))
+    print(f"Q FP32 descale error: {q_error_fp32_scale.item()}")
+
+
+    # Need to do the matmul in the quantized groups
+    group_size = 32
+    num_groups = 128 // group_size
+    
+    quantized = torch.zeros_like(ref)
+    
+    for group_idx in range(num_groups):
+        start_idx = group_idx * group_size
+        end_idx = (group_idx + 1) * group_size
+        # Extract group slices
+        q_group = q_fp4_unpacked[:, :, :, start_idx:end_idx]
+        k_group = k_fp4_unpacked[:, :, :, start_idx:end_idx]
+        q_scale_group = q_scale_fp32_expanded[:, :, :, group_idx:group_idx+1]
+        k_scale_group = k_scale_fp32_expanded[:, :, :, group_idx:group_idx+1]
+        group_descale = (q_scale_group * k_scale_group.permute(0, 1, 3, 2))
+
+        # Compute grouped matmul with broadcasting
+        group_result = torch.einsum(
+            "bhsg,bhtg->bhst",
+            q_group.to(torch.float32),
+            k_group.to(torch.float32),
+        )
+        group_result = group_result * group_descale
+        quantized += group_result
+    
+    # print("Sage V2 Quantization Debug Info:")
+    print(f"Quantization FP4 + e8m0 Descale Error: {torch.mean(torch.abs(ref - quantized)).item()}")
+
+    quantized_fp32_scale = torch.zeros_like(ref)
+    
+    for group_idx in range(num_groups):
+        start_idx = group_idx * group_size
+        end_idx = (group_idx + 1) * group_size
+        # Extract group slices
+        q_group = q_fp4_unpacked[:, :, :, start_idx:end_idx]
+        k_group = k_fp4_unpacked[:, :, :, start_idx:end_idx]
+        q_scale_group = q_scale_fp32[:, :, :, group_idx:group_idx+1]
+        k_scale_group = k_scale_fp32[:, :, :, group_idx:group_idx+1]
+        group_descale = (q_scale_group * k_scale_group.permute(0, 1, 3, 2))
+        # Compute grouped matmul with broadcasting
+        group_result = torch.einsum(
+            "bhsg,bhtg->bhst",
+            q_group.to(torch.float32),
+            k_group.to(torch.float32),
+        )
+        group_result = group_result * group_descale
+        quantized_fp32_scale += group_result
+
+    print(f"Quantization FP4 + FP32 Descale Error: {torch.mean(torch.abs(ref - quantized_fp32_scale)).item()}")
 
 def sage_quant_v2(
     q,
@@ -2152,96 +2223,23 @@ def sage_quant_v2(
         BLK_K=BLKK,
     )
 
-    q_fp4, q_scale, q_scale_fp32 = downcast_to_mxfp(q_bf16, torch.uint8, axis=-1)    
     # q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
-    k_fp4, k_scale, k_scale_fp32 = downcast_to_mxfp(k_bf16, torch.uint8, axis=-1)
     # k_fp4, k_scale = downcast_to_mxfp(k, aiter.dtypes.fp8, axis=-1)
-
-    # I want to do evalution where does the most of the quantization error come from
-    # so do the ref q*k, q_fp4*k_fp4 * q_scale * k_scale, and q_fp4*k_fp4 * q_scale_fp32 * k_scale_fp32
-    # you need to reshape the scales to broadcast correctly, e.g. for bshd layout
-    
-    """
-    print("q shape:", q.shape)
-    print("k shape:", k.shape)
-    print("q fp4 shape:", q_fp4.shape)
-    print("k fp4 shape:", k_fp4.shape)
-    print("q scale shape:", q_scale.shape)
-    print("k scale shape:", k_scale.shape)
-    q shape: torch.Size([1, 5, 75352, 128])
-    k shape: torch.Size([1, 5, 75352, 128])
-    q scale shape: torch.Size([1, 5, 75352, 4])
-    k scale shape: torch.Size([1, 5, 75352, 4])
-    
-    """
-
-    # Convert uint8 exponent back to fp32 scale values
-    q_scale_fp32_expanded = torch.pow(2.0, q_scale.to(torch.float32))
-    k_scale_fp32_expanded = torch.pow(2.0, k_scale.to(torch.float32))
-
-    ref = torch.einsum("bshd,bthd->bsht", q.to(torch.float32), k.to(torch.float32))
-    
-    q_fp4_unpacked = unpack_fp4_to_fp32(q_fp4)
-    k_fp4_unpacked = unpack_fp4_to_fp32(k_fp4)
-    
-    print("Unpacked Q FP4 shape:", q_fp4_unpacked.shape)
-    print("Unpacked K FP4 shape:", k_fp4_unpacked.shape)
-    print("q scale fp32 expanded shape:", q_scale_fp32_expanded.shape)
-    print("k scale fp32 expanded shape:", k_scale_fp32_expanded.shape)
-
-    # Apply grouped scaling (groups of 32) for quantized computation
-    group_size = 32
-    num_groups = head_dim // group_size
-    
-    quantized = torch.zeros_like(ref)
-    
-    for group_idx in range(num_groups):
-        start_idx = group_idx * group_size
-        end_idx = (group_idx + 1) * group_size
-        
-        # Extract group slices
-        q_group = q_fp4_unpacked[:, :, :, start_idx:end_idx]
-        k_group = k_fp4_unpacked[:, :, :, start_idx:end_idx]
-        q_scale_group = q_scale_fp32_expanded[:, :, :, group_idx:group_idx+1]
-        k_scale_group = k_scale_fp32_expanded[:, :, :, group_idx:group_idx+1]
-        """
-        
-        
-        group q shapes torch.Size([1, 5, 75352, 32]) torch.Size([1, 5, 75352, 32])
-        group scale shapes torch.Size([1, 5, 75352, 1]) torch.Size([1, 5, 75352, 1])
-        """
-        print("group q shapes", q_group.shape, k_group.shape)
-        print("group scale shapes", q_scale_group.shape, k_scale_group.shape)
-        group_descale = (q_scale_group * k_scale_group.permute(0, 1, 3, 2))
-        print("group descale shape", group_descale.shape)
-        # Compute grouped matmul with broadcasting
-        group_result = torch.einsum(
-            "bhsg,bhtg->bhst",
-            q_group.to(torch.float32),
-            k_group.to(torch.float32),
-        )
-        print("group result shape", group_result.shape)
-        group_result = group_result * group_descale
-        
-        quantized += group_result
-    
-    print("Sage V2 Quantization Debug Info:")
-    print(f"Quantization FP4 Error: {torch.mean((ref - quantized)**2).item()}")
-    # quantized = torch.einsum(
-    #     "bshd,bthd->bsht",
-    #     q_fp4_unpacked.to(torch.float32),
-    #     k_fp4_unpacked.to(torch.float32),
-    # ) * q_scale_fp32_expanded.unsqueeze(2) * k_scale_fp32_expanded.unsqueeze(1)
-    quantized_fp32_scale = torch.einsum(
-        "bshd,bthd->bsht",
-        q_fp4.to(torch.float32),
-        k_fp4.to(torch.float32),
-    ) * q_scale_fp32.unsqueeze(2) * k_scale_fp32.unsqueeze(1)
+    q_fp4, q_scale, q_scale_fp32 = downcast_to_mxfp(q_bf16, torch.uint8, axis=-1)    
+    k_fp4, k_scale, k_scale_fp32 = downcast_to_mxfp(k_bf16, torch.uint8, axis=-1)
 
 
-    
-    print(f"Quantization FP4 + FP32 Scale Error: {torch.mean((ref - quantized_fp32_scale)**2).item()}")
 
+    accuracy_analysis(
+        q_fp4,
+        k_fp4,
+        q_scale,
+        k_scale,
+        q_scale_fp32,
+        k_scale_fp32,
+        q_bf16,
+        k_bf16,
+    )
 
     return q_fp4, q_scale, q_scale_pre, k_fp4, k_scale, k_scale_pre, v_fp8, v_scale
 
