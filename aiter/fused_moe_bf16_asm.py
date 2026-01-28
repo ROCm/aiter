@@ -88,7 +88,7 @@ def asm_moe(
     enable_fp32 = (
         is_a8w8
         and is_g1u1
-        and (model_dim % 384 == 0)
+        and (inter_dim % 384 == 0)
         and w1.dtype == dtypes.i8
     )
     moebuf_dtype = torch.float32 if enable_fp32 else dtype
