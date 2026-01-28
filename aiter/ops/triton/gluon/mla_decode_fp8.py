@@ -320,7 +320,7 @@ def _fwd_grouped_kernel_stage1_n16x2_prefetch_k(
     cur_k2 = smem_kv2.load(layout=dot_k_layout)
 
     smem_k_rope.store(k_pe.T)
-    gl.amd.cdna3.sched_barrier(0x0)
+    # gl.amd.cdna3.sched_barrier(0x0)
     split_kv_start += BLOCK_N
 
     for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
@@ -794,7 +794,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k
     )
 
-    gl.amd.cdna3.sched_barrier(0x0)
+    # gl.amd.cdna3.sched_barrier(0x0)
 
     smem_kv1.store(kv1.T)
     smem_kv2.store(kv2.T)
@@ -825,22 +825,22 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     cur_k1 = smem_kv1.load(layout=dot_k_layout)
     cur_k2 = smem_kv2.load(layout=dot_k_layout)
 
-    gl.amd.cdna3.sched_barrier(0x0)
+    # gl.amd.cdna3.sched_barrier(0x0)
     smem_kv1 = smem_kv1._reinterpret(
         K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
     kv1_transpose = gl.convert_layout(kv1, kv_itt_layout)
-    gl.amd.cdna3.sched_barrier(0x0)
+    # gl.amd.cdna3.sched_barrier(0x0)
 
     smem_kv1.store(kv1_transpose)
     smem_kv2 = smem_kv2._reinterpret(
         K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
     kv2_transpose = gl.convert_layout(kv2, kv_itt_layout)
-    gl.amd.cdna3.sched_barrier(0x0)
+    # gl.amd.cdna3.sched_barrier(0x0)
 
     smem_kv2.store(kv2_transpose)
 
     smem_k_rope.store(k_pe.T)
-    gl.amd.cdna3.sched_barrier(0x0)
+    # gl.amd.cdna3.sched_barrier(0x0)
     split_kv_start += 1 
 
     mask_qk_h = gl.arange(0, BLOCK_H, gl.SliceLayout(1, mfma_layout_qk))
@@ -855,12 +855,12 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
 
         cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
 
-        gl.amd.cdna3.sched_barrier(0x0)
+        # gl.amd.cdna3.sched_barrier(0x0)
         k_id = kv_loc * PAGE_BLOCK_SIZE + cur_N
         offs_buf_kv = k_id[:, None] * stride_buf_kh + offs_k_c[None, :]
         mask_k_id = start_n * PAGE_BLOCK_SIZE + cur_N
         mask_k = mask_k_id < cur_batch_seq_len
-        gl.amd.cdna3.sched_barrier(0x0)
+        # gl.amd.cdna3.sched_barrier(0x0)
 
         qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
         kv1 = gl.amd.cdna3.buffer_load(
@@ -869,7 +869,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
             mask=mask_k[:, None] & mask_k_c[None, :]
         )
 
-        gl.amd.cdna3.sched_barrier(0x0)
+        # gl.amd.cdna3.sched_barrier(0x0)
 
         qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
         kv2 = gl.amd.cdna3.buffer_load(
@@ -902,7 +902,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         mask_k_id = start_n * PAGE_BLOCK_SIZE + cur_N_pe
         mask_k_pe = mask_k_id < cur_batch_seq_len
 
-        gl.amd.cdna3.sched_barrier(0x0)
+        # gl.amd.cdna3.sched_barrier(0x0)
         k_pe = gl.amd.cdna3.buffer_load(
             ptr=K_Buffer,
             offsets=offs_buf_k_pe,
@@ -919,7 +919,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         re_scale = tl.math.exp2((e_max - n_e_max) * log2e)
         p = tl.math.exp2((qk - n_e_max[:, None]) * log2e)
         smem_p.store(p.to(q0.dtype))
-        gl.amd.cdna3.sched_barrier(0x0)
+        # gl.amd.cdna3.sched_barrier(0x0)
 
         cur_p = smem_p.load(layout=dot_p_layout)
         smem_kv1 = smem_kv1._reinterpret(
@@ -940,7 +940,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
 
         cur_k1 = smem_kv1.load(layout=dot_k_layout)
         kv1_transpose = gl.convert_layout(kv1, kv_itt_layout)
-        gl.amd.cdna3.sched_barrier(0x0)
+        # gl.amd.cdna3.sched_barrier(0x0)
         smem_kv1 = smem_kv1._reinterpret(
             K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
 
@@ -948,7 +948,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         cur_k2 = smem_kv2.load(layout=dot_k_layout)
 
         kv2_transpose = gl.convert_layout(kv2, kv_itt_layout)
-        gl.amd.cdna3.sched_barrier(0x0)
+        # gl.amd.cdna3.sched_barrier(0x0)
         smem_kv2 = smem_kv2._reinterpret(
             K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
         smem_kv2.store(kv2_transpose)
@@ -1001,7 +1001,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     acc1 = acc1 * re_scale[:, None]
     acc2 = acc2 * re_scale[:, None]
     e_sum = e_sum * re_scale + gl.sum(p, 1)
-    gl.amd.cdna3.sched_barrier(0x0)
+    # gl.amd.cdna3.sched_barrier(0x0)
     cur_p = smem_p.load(layout=dot_p_layout)
     e_max = n_e_max
 
@@ -1352,7 +1352,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k(
     cur_k2 = smem_kv2.load(layout=dot_k_layout)
 
     smem_k_rope.store(k_pe.T)
-    gl.amd.cdna3.sched_barrier(0x0)
+    # gl.amd.cdna3.sched_barrier(0x0)
     split_kv_start += BLOCK_N
 
     for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
