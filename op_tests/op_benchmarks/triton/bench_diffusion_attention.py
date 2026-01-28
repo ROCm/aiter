@@ -33,7 +33,8 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd import (
     fav3_sage,
     get_sage_fwd_configs,
     sage_quant,
-    sage_quant_v2
+    sage_quant_v2,
+    sage_quant_v3
 )
 from op_tests.triton_tests.utils.accuracy_analysis import compare_accuracy
 
@@ -321,58 +322,37 @@ def fav3_sage_forward_func(
     fp8_dtype = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(fp8_dtype).max
 
-    if sage_version == fav3_sage.Sage_version.V1:
-        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
-            q,
-            k,
-            v,
-            fp8_dtype,
-            FP8_MAX,
-            sm_scale=softmax_scale,
-            BLKQ=BLKQ,
-            BLKK=BLKK,
-            layout=layout,
-        )
-        return lambda: fav3_sage_func(
-            q_int8,
-            k_int8,
-            v_fp8,
-            q_descale,
-            k_descale,
-            v_descale,
-            FP8_MAX,
-            causal=causal,
-            inference_mode=inference_mode,
-            layout=layout,
-            sage_version=fav3_sage.Sage_version.V1
-        )
-    else:
-        q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale = sage_quant_v2(
-            q,
-            k,
-            v,
-            fp8_dtype,
-            FP8_MAX,
-            sm_scale=softmax_scale,
-            BLKQ=BLKQ,
-            BLKK=BLKK,
-            layout=layout,
-        )
+    sage_quant_func = sage_quant
+    if sage_version == fav3_sage.Sage_version.V2:
+        sage_quant_func = sage_quant_v2
+    if sage_version == fav3_sage.Sage_version.V3:
+        sage_quant_func = sage_quant_v3
 
-        return lambda: fav3_sage_func(
-            q_fp4,
-            k_fp4,
-            v_fp8,
-            q_descale,
-            k_descale,
-            v_descale,
-            FP8_MAX,
-            causal=False,
-            inference_mode=True,
-            layout=layout,
-            config=config,
-            sage_version=fav3_sage.Sage_version.V2
-        )
+    q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant_func(
+        q,
+        k,
+        v,
+        fp8_dtype,
+        FP8_MAX,
+        sm_scale=softmax_scale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        layout=layout,
+    )
+
+    return lambda: fav3_sage_func(
+        q_quantized,
+        k_quantized,
+        v_quantized,
+        q_descale,
+        k_descale,
+        v_descale,
+        FP8_MAX,
+        causal=causal,
+        inference_mode=inference_mode,
+        layout=layout,
+        sage_version=sage_version
+    )
 
 def create_benchmark_configs(args):
     dtype = arg_to_torch_dtype[args.dtype]
@@ -553,9 +533,14 @@ def bench_kernel(q, k, v, args, provider):
     else:  # bhsd
         BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
         _, HK, N_CTX_K, D_HEAD_V = v.shape
-    assert args.sage_version in [1, 2], f"Unsupported sage version {args.sage_version}"
+    assert args.sage_version in [1, 2, 3], f"Unsupported sage version {args.sage_version}"
 
-    sage_version = fav3_sage.Sage_version.V1 if args.sage_version == 1 else fav3_sage.Sage_version.V2
+    sage_version = fav3_sage.Sage_version.V1
+    if args.sage_version == 2:
+        sage_version = fav3_sage.Sage_version.V2
+    if args.sage_version == 3:
+        sage_version = fav3_sage.Sage_version.V3
+
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = args.k_smooth
 

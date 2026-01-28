@@ -2,6 +2,7 @@ import torch
 from typing import Optional, Tuple
 from .fwd_prefill import fav3_sage_triton_impl
 from .fwd_prefill_v2 import fav3_sage_triton_impl_v2
+from .fwd_prefill_v3 import fav3_sage_triton_impl_v3
 from .sage_version import Sage_version
 
 from .utils import (
@@ -308,7 +309,11 @@ def fwd(
 
     # print("sage_version", sage_version)
     # print(sage_version == Sage_version.V1)
-    sage_func = fav3_sage_triton_impl if sage_version == Sage_version.V1 else fav3_sage_triton_impl_v2
+    sage_func = fav3_sage_triton_impl
+    if sage_version == Sage_version.V2:
+        sage_func = fav3_sage_triton_impl_v2
+    elif sage_version == Sage_version.V3:
+        sage_func = fav3_sage_triton_impl_v3
 
     sage_func(
         q,
