@@ -104,6 +104,7 @@ def asm_moe(
             expert_mask,
         )
     )
+    
     if fc1_scale is None:
         # pure bf16
         aiter.fmoe(
@@ -213,7 +214,7 @@ def asm_moe(
                 local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
                 local_expert_hash[local_expert_hash > 0] -= 1
                 topk_ids = topk_ids.to(dtype=torch.int64, device=local_expert_hash.device)
-                topk_ids = local_expert_hash[topk_ids]
+                topk_ids = local_expert_hash[topk_ids].to(dtype=dtypes.i32)
 
             aiter.moe_smoothquant_fwd(
                 a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale

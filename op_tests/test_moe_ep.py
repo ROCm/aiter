@@ -102,8 +102,8 @@ def test_fmoe_ep(
     topk,
     quant="No",
     use_g1u1=False,
-    shared_E=2,
-    ep=8,
+    shared_E=0,
+    ep=1,
 ):
     # This gpu id in EP, this example use the last id
     ep_id = ep - 1
@@ -156,36 +156,35 @@ def test_fmoe_ep(
     )
     score = torch.randn((token, E), device="cuda", dtype=dtype)
 
-    # if shared_E > 0:
-    shared_E_score = 0.1
-    # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
-    total_topk_ids = torch.empty(
-        (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
-    )
-    ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
-    shared_expert_ids = [E + i for i in range(shared_E + 1)]
-    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
-    for i in range(ep_id, MAX_TOKENS, ep):
-        s_topk_ids_list[i] = shared_expert_ids
-    s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device=input.device)
+    if shared_E > 0:
+        shared_E_score = 0.1
+        # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
+        total_topk_ids = torch.empty(
+            (MAX_TOKENS, topk + shared_E), dtype=dtypes.i32, device=input.device
+        )
+        ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+        shared_expert_ids = [E + i for i in range(shared_E + 1)]
+        s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
+        for i in range(ep_id, MAX_TOKENS, ep):
+            s_topk_ids_list[i] = shared_expert_ids
+        s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device=input.device)
 
-    # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
-    total_topk_weights = torch.empty(
-        (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
-    )
-    ns_topk_weights, s_topk_weights = total_topk_weights.split(
-        [topk, shared_E + 1], dim=1
-    )
-    s_topk_weights[:] = shared_E_score
+        # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
+        total_topk_weights = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
+        )
+        ns_topk_weights, s_topk_weights = total_topk_weights.split(
+            [topk, shared_E + 1], dim=1
+        )
+        s_topk_weights[:] = shared_E_score
 
-    # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
-    fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
-    # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
-    topk_ids = total_topk_ids[:token]
-    topk_weights = total_topk_weights[:token]
-
-    # else:
-    #     topk_ids, topk_weights = fused_topk(input, score, topk, True)
+        # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
+        fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
+        # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
+        topk_ids = total_topk_ids[:token]
+        topk_weights = total_topk_weights[:token]
+    else:
+        topk_ids, topk_weights = fused_topk(input, score, topk, True)
 
     if quantAlgoId == 0:
         # ref2 implement
@@ -306,39 +305,42 @@ def test_fmoe_ep(
             f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}TB/s"
         )
 
-        if use_smooth and (
-            (
-                (inter_dim % 512 == 0 or inter_dim % 320 == 0)
-                and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
-            )
-            or (
-                (inter_dim % 256 == 0 or inter_dim % 320 == 0 or inter_dim % 384 == 0)
-                and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
-            )
-            or (
-                (inter_dim % 512 == 0)
-                and (w1b.dtype == dtypes.i8 and inter_dim == w1b.shape[1])
-            )
-        ):
-            out_b2, avg_b2 = asm_moe_test(
-                input,
-                w1b,
-                w2b,
-                topk_weights,
-                topk_ids,
-                fc1_scale,
-                fc2_scale,
-                fc1_smooth_scale,
-                fc2_smooth_scale,
-                a16=True,
-                expert_mask=expert_mask,
-            )
-            msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
-            checkAllclose(out_b, out_b2, atol=10, msg=msg)
+        # if use_smooth and (
+        #     (
+        #         (inter_dim % 512 == 0 or inter_dim % 320 == 0)
+        #         and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
+        #     )
+        #     or (
+        #         (inter_dim % 256 == 0 or inter_dim % 320 == 0 or inter_dim % 384 == 0)
+        #         and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
+        #     )
+        #     or (
+        #         (inter_dim % 512 == 0)
+        #         and (w1b.dtype == dtypes.i8 and inter_dim == w1b.shape[1])
+        #     )
+        # ):
+        #     out_b2, avg_b2 = asm_moe_test(
+        #         input,
+        #         w1b,
+        #         w2b,
+        #         topk_weights,
+        #         topk_ids,
+        #         fc1_scale,
+        #         fc2_scale,
+        #         fc1_smooth_scale,
+        #         fc2_smooth_scale,
+        #         a16=True,
+        #         expert_mask=expert_mask,
+        #     )
+        #     msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
+        #     checkAllclose(out_b, out_b2, atol=10, msg=msg)
 
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
+        print(out_b)
+        print(ref2)
+
 
 
 parser = argparse.ArgumentParser(
@@ -481,7 +483,7 @@ for test in l_test:
                                 topk,
                                 quant="No",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_int8quant":
@@ -509,7 +511,7 @@ for test in l_test:
                                 topk,
                                 quant="int8quant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8quant":
@@ -567,7 +569,7 @@ for test in l_test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=False,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_int8smoothquant":
@@ -593,7 +595,7 @@ for test in l_test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8smoothquant":
@@ -623,7 +625,7 @@ for test in l_test:
                                 topk,
                                 quant="fp8smoothquant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     else:

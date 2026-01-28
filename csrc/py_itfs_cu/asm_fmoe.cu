@@ -124,10 +124,6 @@ class FMoeKernel
         uint32_t O_elemSize = sizeof(T_O);
 
         int stride_X = input.stride(0) * input.element_size();
-        // if(out.scalar_type() == at::ScalarType::Float)
-        // {
-        //     stride_X *= 2;
-        // }
 
         int stride_GU = dim * I_elemSize;
         int stride_D  = inter_dim * I_elemSize;
@@ -144,6 +140,7 @@ class FMoeKernel
             w2_dqn.has_value() ? w2_dqn.value().stride(0) * w2_dqn.value().element_size() : 0;
         int stride_expert_SMTDQN = inter_dim * sizeof(float);
         int stride_O             = dim * O_elemSize;
+  
         if(inter_dim * 2 == w1.size(1))
         {
             stride_expert_GU *= 2;
@@ -217,26 +214,26 @@ class FMoeKernel
             gdz = 1;
         }
 
-        std::cout << "sub_GU: " << sub_GU << std::endl;
-        std::cout << "args.dim: " << args.dim << std::endl;
-        std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
-        std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
-        std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
-        std::cout << "args.stride_X: " << args.Xs << std::endl;
-        std::cout << "args.stride_GU: " << args.GUs << std::endl;
-        std::cout << "args.stride_D: " << args.Ds << std::endl;
-        std::cout << "args.stride_O: " << args.Os << std::endl;
-        std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
-        std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
-        std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
-        std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
-        std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
-        std::cout << "args.topk: " << args.topk << std::endl;
-        std::cout << "args.ps_deno: " << args.ps_deno << std::endl;
-        std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
-        std::cout << "gdx: " << gdx << std::endl;
-        std::cout << "gdy: " << gdy << std::endl;
-        printf("argsize: %zu\n", arg_size);
+        // std::cout << "sub_GU: " << sub_GU << std::endl;
+        // std::cout << "args.dim: " << args.dim << std::endl;
+        // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
+        // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
+        // std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
+        // std::cout << "args.stride_X: " << args.Xs << std::endl;
+        // std::cout << "args.stride_GU: " << args.GUs << std::endl;
+        // std::cout << "args.stride_D: " << args.Ds << std::endl;
+        // std::cout << "args.stride_O: " << args.Os << std::endl;
+        // std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
+        // std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
+        // std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
+        // std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
+        // std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
+        // std::cout << "args.topk: " << args.topk << std::endl;
+        // std::cout << "args.ps_deno: " << args.ps_deno << std::endl;
+        // std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
+        // std::cout << "gdx: " << gdx << std::endl;
+        // std::cout << "gdy: " << gdy << std::endl;
+        // printf("argsize: %zu\n", arg_size);
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -644,7 +641,7 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
-        int vskip_override = (out.dtype() == at::ScalarType::Float) ? 1 : -1;
+        int vskip_override = (out.dtype() == at::ScalarType::Float) ? 0 : -1;
         impl_ptr           = get_heuristic_kernel(
             inter_dim, sub_X_cnt, config_map, smf, kernel_name, vskip_override);
     }
