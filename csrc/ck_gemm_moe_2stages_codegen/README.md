@@ -94,6 +94,15 @@ If you have built moe kernels before tuning new MoE shapes, please add `AITER_RE
 -k
 --splitK
 ```
+#### `--sort`
+- **Type**: Boolean (True/False)
+- **Default**: `False` 
+- **Description**: Sort the output file according to the key columns
+
+**Example**:
+```bash
+--sort True
+```
 
 #### `--all`
 - **Type**: Flag (boolean)
