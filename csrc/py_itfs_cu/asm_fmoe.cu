@@ -629,9 +629,7 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
-        int vskip_override = (out.dtype() == at::ScalarType::Float) ? 1 : -1;
-        impl_ptr           = get_heuristic_kernel(
-            inter_dim, sub_X_cnt, config_map, smf, kernel_name, vskip_override);
+        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
         impl_ptr->set_4bit(true);
     }
 #endif
@@ -652,7 +650,9 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
+        int vskip_override = (out.dtype() == at::ScalarType::Float) ? 1 : -1;
+        impl_ptr           = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name, vskip_override);
     }
     else if(input.dtype() == torch_fp8) // fp8
     {
