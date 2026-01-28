@@ -1,8 +1,15 @@
 from contextlib import redirect_stdout, redirect_stderr
 import io
+import logging
 import shlex
 
-from .bench_mha import main as bench_mha_main
+
+def disable_aiter_logs() -> None:
+    logging.getLogger("aiter").disabled = True
+
+
+disable_aiter_logs()
+from bench_mha import main as bench_mha_main  # noqa: E402
 
 
 def run_bench_mha(args: str) -> tuple[str, str]:
