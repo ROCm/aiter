@@ -1,5 +1,5 @@
 qType,kvType,Gqa,Mtp,Msk,Hp,blkSz,knl_name,co_name,ps,qTile,quant_type
-bf16,fp8,0,0,1,1,256,_ZN5aiter44PA_A16W8_BLK256_1TG_4W_48mx1_64nx4_MTP_PS_PBE,pa_bf16_perblockFp8_1tg_4w_qlen48_msk1_ps.co,1,48,6
+bf16,fp8,0,0,1,1,256,_ZN5aiter44PA_A16W8_BLK256_1TG_4W_48mx1_64nx4_MTP_PS_PBE,pa_bf16_perblockFp8_blk256_1tg_4w_qlen48_msk1_ps.co,1,48,6
 bf16,fp8,0,0,1,1,1024,_ZN5aiter45PA_A16W8_BLK1024_1TG_4W_48mx1_64nx4_MTP_PS_PBE,pa_bf16_perblockFp8_blk1024_1tg_4w_qlen48_msk1_ps.co,1,48,7
 bf16,fp8,0,0,1,1,1024,_ZN5aiter42PA_A16W8_BLK1024_1TG_4W_16mx1_64nx4_MTP_PSE,pa_bf16_pertokenFp8_gqa16_1tg_4w_qlen16_msk1_ps.co,1,16,2
 bf16,fp8,0,0,1,1,1024,_ZN5aiter42PA_A16W8_BLK1024_1TG_4W_32mx1_64nx4_MTP_PSE,pa_bf16_pertokenFp8_gqa16_1tg_4w_qlen32_msk1_ps.co,1,32,2
