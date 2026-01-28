@@ -582,3 +582,120 @@ def _sinkhorn_knopp_log_domain_kernel(
             P = tl.exp2(log_P * LOG2_E)
 
             tl.store(out_ptr + batch_offset + flat_idx, P.to(out_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _sinkhorn_knopp_lite(
+    # Pointers
+    logits_ptr,     # Input: (M, n_factorial) raw logits for permutation weights
+    perm_mats_ptr,  # Input: (n_factorial, N, N) pre-computed permutation matrices
+    out_ptr,        # Output: (M, N, N) doubly stochastic matrices
+    # Dimensions
+    M,              # Batch size (number of matrices)
+    N: tl.constexpr,            # Matrix size
+    N_FACTORIAL: tl.constexpr,  # Number of permutations (N!)
+    N_FACTORIAL_POW2: tl.constexpr,  # Next power of 2 >= N_FACTORIAL
+    # Strides
+    stride_logits_m,      # Stride for batch dimension in logits
+    stride_logits_perm,   # Stride for permutation dimension in logits
+    stride_perm_idx,      # Stride for permutation index in perm_mats
+    stride_perm_row,      # Stride for row in perm_mats
+    stride_perm_col,      # Stride for col in perm_mats
+    stride_out_batch,     # Stride for batch dimension in output
+    stride_out_row,       # Stride for row dimension in output
+    stride_out_col,       # Stride for column dimension in output
+    # Meta-parameters
+    BLOCK_M: tl.constexpr,      # Batch elements per program
+):
+    """
+    Zero-iteration Sinkhorn-Knopp kernel using permutation matrix basis.
+    
+    Instead of iteratively normalizing matrices, this directly parameterizes
+    doubly stochastic matrices as convex combinations of permutation matrices,
+    based on the Birkhoff-von Neumann theorem.
+    
+    Mathematical foundation:
+        Any doubly stochastic matrix M can be written as:
+        M = Σ_{k=1}^{n!} λ_k * P_k
+        where P_k are permutation matrices and λ_k ≥ 0, Σλ_k = 1
+    
+    Algorithm:
+        1. Apply softmax to logits to get weights λ: (M, n!)
+        2. Compute weighted sum: M[b] = Σ_k λ[b,k] * P_k
+        3. Result is automatically doubly stochastic (no iterations!)
+    
+    Advantages:
+        - Zero iterations (one-shot computation)
+        - Exact doubly stochastic property
+        - Faster than iterative Sinkhorn-Knopp
+    
+    Limitations:
+        - Requires storing n! permutation matrices
+        - Only practical for small N (typically N=4, where 4!=24)
+        - For N=5: 5!=120, N=6: 6!=720 (memory intensive)
+    
+    Grid: (cdiv(M, BLOCK_M),) - one program per BLOCK_M batch elements
+    
+    Reference: "mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations"
+               https://arxiv.org/abs/2601.05732
+    """
+    pid_m = tl.program_id(axis=0)
+    batch_start = pid_m * BLOCK_M
+    
+    # Constants for exp2/log2 conversion (for numerical stability in softmax)
+    LOG2_E: tl.constexpr = 1.4426950408889634  # 1/ln(2)
+    LN_2: tl.constexpr = 0.6931471805599453    # ln(2)
+    
+    # Compute flat indices for NxN matrices (shared across all batches)
+    row_idx = tl.arange(0, N)[:, None]  # (N, 1)
+    col_idx = tl.arange(0, N)[None, :]  # (1, N)
+    flat_idx = row_idx * stride_out_row + col_idx * stride_out_col
+    
+    # Loop over batch elements in this block
+    for batch_local in range(BLOCK_M):
+        batch_idx = batch_start + batch_local
+        if batch_idx < M:
+            # Load logits for this batch: (n_factorial,)
+            # Note: tl.arange requires power of 2, so we use N_FACTORIAL_POW2 and mask
+            perm_indices = tl.arange(0, N_FACTORIAL_POW2)
+            logits = tl.load(
+                logits_ptr + batch_idx * stride_logits_m + perm_indices * stride_logits_perm,
+                mask=perm_indices < N_FACTORIAL,
+                other=float('-inf')  # Masked values won't contribute after softmax
+            ).to(tl.float32)
+            
+            # Apply softmax to get weights λ (ensures Σλ = 1, λ ≥ 0)
+            # Using log-domain for numerical stability
+            logits_max = tl.max(logits, axis=0)
+            exp_shifted = tl.exp2((logits - logits_max) * LOG2_E)
+            sum_exp = tl.sum(exp_shifted, axis=0)
+            weights = exp_shifted / sum_exp  # (n_factorial_pow2,) but only first N_FACTORIAL matter
+            
+            # Initialize output matrix
+            out_matrix = tl.zeros((N, N), dtype=tl.float32)
+            
+            # Compute weighted sum: M = Σ_k λ_k * P_k
+            # We need to manually unroll for each N_FACTORIAL value since Triton
+            # doesn't support dynamic tensor indexing in loops
+            # Use tl.sum with broadcasting instead
+            for perm_idx in range(N_FACTORIAL):
+                # Load permutation matrix P_k: (N, N)
+                perm_base = perm_idx * stride_perm_idx
+                perm_matrix = tl.load(
+                    perm_mats_ptr + perm_base + flat_idx,
+                ).to(tl.float32)
+                
+                # Load the corresponding weight (scalar)
+                # Need to extract scalar from weights tensor
+                weight_mask = perm_indices == perm_idx
+                weight_val = tl.sum(tl.where(weight_mask, weights, 0.0))
+                
+                # Add weighted contribution
+                out_matrix += weight_val * perm_matrix
+            
+            # Store result
+            batch_offset = batch_idx * stride_out_batch
+            tl.store(
+                out_ptr + batch_offset + flat_idx, 
+                out_matrix.to(out_ptr.dtype.element_ty)
+            ) 
