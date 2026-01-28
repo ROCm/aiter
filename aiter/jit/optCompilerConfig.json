@@ -170,7 +170,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py --code-objects -m custom_all_reduce --glob=all_reduce.co --glob=allreduce*.co --output_dir {{}}'"
     },
     "module_quick_all_reduce": {
         "srcs": [
@@ -397,7 +397,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py --code-objects -m flatmm_fp8gemm_blockscale --glob=flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32.co --output_dir {{}}'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle_asm": {
         "srcs": [
@@ -421,7 +421,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py --code_objects -m fp8gemm_blockscale_mi350 --glob=f8_block_scale_mi350*.co --output_dir {{}}'"
     },
     "module_moe_asm": {
         "srcs": [
@@ -444,7 +444,8 @@
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'",
-            "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py --code-objects -m fmoe --glob=fmoe_*16.co --glob=fmoe/gelu/fmoe_int8_g1u0_subGU_*.co --glob=fmoe/silu/fmoe_int8_g1u0_subGU_*.co --glob=fmoe_int4fp8_g1u1_subGU_*.co --glob=fmoe_int8_g1u0_smf.co --output_dir {{}}'"
         ]
     },
     "module_moe_ck2stages": {
@@ -535,7 +536,10 @@
             "f'{CK_DIR}/example/ck_tile/02_layernorm2d'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
+        "blob_gen_cmd": [
+            "f'{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py --code-objects -m norm --glob=layer_norm.co --glob=layer_norm_qnt.co --output_dir {{}}'"
+        ]
     },
     "module_pos_encoding": {
         "srcs": [
@@ -1130,7 +1134,10 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py --code-objects -m topk_per_row_decode --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py --code-objects -m topk_per_row_prefill --output_dir {{}}'"
+        ]
     },
     "module_mla_metadata": {
         "srcs": [

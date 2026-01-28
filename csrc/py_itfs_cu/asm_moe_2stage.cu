@@ -60,7 +60,7 @@ struct __attribute__((packed)) KernelArgs
     p2 _p22;
 };
 
-static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, QuantType &quant_type, bool do_weight)
+static const CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, QuantType &quant_type, bool do_weight)
 {
     int E = w1.size(0);
     int dim1 = w1.size(1);
@@ -104,23 +104,16 @@ static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, Q
     }
 };
 
-std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs, std::string arch_id)
+const auto* get_heuristic_kernel(int m_num, int N, int blockk_size, const CFG *cfgs, GPUArchId arch_id)
 {
-    hipDevice_t dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu = dev_prop.multiProcessorCount;
+    uint32_t num_cu = get_num_cu();
     uint32_t empty_cu = num_cu;
     uint32_t tg_num = 0;
     uint32_t round = 0xffffffff;
-    std::string selected = "inter_dim = " + std::to_string(N);
+    const CFG::Entry* selectedCfg = nullptr;
 
-    for (const auto &el : *cfgs)
+    for (const auto &cfg : cfgs->get_configs_for_arch(arch_id))
     {
-        if (el.first.find(arch_id) != 0)
-            continue;
-        const auto &cfg = el.second;
         if (cfg.tile_m != blockk_size || N % cfg.tile_n != 0)
         {
             continue;
@@ -131,7 +124,7 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs, s
         if (local_round < round)
         {
             round = local_round;
-            selected = el.first;
+            selectedCfg = &cfg;
             empty_cu = local_round * num_cu - tg_num;
         }
         else if (local_round == round)
@@ -139,12 +132,12 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs, s
             if (empty_cu > (local_round * num_cu - tg_num))
             {
                 round = local_round;
-                selected = el.first;
+                selectedCfg = &cfg;
                 empty_cu = local_round * num_cu - tg_num;
             }
         }
     }
-    return selected;
+    return selectedCfg;
 }
 void moe_stage1_g1u1(
     torch::Tensor &input,             // [token_cnt, model_dim] M,K
@@ -168,34 +161,27 @@ void moe_stage1_g1u1(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    const CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
     int model_dim = input.size(1);
     int hidden_dim = inter_dim;
     int sub_X_cnt = sorted_expert_ids.size(0);
-    std::string arch_id = get_gpu_arch();
-    kernelName = !kernelName.empty() ? arch_id + kernelName : "";
-    if (kernelName.empty())
+    auto arch_id          = get_gpu_arch();
+    const CFG::Entry* cfg = nullptr;
+    if(kernelName.empty())
     {
-        kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
+        cfg = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
+    }
+    else
+    {
+        cfg = config_map->find_config_by_kernel_name(arch_id, kernelName);
     }
 
-    AiterAsmKernel *impl_ptr = nullptr;
-    auto it = config_map->find(kernelName);
-    if (it != config_map->end())
+    AiterAsmKernel<>* impl_ptr = config_map->load_kernel_for_config(cfg);
+    if(impl_ptr != nullptr)
     {
-        const auto &cfg = it->second;
-        const char *name = cfg.knl_name.c_str();
-        const char *co_name = cfg.co_name.c_str();
-
-        TORCH_CHECK(inter_dim % cfg.tile_n == 0, "ASM kernel " + std::string(name) + " is not supported for inter_dim = " + std::to_string(inter_dim));
-
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if (result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+        TORCH_CHECK(inter_dim % cfg->tile_n == 0,
+                    "ASM kernel " + std::string(config_map->get_kernel_name_for_config(cfg)) +
+                        " is not supported for inter_dim = " + std::to_string(inter_dim));
     }
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
@@ -207,9 +193,8 @@ void moe_stage1_g1u1(
 
     int dim = w2.size(1);
     int eprt = w1.size(0);
-    const auto &cfg = it->second;
-    uint32_t sub_GU = cfg.tile_n;
-    TORCH_CHECK(block_m == cfg.tile_m, __func__, " kernel: ", cfg.knl_name, " need block_m == ", cfg.tile_m);
+    uint32_t sub_GU = cfg->tile_n;
+    TORCH_CHECK(block_m == cfg->tile_m, __func__, " kernel: ", config_map->get_kernel_name_for_config(cfg), " need block_m == ", cfg->tile_m);
 
     int stride_X = input.stride(0) * input.element_size();
     int stride_GU = dim * w1.element_size();
@@ -254,8 +239,8 @@ void moe_stage1_g1u1(
     uint32_t k_num = 1 << ksplit;
     TORCH_CHECK(model_dim % k_num == 0, __func__, " Unsupported ksplit for model_dim:", model_dim, " k_num:", k_num);
 
-    void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                      &arg_size, HIP_LAUNCH_PARAM_END};
+    // void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE,
+    //                   &arg_size, HIP_LAUNCH_PARAM_END};
 
     int bdx = 256;
     int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);

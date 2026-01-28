@@ -993,7 +993,7 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
     TORCH_CHECK(out.is_contiguous());
     TORCH_CHECK(input.is_contiguous());
 
-    uint32_t num_cu       = get_num_cu_func();
+    uint32_t num_cu       = get_num_cu();
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
     int32_t* num_rows_ptr = num_rows.data_ptr<int32_t>();
