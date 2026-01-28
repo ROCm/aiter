@@ -8,7 +8,7 @@ from .utils import (
     map_dims,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import downcast_to_mxfp, accuracy_analysis
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs
 
 @triton.jit
@@ -1986,11 +1986,11 @@ def sage_quant_v2(
         num_warps=8
     )
 
-    # q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
-    q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
-    k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+    q_fp4, q_scale, q_scale_fp32 = downcast_to_mxfp(q, torch.uint8, axis=-1)
+    # q_fp4, q_scale, q_scale_fp32 = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
+    k_fp4, k_scale, k_scale_fp32 = downcast_to_mxfp(k, torch.uint8, axis=-1)
     # k_fp4, k_scale = downcast_to_mxfp(k, aiter.dtypes.fp8, axis=-1)
-
+    accuracy_analysis(q_fp4, k_fp4, q_scale, k_scale, q_scale_fp32, k_scale_fp32, q, k)
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
 
