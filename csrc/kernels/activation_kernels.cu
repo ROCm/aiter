@@ -15,6 +15,7 @@
 #include "py_itfs_common.h"
 #include "vec_convert.h"
 #include "opus.hpp"
+#include "aiter_opus_plus.h"
 #include <hip/hip_bf16.h>
 
 using fp8_type = ck_tile::fp8_t;
@@ -193,11 +194,12 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
     // Use opus::make_gmem instead of ck_tile::make_buffer_view, size in BYTES
     auto buffer_x = opus::make_gmem<DTYPE_I>(ptr_x, oob_i * sizeof(DTYPE_I));
     auto buffer_y = opus::make_gmem<DTYPE_I>(ptr_y, oob_i * sizeof(DTYPE_I));
+    static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * VEC_SIZE_I > 16 ? 16 : sizeof(DTYPE_I) * VEC_SIZE_I;
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
-        auto x = buffer_x.template load<VEC_SIZE_I, 2>(idx); // 2: NT1
-        auto y = buffer_y.template load<VEC_SIZE_I, 2>(idx); // 2: NT1
+        auto x = load_vector_nbytes<DTYPE_I, VEC_SIZE_I, load_chunk_bytes, GROUP_NT>(buffer_x, idx); // 2: NT1
+        auto y = load_vector_nbytes<DTYPE_I, VEC_SIZE_I, load_chunk_bytes, GROUP_NT>(buffer_y, idx);
 
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {

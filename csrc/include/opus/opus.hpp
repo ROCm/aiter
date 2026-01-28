@@ -950,24 +950,6 @@ struct gmem {
         else if constexpr (sizeof(type) == 4)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b32 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 8)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b64 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os, aux)); }
-        else if constexpr (sizeof(type) == 32) {
-            // Load 32 bytes using two 128-bit loads
-            i32x8_t tmp;
-            reinterpret_cast<i32x4_t*>(&tmp)[0] = __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os,      aux);
-            reinterpret_cast<i32x4_t*>(&tmp)[1] = __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os + 16, aux);
-
-            return __builtin_bit_cast(type, tmp);
-        }
-        else if constexpr (sizeof(type) == 64) {
-            // Load 64 bytes using four 128-bit loads
-            i32x16_t tmp;
-            reinterpret_cast<i32x4_t*>(&tmp)[0] = __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os,      aux);
-            reinterpret_cast<i32x4_t*>(&tmp)[1] = __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os + 16, aux);
-            reinterpret_cast<i32x4_t*>(&tmp)[2] = __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os + 32, aux);
-            reinterpret_cast<i32x4_t*>(&tmp)[3] = __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os + 48, aux);
-
-            return __builtin_bit_cast(type, tmp);
-        }
     }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
@@ -992,20 +974,6 @@ struct gmem {
         else if constexpr (sizeof(vector_type<vec>) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 32) {
-            // Store 32 bytes using two 128-bit stores
-            i32x8_t tmp = __builtin_bit_cast(i32x8_t, x);
-            __builtin_amdgcn_raw_buffer_store_b128(reinterpret_cast<i32x4_t*>(&tmp)[0], cached_rsrc, v_os, s_os,      aux);
-            __builtin_amdgcn_raw_buffer_store_b128(reinterpret_cast<i32x4_t*>(&tmp)[1], cached_rsrc, v_os, s_os + 16, aux);
-        }
-        else if constexpr (sizeof(vector_type<vec>) == 64) {
-            // Store 64 bytes using four 128-bit stores
-            i32x16_t tmp = __builtin_bit_cast(i32x16_t, x);
-            __builtin_amdgcn_raw_buffer_store_b128(reinterpret_cast<i32x4_t*>(&tmp)[0], cached_rsrc, v_os, s_os,      aux);
-            __builtin_amdgcn_raw_buffer_store_b128(reinterpret_cast<i32x4_t*>(&tmp)[1], cached_rsrc, v_os, s_os + 16, aux);
-            __builtin_amdgcn_raw_buffer_store_b128(reinterpret_cast<i32x4_t*>(&tmp)[2], cached_rsrc, v_os, s_os + 32, aux);
-            __builtin_amdgcn_raw_buffer_store_b128(reinterpret_cast<i32x4_t*>(&tmp)[3], cached_rsrc, v_os, s_os + 48, aux);
-        }
     }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
