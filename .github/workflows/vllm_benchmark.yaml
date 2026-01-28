@@ -96,7 +96,7 @@ jobs:
           echo "Successfully prepared image: rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}"
 
   vllm_benchmark:
-    name: vLLM Benchmark (MI325 8 GPUs)
+    name: vLLM Benchmark (MI325 8 GPU)
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: build_vllm_image
     runs-on: aiter-8gpu-runner
