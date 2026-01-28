@@ -164,3 +164,101 @@ def _downcast_to_mxfp(
 
     tl.store(mx_scale_ptr + mx_scale_offsets, scale_tensor, mask=full_scale_mask)
     tl.store(mx_tensor_ptr + mx_tensor_offsets, out_tensor, mask=full_mask_mxt)
+
+@triton.jit
+def _compute_mx_quant_and_scale_rne(
+    src_tensor,
+    valid_src_mask,
+    mx_tensor_dtype: tl.constexpr,
+):
+    is_fp8: tl.constexpr = (
+        mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5
+    )
+    BLOCK_SIZE_OUT_DIM: tl.constexpr = src_tensor.shape[0]
+    BLOCK_SIZE_QUANT_DIM: tl.constexpr = src_tensor.shape[1]
+    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = src_tensor.shape[1] // 32
+
+    f32_tensor = src_tensor.to(tl.float32)
+    abs_tensor = tl.abs(f32_tensor)
+    abs_tensor = tl.where(valid_src_mask, abs_tensor, -1.0)
+    abs_tensor = tl.reshape(
+        abs_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
+    )
+    max_val = tl.max(abs_tensor, axis=2, keep_dims=True)
+    dequant_scale = max_val / _get_max_quant_val(mx_tensor_dtype)
+
+    # --- RNE BEGIN ---
+    # bitcast to uint32 to access exponent+mantissa
+    bits = dequant_scale.to(tl.uint32, bitcast=True)
+
+    # extract exponent and mantissa
+    exp   = (bits >> 23) & 0xFF
+    mant  = bits & 0x7FFFFF
+
+    # round-to-nearest-even logic:
+    # if mant > half (0x400000) -> round up
+    # if mant < half -> round down
+    # if mant == half -> tie -> pick even exponent
+    HALF = 0x400000
+    mant_gt_half = mant > HALF
+    mant_eq_half = mant == HALF
+
+    # get low bit of exponent for tie
+    exp_lsb = exp & 1
+
+    round_up = mant_gt_half | (mant_eq_half & (exp_lsb == 1))
+
+    # new exponent = exp + round_up
+    new_exp = exp + round_up
+    new_exp = tl.minimum(new_exp, 0xFF)   # saturate
+
+    # reassemble float32 with zero mantissa
+    dequant_scale_exponent = (new_exp << 23)
+
+    # RNE END ---
+
+    dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
+    quant_scale = tl.where(dequant_scale_rounded == 0, 0, 1.0 / dequant_scale_rounded)
+
+    f32_tensor = tl.reshape(
+        f32_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
+    )
+    quant_tensor = f32_tensor * quant_scale
+
+    quant_tensor = quant_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM])
+    quant_tensor = tl.where(valid_src_mask, quant_tensor, 0)
+    dequant_scale_exponent = dequant_scale_exponent.reshape(
+        [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE]
+    )
+
+    if is_fp8:
+        out_tensor = quant_tensor.to(mx_tensor_dtype)
+    else:
+        quant_tensor = quant_tensor.to(tl.uint32, bitcast=True)
+        signs = quant_tensor & 0x80000000
+        exponents = (quant_tensor >> 23) & 0xFF
+        mantissas = quant_tensor & 0x7FFFFF
+
+        E8_BIAS = 127
+        E2_BIAS = 1
+        adjusted_exponents = tl.core.sub(
+            E8_BIAS, exponents + 1, sanitize_overflow=False
+        )
+        mantissas = tl.where(
+            exponents < E8_BIAS,
+            (0x400000 | (mantissas >> 1)) >> adjusted_exponents,
+            mantissas,
+        )
+
+        exponents = tl.maximum(exponents, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
+
+        e2m1_tmp = tl.minimum((((exponents << 2) | (mantissas >> 21)) + 1) >> 1, 0x7)
+        e2m1_value = ((signs >> 28) | e2m1_tmp).to(tl.uint8)
+
+        e2m1_value = tl.reshape(
+            e2m1_value, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM // 2, 2]
+        )
+        evens, odds = tl.split(e2m1_value)
+        out_tensor = evens | (odds << 4)
+
+    return out_tensor, (dequant_scale_exponent >> 23).to(tl.uint8), dequant_scale_exponent
