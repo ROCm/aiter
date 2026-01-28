@@ -17,7 +17,7 @@ def _get_max_quant_val(dtype: tl.constexpr):
     else:
         tl.static_assert(False, f"Invalid {dtype=}")
 
-def downcast_to_mxfp(
+def downcast_to_mxfp_rne(
     src_tensor: torch.Tensor,
     out_quant_type: torch.dtype,
     axis: int,
@@ -32,6 +32,9 @@ def downcast_to_mxfp(
     If weight_quant_type is torch.float8_e4m3fn or torch.float8_e5m2, we output mxfp8 with the float8s are stored
     in their respective formats.
     """
+
+    assert DEQUANT_SCALE_ROUNDING_MODE == DequantScaleRoundingMode.ROUND_RNE, f"DEQUANT_SCALE_ROUNDING_MODE should be {DequantScaleRoundingMode.ROUND_RNE}."
+
     ndim = src_tensor.ndim
     assert -ndim <= axis < ndim, f"Invalid axis {axis=}"
     axis = axis if axis >= 0 else axis + ndim
@@ -94,10 +97,6 @@ def _downcast_to_mxfp(
     BLOCK_SIZE_QUANT_DIM: tl.constexpr,
     DEQUANT_SCALE_ROUNDING_MODE: tl.constexpr,
 ):
-
-    tl.static_assert(
-        DEQUANT_SCALE_ROUNDING_MODE == DequantScaleRoundingMode.ROUND_RNE, f"DEQUANT_SCALE_ROUNDING_MODE should be {DequantScaleRoundingMode.ROUND_RNE}."
-    )
     tl.static_assert(
         stride_mxt_quant == 1, f"Output stride, {stride_mxt_quant=} must be 1."
     )
