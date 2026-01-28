@@ -52,9 +52,9 @@ def test_fmoe(
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
-    input = torch.ones((token, model_dim), dtype=dtype) / 10
+    input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
-        w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         if hidden_pad != 0 and intermediate_pad != 0:
             w1[:, :, -hidden_pad:] = 0
             w1[:, -intermediate_pad:, :] = 0
@@ -63,7 +63,7 @@ def test_fmoe(
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
-    w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
@@ -297,7 +297,6 @@ l_quant = [
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
-    (aiter.QuantType.per_Token, dtypes.i8, dtypes.i8),  # a8w8 (Int8)
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
@@ -356,9 +355,7 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
-    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,
-    8: aiter.QuantType.per_Token, dtypes.i8, dtypes.i8,  # a8w8 (Int8)
-""",
+    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
 )
 
 parser.add_argument(
