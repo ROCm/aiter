@@ -63,18 +63,18 @@ jobs:
   #         echo "Multigpu: ${{ steps.machines.outputs.multigpu_runners }}"
 
   standard:
-    name: Standard Tests ${{ matrix.label_suffix }}
+    name: >-
+      Standard Tests${{ (matrix.label == 'MI325 1 GPU' || matrix.label == 'MI355 1 GPU')
+        && format(' ({0})', matrix.label) || '' }}
     needs: check-signal
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: aiter-mi355-1gpu
-            labels: MI355 1 GPU
-            label_suffix: (MI355 1 GPU)
+            label: MI355 1 GPU
           - runner: aiter-1gpu-runner
-            labels: MI325 1 GPU
-            label_suffix: (MI325 1 GPU)
+            label: MI325 1 GPU
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -167,7 +167,9 @@ jobs:
           ./.github/scripts/clean_up_rocm.sh
 
   multi-gpu:
-    name: Multi-GPU Tests ${{ matrix.label_suffix }}
+    name: >-
+      Multi-GPU Tests${{ (matrix.label == 'MI325 8 GPU' || matrix.label == 'MI355 8 GPU')
+        && format(' ({0})', matrix.label) || '' }}
     needs: check-signal
     # only run multi-gpu tests on main branch due to limited multi-gpu resources
     if: github.ref == 'refs/heads/main' 
@@ -176,11 +178,9 @@ jobs:
       matrix:
         include:
           - runner: aiter-mi355-8gpu
-            labels: MI355 8 GPU
-            label_suffix: (MI355 8 GPU)
+            label: MI355 8 GPU
           - runner: aiter-8gpu-runner
-            labels: MI325 8 GPU
-            label_suffix: (MI325 8 GPU)
+            label: MI325 8 GPU
     runs-on: ${{ matrix.runner }}
 
     steps:
