@@ -993,14 +993,12 @@ def sage_fwd(
     # D dimensions (MOST IMPORTANT)
     offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
     offs_d_qk = tl.max_contiguous(
-        tl.multiple_of(offs_d_qk, BLOCK_DMODEL_QK),
-        BLOCK_DMODEL_QK
+        tl.multiple_of(offs_d_qk, BLOCK_DMODEL_QK), BLOCK_DMODEL_QK
     )
 
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
     offs_d_v = tl.max_contiguous(
-        tl.multiple_of(offs_d_v, BLOCK_DMODEL_V),
-        BLOCK_DMODEL_V
+        tl.multiple_of(offs_d_v, BLOCK_DMODEL_V), BLOCK_DMODEL_V
     )
 
     # handle seqlen
@@ -1140,7 +1138,6 @@ def sage_fwd(
     v_descale_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
 
     q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
-
 
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
