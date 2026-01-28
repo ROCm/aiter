@@ -26,10 +26,12 @@ def aiter_scaled_silu_mul(m, n, x, x_scale, dtype_quant=aiter.dtypes.fp8):
     aiter.scaled_silu_and_mul(silu_out, x, x_scale)
     return silu_out
 
+
 def aiter_silu_and_mul(m, n, x, out_type):
     silu_out = torch.empty((m, n // 2), dtype=out_type, device=x.device)
     aiter.silu_and_mul(silu_out, x)
     return silu_out
+
 
 @benchmark()
 def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
@@ -47,9 +49,7 @@ def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
     x, y = input.split([d, d], dim=-1)
     ref = (F.silu(x) * y / scale).to(out_dtype)
 
-    out, us_aiter = run_perftest(
-        aiter_scaled_silu_mul, m, n, input, scale, out_dtype
-    )
+    out, us_aiter = run_perftest(aiter_scaled_silu_mul, m, n, input, scale, out_dtype)
     fp8_x, us_triton = run_perftest(
         triton_silu_mul_fp8_quantization_fuse, input, scale, aiter.dtypes.fp8
     )
@@ -91,9 +91,7 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     if output_dtype is not None:
         ref = ref.to(output_dtype)
 
-    out, us_aiter = run_perftest(
-        aiter_silu_and_mul, m, n, input, out_dtype
-    )
+    out, us_aiter = run_perftest(aiter_silu_and_mul, m, n, input, out_dtype)
     # Check if the results are close
     err = checkAllclose(ref, out)
 
@@ -117,7 +115,7 @@ def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
     """Test fp32 input with fp16/bf16 output for scaled activation"""
     input = torch.randn(m, n, dtype=input_dtype, device="cuda")
     scale = torch.max(input).to(torch.float32)
-    #out = torch.empty((m, n // 2), dtype=output_dtype, device="cuda")
+    # out = torch.empty((m, n // 2), dtype=output_dtype, device="cuda")
 
     # Reference: compute in fp32, scale, convert to output dtype
     d = input.shape[-1] // 2
