@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -67,6 +67,7 @@ def asm_moe_test(
     fc2_smooth_scale=None,  # [expert, 1, inter_dim]
     a16=False,
     expert_mask=None,
+    local_expert_hash=None,
 ):
 
     return asm_moe(
@@ -81,6 +82,7 @@ def asm_moe_test(
         fc2_smooth_scale,
         a16,
         expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
     )
 
 
@@ -269,6 +271,10 @@ def test_fmoe_ep(
         # b implement
         w1b = shuffle_weight(w1)
         w2b = shuffle_weight(w2)
+        if expert_mask is not None and use_smooth:
+            local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+            local_expert_hash[local_expert_hash > 0] -= 1
+            local_expert_hash[expert_mask == 0] = -1
         out_b, avg_b = asm_moe_test(
             input,
             w1b,
@@ -280,6 +286,7 @@ def test_fmoe_ep(
             fc1_smooth_scale,
             fc2_smooth_scale,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
         )
 
         def calculateTensorsSize(*args):

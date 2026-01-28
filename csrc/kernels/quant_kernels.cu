@@ -7,6 +7,7 @@
 #include "quant_common.cuh"
 #include "rocprim/rocprim.hpp"
 #include "vec_convert.h"
+#include "opus.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
 
@@ -441,7 +442,7 @@ template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_si
 __device__ std::tuple<float, float*>
 smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
                              const float* __restrict__ smooth_scale,
-                             const int32_t* __restrict__ smooth_scale_map,
+                             int32_t smscale_map_idx,
                              const int32_t cols,
                              const int32_t token_idx)
 {
@@ -455,8 +456,6 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
             ? 0.25
             : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
-
-    const int32_t smscale_map_idx = smooth_scale_map == nullptr ? 0 : smooth_scale_map[blockIdx.x];
     const int64_t row_offset      = token_idx * cols;
     auto const* ptr_i             = reinterpret_cast<DTYPE_I const*>(input + row_offset);
     auto const* input_vecs        = reinterpret_cast<vec_i const*>(ptr_i);
@@ -513,14 +512,17 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                      DTYPE_I* __restrict__ input,
                                                      float* __restrict__ smooth_scale,
                                                      int* __restrict__ smooth_scale_map,
+                                                     int* __restrict__ smooth_scale_map_hash,
                                                      const int32_t cols,
                                                      int32_t const* __restrict__ num_rows = nullptr,
                                                      const int32_t num_rows_factor        = 1,
                                                      const int32_t input_dim0             = 1,
                                                      const int32_t input_dim1             = 1,
                                                      const int32_t input_stride0          = 1,
-                                                     const int32_t input_stride1          = 1)
+                                                     const int32_t input_stride1          = 1,
+                                                     const int32_t smooth_scale_map_hash_size = 256)
 {
+    __shared__ int32_t smooth_scale_map_hash_shared[256];
     int token_idx = blockIdx.x;
     if(num_rows != nullptr)
     {
@@ -528,10 +530,25 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         if(token_idx >= rows)
             return;
     }
+    if(smooth_scale_map_hash != nullptr)
+    {
+        auto buffer_hash = opus::make_gmem<int>(smooth_scale_map_hash, smooth_scale_map_hash_size * sizeof(int));
+        buffer_hash.async_load(smooth_scale_map_hash_shared, threadIdx.x);
+    }
     int real_token_idx = token_idx % input_dim1 * (input_stride1 / cols) +
                          (token_idx / input_dim1) % input_dim0 * (input_stride0 / cols);
+    int32_t smscale_map_idx = smooth_scale_map[token_idx];
+    if(smooth_scale_map_hash != nullptr)
+    {
+        __syncthreads();
+        smscale_map_idx = smscale_map_idx < smooth_scale_map_hash_size ? smooth_scale_map_hash_shared[smscale_map_idx] : -1;
+    }
+    if (smscale_map_idx < 0)
+    {
+        return;
+    }    
     auto res = smooth_data_to_per_row_scale<DTYPE_I, DTYPE_O, block_size, thread_data_size>(
-        input, smooth_scale, smooth_scale_map, cols, real_token_idx);
+        input, smooth_scale, smscale_map_idx, cols, real_token_idx);
     float row_scale = std::get<0>(res);
     float* vec_ptr  = std::get<1>(res);
 
@@ -869,13 +886,15 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                 reinterpret_cast<input_dtype*>(input.data_ptr()),                                 \
                 smooth_scale.data_ptr<float>(),                                                   \
                 smooth_scale_map_ptr,                                                             \
+                smooth_scale_map_hash_ptr,                                                        \
                 cols,                                                                             \
                 num_rows_ptr,                                                                     \
                 num_rows_factor,                                                                  \
                 input_dim0,                                                                       \
                 input_dim1,                                                                       \
                 input_stride0,                                                                    \
-                input_stride1);                                                                   \
+                input_stride1,                                                                    \
+                smooth_scale_map_hash_size);                                                      \
     });
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(quant_kernel, DTYPE_O, cols)           \
@@ -904,7 +923,8 @@ void smooth_per_token_scaled_quant(
     std::optional<torch::Tensor> const& smooth_scale_map = std::nullopt,
     bool shuffle_scale                                   = false,
     std::optional<torch::Tensor> const& num_rows         = std::nullopt,
-    int num_rows_factor                                  = 1)
+    int num_rows_factor                                  = 1,
+    std::optional<torch::Tensor> const& smooth_scale_map_hash = std::nullopt)
 {
     TORCH_CHECK(out.is_contiguous());
 
@@ -913,13 +933,17 @@ void smooth_per_token_scaled_quant(
     int32_t* num_rows_ptr = num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr;
     int32_t* smooth_scale_map_ptr =
         smooth_scale_map.has_value() ? smooth_scale_map->data_ptr<int32_t>() : nullptr;
-
+    int32_t* smooth_scale_map_hash_ptr =
+        smooth_scale_map_hash.has_value() ? smooth_scale_map_hash->data_ptr<int32_t>() : nullptr;
     TORCH_CHECK(
         input.dim() < 4, __func__, " only support input dim <=3, but get dim: ", input.dim());
     int32_t input_dim0    = input.size(0);
     int32_t input_dim1    = input.dim() > 2 ? input.size(1) : 1;
     int32_t input_stride0 = input.stride(0);
     int32_t input_stride1 = input.dim() > 2 ? input.stride(1) : cols;
+    int32_t smooth_scale_map_hash_size = smooth_scale_map.has_value() ? smooth_scale_map_hash->numel() : 0;
+    TORCH_CHECK(
+        smooth_scale_map_hash_size <= 256, __func__, " smooth_scale_map_hash_size is too large, only support <= 256");
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();

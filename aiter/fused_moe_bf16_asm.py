@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -68,6 +68,7 @@ def asm_moe(
     block_shape=None,
     expert_mask=None,
     activation=ActivationType.Silu,
+    local_expert_hash=None,
 ):
     E, model_dim, inter_dim = w2.shape
     global_E = E
@@ -183,18 +184,32 @@ def asm_moe(
             else dtypes.fp8
         )
         if fc1_smooth_scale is not None:
-            a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
+            a8 = torch.empty((M, topk, model_dim), dtype=a8_type, device=device)
             a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
 
             # moe_smoothquant_fwd need topk_ids which contains local_expert_id
-            if expert_mask is not None:
+            if expert_mask is not None and local_expert_hash is None:
                 local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
                 local_expert_hash[local_expert_hash > 0] -= 1
-                topk_ids = local_expert_hash[topk_ids]
+                local_expert_hash[expert_mask == 0] = -1
+            #     topk_ids = local_expert_hash[topk_ids]
 
-            aiter.moe_smoothquant_fwd(
-                a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
+            # aiter.moe_smoothquant_fwd(
+            #     a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
+            # )
+            hidden_states_topk = hidden_states.view(M, 1, model_dim).expand(
+                -1, topk, -1
             )
+            aiter.smooth_per_token_scaled_quant(
+                a8,
+                hidden_states_topk,
+                a8_scale,
+                fc1_smooth_scale,
+                topk_ids,
+                smooth_scale_map_hash=local_expert_hash,
+            )
+            a8 = a8.view(-1, model_dim)
+            return moe_buf
         else:
             if (
                 w1.dtype == dtypes.fp8
