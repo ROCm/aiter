@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout, redirect_stderr
+from dataclasses import dataclass
 import io
 import logging
 import shlex
@@ -10,6 +11,34 @@ def disable_aiter_logs() -> None:
 
 disable_aiter_logs()
 from bench_mha import main as bench_mha_main  # noqa: E402
+
+
+@dataclass(frozen=True)
+class Shape:
+    hq: int
+    hkv: int
+    dqk: int
+    dv: int
+    tp: int = 1
+
+    def __post_init__(self) -> None:
+        assert self.hq > 0, "Number of query heads must be positive."
+        assert self.hkv > 0, "Number of key and value heads must be positive."
+        assert self.dqk > 0, "Dimension of query and key heads must be positive."
+        assert self.dv > 0, "Dimension of value heads must be positive."
+        assert self.tp > 0, "Tensor parallelism must be positive."
+        assert (
+            self.hq % self.tp == 0
+        ), "Number of query heads must be divisible by tensor parallelism."
+        assert (
+            self.hkv % self.tp == 0
+        ), "Number of key and value heads must be divisible by tensor parallelism."
+
+    def with_tp(self, tp: int) -> "Shape":
+        assert tp > 0, "Tensor parallelism must be positive."
+        return Shape(
+            hq=self.hq // tp, hkv=self.hkv // tp, dqk=self.dqk, dv=self.dv, tp=tp
+        )
 
 
 def run_bench_mha(args: str) -> tuple[str, str]:
