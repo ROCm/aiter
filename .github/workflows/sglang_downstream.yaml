@@ -124,6 +124,7 @@ jobs:
         run: |
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
+          ls -R
           bash scripts/ci/amd_ci_exec.sh printenv | grep GPU_ARCH || true
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test/registered/eval/test_eval_accuracy_large.py
           bash scripts/ci/amd_ci_exec.sh python3 test/registered/quant/test_eval_fp8_accuracy.py
