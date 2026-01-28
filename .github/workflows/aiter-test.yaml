@@ -176,7 +176,7 @@ jobs:
           - runner: aiter-mi355-8gpu
             labels: MI355 8 GPUs
           - runner: aiter-8gpu-runner
-            labels: MI300 8 GPUs
+            labels: MI325 8 GPUs
     runs-on: ${{ matrix.runner }}
 
     steps:
