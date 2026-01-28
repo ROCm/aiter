@@ -8,6 +8,7 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
+import pandas as pd
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -172,9 +173,9 @@ def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
     x, y = x.double(), y.double()
-    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    # RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    amax_diff = (x - y).abs().max().item()
+    # amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
@@ -212,7 +213,7 @@ def ref_masked_attention(
     lse = attn_weights.logsumexp(dim=-1)
     m = attn_weights.max(-1).values
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
-    l = attn_weights_exp.sum(-1)
+    l = attn_weights_exp.sum(-1)  # noqa: E741
     if is_fp8_q:
         attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
@@ -243,7 +244,7 @@ def torch_mla_extend_3buffer(
     scale_dim=4,
 ):
     num_page = kvc_cache.shape[0]
-    (kv_nope_buffer_fp8, kv_nope_scale_factors_fp32, kv_rope_buffer_bf16) = (
+    kv_nope_buffer_fp8, kv_nope_scale_factors_fp32, kv_rope_buffer_bf16 = (
         split_3buffer_kv_cache(
             kvc_cache, page_size, nhead_kv, kv_lora_rank, qk_rope_head_dim, scale_dim
         )
@@ -396,8 +397,8 @@ def test_mla(
     kv_indices = torch.randperm(num_page, dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
-    max_seqlen_kv = seq_lens_kv.max().item()
-    total_qo = qo_indptr[-1].item()
+    # max_seqlen_kv = seq_lens_kv.max().item()
+    # total_qo = qo_indptr[-1].item()
     total_kv = seq_lens_kv.sum().item()
 
     kv_buffer = torch.randn(
@@ -424,7 +425,7 @@ def test_mla(
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    us_asm = None
+    # us_asm = None
     # if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
     #     us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
@@ -506,7 +507,7 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-    meta = aiter.get_mla_metadata_v1(
+    aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         kv_last_page_lens,
@@ -580,7 +581,7 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        err_fp8 = checkAllclose(
+        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
@@ -686,7 +687,7 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        err_fp8 = checkAllclose(
+        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
@@ -730,7 +731,7 @@ def test_mla(
             scale_dim=scale_dim,
         )
 
-        err_ref_fp8 = checkAllclose(
+        checkAllclose(
             out_ref,
             out_ref_fp8,
             msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
@@ -769,7 +770,7 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        err_fp8 = checkAllclose(
+        checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
@@ -948,7 +949,6 @@ parser.add_argument(
     help="""scale dim.
     e.g.: -sd 4""",
 )
-import pandas as pd
 
 args = parser.parse_args()
 list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
