@@ -77,10 +77,15 @@ def asm_moe(
     dtype = hidden_states.dtype
     device = topk_ids.device
     lastdim_mul = 8 if w1.dtype in {dtypes.i32, torch.uint32} else 1
-    is_a8w8 = (fc1_scale is not None) and (not a16) and (block_shape is None)
-    is_g1u1 = w2.shape[2] * 2 * lastdim_mul == w1.shape[1]
+    is_g1u1 = (
+        w2.shape[2] * 2 * lastdim_mul == w1.shape[1] and fc2_smooth_scale is not None
+    )
     enable_fp32 = (
-        is_a8w8 and is_g1u1 and (inter_dim % 384 == 0) and w1.dtype == dtypes.i8 and a16
+        fc2_smooth_scale is not None
+        and is_g1u1
+        and (inter_dim % 384 == 0)
+        and w1.dtype == dtypes.i8
+        and a16
     )
     moebuf_dtype = torch.float32 if enable_fp32 else dtype
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
