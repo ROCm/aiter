@@ -469,7 +469,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.uni_seqlen_qo                = uni_seqlen_qo;
     params.ori_seqlen_qo                = ori_uni_seqlen_qo;
     params.is_causal                    = is_causal;
-    params.topk                         = (topk + page_size - 1) / page_size;
+    params.topk                         = (topk < 0) ? topk : (topk + page_size - 1) / page_size;
     params.qk_batch_ratio               = qk_batch_ratio;
     params.k_fixed_over_head_num_blocks = max(1, (16 + page_size - 1) / page_size);
 
