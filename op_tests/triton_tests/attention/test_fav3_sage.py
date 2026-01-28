@@ -45,7 +45,6 @@ def compare_accuracy(current, reference):
     print(f"  Cosine Similarity: {cos_sim.item():.8f}")
 
 
-
 def pad_rearrange_dropout_mask(
     S_dmask,
     cu_seqlens_q,
