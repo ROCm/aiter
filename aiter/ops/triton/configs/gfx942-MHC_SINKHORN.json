@@ -1,0 +1,8 @@
+{
+    "any": {
+        "BLOCK_M": 1,
+        "waves_per_eu": 2,
+        "num_stages": 1,
+        "num_warps": 4
+    }
+}

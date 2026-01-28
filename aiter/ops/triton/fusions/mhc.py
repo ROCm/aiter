@@ -20,26 +20,10 @@ from aiter.ops.triton._triton_kernels.fusions import (
     _sinkhorn_knopp_log_domain_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.mhc_config_utils import get_mhc_config
 
 _LOGGER = AiterTritonLogger()
 
-
-def get_fused_mhc_config():
-    return {
-        "waves_per_eu": 2,
-        "num_stages": 1,
-        "num_warps": 4,
-        "NUM_KSPLIT": 2,
-    }
-
-
-def get_sinkhorn_knopp_config():
-    return {
-        "BLOCK_M": 1,
-        "waves_per_eu": 2,
-        "num_stages": 1,
-        "num_warps": 4,
-    }
 
 def fused_mhc(
     x: torch.Tensor,
@@ -55,6 +39,7 @@ def fused_mhc(
     out_pre: Optional[torch.Tensor] = None,
     out_post: Optional[torch.Tensor] = None,
     out_res: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused Triton kernel inferface for mHC projection mapping (equations 14-18).
@@ -85,6 +70,7 @@ def fused_mhc(
         out_pre (Optional[torch.Tensor]): Pre-allocated output for H^pre with shape (M, n)
         out_post (Optional[torch.Tensor]): Pre-allocated output for H^post with shape (M, n)
         out_res (Optional[torch.Tensor]): Pre-allocated output for H^res with shape (M, n²)
+        config (Optional[dict]): Kernel tuning parameters. If None, loaded from JSON config files.
 
     Returns:
         Tuple of three tensors (H_pre, H_post, H_res):
@@ -113,20 +99,32 @@ def fused_mhc(
         ...                                   alpha_pre, alpha_post, alpha_res, bias, n)
         >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
     """
-    # Get config
-    config = get_fused_mhc_config()
-    num_ksplit = config.pop("NUM_KSPLIT")
-    
-    _LOGGER.info(
-        f"FUSED_MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} num_ksplit={num_ksplit}"
-    )
-    
     # Input shape extraction
     M, K = x.shape  # M: batch/sequence, K: nC (input features)
+    C = K // n  # Derive C from K and n
     K_pre, n_pre = phi_pre.shape
     K_post, n_post = phi_post.shape
     K_res, n_squared = phi_res.shape
     N_total_expected = n * n + 2 * n
+
+    # Get config from JSON files if not provided
+    if config is None:
+        config, _ = get_mhc_config("MHC_FUSED", M, C)
+    else:
+        config = dict(config)  # Copy to avoid mutation
+    
+    num_ksplit = config.pop("NUM_KSPLIT", 1)
+    # Pop block sizes from config, or compute defaults
+    BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
+    # BLOCK_N: Column tile size - should align with output dimension
+    BLOCK_N = n_squared
+    # Ensure BLOCK_K doesn't exceed K dimension
+    BLOCK_K = config.pop("BLOCK_K", 64)
+    BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
+        
+    _LOGGER.info(
+        f"FUSED_MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} num_ksplit={num_ksplit}"
+    )
 
     # Validate tensor shapes
     assert K == K_pre == K_post == K_res, (
@@ -166,14 +164,6 @@ def fused_mhc(
         assert out_res.shape == (M, n_squared), f"out_res shape mismatch: expected ({M}, {n_squared}), got {out_res.shape}"
         assert out_res.dtype == x.dtype and out_res.device == x.device
 
-    # Determine block sizes for optimal performance
-    # BLOCK_M: Row tile size - balance between occupancy and register pressure
-    # BLOCK_N: Column tile size - should align with output dimension
-    # BLOCK_K: Reduction tile size - affects memory reuse in matmul
-    BLOCK_M = 64 if M >= 64 else 32
-    BLOCK_N = n_squared
-    BLOCK_K = min(64, triton.next_power_of_2(K))
-    
     # Stream-aware grid: Each program processes exactly one stream
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
     n_blocks_post = triton.cdiv(n, BLOCK_N)
@@ -433,6 +423,7 @@ def sinkhorn_knopp(
     logits: torch.Tensor,
     num_iters: int = 20,
     out: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ) -> torch.Tensor:
     """
     Projects batched raw logits onto doubly stochastic matrices using log-domain Sinkhorn-Knopp.
@@ -455,6 +446,7 @@ def sinkhorn_knopp(
             Typically 10-20 iterations suffice.
         out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N, N).
             If None, a new tensor is allocated.
+        config (Optional[dict]): Kernel tuning parameters. If None, loaded from JSON config files.
 
     Returns:
         torch.Tensor: Doubly stochastic matrices with shape (M, N, N).
@@ -494,7 +486,11 @@ def sinkhorn_knopp(
         assert out.shape == (M, N, N), f"out.shape {out.shape} must be ({M}, {N}, {N})"
         out = out.contiguous()
 
-    config = get_sinkhorn_knopp_config()
+    # Get config from JSON files if not provided
+    if config is None:
+        config, _ = get_mhc_config("MHC_SINKHORN", M)
+    else:
+        config = dict(config)  # Copy to avoid mutation
 
     # Grid: one program per batch element, need large batch size for optimal performance
     grid = (triton.cdiv(M, config["BLOCK_M"]),)
