@@ -8,7 +8,7 @@ from .utils import (
     map_dims,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.utils import downcast_to_mxfp, accuracy_analysis
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs, _general_quant_kernel
 
 @triton.jit
@@ -1963,135 +1963,7 @@ def fav3_sage_triton_impl_v2(
         **config,
     )
 
-import numpy as np
-def unpack_fp4_to_fp32(uint8_tensor):
-    """
-    Unpack uint8 tensor containing packed e2m1 fp4 values into fp32.
-    Each uint8 contains two 4-bit e2m1 values (2-bit exponent, 1-bit mantissa).
 
-    Args:
-        uint8_tensor: torch.Tensor with dtype uint8, shape [..., D]
-
-    Returns:
-        torch.Tensor with dtype float32, shape [..., 2*D]
-    """
-    # Move to CPU for processing
-    uint8_np = uint8_tensor.detach().cpu().numpy()
-    original_shape = uint8_np.shape
-
-    # Flatten to process
-    uint8_flat = uint8_np.flatten()
-
-    # Extract two 4-bit values from each uint8
-    # Lower 4 bits
-    low_nibble = uint8_flat & 0x0F
-    # Upper 4 bits
-    high_nibble = (uint8_flat >> 4) & 0x0F
-
-    # Interleave them to maintain order
-    fp4_values = np.empty(len(uint8_flat) * 2, dtype=np.uint8)
-    fp4_values[0::2] = low_nibble
-    fp4_values[1::2] = high_nibble
-
-    # Convert e2m1 fp4 to fp32
-    # e2m1 format: [sign:1][exp:2][mantissa:1]
-    sign = ((fp4_values >> 3) & 0x1).astype(np.float32)
-    exp = ((fp4_values >> 1) & 0x3).astype(np.int32)
-    mantissa = (fp4_values & 0x1).astype(np.float32)
-
-    # Convert to float
-    # For e2m1: value = (-1)^sign * 2^(exp-1) * (1 + mantissa * 0.5)
-    # The mantissa bit represents 0.5, so mantissa=0 → 1.0, mantissa=1 → 1.5
-    # Special cases: exp=0 means subnormal or zero
-    fp32_values = np.zeros_like(sign, dtype=np.float32)
-
-    # Normal numbers (exp != 0)
-    normal_mask = exp != 0
-    fp32_values[normal_mask] = (1 - 2 * sign[normal_mask]) * np.power(2.0, exp[normal_mask] - 1) * (1 + mantissa[normal_mask] * 0.5)
-
-    # Subnormal numbers (exp == 0, mantissa != 0)
-    subnormal_mask = (exp == 0) & (mantissa != 0)
-    fp32_values[subnormal_mask] = (1 - 2 * sign[subnormal_mask]) * np.power(2.0, -1) * (mantissa[subnormal_mask] * 0.5)
-
-    # Reshape to [..., 2*D]
-    new_shape = list(original_shape)
-    new_shape[-1] = new_shape[-1] * 2
-    fp32_values = fp32_values.reshape(new_shape)
-
-    return torch.from_numpy(fp32_values).to(uint8_tensor.device)
-
-def accuracy_analysis(q_fp4, k_fp4, q_scale, k_scale, q_scale_fp32, k_scale_fp32, q_bf16, k_bf16):
-    
-    # Convert uint8 exponent back to fp32 scale values
-    q_scale_fp32_expanded = torch.pow(2.0, q_scale.to(torch.float32) - 127.0)
-    k_scale_fp32_expanded = torch.pow(2.0, k_scale.to(torch.float32) - 127.0)
-
-    ref = torch.einsum("bhsd,bhtd->bhst", q_bf16.to(torch.float32), k_bf16.to(torch.float32))
-    
-    q_fp4_unpacked = unpack_fp4_to_fp32(q_fp4)
-    k_fp4_unpacked = unpack_fp4_to_fp32(k_fp4)
-
-    print("q_fp4_unpacked.max()", q_fp4_unpacked.max().item())
-    print("k_fp4_unpacked.max()", k_fp4_unpacked.max().item())
-
-    print("q_bf16 max", q_bf16.max().item())
-    print("(q_fp4_unpacked * q_scale_fp32_expanded.repeat_interleave(32,dim=-1)) max", (q_fp4_unpacked * q_scale_fp32_expanded.repeat_interleave(32,dim=-1)).max().item())
-    print("(q_fp4_unpacked * q_scale_fp32.repeat_interleave(32,dim=-1)) max", (q_fp4_unpacked * q_scale_fp32.repeat_interleave(32,dim=-1)).max().item())
-    q_error = torch.mean(torch.abs(q_bf16.to(torch.float32) - (q_fp4_unpacked * q_scale_fp32_expanded.repeat_interleave(32,dim=-1))))
-    print(f"Q e8m0 descale error: {q_error.item()}")
-    q_error_fp32_scale = torch.mean(torch.abs(q_bf16.to(torch.float32) - (q_fp4_unpacked * q_scale_fp32.repeat_interleave(32,dim=-1))))
-    print(f"Q FP32 descale error: {q_error_fp32_scale.item()}")
-
-
-    # Need to do the matmul in the quantized groups
-    group_size = 32
-    num_groups = 128 // group_size
-    
-    quantized = torch.zeros_like(ref)
-    
-    for group_idx in range(num_groups):
-        start_idx = group_idx * group_size
-        end_idx = (group_idx + 1) * group_size
-        # Extract group slices
-        q_group = q_fp4_unpacked[:, :, :, start_idx:end_idx]
-        k_group = k_fp4_unpacked[:, :, :, start_idx:end_idx]
-        q_scale_group = q_scale_fp32_expanded[:, :, :, group_idx:group_idx+1]
-        k_scale_group = k_scale_fp32_expanded[:, :, :, group_idx:group_idx+1]
-        group_descale = (q_scale_group * k_scale_group.permute(0, 1, 3, 2))
-
-        # Compute grouped matmul with broadcasting
-        group_result = torch.einsum(
-            "bhsg,bhtg->bhst",
-            q_group.to(torch.float32),
-            k_group.to(torch.float32),
-        )
-        group_result = group_result * group_descale
-        quantized += group_result
-    
-    # print("Sage V2 Quantization Debug Info:")
-    print(f"Quantization FP4 + e8m0 Descale Error: {torch.mean(torch.abs(ref - quantized)).item()}")
-
-    quantized_fp32_scale = torch.zeros_like(ref)
-    
-    for group_idx in range(num_groups):
-        start_idx = group_idx * group_size
-        end_idx = (group_idx + 1) * group_size
-        # Extract group slices
-        q_group = q_fp4_unpacked[:, :, :, start_idx:end_idx]
-        k_group = k_fp4_unpacked[:, :, :, start_idx:end_idx]
-        q_scale_group = q_scale_fp32[:, :, :, group_idx:group_idx+1]
-        k_scale_group = k_scale_fp32[:, :, :, group_idx:group_idx+1]
-        group_descale = (q_scale_group * k_scale_group.permute(0, 1, 3, 2))
-        # Compute grouped matmul with broadcasting
-        group_result = torch.einsum(
-            "bhsg,bhtg->bhst",
-            q_group.to(torch.float32),
-            k_group.to(torch.float32),
-        )
-        group_result = group_result * group_descale
-        quantized_fp32_scale += group_result
-
-    print(f"Quantization FP4 + FP32 Descale Error: {torch.mean(torch.abs(ref - quantized_fp32_scale)).item()}")
 
 def sage_quant_v2(
     q,
@@ -2217,7 +2089,7 @@ def sage_quant_v2(
         qo_len,
         kv_len,
         triton.next_power_of_2(kv_len),
-        PRE_SCALE_MAX=3,
+        PRE_SCALE_MAX=6.0,
         D=head_dim,
         BLK_Q=BLKQ,
         BLK_K=BLKK,
