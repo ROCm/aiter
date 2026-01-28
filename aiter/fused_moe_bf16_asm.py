@@ -209,7 +209,6 @@ def asm_moe(
                 smooth_scale_map_hash=local_expert_hash,
             )
             a8 = a8.view(-1, model_dim)
-            return moe_buf
         else:
             if (
                 w1.dtype == dtypes.fp8
