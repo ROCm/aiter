@@ -29,7 +29,7 @@ from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
 )
-from op_tests.triton_tests.utils.accuracy_analysis import compare_accuracy
+from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
 CAUSAL = False
 layout_converter = {
