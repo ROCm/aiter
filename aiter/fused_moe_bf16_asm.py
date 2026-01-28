@@ -80,7 +80,7 @@ def asm_moe(
     is_a8w8 = (fc1_scale is not None) and (not a16) and (block_shape is None)
     is_g1u1 = w2.shape[2] * 2 * lastdim_mul == w1.shape[1]
     enable_fp32 = (
-        is_a8w8 and is_g1u1 and (inter_dim % 384 == 0) and w1.dtype == dtypes.i8
+        is_a8w8 and is_g1u1 and (inter_dim % 384 == 0) and w1.dtype == dtypes.i8 and a16
     )
     moebuf_dtype = torch.float32 if enable_fp32 else dtype
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
