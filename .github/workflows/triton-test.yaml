@@ -39,6 +39,7 @@ jobs:
       matrix:
         include:
           - runner: aiter-1gpu-runner
+            label: MI325
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"

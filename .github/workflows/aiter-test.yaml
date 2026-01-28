@@ -70,9 +70,9 @@ jobs:
       matrix:
         include:
           - runner: aiter-mi355-1gpu
-            label: MI355 1 GPU
+            label: MI355
           - runner: aiter-1gpu-runner
-            label: MI325 1 GPU
+            label: MI325
     runs-on: ${{ matrix.runner }}
 
     steps:

@@ -33,6 +33,7 @@ jobs:
       matrix:
         include:
           - runner: aiter-1gpu-runner
+            label: MI325
 
     env:
       SGL_BRANCH: v0.5.6
