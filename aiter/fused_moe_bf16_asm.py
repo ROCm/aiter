@@ -37,6 +37,9 @@ def moe_sorting_ck(
     num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
+    if topk_weights.dtype != dtypes.fp32:
+        topk_weights = topk_weights.to(dtypes.fp32)
+
     aiter.moe_sorting_fwd(
         topk_ids,
         topk_weights,
@@ -73,6 +76,8 @@ def asm_moe(
     global_E = E
     if expert_mask is not None:
         global_E = expert_mask.numel()
+        if global_E == w1.shape[0] + 1 and int(expert_mask[-1].item()) == 0:
+            global_E -= 1
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype
     device = topk_ids.device
@@ -207,6 +212,7 @@ def asm_moe(
             if expert_mask is not None:
                 local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
                 local_expert_hash[local_expert_hash > 0] -= 1
+                topk_ids = topk_ids.to(dtype=torch.int64, device=local_expert_hash.device)
                 topk_ids = local_expert_hash[topk_ids]
 
             aiter.moe_smoothquant_fwd(

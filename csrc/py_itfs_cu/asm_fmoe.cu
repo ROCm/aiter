@@ -236,13 +236,7 @@ class FMoeKernel
         std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
         std::cout << "gdx: " << gdx << std::endl;
         std::cout << "gdy: " << gdy << std::endl;
-
-        if constexpr(std::is_same<T, uint8_t>::value)
-        {
-            float xq_sum  = input_dqn.value().abs().sum().item<float>();
-            float guq_sum = w1_dqn.value().abs().sum().item<float>();
-            float dq_sum  = w2_dqn.value().abs().sum().item<float>();
-        }
+        printf("argsize: %zu\n", arg_size);
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();

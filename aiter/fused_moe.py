@@ -1219,6 +1219,7 @@ def torch_moe(
     if expert_mask is not None:
         local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
         local_expert_hash[expert_mask == 0] = -1
+        topk_ids = topk_ids.to(dtype=torch.int64, device=local_expert_hash.device)
         topk_ids = local_expert_hash[topk_ids]
 
     hidden_states = hidden_states.view(B, -1, D).repeat(1, topk, 1)
