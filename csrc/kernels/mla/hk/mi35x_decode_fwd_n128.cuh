@@ -4,6 +4,7 @@
 #pragma once
 
 #include "aiter_hip_common.h"
+#include "custom_all_reduce.cuh"
 #include "kittens.cuh"
 #include "mla.h"
 #include <ATen/hip/HIPContext.h>
@@ -146,7 +147,7 @@ struct HkMlaDecodeFwdParams
 // @param row: the row index loaded from p_kv_indices.
 // @param col_base: the base column index which should be:
 //        warp_idx * kNumColsPerWarp(8) + lane_idx % kNumColThreads(2) * kNumBytesPerThrPerRnd(4)
-template <typename T, uint32_t kColOffset, bool kCheckBoundary = true>
+template <typename T, uint32_t kColOffset, bool kIsLastIter, bool kCheckBoundary = true>
 __device__ __forceinline__ void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
                                                   const typename T::gl_kv& kv_buffer,
                                                   const int32_t row,
@@ -154,50 +155,54 @@ __device__ __forceinline__ void async_load_k_tile(const uintptr_t p_lds_kv_warp_
 {
     using kv_t = T::kv_t;
 
-    /// TODO: These parameters should reside in Traits.
-    // In the view of thread block on loading
-    constexpr uint32_t kNumRows = 32;
-    constexpr uint32_t kNumCols = 64;
-    // In the view of warp on loading
-    constexpr uint32_t kNumColsPerWarp = kNumCols / T::kNumWarps;    // 64/8=8
-    constexpr uint32_t kNumElemPerWarp = kNumRows * kNumColsPerWarp; // 32*8=256
-    constexpr uint32_t kNumPaddingDw   = 4;                          // Skip 4 banks.
-    constexpr uint32_t kWarpOffset =
-        kNumElemPerWarp * sizeof(kv_t) + kNumPaddingDw * sizeof(uint32_t); // 256*1+4*4=272
-    constexpr uint32_t kNumRowThreads = 32; // #threads handle the same column.
-    constexpr uint32_t kNumColThreads =
-        ckt::get_warp_size() / kNumRowThreads;    // #threads handle the same row. 64/32=2
-    constexpr uint32_t kNumBytesPerThrPerRnd = 4; // use buffer_load_dword which loads 4B each time.
-
-    static_assert(((kColOffset % 64) == 0) && (kColOffset < 576),
-                  "async_load_k(): Unsupported column offset!");
-
-    const uint32_t warp_idx = ckt::get_warp_id();
-    const uint32_t lane_idx = ckt::get_lane_id();
-
-    const uintptr_t p_lds_kv_warp =
-        p_lds_kv_warp_base + kColOffset / kNumColsPerWarp * kWarpOffset - kColOffset;
-
-    if(kCheckBoundary && (row == -1))
+    if constexpr(kIsLastIter == false)
     {
-        const uintptr_t p_lds_kv_lane =
-            p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
-        hkm::ds_write_b32(p_lds_kv_lane, 0, 0u);
-    }
-    else
-    {
-        const kv_t* p_kv_buffer = &kv_buffer[{0, 0, 0, 0}];
-        const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
+        /// TODO: These parameters should reside in Traits.
+        // In the view of thread block on loading
+        constexpr uint32_t kNumRows = 32;
+        constexpr uint32_t kNumCols = 64;
+        // In the view of warp on loading
+        constexpr uint32_t kNumColsPerWarp = kNumCols / T::kNumWarps;    // 64/8=8
+        constexpr uint32_t kNumElemPerWarp = kNumRows * kNumColsPerWarp; // 32*8=256
+        constexpr uint32_t kNumPaddingDw   = 4;                          // Skip 4 banks.
+        constexpr uint32_t kWarpOffset =
+            kNumElemPerWarp * sizeof(kv_t) + kNumPaddingDw * sizeof(uint32_t); // 256*1+4*4=272
+        constexpr uint32_t kNumRowThreads = 32; // #threads handle the same column.
+        constexpr uint32_t kNumColThreads =
+            ckt::get_warp_size() / kNumRowThreads; // #threads handle the same row. 64/32=2
+        constexpr uint32_t kNumBytesPerThrPerRnd =
+            4; // use buffer_load_dword which loads 4B each time.
 
-        const uint32_t voffset = row * T::kQkHeadDim * sizeof(kv_t) + col_base;
+        static_assert(((kColOffset % 64) == 0) && (kColOffset < 576),
+                      "async_load_k(): Unsupported column offset!");
 
-        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds_kv_warp),
-                                            kNumBytesPerThrPerRnd,
-                                            voffset,
-                                            0,
-                                            kColOffset,
-                                            0);
+        const uint32_t warp_idx = ckt::get_warp_id();
+        const uint32_t lane_idx = ckt::get_lane_id();
+
+        const uintptr_t p_lds_kv_warp =
+            p_lds_kv_warp_base + kColOffset / kNumColsPerWarp * kWarpOffset - kColOffset;
+
+        if(kCheckBoundary && (row == -1))
+        {
+            const uintptr_t p_lds_kv_lane =
+                p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
+            hkm::ds_write_b32(p_lds_kv_lane, 0, 0u);
+        }
+        else
+        {
+            const kv_t* p_kv_buffer = &kv_buffer[{0, 0, 0, 0}];
+            const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
+
+            const uint32_t voffset = row * T::kQkHeadDim * sizeof(kv_t) + col_base;
+
+            hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                                (as3_uint32_ptr)(p_lds_kv_warp),
+                                                kNumBytesPerThrPerRnd,
+                                                voffset,
+                                                0,
+                                                kColOffset,
+                                                0);
+        }
     }
 }
 
@@ -437,16 +442,14 @@ softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const flo
     const uint32_t col_0_last_idx        = col_0_start_idx + num_elem_per_tile - 1;
     const uint32_t col_1_start_idx       = col_0_start_idx + 16;
     const uint32_t col_1_last_idx        = col_1_start_idx + num_elem_per_tile - 1;
+    const float2 softmax_scale_pk        = float2(softmax_scale, softmax_scale);
+    const uint2 minus_inf_f32_pk         = uint2(minus_inf_f32, 0);
     if((kCheckBoundary == false) || (col_1_last_idx < kv_end))
     {
-        asm volatile("v_mul_f32_e32 v[%0], %8, v[%0]\n\t"
-                     "v_mul_f32_e32 v[%1], %8, v[%1]\n\t"
-                     "v_mul_f32_e32 v[%2], %8, v[%2]\n\t"
-                     "v_mul_f32_e32 v[%3], %8, v[%3]\n\t"
-                     "v_mul_f32_e32 v[%4], %8, v[%4]\n\t"
-                     "v_mul_f32_e32 v[%5], %8, v[%5]\n\t"
-                     "v_mul_f32_e32 v[%6], %8, v[%6]\n\t"
-                     "v_mul_f32_e32 v[%7], %8, v[%7]"
+        asm volatile("v_pk_mul_f32 v[%0:%1], %8, v[%0:%1]\n\t"
+                     "v_pk_mul_f32 v[%2:%3], %8, v[%2:%3]\n\t"
+                     "v_pk_mul_f32 v[%4:%5], %8, v[%4:%5]\n\t"
+                     "v_pk_mul_f32 v[%6:%7], %8, v[%6:%7]"
                      :
                      : "n"(GPR),
                        "n"(GPR + 1),
@@ -456,18 +459,14 @@ softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const flo
                        "n"(GPR + 5),
                        "n"(GPR + 6),
                        "n"(GPR + 7),
-                       "v"(softmax_scale));
+                       "v"(softmax_scale_pk));
     }
     else if(col_0_start_idx >= kv_end)
     {
-        asm volatile("v_mov_b32 v[%0], %8\n\t"
-                     "v_mov_b32 v[%1], %8\n\t"
-                     "v_mov_b32 v[%2], %8\n\t"
-                     "v_mov_b32 v[%3], %8\n\t"
-                     "v_mov_b32 v[%4], %8\n\t"
-                     "v_mov_b32 v[%5], %8\n\t"
-                     "v_mov_b32 v[%6], %8\n\t"
-                     "v_mov_b32 v[%7], %8"
+        asm volatile("v_pk_mov_b32 v[%0:%1], %8, %8 op_sel:[0, 0]\n\t"
+                     "v_pk_mov_b32 v[%2:%3], %8, %8 op_sel:[0, 0]\n\t"
+                     "v_pk_mov_b32 v[%4:%5], %8, %8 op_sel:[0, 0]\n\t"
+                     "v_pk_mov_b32 v[%6:%7], %8, %8 op_sel:[0, 0]"
                      :
                      : "n"(GPR),
                        "n"(GPR + 1),
@@ -477,127 +476,117 @@ softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const flo
                        "n"(GPR + 5),
                        "n"(GPR + 6),
                        "n"(GPR + 7),
-                       "i"(minus_inf_f32));
+                       "v"(minus_inf_f32_pk));
     }
     else if(col_0_last_idx < kv_end)
     {
-        asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
-                     "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
-                     "v_mul_f32_e32 v[%2], %4, v[%2]\n\t"
-                     "v_mul_f32_e32 v[%3], %4, v[%3]"
+        asm volatile("v_pk_mul_f32 v[%0:%1], %4, v[%0:%1]\n\t"
+                     "v_pk_mul_f32 v[%2:%3], %4, v[%2:%3]"
                      :
-                     : "n"(GPR), "n"(GPR + 1), "n"(GPR + 2), "n"(GPR + 3), "v"(softmax_scale));
+                     : "n"(GPR), "n"(GPR + 1), "n"(GPR + 2), "n"(GPR + 3), "v"(softmax_scale_pk));
 
         if((col_1_start_idx + 2) < kv_end)
         {
-            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
-                         "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
+            asm volatile("v_pk_mul_f32 v[%0:%1], %5, v[%0:%1]\n\t"
                          "v_mul_f32_e32 v[%2], %4, v[%2]\n\t"
-                         "v_mov_b32 v[%3], %5"
+                         "v_mov_b32 v[%3], %6"
                          :
                          : "n"(GPR + 4),
                            "n"(GPR + 4 + 1),
                            "n"(GPR + 4 + 2),
                            "n"(GPR + 4 + 3),
                            "v"(softmax_scale),
+                           "v"(softmax_scale_pk),
                            "i"(minus_inf_f32));
         }
         else if((col_1_start_idx + 1) < kv_end)
         {
-            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
-                         "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
-                         "v_mov_b32 v[%2], %5\n\t"
-                         "v_mov_b32 v[%3], %5"
+            asm volatile("v_pk_mul_f32 v[%0:%1], %4, v[%0:%1]\n\t"
+                         "v_pk_mov_b32 v[%2:%3], %5, %5 op_sel:[0, 0]"
                          :
                          : "n"(GPR + 4),
                            "n"(GPR + 4 + 1),
                            "n"(GPR + 4 + 2),
                            "n"(GPR + 4 + 3),
-                           "v"(softmax_scale),
-                           "i"(minus_inf_f32));
+                           "v"(softmax_scale_pk),
+                           "v"(minus_inf_f32_pk));
         }
         else if(col_1_start_idx < kv_end)
         {
             asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
                          "v_mov_b32 v[%1], %5\n\t"
-                         "v_mov_b32 v[%2], %5\n\t"
-                         "v_mov_b32 v[%3], %5"
+                         "v_pk_mov_b32 v[%2:%3], %6, %6 op_sel:[0, 0]"
                          :
                          : "n"(GPR + 4),
                            "n"(GPR + 4 + 1),
                            "n"(GPR + 4 + 2),
                            "n"(GPR + 4 + 3),
                            "v"(softmax_scale),
-                           "i"(minus_inf_f32));
+                           "i"(minus_inf_f32),
+                           "v"(minus_inf_f32_pk));
         }
         else
         {
-            asm volatile("v_mov_b32 v[%0], %4\n\t"
-                         "v_mov_b32 v[%1], %4\n\t"
-                         "v_mov_b32 v[%2], %4\n\t"
-                         "v_mov_b32 v[%3], %4"
+            asm volatile("v_pk_mov_b32 v[%0:%1], %4, %4 op_sel:[0, 0]\n\t"
+                         "v_pk_mov_b32 v[%2:%3], %4, %4 op_sel:[0, 0]"
                          :
                          : "n"(GPR + 4),
                            "n"(GPR + 4 + 1),
                            "n"(GPR + 4 + 2),
                            "n"(GPR + 4 + 3),
-                           "i"(minus_inf_f32));
+                           "v"(minus_inf_f32_pk));
         }
     }
     else
     {
-        asm volatile("v_mov_b32 v[%0], %4\n\t"
-                     "v_mov_b32 v[%1], %4\n\t"
-                     "v_mov_b32 v[%2], %4\n\t"
-                     "v_mov_b32 v[%3], %4"
+        asm volatile("v_pk_mov_b32 v[%0:%1], %4, %4 op_sel:[0, 0]\n\t"
+                     "v_pk_mov_b32 v[%2:%3], %4, %4 op_sel:[0, 0]"
                      :
                      : "n"(GPR + 4),
                        "n"(GPR + 4 + 1),
                        "n"(GPR + 4 + 2),
                        "n"(GPR + 4 + 3),
-                       "i"(minus_inf_f32));
+                       "v"(minus_inf_f32_pk));
 
         if((col_0_start_idx + 2) < kv_end)
         {
-            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
-                         "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
+            asm volatile("v_pk_mul_f32 v[%0:%1], %5, v[%0:%1]\n\t"
                          "v_mul_f32_e32 v[%2], %4, v[%2]\n\t"
-                         "v_mov_b32 v[%3], %5"
+                         "v_mov_b32 v[%3], %6"
                          :
                          : "n"(GPR),
                            "n"(GPR + 1),
                            "n"(GPR + 2),
                            "n"(GPR + 3),
                            "v"(softmax_scale),
+                           "v"(softmax_scale_pk),
                            "i"(minus_inf_f32));
         }
         else if((col_0_start_idx + 1) < kv_end)
         {
-            asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
-                         "v_mul_f32_e32 v[%1], %4, v[%1]\n\t"
-                         "v_mov_b32 v[%2], %5\n\t"
-                         "v_mov_b32 v[%3], %5"
+            asm volatile("v_pk_mul_f32 v[%0:%1], %4, v[%0:%1]\n\t"
+                         "v_pk_mov_b32 v[%2:%3], %5, %5 op_sel:[0, 0]"
                          :
                          : "n"(GPR),
                            "n"(GPR + 1),
                            "n"(GPR + 2),
                            "n"(GPR + 3),
-                           "v"(softmax_scale),
-                           "i"(minus_inf_f32));
+                           "v"(softmax_scale_pk),
+                           "v"(minus_inf_f32_pk));
         }
         else
         {
             asm volatile("v_mul_f32_e32 v[%0], %4, v[%0]\n\t"
                          "v_mov_b32 v[%1], %5\n\t"
-                         "v_mov_b32 v[%2], %5\n\t"
-                         "v_mov_b32 v[%3], %5"
+                         "v_pk_mov_b32 v[%2:%3], %6, %6 op_sel:[0, 0]"
                          :
                          : "n"(GPR),
                            "n"(GPR + 1),
                            "n"(GPR + 2),
                            "n"(GPR + 3),
                            "v"(softmax_scale),
-                           "i"(minus_inf_f32));
+                           "i"(minus_inf_f32),
+                           "v"(minus_inf_f32_pk));
         }
     }
 }
@@ -611,7 +600,10 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
                                         float softmax_scale,
                                         void* p_dbg)
 {
+    using comp2_t = __attribute__((__ext_vector_type__(2))) comp_t;
+
     constexpr comp_t log2e = 1.4426950408889634;
+    const comp2_t log2e_pk = {log2e, log2e};
 
     const uint32_t lane_idx = ckt::get_lane_id();
 
@@ -621,12 +613,13 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
         col_0_idx * 4 + kv_tile_start, kv_end, softmax_scale);
 
     // Get max of row
-    comp_t local_max, tmp0, tmp1;
+    comp_t local_max;
+    comp2_t tmp0, tmp1;
     asm volatile("v_max3_f32 %1, v[%3], v[%4], v[%5]\n\t"
                  "v_max3_f32 %2, v[%6], v[%7], v[%8]\n\t"
                  "v_max_f32_e32 %0, v[%9], v[%10]\n\t"
                  "v_max3_f32 %0, %1, %2, %0"
-                 : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
+                 : "=v"(local_max), "=v"(tmp0[0]), "=v"(tmp0[1])
                  : "n"(k_p_comp_begin),
                    "n"(k_p_comp_begin + 1),
                    "n"(k_p_comp_begin + 2),
@@ -636,34 +629,27 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
                    "n"(k_p_comp_begin + 6),
                    "n"(k_p_comp_begin + 7));
 
-#pragma unroll
-    for(uint32_t offset = 32; offset >= 16; offset /= 2)
-    {
-        const uint32_t src_lane = (offset ^ 64) ^ lane_idx;
-        local_max               = ckt::max(local_max, ckt::warp_shuffle(local_max, src_lane));
-    }
+    constexpr int32_t reduce_range = ckt::get_warp_size();
+    constexpr int32_t stop_stride  = ckt::get_warp_size() / 4 - 1;
+    local_max =
+        aiter::warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
+            local_max);
 
     const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, *p_row_max);
     *p_rescale = kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f(((*p_row_max) - new_row_max) * log2e);
 
     *p_row_max = new_row_max;
 
-    asm volatile("v_sub_f32_e32 v[%0], v[%0], %8\n\t"
-                 "v_sub_f32_e32 v[%1], v[%1], %8\n\t"
-                 "v_sub_f32_e32 v[%2], v[%2], %8\n\t"
-                 "v_sub_f32_e32 v[%3], v[%3], %8\n\t"
-                 "v_sub_f32_e32 v[%4], v[%4], %8\n\t"
-                 "v_sub_f32_e32 v[%5], v[%5], %8\n\t"
-                 "v_sub_f32_e32 v[%6], v[%6], %8\n\t"
-                 "v_sub_f32_e32 v[%7], v[%7], %8\n\t"
-                 "v_mul_f32_e32 v[%0], %9, v[%0]\n\t"
-                 "v_mul_f32_e32 v[%1], %9, v[%1]\n\t"
-                 "v_mul_f32_e32 v[%2], %9, v[%2]\n\t"
-                 "v_mul_f32_e32 v[%3], %9, v[%3]\n\t"
-                 "v_mul_f32_e32 v[%4], %9, v[%4]\n\t"
-                 "v_mul_f32_e32 v[%5], %9, v[%5]\n\t"
-                 "v_mul_f32_e32 v[%6], %9, v[%6]\n\t"
-                 "v_mul_f32_e32 v[%7], %9, v[%7]\n\t"
+    const comp2_t neg_new_row_max_pk = {-new_row_max, -new_row_max};
+
+    asm volatile("v_pk_add_f32 v[%0:%1], v[%0:%1], %8\n\t"
+                 "v_pk_add_f32 v[%2:%3], v[%2:%3], %8\n\t"
+                 "v_pk_add_f32 v[%4:%5], v[%4:%5], %8\n\t"
+                 "v_pk_add_f32 v[%6:%7], v[%6:%7], %8\n\t"
+                 "v_pk_mul_f32 v[%0:%1], %9, v[%0:%1]\n\t"
+                 "v_pk_mul_f32 v[%2:%3], %9, v[%2:%3]\n\t"
+                 "v_pk_mul_f32 v[%4:%5], %9, v[%4:%5]\n\t"
+                 "v_pk_mul_f32 v[%6:%7], %9, v[%6:%7]\n\t"
                  "v_exp_f32_e32 v[%0], v[%0]\n\t"
                  "v_exp_f32_e32 v[%1], v[%1]\n\t"
                  "v_exp_f32_e32 v[%2], v[%2]\n\t"
@@ -681,20 +667,14 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
                    "n"(k_p_comp_begin + 5),
                    "n"(k_p_comp_begin + 6),
                    "n"(k_p_comp_begin + 7),
-                   "v"(new_row_max),
-                   "i"(0x3fb8aa3b) // log2e
-    );
+                   "v"(neg_new_row_max_pk),
+                   "v"(log2e_pk));
 
     // Get sum of exp of each row
-    float local_sum_e;
-    asm volatile("v_add_f32 %1, v[%3], v[%4]\n\t"
-                 "v_add_f32 %2, v[%5], v[%6]\n\t"
-                 "v_add_f32 %0, %1, %2\n\t"
-                 "v_add_f32 %1, v[%7], v[%8]\n\t"
-                 "v_add_f32 %2, v[%9], v[%10]\n\t"
-                 "v_add_f32 %1, %2, %1\n\t"
-                 "v_add_f32 %0, %1, %0"
-                 : "=v"(local_sum_e), "=v"(tmp0), "=v"(tmp1)
+    asm volatile("v_pk_add_f32 %0, v[%2:%3], v[%4:%5]\n\t"
+                 "v_pk_add_f32 %1, v[%6:%7], v[%8:%9]\n\t"
+                 "v_pk_add_f32 %0, %0, %1"
+                 : "=v"(tmp0), "=v"(tmp1)
                  : "n"(k_p_comp_begin),
                    "n"(k_p_comp_begin + 1),
                    "n"(k_p_comp_begin + 2),
@@ -703,12 +683,10 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
                    "n"(k_p_comp_begin + 5),
                    "n"(k_p_comp_begin + 6),
                    "n"(k_p_comp_begin + 7));
-#pragma unroll
-    for(uint32_t offset = 32; offset >= 16; offset /= 2)
-    {
-        const uint32_t src_lane = (offset ^ 64) ^ lane_idx;
-        local_sum_e += ckt::warp_shuffle(local_sum_e, src_lane);
-    }
+    float local_sum_e = tmp0[0] + tmp0[1];
+    local_sum_e =
+        aiter::warpReduce<aiter::AddFunctor, decltype(local_sum_e), reduce_range, stop_stride>(
+            local_sum_e);
 
     *p_row_sum_e = kIsFirstIter ? local_sum_e : ((*p_rescale) * (*p_row_sum_e) + local_sum_e);
 }
@@ -773,21 +751,6 @@ __device__ __forceinline__ void float_2_bf16_pair(uint32_t dst, uint32_t src_0, 
 #endif
 }
 
-template <uint32_t DST_GPR>
-__device__ __forceinline__ void transpose(const uint32_t lane_idx,
-                                          const uint32_t src_0,
-                                          const uint32_t src_1,
-                                          const uint32_t src_2,
-                                          const uint32_t src_3)
-{
-    const uint32_t quad_idx    = lane_idx % 4;
-    const uint32_t perm_0      = 0x0c0c0400 + quad_idx * 0x00000101;
-    const uint32_t perm_1      = 0x04000c0c + quad_idx * 0x01010000;
-    const uint32_t front_part  = __builtin_amdgcn_perm(src_1, src_0, perm_0);
-    const uint32_t latter_part = __builtin_amdgcn_perm(src_3, src_2, perm_1);
-    asm volatile("v_or_b32_e32 v[%0], %1, %2" : : "i"(DST_GPR), "v"(front_part), "v"(latter_part));
-};
-
 template <bool kCheckBoundary>
 __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
                                                  const int32_t row_base,
@@ -810,7 +773,7 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
     return row_kv_ld;
 }
 
-template <typename T, bool kCheckBoundary>
+template <typename T, bool kIsLastIter, bool kCheckBoundary>
 __device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv,
                                              const int32_t* p_kv_indices,
                                              const typename T::gl_kv& kv_buffer,
@@ -819,21 +782,33 @@ __device__ __forceinline__ void async_load_k(const uintptr_t p_lds_kv,
                                              const int32_t kv_tile_start,
                                              const int32_t kv_tile_end)
 {
-    const uint32_t warp_idx       = ckt::get_warp_id();
-    const uintptr_t p_lds_kv_warp = p_lds_kv + warp_idx * 272; // TODO: 272 = kWarpOffset
+    if constexpr(kIsLastIter == false)
+    {
+        const uint32_t warp_idx       = ckt::get_warp_id();
+        const uintptr_t p_lds_kv_warp = p_lds_kv + warp_idx * 272; // TODO: 272 = kWarpOffset
 
-    const int32_t row_kv_ld =
-        get_kv_ld_row<kCheckBoundary>(p_kv_indices, kv_ld_row_base_idx, kv_tile_start, kv_tile_end);
+        const int32_t row_kv_ld = get_kv_ld_row<kCheckBoundary>(
+            p_kv_indices, kv_ld_row_base_idx, kv_tile_start, kv_tile_end);
 
-    async_load_k_tile<T, 0, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
-    async_load_k_tile<T, 64, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
-    async_load_k_tile<T, 128, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
-    async_load_k_tile<T, 192, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
-    async_load_k_tile<T, 256, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
-    async_load_k_tile<T, 320, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
-    async_load_k_tile<T, 384, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
-    async_load_k_tile<T, 448, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
-    async_load_k_tile<T, 512, kCheckBoundary>(p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 0, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 64, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 128, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 192, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 256, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 320, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 384, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 448, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+        async_load_k_tile<T, 512, false, kCheckBoundary>(
+            p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+    }
 }
 
 template <typename T>
@@ -975,23 +950,23 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
         if(kv_len < T::kBlockN)
         {
-            async_load_k<T, true>(p_lds_kv_curr,
-                                  params.p_kv_indices,
-                                  params.kv_buffer,
-                                  kv_ld_row_base_idx,
-                                  kv_ld_col_base,
-                                  kv_start,
-                                  ckt::min(kv_end, kv_start + T::kBlockN));
+            async_load_k<T, false, true>(p_lds_kv_curr,
+                                         params.p_kv_indices,
+                                         params.kv_buffer,
+                                         kv_ld_row_base_idx,
+                                         kv_ld_col_base,
+                                         kv_start,
+                                         ckt::min(kv_end, kv_start + T::kBlockN));
         }
         else
         {
-            async_load_k<T, false>(p_lds_kv_curr,
-                                   params.p_kv_indices,
-                                   params.kv_buffer,
-                                   kv_ld_row_base_idx,
-                                   kv_ld_col_base,
-                                   kv_start,
-                                   ckt::min(kv_end, kv_start + T::kBlockN));
+            async_load_k<T, false, false>(p_lds_kv_curr,
+                                          params.p_kv_indices,
+                                          params.kv_buffer,
+                                          kv_ld_row_base_idx,
+                                          kv_ld_col_base,
+                                          kv_start,
+                                          ckt::min(kv_end, kv_start + T::kBlockN));
         }
 
         auto mla_main =
@@ -1024,14 +999,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 __builtin_amdgcn_s_waitcnt(0);
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
-
-                if constexpr((kIsLastIter == false))
-                {
-                    async_load_k_tile<T, 0, kCheckBoundary>(
-                        p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                    async_load_k_tile<T, 64, kCheckBoundary>(
-                        p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                }
 
                 // GEMM on NoPE
                 load_k_to_gpr<T, 0, 0>(kv_0, p_lds_kv_curr);
@@ -1098,23 +1065,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     }
                 });
 
-                if constexpr(kIsLastIter == false)
-                {
-                    // if constexpr (kIsFirstIter)
-                    // {
-                    //     async_load_k_tile<T,   0, kCheckBoundary>(p_lds_kv_next_warp,
-                    //     params.kv_buffer, row_kv_ld, kv_ld_col_base); async_load_k_tile<T,  64,
-                    //     kCheckBoundary>(p_lds_kv_next_warp, params.kv_buffer, row_kv_ld,
-                    //     kv_ld_col_base);
-                    // }
-                    // else
-                    {
-                        async_load_k_tile<T, 128, kCheckBoundary>(
-                            p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                        async_load_k_tile<T, 192, kCheckBoundary>(
-                            p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                    }
-                }
+                async_load_k_tile<T, 0, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                async_load_k_tile<T, 64, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
 
                 float rescale;
                 softmax<kIsFirstIter, kCheckBoundary, k_p_comp_begin, comp_t>(&row_max,
@@ -1125,28 +1079,16 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                                                               params.softmax_scale,
                                                                               params.p_dbg);
 
-                if constexpr(kIsLastIter == false)
-                {
-                    // if constexpr (kIsFirstIter)
-                    // {
-                    //     async_load_k_tile<T, 128, kCheckBoundary>(p_lds_kv_next_warp,
-                    //     params.kv_buffer, row_kv_ld, kv_ld_col_base); async_load_k_tile<T, 192,
-                    //     kCheckBoundary>(p_lds_kv_next_warp, params.kv_buffer, row_kv_ld,
-                    //     kv_ld_col_base);
-                    // }
-                    // else
-                    {
-                        async_load_k_tile<T, 256, kCheckBoundary>(
-                            p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                        async_load_k_tile<T, 320, kCheckBoundary>(
-                            p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                    }
-                }
+                async_load_k_tile<T, 128, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
 
                 if constexpr(kIsFirstIter == false)
                 {
-                    hk::mul_vgpr(oaccu, oaccu, rescale);
+                    hk::mul_vgpr_pk2(oaccu, oaccu, rescale);
                 }
+
+                async_load_k_tile<T, 192, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
 
                 // Convert p from comp_t to kv_t
                 ckt::static_for<k_p_comp_begin, k_p_comp_end + 1, 4>{}([&](auto idx) {
@@ -1161,6 +1103,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                    "n"(src_idx + 2),
                                    "n"(src_idx + 3));
                 });
+
+                async_load_k_tile<T, 256, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
 
                 __builtin_amdgcn_sched_barrier(0);
 
@@ -1177,23 +1122,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
 
-                if constexpr(kIsLastIter == false)
-                {
-                    // if constexpr (kIsFirstIter)
-                    // {
-                    //     async_load_k_tile<T, 256, kCheckBoundary>(p_lds_kv_next_warp,
-                    //     params.kv_buffer, row_kv_ld, kv_ld_col_base); async_load_k_tile<T, 320,
-                    //     kCheckBoundary>(p_lds_kv_next_warp, params.kv_buffer, row_kv_ld,
-                    //     kv_ld_col_base);
-                    // }
-                    // else
-                    {
-                        async_load_k_tile<T, 384, kCheckBoundary>(
-                            p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                        async_load_k_tile<T, 448, kCheckBoundary>(
-                            p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                    }
-                }
+                async_load_k_tile<T, 320, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                async_load_k_tile<T, 384, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                async_load_k_tile<T, 448, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                async_load_k_tile<T, 512, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
 
                 constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
                 ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
@@ -1239,22 +1175,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     {
                         hk::mma_ABt(oaccu_1, kv_1, p_mfma, oaccu_1);
                     }
-
-                    // if constexpr ((idx.value == num_pv_iter / 2) && (kIsLastIter == false) &&
-                    // kIsFirstIter)
-                    // {
-                    //     async_load_k_tile<T, 384, kCheckBoundary>(p_lds_kv_next_warp,
-                    //     params.kv_buffer, row_kv_ld, kv_ld_col_base); async_load_k_tile<T, 448,
-                    //     kCheckBoundary>(p_lds_kv_next_warp, params.kv_buffer, row_kv_ld,
-                    //     kv_ld_col_base);
-                    // }
                 });
-
-                // if constexpr(kIsLastIter == false)
-                {
-                    async_load_k_tile<T, 512, kCheckBoundary>(
-                        p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                }
 
                 if constexpr(kIsLastIter == false)
                 {
@@ -1310,7 +1231,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
         // divide sum(exp)
         float reci_row_sum_e = 1.0f / row_sum_e;
-        hk::mul_vgpr(oaccu, oaccu, reci_row_sum_e);
+        hk::mul_vgpr_pk2(oaccu, oaccu, reci_row_sum_e);
 
         ///
         /// Outputs
