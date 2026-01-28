@@ -5,6 +5,7 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, perftest
 
 
@@ -204,25 +205,25 @@ def compare_topk_results(
             print(f"{'='*80}")
 
             print("\nElement Statistics:")
-            print(f"  • CUDA Top-K original count:    {cuda_original_count}")
-            print(f"  • CUDA Top-K unique count:      {len(cuda_set)}")
+            print(f"  o CUDA Top-K original count:    {cuda_original_count}")
+            print(f"  o CUDA Top-K unique count:      {len(cuda_set)}")
             print(
-                f"  • CUDA has duplicate indices:   {'Yes' if cuda_has_duplicates else 'No'}"
+                f"  o CUDA has duplicate indices:   {'Yes' if cuda_has_duplicates else 'No'}"
             )
             if cuda_has_duplicates:
                 print(f"    Duplicated {cuda_original_count - len(cuda_set)} indices")
 
-            print(f"  • PyTorch Top-K original count: {torch_original_count}")
-            print(f"  • PyTorch Top-K unique count:   {len(torch_set)}")
+            print(f"  o PyTorch Top-K original count: {torch_original_count}")
+            print(f"  o PyTorch Top-K unique count:   {len(torch_set)}")
             print(
-                f"  • PyTorch has duplicates:       {'Yes' if torch_has_duplicates else 'No'}"
+                f"  o PyTorch has duplicates:       {'Yes' if torch_has_duplicates else 'No'}"
             )
             if torch_has_duplicates:
                 print(f"    Duplicated {torch_original_count - len(torch_set)} indices")
 
-            print(f"\n  • Common element count:         {len(common_indices)}")
-            print(f"  • CUDA unique element count:    {len(cuda_only_indices)}")
-            print(f"  • PyTorch unique element count: {len(torch_only_indices)}")
+            print(f"\n  o Common element count:         {len(common_indices)}")
+            print(f"  o CUDA unique element count:    {len(cuda_only_indices)}")
+            print(f"  o PyTorch unique element count: {len(torch_only_indices)}")
 
             # If there are duplicates, find the duplicate indices
             if cuda_has_duplicates:
@@ -345,11 +346,11 @@ def test_top_k_per_row_prefill(
                 raise FileNotFoundError(f"File not found: {file_path}")
 
         # Load data
-        print(f"  • Loading {os.path.basename(logits_file)}...")
+        print(f"  o Loading {os.path.basename(logits_file)}...")
         logits = torch.load(logits_file, weights_only=False)
-        print(f"  • Loading {os.path.basename(ks_file)}...")
+        print(f"  o Loading {os.path.basename(ks_file)}...")
         cu_seqlen_ks = torch.load(ks_file, weights_only=False)
-        print(f"  • Loading {os.path.basename(ke_file)}...")
+        print(f"  o Loading {os.path.basename(ke_file)}...")
         cu_seqlen_ke = torch.load(ke_file, weights_only=False)
 
         # Convert to row_starts and row_ends
@@ -375,13 +376,13 @@ def test_top_k_per_row_prefill(
 
         print("Data loading completed:")
         print(
-            f"  • logits shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}"
+            f"  o logits shape: {logits.shape}, dtype: {logits.dtype}, device: {logits.device}"
         )
-        print(f"  • row_starts shape: {row_starts.shape}, dtype: {row_starts.dtype}")
-        print(f"  • row_ends shape: {row_ends.shape}, dtype: {row_ends.dtype}")
-        print(f"  • num_rows: {num_rows}")
+        print(f"  o row_starts shape: {row_starts.shape}, dtype: {row_starts.dtype}")
+        print(f"  o row_ends shape: {row_ends.shape}, dtype: {row_ends.dtype}")
+        print(f"  o num_rows: {num_rows}")
         print(
-            f"  • Sequence length range: [{row_ends.min().item()}, {row_ends.max().item()}]"
+            f"  o Sequence length range: [{row_ends.min().item()}, {row_ends.max().item()}]"
         )
         print()
     else:
@@ -419,23 +420,25 @@ def test_top_k_per_row_prefill(
         logits.stride(0),
         logits.stride(1),
     )
-    print(f"Standard Kernel performance test completed: {us_standard:.2f} μs")
+    print(f"Standard Kernel performance test completed: {us_standard:.2f} us")
 
     # Run the fast kernel
     print(f"\n{'='*80}")
     print("Running Fast Kernel performance test (101 iterations)...")
     print(f"{'='*80}")
-    _, us_fast = run_top_k_per_row_prefill_fast(
-        logits,
-        row_starts,
-        row_ends,
-        indices_fast,
-        None,  # values
-        num_rows,
-        logits.stride(0),
-        logits.stride(1),
-    )
-    print(f"Fast Kernel performance test completed: {us_fast:.2f} μs")
+    us_fast = 1e6  # Default large value
+    if get_gfx() == "gfx942":
+        _, us_fast = run_top_k_per_row_prefill_fast(
+            logits,
+            row_starts,
+            row_ends,
+            indices_fast,
+            None,  # values
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+        )
+        print(f"Fast Kernel performance test completed: {us_fast:.2f} us")
 
     # Print indices_fast results
     print(f"\n{'='*80}")
@@ -497,10 +500,10 @@ def test_top_k_per_row_prefill(
         f"Performance Comparison (num_rows={num_rows}, context_len={context_len}, top_k={top_k}):"
     )
     print(
-        f"  Standard version: {standard_color}{us_standard:.2f} μs{RESET}, correct={all_close_standard}"
+        f"  Standard version: {standard_color}{us_standard:.2f} us{RESET}, correct={all_close_standard}"
     )
     print(
-        f"  Fast version:     {fast_color}{us_fast:.2f} μs{RESET}, correct={all_close_fast}"
+        f"  Fast version:     {fast_color}{us_fast:.2f} us{RESET}, correct={all_close_fast}"
     )
     print(f"  Speedup:          {speedup_color}{speedup:.3f}x{RESET}")
     print(f"  Improvement:      {speedup_color}{improvement_pct:.2f}%{RESET}")

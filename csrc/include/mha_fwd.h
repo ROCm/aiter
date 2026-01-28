@@ -46,6 +46,42 @@ struct mha_fwd_traits : public fmha_fwd_traits
     int how_v3_bf16_cvt;
 };
 
+struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
+{
+    mha_batch_prefill_traits(int head_size_q,
+                             int head_size_v,
+                             std::string dtype,
+                             bool is_group_mode,
+                             bool has_logits_soft_cap,
+                             mask_enum mask_type,
+                             bias_enum bias_type,
+                             bool has_lse,
+                             bool has_dropout,
+                             quant_scale_enum qscale_type,
+                             bool skip_min_seqlen_q,
+                             ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout,
+                             ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
+                             int page_size)
+        : fmha_batch_prefill_traits{head_size_q,
+                                    head_size_v,
+                                    dtype,
+                                    is_group_mode,
+                                    true, // is_v_rowmajor
+                                    has_logits_soft_cap,
+                                    mask_type,
+                                    bias_type,
+                                    has_lse,
+                                    has_dropout,
+                                    qscale_type,
+                                    skip_min_seqlen_q,
+                                    false, // has_sink
+                                    kv_memory_layout,
+                                    kv_lookup_table,
+                                    page_size}
+    {
+    }
+};
+
 struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
 {
     mha_fwd_splitkv_traits(int head_size_q,
@@ -143,6 +179,9 @@ struct mha_fwd_args
                                            // array [batch + 1]. (Used with padding)
     const void* cu_seqlen_k_ptr = nullptr; // Cumulative logical (excluding padding) sequence length
                                            // array [batch + 1]. (Used with padding)
+    const void* block_scale_seqstart_q_ptr;
+    const void* block_scale_seqstart_k_ptr;
+    const void* sink_ptr;
 
     ck_tile::index_t seqlen_q;
     ck_tile::index_t seqlen_k;
@@ -169,6 +208,9 @@ struct mha_fwd_args
     ck_tile::index_t nhead_stride_randval;
     ck_tile::index_t nhead_stride_lse;
     ck_tile::index_t nhead_stride_o;
+    ck_tile::index_t nhead_stride_q_descale;
+    ck_tile::index_t nhead_stride_k_descale;
+    ck_tile::index_t nhead_stride_v_descale;
     ck_tile::index_t batch_stride_q;
     ck_tile::index_t batch_stride_k;
     ck_tile::index_t batch_stride_v;
@@ -176,6 +218,9 @@ struct mha_fwd_args
     ck_tile::index_t batch_stride_randval;
     ck_tile::index_t batch_stride_lse;
     ck_tile::index_t batch_stride_o;
+    ck_tile::index_t batch_stride_q_descale;
+    ck_tile::index_t batch_stride_k_descale;
+    ck_tile::index_t batch_stride_v_descale;
 
     ck_tile::index_t window_size_left;
     ck_tile::index_t window_size_right;
@@ -189,6 +234,9 @@ struct mha_fwd_args
 
     std::variant<std::pair<uint64_t, uint64_t>, std::pair<const void*, const void*>>
         drop_seed_offset;
+
+    ck_tile::index_t block_scale_size_q;
+    ck_tile::index_t block_scale_size_kv;
 };
 
 using mha_fwd_splitkv_args   = fmha_fwd_splitkv_args;
