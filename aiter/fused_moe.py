@@ -24,6 +24,34 @@ from aiter.utility.fp4_utils import moe_mxfp4_sort
 BLOCK_SIZE_M = 32
 
 
+def parse_flydsl_kernel_name(kernel_name: str):
+    if not kernel_name or not any(kw in kernel_name for kw in ["ck2stages", "flydsl"]):
+        return None
+    
+    try:
+        parts = kernel_name.split('_')
+        
+        tile_part = None
+        for part in parts:
+            if 'x' in part and part.replace('x', '').replace('-', '').isdigit():
+                tile_part = part
+                break
+        
+        if not tile_part:
+            return None
+        
+        tile_values = tile_part.split('x')
+        if len(tile_values) >= 3:
+            tile_m = int(tile_values[0])
+            tile_n = int(tile_values[1])
+            tile_k = int(tile_values[2])
+            return {"tile_m": tile_m, "tile_n": tile_n, "tile_k": tile_k}
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Failed to parse FlyDSL kernel name '{kernel_name}': {e}")
+    
+    return None
+
+
 def moe_sorting(
     topk_ids,
     topk_weights,
@@ -37,6 +65,7 @@ def moe_sorting(
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
+    
     max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
@@ -247,6 +276,7 @@ def fused_moe_(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        use_flydsl,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -262,7 +292,7 @@ def fused_moe_(
         num_local_tokens,
         moe_sorting_dispatch_policy,
     )
-
+    
     if metadata.run_1stage:
         return metadata.stage1(
             hidden_states,
@@ -592,6 +622,7 @@ def get_2stage_cfgs(
     doweight_stage1,
     hidden_pad,
     intermediate_pad,
+    use_flydsl=False,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -778,8 +809,15 @@ def get_2stage_cfgs(
             dtypes.fp8,
         ]
     ):
+
+        use_flydsl_by_kernel = (
+            "flydsl" in kernelName1.lower() 
+            or "flydsl" in kernelName2.lower()
+        )
+        
+
         use_flydsl_stage2 = (
-            os.environ.get("AITER_USE_FLYDSL_MOE", "1") in ("1", "true", "True", "YES", "yes")
+            use_flydsl_by_kernel
             and q_type == QuantType.per_Token
             and q_dtype_a == dtypes.fp8
             and q_dtype_w == dtypes.fp8
@@ -789,7 +827,13 @@ def get_2stage_cfgs(
         use_flydsl_stage1 = use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
         stage1_func = (
-            functools.partial(flydsl_moe_stage1)
+            functools.partial(
+                flydsl_moe_stage1,
+                kernelName=kernelName1, 
+                activation=activation,  
+                quant_type=q_type,
+                splitk=ksplit,
+            )
             if use_flydsl_stage1
             else functools.partial(
                 ck_moe_stage1,
@@ -802,6 +846,9 @@ def get_2stage_cfgs(
         stage2_func = (
             functools.partial(
                 flydsl_moe_stage2,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type, 
             )
             if use_flydsl_stage2
             else functools.partial(
@@ -906,6 +953,7 @@ def fused_moe_2stages(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        use_flydsl,
     )
     if (
         quant_type == QuantType.per_1x32
@@ -1538,19 +1586,35 @@ def flydsl_moe_stage1(
     block_m,
     a1_scale,
     w1_scale,
+    kernelName="", 
     sorted_weights=None,
+    quant_type=None,
+    activation=None, 
+    splitk=0,
     dtype=torch.bfloat16,
     **_kwargs,
 ):
+    print("[FLYDSL] ========== ENTERING flydsl_moe_stage1 ==========")
+    print(f"[FLYDSL] kernelName = {kernelName}")
+    
     if a1_scale is None or w1_scale is None:
         raise RuntimeError("FlyDSL stage1 requires a1_scale and w1_scale")
 
     token_num = hidden_states.shape[0]
     E, _, model_dim = w1.shape
     inter_dim = w2.shape[2]
-    tile_m = block_m if block_m is not None else 64
-    tile_n = 128
-    tile_k = 128
+    
+    parsed_tiles = parse_flydsl_kernel_name(kernelName)
+    if parsed_tiles:
+        tile_m = parsed_tiles["tile_m"]
+        tile_n = parsed_tiles["tile_n"]
+        tile_k = parsed_tiles["tile_k"]
+        print(f"[flydsl_moe_stage1] FLYDSL] ✅ Parsed from kernelName: tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}")
+    else:
+        tile_m = block_m if block_m is not None else 64
+        tile_n = int(os.environ.get("FLYDSL_TILE_N_STAGE1", "128"))
+        tile_k = int(os.environ.get("FLYDSL_TILE_K", "128"))
+        print(f"[FLYDSL] ⚠️  Using default/env tiles: tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}")
 
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
@@ -1580,7 +1644,7 @@ def flydsl_moe_stage1(
     scale_x_1d = a1_scale.view(-1).contiguous()
     w1_flat = w1.contiguous().view(E * (2 * inter_dim), model_dim)
     w1_scale_1d = w1_scale.view(-1).contiguous()
-
+ 
     import sys
 
     DSL2_ROOT = os.environ.get("DSL2_ROOT", None)
@@ -1607,6 +1671,7 @@ def flydsl_moe_stage1(
         out_dtype=out_dtype,
         use_cshuffle_epilog=False,
     )
+    print(f"[FLYDSL] Executing compile_moe_gemm1 with tokens={token_num}, topk={topk}, model_dim={model_dim}, inter_dim={inter_dim}")
     exe1(
         out,
         x_q,
@@ -1622,6 +1687,7 @@ def flydsl_moe_stage1(
         model_dim,
         int(blocks),
     )
+    print("[FLYDSL] ========== EXITING flydsl_moe_stage1 ==========")
     return out
 
 
@@ -1686,9 +1752,15 @@ def flydsl_moe_stage2(
     w2_scale,
     a2_scale,
     block_m,
+    kernelName="",
     sorted_weights=None,
+    quant_type=None,
+    activation=None,
     **_kwargs,
 ):
+    print("[FLYDSL] ========== ENTERING flydsl_moe_stage2 ==========")
+    print(f"[FLYDSL] kernelName = {kernelName}")
+    
     if w2_scale is None or a2_scale is None:
         raise RuntimeError("FlyDSL stage2 requires a2_scale and w2_scale")
 
@@ -1696,9 +1768,17 @@ def flydsl_moe_stage2(
     model_dim = w2.shape[1]
     E = w2.shape[0]
 
-    tile_m = block_m if block_m is not None else 64
-    tile_n = 256
-    tile_k = 128
+    parsed_tiles = parse_flydsl_kernel_name(kernelName)
+    if parsed_tiles:
+        tile_m = parsed_tiles["tile_m"]
+        tile_n = parsed_tiles["tile_n"]
+        tile_k = parsed_tiles["tile_k"]
+        print(f"flydsl_moe_stage2] [FLYDSL] ✅ Parsed from kernelName: tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}")
+    else:
+        tile_m = block_m if block_m is not None else 64
+        tile_n = int(os.environ.get("FLYDSL_TILE_N_STAGE2", "256"))
+        tile_k = int(os.environ.get("FLYDSL_TILE_K", "128"))
+        print(f"[FLYDSL] ⚠️  Using default/env tiles: tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}")
 
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
@@ -1751,6 +1831,7 @@ def flydsl_moe_stage2(
         in_dtype="fp8",
         out_dtype=out_dtype,
     )
+    print(f"[FLYDSL] Executing compile_moe_gemm2 with tokens={token_num}, topk={topk}, model_dim={model_dim}, inter_dim={inter_dim}")
     exe2(
         out,
         a2_qt_flat,
@@ -1766,6 +1847,7 @@ def flydsl_moe_stage2(
         inter_dim,
         int(blocks),
     )
+    print("[FLYDSL] ========== EXITING flydsl_moe_stage2 ==========")
     return out
 
 
