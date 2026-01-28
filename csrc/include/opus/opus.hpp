@@ -866,6 +866,53 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 OPUS_CAST_DEFINE(fp16, fp32)
 OPUS_CAST_DEFINE(fp32, fp16)
 
+namespace impl {
+// implement a "pack" of data, storage should pad to multiple of byte(8bit)
+template<typename storage_, uint32_t bits_, bool is_signed_ = true>
+struct dpacks {
+    using storage = remove_cvref_t<storage_>;
+    static constexpr uint32_t bits = bits_;
+    static constexpr uint32_t mask = (1 << bits) - 1;
+    static constexpr bool is_signed = is_signed_;
+    static constexpr uint32_t num_packs = sizeof(storage) * 8 / bits;   // we will not check if evenly divided or not here
+    OPUS_H_D                     constexpr storage operator[](index_t i) const { return (value >> (i * bits)) & mask; } // NOTE: not efficient, better use v_bfi/v_bfe/v_perm on device
+    template<index_t I> OPUS_H_D constexpr storage operator[](number<I>) const { return (value >> (I * bits)) & mask; } // NOTE: not efficient, better use v_bfi/v_bfe/v_perm on device
+    storage value;
+};
+
+template<typename storage_, uint32_t bits_, uint32_t exp_bits_, uint32_t mantissa_bits_, bool is_signed_ = true>
+struct fpacks : dpacks<storage_, bits_, is_signed_> {
+    static constexpr uint32_t exp_bits = exp_bits_;
+    static constexpr uint32_t mantissa_bits = mantissa_bits_;
+};
+} // namespace impl
+
+template <typename> struct is_packs : false_type {};
+template <typename S, uint32_t B, bool X> struct is_packs<impl::dpacks<S, B, X>> : true_type {};
+template <typename S, uint32_t B, uint32_t E, uint32_t M, bool X> struct is_packs<impl::fpacks<S, B, E, M, X>> : true_type {};
+template <typename T> static constexpr bool is_packs_v = is_packs<remove_cvref_t<T>>::value;
+
+template <typename T> struct sizeof_bits { static constexpr int value = int(sizeof(T) * 8); };
+template <> struct sizeof_bits<void> { static constexpr int value = 0; };
+template <typename S, uint32_t B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
+template <typename S, uint32_t B, uint32_t E, uint32_t M, bool X> struct sizeof_bits<impl::fpacks<S, B, E, M, X>> { static constexpr int value = impl::fpacks<S, B, E, M, X>::bits; };
+template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
+
+#define OPUS_DEFINE_DPACKS(name_, storage_, bits_, is_signed_) \
+    struct name_ : opus::impl::dpacks<storage_, bits_, is_signed_> { using base = opus::impl::dpacks<storage_, bits_, is_signed_>; };  \
+    template<> struct sizeof_bits<name_> { static constexpr int value = name_::bits; }; template<> struct is_packs<name_> : true_type {}; template<> struct is_dtype<name_> : true_type {};
+
+#define OPUS_DEFINE_FPACKS(name_, storage_, bits_, exp_bits_, mantissa_bits_, is_signed_) \
+    struct name_ : opus::impl::fpacks<storage_, bits_, exp_bits_, mantissa_bits_, is_signed_> {using base = opus::impl::fpacks<storage_, bits_, exp_bits_, mantissa_bits_, is_signed_>; };  \
+    template<> struct sizeof_bits<name_> { static constexpr int value = name_::bits; }; template<> struct is_packs<name_> : true_type {}; template<> struct is_dtype<name_> : true_type {};
+
+// NOTE: convention here. The subbyte type below is indeed "packed" data. e.g. fp4_t, underneath it is fp4x2 in one byte, but we don't name it this way
+// This is different from cutlass convention (e.g float4_e2m1_t, but storage is uint8_t, hence an array of float4_e2m1_t will be expanded), and different from ck convention(explicitly name it fp4x2_t)
+OPUS_DEFINE_DPACKS(int4_t , uint8_t, 4, true)           // int4x2
+OPUS_DEFINE_DPACKS(uint4_t, uint8_t, 4, false)          // uint4x2
+OPUS_DEFINE_FPACKS(fp4_t,   uint8_t, 4, 2, 1, true)     // fp4x2
+OPUS_DEFINE_FPACKS(e8m0_t,  uint8_t, 8, 8, 0, false)    // fp4x2
+
 template<typename D, typename S, typename... Aux, std::enable_if_t<is_vector_v<S>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     vector_t<D, size<S>()> r; static_for([&](auto i){ r[i.value] = cast<D>(s[i.value], std::forward<Aux>(aux)...); }, number<size<S>()>{}); return r;
@@ -885,6 +932,8 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return impl::ca
 template<typename D, typename S, typename... Aux, std::enable_if_t<is_array_v<S>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return impl::cast_impl<D>(s, make_index_seq<size<S>()>{}, std::forward<Aux>(aux)...); }
 
+#undef OPUS_DEFINE_DPACKS
+#undef OPUS_DEFINE_FPACKS
 #undef OPUS_CAST_DEFINE
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // arch
