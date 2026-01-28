@@ -440,6 +440,7 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     
     // gqa_ratio * max_qlen <= qTile
     int required_qTile = gqa_ratio * max_qlen;
+    if (required_qTile == 40) required_qTile = 48; // FIXME:workaround
     std::vector<int> available_qTiles = {16, 32, 40, 48, 64};
     int qTile = -1;
     
