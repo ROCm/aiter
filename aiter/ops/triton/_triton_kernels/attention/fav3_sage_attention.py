@@ -1,48 +1,14 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Literal, Optional
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     compute_alibi_block,
-    get_arch,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 
 def map_dims(shape, indices):
     return [shape[i] for i in indices]
-
-
-def get_sage_fwd_configs():
-    arch = get_arch()
-    if arch == "gfx950":
-        return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 5,
-            "num_warps": 8,
-        }
-    elif arch == "gfx942":
-        return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
-        }
-    else:
-        # return tuned config for MI300X by default
-        return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 2,
-            "num_warps": 8,
-        }
 
 
 @triton.jit

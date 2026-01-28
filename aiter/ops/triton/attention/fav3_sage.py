@@ -7,11 +7,44 @@ import torch
 import aiter
 import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
-    get_sage_fwd_configs,
     sage_quant,
     sage_fwd,
     map_dims,
 )
+from aiter.ops.triton.utils._triton import arch_info
+
+
+def get_sage_fwd_configs():
+    arch = arch_info.get_arch()
+    if arch == "gfx950":
+        return {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 5,
+            "num_warps": 8,
+        }
+    elif arch == "gfx942":
+        return {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 2,
+            "num_warps": 8,
+        }
+    else:
+        # return tuned config for MI300X by default
+        return {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 2,
+            "num_warps": 8,
+        }
+
 
 
 class _FAv3SageWrapperFunc(torch.autograd.Function):
