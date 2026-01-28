@@ -650,6 +650,8 @@ def get_2stage_cfgs(
         doweight_stage1,
     )
 
+    # import pdb; pdb.set_trace()
+
     def MainFunc():
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
@@ -917,6 +919,8 @@ def fused_moe_2stages(
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
     device = hidden_states.device
+    print(hidden_states.shape)
+
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -1654,6 +1658,7 @@ def cktile_moe_stage1(
         # tile_n=tile_n,
         # tile_k=tile_k,
         tile_m=block_m,
+        # tile_n=256,
         tile_n=256,
         tile_k=256,
         doweight_stage1=bool(doweight_stage1),
@@ -1669,6 +1674,34 @@ def cktile_moe_stage1(
         inter_dim_pad=n_pad_zeros,
         # enable_bias=False,
     )
+
+    # torch.save(w1_flat, "./w1_flat.pt")
+    # torch.save(scale_x_1d, "./scale_x_1d.pt")
+    print(f"{x_q.shape}")
+    print(f"{w1_flat.shape}")
+    print(f"{scale_x_1d.shape}")
+
+    # torch.save(x_q, "./x_q.pt")
+    # torch.save(sorted_ids, "./sorted_ids.pt")
+    # torch.save(sorted_eids, "./sorted_eids.pt")
+    # torch.save(sorted_w, "./sorted_w.pt")
+    # torch.save(num_valid_ids, "./num_valid_ids.pt")
+
+    # x_q = torch.load("./x_q.pt")
+    # sorted_ids = torch.load("./sorted_ids.pt")
+    # sorted_eids = torch.load("./sorted_eids.pt")
+    # sorted_w = torch.load("./sorted_w.pt")
+    # num_valid_ids = torch.load("./num_valid_ids.pt")
+
+    print(token_num)
+    print(inter_dim)
+    print(model_dim)
+    print(blocks)
+    # import pdb;pdb.set_trace()
+
+
+    # torch.save(bias1, "./bias1.pt")
+    print(f"{bias1.shape}")
 
     # print(f"{model_dim=}")
     # print(f"{inter_dim=}")
