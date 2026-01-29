@@ -113,7 +113,8 @@ def fused_mhc(
     else:
         config = dict(config)  # Copy to avoid mutation
     
-    num_ksplit = config.pop("NUM_KSPLIT", 1)
+    num_ksplit = config.get("NUM_KSPLIT", 1)
+
     # Pop block sizes from config, or compute defaults
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     # BLOCK_N: Column tile size - should align with output dimension
@@ -169,7 +170,7 @@ def fused_mhc(
     n_blocks_post = triton.cdiv(n, BLOCK_N)
     n_blocks_res = triton.cdiv(n * n, BLOCK_N)
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
-    
+
     if num_ksplit > 1:
         # Split-K path: use split and reduce kernels
         splitk_block_size = triton.cdiv(K, num_ksplit)
@@ -223,7 +224,6 @@ def fused_mhc(
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
-            NUM_KSPLIT=num_ksplit,
             SPLITK_BLOCK_SIZE=splitk_block_size,
             **config,
         )
@@ -271,7 +271,6 @@ def fused_mhc(
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             ACTUAL_KSPLIT=actual_ksplit,
-            MAX_KSPLIT=max_ksplit,
             **config,
         )
     else:
