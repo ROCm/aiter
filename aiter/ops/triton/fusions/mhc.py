@@ -641,23 +641,6 @@ def sinkhorn_knopp_lite(
     
     n_factorial = math.factorial(n)
     
-    # Flatten input matrices to vectors (M, n²)
-    logits_flat = logits.view(M, -1)
-    
-    # Project (M, n²) → (M, n!) using deterministic strategies
-    if n_factorial == n * n:
-        # Special case: n=2 (2!=2, n²=4) - use first n_factorial elements
-        logits_projected = logits_flat[:, :n_factorial].contiguous()
-    else:
-        # General case: Deterministic linear projection from n² to n!
-        # For n=4: project 16 dims → 24 dims using tiled repetition
-        repeat_factor = (n_factorial + n * n - 1) // (n * n)  # Ceiling division
-        logits_projected = logits_flat.repeat(1, repeat_factor)[:, :n_factorial].contiguous()
-    
-    _LOGGER.info(
-        f"Projected (M, n²)=({M}, {n * n}) → (M, n!)=({M}, {n_factorial})"
-    )
-    
     # Generate permutation matrices (cached)
     perm_mats = _generate_permutation_matrices(n, logits.device, logits.dtype)
     assert perm_mats.shape == (n_factorial, n, n), (

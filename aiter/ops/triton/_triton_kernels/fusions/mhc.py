@@ -689,7 +689,6 @@ def _sinkhorn_knopp_lite(
                 weight_val = tl.sum(tl.where(weight_mask, weights, 0.0))
                 
                 # Load permutation matrix P_k: (N, N)
-                # Use contiguous memory access pattern for better cache utilization
                 perm_base = perm_idx * stride_perm_idx
                 perm_matrix = tl.load(
                     perm_mats_ptr + perm_base + flat_idx,
