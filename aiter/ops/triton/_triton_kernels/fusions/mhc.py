@@ -54,6 +54,7 @@ def _mhc_fused_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
 ):
     """
     Fused kernel for equations 14-18 with stream-aware grid.
@@ -368,8 +369,8 @@ def _mhc_fused_reduce_kernel(
     # Block sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
     ACTUAL_KSPLIT: tl.constexpr,
-    MAX_KSPLIT: tl.constexpr,
 ):
     """
     Reduce kernel for mHC - combines partial results and applies post-processing.
