@@ -59,7 +59,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    int activation = 0,
                    std::optional<int> splitk = 1,
                    bool nt = false,
-                   std::optional<std::string> dst_type = std::nullopt)
+                   std::optional<std::string> dst_type = std::nullopt,
+                   bool is_shuffled = true)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt << " " << block_m.value() << std::endl;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
@@ -108,7 +109,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
     activation = !activation;
 
-    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
+    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
@@ -132,7 +133,8 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    int activation = 0,
                    std::optional<int> splitk = 1,
                    bool nt = false,
-                   std::optional<std::string> dst_type = std::nullopt)
+                   std::optional<std::string> dst_type = std::nullopt,
+                   bool is_shuffled = true)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage2 called!" << nt << " " << block_m.value() << std::endl;
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
@@ -170,7 +172,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     }
 
     activation = !activation;
-    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
+    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,

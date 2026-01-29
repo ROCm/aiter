@@ -226,6 +226,7 @@ def cmdGenFunc_ck_moe_stage(
     splitk: int = 1,
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
+    is_shuffled: bool = True,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -238,7 +239,7 @@ def cmdGenFunc_ck_moe_stage(
         activation,
         quant_type,
         mul_routed_weight_stage,
-        getattr(w1, "is_shuffled", False),
+        is_shuffled,
         is_splitk,
     )
     return {
@@ -266,6 +267,7 @@ def cmdGenFunc_ck_moe_stage2(
     splitk: int = 1,
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
+    is_shuffled: bool = True,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -276,7 +278,7 @@ def cmdGenFunc_ck_moe_stage2(
         activation,
         quant_type,
         mul_routed_weight_stage,
-        getattr(w1, "is_shuffled", False),
+        is_shuffled,
     )
     return {
         "md_name": md_name,
@@ -304,6 +306,7 @@ def ck_moe_stage1(
     splitk: Optional[int] = 1,
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
+    is_shuffled: bool = True,
 ) -> None: ...
 
 
@@ -327,6 +330,7 @@ def ck_moe_stage2(
     splitk: int = 1,
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
+    is_shuffled: bool = True,
 ) -> None: ...
 
 
@@ -542,6 +546,7 @@ def ck_moe_stage1_fwd(
         int(splitk) if splitk is not None else splitk,
         use_non_temporal_load,
         dtype2str_dict[dst_type],
+        is_shuffled=getattr(w1, "is_shuffled", False),
     )
     return out
 
@@ -581,5 +586,6 @@ def ck_moe_stage2_fwd(
         quant_type.value,
         activation.value,
         use_non_temporal_load=use_non_temporal_load,
+        is_shuffled=getattr(w2, "is_shuffled", False),
     )
     return out

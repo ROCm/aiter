@@ -45,7 +45,7 @@ gemm1_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage1_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage)
+MoeKernel moe_stage1_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
 {{
 """
 
@@ -54,7 +54,7 @@ gemm2_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage)
+MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
 {{
 """
 
@@ -212,7 +212,8 @@ A4W4_gemm1_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {Preshuffle} == is_shuffled)
     {{
         if (block_m == 32)
         {{
@@ -245,7 +246,8 @@ A4W4_bns_gemm1_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {Preshuffle} == is_shuffled)
     {{
         if (block_m == 32)
         {{
@@ -497,7 +499,8 @@ A4W4_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {Preshuffle} == is_shuffled)
     {{
         if (inter_dim <= 256)
         {{
@@ -553,7 +556,8 @@ A4W4_bns_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {Preshuffle} == is_shuffled)
     {{
         if (inter_dim <= 256)
         {{
@@ -860,6 +864,7 @@ class ck_moe_2stage_gemm_codegen:
                 Quant=self.quant_type,
                 ActOP=str(int(self.activation == "silu")),
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
+                Preshuffle=str(self.preshuffle).lower(),
             )
             f_h.write(gemm1_heuristic_dispatch_str)
 
@@ -877,6 +882,7 @@ class ck_moe_2stage_gemm_codegen:
                 Quant=self.quant_type,
                 ActOP=0,
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 2).lower(),
+                Preshuffle=str(self.preshuffle).lower(),
             )
             f_h.write(gemm2_heuristic_dispatch_str)
 
