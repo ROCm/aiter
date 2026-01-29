@@ -592,18 +592,13 @@ softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const flo
 }
 
 template <bool kIsFirstIter, bool kCheckBoundary, uint32_t k_p_comp_begin, typename comp_t = float>
-__device__ __forceinline__ void softmax(comp_t* p_row_max,
-                                        comp_t* p_row_sum_e,
-                                        comp_t* p_rescale,
-                                        uint32_t kv_tile_start,
-                                        uint32_t kv_end,
-                                        float softmax_scale,
-                                        void* p_dbg)
+__device__ __forceinline__ void softmax_p0(comp_t* p_row_max,
+                                           comp_t* p_rescale,
+                                           const uint32_t kv_tile_start,
+                                           const uint32_t kv_end,
+                                           const float softmax_scale)
 {
-    using comp2_t = __attribute__((__ext_vector_type__(2))) comp_t;
-
     constexpr comp_t log2e = 1.4426950408889634;
-    const comp2_t log2e_pk = {log2e, log2e};
 
     const uint32_t lane_idx = ckt::get_lane_id();
 
@@ -613,13 +608,12 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
         col_0_idx * 4 + kv_tile_start, kv_end, softmax_scale);
 
     // Get max of row
-    comp_t local_max;
-    comp2_t tmp0, tmp1;
+    comp_t local_max, tmp0, tmp1;
     asm volatile("v_max3_f32 %1, v[%3], v[%4], v[%5]\n\t"
                  "v_max3_f32 %2, v[%6], v[%7], v[%8]\n\t"
                  "v_max_f32_e32 %0, v[%9], v[%10]\n\t"
                  "v_max3_f32 %0, %1, %2, %0"
-                 : "=v"(local_max), "=v"(tmp0[0]), "=v"(tmp0[1])
+                 : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
                  : "n"(k_p_comp_begin),
                    "n"(k_p_comp_begin + 1),
                    "n"(k_p_comp_begin + 2),
@@ -637,10 +631,19 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
 
     const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, *p_row_max);
     *p_rescale = kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f(((*p_row_max) - new_row_max) * log2e);
-
     *p_row_max = new_row_max;
+}
 
+template <bool kIsFirstIter, uint32_t k_p_comp_begin, typename comp_t = float>
+__device__ __forceinline__ void
+softmax_p1(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t rescale)
+{
+    using comp2_t = __attribute__((__ext_vector_type__(2))) comp_t;
+
+    constexpr comp_t log2e           = 1.4426950408889634;
+    const comp2_t log2e_pk           = {log2e, log2e};
     const comp2_t neg_new_row_max_pk = {-new_row_max, -new_row_max};
+    comp2_t tmp0, tmp1;
 
     asm volatile("v_pk_add_f32 v[%0:%1], v[%0:%1], %8\n\t"
                  "v_pk_add_f32 v[%2:%3], v[%2:%3], %8\n\t"
@@ -683,12 +686,16 @@ __device__ __forceinline__ void softmax(comp_t* p_row_max,
                    "n"(k_p_comp_begin + 5),
                    "n"(k_p_comp_begin + 6),
                    "n"(k_p_comp_begin + 7));
+
     float local_sum_e = tmp0[0] + tmp0[1];
+
+    constexpr int32_t reduce_range = ckt::get_warp_size();
+    constexpr int32_t stop_stride  = ckt::get_warp_size() / 4 - 1;
     local_sum_e =
         aiter::warpReduce<aiter::AddFunctor, decltype(local_sum_e), reduce_range, stop_stride>(
             local_sum_e);
 
-    *p_row_sum_e = kIsFirstIter ? local_sum_e : ((*p_rescale) * (*p_row_sum_e) + local_sum_e);
+    *p_row_sum_e = kIsFirstIter ? local_sum_e : (rescale * (*p_row_sum_e) + local_sum_e);
 }
 
 template <uint32_t kRoundMode>
@@ -1001,10 +1008,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 __builtin_amdgcn_sched_barrier(0);
 
                 // GEMM on NoPE
-                load_k_to_gpr<T, 0, 0>(kv_0, p_lds_kv_curr);
-                load_k_to_gpr<T, 16, 0>(kv_0, p_lds_kv_curr);
-                load_k_to_gpr<T, 0, T::kBlockK>(kv_1, p_lds_kv_curr);
-                load_k_to_gpr<T, 16, T::kBlockK>(kv_1, p_lds_kv_curr);
+                __builtin_amdgcn_s_setprio(5);
                 ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}([&](auto idx) {
                     using q_range_0 = hkdart::
                         split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>, 2>;
@@ -1016,6 +1020,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                     // Load K from LDS to GPR
                     constexpr int32_t tile_idx = (idx.value - k_q_nope_begin) / 2;
+                    load_k_to_gpr<T, 0, (tile_idx + 0) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                    load_k_to_gpr<T, 16, (tile_idx + 0) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                    load_k_to_gpr<T, 0, (tile_idx + 1) * T::kBlockK>(kv_1, p_lds_kv_curr);
+                    load_k_to_gpr<T, 16, (tile_idx + 1) * T::kBlockK>(kv_1, p_lds_kv_curr);
                     asm volatile("s_waitcnt lgkmcnt(2)");
                     if constexpr(idx.value == k_q_nope_begin)
                     {
@@ -1025,12 +1033,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     {
                         hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
                     }
-                    load_k_to_gpr<T, 0, (tile_idx + 2) * T::kBlockK>(kv_0, p_lds_kv_curr);
-                    load_k_to_gpr<T, 16, (tile_idx + 2) * T::kBlockK>(kv_0, p_lds_kv_curr);
-                    asm volatile("s_waitcnt lgkmcnt(2)");
+                    asm volatile("s_waitcnt lgkmcnt(0)");
                     hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
-                    load_k_to_gpr<T, 0, (tile_idx + 3) * T::kBlockK>(kv_1, p_lds_kv_curr);
-                    load_k_to_gpr<T, 16, (tile_idx + 3) * T::kBlockK>(kv_1, p_lds_kv_curr);
                 });
 
                 // GEMM on RoPE
@@ -1045,25 +1049,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                     // Load K from LDS to GPR
                     constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
+                    load_k_to_gpr<T, 0, (tile_idx + 0 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                    load_k_to_gpr<T, 16, (tile_idx + 0 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
+                    load_k_to_gpr<T, 0, (tile_idx + 1 + 16) * T::kBlockK>(kv_1, p_lds_kv_curr);
+                    load_k_to_gpr<T, 16, (tile_idx + 1 + 16) * T::kBlockK>(kv_1, p_lds_kv_curr);
+
                     asm volatile("s_waitcnt lgkmcnt(2)");
                     hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
-                    if constexpr(idx.value < k_q_rope_end + 1 - 2 * 2)
-                    {
-                        load_k_to_gpr<T, 0, (tile_idx + 2 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
-                        load_k_to_gpr<T, 16, (tile_idx + 2 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
-                        asm volatile("s_waitcnt lgkmcnt(2)");
-                    }
-                    else
-                    {
-                        asm volatile("s_waitcnt lgkmcnt(0)");
-                    }
+                    asm volatile("s_waitcnt lgkmcnt(0)");
                     hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
-                    if constexpr(idx.value < k_q_rope_end + 1 - 2 * 2)
-                    {
-                        load_k_to_gpr<T, 0, (tile_idx + 3 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
-                        load_k_to_gpr<T, 16, (tile_idx + 3 + 16) * T::kBlockK>(kv_0, p_lds_kv_curr);
-                    }
                 });
+                __builtin_amdgcn_s_setprio(1);
 
                 async_load_k_tile<T, 0, kIsLastIter, kCheckBoundary>(
                     p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
@@ -1071,13 +1067,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
 
                 float rescale;
-                softmax<kIsFirstIter, kCheckBoundary, k_p_comp_begin, comp_t>(&row_max,
-                                                                              &row_sum_e,
-                                                                              &rescale,
-                                                                              kv_tile_start,
-                                                                              kv_end,
-                                                                              params.softmax_scale,
-                                                                              params.p_dbg);
+                softmax_p0<kIsFirstIter, kCheckBoundary, k_p_comp_begin>(
+                    &row_max, &rescale, kv_tile_start, kv_end, params.softmax_scale);
+                softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
+                __builtin_amdgcn_s_setprio(0);
 
                 async_load_k_tile<T, 128, kIsLastIter, kCheckBoundary>(
                     p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
@@ -1104,17 +1097,16 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                    "n"(src_idx + 3));
                 });
 
-                async_load_k_tile<T, 256, kIsLastIter, kCheckBoundary>(
-                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-
-                __builtin_amdgcn_sched_barrier(0);
-
                 // GEMM on PV
 
                 // Transpose
                 v8ui v;
                 load_v_to_gpr<T>(&v, p_lds_kv_curr);
                 asm volatile("s_waitcnt lgkmcnt(0)");
+
+                async_load_k_tile<T, 256, kIsLastIter, kCheckBoundary>(
+                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+
                 transpose_v<0>(&v);
                 transpose_v<1>(&v);
                 store_transposed_v_to_lds<T>(p_lds_vt, v);
@@ -1124,13 +1116,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 async_load_k_tile<T, 320, kIsLastIter, kCheckBoundary>(
                     p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                async_load_k_tile<T, 384, kIsLastIter, kCheckBoundary>(
-                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                async_load_k_tile<T, 448, kIsLastIter, kCheckBoundary>(
-                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
-                async_load_k_tile<T, 512, kIsLastIter, kCheckBoundary>(
-                    p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
 
+                __builtin_amdgcn_s_setprio(4);
                 constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
                 ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
                     constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
@@ -1175,7 +1162,28 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     {
                         hk::mma_ABt(oaccu_1, kv_1, p_mfma, oaccu_1);
                     }
+
+                    if constexpr(kIsLastIter) {}
+                    else
+                    {
+                        if constexpr(idx.value == 1)
+                        {
+                            async_load_k_tile<T, 384, kIsLastIter, kCheckBoundary>(
+                                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                        }
+                        else if constexpr(idx.value == 3)
+                        {
+                            async_load_k_tile<T, 448, kIsLastIter, kCheckBoundary>(
+                                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                        }
+                        else if constexpr(idx.value == 5)
+                        {
+                            async_load_k_tile<T, 512, kIsLastIter, kCheckBoundary>(
+                                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld, kv_ld_col_base);
+                        }
+                    }
                 });
+                __builtin_amdgcn_s_setprio(0);
 
                 if constexpr(kIsLastIter == false)
                 {
