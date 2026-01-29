@@ -226,6 +226,7 @@ def cmdGenFunc_ck_moe_stage(
     splitk: int = 1,
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
+    is_shuffled: bool = True,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -238,7 +239,7 @@ def cmdGenFunc_ck_moe_stage(
         activation,
         quant_type,
         mul_routed_weight_stage,
-        getattr(w1, "is_shuffled", False),
+        is_shuffled,
         is_splitk,
     )
     return {
@@ -266,6 +267,7 @@ def cmdGenFunc_ck_moe_stage2(
     splitk: int = 1,
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
+    is_shuffled: bool = True,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -276,7 +278,7 @@ def cmdGenFunc_ck_moe_stage2(
         activation,
         quant_type,
         mul_routed_weight_stage,
-        getattr(w1, "is_shuffled", False),
+        is_shuffled,
     )
     return {
         "md_name": md_name,
@@ -304,6 +306,7 @@ def ck_moe_stage1(
     splitk: Optional[int] = 1,
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
+    is_shuffled: bool = True,
 ) -> None: ...
 
 
@@ -327,6 +330,7 @@ def ck_moe_stage2(
     splitk: int = 1,
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
+    is_shuffled: bool = True,
 ) -> None: ...
 
 
@@ -495,21 +499,9 @@ def get_moe_stage_module(
     act = str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()
 
-    md_name = ("_").join(
-        [
-            "module_moe_ck2stages",
-            Adtype,
-            Bdtype,
-            "preshuffle_on" if preshuffle_mode else "preshuffle_off",
-            Cdtype,
-            act,
-            quant_type,
-            f"mulWeightStage{mul_routed_weight_stage}",
-            "splitk" if is_splitk else "",
-        ]
-    )
+    md_name = "module_moe_ck2stages"
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -w {{}}"
     ]
 
     return md_name, blob_gen_cmd
@@ -554,6 +546,7 @@ def ck_moe_stage1_fwd(
         int(splitk) if splitk is not None else splitk,
         use_non_temporal_load,
         None if dst_type is None else dtype2str_dict[dst_type],
+        is_shuffled=getattr(w1, "is_shuffled", False),
     )
     return out
 
@@ -593,5 +586,6 @@ def ck_moe_stage2_fwd(
         quant_type.value,
         activation.value,
         use_non_temporal_load=use_non_temporal_load,
+        is_shuffled=getattr(w2, "is_shuffled", False),
     )
     return out
