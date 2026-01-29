@@ -12,6 +12,7 @@ from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs, _general_quant_kernel
 
 from .scale_mxfp import downcast_to_mxfp_rne
+from .hadamard_rotation import apply_hadamard_rotation_qk
 
 @triton.jit
 def _sage_fwd_no_mask_v2(
@@ -2051,6 +2052,9 @@ def sage_quant_v2(
         num_stages=3,
         num_warps=8
     )
+
+    ## rotate q and k
+    q, k = apply_hadamard_rotation_qk(q, k)
 
     ## quantize q and k
     q_bf16 = torch.empty_like(q, dtype=torch.bfloat16, device=q.device)
