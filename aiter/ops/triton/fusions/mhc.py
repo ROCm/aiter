@@ -178,7 +178,7 @@ def fused_mhc(
         # Split-K path: use split and reduce kernels
         splitk_block_size = triton.cdiv(K, num_ksplit)
         actual_ksplit = triton.cdiv(K, splitk_block_size)
-        max_ksplit = triton.next_power_of_2(num_ksplit)
+        # max_ksplit = triton.next_power_of_2(num_ksplit)
         
         # Allocate intermediate buffers (float32 for precision)
         acc_pre_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
@@ -639,6 +639,7 @@ def sinkhorn_knopp_lite(
     )
     
     n_factorial = math.factorial(n)
+    n_sq = n * n
     
     # Generate permutation matrices (cached)
     perm_mats = _generate_permutation_matrices(n, logits.device, logits.dtype)
@@ -664,8 +665,9 @@ def sinkhorn_knopp_lite(
     else:
         config = dict(config)  # Copy to avoid mutation
     
-    # Grid: one program per BLOCK_M batch elements
-    grid = (triton.cdiv(M, config["BLOCK_M"]),)
+    # 2D Grid (like mhc_fused_reduce_kernel):
+    # Axis 0: batch dimension (M), Axis 1: flattened matrix elements (n²)
+    grid = (triton.cdiv(M, config["BLOCK_M"]), triton.cdiv(n_sq, config["BLOCK_SIZE"]))
     
     # Compute next power of 2 for N_FACTORIAL (required by Triton's tl.arange)
     n_factorial_pow2 = triton.next_power_of_2(n_factorial)
@@ -679,7 +681,8 @@ def sinkhorn_knopp_lite(
         N_FACTORIAL=n_factorial,
         N_FACTORIAL_POW2=n_factorial_pow2,
         stride_logits_m=logits.stride(0),
-        stride_logits_perm=logits.stride(1),
+        stride_logits_row=logits.stride(1),
+        stride_logits_col=logits.stride(2),
         stride_perm_idx=perm_mats.stride(0),
         stride_perm_row=perm_mats.stride(1),
         stride_perm_col=perm_mats.stride(2),

@@ -1,6 +1,6 @@
 {
     "any": {
-        "BLOCK_M": 1,
+        "BLOCK_M": 8,
         "BLOCK_SIZE": 16,
         "waves_per_eu": 2,
         "num_stages": 1,

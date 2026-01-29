@@ -588,7 +588,7 @@ def _sinkhorn_knopp_log_domain_kernel(
 @triton.jit
 def _sinkhorn_knopp_lite(
     # Pointers
-    logits_ptr,     # Input: (M, n_factorial) raw logits for permutation weights
+    logits_ptr,     # Input: (M, n, n) raw logits
     perm_mats_ptr,  # Input: (n_factorial, N, N) pre-computed permutation matrices
     out_ptr,        # Output: (M, N, N) doubly stochastic matrices
     # Dimensions
@@ -598,7 +598,8 @@ def _sinkhorn_knopp_lite(
     N_FACTORIAL_POW2: tl.constexpr,  # Next power of 2 >= N_FACTORIAL
     # Strides
     stride_logits_m,      # Stride for batch dimension in logits
-    stride_logits_perm,   # Stride for permutation dimension in logits
+    stride_logits_row,    # Stride for row in logits
+    stride_logits_col,    # Stride for col in logits
     stride_perm_idx,      # Stride for permutation index in perm_mats
     stride_perm_row,      # Stride for row in perm_mats
     stride_perm_col,      # Stride for col in perm_mats
@@ -607,101 +608,86 @@ def _sinkhorn_knopp_lite(
     stride_out_col,       # Stride for column dimension in output
     # Meta-parameters
     BLOCK_M: tl.constexpr,      # Batch elements per program
-    BLOCK_SIZE: tl.constexpr,   # Block size for matrix element processing
+    BLOCK_SIZE: tl.constexpr,   # Matrix elements per program (n²)
 ):
     """
     Zero-iteration Sinkhorn-Knopp kernel using permutation matrix basis.
     
-    Instead of iteratively normalizing matrices, this directly parameterizes
-    doubly stochastic matrices as convex combinations of permutation matrices,
-    based on the Birkhoff-von Neumann theorem.
+    Grid structure (like mhc_fused_reduce_kernel):
+        2D grid: (cdiv(M, BLOCK_M), cdiv(N², BLOCK_SIZE))
+        - pid_m: batch dimension (processes BLOCK_M matrices)
+        - pid_n: flattened matrix dimension (processes BLOCK_SIZE elements)
+    
+    Each program computes BLOCK_M × BLOCK_SIZE output elements.
     
     Mathematical foundation:
-        Any doubly stochastic matrix M can be written as:
-        M = Σ_{k=1}^{n!} λ_k * P_k
-        where P_k are permutation matrices and λ_k ≥ 0, Σλ_k = 1
-    
-    Algorithm:
-        1. Apply softmax to logits to get weights λ: (M, n!)
-        2. Compute weighted sum: M[b] = Σ_k λ[b,k] * P_k
-        3. Result is automatically doubly stochastic (no iterations!)
-    
-    Advantages:
-        - Zero iterations (one-shot computation)
-        - Exact doubly stochastic property
-        - Faster than iterative Sinkhorn-Knopp
-    
-    Limitations:
-        - Requires storing n! permutation matrices
-        - Only practical for small N (typically N=4, where 4!=24)
-        - For N=5: 5!=120, N=6: 6!=720 (memory intensive)
-    
-    Grid: (cdiv(M, BLOCK_M),) - one program per BLOCK_M batch elements
+        M = Σ_{k=1}^{n!} λ_k * P_k (Birkhoff-von Neumann theorem)
     
     Reference: "mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations"
-               https://arxiv.org/abs/2601.05732
     """
     pid_m = tl.program_id(axis=0)
-    batch_start = pid_m * BLOCK_M
+    pid_n = tl.program_id(axis=1)
     
-    # Constants for exp2/log2 conversion (for numerical stability in softmax)
-    LOG2_E: tl.constexpr = 1.4426950408889634  # 1/ln(2)
-    LN_2: tl.constexpr = 0.6931471805599453    # ln(2)
+    # Batch indices: (BLOCK_M,)
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     
-    # Compute flat indices for NxN matrices (shared across all batches)
-    row_idx = tl.arange(0, N)[:, None]  # (N, 1)
-    col_idx = tl.arange(0, N)[None, :]  # (1, N)
-    flat_idx = row_idx * stride_out_row + col_idx * stride_out_col
+    # Flattened matrix element indices: (BLOCK_SIZE,)
+    rn = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    # Pre-compute permutation indices for weight extraction
+    # Convert flat indices to (row, col)
+    N_SQ: tl.constexpr = N * N
+    row_coords = rn // N  # (BLOCK_SIZE,)
+    col_coords = rn % N   # (BLOCK_SIZE,)
+    
+    # Masks
+    batch_mask = rm < M
+    elem_mask = rn < N_SQ
+    
+    # Constants
+    LOG2_E: tl.constexpr = 1.4426950408889634
+    
+    # Permutation indices
     perm_indices = tl.arange(0, N_FACTORIAL_POW2)
-    perm_mask = perm_indices < N_FACTORIAL
     
-    # Loop over batch elements in this block
-    for batch_local in range(BLOCK_M):
-        batch_idx = batch_start + batch_local
-        if batch_idx < M:
-            # Load logits for this batch: (n_factorial,)
-            # Note: tl.arange requires power of 2, so we use N_FACTORIAL_POW2 and mask
-            logits_offset = batch_idx * stride_logits_m + perm_indices * stride_logits_perm
-            logits = tl.load(
-                logits_ptr + logits_offset,
-                mask=perm_mask,
-                other=float('-inf')  # Masked values won't contribute after softmax
-            ).to(tl.float32)
-            
-            # Apply softmax to get weights λ (ensures Σλ = 1, λ ≥ 0)
-            # Using log-domain for numerical stability
-            logits_max = tl.max(logits)
-            exp_shifted = tl.exp2((logits - logits_max) * LOG2_E)
-            sum_exp = tl.sum(exp_shifted)
-            weights = exp_shifted / sum_exp  # (n_factorial_pow2,) but only first N_FACTORIAL matter
-            
-            # Initialize output matrix with zeros
-            out_matrix = tl.zeros((N, N), dtype=tl.float32)
-            
-            # Compute weighted sum: M = Σ_k λ_k * P_k
-            # Unroll the loop over N_FACTORIAL permutations for better performance
-            # Triton will optimize this at compile time since N_FACTORIAL is constexpr
-            for perm_idx in tl.static_range(N_FACTORIAL):
-                # Extract weight for this permutation using optimized indexing
-                # Create a mask for exactly this permutation index
-                weight_mask = perm_indices == perm_idx
-                weight_val = tl.sum(tl.where(weight_mask, weights, 0.0))
-                
-                # Load permutation matrix P_k: (N, N)
-                perm_base = perm_idx * stride_perm_idx
-                perm_matrix = tl.load(
-                    perm_mats_ptr + perm_base + flat_idx,
-                ).to(tl.float32)
-                
-                # Fused multiply-add: accumulate weighted contribution
-                # This is optimized to a single FMA instruction per element
-                out_matrix = tl.fma(weight_val, perm_matrix, out_matrix)
-            
-            # Store result with coalesced memory access
-            batch_offset = batch_idx * stride_out_batch
-            tl.store(
-                out_ptr + batch_offset + flat_idx, 
-                out_matrix.to(out_ptr.dtype.element_ty)
-            ) 
+    # STEP 1: Load logits and compute softmax for BLOCK_M batches
+    # Shape: (BLOCK_M, N_FACTORIAL_POW2)
+    logits_2d = tl.zeros((BLOCK_M, N_FACTORIAL_POW2), dtype=tl.float32) + float('-inf')
+    
+    for perm_idx in tl.static_range(N_FACTORIAL):
+        logit_elem_idx = perm_idx % N_SQ
+        logit_row = logit_elem_idx // N
+        logit_col = logit_elem_idx % N
+        
+        # Vectorized load across batches
+        logit_ptrs = logits_ptr + rm * stride_logits_m + logit_row * stride_logits_row + logit_col * stride_logits_col
+        logit_vals = tl.load(logit_ptrs, mask=batch_mask, other=float('-inf')).to(tl.float32)
+        
+        logits_2d = tl.where((perm_indices == perm_idx)[None, :], logit_vals[:, None], logits_2d)
+    
+    # Vectorized softmax for BLOCK_M batches
+    logits_max = tl.max(logits_2d, axis=1, keep_dims=True)
+    exp_shifted = tl.exp2((logits_2d - logits_max) * LOG2_E)
+    sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
+    weights = exp_shifted / sum_exp  # (BLOCK_M, N_FACTORIAL_POW2)
+    
+    # STEP 2: Compute weighted sum for (BLOCK_M, BLOCK_SIZE) output elements
+    # output[b, e] = Σ_k weights[b, k] * perm_mats[k, row_coords[e], col_coords[e]]
+    output = tl.zeros((BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
+    
+    for perm_idx in tl.static_range(N_FACTORIAL):
+        # Load permutation matrix elements for BLOCK_SIZE positions
+        # perm_vals[e] = perm_mats[perm_idx, row_coords[e], col_coords[e]]
+        perm_ptrs = perm_mats_ptr + perm_idx * stride_perm_idx + row_coords * stride_perm_row + col_coords * stride_perm_col
+        perm_vals = tl.load(perm_ptrs, mask=elem_mask, other=0.0).to(tl.float32)  # (BLOCK_SIZE,)
+        
+        # Extract weights for this permutation across batches
+        weight_mask = perm_indices == perm_idx
+        perm_weights = tl.sum(tl.where(weight_mask[None, :], weights, 0.0), axis=1)  # (BLOCK_M,)
+        
+        # Outer product: (BLOCK_M, 1) * (1, BLOCK_SIZE) → (BLOCK_M, BLOCK_SIZE)
+        output = tl.fma(perm_weights[:, None], perm_vals[None, :], output)
+    
+    # STEP 3: Store (BLOCK_M, BLOCK_SIZE) outputs
+    out_ptrs = out_ptr + rm[:, None] * stride_out_batch + row_coords[None, :] * stride_out_row + col_coords[None, :] * stride_out_col
+    store_mask = batch_mask[:, None] & elem_mask[None, :]
+    tl.store(out_ptrs, output.to(out_ptr.dtype.element_ty), mask=store_mask) 
