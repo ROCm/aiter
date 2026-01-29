@@ -883,7 +883,7 @@ def test_batch_prefill(
         )
 
         verify_fp8_output(out_fp8, o_ref)
-        rtol, atol = get_tolerances(dtype, is_fp8=True)
+        rtol, atol = get_tolerances(dtype, is_fp8=False)
         torch.testing.assert_close(out_ref, o_ref, rtol=rtol, atol=atol)
     else:
         # Prepare KV cache based on layout and contiguity
@@ -989,6 +989,7 @@ def run_ck(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    kv_block_descale=None,
     kv_last_page_lens=None,
     block_table=None,
     seqlen_k=None,
@@ -1017,6 +1018,7 @@ def run_ck(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        kv_block_descale=kv_block_descale,
         kv_last_page_lens=kv_last_page_lens,
         block_table=block_table,
         seqlen_k=seqlen_k,
@@ -1286,6 +1288,424 @@ def test_batch_prefill_vs_varlen_fp8(
     torch.testing.assert_close(out_batch_prefill, out_varlen, rtol=rtol, atol=atol)
 
 
+def per_page_quant(tensor, page_size, quant_dtype):
+    """
+    Quantize tensor with per-page scale.
+
+    Args:
+        tensor: [num_pages, page_size, num_heads, head_dim]
+        page_size: tokens per page
+        quant_dtype: target quantization dtype
+
+    Returns:
+        quantized: quantized tensor [num_pages, page_size, num_heads, head_dim]
+        descales: [num_pages, num_heads] per-page descale factors
+    """
+    num_pages, ps, num_heads, head_dim = tensor.shape
+    assert ps == page_size
+
+    # Compute per-page max absolute value
+    # [num_pages, page_size, num_heads, head_dim] -> [num_pages, num_heads]
+    abs_max = tensor.abs().amax(dim=(1, 3))  # max over page_size and head_dim
+    abs_max = abs_max.clamp(min=1e-12)
+
+    # Get FP8 max value
+    fp8_max = torch.finfo(quant_dtype).max
+
+    # Compute descale = abs_max / fp8_max (must be float32 for kernel)
+    descales = (abs_max / fp8_max).float()  # [num_pages, num_heads]
+
+    # Quantize: q = round(x / descale)
+    # Broadcast descales: [num_pages, 1, num_heads, 1]
+    descales_broadcast = descales.unsqueeze(1).unsqueeze(-1)
+    quantized = (tensor / descales_broadcast).to(quant_dtype)
+
+    return quantized, descales
+
+
+def reference_attention_kv_blockscale(
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    q_descale,
+    kv_block_descale,
+    cu_seqlens_q,
+    kv_indptr,
+    kv_indices,
+    kv_lens,
+    page_size,
+    causal=False,
+    softmax_scale=None,
+    logits_soft_cap=0.0,
+):
+    """
+    Reference implementation of attention with per-page KV descale.
+
+    Args:
+        q_fp8: [total_q, num_heads, head_dim] FP8
+        k_fp8: [num_pages, page_size, num_kv_heads, head_dim] FP8
+        v_fp8: [num_pages, page_size, num_kv_heads, head_dim] FP8
+        q_descale: [1] per-tensor Q descale
+        kv_block_descale: [num_pages, num_kv_heads, 2] per-page K/V descales
+        cu_seqlens_q: [batch_size + 1]
+        kv_indptr: [batch_size + 1]
+        kv_indices: page indices
+        kv_lens: [batch_size] K/V sequence lengths
+        page_size: tokens per page
+        causal: whether to use causal mask
+        softmax_scale: attention scale (default: 1/sqrt(head_dim))
+        logits_soft_cap: soft cap for logits (0.0 = disabled)
+
+    Returns:
+        output: [total_q, num_heads, head_dim]
+    """
+    import math
+
+    batch_size = len(kv_lens)
+    num_heads = q_fp8.shape[1]
+    num_kv_heads = k_fp8.shape[2]
+    head_dim = q_fp8.shape[2]
+    head_ratio = num_heads // num_kv_heads
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    # Dequantize Q
+    q = q_fp8.float() * q_descale.item()
+
+    # Build output tensor
+    total_q = q_fp8.shape[0]
+    output = torch.zeros(
+        total_q, num_heads, head_dim, dtype=torch.float32, device=q_fp8.device
+    )
+
+    for batch_idx in range(batch_size):
+        q_start = cu_seqlens_q[batch_idx].item()
+        q_end = cu_seqlens_q[batch_idx + 1].item()
+        q_len = q_end - q_start
+
+        page_start = kv_indptr[batch_idx].item()
+        page_end = kv_indptr[batch_idx + 1].item()
+        kv_len = kv_lens[batch_idx].item()
+
+        q_batch = q[q_start:q_end]
+
+        # Gather and dequantize K/V from pages
+        k_batch = []
+        v_batch = []
+        for page_offset in range(page_end - page_start):
+            page_idx = kv_indices[page_start + page_offset].item()
+            token_start = page_offset * page_size
+            token_end = min(token_start + page_size, kv_len)
+            num_tokens = token_end - token_start
+
+            k_page = k_fp8[page_idx, :num_tokens].float()
+            v_page = v_fp8[page_idx, :num_tokens].float()
+
+            # Apply per-page descale
+            k_descale = kv_block_descale[page_idx, :, 0]
+            v_descale_page = kv_block_descale[page_idx, :, 1]
+
+            k_page = k_page * k_descale.unsqueeze(0).unsqueeze(-1)
+            v_page = v_page * v_descale_page.unsqueeze(0).unsqueeze(-1)
+
+            k_batch.append(k_page)
+            v_batch.append(v_page)
+
+        k_batch = torch.cat(k_batch, dim=0)
+        v_batch = torch.cat(v_batch, dim=0)
+
+        # Expand K/V for GQA
+        if head_ratio > 1:
+            k_batch = k_batch.unsqueeze(2).expand(-1, -1, head_ratio, -1)
+            k_batch = k_batch.reshape(kv_len, num_heads, head_dim)
+            v_batch = v_batch.unsqueeze(2).expand(-1, -1, head_ratio, -1)
+            v_batch = v_batch.reshape(kv_len, num_heads, head_dim)
+
+        # Compute attention scores
+        scores = torch.einsum("qhd,khd->hqk", q_batch, k_batch) * softmax_scale
+
+        # Apply logits soft cap
+        if logits_soft_cap > 0.0:
+            scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+
+        # Apply causal mask
+        if causal:
+            mask = torch.triu(
+                torch.ones(q_len, kv_len, device=scores.device),
+                diagonal=kv_len - q_len + 1,
+            )
+            scores = scores.masked_fill(mask.unsqueeze(0).bool(), float("-inf"))
+
+        attn = torch.softmax(scores, dim=-1)
+        out_batch = torch.einsum("hqk,khd->qhd", attn, v_batch)
+        output[q_start:q_end] = out_batch
+
+    return output.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8), (16, 16)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("qo_len,kv_len", [(128, 1024), (512, 2048), (1024, 4096)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_batch_prefill_kv_blockscale_pytest(
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    qo_len,
+    kv_len,
+    causal,
+    table_layout,
+    logits_soft_cap,
+):
+    """Pytest wrapper for KV_BLOCKSCALE test."""
+    run_batch_prefill_kv_blockscale(
+        kvcache_layout="linear",
+        table_layout=table_layout,
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=1024,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+    )
+
+
+def run_batch_prefill_kv_blockscale(
+    kvcache_layout,
+    table_layout,
+    batch_size,
+    qo_len,
+    kv_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    causal,
+    logits_soft_cap,
+    dtype,
+    contiguous_kv,
+    seed,
+    profile=False,
+):
+    """
+    Test FP8 batch prefill with per-page KV descale (KV_BLOCKSCALE mode).
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    quant_dtype = dtypes.fp8
+    # KV_BLOCKSCALE only supports page_size=1024
+    if page_size != 1024:
+        if skip_test_if(
+            True, f"KV_BLOCKSCALE only supports page_size=1024, got {page_size}"
+        ):
+            return {"status": "skipped"}
+
+    k_vector_size = get_vector_size(quant_dtype)
+
+    if skip_test_if(
+        causal and kv_len < qo_len,
+        "kv_len < qo_len is not allowed if causal=True",
+    ):
+        return {"status": "skipped"}
+
+    # Build sequence lengths
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=batch_size > 1)
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=batch_size > 1)
+    max_qo_len = qo_lens.max().item()
+    max_kv_len = kv_lens.max().item()
+
+    # Create Q in dtype (same as pertensor FP8 test - uses uniform [0, 1])
+    q = build_q_tensor_for_test(
+        qo_lens,
+        batch_size,
+        qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        None,  # q_init_min = None (not used for FP8)
+        None,  # q_init_max = None (not used for FP8)
+        is_input_fp8=True,  # Use FP8 path: uniform [0, 1]
+    )
+
+    # Create paged KV cache with uniform [0, 1] data (same as pertensor FP8 test)
+    # Use build_paged_kv_cache with use_uniform=True and no min/max scaling
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        None,  # kv_init_min = None for uniform [0, 1]
+        None,  # kv_init_max = None for uniform [0, 1]
+        dtype,
+        use_uniform=True,
+        contiguous_kv=contiguous_kv,
+    )
+
+    # Extract tensors
+    kv_data_fp32 = kv_cache["kv_data_fp32"]  # FP32 for reference calculation
+    kv_data = kv_cache["kv_data"]  # dtype (BF16) version
+    kv_indptr = kv_cache["kv_indptr_cpu"]
+    kv_indices = kv_cache["kv_indices_cpu"]
+    kv_last_page_len_cpu = kv_cache["kv_last_page_len_cpu"]
+    total_num_pages = kv_cache["total_num_pages"]
+
+    # Split K/V from paged format
+    k_paged_ref, v_paged_ref = split_kv_pages(kv_data)  # BF16 for BF16 kernel
+
+    # Quantize Q with per-tensor scale
+    q_fp8, q_descale = per_tensor_quant(q, quant_dtype=quant_dtype)
+
+    cu_seqlens_q = convert_lens_to_indptr(qo_lens).cuda()
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+
+    # Build FP32 reference output (same as pertensor test)
+    o_ref = build_reference_output(
+        q,
+        q_indptr_cpu,
+        kv_data_fp32,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len_cpu,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        causal,
+        logits_soft_cap,
+    )
+
+    # Quantize K/V with per-page scale
+    # k_paged_ref is [num_pages, page_size, num_kv_heads, head_dim]
+    k_paged_fp8, k_descales = per_page_quant(k_paged_ref, page_size, quant_dtype)
+    v_paged_fp8, v_descales = per_page_quant(v_paged_ref, page_size, quant_dtype)
+
+    # Build kv_block_descale: [num_pages, num_kv_heads, 2]
+    kv_block_descale = torch.stack([k_descales, v_descales], dim=-1)
+
+    # Apply KV layout for FP8 tensors
+    if kvcache_layout == "vectorized":
+        k_for_vec = k_paged_fp8.view(-1, num_kv_heads, head_dim)
+        v_for_vec = v_paged_fp8.view(-1, num_kv_heads, head_dim)
+        k_paged, v_paged = vectorize_kv_cache(
+            k_for_vec,
+            v_for_vec,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+        )
+    else:
+        # Linear layout: [num_pages, page_size, num_kv_heads, head_dim]
+        k_paged = k_paged_fp8
+        v_paged = v_paged_fp8
+
+    # Apply KV layout for BF16 reference tensors (for BF16 kernel run)
+    k_vector_size_bf16 = get_vector_size(dtype)
+    if kvcache_layout == "vectorized":
+        k_for_vec_bf16 = k_paged_ref.view(-1, num_kv_heads, head_dim)
+        v_for_vec_bf16 = v_paged_ref.view(-1, num_kv_heads, head_dim)
+        k_cache_bf16, v_cache_bf16 = vectorize_kv_cache(
+            k_for_vec_bf16,
+            v_for_vec_bf16,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size_bf16,
+        )
+    else:
+        # Linear layout: [num_pages, page_size, num_kv_heads, head_dim]
+        k_cache_bf16 = k_paged_ref
+        v_cache_bf16 = v_paged_ref
+
+    # Build block table
+    max_num_pages_per_seq = (max_kv_len + page_size - 1) // page_size
+    block_table_cpu = torch.zeros(
+        (batch_size, max_num_pages_per_seq), dtype=torch.int32
+    )
+    for i in range(batch_size):
+        start, end = kv_indptr[i].item(), kv_indptr[i + 1].item()
+        block_table_cpu[i, : (end - start)] = kv_indices[start:end]
+    block_table_gpu = block_table_cpu.cuda()
+
+    kv_last_page_len_gpu = ((kv_lens - 1) % page_size + 1).int().cuda()
+    seqlen_k_gpu = kv_lens.cuda().int()
+
+    # Run kernel with KV_BLOCKSCALE using run_ck
+    profile_result = {"status": "passed"}
+    run_result = run_ck(
+        batch_size,
+        num_kv_heads,
+        q_fp8,
+        k_paged,
+        v_paged,
+        cu_seqlens_q,
+        kv_indptr.cuda(),
+        kv_indices.cuda(),
+        max_qo_len,
+        max_kv_len,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        q_descale=q_descale,
+        kv_block_descale=kv_block_descale,
+        kv_last_page_lens=kv_last_page_len_gpu,
+        block_table=block_table_gpu,
+        seqlen_k=seqlen_k_gpu,
+        profile=profile,
+    )
+    if profile:
+        out_fp8, time_us, tflops = run_result
+        profile_result = {"status": "passed", "time_us": time_us, "tflops": tflops}
+    else:
+        out_fp8 = run_result
+
+    # Run BF16 reference kernel (no quantization) - no profiling for reference
+    out_bf16 = run_ck(
+        batch_size,
+        num_kv_heads,
+        q.cuda(),
+        k_cache_bf16.cuda(),
+        v_cache_bf16.cuda(),
+        cu_seqlens_q,
+        kv_indptr.cuda(),
+        kv_indices.cuda(),
+        max_qo_len,
+        max_kv_len,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        kv_last_page_lens=kv_last_page_len_gpu,
+        block_table=block_table_gpu,
+        seqlen_k=seqlen_k_gpu,
+        profile=False,
+    )
+
+    # Sanity checks
+    assert out_fp8.abs().max().item() > 1e-6, "FP8 kernel output is all zeros!"
+    assert out_bf16.abs().max().item() > 1e-6, "BF16 kernel output is all zeros!"
+    assert o_ref.abs().max().item() > 1e-6, "FP32 reference output is all zeros!"
+
+    # Compare FP8 kernel vs FP32 reference (same as pertensor test)
+    verify_fp8_output(out_fp8, o_ref)
+
+    # Compare BF16 kernel vs FP32 reference (same as pertensor test)
+    rtol, atol = get_tolerances(dtype, is_fp8=False)
+    torch.testing.assert_close(out_bf16, o_ref, rtol=rtol, atol=atol)
+
+    return profile_result
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1381,13 +1801,26 @@ parser.add_argument(
 )
 parser.add_argument(
     "--input_dtype",
-    type=dtypes.str2Dtype,
+    type=str,
     const=None,
-    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-    default="bf16, fp8",
+    choices=["fp16", "bf16", "fp8"],
+    default=["bf16", "fp8"],
     nargs="*",
     help="""input dtype.
-    e.g.: -o bf16""",
+    e.g.: --input_dtype bf16 fp8""",
+)
+parser.add_argument(
+    "--quant_method",
+    type=str,
+    const=None,
+    choices=["none", "pertensor", "kv_blockscale"],
+    default=["none", "pertensor", "kv_blockscale"],
+    nargs="*",
+    help="""quantization method.
+    none: no quantization (for fp16/bf16)
+    pertensor: per-tensor Q/K/V descale (for fp8)
+    kv_blockscale: per-tensor Q, per-page K/V descale (for fp8)
+    e.g.: --quant_method pertensor kv_blockscale""",
 )
 parser.add_argument(
     "--profile",
@@ -1408,6 +1841,7 @@ if __name__ == "__main__":
         lookup_table,
         kv_layout,
         input_dtype,
+        quant_method,
         contiguous_kv,
     ) in itertools.product(
         args.pagesize,
@@ -1417,30 +1851,63 @@ if __name__ == "__main__":
         args.lookup_table,
         args.kv_layout,
         args.input_dtype,
+        args.quant_method,
         [True, False],  # contiguous_kv
     ):
-        result = test_batch_prefill(
-            kvcache_layout=kv_layout,
-            table_layout=lookup_table,
-            input_dtype=input_dtype,
-            batch_size=1,
-            qo_len=args.seqlen,
-            kv_len=args.seqlen,
-            page_size=page_size,
-            num_qo_heads=args.headq,
-            num_kv_heads=args.headk,
-            head_dim=128,
-            causal=causal,
-            logits_soft_cap=logits_soft_cap,
-            dtype=dtype,
-            q_init_min=-10,
-            q_init_max=10,
-            kv_init_min=-5,
-            kv_init_max=5,
-            contiguous_kv=contiguous_kv,
-            seed=19378,
-            profile=args.profile,
-        )
+        # Validate quant_method and input_dtype combinations:
+        # - fp16/bf16 must use quant_method="none"
+        # - fp8 must use quant_method="pertensor" or "kv_blockscale"
+        if input_dtype != "fp8" and quant_method != "none":
+            continue
+        if input_dtype == "fp8" and quant_method == "none":
+            continue
+
+        # Convert string input_dtype to torch dtype
+        input_dtype_torch = dtypes.str2Dtype(input_dtype)
+
+        # Choose test function based on input_dtype and quant_method
+        if input_dtype == "fp8" and quant_method == "kv_blockscale":
+            # KV_BLOCKSCALE: per-page K/V descale
+            result = run_batch_prefill_kv_blockscale(
+                kvcache_layout=kv_layout,
+                table_layout=lookup_table,
+                batch_size=1,
+                qo_len=args.seqlen,
+                kv_len=args.seqlen,
+                page_size=page_size,
+                num_qo_heads=args.headq,
+                num_kv_heads=args.headk,
+                head_dim=128,
+                causal=causal,
+                logits_soft_cap=logits_soft_cap,
+                dtype=dtype,
+                contiguous_kv=contiguous_kv,
+                seed=19378,
+                profile=args.profile,
+            )
+        else:
+            result = test_batch_prefill(
+                kvcache_layout=kv_layout,
+                table_layout=lookup_table,
+                input_dtype=input_dtype_torch,
+                batch_size=1,
+                qo_len=args.seqlen,
+                kv_len=args.seqlen,
+                page_size=page_size,
+                num_qo_heads=args.headq,
+                num_kv_heads=args.headk,
+                head_dim=128,
+                causal=causal,
+                logits_soft_cap=logits_soft_cap,
+                dtype=dtype,
+                q_init_min=-10,
+                q_init_max=10,
+                kv_init_min=-5,
+                kv_init_max=5,
+                contiguous_kv=contiguous_kv,
+                seed=19378,
+                profile=args.profile,
+            )
 
         # Build result row
         time_us = result.get("time_us") if result else None
@@ -1451,7 +1918,8 @@ if __name__ == "__main__":
             "h_q": args.headq,
             "h_kv": args.headk,
             "hdim": 128,
-            "input_dtype": str(input_dtype).split(".")[-1],
+            "input_dtype": input_dtype,
+            "quant_method": quant_method if input_dtype == "fp8" else "-",
             "kv_layout": kv_layout,
             "table": lookup_table,
             "causal": causal,
