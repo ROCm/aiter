@@ -338,7 +338,7 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=512,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
     )
     if unsqueeze:
