@@ -8,11 +8,12 @@ from itertools import product
 from typing import Iterable, Literal, Optional, Self, get_args
 
 
-def disable_aiter_logs() -> None:
-    logging.getLogger("aiter").disabled = True
+def disable_logs(logger: str) -> None:
+    logging.getLogger(logger).disabled = True
+    logging.getLogger(logger).setLevel(logging.CRITICAL + 1)
 
 
-disable_aiter_logs()
+disable_logs("aiter")
 from bench_mha import main as bench_mha_main  # noqa: E402
 
 Flavor = Literal["mha", "gqa", "mla"]
@@ -240,14 +241,18 @@ def get_bench_args(
 
 
 def main() -> None:
+    disable_logs("matplotlib")
     logging.basicConfig(level=logging.DEBUG)
+
     logging.info("Benchmarking attention configurations...")
-    for ba in get_bench_args():
+
+    for ba in get_bench_args(kernels=("fwd",)):
         ms = run_bench_mha(ba)
-        if ms is not None:
+        if ms is None:
             logging.info("%s => error!", ba)
         else:
             logging.info("%s => %.3f ms", ba, ms)
+
     logging.info("DONE.")
 
 
