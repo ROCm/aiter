@@ -1,9 +1,11 @@
-from contextlib import redirect_stdout, redirect_stderr
-from dataclasses import dataclass, field
+import copy
 import io
 import logging
 import shlex
-from typing import Literal, Optional
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass, field
+from itertools import product
+from typing import Literal, Optional, Self
 
 
 def disable_aiter_logs() -> None:
@@ -12,7 +14,6 @@ def disable_aiter_logs() -> None:
 
 disable_aiter_logs()
 from bench_mha import main as bench_mha_main  # noqa: E402
-
 
 Flavor = Literal["mha", "gqa", "mla"]
 
@@ -27,6 +28,7 @@ class Model:
     flavor: Flavor = field(init=False)
 
     def __post_init__(self) -> None:
+        assert self.name, "Model name must be non-empty."
         assert self.hq > 0, "Number of query heads must be positive."
         assert self.hkv > 0, "Number of key and value heads must be positive."
         assert self.dqk > 0, "Dimension of query and key heads must be positive."
@@ -42,6 +44,42 @@ class Model:
         else:
             assert False, "Unable to deduce attention flavor from heads configuration."
         self.flavor = flavor
+
+    @classmethod
+    def new(cls, name: str) -> "ModelBuilder":
+        return ModelBuilder(name)
+
+
+class ModelBuilder:
+    name: str
+    hq: int
+    hkv: int
+    dqk: int
+    dv: int
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def h(self, h: int) -> Self:
+        self.hq = self.hkv = h
+        return self
+
+    def h_q_vk(self, hq: int, hkv: int) -> Self:
+        self.hq = hq
+        self.hkv = hkv
+        return self
+
+    def d(self, d: int) -> Self:
+        self.dqk = self.dv = d
+        return self
+
+    def d_qk_v(self, dqk: int, dv: int) -> Self:
+        self.dqk = dqk
+        self.dv = dv
+        return self
+
+    def build(self) -> Model:
+        return Model(name=self.name, hq=self.hq, hkv=self.hkv, dqk=self.dqk, dv=self.dv)
 
 
 @dataclass(kw_only=True)
@@ -161,15 +199,35 @@ def run_bench_mha(args: BenchArgs) -> Optional[float]:
     return get_bench_result(args, out.getvalue(), err.getvalue())
 
 
+def get_models() -> list[Model]:
+    return [
+        Model.new("Llama3 405B").h_q_vk(128, 8).d(128).build(),
+        Model.new("Llama3 70B").h_q_vk(64, 8).d(128).build(),
+        Model.new("Llama3 8B").h_q_vk(32, 8).d(128).build(),
+        Model.new("Llama 4 Maverick (Text)").h_q_vk(40, 8).d(128).build(),
+        Model.new("Llama 4 Maverick (Vision)").h(16).d(88).build(),
+        Model.new("Qwen-235B-A22B").h_q_vk(64, 4).d(128).build(),
+        Model.new("GPT-OSS 120B").h_q_vk(64, 8).d(64).build(),
+        Model.new("DeepSeek R1").h(128).d_qk_v(192, 128).build(),
+    ]
+
+
+def get_tp_models(
+    models: list[Model] = get_models(), tps: list[int] = [1, 2, 4, 8]
+) -> list[TpModel]:
+    return [
+        TpModel(model=copy.copy(model), tp=tp) for model, tp in product(models, tps)
+    ]
+
+
 def main() -> None:
-    m = Model(name="Llama3 405B", hq=128, hkv=8, dqk=128, dv=128)
-    tpm = TpModel(model=m, tp=8)
-    ba = BenchArgs(kernel="fwd", layout="thd", tp_model=tpm, b=1, s=1024)
-    result = run_bench_mha(ba)
-    if not result:
-        print("Unable to run benchmark.")
-    else:
-        print(f"Performance: {result:.3f} ms")
+    for model in get_tp_models():
+        ba = BenchArgs(kernel="fwd", layout="thd", tp_model=model, b=1, s=1024)
+        result = run_bench_mha(ba)
+        if not result:
+            print("Unable to run benchmark.")
+        else:
+            print(f"Performance: {str(model)} => {result:.3f} ms")
 
 
 if __name__ == "__main__":
