@@ -25,9 +25,16 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
-    name: sglang integration
+    name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
-    runs-on: aiter-1gpu-runner
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: aiter-1gpu-runner
+            label: MI325
+
     env:
       SGL_BRANCH: v0.5.6
       GPU_ARCH: gfx942

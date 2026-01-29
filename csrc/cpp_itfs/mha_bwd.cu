@@ -236,8 +236,12 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
-    std::string arch_id = get_gpu_arch();
+    if(a.nhead_stride_dq_acc < a.stride_dq_acc)
+    {
+        return -1;  // dq_acc only support BHSD layout
+    }
 
+    std::string arch_id = get_gpu_arch();
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
        (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950")))
