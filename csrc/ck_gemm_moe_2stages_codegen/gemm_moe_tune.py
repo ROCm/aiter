@@ -154,6 +154,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             q_type,
             act_type,
+            dst_type = dtype,
         )
         if q_type == QuantType.per_1x128:
             quant_func = aiter.get_hip_quant(q_type)

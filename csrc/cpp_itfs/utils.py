@@ -88,9 +88,17 @@ def mp_lock(
     main_func: callable,
     final_func: callable = None,
     wait_func: callable = None,
+    timeout: float = None,
 ):
     """
     Using FileBaton for multiprocessing.
+    
+    Args:
+        lock_path: Path to the lock file
+        main_func: Function to execute while holding the lock
+        final_func: Optional function to execute before releasing the lock
+        wait_func: Optional function to execute after waiting for the lock
+        timeout: Optional timeout in seconds for waiting (None = use default from FileBaton)
     """
     from aiter.jit.utils.file_baton import FileBaton
 
@@ -103,7 +111,7 @@ def mp_lock(
                 final_func()
             baton.release()
     else:
-        baton.wait()
+        baton.wait(timeout=timeout)
         if wait_func is not None:
             ret = wait_func()
         ret = None

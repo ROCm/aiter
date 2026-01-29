@@ -3,10 +3,48 @@
 import torch
 import multiprocessing as mp
 import time
+import os
+import glob
 from multiprocessing import TimeoutError as MPTimeoutError
 from aiter.test_common import checkAllclose
 from aiter import dtypes
 from aiter import logger
+
+
+def get_existing_core_files(directory=None):
+    """Get set of existing core dump files in directory (default: cwd)."""
+    if directory is None:
+        directory = os.getcwd()
+    patterns = [
+        os.path.join(directory, "core.*"),
+        os.path.join(directory, "core"),
+        os.path.join(directory, "*.core"),
+        os.path.join(directory, "gpucore.*"),  # AMD GPU core dumps
+    ]
+    existing = set()
+    for pattern in patterns:
+        existing.update(glob.glob(pattern))
+    return existing
+
+
+def detect_new_core_dumps(baseline_cores, directory=None):
+    """Check if new core dump files appeared since baseline was captured."""
+    current_cores = get_existing_core_files(directory)
+    new_cores = current_cores - baseline_cores
+    return new_cores
+
+
+def cleanup_core_dumps(core_files):
+    """Delete core dump files to free disk space."""
+    deleted = 0
+    for f in core_files:
+        try:
+            os.remove(f)
+            deleted += 1
+        except Exception as e:
+            print(f"Warning: Could not delete {f}: {e}")
+    if deleted > 0:
+        print(f"[!] Cleaned up {deleted} core dump files")
 
 
 def worker(
@@ -358,7 +396,13 @@ def mp_tuner(
     # Create initial pool and submit all tasks
     pool = mp.Pool(processes=parallel_num)
     pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
-    gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
+    try:
+        gpu_map = {el.get(timeout=30): i + start_idx for i, el in enumerate(pids)}
+    except MPTimeoutError:
+        print("[!] Timeout getting worker PIDs - GPUs may be in bad state")
+        pool.terminate()
+        pool.join()
+        raise RuntimeError("Failed to initialize worker pool - GPU reset may be needed")
     rets_dict = submit_tasks(pool, gpu_map, range(len(task_group)))
     # Convert to list for compatibility with existing code
     rets = [rets_dict[k] for k in range(len(task_group))]
@@ -370,7 +414,14 @@ def mp_tuner(
 
     # Track start time for each task
     task_start_times = {k: time.time() for k, _ in remaining_tasks}
-    check_interval = 10  # Check every 10 seconds for responsive polling
+    check_interval = 2  # Check every 2 seconds for fast crash detection (was 10)
+
+    # Track retry count per task to avoid infinite loops on consistently crashing kernels
+    task_retry_count = {k: 0 for k, _ in remaining_tasks}
+    max_retries = 2  # Mark as failed after this many crashes
+
+    # Capture baseline core dump files to detect new ones
+    baseline_cores = get_existing_core_files()
 
     timeout_msg = (
         f"timeout={timeout}s each" if timeout is not None else "no timeout limit"
@@ -402,81 +453,154 @@ def mp_tuner(
         dummy_failed_tasks = []
         timeout_count_this_round = 0  # Track timeouts in this round
 
-        for k, async_result in remaining_tasks:
-            try:
-                # Calculate appropriate timeout based on task's remaining time
-                if timeout is not None:
+        # Check for new core dumps - if detected, trigger immediate pool restart
+        new_cores = detect_new_core_dumps(baseline_cores)
+        if new_cores:
+            num_core_dumps = len(new_cores)
+            print(f"\n[!] GPU core dump detected ({num_core_dumps} files): {new_cores}")
+            print("[!] Checking task status before pool restart...")
+            baseline_cores.update(new_cores)  # Update baseline so we don't detect same files again
+            cleanup_core_dumps(new_cores)  # Clean up to save disk space
+            pool_restart_needed = True
+            
+            # Try to salvage results from tasks that completed successfully before the crash
+            successful_count = 0
+            crashed_count = 0
+            pending_tasks_to_rerun = []
+            exceeded_retry_count = 0
+            
+            for k, async_result in remaining_tasks:
+                if k not in result_dict:
+                    if async_result.ready():
+                        # Task finished - try to get result (might be success or crash)
+                        try:
+                            task_result = async_result.get(timeout=0.1)
+                            # Success! Save the result
+                            result_dict[k] = task_result
+                            completed_this_round.append((k, async_result))
+                            successful_count += 1
+                        except Exception as e:
+                            # Task crashed - mark as failed
+                            dummy_results = []
+                            add_dummy_result(k, dummy_results)
+                            result_dict[k] = dummy_results if shape_grouped else [dummy_results[0]]
+                            failed_tasks.append((k, "gpu_crash"))
+                            completed_this_round.append((k, async_result))
+                            crashed_count += 1
+                    else:
+                        # Task was running but not finished - check retry count
+                        task_retry_count[k] = task_retry_count.get(k, 0) + 1
+                        if task_retry_count[k] >= max_retries:
+                            # Too many retries - mark as permanently failed
+                            dummy_results = []
+                            add_dummy_result(k, dummy_results)
+                            result_dict[k] = dummy_results if shape_grouped else [dummy_results[0]]
+                            failed_tasks.append((k, "gpu_crash_max_retries"))
+                            completed_this_round.append((k, async_result))
+                            exceeded_retry_count += 1
+                        else:
+                            # Will retry
+                            pending_tasks_to_rerun.append(k)
+            
+            # Remove completed/crashed tasks from remaining
+            for item in completed_this_round:
+                if item in remaining_tasks:
+                    remaining_tasks.remove(item)
+            
+            print(f"[!] Results: {successful_count} completed OK, {crashed_count} crashed, {exceeded_retry_count} exceeded max retries")
+            print(f"[!] Tasks to rerun after pool restart: {len(pending_tasks_to_rerun)}")
+            
+            # OPTIMIZATION: If # core dumps >= # pending tasks, all pending tasks crashed
+            # No need for isolation mode - just mark them all as failed
+            if num_core_dumps >= len(pending_tasks_to_rerun) and len(pending_tasks_to_rerun) > 0:
+                print(f"[!] {num_core_dumps} core dumps >= {len(pending_tasks_to_rerun)} pending tasks")
+                print(f"[!] All pending tasks crashed - skipping isolation mode, marking all as FAILED")
+                for task_idx in pending_tasks_to_rerun:
+                    dummy_results = []
+                    add_dummy_result(task_idx, dummy_results)
+                    result_dict[task_idx] = dummy_results if shape_grouped else [dummy_results[0]]
+                    failed_tasks.append((task_idx, "gpu_crash_all_pending"))
+                # Clear remaining tasks since we've handled them all
+                remaining_tasks = [(k, ar) for k, ar in remaining_tasks if k not in pending_tasks_to_rerun]
+                pool_restart_needed = False  # No need to restart, we're done with these
+            # Skip the normal polling loop and go to pool restart
+        else:
+            # Normal polling loop - only runs if no core dump detected
+            for k, async_result in remaining_tasks:
+                try:
+                    # Calculate appropriate timeout based on task's remaining time
+                    if timeout is not None:
+                        elapsed = time.time() - task_start_times[k]
+                        remaining_time = timeout - elapsed
+                        # Use the smaller of check_interval and remaining_time, but at least 1 second
+                        actual_timeout = max(1, min(check_interval, remaining_time))
+                    else:
+                        # No timeout set, use default check_interval
+                        actual_timeout = check_interval
+
+                    # Non-blocking check with dynamic timeout
+                    task_result = async_result.get(timeout=actual_timeout)
+
+                    # Task completed successfully
+                    result_dict[k] = task_result
+                    completed_this_round.append((k, async_result))
                     elapsed = time.time() - task_start_times[k]
-                    remaining_time = timeout - elapsed
-                    # Use the smaller of check_interval and remaining_time, but at least 1 second
-                    actual_timeout = max(1, min(check_interval, remaining_time))
-                else:
-                    # No timeout set, use default check_interval
-                    actual_timeout = check_interval
-
-                # Non-blocking check with dynamic timeout
-                task_result = async_result.get(timeout=actual_timeout)
-
-                # Task completed successfully
-                result_dict[k] = task_result
-                completed_this_round.append((k, async_result))
-                elapsed = time.time() - task_start_times[k]
-                if verbose:
-                    print(
-                        f"[Done] Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
-                    )
-
-            except MPTimeoutError:
-                # Check if this specific task has exceeded its timeout (only if timeout is set)
-                if timeout is not None:
-                    elapsed = time.time() - task_start_times[k]
-
-                    if elapsed > timeout:
-                        timeout_count_this_round += 1
-
-                        error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
-                        print(error_msg)
-                        failed_tasks.append((k, "timeout"))
-
-                        # Add dummy result
-                        dummy_results = []
-                        add_dummy_result(k, dummy_results)
-                        result_dict[k] = (
-                            dummy_results if shape_grouped else [dummy_results[0]]
+                    if verbose:
+                        print(
+                            f"[Done] Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
                         )
+
+                except MPTimeoutError:
+                    # Check if this specific task has exceeded its timeout (only if timeout is set)
+                    if timeout is not None:
+                        elapsed = time.time() - task_start_times[k]
+
+                        if elapsed > timeout:
+                            timeout_count_this_round += 1
+
+                            error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
+                            print(error_msg)
+                            failed_tasks.append((k, "timeout"))
+
+                            # Add dummy result
+                            dummy_results = []
+                            add_dummy_result(k, dummy_results)
+                            result_dict[k] = (
+                                dummy_results if shape_grouped else [dummy_results[0]]
+                            )
+                            completed_this_round.append((k, async_result))
+
+                            # Trigger pool restart for timeout (similar to crash)
+                            pool_restart_needed = True
+
+                            # If mp_num tasks timed out, all GPUs are likely stuck - restart immediately
+                            if timeout_count_this_round >= mp_num:
+                                print(
+                                    f"\n[!] {timeout_count_this_round} tasks timed out (all {mp_num} GPUs likely stuck)"
+                                )
+                                print("[!] Triggering immediate pool restart...\n")
+                                break
+
+                except Exception as e:
+                    # Check if it's a process crash (segfault, memory fault, etc.)
+                    error_type = type(e).__name__
+
+                    # Special handling for KeyError (PID mapping issue)
+                    is_mapping_error = error_type == "KeyError"
+
+                    if is_mapping_error:
+                        error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
+                        dummy_failed_tasks.append((k, "mapping error"))
+                        # pool_restart_needed = True
+                    else:
+                        error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
+                        failed_tasks.append((k, "timeout"))
                         completed_this_round.append((k, async_result))
 
-                        # Trigger pool restart for timeout (similar to crash)
-                        pool_restart_needed = True
-
-                        # If mp_num tasks timed out, all GPUs are likely stuck - restart immediately
-                        if timeout_count_this_round >= mp_num:
-                            print(
-                                f"\n[!] {timeout_count_this_round} tasks timed out (all {mp_num} GPUs likely stuck)"
-                            )
-                            print("[!] Triggering immediate pool restart...\n")
-                            break
-
-            except Exception as e:
-                # Check if it's a process crash (segfault, memory fault, etc.)
-                error_type = type(e).__name__
-
-                # Special handling for KeyError (PID mapping issue)
-                is_mapping_error = error_type == "KeyError"
-
-                if is_mapping_error:
-                    error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
-                    dummy_failed_tasks.append((k, "mapping error"))
-                    # pool_restart_needed = True
-                else:
-                    error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
-                    failed_tasks.append((k, "timeout"))
-                    completed_this_round.append((k, async_result))
-
-                # Only log error once per error type
-                if error_type not in logged_error_types:
-                    logger.error(error_msg)
-                    logged_error_types.add(error_type)
+                    # Only log error once per error type
+                    if error_type not in logged_error_types:
+                        logger.error(error_msg)
+                        logged_error_types.add(error_type)
 
         #
         # Remove completed tasks from remaining list
@@ -485,41 +609,167 @@ def mp_tuner(
 
         # If pool restart needed due to crash, restart pool and resubmit remaining tasks
         if pool_restart_needed and remaining_tasks:
-            if verbose:
-                print(f"\n{'='*60}")
-                print("? Pool restart needed due to crash. Restarting pool...")
-                print(f"Remaining tasks: {len(remaining_tasks)}")
-                print(f"{'='*60}\n")
-
-            # Terminate old pool
+            remaining_task_indices = [k for k, _ in remaining_tasks]
+            
+            # Terminate old pool first
             try:
                 pool.terminate()
                 pool.join()
             except Exception as e:
                 print(f"Warning: Error during pool termination: {e}")
-            # Create new pool
-            pool = mp.Pool(processes=parallel_num)
+            
+            # CRASH ISOLATION: If we crashed with multiple GPUs, fall back to single-GPU
+            # serial execution to identify exactly which task is crashing
+            if parallel_num > 1 and len(remaining_task_indices) > 0:
+                print(f"\n{'='*60}")
+                print(f"[!] GPU crash detected with {parallel_num} parallel tasks")
+                print("[!] Falling back to SINGLE-GPU serial execution to isolate faulty kernel...")
+                print(f"[!] Will run {len(remaining_task_indices)} tasks one at a time")
+                print(f"{'='*60}\n")
+                
+                # Use shorter timeout for isolation mode since we expect crashes to be fast
+                isolation_timeout = min(timeout, 60) if timeout else 60
+                
+                # Create single-GPU pool
+                pool = mp.Pool(processes=1)
+                pids = [pool.apply_async(get_pid)]
+                try:
+                    gpu_map = {pids[0].get(timeout=30): start_idx}
+                except MPTimeoutError:
+                    print("[!] Timeout getting worker PID - GPU may need reset")
+                    pool.terminate()
+                    pool.join()
+                    raise RuntimeError("Failed to create isolation pool - GPU reset may be needed")
+                
+                # Run tasks ONE BY ONE to isolate crashes
+                for task_idx in remaining_task_indices:
+                    # Check for existing core dumps before this task
+                    pre_task_cores = get_existing_core_files()
+                    
+                    # Submit single task
+                    async_result = pool.apply_async(
+                        work_group,
+                        args=(
+                            gpu_map,
+                            fast_mode,
+                            err_ratio,
+                            in_datas[ref_data_index[task_idx]],
+                            task_group[task_idx],
+                            verbose,
+                        ),
+                    )
+                    
+                    task_start = time.time()
+                    task_crashed = False
+                    
+                    # Wait for this single task with timeout
+                    # Poll every 1 second for fast crash detection
+                    while True:
+                        try:
+                            task_result = async_result.get(timeout=1)  # Check every 1s for fast crash detection
+                            # Success!
+                            result_dict[task_idx] = task_result
+                            elapsed = time.time() - task_start
+                            print(f"  [OK] Task {task_idx} completed in {elapsed:.1f}s")
+                            break
+                        except MPTimeoutError:
+                            elapsed = time.time() - task_start
+                            # Check for new core dumps
+                            new_cores = detect_new_core_dumps(pre_task_cores)
+                            if new_cores:
+                                print(f"  [CRASH] Task {task_idx} caused GPU crash (core dump detected after {elapsed:.1f}s)")
+                                cleanup_core_dumps(new_cores)
+                                task_crashed = True
+                                break
+                            # Check timeout
+                            if elapsed > isolation_timeout:
+                                print(f"  [TIMEOUT] Task {task_idx} timed out after {elapsed:.1f}s")
+                                task_crashed = True
+                                break
+                        except Exception as e:
+                            print(f"  [ERROR] Task {task_idx} failed: {e}")
+                            task_crashed = True
+                            break
+                    
+                    if task_crashed:
+                        # Mark as failed and record dummy result
+                        dummy_results = []
+                        add_dummy_result(task_idx, dummy_results)
+                        result_dict[task_idx] = dummy_results if shape_grouped else [dummy_results[0]]
+                        failed_tasks.append((task_idx, "gpu_crash_isolated"))
+                        
+                        # Restart the single-GPU pool for next task
+                        try:
+                            pool.terminate()
+                            pool.join()
+                        except:
+                            pass
+                        pool = mp.Pool(processes=1)
+                        pids = [pool.apply_async(get_pid)]
+                        try:
+                            gpu_map = {pids[0].get(timeout=30): start_idx}
+                        except MPTimeoutError:
+                            print("[!] Failed to restart isolation pool - stopping isolation")
+                            break
+                
+                # Done with isolation mode - all remaining tasks processed
+                remaining_tasks = []
+                pool_restart_needed = False
+                
+                # Clean up isolation pool
+                try:
+                    pool.terminate()
+                    pool.join()
+                except:
+                    pass
+                
+                # Restore parallel pool for any future use (though we should be done)
+                pool = mp.Pool(processes=parallel_num)
+                pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
+                try:
+                    gpu_map = {el.get(timeout=30): i + start_idx for i, el in enumerate(pids)}
+                except:
+                    pass
+                pool.close()
+                
+                print(f"\n[!] Isolation complete. Processed all {len(remaining_task_indices)} tasks.\n")
+                
+            else:
+                # Already in single-GPU mode or no remaining tasks
+                if verbose:
+                    print(f"\n{'='*60}")
+                    print("? Pool restart needed due to crash. Restarting pool...")
+                    print(f"Remaining tasks: {len(remaining_tasks)}")
+                    print(f"{'='*60}\n")
 
-            # Recreate gpu_map for new processes (new PIDs)
-            pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
-            gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
+                # Create new pool
+                pool = mp.Pool(processes=parallel_num)
 
-            # Resubmit remaining tasks
-            remaining_task_indices = [k for k, _ in remaining_tasks]
-            new_rets_dict = submit_tasks(pool, gpu_map, remaining_task_indices)
-            pool.close()
+                # Recreate gpu_map for new processes (new PIDs)
+                pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
+                try:
+                    gpu_map = {el.get(timeout=30): i + start_idx for i, el in enumerate(pids)}
+                except MPTimeoutError:
+                    print("[!] Timeout getting worker PIDs after restart - GPUs may need reset")
+                    pool.terminate()
+                    pool.join()
+                    raise RuntimeError("Failed to restart worker pool - GPU reset may be needed")
 
-            # Update remaining_tasks with new async results
-            remaining_tasks = [(k, new_rets_dict[k]) for k in remaining_task_indices]
-            # Reset start times for resubmitted tasks
-            for k in remaining_task_indices:
-                task_start_times[k] = time.time()
+                # Resubmit remaining tasks
+                new_rets_dict = submit_tasks(pool, gpu_map, remaining_task_indices)
+                pool.close()
 
-            # Reset pool restart flag
-            pool_restart_needed = False
-            print(
-                f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n"
-            )
+                # Update remaining_tasks with new async results
+                remaining_tasks = [(k, new_rets_dict[k]) for k in remaining_task_indices]
+                # Reset start times for resubmitted tasks
+                for k in remaining_task_indices:
+                    task_start_times[k] = time.time()
+
+                # Reset pool restart flag
+                pool_restart_needed = False
+                print(
+                    f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n"
+                )
 
         # Small sleep to avoid busy waiting
         if remaining_tasks:
@@ -544,15 +794,23 @@ def mp_tuner(
     # Print summary
     if failed_tasks:
         timeout_count = sum(1 for _, reason in failed_tasks if reason == "timeout")
-        crash_count = len(failed_tasks) - timeout_count
+        gpu_crash_count = sum(1 for _, reason in failed_tasks if reason == "gpu_crash")
+        max_retry_count = sum(1 for _, reason in failed_tasks if reason == "gpu_crash_max_retries")
+        isolated_crash_count = sum(1 for _, reason in failed_tasks if reason == "gpu_crash_isolated")
+        all_pending_crash_count = sum(1 for _, reason in failed_tasks if reason == "gpu_crash_all_pending")
+        other_crash_count = len(failed_tasks) - timeout_count - gpu_crash_count - max_retry_count - isolated_crash_count - all_pending_crash_count
         summary = (
             f"\n{'='*60}\n"
             f"Tuning Summary:\n"
             f"  Total tasks: {len(rets)}\n"
             f"  Successful: {len(rets) - len(failed_tasks)}\n"
             f"  Failed: {len(failed_tasks)}\n"
+            f"    - GPU crashes (all pending crashed): {all_pending_crash_count}\n"
+            f"    - GPU crashes (isolated via single-GPU): {isolated_crash_count}\n"
+            f"    - GPU crashes (core dump): {gpu_crash_count}\n"
+            f"    - GPU crashes (max retries exceeded): {max_retry_count}\n"
             f"    - Timeouts (GPU hang): {timeout_count}\n"
-            f"    - Crashes (memory fault): {crash_count}\n"
+            f"    - Other crashes: {other_crash_count}\n"
             f"{'='*60}"
         )
         logger.warning(summary)
