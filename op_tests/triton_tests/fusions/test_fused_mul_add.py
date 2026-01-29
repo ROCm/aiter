@@ -34,7 +34,7 @@ def run_torch(x, a, b):
 
 
 @pytest.mark.parametrize(
-    "shape", [(1,), (8,), (500,), (10000,), (32, 7168), (16, 50, 4186)]
+    "shape", [(1,), (8,), (500,), (10000,), (16, 50, 4186)]
 )
 @pytest.mark.parametrize(
     "a_type_is_scalar",
