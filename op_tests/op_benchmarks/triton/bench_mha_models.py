@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from itertools import product
 from typing import Iterable, Literal, Optional, Self, get_args
 
+import matplotlib.pyplot as plt
+
 
 def disable_logs(logger: str) -> None:
     logging.getLogger(logger).disabled = True
@@ -207,6 +209,8 @@ def run_bench_mha(args: BenchArgs) -> Optional[float]:
     err = io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         bench_mha_main(shlex.split(args.to_cli_str()))
+    # Close matplotlib figures to silence errors and avoid memory leaks.
+    plt.close("all")
     return get_bench_result(args, out.getvalue(), err.getvalue())
 
 
