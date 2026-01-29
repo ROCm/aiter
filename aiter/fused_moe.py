@@ -118,7 +118,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    use_flydsl=False,
+    use_flydsl=True,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -207,7 +207,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    use_flydsl: bool = False,
+    use_flydsl: bool = True,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -1002,7 +1002,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
-    use_flydsl: bool = False,
+    use_flydsl: bool = True,
 ):
     quant_func = get_quant(quant_type)
     token_num_quant_moe_sort_switch = 1024
@@ -1144,7 +1144,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
-            or metadata.ksplit > 1
+            or (metadata.ksplit > 1 and not _is_flydsl_available())
         )
     ):
         a2_scale = None
