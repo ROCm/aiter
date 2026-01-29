@@ -61,7 +61,7 @@ struct MlaMetadataV1KernelParameter
     int32_t qk_batch_ratio;
     int32_t num_splits;
     bool is_causal;
-    int32_t k_fixed_over_head_num_blocks;
+    int32_t fixed_over_head_num_blocks;
 };
 
 struct PaMetadataV1KernelParameter : MlaMetadataV1KernelParameter
