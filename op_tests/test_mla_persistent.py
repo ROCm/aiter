@@ -279,19 +279,30 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-    meta = aiter.get_mla_metadata_v1(
+    kv_granularity = (
+        (2**30)
+        if (
+            nhead == 32
+            and max_seqlen_qo == 4
+            and dtype == dtypes.fp8
+            and kvtype == dtypes.fp8
+        )
+        else max(page_size, 16)
+    )
+
+    aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
         nhead_kv,
-        True,
+        False,
         work_meta_data,
         work_info_set,
         work_indptr,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        kv_granularity=max(page_size, 16),
+        kv_granularity=kv_granularity,  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,
@@ -358,7 +369,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=False,
             q_scale=None,
             kv_scale=kv_scale,
         )
@@ -436,7 +447,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)]
+list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2), (32, 4)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
