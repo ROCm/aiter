@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import hip
-hip.hip.hipInit(0)
+
 from typing import Optional
 import torch
 import triton
@@ -59,7 +58,7 @@ def gemm_a8w8(
     w = w.T
 
     if y is None:
-        y = torch.empty((M, N), dtype=dtype)
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
         config, _ = _get_config(M, N, K)
@@ -67,12 +66,6 @@ def gemm_a8w8(
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    x = x.cuda()
-    w = w.cuda()
-    x_scale = x_scale.cuda()
-    w_scale = w_scale.cuda()
-    bias = bias.cuda()
-    y= y.cuda()
     _gemm_a8w8_kernel[grid](
         x,
         w,
@@ -94,4 +87,4 @@ def gemm_a8w8(
         **config,
     )
 
-    return y.cpu()
+    return y
