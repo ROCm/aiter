@@ -448,6 +448,7 @@ def smooth_per_token_scaled_quant(
     num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
     smooth_scale_map_hash: Optional[torch.Tensor] = None,
+    enable_ps: bool = False,
 ) -> None: ...
 
 

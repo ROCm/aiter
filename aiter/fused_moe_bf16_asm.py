@@ -204,6 +204,7 @@ def asm_moe(
                 fc1_smooth_scale,
                 topk_ids,
                 smooth_scale_map_hash=local_expert_hash,
+                enable_ps=True,
             )
             a8 = a8.view(-1, model_dim)
         else:

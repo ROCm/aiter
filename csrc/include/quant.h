@@ -39,7 +39,8 @@ void smooth_per_token_scaled_quant(
     bool shuffle_scale                                        = false,
     std::optional<torch::Tensor> const& num_rows              = std::nullopt,
     int num_rows_factor                                       = 1,
-    std::optional<torch::Tensor> const& smooth_scale_map_hash = std::nullopt);
+    std::optional<torch::Tensor> const& smooth_scale_map_hash = std::nullopt,
+    bool enable_ps                                            = false);
 
 void partial_transpose(torch::Tensor& out,         // [rows, d]
                        torch::Tensor const& input, // [rows, d]
