@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
 import aiter
@@ -180,7 +180,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
 
     def get_asm_gemm_i8_tasks(self, info_keys, useSplitK, kernel_id_start, seed=0):
         task = []
-        (cu_num, M, N, K, q_dtype_w) = info_keys
+        cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.i8:
             return task
         asm_kernel_list_csv = f"{get_asm_dir()}/i8gemm/i8gemm_bf16_perTokenI8.csv"
@@ -239,7 +239,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        (cu_num, M, N, K, q_dtype_w) = info_keys
+        cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
             print(
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
@@ -256,9 +256,9 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     M,
                     N,
                     K,
-                    kernel.MPerBLOCK,
-                    kernel.NPerBLOCK,
-                    kernel.KPerBLOCK,
+                    kernel.MTile,
+                    kernel.NTile,
+                    kernel.KTile,
                 )
                 if useSplitK
                 else 0
@@ -276,7 +276,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                             i,
                             splitK,
                         ),
-                        {},
+                        {
+                            "num_warmup": args.warmup,
+                            "num_iters": args.iters,
+                        },
                         run_torch,
                         (
                             ref_data_idx,
@@ -296,7 +299,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        (cu_num, M, N, K, q_dtype_w) = info_keys
+        cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
             print(
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
@@ -333,7 +336,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                             i,
                             splitK,
                         ),
-                        {},
+                        {
+                            "num_warmup": args.warmup,
+                            "num_iters": args.iters,
+                        },
                         run_torch,
                         (
                             ref_data_idx,
@@ -395,7 +401,16 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
 
         return ret
 
@@ -456,6 +471,7 @@ if __name__ == "__main__":
     tuner = GemmA8W8BpreShuffleTuner(
         "GemmA8W8BpreShuffleTuner",
         key=key,
+        resultList=resultList,
         description="gen API for gemm a8w8 bpreshuffle kernel",
     )
 

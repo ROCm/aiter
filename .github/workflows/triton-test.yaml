@@ -8,7 +8,9 @@ on:
     paths:
       - "aiter/ops/triton/**"
       - "op_tests/triton_tests/**"
+      - "op_tests/op_benchmarks/triton/**"
       - ".github/workflows/triton-test.yaml"
+      - ".github/scripts/select_triton_tests.py"
   workflow_dispatch:
 
 concurrency:
@@ -29,8 +31,15 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
-    runs-on: aiter-mi300-1gpu
+    name: Triton Tests (1 GPU)
+    runs-on: ${{ matrix.runner }}
     needs: [check-signal]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: aiter-1gpu-runner
+            label: MI325
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
@@ -39,6 +48,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          fetch-depth: 1
           submodules: 'recursive'
 
       - name: Clean up Rocm processes
@@ -98,12 +108,34 @@ jobs:
           triton_test \
           pip install pytest
 
+      # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
+      #       command to enable test selection.
+      - name: Triton Test Selection Script
+        # main branch should always run the full test suite.
+        if: ${{ github.ref != 'refs/heads/main' }}
+        run: |
+          set -ex
+          git fetch --no-tags origin --depth=1 \
+            "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
+          git fetch --no-tags origin --depth=1 \
+            "refs/heads/${{ github.event.pull_request.base.ref }}:target"
+          ENV_FILE=$(docker exec -w /workspace triton_test \
+            mktemp /workspace/github_env.XXXXXXXXXX.tmp)
+          docker exec -w /workspace triton_test \
+            git config --global --add safe.directory /workspace
+          docker exec -w /workspace triton_test \
+            python .github/scripts/select_triton_tests.py \
+              --source pr-merge --target target \
+              --env-var TRITON_TEST --env-file "${ENV_FILE}"
+          # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
+          docker exec -w /workspace triton_test rm "${ENV_FILE}"
+
       - name: Triton Tests
         run: |
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          docker exec -w /workspace triton_test pytest -v ${{ env.TRITON_TEST }} --junitxml=test-reports/triton.xml
+          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4

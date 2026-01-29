@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import os
 import logging
-
 
 logger = logging.getLogger("aiter")
 
@@ -12,7 +11,20 @@ logger = logging.getLogger("aiter")
 def getLogger():
     global logger
     if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
+        # Configure log level from environment variable
+        # Valid values: DEBUG, INFO (default), WARNING, ERROR
+        log_level_str = os.getenv("AITER_LOG_LEVEL", "INFO").upper()
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR"]
+
+        if log_level_str not in valid_levels:
+            print(
+                f"\033[93m[aiter] Warning: Invalid AITER_LOG_LEVEL '{log_level_str}', "
+                f"using 'INFO'. Valid values: {', '.join(valid_levels)}\033[0m"
+            )
+            log_level_str = "INFO"
+
+        log_level = getattr(logging, log_level_str)
+        logger.setLevel(log_level)
 
         console_handler = logging.StreamHandler()
         if int(os.environ.get("AITER_LOG_MORE", 0)):
@@ -25,7 +37,7 @@ def getLogger():
                 fmt="[%(name)s] %(message)s",
             )
         console_handler.setFormatter(formatter)
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(log_level)
 
         logger.addHandler(console_handler)
         if hasattr(torch._dynamo.config, "ignore_logger_methods"):
@@ -43,39 +55,51 @@ def getLogger():
 
 logger = getLogger()
 
-import importlib.util
+from .jit import core as core  # noqa: E402
+from .utility import dtypes as dtypes  # noqa: E402
+from .ops.enum import *  # noqa: F403,E402
+from .ops.norm import *  # noqa: F403,E402
+from .ops.quant import *  # noqa: F403,E402
+from .ops.gemm_op_a8w8 import *  # noqa: F403,E402
+from .ops.gemm_op_a16w16 import *  # noqa: F403,E402
+from .ops.gemm_op_a4w4 import *  # noqa: F403,E402
+from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
+from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
+from .ops.deepgemm import *  # noqa: F403,E402
+from .ops.aiter_operator import *  # noqa: F403,E402
+from .ops.activation import *  # noqa: F403,E402
+from .ops.attention import *  # noqa: F403,E402
+from .ops.custom import *  # noqa: F403,E402
+from .ops.custom_all_reduce import *  # noqa: F403,E402
+from .ops.quick_all_reduce import *  # noqa: F403,E402
+from .ops.moe_op import *  # noqa: F403,E402
+from .ops.moe_sorting import *  # noqa: F403,E402
+from .ops.pos_encoding import *  # noqa: F403,E402
+from .ops.cache import *  # noqa: F403,E402
+from .ops.rmsnorm import *  # noqa: F403,E402
+from .ops.communication import *  # noqa: F403,E402
+from .ops.rope import *  # noqa: F403,E402
+from .ops.topk import *  # noqa: F403,E402
+from .ops.topk_plain import topk_plain  # noqa: F403,F401,E402
+from .ops.mha import *  # noqa: F403,E402
+from .ops.gradlib import *  # noqa: F403,E402
+from .ops.trans_ragged_layout import *  # noqa: F403,E402
+from .ops.sample import *  # noqa: F403,E402
+from .ops.fused_mrope_rms import *  # noqa: F403,E402
+from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
+from .ops.groupnorm import *  # noqa: F403,E402
+from . import mla  # noqa: F403,F401,E402
 
-if importlib.util.find_spec("aiter_") is not None:
-    from aiter_ import *
-from .jit import core as core
-from .utility import dtypes as dtypes
-from .ops.enum import *
-from .ops.norm import *
-from .ops.quant import *
-from .ops.gemm_op_a8w8 import *
-from .ops.gemm_op_a16w16 import *
-from .ops.gemm_op_a4w4 import *
-from .ops.batched_gemm_op_a8w8 import *
-from .ops.batched_gemm_op_bf16 import *
-from .ops.deepgemm import *
-from .ops.aiter_operator import *
-from .ops.activation import *
-from .ops.attention import *
-from .ops.custom import *
-from .ops.custom_all_reduce import *
-from .ops.quick_all_reduce import *
-from .ops.moe_op import *
-from .ops.moe_sorting import *
-from .ops.pos_encoding import *
-from .ops.cache import *
-from .ops.rmsnorm import *
-from .ops.communication import *
-from .ops.rope import *
-from .ops.topk import *
-from .ops.topk_plain import topk_plain
-from .ops.mha import *
-from .ops.gradlib import *
-from .ops.trans_ragged_layout import *
-from .ops.sample import *
-from .ops.fused_mrope_rms import *
-from . import mla
+# Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
+try:
+    from .ops.triton.comms import (
+        IrisCommContext,  # noqa: F401
+        calculate_heap_size,  # noqa: F401
+        reduce_scatter,  # noqa: F401
+        all_gather,  # noqa: F401
+        reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
+        IRIS_COMM_AVAILABLE,  # noqa: F401
+    )
+except ImportError:
+    # Iris not available, skip import
+    IRIS_COMM_AVAILABLE = False

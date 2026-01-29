@@ -161,7 +161,8 @@ def test_Smoothquant(l_dtype: list, l_m: list, l_n: list):
                         )
                         df.append(ret)
                     df = pd.DataFrame(df)
-                    aiter.logger.info(f"summary:\n{df}")
+                    df_md = df.to_markdown(index=False)
+                    aiter.logger.info("Smoothquant summary (markdown):\n%s", df_md)
 
     print("\nstart topk Smoothquant test")
     for scaleType in [dtypes.fp32]:
@@ -175,7 +176,8 @@ def test_Smoothquant(l_dtype: list, l_m: list, l_n: list):
                         )
                         df.append(ret)
                     df = pd.DataFrame(df)
-                    aiter.logger.info(f"summary:\n{df}")
+                    df_md = df.to_markdown(index=False)
+                    aiter.logger.info("Smoothquant_topk summary (markdown):\n%s", df_md)
 
     print("\nstart moe Smoothquant test")
     for scaleType in [dtypes.fp32]:
@@ -189,7 +191,8 @@ def test_Smoothquant(l_dtype: list, l_m: list, l_n: list):
                         )
                         df.append(ret)
                     df = pd.DataFrame(df)
-                    aiter.logger.info(f"summary:\n{df}")
+                    df_md = df.to_markdown(index=False)
+                    aiter.logger.info("Smoothquant_moe summary (markdown):\n%s", df_md)
 
 
 if __name__ == "__main__":

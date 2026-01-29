@@ -37,7 +37,11 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    float p_dropout,
                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset,
                                    const std::optional<at::Tensor> &cu_seqlens_q_,
-                                   const std::optional<at::Tensor> &cu_seqlens_kv_)
+                                   const std::optional<at::Tensor> &cu_seqlens_kv_,
+                                   const std::string& data_type,
+                                   bias_enum bias_type,
+                                   quant_scale_enum qscale_type,
+                                   const std::optional<at::Tensor> &sink_ptr_)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -96,8 +100,17 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
 
     const ck_tile::index_t *cu_seqlen_q_ptr = cu_seqlens_q_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_q_.value().data_ptr<int32_t>()) : nullptr;
     const ck_tile::index_t *cu_seqlen_kv_ptr = cu_seqlens_kv_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_kv_.value().data_ptr<int32_t>()) : nullptr;
-
-    return mha_fwd_args{q.data_ptr(),
+    const void *sink_ptr      = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
+    return mha_fwd_args{false, // use_asm_v3
+                        false, // v3_api_check
+                        1, // how_v3_bf16_cvt
+                        data_type,
+                        false, // is_group_mode
+                        static_cast<int>(bias_type),
+                        has_lse,
+                        static_cast<int>(qscale_type),
+                        mask.sink > 0, // has_sink
+                        q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
                         bias_ptr,
@@ -113,6 +126,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         nullptr, // seqlen_k_ptr
                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
                         cu_seqlen_kv_ptr, // cu_seqlen_k_ptr
+                        nullptr, // block_scale_seqstart_q_ptr
+                        nullptr, // block_scale_seqstart_k_ptr
+                        sink_ptr, // sink_ptr
                         seqlen_q,
                         seqlen_k,
                         b,
@@ -136,6 +152,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         nhead_stride_randval,
                         nhead_stride_lse,
                         nhead_stride_o,
+                        0, // nhead_stride_q_descale
+                        0, // nhead_stride_k_descale
+                        0, // nhead_stride_v_descale
                         batch_stride_q,
                         batch_stride_k,
                         batch_stride_v,
@@ -143,13 +162,19 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         batch_stride_randval,
                         batch_stride_lse,
                         batch_stride_o,
+                        0, // batch_stride_q_descale
+                        0, // batch_stride_k_descale
+                        0, // batch_stride_v_descale
                         mask.left,
                         mask.right,
+                        mask.sink,
                         static_cast<ck_tile::index_t>(mask.type),
                         0, // min_seqlen_q
                         p_dropout,
                         has_dropout_randval,
-                        drop_seed_offset};
+                        drop_seed_offset,
+                        128, // block_scale_size_q (per-block quantization block size)
+                        128}; // block_scale_size_kv (per-block quantization block size)
 }
 
 std::vector<at::Tensor>
@@ -161,6 +186,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         bool is_causal,
         int window_size_left,
         int window_size_right,
+        int sink_size,
         bool return_softmax_lse,
         bool return_dropout_randval,
         std::optional<at::Tensor> cu_seqlens_q_,
@@ -171,6 +197,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::optional<const at::Tensor> q_descale_,    // [1]
         std::optional<const at::Tensor> k_descale_,    // [1]
         std::optional<const at::Tensor> v_descale_,    // [1]
+        std::optional<const at::Tensor> sink_ptr,      // [hq]
         std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.scalar_type();
@@ -233,7 +260,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     if (is_causal) {
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
         window_size_right = 0;
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0" + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // casual
     }
     else if (window_size_left == -1 && window_size_right == -1) {
@@ -241,7 +268,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
     else {
         // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
 
@@ -352,17 +379,13 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p_dropout,
                 drop_seed_offset,
                 cu_seqlens_q_,
-                cu_seqlens_kv_);
+                cu_seqlens_kv_,
+                dtype_str,
+                bias_type,
+                qscale_type,
+                sink_ptr);
 
-        float t = aiter::mha_fwd(args,
-                                 stream_config,
-                                 dtype_str,
-                                 false, // is_group_mode
-                                 mask.type,
-                                 bias_type,
-                                 has_lse,
-                                 qscale_type,
-                                 false);
+        float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

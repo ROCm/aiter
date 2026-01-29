@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -16,6 +16,12 @@ torch.set_printoptions(sci_mode=False)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
 # qdtype fp8, kdtype bf16: nhead16
+
+
+def check_support(dtype, kv_dtype, nhead):
+    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    return True
 
 
 def cal_diff(
@@ -244,8 +250,8 @@ def test_mla(
         batch_size,
         max_seqlen_qo,
         nhead,
-        q.dtype,
-        kv_buffer.dtype,
+        dtype,
+        kvtype,
         is_sparse=False,
         fast_mode=True if not non_persistent_mode else False,
         num_kv_splits=max_split_per_batch,
@@ -292,9 +298,7 @@ def test_mla(
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
         dtype_q=dtype,
-        dtype_kv=(
-            kvtype if dtype == kvtype else dtype
-        ),  # if q bf16 k fp8 should be same as bf16bf16 for dp mode
+        dtype_kv=kvtype,
     )
 
     def test_absorb_decode_bf16():
@@ -403,15 +407,9 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        (nhead in [16]) or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
-    ):
+    if dtype == torch.bfloat16:
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and (
-        (dtype == dtypes.fp8 and nhead in [16, 128])
-        or (dtype == dtypes.bf16 and nhead in [16])
-        or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
-    ):
+    elif kvtype == dtypes.fp8:
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
@@ -568,23 +566,25 @@ for nhead, decode_qlen in list_nhead:
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
         list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
-        ret = test_mla(
-            ctx_len,
-            batch_size,
-            nhead,
-            args.kv_lora_rank,
-            args.qk_nope_head_dim,
-            args.qk_rope_head_dim,
-            args.v_head_dim,
-            dtype,
-            kvtype,
-            args.block_size,
-            varlen=args.varlen,
-            decode_qlen=decode_qlen,
-            max_split_per_batch=max_split_per_batch,
-            non_persistent_mode=args.non_persistent_mode,
-        )
-        df.append(ret)
+        if check_support(dtype, kvtype, nhead):
+            ret = test_mla(
+                ctx_len,
+                batch_size,
+                nhead,
+                args.kv_lora_rank,
+                args.qk_nope_head_dim,
+                args.qk_rope_head_dim,
+                args.v_head_dim,
+                dtype,
+                kvtype,
+                args.block_size,
+                varlen=args.varlen,
+                decode_qlen=decode_qlen,
+                max_split_per_batch=max_split_per_batch,
+                non_persistent_mode=args.non_persistent_mode,
+            )
+            df.append(ret)
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)

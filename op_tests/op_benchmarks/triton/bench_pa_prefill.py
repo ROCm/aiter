@@ -4,7 +4,7 @@ import math
 import random
 import triton
 
-from aiter.ops.triton.pa_prefill import context_attention_fwd
+from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_dtype_bytes,
@@ -12,7 +12,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.triton_tests.test_pa_prefill import (
+from op_tests.triton_tests.attention.test_pa_prefill import (
     seed_everything,
     STR_DTYPE_TO_TORCH_DTYPE,
 )

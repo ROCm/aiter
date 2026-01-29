@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # user interface
 
 import functools
+from typing import Optional
 
 import torch
 import triton
@@ -71,7 +72,7 @@ def _fwd_kernel_stage2_asm(
         else:
             e_sum = 0.0
             e_max = -float("inf")
-            acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+            acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
             for split_kv_id in range(0, num_valid_kv_splits):
                 tv = tl.load(
                     Mid_O + offs_v + split_kv_id * stride_mid_os * Lv,
@@ -162,6 +163,8 @@ def mla_decode_fwd(
     q_scale=None,
     kv_scale=None,
     intra_batch_mode=False,
+    return_logits=False,
+    return_lse=False,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -233,7 +236,13 @@ def mla_decode_fwd(
         )
 
         if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            q.dtype == dtypes.fp8
+            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            or (
+                q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+                and nhead in [32, 64]
+            )
         ):
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
@@ -271,7 +280,7 @@ def mla_decode_fwd(
         ):
             # Natively support cases
             pass
-        elif nhead in range(32, 128 + 1, 16) and persistent_mode and max_seqlen_q == 1:
+        elif nhead in range(32, 128 + 1, 16) and persistent_mode:
             # we use nhead=16 to simulate such cases by customized metadata
             # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
             total_s = ori_total_s * (ori_nhead // 16)
@@ -292,7 +301,11 @@ def mla_decode_fwd(
             dtype=dtypes.fp32,
             device=device,
         )
-        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        final_lse = (
+            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            if return_lse
+            else None
+        )
 
         aiter.mla_decode_stage1_asm_fwd(
             q,
@@ -326,10 +339,9 @@ def mla_decode_fwd(
         )
 
     if io_transformed:
-        if persistent_mode:
+        if return_logits:
             logits = logits.view(-1, 1, ori_nhead, v_head_dim)
-        else:
-            logits = logits.view(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
+
         q = q.view(ori_total_s, ori_nhead, -1)
         o = o.view(ori_total_s, ori_nhead, -1)
 
@@ -382,3 +394,384 @@ def mla_prefill_fwd(
 
     # return logits.view(bs, nhead, v_head_dim).to(o.dtype), attn_lse
     return o.view(bs, nhead, v_head_dim), attn_lse
+
+
+def mla_prefill_ps_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    output: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    is_causal: bool,
+    reduce_indptr: Optional[torch.Tensor] = None,
+    reduce_final_map: Optional[torch.Tensor] = None,
+    reduce_partial_map: Optional[torch.Tensor] = None,
+    softmax_scale: float = None,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+) -> None:
+    device = Q.device
+    total_s, nhead, v_head_dim = output.shape
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (v_head_dim**0.5)
+
+    tile_q = 256
+    logits = torch.empty(
+        (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    attn_lse = torch.empty(
+        (reduce_partial_map.size(0) * tile_q, nhead), dtype=dtypes.fp32, device=device
+    )
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+
+    aiter.mla_prefill_ps_asm_fwd(
+        Q,
+        K,
+        V,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        work_indptr,
+        work_info_set,
+        max_seqlen_q,
+        softmax_scale,
+        is_causal,
+        logits,
+        attn_lse,
+        output,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
+
+    aiter.mla_reduce_v1(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        tile_q,
+        output,
+        final_lse,
+    )
+
+    return output.view(total_s, nhead, v_head_dim), attn_lse
+
+
+@triton.jit
+def _mla_prefill_reduce_kernel(
+    # Input tensors
+    partial_output_ptr,  # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
+    partial_lse_ptr,  # [padded_num_tokens * available_tgs, num_head_q]
+    # Metadata tensors
+    reduce_indptr_ptr,  # [num_reduce_groups + 1]
+    reduce_final_map_ptr,  # [num_reduce_groups, 2]: [qo_start, qo_end]
+    reduce_partial_map_ptr,  # [num_partial_tiles]: [partial_qo_loc]
+    # Output tensor
+    output_ptr,  # [total_tokens, num_head_q, v_head_dim]
+    # Strides
+    stride_po_tok,
+    stride_po_head,
+    stride_po_dim,
+    stride_lse_tok,
+    stride_lse_head,
+    stride_o_tok,
+    stride_o_head,
+    stride_o_dim,
+    # Constants
+    TILE_Q: tl.constexpr,
+    V_HEAD_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    MAX_PARTIALS: tl.constexpr,
+):
+    """
+    Each program processes one (reduce_group, head, token) combination.
+    Grid: (num_reduce_groups, num_heads, TILE_Q)
+
+    All heads are uniformly split and reduced together.
+    """
+
+    group_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    tok_offset = tl.program_id(2)  # q_tile
+
+    # Load reduce group metadata (read once per block)
+    start_idx = tl.load(reduce_indptr_ptr + group_id)
+    end_idx = tl.load(reduce_indptr_ptr + group_id + 1)
+    num_partials = end_idx - start_idx
+
+    if num_partials == 0:
+        return
+
+    # Load final map: [qo_start, qo_end]
+    final_map_offset = group_id * 2
+    qo_start = tl.load(reduce_final_map_ptr + final_map_offset + 0)
+    qo_end = tl.load(reduce_final_map_ptr + final_map_offset + 1)
+
+    q_len = qo_end - qo_start
+    tok_id = tok_offset
+
+    # Skip if beyond valid range
+    if tok_id >= q_len:
+        return
+
+    # compute max LSE and collect LSE values
+    max_lse = -float("inf")
+    lse_values = tl.zeros((MAX_PARTIALS,), dtype=tl.float32) - float("inf")
+
+    for p_idx in range(num_partials):
+        if p_idx < num_partials:
+            partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
+
+            lse_offset = (
+                partial_qo_loc + tok_id
+            ) * stride_lse_tok + head_id * stride_lse_head
+            lse = tl.load(partial_lse_ptr + lse_offset)
+
+            is_valid = lse == lse
+            lse = tl.where(is_valid, lse, -float("inf"))
+
+            lse_values = tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse, lse_values)
+
+            # Update max
+            max_lse = tl.maximum(max_lse, lse)
+
+    # compute sum_exp
+    sum_exp = 0.0
+    for p_idx in tl.static_range(MAX_PARTIALS):
+        if p_idx < num_partials:
+            # Extract the lse value for this partition
+            lse = tl.sum(tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse_values, 0.0))
+            exp_val = tl.exp(lse - max_lse)
+            sum_exp += exp_val
+
+    final_lse = max_lse + tl.log(sum_exp)
+
+    # accumulate weighted outputs in chunks
+    # Process V_HEAD_DIM in chunks of BLOCK_DIM
+    num_dim_blocks = tl.cdiv(V_HEAD_DIM, BLOCK_DIM)
+
+    for dim_block_id in range(num_dim_blocks):
+        dim_offs = dim_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+        dim_mask = dim_offs < V_HEAD_DIM
+
+        acc = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
+
+        for p_idx in tl.static_range(MAX_PARTIALS):
+            if p_idx < num_partials:
+                partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
+
+                # Extract lse value
+                lse = tl.sum(
+                    tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse_values, 0.0)
+                )
+
+                scale = tl.exp(lse - final_lse)
+
+                # load partial output
+                out_offset = (
+                    (partial_qo_loc + tok_id) * stride_po_tok
+                    + head_id * stride_po_head
+                    + dim_offs * stride_po_dim
+                )
+                partial_out = tl.load(
+                    partial_output_ptr + out_offset, mask=dim_mask, other=0.0
+                )
+
+                # Handle NaN in output (NaN != NaN)
+                is_valid_out = partial_out == partial_out
+                partial_out = tl.where(is_valid_out, partial_out, 0.0)
+
+                acc += scale * partial_out
+
+        output_offset = (
+            (qo_start + tok_id) * stride_o_tok
+            + head_id * stride_o_head
+            + dim_offs * stride_o_dim
+        )
+        tl.store(
+            output_ptr + output_offset,
+            acc.to(output_ptr.dtype.element_ty),
+            mask=dim_mask,
+        )
+
+
+def mla_prefill_reduce_triton(
+    partial_output: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
+    partial_lse: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q]
+    reduce_indptr: torch.Tensor,  # [num_reduce_groups + 1], int32
+    reduce_final_map: torch.Tensor,  # [num_reduce_groups, 2], int32: [qo_start, qo_end]
+    reduce_partial_map: torch.Tensor,  # [num_partial_tiles], int32: [partial_qo_loc]
+    output: torch.Tensor,  # [total_tokens, num_head_q, v_head_dim], output buffer
+    tile_q: int = 256,  # Q tile size (for padding)
+    max_partials_static: int = None,  # Maximum number of partials, defaults to num_cu
+) -> None:
+    """Triton version of mla_prefill_reduce.
+    All heads are uniformly split and reduced together.
+    """
+    MAX_PARTIALS_STATIC = (
+        max_partials_static if max_partials_static is not None else get_cu_num()
+    )
+
+    num_reduce_groups = reduce_indptr.shape[0] - 1
+    _, num_heads, v_head_dim = partial_output.shape
+
+    if num_reduce_groups == 0:
+        return
+
+    # Check max_partials doesn't exceed the fixed constant in kernel
+    max_partials = 0
+    for i in range(num_reduce_groups):
+        num_p = (reduce_indptr[i + 1] - reduce_indptr[i]).item()
+        max_partials = max(max_partials, num_p)
+
+    if max_partials > MAX_PARTIALS_STATIC:
+        raise ValueError(
+            f"max_partials={max_partials} exceeds MAX_PARTIALS_STATIC={MAX_PARTIALS_STATIC}. "
+            "Consider increasing MAX_PARTIALS_STATIC."
+        )
+
+    # Choose block size for v_head_dim chunks
+    BLOCK_DIM = 64
+    if v_head_dim <= 64:
+        BLOCK_DIM = triton.next_power_of_2(v_head_dim)
+
+    # Grid: (num_reduce_groups, num_heads, TILE_Q)
+    grid = (num_reduce_groups, num_heads, tile_q)
+
+    _mla_prefill_reduce_kernel[grid](
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        output,
+        # Strides
+        partial_output.stride(0),
+        partial_output.stride(1),
+        partial_output.stride(2),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        # Constants
+        TILE_Q=tile_q,
+        V_HEAD_DIM=v_head_dim,
+        BLOCK_DIM=BLOCK_DIM,
+        MAX_PARTIALS=MAX_PARTIALS_STATIC,
+        num_warps=4,
+    )
+
+
+def mla_prefill_reduce(
+    partial_output: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
+    partial_lse: torch.Tensor,  # [padded_num_tokens * available_tgs, num_head_q]
+    reduce_indptr: torch.Tensor,  # [num_reduce_groups + 1], int32
+    reduce_final_map: torch.Tensor,  # [num_reduce_groups, 2], int32: [qo_start, qo_end]
+    reduce_partial_map: torch.Tensor,  # [num_partial_tiles], int32: [partial_qo_loc]
+    output: torch.Tensor,  # [total_tokens, num_head_q, v_head_dim], output buffer
+    tile_q: int = 256,  # Q tile size (for padding)
+    use_triton: bool = True,  # Whether to use Triton kernel
+) -> None:
+
+    if True:
+        try:
+            return mla_prefill_reduce_triton(
+                partial_output,
+                partial_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                output,
+                tile_q,
+            )
+        except Exception as e:
+            print(f"Warning: Triton reduce failed ({e}), falling back to PyTorch")
+
+    # torch implementation, just for reference
+    num_reduce_groups = reduce_indptr.shape[0] - 1
+    device = partial_output.device
+    dtype = partial_output.dtype
+    _, num_heads, v_head_dim = partial_output.shape
+
+    for group_id in range(num_reduce_groups):
+        start_idx = reduce_indptr[group_id].item()  # 0
+        end_idx = reduce_indptr[group_id + 1].item()  # 2
+        num_partials = end_idx - start_idx
+
+        if num_partials == 0:
+            continue
+
+        final_map = reduce_final_map[group_id]
+        qo_start = final_map[0].item()
+        qo_end = final_map[1].item()
+
+        q_len = qo_end - qo_start  # actual length (may be < tile_q for last tile)
+        read_len = tile_q
+
+        # Collect partial indices
+        partial_indices = []
+        for partial_idx in range(start_idx, end_idx):
+            partial_qo_loc = reduce_partial_map[partial_idx].item()
+            partial_indices.append(partial_qo_loc)
+
+        # Process all heads together
+        for head_idx in range(num_heads):
+            partial_lses = []
+            partial_outputs = []
+
+            for partial_qo_loc in partial_indices:
+                lse = partial_lse[partial_qo_loc : partial_qo_loc + read_len, head_idx]
+                partial_lses.append(lse)
+
+                out = partial_output[
+                    partial_qo_loc : partial_qo_loc + read_len, head_idx, :
+                ]
+                partial_outputs.append(out)
+
+            if len(partial_lses) == 0:
+                continue
+
+            partial_lses = torch.stack(partial_lses, dim=0)  # [K, tile_q]
+            partial_outputs = torch.stack(partial_outputs, dim=0)  # [K, tile_q, D]
+
+            nan_mask = torch.isnan(partial_lses)  # [K, tile_q]
+            neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
+            zero = torch.tensor(0.0, device=device, dtype=dtype)
+
+            partial_lses_clean = torch.where(nan_mask, neg_inf, partial_lses)
+
+            max_lse = torch.max(partial_lses_clean, dim=0)[0]  # [tile_q]
+
+            # Compute sum_exp (NaN values contribute 0 to sum)
+            # exp(-inf - max) = 0, so NaN values are automatically excluded
+            sum_exp = torch.sum(
+                torch.where(
+                    nan_mask, zero, torch.exp(partial_lses - max_lse.unsqueeze(0))
+                ),
+                dim=0,
+            )
+
+            final_lse = max_lse + torch.log(sum_exp)
+
+            scales = torch.exp(partial_lses_clean - final_lse.unsqueeze(0)).unsqueeze(
+                -1
+            )  # [K, tile_q, 1]
+
+            nan_output_mask = torch.isnan(partial_outputs)  # [K, tile_q, D]
+            partial_outputs_clean = torch.where(nan_output_mask, zero, partial_outputs)
+
+            final_output = torch.sum(
+                partial_outputs_clean * scales, dim=0
+            )  # [tile_q, v_head_dim]
+
+            output[qo_start:qo_end, head_idx, :] = final_output[:q_len, :]

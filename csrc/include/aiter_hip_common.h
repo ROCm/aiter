@@ -2,14 +2,28 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck_tile/core.hpp"
+#include <cstdint>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#ifdef AITER_EMBEDDED_HSA_HEADER
+#include AITER_EMBEDDED_HSA_HEADER
+#endif
 
 enum class GPUArch
 {
     gfx942,
     gfx950
 };
+
+#define CHECK_COND(x)                                                                             \
+    do                                                                                            \
+    {                                                                                             \
+        if(!(x))                                                                                  \
+        {                                                                                         \
+            std::cerr << "check failed, file=" << __FILE__ << ", line=" << __LINE__ << std::endl; \
+            std::terminate();                                                                     \
+        }                                                                                         \
+    } while(0)
 
 #define HIP_CALL(call)                                                       \
     do                                                                       \
@@ -55,6 +69,36 @@ struct AiterAsmKernelArgs
     const hipStream_t stream;
 };
 
+static const std::string get_gpu_arch();
+
+inline void load_asm_kernel(const char* name,
+                            const char* hsaco,
+                            hipModule_t& module,
+                            hipFunction_t& kernel_func)
+{
+    const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
+    std::string arch_name     = get_gpu_arch();
+    if(AITER_ASM_DIR != nullptr)
+    {
+        std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
+        std::cout << "[aiter] hipModuleLoad: " << hsa_path << " GetFunction: " << name;
+        HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
+    }
+    else
+    {
+#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
+        std::string fname = "hsa/" + arch_name + "/" + hsaco;
+        auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
+        CHECK_COND(hasco_obj != AITER_EMBEDDED_HSA_MAP.end());
+        CHECK_COND(hasco_obj->second.data() != nullptr);
+        std::cout << "hipModuleLoad: " << fname << " GetFunction: " << name << std::endl;
+        HIP_CALL(hipModuleLoadData(&module, hasco_obj->second.data()));
+#endif
+    }
+    HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
+    std::cout << " Success" << std::endl;
+}
+
 class AiterAsmKernel
 {
     private:
@@ -64,12 +108,7 @@ class AiterAsmKernel
     public:
     AiterAsmKernel(const char* name, const char* hsaco)
     {
-        const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-        std::cout << "[aiter] hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str()
-                  << " GetFunction: " << name;
-        HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
-        HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
-        std::cout << " Success" << std::endl;
+        load_asm_kernel(name, hsaco, module, kernel_func);
     };
 
     ~AiterAsmKernel() { HIP_CALL(hipModuleUnload(module)); }
@@ -137,16 +176,18 @@ class AiterAsmKernelFast
 static const std::string get_gpu_arch()
 {
     int device_count;
-    hipError_t err = hipGetDeviceCount(&device_count);
-    if(err != hipSuccess || device_count == 0)
+    HIP_CALL(hipGetDeviceCount(&device_count));
+    if(device_count == 0)
     {
         return "No GPU Found";
     }
 
-    hipDeviceProp_t prop;
-    hipGetDeviceProperties(&prop, 0);
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDevice(&dev));
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
-    std::string arch_full = prop.gcnArchName;
+    std::string arch_full = dev_prop.gcnArchName;
     size_t colon_pos      = arch_full.find(':');
     if(colon_pos != std::string::npos)
     {
@@ -158,7 +199,7 @@ static const std::string get_gpu_arch()
     }
 }
 
-static const uint32_t get_num_cu_func()
+static uint32_t get_num_cu_func()
 {
     auto get_num_cu_local = []() {
         hipDevice_t dev;

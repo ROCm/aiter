@@ -15,7 +15,6 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
     default_kernels_dict,
 )
 
-
 """
 
 gemm_a8w8_bpreshuffle_cktile instance gen
@@ -240,7 +239,7 @@ def get_tune_dict(tune_dict_csv):
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             kid = tune_df.loc[i, "kernelId"]
-            if kid < 0 or kid > len(kernels_list):
+            if kid < 0 or kid >= len(kernels_list):
                 print(f"[Warning]: kernelId {kid} is out of range, skip it")
                 continue
             tune_dict[(M, N, K)] = kernels_list[kid]

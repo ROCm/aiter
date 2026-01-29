@@ -3,6 +3,7 @@
 
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 """Rotary Positional Embeddings."""
+
 import math
 from typing import Optional, Tuple, Union
 

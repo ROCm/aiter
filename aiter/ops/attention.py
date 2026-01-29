@@ -1,21 +1,29 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+from typing import Optional, Tuple
+
 import torch
-from typing import Tuple, Optional
-from ..jit.core import (
-    compile_ops,
-)
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
-from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
+from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+
 from aiter import dtypes
 
+from ..jit.core import compile_ops
+
 MD_NAME = "module_attention"
+
+direct_register_custom_op(
+    "pa_decode_gluon",
+    pa_decode_gluon,
+    ["output", "exp_sums", "max_logits", "temporary_output"],
+)
 
 
 def gen_pa_fwd_native_fake(
@@ -114,6 +122,116 @@ def pa_fwd_asm(
 ) -> torch.Tensor: ...
 
 
+def _should_use_asm_kernel(
+    num_seqs: int,
+    num_heads: int,
+    kv_cache_tensor_dtype: torch.dtype,
+) -> bool:
+
+    if kv_cache_tensor_dtype == torch.int8:
+        return True
+
+    # Get GPU compute units (CUs)
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    # ASM kernel becomes relevant, once the total_heads is sufficiently large compared to CUs
+    total_heads = num_seqs * num_heads
+    return total_heads > 2 * cu_num
+
+
+def paged_attention_common(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    scale: float,
+    max_qlen: int = 1,
+    max_seq_len: int = 1,
+    K_QScale_hip: Optional[torch.Tensor] = None,  # [num_seqs, num_heads]
+    V_QScale_hip: Optional[torch.Tensor] = None,
+    K_QScale_asm: Optional[
+        torch.Tensor
+    ] = None,  # [num_blocks, num_kv_heads, block_size]
+    V_QScale_asm: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    high_precision: Optional[
+        int
+    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: Optional[str] = None,
+    kv_cache_dtype: str = "auto",
+    kv_cache_tensor_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """
+    Paged attention forward pass with automatic kernel selection.
+    ASM is favored for int8 kv caches, for short ctx_len, or when the workload exceeds
+    the heuristic thresholds for larger ctx_len values.
+    PA is normally using per tensor quant and this is what has been tested, however,
+    per head quant can be supported as well in principle, but not tested.
+    """
+    kv_cache_tensor_dtype = (
+        kv_cache_tensor_dtype if kv_cache_tensor_dtype is not None else K.dtype
+    )
+    num_seqs, num_heads, head_size = Q.shape
+
+    use_asm_kernel = (
+        _should_use_asm_kernel(num_seqs, num_heads, kv_cache_tensor_dtype)
+        or high_precision == 2
+    )
+
+    if use_asm_kernel:
+        output = pa_fwd_asm(
+            Q,
+            K,
+            V,
+            block_tables,
+            context_lens,
+            block_tables_stride0,
+            max_qlen,
+            K_QScale_asm,
+            V_QScale_asm,
+            out_,
+            qo_indptr,
+            high_precision,
+            kernelName,
+        )
+        return output
+
+    # Use ROCm paged attention kernel for smaller workloads / common path.
+    output = out_ if out_ is not None else torch.empty_like(Q)
+
+    paged_attention_rocm(
+        out=output,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        tmp_out=tmp_out,
+        query=Q,
+        key_cache=K,
+        value_cache=V,
+        num_kv_heads=int(K.size(1)),
+        scale=scale,
+        block_tables=block_tables,
+        context_lens=context_lens,
+        block_size=int(K.size(3)),
+        max_context_len=max_seq_len,
+        alibi_slopes=None,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=K_QScale_hip,
+        v_scale=V_QScale_hip,
+        fp8_out_scale=None,
+        partition_size=256,
+        mtp=1,
+        q_scale=None,
+    )
+    return output
+
+
 def gen_pa_ps_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -199,18 +317,18 @@ def pa_persistent_fwd(
     output: torch.Tensor,
     max_qlen: int,  # default = 1
     qo_indptr: torch.Tensor,  # [batch+1], qolen prefix sum
-    kv_indptr: torch.Tensor,  # [batch+1], kvlen prefix sum   1
-    kv_indices: torch.Tensor,  # [sum_kvlen], packed kv ids    2
-    context_lens: torch.Tensor,  # [batch]                       3
+    kv_indptr: torch.Tensor,  # [batch+1], kv_used_pages prefix sum
+    kv_indices: torch.Tensor,  # [sum_kv_used_pages], packed kv ids
+    context_lens: torch.Tensor,  # [batch]
     # work_meta_data: torch.Tensor,
-    work_indptr: Optional[torch.Tensor] = None,
-    work_info: Optional[torch.Tensor] = None,
-    reduce_indptr: Optional[torch.Tensor] = None,
-    reduce_final_map: Optional[torch.Tensor] = None,
-    reduce_partial_map: Optional[torch.Tensor] = None,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
     K_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
     V_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
-    softmax_scale: float = None,
+    softmax_scale: Optional[float] = None,
     mask: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = Q.device
@@ -444,7 +562,7 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size]
     kv_last_page_lens: torch.Tensor,
     num_kv_splits_indptr: Optional[torch.Tensor],
-    work_metadata: Optional[torch.Tensor],
+    work_meta_data: Optional[torch.Tensor],
     work_indptr: Optional[torch.Tensor],
     work_info_set: Optional[torch.Tensor],
     max_seqlen_q: int,
@@ -486,12 +604,7 @@ def mla_prefill_asm_fwd(
 
 def get_pa_metadata_info_v1(
     batch_size: int,
-    max_seqlen_qo: int,
-    num_head_qo: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
-    is_sparse: int,
-    fast_mode: bool = True,
+    num_head_k: int = 1,
 ):
     """
     Returns:
@@ -507,22 +620,9 @@ def get_pa_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
 
-    tile_q = 16  # TODO: fix hack
-    # max_qo_tiles_per_batch = max_seqlen_qo * gqa_ratio / tile_q
-    # tile_q related to kernel dispatch strategy
-    # better hide inside get_xxx_metadata csrc?
-    max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * num_head_qo / tile_q))
-    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
-    tile_cnt = batch_size * max_qo_tiles_per_batch
-
-    if fast_mode:
-        max_work = tile_cnt + cu_num - 1
-        max_split_tiles = (
-            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
-        )
-    else:
-        max_work = tile_cnt * cu_num
-        max_split_tiles = tile_cnt * cu_num
+    tile_cnt = batch_size
+    max_work = (tile_cnt + cu_num - 1) * num_head_k
+    max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2)
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
@@ -538,6 +638,7 @@ def get_pa_metadata_info_v1(
 def get_pa_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     pages_kv_indptr: torch.Tensor,
+    context_lens: torch.Tensor,
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
@@ -548,6 +649,7 @@ def get_pa_metadata_v1(
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
     kv_granularity: int = 16,
+    block_size: int = 16,
     max_seqlen_qo: int = -1,
     uni_seqlen_qo: int = -1,
     fast_mode: bool = True,
@@ -558,6 +660,7 @@ def get_pa_metadata_v1(
     Inputs:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
         cumulated used pages of k/v: (batch_size + 1), dtype torch.int32.
+        context_lens: seqlens of k/v, dtype torch.int32.
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
@@ -597,6 +700,92 @@ def get_pa_metadata_v1(
     ...
 
 
+def get_ps_metadata_info_v1(
+    batch_size: int,
+    num_head_k: int,
+    max_qlen: int,
+    qlen_granularity: int = 256,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    device = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(device)
+    cu_num = device_properties.multi_processor_count
+
+    num_clusters = math.gcd(num_head_k, cu_num)
+    cus_per_cluster = cu_num // num_clusters
+
+    max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
+
+    qo_tile_cnt = batch_size * max_qo_split_per_batch
+    # TODO: consider split q to reduce max_works & max_partials
+    max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
+    max_partials = (
+        min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2)
+        * max_qo_split_per_batch
+    )
+
+    return (
+        (2, torch.uint64),  # work_metadata_ptrs
+        (cu_num + 1, torch.int32),  # work_indptr
+        ((max_works, 8), torch.int32),  # work_info
+        (qo_tile_cnt + 1, torch.int32),  # reduce_indptr
+        ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_partials, torch.int32),  # reduce_partial_map
+    )
+
+
+@compile_ops("module_ps_metadata")
+def get_ps_metadata_v1(
+    seqlens_qo_indptr: torch.Tensor,
+    pages_kv_indptr: torch.Tensor,
+    context_lens: torch.Tensor,
+    gqa_ratio: int,
+    num_heads_k: int,
+    work_metadata_ptrs: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    qhead_granularity: int = 1,
+    qlen_granularity: int = 256,
+    kvlen_granularity: int = 16,
+    block_size: int = 16,
+    is_causal: bool = True,
+) -> None: ...
+
+
+@compile_ops(MD_NAME)
+def mla_prefill_ps_asm_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 def get_mla_metadata_info_v1(
     batch_size: int,
     max_seqlen_qo: int,
@@ -625,14 +814,15 @@ def get_mla_metadata_info_v1(
 
     max_qo_tiles_per_batch = (
         int(math.ceil(max_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
+        if num_head_qo == 16
+        or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
     if fast_mode:
-        max_work = tile_cnt + cu_num - 1
+        max_work = (batch_size + cu_num - 1) * max_qo_tiles_per_batch
         max_split_tiles = (
             min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
         )
@@ -668,8 +858,8 @@ def get_mla_metadata_v1(
     num_heads_k: int,
     is_causal: bool,
     work_metadata_ptrs: torch.Tensor,
+    work_info_set: torch.Tensor,
     work_indptr: torch.Tensor,
-    work_info: torch.Tensor,
     reduce_indptr: torch.Tensor,
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
