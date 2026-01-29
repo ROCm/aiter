@@ -150,6 +150,8 @@ def mla_decode_fwd(
     kv_indices,
     kv_last_page_lens,
     max_seqlen_q,
+    page_size=1,
+    nhead_kv=1,
     sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
     logit_cap=0.0,
     num_kv_splits=None,  # for experts only!!!
@@ -168,7 +170,11 @@ def mla_decode_fwd(
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
+    if kv_buffer.dtype != torch.uint8:
+        _, _, _, qk_head_dim = kv_buffer.shape
+    else:
+        _, _, qk_head_dim = q.shape
+
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
@@ -227,6 +233,8 @@ def mla_decode_fwd(
             None,
             None,
             max_seqlen_q,
+            page_size,
+            nhead_kv,
             sm_scale,
             logits,
             attn_lse,
@@ -319,6 +327,8 @@ def mla_decode_fwd(
             work_indptr,
             work_info_set,
             max_seqlen_q,
+            page_size,
+            nhead_kv,
             sm_scale,
             logits,
             attn_lse,

@@ -15,6 +15,8 @@ void mla_decode_stage1_asm_fwd(
     std::optional<torch::Tensor>& work_indptr,          //   metadata
     std::optional<torch::Tensor>& work_info_set,        //   [batch_size+1]
     int max_seqlen_q,
+    int page_size,
+    int nhead_kv,
     float softmax_scale,
     // following are output
     torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
