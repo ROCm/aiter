@@ -49,6 +49,15 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     
     return H
 
+def create_random_rotation(block_size, device="cuda", dtype=torch.float32):
+    generator = torch.Generator(device=device)
+    generator.manual_seed(1000)
+
+    A = torch.randn(block_size, block_size, device=device, dtype=torch.float32, generator=generator)
+
+    Q, R = torch.linalg.qr(A)
+
+    return Q.to(dtype)
 
 @triton.jit
 def _hadamard_rotation_kernel(
@@ -153,6 +162,7 @@ def apply_hadamard_rotation_qk(q, k, BLKM=128, BLKN=64, block_size=32):
     k = k.view(-1, k_shape[-1])
 
     r = create_hadamard_matrix(block_size, q.device, q.dtype)
+    #r = create_random_rotation(block_size, q.device, q.dtype)
     
     q_rotated = apply_hadamard_rotation(q, r, BLKM, block_size=block_size)
     k_rotated = apply_hadamard_rotation(k, r, BLKN, block_size=block_size)
