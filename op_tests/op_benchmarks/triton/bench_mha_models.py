@@ -106,7 +106,7 @@ class BenchArgs:
 
 def get_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
     # Check empty stderr:
-    if not err:
+    if err:
         return None
     # Split stdout:
     out_lines: list[list[str]] = [
@@ -140,11 +140,11 @@ def get_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
             [
                 len(l2) == 7,
                 l2[0] == "0",
-                int(l2[1]) == args.b,
-                int(l2[2]) == m.hq,
-                int(l2[3]) == m.hkv,
-                int(l2[4]) == args.s,
-                int(l2[5]) == args.s,
+                int(float(l2[1])) == args.b,
+                int(float(l2[2])) == m.hq,
+                int(float(l2[3])) == m.hkv,
+                int(float(l2[4])) == args.s,
+                int(float(l2[5])) == args.s,
             ]
         ):
             return None
