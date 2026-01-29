@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import hip
-hip.hip.hipInit(0)
+
 import torch
 import pytest
 import torch.nn.functional as F
@@ -102,14 +101,14 @@ def generate_gemm_a8w8_inputs(
     """
     if layout[0] == "T":
         # T (transposed) in Fortran notation equals row-major
-        x = torch.randn((M, K), dtype=torch.float32)
+        x = torch.randn((M, K), dtype=torch.float32, device="cuda")
     else:
-        x = torch.randn((K, M), dtype=torch.float32).T
+        x = torch.randn((K, M), dtype=torch.float32, device="cuda").T
 
     if layout[1] == "N":
-        weight = torch.randn((N, K), dtype=torch.float32)
+        weight = torch.randn((N, K), dtype=torch.float32, device="cuda")
     else:
-        weight = torch.randn((K, N), dtype=torch.float32).T
+        weight = torch.randn((K, N), dtype=torch.float32, device="cuda").T
 
     max_x = x.abs().float().amax(dim=1, keepdim=True)
     x_scale = max_x / dtype_max[in_dtype]
@@ -121,7 +120,7 @@ def generate_gemm_a8w8_inputs(
     weight = weight / w_scale.T
     weight = weight.to(in_dtype)
 
-    bias = torch.rand([1, N], dtype=torch.float32) * 10
+    bias = torch.rand([1, N], dtype=torch.float32, device="cuda") * 10
 
     if shuffle:
         weight_shuffle_layout = (16, 16)
@@ -134,7 +133,7 @@ def generate_gemm_a8w8_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=out_dtype)
+        y = torch.empty((M, N), dtype=out_dtype, device="cuda")
 
     return x, weight, weight_shuffled, x_scale, w_scale, bias, y
 
@@ -143,17 +142,19 @@ def generate_gemm_a8w8_inputs(
     "in_dtype, out_dtype, m, n, k, layout, output",
     [
         (in_dtype, out_dtype, *shape, layout, output)
-        for in_dtype in ["int8"]
+        for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
         for out_dtype in ["bf16", "fp16", "fp32", "int32"]
-        for shape in [(128, 128, 128), (256, 256, 256)]
-        for layout in ["TN"]
-        for output in [True]
+        for shape in get_x_vals()
+        for layout in ["TN", "TT", "NN", "NT"]
+        for output in [True, False]
     ],
 )
 @pytest.mark.parametrize(
     "impl",
     [
         "triton",
+        "gluon",
+        "gluon_shuffle",
     ],
 )
 def test_gemm(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
