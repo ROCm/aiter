@@ -184,7 +184,7 @@ def asm_moe(
             else dtypes.fp8
         )
         if fc1_smooth_scale is not None:
-            a8 = torch.empty((M, topk, model_dim), dtype=a8_type, device=device)
+            a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
             a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
 
             # moe_smoothquant_fwd need topk_ids which contains local_expert_id
@@ -197,12 +197,9 @@ def asm_moe(
             # aiter.moe_smoothquant_fwd(
             #     a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
             # )
-            hidden_states_topk = hidden_states.view(M, 1, model_dim).expand(
-                -1, topk, -1
-            )
             aiter.smooth_per_token_scaled_quant(
-                a8,
-                hidden_states_topk,
+                a8.view(topk, M, model_dim).transpose(0, 1),
+                hidden_states.view(M, 1, model_dim).expand(-1, topk, -1),
                 a8_scale,
                 fc1_smooth_scale,
                 topk_ids,
