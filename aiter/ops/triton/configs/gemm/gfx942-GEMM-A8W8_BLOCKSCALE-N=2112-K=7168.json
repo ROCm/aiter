@@ -47,12 +47,6 @@
         "GROUP_K": 128,
         "GROUP_N": 128
     },
-      
-    
-    
-    
-    
-    
     "M_LEQ_32": {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 64,
