@@ -5,7 +5,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     compute_alibi_block,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
-
+from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
 def map_dims(shape, indices):
     return [shape[i] for i in indices]
@@ -43,6 +43,7 @@ def _sage_fwd_no_mask(
     block_max,
     alibi_slope,
     q_descale,
+    k_descale,
     k_descale_base_ptr,
     stride_ksblk,
     BLOCK_M: tl.constexpr,
@@ -57,6 +58,7 @@ def _sage_fwd_no_mask(
     USE_EXP2: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
+    K_BLOCKSCALE: tl.constexpr,
 ):
     k_descale_ptr = k_descale_base_ptr
 
@@ -74,8 +76,9 @@ def _sage_fwd_no_mask(
         else:
             k = tl.load(k_ptrs)
 
-        k_descale = tl.load(k_descale_ptr)
-        k_descale_ptr += stride_ksblk
+        if K_BLOCKSCALE:
+            k_descale = tl.load(k_descale_ptr)
+            k_descale_ptr += stride_ksblk
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -232,6 +235,7 @@ def _sage_fwd_mask(
     n_extra_tokens,
     alibi_slope,
     q_descale,
+    k_descale,
     k_descale_base_ptr,
     stride_ksblk,
     IS_CAUSAL: tl.constexpr,
@@ -250,11 +254,14 @@ def _sage_fwd_mask(
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
     ACCUMULATOR_TYPE,
+    K_BLOCKSCALE: tl.constexpr,
 ):
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
 
     k_descale_ptr = k_descale_base_ptr
+
+
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -274,8 +281,9 @@ def _sage_fwd_mask(
 
         # load k and if preload_v then v
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
-        k_descale = tl.load(k_descale_ptr)
-        k_descale_ptr += stride_ksblk
+        if K_BLOCKSCALE:
+            k_descale = tl.load(k_descale_ptr)
+            k_descale_ptr += stride_ksblk
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
@@ -932,6 +940,7 @@ def sage_fwd(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
+    K_BLOCKSCALE: tl.constexpr=False,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
@@ -1107,6 +1116,7 @@ def sage_fwd(
     v_descale_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
 
     q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
+    k_descale = tl.load(k_descale_offset)
 
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
@@ -1178,6 +1188,7 @@ def sage_fwd(
             0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
             alibi_slope,
             q_descale,
+            k_descale,
             k_descale_ptr,
             stride_ksblk,
             IS_CAUSAL,
@@ -1196,6 +1207,7 @@ def sage_fwd(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            K_BLOCKSCALE=K_BLOCKSCALE,
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1241,6 +1253,7 @@ def sage_fwd(
             block_max,  # End of range: n_full_blocks * BLOCK_N
             alibi_slope,
             q_descale,
+            k_descale,
             k_descale_ptr,
             stride_ksblk,
             BLOCK_M,
@@ -1255,6 +1268,7 @@ def sage_fwd(
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            K_BLOCKSCALE=K_BLOCKSCALE,
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1308,6 +1322,7 @@ def sage_fwd(
             n_extra_tokens,  # Padding tokens in last block
             alibi_slope,
             q_descale,
+            k_descale,
             k_descale_ptr,
             stride_ksblk,
             IS_CAUSAL,  # Use actual causal flag
@@ -1326,6 +1341,7 @@ def sage_fwd(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            K_BLOCKSCALE=K_BLOCKSCALE,
         )
 
     # ============================================================
@@ -1461,6 +1477,33 @@ def sage_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
+
+def per_tensor_int8_quantize_bhsd(x, layout, clamp_val=1e-9):
+    # Standard case: compute scaling per head
+    reduce_dims = (1, 3) if layout=="bshd" else (2,3)  # seq_len and dim dimensions
+
+    # Compute the absolute max along reduce_dims, clamped to avoid 0-scale
+    # Result shape: [batch, heads]
+    x_abs_max = x.abs().amax(dim=reduce_dims)
+    x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
+
+    # Unsqueeze to [batch, 1, heads, 1] for broadcasting during scaling
+    if layout == "bshd":
+        x_abs_max_broadcast = x_abs_max.unsqueeze(1).unsqueeze(3)
+    else:  # "bhsd"
+        x_abs_max_broadcast = x_abs_max.unsqueeze(-1).unsqueeze(-1)
+
+    # compute scale and descale
+    int8_max = torch.iinfo(torch.int8).max
+    scale = int8_max / x_abs_max_broadcast
+    descale_factor = (x_abs_max / int8_max).to(torch.float32)
+
+    # Quantize to FP8
+    x_int8 = (x * scale).to(torch.int8)
+
+    return x_int8, descale_factor
+
+
 def sage_quant(
     q,
     k,
@@ -1472,6 +1515,7 @@ def sage_quant(
     sm_scale=None,
     layout="bshd",
     smooth_k=True,
+    blockscale_k=True,
 ):
     """
     Quantize Q and K tensors to INT8 with per-block scaling.
@@ -1496,7 +1540,7 @@ def sage_quant(
     q_int8 = torch.empty_like(q, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-
+    
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = k.shape
@@ -1531,7 +1575,11 @@ def sage_quant(
     k_task_count = b * h_kv * K_NUM_BLKS
     v_task_count = b * h_kv * K_NUM_BLKS
 
-    grid = (q_task_count + k_task_count + v_task_count,)
+    if not blockscale_k:
+        k_int8, k_scale = per_tensor_int8_quantize_bhsd(k, layout)
+        grid = (q_task_count + v_task_count,) # no k tasks launched
+    else:
+        grid = (q_task_count + v_task_count + k_task_count,)
 
     # call sage_quant_kernel
     sage_quant_kernel[grid](
@@ -1558,7 +1606,7 @@ def sage_quant(
         v_scale.stride(1),
         (sm_scale * 1.4426950408889634),
         q_task_count,
-        k_task_count,
+        v_task_count,
         b,
         h_qo,
         h_kv,
@@ -1604,7 +1652,7 @@ def sage_quant_kernel(
     stride_vsh,
     sm_scale,
     q_task_count,
-    k_task_count,
+    v_task_count,
     BATCH,
     Q_HEAD,
     K_HEAD,
@@ -1649,34 +1697,9 @@ def sage_quant_kernel(
             offs_qn[:, None] < SEQLEN_Q,
             sm_scale=sm_scale,
         )
-    elif pid >= q_task_count and pid < q_task_count + k_task_count:
-        # here we do K
-        _pid = pid - q_task_count
-        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-
-        offs_kn = off_blk * BLK_K + offs_blk_k
-
-        k_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
-        )
-
-        k_input_ptrs = K_Input + k_offs
-        k_output_ptrs = K_Output + k_offs
-        k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
-
-        _general_quant_kernel(
-            k_input_ptrs,
-            k_output_ptrs,
-            k_scale_ptrs,
-            INT8_MAX,
-            offs_kn[:, None] < SEQLEN_K,
-        )
-    else:
+    elif pid >= q_task_count and pid < q_task_count + v_task_count:
         # V
-        _pid = pid - (q_task_count + k_task_count)
+        _pid = pid - q_task_count
         off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
         offs_kn = off_blk * BLK_K + offs_blk_k
 
@@ -1700,6 +1723,31 @@ def sage_quant_kernel(
         v_quant = v / v_scales
         v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
         tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
+    else:
+        # here we do K
+        _pid = pid - (q_task_count + v_task_count)
+        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
+
+        offs_kn = off_blk * BLK_K + offs_blk_k
+
+        k_offs = (
+            off_b * stride_kz
+            + off_h * stride_kh
+            + offs_kn[:, None] * stride_kn
+            + offs_d[None, :]
+        )
+
+        k_input_ptrs = K_Input + k_offs
+        k_output_ptrs = K_Output + k_offs
+        k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
+
+        _general_quant_kernel(
+            k_input_ptrs,
+            k_output_ptrs,
+            k_scale_ptrs,
+            INT8_MAX,
+            offs_kn[:, None] < SEQLEN_K,
+        )
 
 
 @triton.jit

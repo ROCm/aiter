@@ -74,6 +74,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         return_lse: bool = True,
         layout: str = "bshd",
         config: Optional[dict] = None,
+        blockscale_k: bool = True,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -114,6 +115,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             BLKQ=BLKQ,
             BLKK=BLKK,
             layout=layout,
+            blockscale_k=blockscale_k,
         )
 
         # 4. Verify Descale Shapes (Grouped scaling for GQA/MQA)
@@ -121,8 +123,11 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
         expected_q_ds = (batch, num_q_heads, num_q_blocks)
-        expected_k_ds = (batch, num_kv_heads, num_k_blocks)
-
+        if blockscale_k:
+            expected_k_ds = (batch, num_kv_heads, num_k_blocks)
+        else:
+            expected_k_ds = (batch, num_kv_heads)  # per-tensor scaling
+        
         assert (
             q_descale.shape == expected_q_ds
         ), f"q_descale shape {q_descale.shape} != {expected_q_ds}"
@@ -147,6 +152,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse,
             layout,
             config,
+            blockscale_k,
         )
 
         # 6. Context Saving for Backward
@@ -181,6 +187,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # layout
             None,  # config
+            None,  # blockscale_k
         )
 
 
@@ -198,6 +205,7 @@ def fav3_sage_wrapper_func(
     inference_mode: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    blockscale_k: bool = True,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -276,6 +284,7 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
+        blockscale_k,
     )
 
 
@@ -295,6 +304,7 @@ def fav3_sage_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    blockscale_k: bool = True,
 ):
     """
     SageAttention v1.
@@ -353,8 +363,10 @@ def fav3_sage_func(
     num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
     assert q_descale.shape == (batch, nheads_q, num_q_blocks)
-    assert k_descale.shape == (batch, nheads_k, num_k_blocks)
-
+    if blockscale_k:
+        assert k_descale.shape == (batch, nheads_k, num_k_blocks)
+    else:
+        assert k_descale.shape == (batch, nheads_k)
     # --- 4. Output Allocation ---
     out_dtype = torch.bfloat16
     if layout == "thd":
@@ -387,7 +399,10 @@ def fav3_sage_func(
         softmax_lse.stride() if return_lse else (0, 0, 0)
     )
     stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
-    stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
+    if blockscale_k:
+        stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
+    else:
+        stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()[0], k_descale.stride()[1], 0
     stride_vsz, stride_vsh, _ = v_descale.stride()
 
     # --- 6. Padding & Metadata ---
@@ -479,6 +494,7 @@ def fav3_sage_func(
         RETURN_SCORES=False,
         USE_SEQUSED=False,
         **config,
+        K_BLOCKSCALE=blockscale_k,
     )
 
     if return_lse:

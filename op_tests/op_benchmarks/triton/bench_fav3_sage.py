@@ -27,7 +27,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
 from aiter.ops.triton.attention.fav3_sage import (
-    fav3_sage_wrapper_func,
+    fav3_sage_wrapper_func, get_sage_fwd_configs, sage_quant, fav3_sage_func
 )
 from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
@@ -300,22 +300,57 @@ def fav3_sage_forward_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    causal: bool,
-    inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
+    include_quantization_overhead: bool = False,
+    blockscale_k: bool = True,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
+    if include_quantization_overhead:
+        return lambda: fav3_sage_wrapper_func(
+            q,
+            k,
+            v,
+            softmax_scale,
+            causal=False,
+            inference_mode=True,
+            layout=layout,
+            blockscale_k=blockscale_k,
+        )
+    else: # exclude quantization overhead
+        config = get_sage_fwd_configs()
+        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+        
+        
+        # Note: softmax_scale is integrated into quantization descaling
+        fp8_dtype = aiter.dtypes.fp8
+        fp8_max = torch.finfo(fp8_dtype).max
+        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
+            q,
+            k,
+            v,
+            fp8_dtype,
+            fp8_max,
+            sm_scale=softmax_scale,
+            BLKQ=BLKQ,
+            BLKK=BLKK,
+            layout=layout,
+            blockscale_k=blockscale_k,
+        )
+        
+        return lambda: fav3_sage_func(
+            q_int8,
+            k_int8,
+            v_fp8,
+            q_descale,
+            k_descale,
+            v_descale,
+            layout=layout,
+            config=config,
+            blockscale_k=blockscale_k,
+        )
 
-    return lambda: fav3_sage_wrapper_func(
-        q,
-        k,
-        v,
-        softmax_scale,
-        causal=False,
-        inference_mode=True,
-        layout=layout,
-    )
+    
 
 
 def create_benchmark_configs(args):
@@ -445,8 +480,6 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
             q,
             k,
             v,
-            causal=False,
-            inference_mode=True,
             layout=layout,
         )
     else:
