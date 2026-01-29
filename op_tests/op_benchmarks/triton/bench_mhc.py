@@ -10,9 +10,18 @@ and configurations, reporting time, throughput (TFLOPS), and bandwidth.
 
 import sys
 import argparse
+import logging
 from itertools import product
 import torch
 import triton
+
+# Configure logging before importing aiter modules
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(name)s] %(levelname)s: %(message)s',
+    force=True
+)
+
 from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
 from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (

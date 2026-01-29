@@ -418,12 +418,11 @@ def mhc(
     M = out_res.shape[0]
     H_res_3d = out_res.view(M, n, n)
     
-    # iterative Sinkhorn-Knopp
+    # # Iterative Sinkhorn-Knopp - modifies H_res_3d in-place
     # sinkhorn_knopp(H_res_3d, num_iters=sinkhorn_iters, out=H_res_3d)
     
-    # zero-iteration Sinkhorn-Knopp (mHC-Lite), sinkhorn_knopp_lite handles the conversion from (M, n, n) to (M, n!) internally
-    H_res_3d = sinkhorn_knopp_lite(H_res_3d, out=H_res_3d)
-    out_res = H_res_3d.view(M, -1) # Flatten back to (M, n²) for output
+    # Zero-iteration Sinkhorn-Knopp (mHC-Lite) - modifies H_res_3d in-place
+    sinkhorn_knopp_lite(H_res_3d, out=H_res_3d)
     
     return out_pre, out_post, out_res
 
@@ -500,6 +499,9 @@ def sinkhorn_knopp(
         config, _ = get_mhc_config("MHC_SINKHORN", M)
     else:
         config = dict(config)  # Copy to avoid mutation
+    
+    # Filter out BLOCK_SIZE - only used by sinkhorn_knopp_lite, not the log domain kernel
+    kernel_config = {k: v for k, v in config.items() if k != "BLOCK_SIZE"}
 
     # Grid: one program per batch element, need large batch size for optimal performance
     grid = (triton.cdiv(M, config["BLOCK_M"]),)
@@ -513,7 +515,7 @@ def sinkhorn_knopp(
         logits.stride(2),
         N=N,
         NUM_ITERS=num_iters,
-        **config,
+        **kernel_config,
     )
 
     return out
@@ -555,14 +557,11 @@ def _generate_permutation_matrices(n: int, device: torch.device, dtype: torch.dt
     perms = list(itertools.permutations(range(n)))
     n_factorial = len(perms)
     
-    # Convert permutations to permutation matrices
+    # Convert permutations to permutation matrices directly on target device
     # For each permutation p, create matrix where M[i, p[i]] = 1
-    indices = torch.tensor(perms, dtype=torch.long)
-    eye = torch.eye(n, dtype=dtype)
+    indices = torch.tensor(perms, dtype=torch.long, device=device)
+    eye = torch.eye(n, dtype=dtype, device=device)
     perm_mats = eye[indices]  # Shape: (n!, n, n)
-    
-    # Move to target device
-    perm_mats = perm_mats.to(device)
     
     # Cache for future use
     _PERM_MATS_CACHE[cache_key] = perm_mats
@@ -596,7 +595,7 @@ def sinkhorn_knopp_lite(
     Advantages over iterative Sinkhorn-Knopp:
         ✓ Zero iterations required (one-shot computation)
         ✓ Exact doubly stochastic property
-        ✓ Faster inference
+        ✓ Faster inference (no iteration loop)
         ✓ Better numerical stability
     
     Limitations:
@@ -605,78 +604,59 @@ def sinkhorn_knopp_lite(
         ✗ For n=5: 5!=120, n=6: 6!=720 (memory intensive)
     
     Args:
-        logits (torch.Tensor): Input logits with shape (M, n!) or (M, n, n):
-            - If (M, n!): Direct permutation weights for n! permutation matrices
-            - If (M, n, n): Raw matrices that will be converted to permutation weights
-            where M is the batch size and n is the matrix dimension.
-        out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, n, n).
-            If None, a new tensor is allocated.
-        config (Optional[dict]): Kernel tuning parameters. If None, uses default config.
+        logits (torch.Tensor): Input raw logits with shape (M, N, N), where:
+            - M is the batch size
+            - N is the matrix size (typically n=4)
+        out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N, N).
+            If None, a new tensor is allocated. When provided, enables in-place operation.
+        config (Optional[dict]): Kernel tuning parameters. If None, loaded from JSON config files.
     
     Returns:
-        torch.Tensor: Doubly stochastic matrices with shape (M, n, n).
+        torch.Tensor: Doubly stochastic matrices with shape (M, N, N).
             Each matrix in the batch has rows and columns summing to 1.
+            If `out` is provided, returns the same tensor (in-place operation).
     
     Example:
-        >>> # Option 1: Direct permutation logits for n=4 (4! = 24 permutations)
-        >>> logits = torch.randn(16, 24, device='cuda')
-        >>> P = sinkhorn_knopp_lite(logits)
-        >>> P.shape
-        torch.Size([16, 4, 4])
-        >>>
-        >>> # Option 2: From (M, n, n) matrices
-        >>> matrices = torch.randn(16, 4, 4, device='cuda')
-        >>> P = sinkhorn_knopp_lite(matrices)
-        >>> P.shape
-        torch.Size([16, 4, 4])
+        >>> # Zero-iteration doubly stochastic projection
+        >>> logits = torch.randn(16, 4, 4, device='cuda')
+        >>> P = sinkhorn_knopp_lite(logits, out=logits)
+        >>> print(P.sum(dim=-1))  # Row sums = 1
+        >>> print(P.sum(dim=-2))  # Col sums = 1
     
     Reference:
         "mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations"
         https://arxiv.org/abs/2601.05732
     """
+    import math
+    
+    # Input validation
+    assert logits.dim() == 3, f"logits must be 3D (M, N, N), got {logits.dim()}D"
+    M, n, n2 = logits.shape
+    assert n == n2, f"Last two dimensions must be equal, got ({n}, {n2})"
+    assert n <= 6, f"Matrix size n={n} too large (max n=6 for n!=720)"
     
     _LOGGER.info(
-        f"Sinkhorn-Knopp-Lite: logits={tuple(logits.shape)}"
+        f"Sinkhorn-Knopp-Lite: logits=({M}, {n}, {n}) (zero iterations)"
     )
     
-    # Handle both (M, n!) and (M, n, n) input formats
-    if logits.dim() == 3:
-        # Input is (M, n, n) - convert to (M, n!) logits
-        M, n, n2 = logits.shape
-        assert n == n2, f"Last two dimensions must be equal, got ({n}, {n2})"
-        
-        n_factorial = math.factorial(n)
-        
-        # Flatten and project to n! dimensions
-        logits_flat = logits.view(M, -1)  # (M, n²)
-        
-        # Simple projection strategy:
-        # If n² == n!, use directly; otherwise create uniform logits
-        if n_factorial == n * n:
-            logits = logits_flat
-        else:
-            # Use uniform logits (in practice, this should be a learned projection)
-            logits = torch.zeros(M, n_factorial, dtype=logits_flat.dtype, device=logits_flat.device)
-        
-        _LOGGER.info(
-            f"Converted (M, n, n)={M, n, n} to (M, n!)={M, n_factorial}"
-        )
+    n_factorial = math.factorial(n)
     
-    # Validate inputs
-    assert logits.dim() == 2, f"logits must be 2D (M, n!) or 3D (M, n, n), got {logits.dim()}D"
+    # Flatten input matrices to vectors (M, n²)
+    logits_flat = logits.view(M, -1)
     
-    M, n_factorial = logits.shape
+    # Project (M, n²) → (M, n!) using deterministic strategies
+    if n_factorial == n * n:
+        # Special case: n=2 (2!=2, n²=4) - use first n_factorial elements
+        logits_projected = logits_flat[:, :n_factorial].contiguous()
+    else:
+        # General case: Deterministic linear projection from n² to n!
+        # For n=4: project 16 dims → 24 dims using tiled repetition
+        repeat_factor = (n_factorial + n * n - 1) // (n * n)  # Ceiling division
+        logits_projected = logits_flat.repeat(1, repeat_factor)[:, :n_factorial].contiguous()
     
-    # Infer n from n! (reverse factorial)
-    # For small n: 1!=1, 2!=2, 3!=6, 4!=24, 5!=120, 6!=720
-    factorial_to_n = {1: 1, 2: 2, 6: 3, 24: 4, 120: 5, 720: 6}
-    assert n_factorial in factorial_to_n, (
-        f"n_factorial={n_factorial} doesn't correspond to valid n. "
-        f"Supported: {list(factorial_to_n.keys())}"
+    _LOGGER.info(
+        f"Projected (M, n²)=({M}, {n * n}) → (M, n!)=({M}, {n_factorial})"
     )
-    n = factorial_to_n[n_factorial]
-    
-    _LOGGER.info(f"Inferred n={n} from n_factorial={n_factorial}")
     
     # Generate permutation matrices (cached)
     perm_mats = _generate_permutation_matrices(n, logits.device, logits.dtype)

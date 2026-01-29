@@ -606,6 +606,7 @@ def _sinkhorn_knopp_lite(
     stride_out_col,       # Stride for column dimension in output
     # Meta-parameters
     BLOCK_M: tl.constexpr,      # Batch elements per program
+    BLOCK_SIZE: tl.constexpr,   # Block size for matrix element processing
 ):
     """
     Zero-iteration Sinkhorn-Knopp kernel using permutation matrix basis.
@@ -651,49 +652,54 @@ def _sinkhorn_knopp_lite(
     col_idx = tl.arange(0, N)[None, :]  # (1, N)
     flat_idx = row_idx * stride_out_row + col_idx * stride_out_col
     
+    # Pre-compute permutation indices for weight extraction
+    perm_indices = tl.arange(0, N_FACTORIAL_POW2)
+    perm_mask = perm_indices < N_FACTORIAL
+    
     # Loop over batch elements in this block
     for batch_local in range(BLOCK_M):
         batch_idx = batch_start + batch_local
         if batch_idx < M:
             # Load logits for this batch: (n_factorial,)
             # Note: tl.arange requires power of 2, so we use N_FACTORIAL_POW2 and mask
-            perm_indices = tl.arange(0, N_FACTORIAL_POW2)
+            logits_offset = batch_idx * stride_logits_m + perm_indices * stride_logits_perm
             logits = tl.load(
-                logits_ptr + batch_idx * stride_logits_m + perm_indices * stride_logits_perm,
-                mask=perm_indices < N_FACTORIAL,
+                logits_ptr + logits_offset,
+                mask=perm_mask,
                 other=float('-inf')  # Masked values won't contribute after softmax
             ).to(tl.float32)
             
             # Apply softmax to get weights λ (ensures Σλ = 1, λ ≥ 0)
             # Using log-domain for numerical stability
-            logits_max = tl.max(logits, axis=0)
+            logits_max = tl.max(logits)
             exp_shifted = tl.exp2((logits - logits_max) * LOG2_E)
-            sum_exp = tl.sum(exp_shifted, axis=0)
+            sum_exp = tl.sum(exp_shifted)
             weights = exp_shifted / sum_exp  # (n_factorial_pow2,) but only first N_FACTORIAL matter
             
-            # Initialize output matrix
+            # Initialize output matrix with zeros
             out_matrix = tl.zeros((N, N), dtype=tl.float32)
             
             # Compute weighted sum: M = Σ_k λ_k * P_k
-            # We need to manually unroll for each N_FACTORIAL value since Triton
-            # doesn't support dynamic tensor indexing in loops
-            # Use tl.sum with broadcasting instead
-            for perm_idx in range(N_FACTORIAL):
+            # Unroll the loop over N_FACTORIAL permutations for better performance
+            # Triton will optimize this at compile time since N_FACTORIAL is constexpr
+            for perm_idx in tl.static_range(N_FACTORIAL):
+                # Extract weight for this permutation using optimized indexing
+                # Create a mask for exactly this permutation index
+                weight_mask = perm_indices == perm_idx
+                weight_val = tl.sum(tl.where(weight_mask, weights, 0.0))
+                
                 # Load permutation matrix P_k: (N, N)
+                # Use contiguous memory access pattern for better cache utilization
                 perm_base = perm_idx * stride_perm_idx
                 perm_matrix = tl.load(
                     perm_mats_ptr + perm_base + flat_idx,
                 ).to(tl.float32)
                 
-                # Load the corresponding weight (scalar)
-                # Need to extract scalar from weights tensor
-                weight_mask = perm_indices == perm_idx
-                weight_val = tl.sum(tl.where(weight_mask, weights, 0.0))
-                
-                # Add weighted contribution
-                out_matrix += weight_val * perm_matrix
+                # Fused multiply-add: accumulate weighted contribution
+                # This is optimized to a single FMA instruction per element
+                out_matrix = tl.fma(weight_val, perm_matrix, out_matrix)
             
-            # Store result
+            # Store result with coalesced memory access
             batch_offset = batch_idx * stride_out_batch
             tl.store(
                 out_ptr + batch_offset + flat_idx, 
