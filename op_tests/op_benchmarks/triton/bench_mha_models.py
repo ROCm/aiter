@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 import io
 import logging
 import shlex
-from typing import Literal
+from typing import Literal, Optional
 
 
 def disable_aiter_logs() -> None:
@@ -104,22 +104,72 @@ class BenchArgs:
         return args_str
 
 
-def run_bench_mha(args: BenchArgs) -> tuple[str, str]:
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-    with redirect_stdout(stdout), redirect_stderr(stderr):
+def get_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
+    # Check empty stderr:
+    if not err:
+        return None
+    # Split stdout:
+    out_lines: list[list[str]] = [
+        out_line.split() for out_line in out.strip().split(sep="\n")
+    ]
+    # Check number of lines in stdout:
+    if len(out_lines) != 3:
+        return None
+    # Check stdout line #1 (benchmark name):
+    if out_lines[0] != ["bench_mha:"]:
+        return None
+    # Check stdout line #2 (table header):
+    kernel_header: str = {"fwd": "fwd", "bwdo": "onekernel-bwd", "bwdf": "fused-bwd"}[
+        args.kernel
+    ]
+    if out_lines[1] != [
+        "BATCH",
+        "HQ",
+        "HK",
+        "N_CTX_Q",
+        "N_CTX_K",
+        f"{kernel_header}(ms)",
+        "(ms)",
+    ]:
+        return None
+    # Check stdout line #3 (table data):
+    l2: list[str] = out_lines[2]
+    m: Model = args.tp_model.model
+    try:
+        if not all(
+            [
+                len(l2) == 7,
+                l2[0] == "0",
+                int(l2[1]) == args.b,
+                int(l2[2]) == m.hq,
+                int(l2[3]) == m.hkv,
+                int(l2[4]) == args.s,
+                int(l2[5]) == args.s,
+            ]
+        ):
+            return None
+        return float(l2[6])
+    except ValueError:
+        return None
+
+
+def run_bench_mha(args: BenchArgs) -> Optional[float]:
+    out = io.StringIO()
+    err = io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
         bench_mha_main(shlex.split(args.to_cli_str()))
-    return stdout.getvalue(), stderr.getvalue()
+    return get_bench_result(args, out.getvalue(), err.getvalue())
 
 
 def main() -> None:
     m = Model(name="Llama3 405B", hq=128, hkv=8, dqk=128, dv=128)
     tpm = TpModel(model=m, tp=8)
     ba = BenchArgs(kernel="fwd", layout="thd", tp_model=tpm, b=1, s=1024)
-    stdout, stderr = run_bench_mha(ba)
-    if stderr:
-        print(f"Errors / warnings:\n{stderr}")
-    print(f"Output:\n{stdout}")
+    result = run_bench_mha(ba)
+    if not result:
+        print("Unable to run benchmark.")
+    else:
+        print(f"Performance: {result:.3f} ms")
 
 
 if __name__ == "__main__":
