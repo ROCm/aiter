@@ -240,13 +240,15 @@ def get_bench_args(
 
 
 def main() -> None:
-    logging.basicConfig(format="%(levelname)s|%(message)s", level=logging.DEBUG)
+    logging.basicConfig(level=logging.DEBUG)
+    logging.info("Benchmarking attention configurations...")
     for ba in get_bench_args():
-        result = run_bench_mha(ba)
-        if not result:
-            print(f"{str(ba)} => error")
+        ms = run_bench_mha(ba)
+        if ms is not None:
+            logging.info("%s => error!", ba)
         else:
-            print(f"{str(ba)} => {result:.3f} ms")
+            logging.info("%s => %.3f ms", ba, ms)
+    logging.info("DONE.")
 
 
 if __name__ == "__main__":
