@@ -20,7 +20,8 @@ from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_fused_split_kernel,
     _mhc_fused_reduce_kernel,
     _sinkhorn_knopp_log_domain_kernel,
-    _sinkhorn_knopp_lite,
+    _mhc_lite_fused_split_kernel,
+    _mhc_lite_fused_reduce_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.mhc_config_utils import get_mhc_config
@@ -417,11 +418,8 @@ def mhc(
     M = out_res.shape[0]
     H_res_3d = out_res.view(M, n, n)
     
-    # # Iterative Sinkhorn-Knopp - modifies H_res_3d in-place
-    # sinkhorn_knopp(H_res_3d, num_iters=sinkhorn_iters, out=H_res_3d)
-    
-    # Zero-iteration Sinkhorn-Knopp (mHC-Lite) - modifies H_res_3d in-place
-    sinkhorn_knopp_lite(H_res_3d, out=H_res_3d)
+    # Iterative Sinkhorn-Knopp - modifies H_res_3d in-place
+    sinkhorn_knopp(H_res_3d, num_iters=sinkhorn_iters, out=H_res_3d)
     
     return out_pre, out_post, out_res
 
@@ -498,12 +496,12 @@ def sinkhorn_knopp(
         config, _ = get_mhc_config("MHC_SINKHORN", M)
     else:
         config = dict(config)  # Copy to avoid mutation
-    
-    # Filter out BLOCK_SIZE - only used by sinkhorn_knopp_lite, not the log domain kernel
-    kernel_config = {k: v for k, v in config.items() if k != "BLOCK_SIZE"}
 
+    # Pop BLOCK_M for grid calculation (handle legacy BLOCK_SIZE name)
+    BLOCK_M = config.pop("BLOCK_M", config.pop("BLOCK_SIZE", 8))
+    
     # Grid: one program per batch element, need large batch size for optimal performance
-    grid = (triton.cdiv(M, config["BLOCK_M"]),)
+    grid = (triton.cdiv(M, BLOCK_M),)
 
     _sinkhorn_knopp_log_domain_kernel[grid](
         logits,
@@ -514,7 +512,8 @@ def sinkhorn_knopp(
         logits.stride(2),
         N=N,
         NUM_ITERS=num_iters,
-        **kernel_config,
+        BLOCK_M=BLOCK_M,
+        **config,
     )
 
     return out
@@ -568,128 +567,241 @@ def _generate_permutation_matrices(n: int, device: torch.device, dtype: torch.dt
     return perm_mats
 
 
-def sinkhorn_knopp_lite(
-    logits: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+def mhc_lite(
+    x: torch.Tensor,
+    phi_pre: torch.Tensor,
+    phi_post: torch.Tensor,
+    phi_res: torch.Tensor,
+    alpha_pre: float,
+    alpha_post: float,
+    alpha_res: float,
+    bias: torch.Tensor,
+    n: int,
+    eps: float = 1e-6,
+    out_pre: Optional[torch.Tensor] = None,
+    out_post: Optional[torch.Tensor] = None,
+    out_res: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Zero-iteration Sinkhorn-Knopp using permutation matrix basis (mHC-Lite).
+    TRUE mHC-Lite with split-reduce optimization and integrated Sinkhorn-Knopp.
     
-    Instead of iteratively normalizing matrices to be doubly stochastic, this function
-    directly parameterizes them as convex combinations of permutation matrices, based
-    on the Birkhoff-von Neumann theorem.
+    Unlike standard `fused_mhc()`, this function:
+    - Accepts phi_res with shape (nC, n!) instead of (nC, n²)
+    - Fuses Sinkhorn-Knopp into the forward pass
+    - Produces H_res that is doubly stochastic by construction
     
-    Mathematical foundation:
-        Any doubly stochastic matrix M can be written as:
-        M = Σ_{k=1}^{n!} λ_k * P_k
-        where P_k are permutation matrices and λ_k ≥ 0, Σλ_k = 1
-    
-    Algorithm:
-        1. Generate all n! permutation matrices (cached)
-        2. Apply softmax to input logits to get weights λ
-        3. Compute weighted sum: M = Σ_k λ_k * P_k
-        4. Result is automatically doubly stochastic (no iterations!)
-    
-    Advantages over iterative Sinkhorn-Knopp:
-        ✓ Zero iterations required (one-shot computation)
-        ✓ Exact doubly stochastic property
-        ✓ Faster inference (no iteration loop)
-        ✓ Better numerical stability
-    
-    Limitations:
-        ✗ Requires storing n! permutation matrices in memory
-        ✗ Only practical for small n (typically n=4, where 4!=24)
-        ✗ For n=5: 5!=120, n=6: 6!=720 (memory intensive)
+    Mathematical implementation:
+        1. H̃^res = x @ phi_res  → (M, n!)
+        2. a = softmax(α^res·H̃^res + b^res) → (M, n!) normalized weights
+        3. H^res = Σ_k a_k · P_k → (M, n²) doubly stochastic
+        
+    This integrates equations 14-19 into a single forward pass with split-reduce
+    optimization for large K dimensions.
     
     Args:
-        logits (torch.Tensor): Input raw logits with shape (M, N, N), where:
-            - M is the batch size
-            - N is the matrix size (typically n=4)
-        out (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N, N).
-            If None, a new tensor is allocated. When provided, enables in-place operation.
-        config (Optional[dict]): Kernel tuning parameters. If None, loaded from JSON config files.
-    
+        x: Input tensor with shape (M, nC)
+        phi_pre: Pre-stream projection with shape (nC, n)
+        phi_post: Post-stream projection with shape (nC, n)
+        phi_res: Residual stream projection with shape (nC, n!) ← KEY DIFFERENCE
+        alpha_pre: Scaling factor α^pre for pre-stream
+        alpha_post: Scaling factor α^post for post-stream
+        alpha_res: Scaling factor α^res for residual stream
+        bias: Bias vector b with shape (n! + 2n,) ← Different from standard mHC
+        n: Stream parameter (manifold dimension)
+        eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
+        out_pre: Optional pre-allocated output for H^pre with shape (M, n)
+        out_post: Optional pre-allocated output for H^post with shape (M, n)
+        out_res: Optional pre-allocated output for H^res with shape (M, n²)
+        config: Kernel tuning parameters
+        
     Returns:
-        torch.Tensor: Doubly stochastic matrices with shape (M, N, N).
-            Each matrix in the batch has rows and columns summing to 1.
-            If `out` is provided, returns the same tensor (in-place operation).
-    
-    Example:
-        >>> # Zero-iteration doubly stochastic projection
-        >>> logits = torch.randn(16, 4, 4, device='cuda')
-        >>> P = sinkhorn_knopp_lite(logits, out=logits)
-        >>> print(P.sum(dim=-1))  # Row sums = 1
-        >>> print(P.sum(dim=-2))  # Col sums = 1
+        Tuple of three tensors (H_pre, H_post, H_res):
+        - H_pre: (M, n) - pre-stream with sigmoid activation
+        - H_post: (M, n) - post-stream with scaled sigmoid
+        - H_res: (M, n²) - residual stream (DOUBLY STOCHASTIC by construction)
+        
+    Shape requirements:
+        - x: (M, nC)
+        - phi_pre: (nC, n)
+        - phi_post: (nC, n)
+        - phi_res: (nC, n!) ← Not (nC, n²)!
+        - bias: (n! + 2n,) ← Not (n² + 2n)!
+        - outputs: H_pre (M, n), H_post (M, n), H_res (M, n²)
     
     Reference:
         "mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations"
         https://arxiv.org/abs/2601.05732
     """
-    import math
-    
     # Input validation
-    assert logits.dim() == 3, f"logits must be 3D (M, N, N), got {logits.dim()}D"
-    M, n, n2 = logits.shape
-    assert n == n2, f"Last two dimensions must be equal, got ({n}, {n2})"
-    assert n <= 6, f"Matrix size n={n} too large (max n=6 for n!=720)"
+    M, K = x.shape
+    import math
+    n_factorial = math.factorial(n)
+    n_squared = n * n
+    
+    assert phi_res.shape == (K, n_factorial), (
+        f"phi_res shape mismatch: expected ({K}, {n_factorial}), got {phi_res.shape}"
+    )
+    assert bias.shape[0] == n_factorial + 2 * n, (
+        f"bias shape mismatch: expected ({n_factorial + 2 * n},), got {bias.shape}"
+    )
     
     _LOGGER.info(
-        f"Sinkhorn-Knopp-Lite: logits=({M}, {n}, {n}) (zero iterations)"
+        f"TRUE mHC-Lite: x=({M}, {K}), phi_res=({K}, {n_factorial}), n={n}"
     )
     
-    n_factorial = math.factorial(n)
-    n_sq = n * n
+    # Allocate outputs if not provided
+    if out_pre is None:
+        out_pre = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    if out_post is None:
+        out_post = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    if out_res is None:
+        out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
     
     # Generate permutation matrices (cached)
-    perm_mats = _generate_permutation_matrices(n, logits.device, logits.dtype)
-    assert perm_mats.shape == (n_factorial, n, n), (
-        f"Expected perm_mats shape ({n_factorial}, {n}, {n}), "
-        f"got {perm_mats.shape}"
-    )
+    perm_mats = _generate_permutation_matrices(n, x.device, x.dtype)
     
-    # Ensure contiguous
-    logits = logits.contiguous()
-    perm_mats = perm_mats.contiguous()
+    # Find next power of 2 >= n_factorial for vectorized softmax
+    n_factorial_pow2 = 1 << (n_factorial - 1).bit_length()
     
-    # Allocate output if not provided
-    if out is None:
-        out = torch.empty((M, n, n), dtype=logits.dtype, device=logits.device)
-    else:
-        assert out.shape == (M, n, n), f"out.shape {out.shape} must be ({M}, {n}, {n})"
-        out = out.contiguous()
-    
-    # Get config from JSON files if not provided
+    # Load configuration
+    C = K // n
     if config is None:
-        config, _ = get_mhc_config("MHC_SINKHORN", M)
+        config, _ = get_mhc_config("MHC_FUSED", M, C)
     else:
-        config = dict(config)  # Copy to avoid mutation
+        base_config, _ = get_mhc_config("MHC_FUSED", M, C)
+        config = {**base_config, **config}
     
-    # 2D Grid (like mhc_fused_reduce_kernel):
-    # Axis 0: batch dimension (M), Axis 1: flattened matrix elements (n²)
-    grid = (triton.cdiv(M, config["BLOCK_M"]), triton.cdiv(n_sq, config["BLOCK_SIZE"]))
+    # Pop block sizes and num_ksplit from config to avoid conflicts
+    BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
+    BLOCK_N = config.pop("BLOCK_N", 16)
+    BLOCK_K = config.pop("BLOCK_K", 64)
+    BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
+    num_ksplit = config.pop("NUM_KSPLIT", 2)  # Default to 2 for parallelization
     
-    # Compute next power of 2 for N_FACTORIAL (required by Triton's tl.arange)
-    n_factorial_pow2 = triton.next_power_of_2(n_factorial)
+    # Total bias size for kernel
+    N = n_factorial + 2 * n
     
-    _sinkhorn_knopp_lite[grid](
-        logits,
-        perm_mats,
-        out,
-        M,
-        N=n,
-        N_FACTORIAL=n_factorial,
-        N_FACTORIAL_POW2=n_factorial_pow2,
-        stride_logits_m=logits.stride(0),
-        stride_logits_row=logits.stride(1),
-        stride_logits_col=logits.stride(2),
-        stride_perm_idx=perm_mats.stride(0),
-        stride_perm_row=perm_mats.stride(1),
-        stride_perm_col=perm_mats.stride(2),
-        stride_out_batch=out.stride(0),
-        stride_out_row=out.stride(1),
-        stride_out_col=out.stride(2),
-        **config,
-    )
+    # Calculate total output blocks: pre + post + res
+    n_blocks_pre = triton.cdiv(n, BLOCK_N)
+    n_blocks_post = triton.cdiv(n, BLOCK_N)
+    n_blocks_res = triton.cdiv(n_squared, BLOCK_N)
+    total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
     
-    return out
+    if num_ksplit > 1:
+        # Split-K path: use split and reduce kernels
+        splitk_block_size = triton.cdiv(K, num_ksplit)
+        actual_ksplit = triton.cdiv(K, splitk_block_size)
+        
+        # Allocate intermediate buffers (float32 for precision)
+        acc_pre_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
+        acc_post_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
+        acc_res_partial = torch.empty((num_ksplit, M, n_factorial), dtype=torch.float32, device=x.device)  # n! not n²
+        acc_sq_partial = torch.empty((num_ksplit, M), dtype=torch.float32, device=x.device)
+        
+        # Launch split kernel with 3D grid: (M_blocks, N_blocks_total, NUM_KSPLIT)
+        grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
+        _mhc_lite_fused_split_kernel[grid_split](
+            x,
+            phi_pre,
+            phi_post,
+            phi_res,
+            acc_pre_partial,
+            acc_post_partial,
+            acc_res_partial,
+            acc_sq_partial,
+            # Dimensions
+            M=M,
+            K=K,
+            N=N,
+            n=n,
+            N_FACTORIAL=n_factorial,
+            # Input strides
+            stride_xm=x.stride(0),
+            stride_xk=x.stride(1),
+            stride_phi_pre_k=phi_pre.stride(0),
+            stride_phi_pre_n=phi_pre.stride(1),
+            stride_phi_post_k=phi_post.stride(0),
+            stride_phi_post_n=phi_post.stride(1),
+            stride_phi_res_k=phi_res.stride(0),
+            stride_phi_res_n=phi_res.stride(1),  # n! dimension
+            # Intermediate buffer strides
+            stride_acc_pre_k=acc_pre_partial.stride(0),
+            stride_acc_pre_m=acc_pre_partial.stride(1),
+            stride_acc_pre_n=acc_pre_partial.stride(2),
+            stride_acc_post_k=acc_post_partial.stride(0),
+            stride_acc_post_m=acc_post_partial.stride(1),
+            stride_acc_post_n=acc_post_partial.stride(2),
+            stride_acc_res_k=acc_res_partial.stride(0),
+            stride_acc_res_m=acc_res_partial.stride(1),
+            stride_acc_res_n=acc_res_partial.stride(2),  # n! dimension
+            stride_acc_sq_k=acc_sq_partial.stride(0),
+            stride_acc_sq_m=acc_sq_partial.stride(1),
+            # Block sizes
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            NUM_KSPLIT=num_ksplit,
+            SPLITK_BLOCK_SIZE=splitk_block_size,
+            **config,
+        )
+        
+        # Launch reduce kernel with 2D grid: (M_blocks, N_blocks_total)
+        grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
+        _mhc_lite_fused_reduce_kernel[grid_reduce](
+            acc_pre_partial,
+            acc_post_partial,
+            acc_res_partial,
+            acc_sq_partial,
+            perm_mats,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            out_pre,
+            out_post,
+            out_res,
+            # Dimensions
+            M=M,
+            K=K,
+            N=N,
+            n=n,
+            N_FACTORIAL=n_factorial,
+            N_FACTORIAL_POW2=n_factorial_pow2,
+            eps=eps,
+            # Intermediate buffer strides
+            stride_acc_pre_k=acc_pre_partial.stride(0),
+            stride_acc_pre_m=acc_pre_partial.stride(1),
+            stride_acc_pre_n=acc_pre_partial.stride(2),
+            stride_acc_post_k=acc_post_partial.stride(0),
+            stride_acc_post_m=acc_post_partial.stride(1),
+            stride_acc_post_n=acc_post_partial.stride(2),
+            stride_acc_res_k=acc_res_partial.stride(0),
+            stride_acc_res_m=acc_res_partial.stride(1),
+            stride_acc_res_n=acc_res_partial.stride(2),  # n! dimension
+            stride_acc_sq_k=acc_sq_partial.stride(0),
+            stride_acc_sq_m=acc_sq_partial.stride(1),
+            # Permutation matrix strides
+            stride_perm_idx=perm_mats.stride(0),
+            stride_perm_row=perm_mats.stride(1),
+            stride_perm_col=perm_mats.stride(2),
+            # Output strides
+            stride_pre_m=out_pre.stride(0),
+            stride_pre_n=out_pre.stride(1),
+            stride_post_m=out_post.stride(0),
+            stride_post_n=out_post.stride(1),
+            stride_res_m=out_res.stride(0),
+            stride_res_n=out_res.stride(1),
+            # Block sizes
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            NUM_KSPLIT=num_ksplit,
+            ACTUAL_KSPLIT=actual_ksplit,
+            **config,
+        )
+    else:
+        raise NotImplementedError(
+            "Use NUM_KSPLIT > 1 for split-reduce optimization."
+        )
+    
+    return out_pre, out_post, out_res

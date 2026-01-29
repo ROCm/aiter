@@ -14,6 +14,7 @@ import logging
 from itertools import product
 import torch
 import triton
+import math
 
 # Configure logging before importing aiter modules
 logging.basicConfig(
@@ -22,7 +23,7 @@ logging.basicConfig(
     force=True
 )
 
-from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
+from aiter.ops.triton.fusions.mhc import mhc, mhc_lite, fused_mhc, sinkhorn_knopp
 from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
@@ -88,6 +89,8 @@ def run_benchmark(args):
     benchmark_name = get_caller_name_no_ext()
     if mode == "full":
         benchmark_name += f"_full_sinkhorn{sinkhorn_iters}"
+    elif mode == "full_lite":
+        benchmark_name += "_full_lite_zero_iter"
     elif mode == "fused":
         benchmark_name += "_fused_only"
     elif mode == "sinkhorn":
@@ -112,28 +115,46 @@ def run_benchmark(args):
         x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = \
             generate_mhc_inputs(M, n, C, dtype)
         
-        # Compute FLOPs for mHC operation
+        # Compute FLOPs for mHC or mHC-Lite operation
         nC = n * C
-        N = n * n + 2 * n
+        if mode == "full_lite":
+            import math
+            n_factorial = math.factorial(n)
+            # Replace phi_res: (nC, n²) → (nC, n!)
+            phi_res = torch.randn(nC, n_factorial, dtype=dtype, device=x.device)
+            # Replace bias: (n² + 2n,) → (n! + 2n,)
+            bias = torch.randn(n_factorial + 2 * n, dtype=torch.float32, device=x.device)
+            N = n_factorial + 2 * n
+        else:
+            N = n * n + 2 * n
         
         # Standard GEMM FLOPs (2*M*N*K for matrix multiply)
         # Eq 14: x @ phi for 3 streams
         # - x @ phi_pre: (M, nC) @ (nC, n) = 2*M*nC*n
         # - x @ phi_post: (M, nC) @ (nC, n) = 2*M*nC*n  
-        # - x @ phi_res: (M, nC) @ (nC, n*n) = 2*M*nC*n*n
-        flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * (n * n)
+        # - x @ phi_res: For mHC: (M, nC) @ (nC, n²) = 2*M*nC*n²
+        #                For mHC-Lite: (M, nC) @ (nC, n!) = 2*M*nC*n!
+        if mode == "full_lite":
+            n_factorial = math.factorial(n)
+            # mHC-Lite matmul: pre + post + res(n!)
+            flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * n_factorial
+            # mHC-Lite includes softmax + weighted permutation sum as "Sinkhorn"
+            # Softmax: exp + sum + divide ≈ 3*n! ops per row
+            # Weighted sum: n! * n² multiply-adds ≈ 2*n!*n² ops per row
+            flops_sinkhorn = M * (3.0 * n_factorial + 2.0 * n_factorial * n * n)
+        else:
+            # Standard mHC matmul: pre + post + res(n²)
+            flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * (n * n)
+            # Iterative Sinkhorn: 2 normalizations per iteration
+            flops_sinkhorn = 4.0 * M * n * n * sinkhorn_iters
         
         # Eq 15: RMS normalization - M rows, each with nC elements
         # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
         flops_rms = 4.0 * M * nC
         
-        # Eq 19: Sinkhorn-Knopp (separate kernel)
-        # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
-        # Per normalization: sum + divide ≈ 2n ops per row/col
-        # Total per iteration: 2 * 2 * M * n * n = 4 * M * n * n ops
-        flops_sinkhorn = 4.0 * M * n * n * sinkhorn_iters
-        
         if mode == "full":
+            total_flops = flops_matmul + flops_rms + flops_sinkhorn
+        elif mode == "full_lite":
             total_flops = flops_matmul + flops_rms + flops_sinkhorn
         elif mode == "fused":
             total_flops = flops_matmul + flops_rms
@@ -146,13 +167,20 @@ def run_benchmark(args):
         
         # Memory reads:
         # - x: (M, nC)
-        # - phi_pre, phi_post, phi_res: (nC, n), (nC, n), (nC, n*n)
+        # - phi_pre, phi_post: (nC, n), (nC, n)
+        # - phi_res: (nC, n²) for standard mHC or (nC, n!) for mHC-Lite
         # - bias: (N,) in fp32
+        if mode == "full_lite":
+            n_factorial = math.factorial(n)
+            phi_res_size = n_factorial
+        else:
+            phi_res_size = n * n
+            
         mem_read = (
             M * nC * elem_size +  # x
             nC * n * elem_size +  # phi_pre
             nC * n * elem_size +  # phi_post
-            nC * n * n * elem_size +  # phi_res
+            nC * phi_res_size * elem_size +  # phi_res
             N * bias_size  # bias
         )
         
@@ -173,6 +201,11 @@ def run_benchmark(args):
             mem_read += mem_sinkhorn / 2
             mem_write += mem_sinkhorn / 2
             total_mem = mem_read + mem_write
+        elif mode == "full_lite":
+            # mHC-Lite: includes permutation matrices (n!, n, n) in read
+            n_factorial = math.factorial(n)
+            mem_read += n_factorial * n * n * elem_size  # perm_mats
+            total_mem = mem_read + mem_write
         elif mode == "fused":
             total_mem = mem_read + mem_write
         elif mode == "sinkhorn":
@@ -186,6 +219,12 @@ def run_benchmark(args):
                 alpha_pre, alpha_post, alpha_res,
                 bias, n_streams,
                 sinkhorn_iters=sinkhorn_iters
+            )
+        elif mode == "full_lite":
+            fn = lambda: mhc_lite(
+                x, phi_pre, phi_post, phi_res,
+                alpha_pre, alpha_post, alpha_res,
+                bias, n_streams
             )
         elif mode == "fused":
             fn = lambda: fused_mhc(
@@ -261,8 +300,8 @@ def parse_args():
         "--mode",
         type=str,
         default="full",
-        choices=["full", "fused", "sinkhorn"],
-        help="Benchmark mode: 'full' (fused+sinkhorn), 'fused' (fused kernel only), 'sinkhorn' (sinkhorn-only)"
+        choices=["full", "full_lite", "fused", "sinkhorn"],
+        help="Benchmark mode: 'full' (fused+sinkhorn), 'full_lite' (mHC-Lite), 'fused' (fused kernel only), 'sinkhorn' (sinkhorn-only)"
     )
     parser.add_argument(
         "-sinkhorn_iters",

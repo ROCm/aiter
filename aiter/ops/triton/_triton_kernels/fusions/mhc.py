@@ -586,108 +586,332 @@ def _sinkhorn_knopp_log_domain_kernel(
 
 
 @triton.jit
-def _sinkhorn_knopp_lite(
-    # Pointers
-    logits_ptr,     # Input: (M, n, n) raw logits
-    perm_mats_ptr,  # Input: (n_factorial, N, N) pre-computed permutation matrices
-    out_ptr,        # Output: (M, N, N) doubly stochastic matrices
-    # Dimensions
-    M,              # Batch size (number of matrices)
-    N: tl.constexpr,            # Matrix size
-    N_FACTORIAL: tl.constexpr,  # Number of permutations (N!)
-    N_FACTORIAL_POW2: tl.constexpr,  # Next power of 2 >= N_FACTORIAL
-    # Strides
-    stride_logits_m,      # Stride for batch dimension in logits
-    stride_logits_row,    # Stride for row in logits
-    stride_logits_col,    # Stride for col in logits
-    stride_perm_idx,      # Stride for permutation index in perm_mats
-    stride_perm_row,      # Stride for row in perm_mats
-    stride_perm_col,      # Stride for col in perm_mats
-    stride_out_batch,     # Stride for batch dimension in output
-    stride_out_row,       # Stride for row dimension in output
-    stride_out_col,       # Stride for column dimension in output
-    # Meta-parameters
-    BLOCK_M: tl.constexpr,      # Batch elements per program
-    BLOCK_SIZE: tl.constexpr,   # Matrix elements per program (n²)
+def _mhc_lite_fused_split_kernel(
+    x_ptr,
+    phi_pre_ptr,
+    phi_post_ptr,
+    phi_res_ptr,  # Shape: (nC, n!) for mHC-Lite
+    # Intermediate output buffers (float32)
+    acc_pre_ptr,      # (NUM_KSPLIT, M, n)
+    acc_post_ptr,     # (NUM_KSPLIT, M, n)
+    acc_res_ptr,      # (NUM_KSPLIT, M, n!) - logits for permutation weights
+    acc_sq_ptr,       # (NUM_KSPLIT, M)
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,            # Total output: n + n + n²
+    n: tl.constexpr,
+    N_FACTORIAL: tl.constexpr,  # n!
+    stride_xm,
+    stride_xk,
+    stride_phi_pre_k,
+    stride_phi_pre_n,
+    stride_phi_post_k,
+    stride_phi_post_n,
+    stride_phi_res_k,
+    stride_phi_res_n,  # n! dimension
+    # Strides for intermediate buffers
+    stride_acc_pre_k,
+    stride_acc_pre_m,
+    stride_acc_pre_n,
+    stride_acc_post_k,
+    stride_acc_post_m,
+    stride_acc_post_n,
+    stride_acc_res_k,
+    stride_acc_res_m,
+    stride_acc_res_n,  # n! dimension
+    stride_acc_sq_k,
+    stride_acc_sq_m,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Zero-iteration Sinkhorn-Knopp kernel using permutation matrix basis.
+    Split-K kernel for mHC-Lite - computes partial matmuls.
     
-    Grid structure (like mhc_fused_reduce_kernel):
-        2D grid: (cdiv(M, BLOCK_M), cdiv(N², BLOCK_SIZE))
-        - pid_m: batch dimension (processes BLOCK_M matrices)
-        - pid_n: flattened matrix dimension (processes BLOCK_SIZE elements)
+    Key difference from standard mHC: phi_res has shape (nC, n!) instead of (nC, n²).
+    This produces logits for the n! permutation weights that will be softmaxed
+    in the reduce kernel.
     
-    Each program computes BLOCK_M × BLOCK_SIZE output elements.
-    
-    Mathematical foundation:
-        M = Σ_{k=1}^{n!} λ_k * P_k (Birkhoff-von Neumann theorem)
-    
-    Reference: "mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations"
+    Grid structure: (M_blocks, N_blocks_total, NUM_KSPLIT)
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    
-    # Batch indices: (BLOCK_M,)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     
-    # Flattened matrix element indices: (BLOCK_SIZE,)
-    rn = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # Compute stream block counts
+    n_squared = n * n
+    n_blocks_pre = tl.cdiv(n, BLOCK_N)
+    n_blocks_post = n_blocks_pre
+    n_blocks_res = tl.cdiv(N_FACTORIAL, BLOCK_N)  # n! dimension for lite
     
-    # Convert flat indices to (row, col)
-    N_SQ: tl.constexpr = N * N
-    row_coords = rn // N  # (BLOCK_SIZE,)
-    col_coords = rn % N   # (BLOCK_SIZE,)
+    is_pre_program = pid_n < n_blocks_pre
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
+    is_res_program = ~is_pre_program & ~is_post_program
     
-    # Masks
-    batch_mask = rm < M
-    elem_mask = rn < N_SQ
+    stream_offset = is_post_program.to(tl.int32) * n_blocks_pre + is_res_program.to(tl.int32) * (n_blocks_pre + n_blocks_post)
+    local_pid_n = pid_n - stream_offset
     
-    # Constants
-    LOG2_E: tl.constexpr = 1.4426950408889634
+    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     
-    # Permutation indices
-    perm_indices = tl.arange(0, N_FACTORIAL_POW2)
+    # Output dimension for this stream
+    n_out = tl.where(is_res_program, N_FACTORIAL, n)  # n! for res, n for pre/post
     
-    # STEP 1: Load logits and compute softmax for BLOCK_M batches
-    # Shape: (BLOCK_M, N_FACTORIAL_POW2)
-    logits_2d = tl.zeros((BLOCK_M, N_FACTORIAL_POW2), dtype=tl.float32) + float('-inf')
+    split_k_start = pid_k * SPLITK_BLOCK_SIZE
+    split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
     
-    for perm_idx in tl.static_range(N_FACTORIAL):
-        logit_elem_idx = perm_idx % N_SQ
-        logit_row = logit_elem_idx // N
-        logit_col = logit_elem_idx % N
+    if split_k_start >= K:
+        return
+    
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    phi_ptr = tl.where(is_pre_program, phi_pre_ptr,
+                       tl.where(is_post_program, phi_post_ptr, phi_res_ptr))
+    stride_phi_k = tl.where(is_pre_program, stride_phi_pre_k,
+                       tl.where(is_post_program, stride_phi_post_k, stride_phi_res_k))
+    stride_phi_n = tl.where(is_pre_program, stride_phi_pre_n,
+                       tl.where(is_post_program, stride_phi_post_n, stride_phi_res_n))
+    
+    k_span = split_k_end - split_k_start
+    num_k_iter = tl.cdiv(k_span, BLOCK_K)
+    
+    for k_idx in range(num_k_iter):
+        k = split_k_start + k_idx * BLOCK_K
+        rk = k + tl.arange(0, BLOCK_K)
         
-        # Vectorized load across batches
-        logit_ptrs = logits_ptr + rm * stride_logits_m + logit_row * stride_logits_row + logit_col * stride_logits_col
-        logit_vals = tl.load(logit_ptrs, mask=batch_mask, other=float('-inf')).to(tl.float32)
+        x_tile = tl.load(
+            x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
+            mask=(rm[:, None] < M) & (rk[None, :] < split_k_end),
+            other=0.0,
+        )
         
-        logits_2d = tl.where((perm_indices == perm_idx)[None, :], logit_vals[:, None], logits_2d)
-    
-    # Vectorized softmax for BLOCK_M batches
-    logits_max = tl.max(logits_2d, axis=1, keep_dims=True)
-    exp_shifted = tl.exp2((logits_2d - logits_max) * LOG2_E)
-    sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
-    weights = exp_shifted / sum_exp  # (BLOCK_M, N_FACTORIAL_POW2)
-    
-    # STEP 2: Compute weighted sum for (BLOCK_M, BLOCK_SIZE) output elements
-    # output[b, e] = Σ_k weights[b, k] * perm_mats[k, row_coords[e], col_coords[e]]
-    output = tl.zeros((BLOCK_M, BLOCK_SIZE), dtype=tl.float32)
-    
-    for perm_idx in tl.static_range(N_FACTORIAL):
-        # Load permutation matrix elements for BLOCK_SIZE positions
-        # perm_vals[e] = perm_mats[perm_idx, row_coords[e], col_coords[e]]
-        perm_ptrs = perm_mats_ptr + perm_idx * stride_perm_idx + row_coords * stride_perm_row + col_coords * stride_perm_col
-        perm_vals = tl.load(perm_ptrs, mask=elem_mask, other=0.0).to(tl.float32)  # (BLOCK_SIZE,)
+        phi_tile = tl.load(
+            phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
+            mask=(rk[:, None] < split_k_end) & (rn_local[None, :] < n_out),
+            other=0.0,
+        )
         
-        # Extract weights for this permutation across batches
-        weight_mask = perm_indices == perm_idx
-        perm_weights = tl.sum(tl.where(weight_mask[None, :], weights, 0.0), axis=1)  # (BLOCK_M,)
-        
-        # Outer product: (BLOCK_M, 1) * (1, BLOCK_SIZE) → (BLOCK_M, BLOCK_SIZE)
-        output = tl.fma(perm_weights[:, None], perm_vals[None, :], output)
+        acc += tl.dot(x_tile, phi_tile)
+        x_tile_f32 = x_tile.to(tl.float32)
+        acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
     
-    # STEP 3: Store (BLOCK_M, BLOCK_SIZE) outputs
-    out_ptrs = out_ptr + rm[:, None] * stride_out_batch + row_coords[None, :] * stride_out_row + col_coords[None, :] * stride_out_col
-    store_mask = batch_mask[:, None] & elem_mask[None, :]
-    tl.store(out_ptrs, output.to(out_ptr.dtype.element_ty), mask=store_mask) 
+    acc_ptr = tl.where(is_pre_program, acc_pre_ptr,
+                       tl.where(is_post_program, acc_post_ptr, acc_res_ptr))
+    stride_acc_k = tl.where(is_pre_program, stride_acc_pre_k,
+                       tl.where(is_post_program, stride_acc_post_k, stride_acc_res_k))
+    stride_acc_m = tl.where(is_pre_program, stride_acc_pre_m,
+                       tl.where(is_post_program, stride_acc_post_m, stride_acc_res_m))
+    stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n,
+                       tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n))
+    
+    tl.store(
+        acc_ptr + pid_k * stride_acc_k + rm[:, None] * stride_acc_m + rn_local[None, :] * stride_acc_n,
+        acc,
+        mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+    )
+    
+    if is_pre_program:
+        if local_pid_n == 0:
+            tl.store(
+                acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
+                acc_sq,
+                mask=rm < M,
+            )
+
+
+@triton.jit
+def _mhc_lite_fused_reduce_kernel(
+    # Intermediate buffers
+    acc_pre_ptr,      # (NUM_KSPLIT, M, n)
+    acc_post_ptr,     # (NUM_KSPLIT, M, n)
+    acc_res_ptr,      # (NUM_KSPLIT, M, n!) - logits
+    acc_sq_ptr,       # (NUM_KSPLIT, M)
+    # Permutation matrices
+    perm_mats_ptr,    # (n!, n, n)
+    # Parameters
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    bias_ptr,
+    # Final outputs
+    out_pre_ptr,
+    out_post_ptr,
+    out_res_ptr,      # (M, n²)
+    # Dimensions
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    n: tl.constexpr,
+    N_FACTORIAL: tl.constexpr,
+    N_FACTORIAL_POW2: tl.constexpr,
+    eps: tl.constexpr,
+    # Intermediate buffer strides
+    stride_acc_pre_k,
+    stride_acc_pre_m,
+    stride_acc_pre_n,
+    stride_acc_post_k,
+    stride_acc_post_m,
+    stride_acc_post_n,
+    stride_acc_res_k,
+    stride_acc_res_m,
+    stride_acc_res_n,
+    stride_acc_sq_k,
+    stride_acc_sq_m,
+    # Permutation matrix strides
+    stride_perm_idx,
+    stride_perm_row,
+    stride_perm_col,
+    # Output strides
+    stride_pre_m,
+    stride_pre_n,
+    stride_post_m,
+    stride_post_n,
+    stride_res_m,
+    stride_res_n,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    ACTUAL_KSPLIT: tl.constexpr,
+):
+    """
+    Reduce kernel for mHC-Lite - reduces partial results and applies Sinkhorn-Knopp fusion.
+    
+    For pre/post streams: standard reduce + RMS + bias + activation
+    For res stream: reduce → softmax over n! → weighted permutation sum → doubly stochastic
+    
+    This implements the core mHC-Lite innovation: H^res = Σ softmax(logits)_k * P_k
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    
+    n_squared = n * n
+    n_blocks_pre = tl.cdiv(n, BLOCK_N)
+    n_blocks_post = n_blocks_pre
+    
+    is_pre_program = pid_n < n_blocks_pre
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
+    is_res_program = ~is_pre_program & ~is_post_program
+    
+    stream_offset = is_post_program.to(tl.int32) * n_blocks_pre + is_res_program.to(tl.int32) * (n_blocks_pre + n_blocks_post)
+    local_pid_n = pid_n - stream_offset
+    
+    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    col_offset = n * (is_post_program.to(tl.int32) + 2 * is_res_program.to(tl.int32))
+    rn_global = rn_local + col_offset
+    
+    # Reduce acc_sq
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for ks in range(ACTUAL_KSPLIT):
+        acc_sq_partial = tl.load(
+            acc_sq_ptr + ks * stride_acc_sq_k + rm * stride_acc_sq_m,
+            mask=rm < M,
+            other=0.0,
+        )
+        acc_sq += acc_sq_partial
+    
+    rms = tl.sqrt(acc_sq / K + eps)
+    rsigma = 1.0 / rms
+    
+    if is_res_program:
+        # mHC-Lite path: reduce logits → softmax → weighted permutation sum
+        # STEP 1: Reduce logits across K-splits (M, n!)
+        n_blocks_res = tl.cdiv(n_squared, BLOCK_N)
+        if local_pid_n >= n_blocks_res:
+            return
+        
+        # Allocate for n! logits per batch
+        logits = tl.zeros([BLOCK_M, N_FACTORIAL_POW2], dtype=tl.float32) + float('-inf')
+        
+        # Reduce partial logits
+        for perm_idx in tl.static_range(N_FACTORIAL):
+            logit_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
+            for ks in range(ACTUAL_KSPLIT):
+                logit_partial = tl.load(
+                    acc_res_ptr + ks * stride_acc_res_k + rm * stride_acc_res_m + perm_idx * stride_acc_res_n,
+                    mask=rm < M,
+                    other=0.0,
+                )
+                logit_acc += logit_partial
+            
+            # Apply RMSNorm + alpha + bias
+            bias_val = tl.load(bias_ptr + (n + n + perm_idx), mask=(n + n + perm_idx) < N, other=0.0).to(tl.float32)
+            logit_normalized = rsigma * alpha_res * logit_acc + bias_val
+            
+            perm_indices = tl.arange(0, N_FACTORIAL_POW2)
+            logits = tl.where((perm_indices == perm_idx)[None, :], logit_normalized[:, None], logits)
+        
+        # STEP 2: Softmax over n! dimension
+        LOG2_E: tl.constexpr = 1.4426950408889634
+        logits_max = tl.max(logits, axis=1, keep_dims=True)
+        exp_shifted = tl.exp2((logits - logits_max) * LOG2_E)
+        sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
+        weights = exp_shifted / sum_exp  # (BLOCK_M, N_FACTORIAL_POW2)
+        
+        # STEP 3: Weighted sum of permutation matrices
+        # Compute which n² elements this program handles
+        elem_start = local_pid_n * BLOCK_N
+        elem_indices = elem_start + tl.arange(0, BLOCK_N)
+        elem_mask = elem_indices < n_squared
+        
+        row_coords = elem_indices // n
+        col_coords = elem_indices % n
+        
+        output = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        
+        for perm_idx in tl.static_range(N_FACTORIAL):
+            perm_ptrs = perm_mats_ptr + perm_idx * stride_perm_idx + row_coords * stride_perm_row + col_coords * stride_perm_col
+            perm_vals = tl.load(perm_ptrs, mask=elem_mask, other=0.0).to(tl.float32)
+            
+            perm_indices = tl.arange(0, N_FACTORIAL_POW2)
+            weight_mask = perm_indices == perm_idx
+            perm_weights = tl.sum(tl.where(weight_mask[None, :], weights, 0.0), axis=1)
+            
+            output = tl.fma(perm_weights[:, None], perm_vals[None, :], output)
+        
+        # Store H^res (already doubly stochastic)
+        out_ptrs = out_res_ptr + rm[:, None] * stride_res_m + elem_indices[None, :] * stride_res_n
+        store_mask = (rm < M)[:, None] & elem_mask[None, :]
+        tl.store(out_ptrs, output.to(out_res_ptr.dtype.element_ty), mask=store_mask)
+        
+    else:
+        # Standard mHC path for pre/post streams
+        n_out = n
+        acc_ptr = tl.where(is_pre_program, acc_pre_ptr, acc_post_ptr)
+        stride_acc_k = tl.where(is_pre_program, stride_acc_pre_k, stride_acc_post_k)
+        stride_acc_m = tl.where(is_pre_program, stride_acc_pre_m, stride_acc_post_m)
+        stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n, stride_acc_post_n)
+        
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for ks in range(ACTUAL_KSPLIT):
+            acc_partial = tl.load(
+                acc_ptr + ks * stride_acc_k + rm[:, None] * stride_acc_m + rn_local[None, :] * stride_acc_n,
+                mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+                other=0.0,
+            )
+            acc += acc_partial
+        
+        bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
+        alpha_val = tl.where(is_pre_program, alpha_pre, alpha_post)
+        
+        out = rsigma[:, None] * alpha_val * acc + bias[None, :]
+        
+        sigmoid_out = tl.sigmoid(out)
+        out_activated = tl.where(is_pre_program, sigmoid_out, sigmoid_out * 2.0)
+
+        out_ptr = tl.where(is_pre_program, out_pre_ptr, out_post_ptr)
+        stride_out_m = tl.where(is_pre_program, stride_pre_m, stride_post_m)
+        stride_out_n = tl.where(is_pre_program, stride_pre_n, stride_post_n)
+        
+        tl.store(
+            out_ptr + rm[:, None] * stride_out_m + rn_local[None, :] * stride_out_n,
+            out_activated,
+            mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+        )

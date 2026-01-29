@@ -5,5 +5,6 @@ from aiter.ops.triton.fusions.mhc import mhc, sinkhorn_knopp
 
 __all__ = [
     "mhc",
+    "mhc_lite",
     "sinkhorn_knopp",
 ]
