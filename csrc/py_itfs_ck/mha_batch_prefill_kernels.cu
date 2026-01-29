@@ -33,9 +33,13 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                std::optional<const at::Tensor> sink_ptr_,
                                std::optional<const at::Tensor>& bias_,
                                std::optional<const at::Tensor>& alibi_slopes_,
-                               std::optional<const at::Tensor>& q_descale,
-                               std::optional<const at::Tensor>& k_descale,
-                               std::optional<const at::Tensor>& v_descale,
+                               // Per-tensor descale for PERTENSOR mode (Q/K/V each have one scale value)
+                               std::optional<const at::Tensor>& q_descale,   // [1] per-tensor Q descale
+                               std::optional<const at::Tensor>& k_descale,   // [1] per-tensor K descale
+                               std::optional<const at::Tensor>& v_descale,   // [1] per-tensor V descale
+                               // Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
+                               // Mutually exclusive with k_descale/v_descale
+                               std::optional<const at::Tensor>& kv_block_descale, // [num_block, num_kv_head, 2]
                                at::Tensor out,
                                at::Tensor softmax_lse,
                                at::Tensor dropout_randval,
@@ -364,6 +368,32 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.s_randval            = has_dropout_randval;
     args.drop_seed_offset     = drop_seed_offset;
 
+    // KV_BLOCKSCALE: per-page K/V descales (Q per-tensor, K/V per-page)
+    // kv_block_descale layout: [num_block, num_kv_head, 2] where 2 = (k_descale, v_descale)
+    if(kv_block_descale.has_value())
+    {
+        auto kv_block_descale_tensor = kv_block_descale.value();
+        CHECK_DEVICE(kv_block_descale_tensor);
+        TORCH_CHECK(kv_block_descale_tensor.scalar_type() == at::kFloat,
+                    "kv_block_descale must be float32");
+        TORCH_CHECK(kv_block_descale_tensor.dim() == 3,
+                    "kv_block_descale must be 3D [num_block, num_kv_head, 2]");
+        TORCH_CHECK(kv_block_descale_tensor.size(0) == num_total_pages,
+                    "kv_block_descale first dim must match num_total_pages");
+        TORCH_CHECK(kv_block_descale_tensor.size(1) == h_k,
+                    "kv_block_descale second dim must match num_kv_heads");
+        TORCH_CHECK(kv_block_descale_tensor.size(2) == 2,
+                    "kv_block_descale third dim must be 2 (k_scale, v_scale)");
+        TORCH_CHECK(kv_block_descale_tensor.stride(-1) == 1,
+                    "kv_block_descale must have contiguous last dimension");
+
+        args.kv_block_descale_ptr          = kv_block_descale_tensor.data_ptr();
+        // Strides: [num_block, num_kv_head, 2]
+        args.kv_block_descale_stride_block = kv_block_descale_tensor.stride(0);
+        args.kv_block_descale_stride_head  = kv_block_descale_tensor.stride(1);
+        args.kv_block_descale_stride_kv    = kv_block_descale_tensor.stride(2);
+    }
+
     return args;
 }
 
@@ -391,6 +421,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   std::optional<const at::Tensor> q_descale,     // [1]
                   std::optional<const at::Tensor> k_descale,     // [1]
                   std::optional<const at::Tensor> v_descale,     // [1]
+                  std::optional<const at::Tensor> kv_block_descale,      // [num_block, num_kv_head, 2] for KV_BLOCKSCALE
                   std::optional<const at::Tensor> kv_last_page_lens_,
                   std::optional<const at::Tensor> block_table_,
                   std::optional<const at::Tensor> seqlen_k_,
@@ -420,12 +451,35 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
             TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
     }
 
-    TORCH_CHECK(q_descale.has_value() == k_descale.has_value() &&
-                    k_descale.has_value() == v_descale.has_value(),
-                "q_descale, k_descale, v_descale must be all provided or all not provided");
-
-    quant_scale_enum qscale_type =
-        q_descale.has_value() ? quant_scale_enum::pertensor : quant_scale_enum::no_scale;
+    // Validate descale tensor combinations:
+    // - PERTENSOR mode: q_descale, k_descale, v_descale all provided
+    // - KV_BLOCKSCALE mode: q_descale + kv_block_descale provided, k_descale/v_descale NOT provided
+    // - NO_SCALE mode: none provided
+    quant_scale_enum qscale_type;
+    if(kv_block_descale.has_value())
+    {
+        // KV_BLOCKSCALE: Q per-tensor, K/V per-page
+        TORCH_CHECK(q_descale.has_value(),
+                    "kv_block_descale requires q_descale for per-tensor Q scaling");
+        TORCH_CHECK(!k_descale.has_value() && !v_descale.has_value(),
+                    "kv_block_descale and k_descale/v_descale are mutually exclusive. "
+                    "Use kv_block_descale for per-page KV scaling, or k_descale/v_descale for per-tensor scaling.");
+        qscale_type = quant_scale_enum::kv_blockscale;
+    }
+    else if(q_descale.has_value())
+    {
+        // PERTENSOR mode: all three per-tensor descales required
+        TORCH_CHECK(k_descale.has_value() && v_descale.has_value(),
+                    "For per-tensor mode, q_descale, k_descale, v_descale must all be provided");
+        qscale_type = quant_scale_enum::pertensor;
+    }
+    else
+    {
+        // NO_SCALE mode: none should be provided
+        TORCH_CHECK(!k_descale.has_value() && !v_descale.has_value(),
+                    "k_descale and v_descale require q_descale to also be provided");
+        qscale_type = quant_scale_enum::no_scale;
+    }
 
     const int k_vector_size = 16 / static_cast<int>(q.element_size());
 
@@ -712,6 +766,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                                    q_descale,
                                                    k_descale,
                                                    v_descale,
+                                                   kv_block_descale,
                                                    out,
                                                    softmax_lse,
                                                    p,

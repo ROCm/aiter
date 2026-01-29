@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 namespace aiter {
@@ -26,13 +26,17 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   std::optional<at::Tensor> out_,                // [total_q, hq, d]
                   std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                   std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-                  std::optional<const at::Tensor> q_descale,     // [1]
-                  std::optional<const at::Tensor> k_descale,     // [1]
-                  std::optional<const at::Tensor> v_descale,     // [1]
+                  // Per-tensor descale for PERTENSOR mode (Q/K/V each have one scale value)
+                  std::optional<const at::Tensor> q_descale, // [1] per-tensor Q descale
+                  std::optional<const at::Tensor> k_descale, // [1] per-tensor K descale
+                  std::optional<const at::Tensor> v_descale, // [1] per-tensor V descale
+                  // Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
+                  // Mutually exclusive with k_descale/v_descale
+                  std::optional<const at::Tensor> kv_block_descale, // [num_block, num_kv_head, 2]
                   std::optional<const at::Tensor> kv_last_page_lens,
                   std::optional<const at::Tensor> block_table,
                   std::optional<const at::Tensor> seqlen_k,
-                  std::optional<const at::Tensor> sink_ptr_,     // [hq];
+                  std::optional<const at::Tensor> sink_ptr_, // [hq];
                   std::optional<at::Generator> gen_);
 
 } // namespace torch_itfs
