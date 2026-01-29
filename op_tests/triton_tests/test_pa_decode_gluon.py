@@ -2457,6 +2457,25 @@ def sliding_window_performance_test():
     PS_OPTIONS = [True]
     parse_arg_and_run_test()
 
+    # SINKS_OPTIONS = [False]
+    # SLIDING_WINDOW_OPTIONS = [0]
+
+    # USE_TORCH_FLASH_REF_OPTIONS = [False]
+    # CONTEXT_PARTITION_SIZE_OPTIONS = [128]
+    # HEAD_DIMENSION_OPTIONS = [128]
+    # HEAD_CONFIGURATIONS = [(16, 1),(8,1),(64,8)]
+    # QUERY_LENGTH_OPTIONS = [1]
+    # COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", False, True],["bf16", False, True]]
+    # QUANT_MODE_OPTIONS = ["per_tensor"]
+    # CONTEXT_LENGTH_OPTIONS = [1024,4000,4096,8192,10240]
+    # BATCH_SIZE_OPTIONS = [256]
+    # TRANS_V_OPTIONS = [False]
+    # KV_VARLEN_OPTIONS = [False]
+    # USE_AOT_IMPL_OPTIONS = [False]
+    # BLOCK_SIZE_OPTIONS = [16]
+    # PS_OPTIONS = [True]
+    # parse_arg_and_run_test()
+
 
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
 def test_multi_case_set(case_set_name):

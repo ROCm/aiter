@@ -7,6 +7,26 @@ import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
+try:
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_barrier as _amd_iglp_sched_barrier,
+        sched_group_barrier as _amd_iglp_sched_group_barrier,
+        s_set_prio as _amd_s_set_prio,
+    )
+except ImportError:
+    # ignore iglp hint
+    @gluon.jit
+    def _amd_iglp_sched_barrier(inst_mask):
+        pass
+
+    @gluon.jit
+    def _amd_iglp_sched_group_barrier(inst_mask, cnt, _):
+        pass
+
+    @gluon.jit
+    def _amd_s_set_prio(prio):
+        pass
+
 import triton
 import triton.language as tl
 
@@ -896,7 +916,7 @@ def paged_attention_decode_sliding_window(
         MFMA_INSTR_K: gl.constexpr = 32
     else:
         MFMA_INSTR_K: gl.constexpr = 16
-    if TRITON_VERSION_GE_3_6_0:
+    if True:
         QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
     else:
         QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
@@ -1331,7 +1351,7 @@ def paged_attention_decode_sliding_window(
     )
     prefetch_masked_0 = gl.where(prefetch_valid_0, block_indices, 0)
     kv_block_numbers_pre = gl.amd.cdna3.buffer_load(
-        ptr=block_table_start_ptr + prefetch_offset_0, offsets=prefetch_masked_0
+        ptr=block_table_start_ptr + prefetch_offset_0, offsets=prefetch_masked_0, cache=".cg"
     ).to(gl.int64)
     kv_block_start_idx = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
     
@@ -1532,8 +1552,9 @@ def paged_attention_decode_sliding_window(
         valid_block_mask = (block_indices < num_kv_blocks) & next_partition_valid
         masked_block_indices = gl.where(valid_block_mask, block_indices, 0)
         kv_block_numbers_pre = gl.amd.cdna3.buffer_load(
-            ptr=block_table_start_ptr + kv_block_start_idx, offsets=masked_block_indices, mask=next_partition_valid
+            ptr=block_table_start_ptr + kv_block_start_idx, offsets=masked_block_indices, mask=next_partition_valid, cache=".cg"
         ).to(gl.int64)
+        # _amd_iglp_sched_barrier(0x0)
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
@@ -2862,7 +2883,7 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Calculate offsets and mask for loading partial logits
-        if TRITON_VERSION_GE_3_6_0:
+        if True:
             logits_offsets = (
                 sequence_idx * stride_logits_seq
                 + kv_head_idx * stride_logits_head
@@ -2891,7 +2912,7 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Permute to match the expected dimension order
-        if not TRITON_VERSION_GE_3_6_0:
+        if not True:
             partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
 
         updated_output = partial_logits * attention_probs
