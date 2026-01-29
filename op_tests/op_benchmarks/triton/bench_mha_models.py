@@ -146,6 +146,7 @@ class BenchArgs:
 def get_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
     # Check empty stderr:
     if err:
+        logging.debug("Standard error stream isn't empty: [%s]", err)
         return None
     # Split stdout:
     out_lines: list[list[str]] = [
@@ -153,15 +154,21 @@ def get_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
     ]
     # Check number of lines in stdout:
     if len(out_lines) != 3:
+        logging.debug("Standard out stream doesn't have 3 lines: [%s]", out)
         return None
+    l0: list[str]
+    l1: list[str]
+    l2: list[str]
+    l0, l1, l2 = out_lines
     # Check stdout line #1 (benchmark name):
-    if out_lines[0] != ["bench_mha:"]:
+    if l0 != ["bench_mha:"]:
+        logging.debug("Benchmark name doesn't match: %s", l0)
         return None
     # Check stdout line #2 (table header):
     kernel_header: str = {"fwd": "fwd", "bwdo": "onekernel-bwd", "bwdf": "fused-bwd"}[
         args.kernel
     ]
-    if out_lines[1] != [
+    if l1 != [
         "BATCH",
         "HQ",
         "HK",
@@ -170,9 +177,9 @@ def get_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
         f"{kernel_header}(ms)",
         "(ms)",
     ]:
+        logging.debug("Table header doesn't match: %s", l1)
         return None
     # Check stdout line #3 (table data):
-    l2: list[str] = out_lines[2]
     m: Model = args.tp_model.model
     try:
         if not all(
@@ -186,9 +193,11 @@ def get_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
                 int(float(l2[5])) == args.s,
             ]
         ):
+            logging.debug("Table data doesn't match: %s", l2)
             return None
         return float(l2[6])
     except ValueError:
+        logging.exception("Unexpected numeric conversion error.")
         return None
 
 
@@ -205,8 +214,8 @@ def get_models() -> Iterable[Model]:
         Model.new("Llama3 405B").h_q_vk(128, 8).d(128).build(),
         Model.new("Llama3 70B").h_q_vk(64, 8).d(128).build(),
         Model.new("Llama3 8B").h_q_vk(32, 8).d(128).build(),
-        Model.new("Llama 4 Maverick (Text)").h_q_vk(40, 8).d(128).build(),
-        Model.new("Llama 4 Maverick (Vision)").h(16).d(88).build(),
+        Model.new("Llama4 Maverick (Text)").h_q_vk(40, 8).d(128).build(),
+        Model.new("Llama4 Maverick (Vision)").h(16).d(88).build(),
         Model.new("Qwen-235B-A22B").h_q_vk(64, 4).d(128).build(),
         Model.new("GPT-OSS 120B").h_q_vk(64, 8).d(64).build(),
         Model.new("DeepSeek R1").h(128).d_qk_v(192, 128).build(),
@@ -231,6 +240,7 @@ def get_bench_args(
 
 
 def main() -> None:
+    logging.basicConfig(format="%(levelname)s|%(message)s", level=logging.DEBUG)
     for ba in get_bench_args():
         result = run_bench_mha(ba)
         if not result:
