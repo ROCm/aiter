@@ -5,7 +5,7 @@ import shlex
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from itertools import product
-from typing import Literal, Optional, Self
+from typing import Iterable, Literal, Optional, Self, get_args
 
 
 def disable_aiter_logs() -> None:
@@ -93,6 +93,7 @@ class TpModel:
             self.model.hq % self.tp == 0
         ), "Number of query heads must be divisible by tensor parallelism."
 
+        self.model = copy.copy(self.model)
         self.model.hq = self.model.hq // self.tp
         self.model.hkv = max(self.model.hkv // self.tp, 1)
 
@@ -199,8 +200,8 @@ def run_bench_mha(args: BenchArgs) -> Optional[float]:
     return get_bench_result(args, out.getvalue(), err.getvalue())
 
 
-def get_models() -> list[Model]:
-    return [
+def get_models() -> Iterable[Model]:
+    return (
         Model.new("Llama3 405B").h_q_vk(128, 8).d(128).build(),
         Model.new("Llama3 70B").h_q_vk(64, 8).d(128).build(),
         Model.new("Llama3 8B").h_q_vk(32, 8).d(128).build(),
@@ -209,25 +210,33 @@ def get_models() -> list[Model]:
         Model.new("Qwen-235B-A22B").h_q_vk(64, 4).d(128).build(),
         Model.new("GPT-OSS 120B").h_q_vk(64, 8).d(64).build(),
         Model.new("DeepSeek R1").h(128).d_qk_v(192, 128).build(),
-    ]
+    )
 
 
 def get_tp_models(
-    models: list[Model] = get_models(), tps: list[int] = [1, 2, 4, 8]
-) -> list[TpModel]:
-    return [
-        TpModel(model=copy.copy(model), tp=tp) for model, tp in product(models, tps)
-    ]
+    models: Iterable[Model] = get_models(), tps: Iterable[int] = (1, 2, 4, 8)
+) -> Iterable[TpModel]:
+    return (TpModel(model=model, tp=tp) for model, tp in product(models, tps))
+
+
+def get_bench_args(
+    kernels: Iterable[Kernel] = get_args(Kernel),
+    layouts: Iterable[Layout] = get_args(Layout),
+    tp_models: Iterable[TpModel] = get_tp_models(),
+) -> Iterable[BenchArgs]:
+    return (
+        BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=1, s=1024)
+        for kernel, layout, tp_model in product(kernels, layouts, tp_models)
+    )
 
 
 def main() -> None:
-    for model in get_tp_models():
-        ba = BenchArgs(kernel="fwd", layout="thd", tp_model=model, b=1, s=1024)
+    for ba in get_bench_args():
         result = run_bench_mha(ba)
         if not result:
-            print("Unable to run benchmark.")
+            print(f"{str(ba)} => error")
         else:
-            print(f"Performance: {str(model)} => {result:.3f} ms")
+            print(f"{str(ba)} => {result:.3f} ms")
 
 
 if __name__ == "__main__":
