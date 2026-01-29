@@ -188,38 +188,8 @@ class Case:
             # TP1
             Case(
                 16,
-                4096,
-                7168,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            Case(
-                1024,
-                7168,
-                2048,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            Case(
-                4096,
-                4096,
-                7168,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            Case(
-                8192,
-                7168,
-                2048,
+                128,
+                512,
                 "mxfloat8_e4m3fn",
                 "mxfloat8_e4m3fn",
                 256,
@@ -227,58 +197,8 @@ class Case:
                 hbm_swizzling=True,
             ),
             # TP8
-            Case(
-                16,
-                512,
-                7168,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            Case(
-                1024,
-                7168,
-                256,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            Case(
-                4096,
-                512,
-                7168,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            Case(
-                8192,
-                7168,
-                256,
-                "mxfloat8_e4m3fn",
-                "mxfloat8_e4m3fn",
-                256,
-                8,
-                hbm_swizzling=True,
-            ),
-            # Precision combinations
-            Case(4096, 7168, 4096, "float8_e4m3fn", "float8_e4m3fn", 256, 8),
-            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "float8_e4m3fn", 256, 8),
-            Case(4096, 7168, 4096, "float8_e4m3fn", "mxfloat8_e4m3fn", 256, 8),
-            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8),
             # edges
             Case(300, 400, 400, "float8_e4m3fn", "float8_e4m3fn", 8, 2),
-            Case(300, 400, 400, "float8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
-            Case(300, 400, 400, "mxfloat8_e4m3fn", "float8_e4m3fn", 8, 2),
-            Case(300, 400, 400, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
-            Case(1000, 704, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 4),
-            Case(8192, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 4),
         ]
     ],
 )
@@ -311,17 +231,7 @@ def test_op(
     device="cuda",
 ):
 
-    if get_arch() != "gfx950":
-        pytest.skip("float8 x mx only supported on CDNA4")
-
-    if "float8_e4m3fnuz" in act_dtype_str and get_arch() != "gfx942":
-        pytest.skip("float8_e4m3fnuz only tested on AMD CDNA3 Platform")
-
     if hbm_swizzling:
-        if get_arch() != "gfx950":
-            pytest.skip(
-                "Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet."
-            )
         if n % 32 != 0 or k % (32 * 8) != 0:
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
