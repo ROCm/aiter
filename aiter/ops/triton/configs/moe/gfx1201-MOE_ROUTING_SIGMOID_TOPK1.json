@@ -1,0 +1,12 @@
+{
+    "N128": {
+        "small": {
+            "BLOCK_M": 16,
+            "BLOCK_K": 256,
+            "num_warps": 8,
+            "num_stages": 1,
+            "waves_per_eu": 4,
+            "kpack": 2
+        }
+    }
+}
