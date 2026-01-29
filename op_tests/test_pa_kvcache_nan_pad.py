@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# This test validates PA KV cache behavior when unused cache entries are NaN-padded.
+
 
 import argparse
 import itertools
@@ -483,16 +485,19 @@ def test_pa_ps(
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
     )
     
+    # Test case: explicitly NaN-pad unused KV cache regions to ensure kernels ignore them.
     # fill all unused kv cache with nan based on actual_blocks for seq_lens_kv and block_tables
     # k_cache: torch.Tensor, [num_blocks, num_heads, head_size // x, block_size, x]
     # v_cache: torch.Tensor, [num_blocks, num_heads, head_size, block_size]
+    # used_blk: set of used blocks
+    used_blk = []
     for i in range(batch_size):
         cur_kv_len = seq_lens_kv[i]
-        last_block =  block_tables[i][(cur_kv_len + block_size - 1) // block_size  - 1]
+        valid_blocks = (cur_kv_len + block_size - 1) // block_size
+        last_block =  block_tables[i][valid_blocks  - 1]
         last_valid_token = cur_kv_len % block_size
         
-        # print(f"---------last_block: {last_block}, last_valid_token: {last_valid_token}")
-        # print(f"---------before: v_quant: {v_quant_[last_block, :, 0, :]}")
+        used_blk.extend(block_tables[i][:valid_blocks].tolist())
         
         if last_valid_token > 0:
             k_quant_[last_block, :, :, last_valid_token:, :] = torch.nan
@@ -502,7 +507,16 @@ def test_pa_ps(
             end = (last_block + 1) * block_size
             k_scale_[:, start: end] = torch.nan
             v_scale_[:,  start: end] = torch.nan
-        # print(f"---------after: v_quant: {v_quant_[last_block, :, 0, :]}")
+    
+    # fill unused blocks with nan based on used_blk
+    used_blk = set(used_blk)
+    for i in range(num_blocks):
+        if i not in used_blk:
+            k_quant_[i, :, :, :, :] = torch.nan
+            v_quant_[i, :, :, :] = torch.nan
+            k_scale_[:, i * block_size:(i + 1) * block_size] = torch.nan
+            v_scale_[:, i * block_size:(i + 1) * block_size] = torch.nan
+        
         
     # torch ref
     out_ref = torch_mha_extend(
