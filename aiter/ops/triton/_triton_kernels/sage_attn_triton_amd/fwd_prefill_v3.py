@@ -10,58 +10,60 @@ from .utils import (
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 from .sage_version import Sage_version
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+"""aiter/aiter/ops/triton/_triton_kernels/moe/quant_moe.py"""
+from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_mx_quant_and_scale
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs, compute_block_masking 
 
 import triton
 import triton.language as tl
 
-@triton.jit
-def _quantize_p_mxfp4(p, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-    GROUP_SIZE: tl.constexpr = 32
+# @triton.jit
+# def _quantize_p_mxfp4(p, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+#     GROUP_SIZE: tl.constexpr = 32
     
-    # 1. Scaling Logic (Group of 32)
-    p_reshaped = tl.view(p, [BLOCK_M, BLOCK_N // GROUP_SIZE, GROUP_SIZE])
-    p_abs = tl.abs(p_reshaped)
-    max_val = tl.max(p_abs, axis=2)
+#     # 1. Scaling Logic (Group of 32)
+#     p_reshaped = tl.view(p, [BLOCK_M, BLOCK_N // GROUP_SIZE, GROUP_SIZE])
+#     p_abs = tl.abs(p_reshaped)
+#     max_val = tl.max(p_abs, axis=2)
     
-    # Scale to the max representable value of E2M1 (which is 6.0)
-    # p_scaled is the "Shared Exponent"
-    p_scale = max_val / 6.0
-    p_scale = tl.where(p_scale == 0, 1e-5, p_scale)
+#     # Scale to the max representable value of E2M1 (which is 6.0)
+#     # p_scaled is the "Shared Exponent"
+#     p_scale = max_val / 6.0
+#     p_scale = tl.where(p_scale == 0, 1e-5, p_scale)
     
-    # Normalize p
-    p_norm = p_reshaped / p_scale[:, :, None]
+#     # Normalize p
+#     p_norm = p_reshaped / p_scale[:, :, None]
     
-    # 2. Map to E2M1 Bits (S1E2M1)
-    # Range: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-    sign = tl.where(p_norm < 0, 0x8, 0x0)
-    abs_p = tl.abs(p_norm)
+#     # 2. Map to E2M1 Bits (S1E2M1)
+#     # Range: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+#     sign = tl.where(p_norm < 0, 0x8, 0x0)
+#     abs_p = tl.abs(p_norm)
     
-    # Manual quantization to E2M1 bit patterns
-    # This is a simplified hardware-like mapping
-    ebits = tl.where(abs_p >= 4.0, 0x6, 
-             tl.where(abs_p >= 2.0, 0x4,
-             tl.where(abs_p >= 1.0, 0x2, 0x0)))
+#     # Manual quantization to E2M1 bit patterns
+#     # This is a simplified hardware-like mapping
+#     ebits = tl.where(abs_p >= 4.0, 0x6, 
+#              tl.where(abs_p >= 2.0, 0x4,
+#              tl.where(abs_p >= 1.0, 0x2, 0x0)))
     
-    mbits = tl.where((abs_p >= 1.5) & (abs_p < 2.0) | 
-                     (abs_p >= 3.0) & (abs_p < 4.0) | 
-                     (abs_p >= 6.0), 0x1, 0x0)
+#     mbits = tl.where((abs_p >= 1.5) & (abs_p < 2.0) | 
+#                      (abs_p >= 3.0) & (abs_p < 4.0) | 
+#                      (abs_p >= 6.0), 0x1, 0x0)
     
-    # Combine bits into 4-bit nibbles
-    fp4_nibbles = (sign | ebits | mbits).to(tl.uint8)
+#     # Combine bits into 4-bit nibbles
+#     fp4_nibbles = (sign | ebits | mbits).to(tl.uint8)
     
-    # 3. Packing into uint8
-    # We take two 4-bit nibbles and pack them into one uint8
-    # Reshape to separate even and odd elements for packing
-    p_for_packing = tl.view(fp4_nibbles, [BLOCK_M, BLOCK_N // 2, 2])
+#     # 3. Packing into uint8
+#     # We take two 4-bit nibbles and pack them into one uint8
+#     # Reshape to separate even and odd elements for packing
+#     p_for_packing = tl.view(fp4_nibbles, [BLOCK_M, BLOCK_N // 2, 2])
     
-    low_nibble = tl.view(p_for_packing[:, :, 0], [BLOCK_M, BLOCK_N // 2])
-    high_nibble = tl.view(p_for_packing[:, :, 1], [BLOCK_M, BLOCK_N // 2])
+#     low_nibble = tl.view(p_for_packing[:, :, 0], [BLOCK_M, BLOCK_N // 2])
+#     high_nibble = tl.view(p_for_packing[:, :, 1], [BLOCK_M, BLOCK_N // 2])
     
-    # Shift high nibble and OR with low nibble
-    packed_p = (high_nibble << 4) | (low_nibble & 0x0F)
+#     # Shift high nibble and OR with low nibble
+#     packed_p = (high_nibble << 4) | (low_nibble & 0x0F)
     
-    return packed_p, p_scale
+#     return packed_p, p_scale
 
 @triton.jit
 def _sage_fwd_no_mask_v3(
@@ -118,7 +120,7 @@ def _sage_fwd_no_mask_v3(
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
-        v_ptrs = v_base_ptrs + start_n * stride_vk
+        v_ptrs = v_base_ptrs + start_n//2 * stride_vk
 
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
         # Load K
@@ -130,12 +132,12 @@ def _sage_fwd_no_mask_v3(
 
         k_descale = tl.load(k_descale_ptr)
         k_descale_ptr += stride_ksblk
-        v_descale_ptr += stride_vsn * BLOCK_N
+        v_descale_ptr += stride_vsn * BLOCK_N//2
 
         # Optionally preload V
         if PRE_LOAD_V:
             if PADDED_HEAD_V:
-                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+                v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
                 v_descale_mask = offs_d_vs[None, :] < ACTUAL_BLOCK_DMODEL_VS
                 v = tl.load(v_ptrs, mask=v_mask, other=0.0)
                 v_descale = tl.load(v_descale_ptr, mask=v_descale_mask, other=0.0)
@@ -255,8 +257,16 @@ def _sage_fwd_no_mask_v3(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        p, p_descale = _quantize_p_mxfp4(p)
-        # TODO bf16 out type?
+
+        p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
+        
+        # tl.static_print("BLOCK_M", BLOCK_M)
+        # tl.static_print("BLOCK_N", BLOCK_N)
+        # tl.static_print("p", p)
+        # tl.static_print("p_descale", p_descale)
+        # tl.static_print("v", v)
+        # tl.static_print("v_descale", v_descale)
         acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1", fast_math=True,)
 
     return acc, l_i, m_i
@@ -327,30 +337,33 @@ def _sage_fwd_mask_v3(
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
-        v_ptrs = v_base_ptrs + start_n * stride_vk
+        v_ptrs = v_base_ptrs + start_n//2 * stride_vk
 
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
+        v_offs_n = start_n//2 + tl.arange(0, BLOCK_N//2) # Important! //2 for MXFP4 since two fp4 per byte
         k_mask = kv_offs_n[None, :] < seqlen_k
-        v_mask = kv_offs_n[:, None] < seqlen_k
+        v_mask = v_offs_n[:, None] < seqlen_k//2
         if PADDED_HEAD_QK:
             k_mask = k_mask & (offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK)
             v_descale_mask = None
-        if PADDED_HEAD_V:
-            v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
-            v_descale_mask = offs_d_vs[None, :] < ACTUAL_BLOCK_DMODEL_VS
-
-
+      
         # load k and if preload_v then v
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         k_descale = tl.load(k_descale_ptr)
         k_descale_ptr += stride_ksblk
-        v_descale_ptr += stride_vsn * BLOCK_N
+        v_descale_ptr += stride_vsn * BLOCK_N//2
 
         if PRE_LOAD_V:
-            v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-            v_descale = tl.load(v_descale_ptr, mask=v_descale_mask, other=0.0)
+            if PADDED_HEAD_V:
+                v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
+                v_descale_mask = offs_d_vs[None, :] < ACTUAL_BLOCK_DMODEL_VS
+                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+                v_descale = tl.load(v_descale_ptr, mask=v_descale_mask, other=0.0)
+            else:
+                v = tl.load(v_ptrs)
+                v_descale = tl.load(v_descale_ptr)
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
@@ -623,13 +636,25 @@ def _sage_fwd_mask_v3(
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
-            v_descale = tl.load(v_descale_ptr, mask=v_descale_mask, other=0.0)
+            if PADDED_HEAD_V:
+                v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
+                v_descale_mask = offs_d_vs[None, :] < ACTUAL_BLOCK_DMODEL_VS
+                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+                v_descale = tl.load(v_descale_ptr, mask=v_descale_mask, other=0.0)
+            else:
+                v = tl.load(v_ptrs)
+                v_descale = tl.load(v_descale_ptr)
 
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        p, p_descale = _quantize_p_mxfp4(p)
+        p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
+        # tl.static_print("p", p)
+        # tl.static_print("p_descale", p_descale)
+        # tl.static_print("v", v)
+        # tl.static_print("v_descale", v_descale)
 
         acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1", fast_math=True,)
 
@@ -722,8 +747,8 @@ def sage_fwd_v3(
     SCALE_GROUP_SIZE: tl.constexpr = 32
     # set params
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
-    ACTUAL_BLOCK_DMODEL_VS: tl.constexpr = ACTUAL_BLOCK_DMODEL_V // SCALE_GROUP_SIZE
-    ACTUAL_BLOCK_DMODEL_V: tl.constexpr = ACTUAL_BLOCK_DMODEL_V // 2 
+    ACTUAL_BLOCK_DMODEL_VS: tl.constexpr = ACTUAL_BLOCK_DMODEL_V
+    # ACTUAL_BLOCK_DMODEL_V: tl.constexpr = ACTUAL_BLOCK_DMODEL_V // 2 
     # compute offsets
     off_z = tl.program_id(0)
     off_h_q = tl.program_id(1)
@@ -740,9 +765,12 @@ def sage_fwd_v3(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
+    offs_vn = tl.arange(0, BLOCK_N//2)
+    offs_vsn = tl.arange(0, BLOCK_N//SCALE_GROUP_SIZE)
     offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
-    offs_d_v = tl.arange(0, BLOCK_DMODEL_V // 2)
-    offs_d_vs = tl.arange(0, BLOCK_DMODEL_V // SCALE_GROUP_SIZE)
+    offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
+    offs_d_o = tl.arange(0, BLOCK_DMODEL_V)
+    offs_d_vs = tl.arange(0, BLOCK_DMODEL_V)
 
     # handle seqlen
     if IS_VARLEN:
@@ -820,10 +848,10 @@ def sage_fwd_v3(
             + off_h_q * stride_oh
             + cu_seqlens_q_start * stride_om
         )
-        o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
+        o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_o[None, :] * stride_on
         o_mask = offs_m[:, None] < seqlen_q
         if PADDED_HEAD_V:
-            o_mask = o_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
+            o_mask = o_mask & (offs_d_o[None, :] < ACTUAL_BLOCK_DMODEL_V)
         tl.store(
             o_ptrs,
             tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=Out.type.element_ty),
@@ -865,7 +893,7 @@ def sage_fwd_v3(
     v_offset = (
         V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     )
-    v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
+    v_ptrs = v_offset + offs_vn[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
     q_descale_ptr = (
         Q_Descale
         + off_z * stride_qsz
@@ -923,7 +951,7 @@ def sage_fwd_v3(
         v_descale_ptr = (
             V_Descale
             + v_descale_offset
-            + (block_min + offs_n[None, :]) * stride_vsn
+            + (block_min//SCALE_GROUP_SIZE + offs_vsn[None, :]) * stride_vsn
             + offs_d_vs[:, None]
         )
 
@@ -998,7 +1026,7 @@ def sage_fwd_v3(
         v_descale_ptr = (
             V_Descale
             + v_descale_offset
-            + (block_min + offs_n[None, :]) * stride_vsn
+            + (block_min//SCALE_GROUP_SIZE + offs_vsn[None, :]) * stride_vsn
             + offs_d_vs[:, None]
         )
 
@@ -1073,7 +1101,7 @@ def sage_fwd_v3(
         v_descale_ptr = (
             V_Descale
             + v_descale_offset
-            + (block_min + offs_n[None, :]) * stride_vsn
+            + (block_min//SCALE_GROUP_SIZE + offs_n[None, :]) * stride_vsn
             + offs_d_vs[:, None]
         )
         acc, l_i, m_i = _sage_fwd_mask_v3(
@@ -1123,6 +1151,7 @@ def sage_fwd_v3(
             PADDED_HEAD_V,
             ACTUAL_BLOCK_DMODEL_QK,
             ACTUAL_BLOCK_DMODEL_V,
+            ACTUAL_BLOCK_DMODEL_VS,
             USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES,
@@ -1249,12 +1278,12 @@ def sage_fwd_v3(
     o_offset = (
         Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
     )
-    o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
+    o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_o[None, :] * stride_on
     o_ptrs_mask = tl.full([BLOCK_M, BLOCK_DMODEL_V], 1, dtype=tl.int1)
     if overflow_size > 0:
         o_ptrs_mask = o_ptrs_mask & (offs_m[:, None] < seqlen_q)
     if PADDED_HEAD_V:
-        o_ptrs_mask = o_ptrs_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
+        o_ptrs_mask = o_ptrs_mask & (offs_d_o[None, :] < ACTUAL_BLOCK_DMODEL_V)
 
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
@@ -1317,7 +1346,8 @@ def fav3_sage_triton_impl_v3(
     assert (
         q.is_cuda and q.device.index == current_device
     ), f"Device mismatch: Kernel will launch on cuda:{current_device}, but tensors are on {q.device}"
-
+    
+    
     # get shapes and strides
     if IS_VARLEN:
         # shape
@@ -1451,7 +1481,7 @@ def fav3_sage_triton_impl_v3(
 
         # assert sequence lengths
         assert (
-            seqlen_k == seqlen_v
+            seqlen_k == seqlen_v*2
         ), f"k and v sequence lengths must match: k={seqlen_k}, v={seqlen_v}"
 
         # assert output shapes
@@ -1509,7 +1539,7 @@ def fav3_sage_triton_impl_v3(
     stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
 
     stride_vsz, stride_vsn, stride_vsh, _ = map_dims(
-        k_descale.stride(), bshd
+        v_descale.stride(), bshd
     )
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
@@ -1763,9 +1793,10 @@ def sage_quant_v3(
         BLK_Q=BLKQ,
         BLK_K=BLKK,
     )
-
-    print(v.shape)
+    # v = v.permute(0, 1, 3, 2) if layout == "bhsd" else v.permute(0, 2, 3, 1)
     v_fp4, v_scale = downcast_to_mxfp(v, torch.uint8, axis=-2 if layout == "bhsd" else -3)
+
+    # print("v_fp4.shape:", v_fp4.shape)
 
     return q_int8, q_scale, k_int8, k_scale, v_fp4, v_scale
 
