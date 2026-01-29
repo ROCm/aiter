@@ -35,9 +35,17 @@ def mp_lock(
     MainFunc: Callable,
     FinalFunc: Optional[Callable] = None,
     WaitFunc: Optional[Callable] = None,
+    timeout: Optional[float] = None,
 ):
     """
     Using FileBaton for multiprocessing.
+    
+    Args:
+        lockPath: Path to the lock file
+        MainFunc: Function to execute while holding the lock
+        FinalFunc: Optional function to execute before releasing the lock
+        WaitFunc: Optional function to execute after waiting for the lock
+        timeout: Optional timeout in seconds for waiting (None = use default from FileBaton)
     """
     baton = FileBaton(lockPath)
     if baton.try_acquire():
@@ -48,7 +56,7 @@ def mp_lock(
                 FinalFunc()
             baton.release()
     else:
-        baton.wait()
+        baton.wait(timeout=timeout)
         if WaitFunc is not None:
             ret = WaitFunc()
         ret = None
