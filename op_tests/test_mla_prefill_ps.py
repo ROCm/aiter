@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import sys
+
 import aiter
 import argparse
 import itertools
@@ -12,8 +14,16 @@ import torch
 from aiter import dtypes
 from aiter import per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.jit.utils.chip_info import get_gfx
 
 from typing import Tuple, Optional
+
+# This test only supports gfx950, skip on gfx942
+if get_gfx() == "gfx942":
+    aiter.logger.info(
+        "Skipping test_mla_prefill_ps.py: only supported on gfx950, not gfx942"
+    )
+    sys.exit(0)
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
