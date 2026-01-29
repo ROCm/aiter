@@ -129,7 +129,7 @@ def get_search_space(small: bool = False):
 def save_configs_to_json(
     json_file_name: str,
     save_path: str,
-    configs: list[dict],
+    configs: dict | list[dict],
 ) -> None:
     os.makedirs(save_path, exist_ok=True)
     config_file_path = os.path.join(save_path, json_file_name)
