@@ -91,7 +91,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_qo_tiles = get_num_qo_tiles(bid);
-        sum_blocks += (num_blocks + params.k_fixed_over_head_num_blocks) * num_qo_tiles;
+        sum_blocks += (num_blocks + params.fixed_over_head_num_blocks) * num_qo_tiles;
 
         if constexpr(QoState::is_unique() == false)
         {
@@ -116,7 +116,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     // expected payload handled by each cu part.
     const int32_t payload = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
-                            params.k_fixed_over_head_num_blocks;
+                            params.fixed_over_head_num_blocks;
     const int32_t page_size   = params.page_size;
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
@@ -149,7 +149,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
 
             // If current cu part is able to handle this batch of seqences
-            if(remain_payload >= (remain_kv_blocks + params.k_fixed_over_head_num_blocks))
+            if(remain_payload >= (remain_kv_blocks + params.fixed_over_head_num_blocks))
             {
                 const int32_t num_splits = curr_n_split_idx + 1;
 
@@ -234,7 +234,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 tot_qo_tiles += 1;
                 num_works += 1;
 
-                remain_payload -= (remain_kv_blocks + params.k_fixed_over_head_num_blocks);
+                remain_payload -= (remain_kv_blocks + params.fixed_over_head_num_blocks);
 
                 // update state
                 curr_qo_tile_idx =
@@ -282,10 +282,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             }
             else
             {
-                if(remain_payload > params.k_fixed_over_head_num_blocks)
+                if(remain_payload > params.fixed_over_head_num_blocks)
                 {
                     const int32_t consuming_blks =
-                        remain_payload - params.k_fixed_over_head_num_blocks;
+                        remain_payload - params.fixed_over_head_num_blocks;
 
                     auto fill_work_info = [&]() {
                         MlaWorkInfo work_info{};
@@ -470,7 +470,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.is_causal                    = is_causal;
     params.topk                         = (topk < 0) ? topk : (topk + page_size - 1) / page_size;
     params.qk_batch_ratio               = qk_batch_ratio;
-    params.k_fixed_over_head_num_blocks = max(1, (16 + page_size - 1) / page_size);
+    params.fixed_over_head_num_blocks = max(1, (16 + page_size - 1) / page_size);
 
     // launch kernel
     MLA_METADATA_DISPATCHER(

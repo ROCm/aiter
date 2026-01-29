@@ -880,14 +880,14 @@ def get_mla_metadata_v1(
     """
     Inputs:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
-        cumulated seqlens or page indices of k/v: (batch_size + 1), dtype torch.int32.
+        cumulated page indices of k/v: (batch_size + 1), dtype torch.int32.
         Length of last page of k/v: (batch_size), dtype torch.int32.
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
         Options: Detailed settings for spliting. All of them are optional.
             page_size: default=1. The size of a page.
-            kv_granularity: default=16. The granularity on kv sequence length when cutting batch.
+            kv_granularity: default=16. The granularity on kv page nums when cutting batch.
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
@@ -905,11 +905,11 @@ def get_mla_metadata_v1(
         [2.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
                                                     reduce memory access count in kernel.
         [2.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
-        [2.4] kv_start:         (#work),            The global index in seq where k/v starts.
-        [2.5] kv_end:           (#work),            The global index in seq where k/v ends (not included). Note that
+        [2.4] kv_start:         (#work),            The global index in page where k/v starts.
+        [2.5] kv_end:           (#work),            The global index in page where k/v ends (not included). Note that
                                                     this value indicates the end of last qo sequence if there are
                                                     multiple qo sequences included in the current work and causal mask
-                                                    is enabled.
+                                                    is enabled when page_size is 1.
         [2.6] kv_offset:        (#work),            Remaining length in seq from kv_end to the end of current batch.
         [2.7] pad               (#work, 1),         Pad to 8 DWs.
         [3] reduce_indptr:      (sum(qo_seqlen_blk_count) + 1),
