@@ -9,13 +9,12 @@ import numpy as np
 import random
 from typing import List, Optional, Tuple, Union
 
-import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter import pertoken_quant
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import checkAllclose
 import torch.profiler as tpf
 
 torch.set_default_device("cuda")
@@ -38,8 +37,9 @@ l_num_heads = [
     (10, 1),
     (16, 2),
 ]
-l_qlen = [1,2,3,4]
-l_ctx_len = [256 + i for i in range(4)] + [1024 + i for i in range(4)] 
+l_qlen = [1, 2, 3, 4]
+l_ctx_len = [256 + i for i in range(4)] + [1024 + i for i in range(4)]
+
 
 def get_kv_cache_torch_dtype(
     cache_dtype: Optional[Union[str, torch.dtype]],
@@ -77,7 +77,6 @@ def kv_cache_factory(
     seed: int = 0,
     device: Optional[str] = "cuda",
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
             f"Does not support key cache of type fp8 with head_size {head_size}"
@@ -189,7 +188,9 @@ def torch_mha_extend(
         if torch.isnan(o).any():
             print("*" * 100)
             print(f">>>debug: bs: {i}")
-            print(f">>>debug: q is nan: {torch.isnan(q).any()}, k is nan: {torch.isnan(k).any()}, v is nan: {torch.isnan(v).any()}")
+            print(
+                f">>>debug: q is nan: {torch.isnan(q).any()}, k is nan: {torch.isnan(k).any()}, v is nan: {torch.isnan(v).any()}"
+            )
             print(f">>>debug: o is nan: {torch.isnan(o).any()}")
             print("*" * 100)
         os.append(o)
@@ -424,7 +425,6 @@ def test_pa_ps(
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_qo = qo_indptr[-1].item()
     max_qlen = seq_lens_qo.max().item()
-    
 
     qkv = torch.randn(
         total_qo,
@@ -440,9 +440,7 @@ def test_pa_ps(
     # Create the block tables.
     block_tables_lst: List[List[int]] = []
     for bs in range(batch_size):
-        block_table = [
-            (i + bs * num_blocks_per_seq) for i in range(num_blocks_per_seq)
-        ]
+        block_table = [(i + bs * num_blocks_per_seq) for i in range(num_blocks_per_seq)]
         block_tables_lst.append(block_table)
 
     block_tables = torch.tensor(block_tables_lst, dtype=torch.int)
@@ -484,7 +482,7 @@ def test_pa_ps(
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
     )
-    
+
     # Test case: explicitly NaN-pad unused KV cache regions to ensure kernels ignore them.
     # fill all unused kv cache with nan based on actual_blocks for seq_lens_kv and block_tables
     # k_cache: torch.Tensor, [num_blocks, num_heads, head_size // x, block_size, x]
@@ -494,30 +492,29 @@ def test_pa_ps(
     for i in range(batch_size):
         cur_kv_len = seq_lens_kv[i]
         valid_blocks = (cur_kv_len + block_size - 1) // block_size
-        last_block =  block_tables[i][valid_blocks  - 1]
+        last_block = block_tables[i][valid_blocks - 1]
         last_valid_token = cur_kv_len % block_size
-        
+
         used_blk.extend(block_tables[i][:valid_blocks].tolist())
-        
+
         if last_valid_token > 0:
             k_quant_[last_block, :, :, last_valid_token:, :] = torch.nan
             v_quant_[last_block, :, :, last_valid_token:] = torch.nan
-            
+
             start = last_block * block_size + last_valid_token
             end = (last_block + 1) * block_size
-            k_scale_[:, start: end] = torch.nan
-            v_scale_[:,  start: end] = torch.nan
-    
+            k_scale_[:, start:end] = torch.nan
+            v_scale_[:, start:end] = torch.nan
+
     # fill unused blocks with nan based on used_blk
     used_blk = set(used_blk)
     for i in range(num_blocks):
         if i not in used_blk:
             k_quant_[i, :, :, :, :] = torch.nan
             v_quant_[i, :, :, :] = torch.nan
-            k_scale_[:, i * block_size:(i + 1) * block_size] = torch.nan
-            v_scale_[:, i * block_size:(i + 1) * block_size] = torch.nan
-        
-        
+            k_scale_[:, i * block_size : (i + 1) * block_size] = torch.nan
+            v_scale_[:, i * block_size : (i + 1) * block_size] = torch.nan
+
     # torch ref
     out_ref = torch_mha_extend(
         query,
@@ -660,6 +657,7 @@ def test_pa_ps(
 
     return ret
 
+
 gpu = torch.cuda.current_device()
 device_properties = torch.cuda.get_device_properties(gpu)
 cu_num = device_properties.multi_processor_count
@@ -767,7 +765,9 @@ for dtype in l_dtype:
         l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
     ):
         print("*" * 100, flush=True)
-        print(f"---------num_heads: {num_heads}, qlen: {qlen}, ctx_len: {ctx_len}, batch_size: {batch_size}, block_size: {block_size}")
+        print(
+            f"---------num_heads: {num_heads}, qlen: {qlen}, ctx_len: {ctx_len}, batch_size: {batch_size}, block_size: {block_size}"
+        )
         ret = test_pa_ps(
             ctx_len,
             batch_size,
