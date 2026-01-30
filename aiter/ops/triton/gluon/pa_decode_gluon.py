@@ -2469,6 +2469,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
 
         # ==================== 3. LOAD NEXT K (prefetch) ====================
         # Load next K tensor (prefetch)
+        # if kv_compute_idx <= KV_COMPUTE_BLOCK_COUNT - 2:
         next_key_tensor = gl.load(key_cache_ptr + next_key_block_offsets)
         next_key_tensor = gl.permute(next_key_tensor, [1, 3, 0, 2])
         next_key_tensor = gl.reshape(
@@ -2478,6 +2479,13 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             next_key_tensor, layout=qk_rhs_operand_layout
         )
         next_key_converted = next_key_converted.to(COMPUTE_TYPE)
+        # kv_block_numbers = next_kv_block_numbers
+        # qk_column_offsets = next_qk_column_offsets
+        # key_converted = next_key_converted
+        # if KV_QUANT_MODE >= 0:
+        #     if KV_QUANT_MODE == 1:
+        #         key_scale_value = next_key_scale_value
+        #         value_scale_value = next_value_scale_value
 
         # ==================== 5. P * V ====================
         # Handle value quantization scaling for FP8
