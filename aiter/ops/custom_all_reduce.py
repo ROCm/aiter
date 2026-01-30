@@ -28,7 +28,8 @@ def all_reduce(
     out: torch.Tensor,
     use_new: bool,
     open_fp8_quant: bool,
-    reg_buffer: Optional[torch.Tensor] = None,
+    reg_input_buffer: Optional[torch.Tensor] = None,
+    reg_output_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
@@ -179,7 +180,13 @@ def meta_size() -> int: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def register_buffer(
+def register_input_buffer(
+    _fa: int, t: torch.Tensor, handles: List[torch.Tensor], offsets: List[int]
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def register_output_buffer(
     _fa: int, t: torch.Tensor, handles: List[torch.Tensor], offsets: List[int]
 ) -> None: ...
 
