@@ -223,7 +223,8 @@ def get_models() -> Iterable[Model]:
         Model.new("Llama4 Maverick (Vision)").h(16).d(88).build(),
         Model.new("Qwen-235B-A22B").h_q_vk(64, 4).d(128).build(),
         Model.new("GPT-OSS 120B").h_q_vk(64, 8).d(64).build(),
-        Model.new("DeepSeek R1").h(128).d_qk_v(192, 128).build(),
+        Model.new("DeepSeek R1 (Prefill)").h(128).d(56).build(),
+        Model.new("DeepSeek R1 (Decode)").h(128).d_qk_v(192, 128).build(),
     )
 
 
