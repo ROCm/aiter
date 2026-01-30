@@ -327,18 +327,30 @@ def fav3_sage_forward_func(
         sage_quant_func = sage_quant_v2
     if sage_version == fav3_sage.Sage_version.V3:
         sage_quant_func = sage_quant_v3
-
-    q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale, v_mean = sage_quant_func(
-        q,
-        k,
-        v,
-        fp8_dtype,
-        FP8_MAX,
-        sm_scale=softmax_scale,
-        BLKQ=BLKQ,
-        BLKK=BLKK,
-        layout=layout,
-    )
+        q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale, v_mean = sage_quant_func(
+            q,
+            k,
+            v,
+            fp8_dtype,
+            FP8_MAX,
+            sm_scale=softmax_scale,
+            BLKQ=BLKQ,
+            BLKK=BLKK,
+            layout=layout,
+        )
+    else:
+        q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant_func(
+            q,
+            k,
+            v,
+            fp8_dtype,
+            FP8_MAX,
+            sm_scale=softmax_scale,
+            BLKQ=BLKQ,
+            BLKK=BLKK,
+            layout=layout,
+        )
+        v_mean = None
 
     return lambda: fav3_sage_func(
         q_quantized,
