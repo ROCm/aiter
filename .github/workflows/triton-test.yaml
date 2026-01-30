@@ -70,6 +70,7 @@ jobs:
 
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
+          --network=host \
           --shm-size=16G \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
