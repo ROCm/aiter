@@ -632,6 +632,18 @@ class KvManagerV2
 // ...
 // [28, 504-511], [29, 504-511], [30, 504-511], [31, 504-511] (done by warp 7 thread 63)
 template <typename T>
+__device__ __forceinline__ constexpr uint32_t get_transposed_v_lds_size_in_byte()
+{
+    using kv_t = T::kv_t;
+
+    // sub_block[0]: [0:3, 0:511], sub_block[1]: [4:7, 0:511], ...
+    constexpr uint32_t kNumSubBlock = 8;
+    // 8*((32/8)*512*1+16*4)=8*(4*512+64)=8*2112=16896
+    return kNumSubBlock *
+           ((T::kBlockN / kNumSubBlock) * T::kVoHeadDim * sizeof(kv_t) + 16 * sizeof(uint32_t));
+}
+
+template <typename T>
 __device__ __forceinline__ void store_transposed_v_to_lds(const uintptr_t p_lds_vt,
                                                           const v8ui& v_transposed)
 {
@@ -1088,10 +1100,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     extern __shared__ int32_t p_lds[];
 
     constexpr uint32_t kSzLdsKv = kv_manager.get_lds_size_in_byte();
+    constexpr uint32_t kSzLdsTv = get_transposed_v_lds_size_in_byte<T>();
 
     uintptr_t p_lds_kv_curr  = reinterpret_cast<uintptr_t>(p_lds);
     uintptr_t p_lds_kv_next  = p_lds_kv_curr + kSzLdsKv;
-    const uintptr_t p_lds_vt = p_lds_kv_next + kSzLdsKv; // TODO: p_lds_vt is not used.
+    const uintptr_t p_lds_vt = p_lds_kv_next + kSzLdsKv;
+    const uintptr_t p_lds_q  = p_lds_vt + kSzLdsTv;
 
     // Reg tiles
     constexpr uint32_t k_o_sz      = 128;
