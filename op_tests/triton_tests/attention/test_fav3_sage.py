@@ -229,6 +229,7 @@ def test_sage(
         causal=False,
         inference_mode=True,
         layout=layout,
+        blockscale_k=False,
     )
 
     if DEBUG_MODE:

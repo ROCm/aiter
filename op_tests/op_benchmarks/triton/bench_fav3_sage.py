@@ -302,7 +302,7 @@ def fav3_sage_forward_func(
     v: torch.Tensor,
     layout: Literal["bshd", "bhsd"],
     include_quantization_overhead: bool = False,
-    blockscale_k: bool = True,
+    blockscale_k: bool = False,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
