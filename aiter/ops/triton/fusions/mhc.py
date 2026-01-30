@@ -171,9 +171,9 @@ def fused_mhc(
     n_res_expected = n_factorial if hres_lite_mode else n_squared
     N_total_expected = n_res_expected + 2 * n  # n (pre) + n (post) + n_res
 
-    # Get config from JSON files if not provided
+    # Get config from JSON files if not provided (mode-aware config loading)
     if config is None:
-        config, _ = get_mhc_config("MHC_FUSED", M, C)
+        config, _ = get_mhc_config("MHC_FUSED", M, C, mode=hres_mode)
     else:
         config = dict(config)  # Copy to avoid mutation
     
@@ -834,12 +834,12 @@ def mhc_lite(
     # Find next power of 2 >= n_factorial for vectorized softmax
     n_factorial_pow2 = 1 << (n_factorial - 1).bit_length()
     
-    # Load configuration
+    # Load configuration (always use lite mode for mhc_lite)
     C = K // n
     if config is None:
-        config, _ = get_mhc_config("MHC_FUSED", M, C)
+        config, _ = get_mhc_config("MHC_FUSED", M, C, mode="lite")
     else:
-        base_config, _ = get_mhc_config("MHC_FUSED", M, C)
+        base_config, _ = get_mhc_config("MHC_FUSED", M, C, mode="lite")
         config = {**base_config, **config}
     
     # Pop block sizes and num_ksplit from config to avoid conflicts
