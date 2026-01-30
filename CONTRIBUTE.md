@@ -245,8 +245,8 @@ if __name__ == "__main__":
 ### Testing on Different Hardware
 
 If you don't have access to specific AMD GPU models, mention this in your PR. Our CI system will run tests on:
-* MI250X (gfx90a)
 * MI300X (gfx942)
+* MI350X (gfx950)
 
 ---
 
