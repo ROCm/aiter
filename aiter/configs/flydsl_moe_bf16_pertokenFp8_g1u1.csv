@@ -1,3 +1,7 @@
 tile_m,tile_n,tile_k,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,kernelName1,kernelName2
-32,128,128,silu,bf16,fp8,fp8,per_token,1,0,moe_flydsl_gemm1_32x128x128_F8_F8_B16,moe_flydsl_gemm2_32x256x128_F8_F8_B16
-
+16,128,128,silu,bf16,fp8,fp8,per_token,1,0,moe_flydsl_gemm1_16x128x128_F8_F8_B16,moe_flydsl_gemm2_16x128x128_F8_F8_B16
+16,128,256,silu,bf16,fp8,fp8,per_token,1,0,moe_flydsl_gemm1_16x128x256_F8_F8_B16,moe_flydsl_gemm2_16x128x256_F8_F8_B16
+32,128,128,silu,bf16,fp8,fp8,per_token,1,0,moe_flydsl_gemm1_32x128x128_F8_F8_B16,moe_flydsl_gemm2_32x128x128_F8_F8_B16
+32,128,256,silu,bf16,fp8,fp8,per_token,1,0,moe_flydsl_gemm1_32x128x256_F8_F8_B16,moe_flydsl_gemm2_32x128x256_F8_F8_B16
+64,128,128,silu,bf16,fp8,fp8,per_token,1,0,moe_flydsl_gemm1_64x128x128_F8_F8_B16,moe_flydsl_gemm2_64x128x128_F8_F8_B16
+64,128,256,silu,bf16,fp8,fp8,per_token,1,0,moe_flydsl_gemm1_64x128x256_F8_F8_B16,moe_flydsl_gemm2_64x128x256_F8_F8_B16
