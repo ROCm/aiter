@@ -116,69 +116,6 @@ def ref_paged_attn(
 
     return torch.cat(outputs, dim=0).to(prev_device)
 
-def ref_paged_attn(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    query_lens: list[int],
-    kv_lens: list[int],
-    block_tables: torch.Tensor,
-    scale: float,
-    sliding_window: Optional[int] = None,
-    soft_cap: Optional[float] = None,
-    sinks: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    num_seqs = len(query_lens)
-    block_tables = block_tables.cpu().numpy()
-    _, block_size, num_kv_heads, head_size = key_cache.shape
-
-    outputs: list[torch.Tensor] = []
-    start_idx = 0
-    for i in range(num_seqs):
-        query_len = query_lens[i]
-        kv_len = kv_lens[i]
-        q = query[start_idx : start_idx + query_len]
-        q *= scale
-
-        num_kv_blocks = (kv_len + block_size - 1) // block_size
-        block_indices = block_tables[i, :num_kv_blocks]
-
-        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
-        k = k[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
-        v = v[:kv_len]
-
-        if q.shape[1] != k.shape[1]:
-            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
-            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len, device=q.device)
-        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-        if sliding_window is not None:
-            sliding_window_mask = (
-                torch.triu(
-                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
-                )
-                .bool()
-                .logical_not()
-            )
-            mask |= sliding_window_mask
-        if soft_cap is not None and soft_cap > 0:
-            attn = soft_cap * torch.tanh(attn / soft_cap)
-        attn.masked_fill_(mask, float("-inf"))
-        if sinks is not None:
-            s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
-            attn = torch.cat((attn, s_aux), dim=-1)
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
-        if sinks is not None:
-            attn = attn[..., :-1]
-        out = torch.einsum("hqk,khd->qhd", attn, v)
-
-        outputs.append(out)
-        start_idx += query_len
-
-    return torch.cat(outputs, dim=0)
-
 
 def gen_testdata(
     seq_lens: list[tuple[int, int]],
@@ -338,7 +275,7 @@ def test_triton_unified_attn(
 
 
 @pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]][0:1]
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
@@ -372,27 +309,27 @@ def test_triton_unified_attn_blockscale(
     window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
     scale = head_size**-0.5
 
-    # unified_attention(
-    #     q=data["maybe_quantized_query"],
-    #     k=data["maybe_quantized_key_cache"],
-    #     v=data["maybe_quantized_value_cache"],
-    #     out=data["output"],
-    #     cu_seqlens_q=data["cu_query_lens"],
-    #     seqused_k=data["kv_lens"],
-    #     max_seqlen_q=data["max_query_len"],
-    #     max_seqlen_k=data["max_kv_len"],
-    #     softmax_scale=scale,
-    #     causal=True,
-    #     window_size=window_size,
-    #     block_table=data["block_tables"],
-    #     softcap=soft_cap if soft_cap is not None else 0,
-    #     q_descale=None,
-    #     k_descale=None,
-    #     v_descale=None,
-    #     sinks=None,
-    #     k_block_scale=k_block_scale,
-    #     v_block_scale=v_block_scale,
-    # )
+    unified_attention(
+        q=data["maybe_quantized_query"],
+        k=data["maybe_quantized_key_cache"],
+        v=data["maybe_quantized_value_cache"],
+        out=data["output"],
+        cu_seqlens_q=data["cu_query_lens"],
+        seqused_k=data["kv_lens"],
+        max_seqlen_q=data["max_query_len"],
+        max_seqlen_k=data["max_kv_len"],
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=data["block_tables"],
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        k_block_scale=k_block_scale,
+        v_block_scale=v_block_scale,
+    )
     
     ref_output = ref_paged_attn(
         query=data["query"],
@@ -408,7 +345,6 @@ def test_triton_unified_attn_blockscale(
         k_block_scale=k_block_scale,
         v_block_scale=v_block_scale,
     )
-    data["output"] = ref_output
     ref_output = ref_output.to(data["output"].device).to(data["output"].dtype)
     atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
