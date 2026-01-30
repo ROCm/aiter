@@ -2,20 +2,21 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import copy
 import itertools
-from aiter.ops.enum import QuantType
 import numpy as np
 import random
+import time
+import torch
+import pandas as pd
+
+from torch.utils.benchmark import Timer
 from typing import List, Optional, Tuple, Union
 
-import pandas as pd
-import torch
-
 import aiter
-from aiter import dtypes
-from aiter import pertoken_quant
-from aiter.test_common import benchmark, checkAllclose, perftest
-import torch.profiler as tpf
+from aiter import dtypes, pertoken_quant
+from aiter.ops.enum import QuantType
+from aiter.test_common import benchmark, checkAllclose, perftest, device_memory_profiling, run_iters, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -29,6 +30,67 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
 }
+
+
+def run_rocmprof_test(
+    func,
+    *args,
+    num_iters=101,
+    num_warmup=2,
+    testGraph=False,
+    num_rotate_args=0,
+    needTrace=False,
+    **kwargs,
+):
+    @rocmprof_test(
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        testGraph=testGraph,
+        num_rotate_args=num_rotate_args,
+        needTrace=needTrace,
+    )
+    def worker(*args, **kwargs):
+        return func(*args, **kwargs)
+
+    return worker(*args, **kwargs)
+
+
+def rocmprof_test(
+    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            num = num_rotate_args
+            if num < 1:
+                gpu_id = torch.cuda.current_device()
+                iter_used_memory, inputSize, _, _ = device_memory_profiling(
+                    func, *args, **kwargs
+                )
+
+                properties = torch.cuda.get_device_properties(gpu_id)
+                free_memory = torch.cuda.mem_get_info(gpu_id)[0]
+                cache_size = min(
+                    getattr(properties, "L2_cache_size", 4096 * 1024) * 64 * 128,
+                    (free_memory - iter_used_memory + inputSize) * 0.9,
+                )
+                cache_size = max(cache_size, 0)
+                num = int((cache_size + inputSize - 1) // inputSize)
+            num = min(num, num_iters)
+
+            rotate_args = [
+                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
+            ] + [(args, kwargs)]
+            run_iters(num_warmup, func, *args, **kwargs)
+            for _ in range(num_iters):
+                data = func(*args, **kwargs)
+                torch.cuda.empty_cache()
+                # torch.cuda.ipc_collect()
+            avg = float('nan')
+            return data, avg
+
+        return wrapper
+
+    return decorator
 
 
 def get_kv_cache_torch_dtype(
@@ -294,80 +356,6 @@ def perblock_quant_kvcache_symm(
     return k_quant, k_scale_asm, v_quant, v_scale_asm
 
 
-@perftest(num_rotate_args=20)
-def run_aiter_asm_ps(
-    Q,
-    K,
-    V,
-    output,
-    max_qlen,
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    context_lens,
-    K_QScale,
-    V_QScale,
-    work_indptr,
-    work_info,
-    reduce_indptr,
-    reduce_final_map,
-    reduce_partial_map,
-    softmax_scale,
-    mask,
-    quant_type: QuantType = QuantType.per_Token,
-):
-    return aiter.pa_persistent_fwd(
-        Q=Q,
-        K=K,
-        V=V,
-        output=output,
-        max_qlen=max_qlen,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_indices=kv_indices,
-        context_lens=context_lens,
-        K_QScale=K_QScale,
-        V_QScale=V_QScale,
-        work_indptr=work_indptr,
-        work_info=work_info,
-        reduce_indptr=reduce_indptr,
-        reduce_final_map=reduce_final_map,
-        reduce_partial_map=reduce_partial_map,
-        softmax_scale=softmax_scale,
-        mask=mask,
-        quant_type=quant_type,
-    )
-
-
-@perftest()
-def run_aiter_asm(
-    query,
-    k_cache,
-    v_cache,
-    block_tables,
-    seq_lens,
-    block_tables_stride0,
-    max_qlen,
-    k_scale=None,
-    v_scale=None,
-    qo_indptr=None,
-):
-    return aiter.pa_fwd_asm(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens,
-        block_tables_stride0,
-        max_qlen,
-        k_scale,
-        v_scale,
-        None,
-        qo_indptr,
-        # kernelName="_ZN5aiter42pa_bf16_pertokenFp8_gqa10_1tg_4w_mtp3_msk1E",
-    )
-
-
 def asm_V_shuffle(VC):
     # [num_blocks, num_kv_heads, head_size, block_size]
     x = 16 // VC.element_size()
@@ -376,53 +364,6 @@ def asm_V_shuffle(VC):
     # [num_blocks, num_kv_heads, block_size/X, head_size, X]
     VC = VC.permute(0, 1, 3, 2, 4).contiguous()
     return VC
-
-
-def profile_kernel_breakdown(func, num_iters=100, num_warmup=10):
-    """
-    Profile a function and extract PA kernel and reduce kernel time breakdown.
-    """
-    schedule = tpf.schedule(
-        wait=0,
-        warmup=num_warmup,
-        active=num_iters,
-        repeat=1,
-    )
-
-    pa_time = 0.0
-    reduce_time = 0.0
-    total_time = 0.0
-
-    with tpf.profile(
-        activities=[tpf.ProfilerActivity.CUDA],
-        schedule=schedule,
-        profile_memory=False,
-        with_stack=False,
-    ) as prof:
-        for step in range(num_warmup + num_iters):
-            func()
-            prof.step()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    # Analyze kernel times
-    for event in prof.events():
-        if event.device_type.name == "CUDA":
-            time_us = event.device_time_total
-            total_time += time_us
-            name = event.name.lower()
-            if "reduce" in name:
-                reduce_time += time_us
-            elif "pa_" in name or "pa " in name:
-                pa_time += time_us
-
-    avg_total = total_time / num_iters if num_iters > 0 else 0
-    pa_ratio = pa_time / total_time if total_time > 0 else 0
-    reduce_ratio = reduce_time / total_time if total_time > 0 else 0
-    avg_pa_time = pa_time / num_iters if num_iters > 0 else 0
-    avg_reduce_time = reduce_time / num_iters if num_iters > 0 else 0
-
-    return avg_total, pa_ratio, reduce_ratio, avg_pa_time, avg_reduce_time
 
 
 @benchmark()
@@ -437,7 +378,9 @@ def test_pa_ps(
     varlen: bool = False,
     load_metadata: bool = False,
     dump_metadata: bool = False,
-    profile_ps: bool = False,
+    enable_rocmprof: bool = False,
+    check_nops: bool = False,
+    skip_reference: bool = False,
     quant_type: QuantType = QuantType.per_Token,
 ) -> dict:
     ret = {}
@@ -460,7 +403,7 @@ def test_pa_ps(
     seq_lens_qo = torch.randint(
         1, 5, (batch_size,), dtype=torch.int, device=device
     ).fill_(qlen)
-    # seq_lens_kv = torch.tensor([10240] * (batch_size - 1) + [30720], dtype=torch.int, device=device)
+    seq_lens_kv = torch.tensor([10240] * (batch_size - 1) + [30720], dtype=torch.int, device=device)
     # print(seq_lens_qo)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_qo = qo_indptr[-1].item()
@@ -506,15 +449,6 @@ def test_pa_ps(
     )
     k_cache, v_cache = k_caches[0], v_caches[0]
 
-    torch_mha_extend(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens_kv,
-        qo_indptr,
-    )
-
     scale = float(1.0 / (head_size**0.5))
 
     # ################## quant start ######################
@@ -533,18 +467,6 @@ def test_pa_ps(
         k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
             pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
         )
-
-    # torch ref
-    out_ref = torch_mha_extend(
-        query,
-        k_quant_,
-        v_quant_,
-        block_tables,
-        seq_lens_kv,
-        qo_indptr,
-        k_scale_,
-        v_scale_,
-    )
 
     (
         (work_meta_data_size, work_meta_data_type),
@@ -582,7 +504,7 @@ def test_pa_ps(
             array = np.fromfile(file_name, dtype=np.uint32)
             meta = torch.from_numpy(array).reshape(shape)
             torch.set_printoptions(threshold=999999, linewidth=120)
-            print(f"==>load {name} from {file_name}:\n{meta}")
+            print(f"==>load {name} shape {meta.shape} from {file_name}:\n{meta}", flush=True)
     else:
         # warmup for get_pa_metadata_v1
         aiter.get_pa_metadata_v1(
@@ -632,43 +554,50 @@ def test_pa_ps(
         end_event.record()
         end_event.synchronize()
         us_metadata = start_event.elapsed_time(end_event) * 1000  # ms to us
+        ret["us_metadata"] = us_metadata
 
     if dump_metadata:
         for name, meta in metadata_map.items():
             file_name = f"{name}.bin"
             torch.set_printoptions(threshold=999999, linewidth=120)
-            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}")
+            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}", flush=True)
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
     # Benchmark PA Persistent Scheduling
+    v_shuffled = asm_V_shuffle(v_quant_)
     output = torch.empty_like(query)
 
-    if profile_ps:
-        # Prepare V cache for both methods
-        v_shuffled = asm_V_shuffle(v_quant_)
+    benchmark_func = run_rocmprof_test if enable_rocmprof else run_perftest
+    _, us_pa_ps = benchmark_func(
+        aiter.pa_persistent_fwd,
+        Q=query,
+        K=k_quant_,
+        V=v_shuffled,
+        output=output,
+        max_qlen=max_qlen,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        context_lens=seq_lens_kv,
+        K_QScale=k_scale_asm,
+        V_QScale=v_scale_asm,
+        work_indptr=work_indptr,
+        work_info=work_info,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        softmax_scale=scale,
+        mask=1,
+        quant_type=quant_type,
+        # benchmark arg only
+        num_warmup=20,
+        num_rotate_args=20,
+    )
+    ret["us_pa_ps"] = us_pa_ps
 
-        out_aiter_asm, us_pa_ps = run_aiter_asm_ps(
-            Q=query,
-            K=k_quant_,
-            V=v_shuffled,
-            output=output,
-            max_qlen=max_qlen,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            context_lens=seq_lens_kv,
-            K_QScale=k_scale_asm,
-            V_QScale=v_scale_asm,
-            work_indptr=work_indptr,
-            work_info=work_info,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            softmax_scale=scale,
-            mask=1,
-        )
-
-        _, us_pa_nops = run_aiter_asm(
+    if check_nops:
+        _, us_pa_nops = benchmark_func(
+            aiter.pa_fwd_asm,
             query,
             k_quant_,
             v_shuffled,
@@ -676,131 +605,40 @@ def test_pa_ps(
             seq_lens_kv,
             block_tables.size(1),
             max_qlen,
-            k_scale=k_scale_asm,
-            v_scale=v_scale_asm,
+            k_scale=k_scale_,
+            v_scale=v_scale_,
             qo_indptr=qo_indptr,
         )
-
-        # Profile kernel breakdown for PA PS
-        _, pa_ps_ratio, reduce_ratio, us_pa_ps_kernel, us_reduce_kernel = (
-            profile_kernel_breakdown(
-                lambda: aiter.pa_persistent_fwd(
-                    Q=query,
-                    K=k_quant_,
-                    V=v_shuffled,
-                    output=output,
-                    max_qlen=max_qlen,
-                    qo_indptr=qo_indptr,
-                    kv_indptr=kv_indptr,
-                    kv_indices=kv_indices,
-                    context_lens=seq_lens_kv,
-                    K_QScale=k_scale_asm,
-                    V_QScale=v_scale_asm,
-                    work_indptr=work_indptr,
-                    work_info=work_info,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    softmax_scale=scale,
-                    mask=1,
-                )
-            )
-        )
-
-        # Profile kernel breakdown for PA NOPS (no reduce kernel)
-        _, _, _, us_pa_nops_kernel, _ = profile_kernel_breakdown(
-            lambda: aiter.pa_fwd_asm(
-                query,
-                k_quant_,
-                v_shuffled,
-                block_tables,
-                seq_lens_kv,
-                block_tables.size(1),
-                max_qlen,
-                k_scale_asm,
-                v_scale_asm,
-                None,
-                qo_indptr,
-            )
-        )
-
-        # Verify correctness
-        err = checkAllclose(
-            out_ref,
-            output,
-            msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
-        )
-
-        # Store results
-        ret["us_metadata"] = us_metadata
         ret["us_pa_nops"] = us_pa_nops
-        ret["us_pa_ps"] = us_pa_ps
-        ret["us_pa_ps_kernel"] = us_pa_ps_kernel
-        ret["pa_ps_ratio"] = pa_ps_ratio
-        ret["us_reduce_kernel"] = us_reduce_kernel
-        ret["reduce_ratio"] = reduce_ratio
         ret["speedup"] = us_pa_nops / us_pa_ps if us_pa_ps > 0 else 0
-        ret["speedup(pa)"] = (
-            us_pa_nops_kernel / us_pa_ps_kernel if us_pa_ps_kernel > 0 else 0
-        )
-        ret["err fp8"] = err
-    else:
-        out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
-            Q=query,
-            K=k_quant_,
-            V=asm_V_shuffle(v_quant_),
-            output=output,
-            max_qlen=max_qlen,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            context_lens=seq_lens_kv,
-            K_QScale=k_scale_asm,
-            V_QScale=v_scale_asm,
-            work_indptr=work_indptr,
-            work_info=work_info,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            softmax_scale=scale,
-            mask=1,
-            quant_type=quant_type,
-        )
 
-        # _, us_asm_noquant = run_aiter_asm(
+    if not skip_reference:
+        # torch_mha_extend(
         #     query,
-        #     k_quant_,
-        #     asm_V_shuffle(v_quant_),
+        #     k_cache,
+        #     v_cache,
         #     block_tables,
         #     seq_lens_kv,
-        #     block_tables.size(1),
-        #     max_qlen,
-        #     k_scale=k_scale_,
-        #     v_scale=v_scale_,
-        #     qo_indptr=qo_indptr,
+        #     qo_indptr,
         # )
+
+        # torch ref
+        out_ref = torch_mha_extend(
+            query,
+            k_quant_,
+            v_quant_,
+            block_tables,
+            seq_lens_kv,
+            qo_indptr,
+            k_scale_,
+            v_scale_,
+        )
 
         err = checkAllclose(
             out_ref,
             output,
             msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
         )
-
-        # if isinstance(us_aiter_asm, torch.Tensor):
-        #     us_aiter_asm = us_aiter_asm.item()
-        # if isinstance(us_asm_noquant, torch.Tensor):
-        #     us_asm_noquant = us_asm_noquant.item()
-
-        # print(f"seq_lens_kv: {seq_lens_kv.tolist()[0]}")
-        # print(f"batch_size: {batch_size}")
-        # print(f"PA PS forward: {us_aiter_asm:>8.2f} ms")
-        # print(f"PA without persistent: {us_asm_noquant:>8.2f} ms")
-        # print(
-        #     f"Speedup: {us_asm_noquant / us_aiter_asm if us_aiter_asm > 0 else 0:.2f}x"
-        # )
-
-        ret["us_metadata"] = us_metadata
-        ret["us_asm_fp8"] = us_aiter_asm
         ret["err fp8"] = err
 
     return ret
@@ -814,8 +652,8 @@ l_num_heads = [
     # (16, 2),
     (16, 1),
 ]
-l_qlen = [3]
-# l_qlen = [4]
+# l_qlen = [3]
+l_qlen = [4]
 l_ctx_len = [
     7,
     109,
@@ -914,6 +752,18 @@ parser.add_argument(
     --profile # Enable detailed performance stats""",
 )
 parser.add_argument(
+    "--check_nops",
+    action="store_true",
+    help="""Check NOPs. Default: False.
+    --check_nops # True""",
+)
+parser.add_argument(
+    "--skip_reference",
+    action="store_true",
+    help="""Skip reference test. Default: False.
+    --skip_reference # True""",
+)
+parser.add_argument(
     "--quant_type",
     type=str,
     choices=["per_Token", "per_256x128", "per_1024x128"],
@@ -962,6 +812,8 @@ for dtype in l_dtype:
             args.load_metadata,
             args.dump_metadata,
             args.profile,
+            args.check_nops,
+            args.skip_reference,
             l_quant_type,
         )
         df.append(ret)
