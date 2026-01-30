@@ -34,12 +34,20 @@ jobs:
         include:
           - runner: aiter-1gpu-runner
             label: MI325
+            gpu_arch: gfx942
+            gpu_arch_ci: mi300
+            sgl_image: rocm/sgl-dev:v0.5.8-rocm700-mi30x-20260127
+          - runner: aiter-mi355-1gpu
+            label: MI355
+            gpu_arch: gfx950
+            gpu_arch_ci: mi35x
+            sgl_image: rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260129
 
     env:
       SGL_BRANCH: v0.5.8
-      GPU_ARCH: gfx942
-      GPU_ARCH_CI: mi300 # used in sglang ci scripts
-      SGL_IMAGE: rocm/sgl-dev:v0.5.8-rocm700-mi30x-20260127
+      GPU_ARCH: ${{ matrix.gpu_arch }}
+      GPU_ARCH_CI: ${{ matrix.gpu_arch_ci }} # used in sglang ci scripts
+      SGL_IMAGE: ${{ matrix.sgl_image }}
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 

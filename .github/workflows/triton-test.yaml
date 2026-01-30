@@ -40,6 +40,8 @@ jobs:
         include:
           - runner: aiter-1gpu-runner
             label: MI325
+          - runner: aiter-mi355-1gpu
+            label: MI355
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
