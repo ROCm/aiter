@@ -6,7 +6,6 @@ from aiter.ops.triton._triton_kernels.conv.conv3d.conv3d_std import _conv3d_std_
 from aiter.ops.triton.utils.conv_common import (
     conv3d_output_shape,
     padding_type,
-    ConvGPUTimer,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -91,51 +90,38 @@ def conv3d_std(
     _LOGGER.info(f"x.stride: {x.stride()}, weight.stride(): {weight.stride()}")
     _LOGGER.info(f"output.shape: {output.shape}, output.stride(): {output.stride()}")
 
-    # time the kernel execution
-    with ConvGPUTimer(
+    _conv3d_std_kernel[grid_fn](
         x,
         weight,
-        bias=bias,
-        stride=stride,
-        padding=padding_val,
-        dilation=dilation,
-        groups=groups,
-    ) as gt:
-        _conv3d_std_kernel[grid_fn](
-            x,
-            weight,
-            output,
-            bias,
-            N,
-            x.shape[2],
-            x.shape[3],
-            x.shape[4],
-            oc,
-            od,
-            oh,
-            ow,
-            *x.stride(),
-            *weight.stride(),
-            *output.stride(),
-            weight.shape[1],
-            weight.shape[2],
-            weight.shape[3],
-            weight.shape[4],
-            stride[0],
-            stride[1],
-            stride[2],
-            padding_val[0],
-            padding_val[1],
-            padding_val[2],
-            dilation[0],
-            dilation[1],
-            dilation[2],
-            GROUPS=groups,
-            **config,
-        )
-    _LOGGER.info(f"CONV3D_STD kernel execution time: {gt.elapsed:2f} ms")
-    _LOGGER.info(f"CONV3D_STD achieved bandwidth: {gt.bandwidth:.2f} GB/s")
-    _LOGGER.info(f"CONV3D_STD achieved FLOPS: {gt.computation:.2f} TFLOPS")
+        output,
+        bias,
+        N,
+        x.shape[2],
+        x.shape[3],
+        x.shape[4],
+        oc,
+        od,
+        oh,
+        ow,
+        *x.stride(),
+        *weight.stride(),
+        *output.stride(),
+        weight.shape[1],
+        weight.shape[2],
+        weight.shape[3],
+        weight.shape[4],
+        stride[0],
+        stride[1],
+        stride[2],
+        padding_val[0],
+        padding_val[1],
+        padding_val[2],
+        dilation[0],
+        dilation[1],
+        dilation[2],
+        GROUPS=groups,
+        **config,
+    )
 
     if isinstance(padding, str) and padding.upper() == "SAME":
         _LOGGER.info("Output generated with SAME padding.")
