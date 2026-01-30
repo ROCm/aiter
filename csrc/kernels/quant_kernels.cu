@@ -507,7 +507,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
+template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16, bool transpose_out_dim01 = false>
 __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                      float* __restrict__ scale,
                                                      DTYPE_I* __restrict__ input,
@@ -519,33 +519,27 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                      const int32_t num_rows_factor        = 1,
                                                      const int32_t input_dim0             = 1,
                                                      const int32_t input_dim1             = 1,
-                                                     const int32_t input_stride0          = 1,
-                                                     const int32_t input_stride1          = 1,
-                                                     const int32_t out_dim0               = 1,
-                                                     const int32_t out_dim1               = 1,
-                                                     const int32_t out_stride0            = 1,
-                                                     const int32_t out_stride1            = 1,
+                                                     const int32_t input_stride0_cols     = 1,
+                                                     const int32_t input_stride1_cols     = 1,
+                                                     const int32_t out_stride0_cols       = 1,
+                                                     const int32_t out_stride1_cols       = 1,
                                                      const int32_t smooth_scale_map_hash_size = 256)
 {
     __shared__ int32_t smooth_scale_map_hash_shared[256];
-    // int token_idx = blockIdx.x;
+    int token_idx = blockIdx.x;
     int num_tg = gridDim.x;
     int rows = num_rows == nullptr ? input_dim0 * input_dim1 : *num_rows * num_rows_factor;
-    // if(num_rows != nullptr)
-    // {
-    //     int32_t rows = *num_rows * num_rows_factor;
-    //     if(token_idx >= rows)
-    //         return;
-    // }
     if(smooth_scale_map != nullptr && smooth_scale_map_hash != nullptr)
     {
         auto buffer_hash = opus::make_gmem<int>(smooth_scale_map_hash, smooth_scale_map_hash_size * sizeof(int));
         buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x, threadIdx.x);
     }
-    for(int token_idx = blockIdx.x; token_idx < rows; token_idx += num_tg)
+    for(; token_idx < rows; token_idx += num_tg)
     {
-        int real_token_idx = token_idx % input_dim1 * (input_stride1 / cols) +
-                            (token_idx / input_dim1) % input_dim0 * (input_stride0 / cols);
+        int idx_input_dim0 = token_idx / input_dim1;
+        int idx_input_dim1 = token_idx % input_dim1;
+        int real_token_idx = idx_input_dim1 * input_stride1_cols +
+                            idx_input_dim0 * input_stride0_cols;
         int32_t smscale_map_idx = smooth_scale_map == nullptr ? 0 : smooth_scale_map[token_idx];
         if(smooth_scale_map != nullptr && smooth_scale_map_hash != nullptr)
         {
@@ -562,8 +556,19 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         float row_scale = std::get<0>(res);
         float* vec_ptr  = std::get<1>(res);
 
-        int64_t out_token_idx = token_idx % out_dim1 * (out_stride1 / cols) +
-            (token_idx / out_dim1) % out_dim0 * (out_stride0 / cols);
+        int out_token_idx;
+        if constexpr(transpose_out_dim01)
+        {   
+            int idx_out_dim0 = token_idx / input_dim0;
+            int idx_out_dim1 = token_idx % input_dim0;
+            out_token_idx = idx_out_dim1 * out_stride1_cols +
+                            idx_out_dim0 * out_stride0_cols;
+        }
+        else
+        {
+            out_token_idx = idx_input_dim1 * out_stride1_cols +
+                            idx_input_dim0 * out_stride0_cols;
+        }
         if(threadIdx.x == 0)
         {
             if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
@@ -890,48 +895,56 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
 #endif
 }
 
-#define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE) \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                    \
-        using input_dtype = typename t2ck<scalar_t>::type;                                        \
-        const int cu_num = get_num_cu_func();                                                     \
-        const int max_warp_per_simd = 8;                                                          \
-        const int warp_per_simd = BLOCK_SIZE / (opus::get_warp_size() * 4);                        \
-        int grid_size = enable_ps ? max_warp_per_simd / warp_per_simd * cu_num : rows;            \
-        dim3 const grid(grid_size);                                                               \
-        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>                        \
-            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                              \
-                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                       \
-                scales.data_ptr<float>(),                                                         \
-                reinterpret_cast<input_dtype*>(input.data_ptr()),                                 \
-                smooth_scale.data_ptr<float>(),                                                   \
-                smooth_scale_map_ptr,                                                             \
-                smooth_scale_map_hash_ptr,                                                        \
-                cols,                                                                             \
-                num_rows_ptr,                                                                     \
-                num_rows_factor,                                                                  \
-                input_dim0,                                                                       \
-                input_dim1,                                                                       \
-                input_stride0,                                                                    \
-                input_stride1,                                                                    \
-                out_dim0,                                                                         \
-                out_dim1,                                                                         \
-                out_stride0,                                                                      \
-                out_stride1,                                                                      \
-                smooth_scale_map_hash_size);                                                      \
+#define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01) \
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                                         \
+        using input_dtype = typename t2ck<scalar_t>::type;                                                             \
+        const int cu_num = get_num_cu_func();                                                                          \
+        const int max_warp_per_simd = 8;                                                                               \
+        const int warp_per_simd = BLOCK_SIZE / (opus::get_warp_size() * 4);                                            \
+        int grid_size = enable_ps ? max_warp_per_simd / warp_per_simd * cu_num : rows;                                 \
+        dim3 const grid(grid_size);                                                                                    \
+        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA, TRANSPOSE_OUT_DIM01>                        \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                                   \
+                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
+                scales.data_ptr<float>(),                                                                              \
+                reinterpret_cast<input_dtype*>(input.data_ptr()),                                                      \
+                smooth_scale.data_ptr<float>(),                                                                        \
+                smooth_scale_map_ptr,                                                                                  \
+                smooth_scale_map_hash_ptr,                                                                             \
+                cols,                                                                                                  \
+                num_rows_ptr,                                                                                          \
+                num_rows_factor,                                                                                       \
+                input_dim0,                                                                                            \
+                input_dim1,                                                                                            \
+                input_stride0_cols,                                                                                    \
+                input_stride1_cols,                                                                                    \
+                out_stride0_cols,                                                                                      \
+                out_stride1_cols,                                                                                      \
+                smooth_scale_map_hash_size);                                                                           \
     });
+
+#define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL_(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE)        \
+    if(transpose_out_dim01)                                                                               \
+    {                                                                                                     \
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, true);  \
+    }                                                                                                     \
+    else                                                                                                  \
+    {                                                                                                     \
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, false); \
+    }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(quant_kernel, DTYPE_O, cols)           \
     if(cols <= 8 * BlockSize)                                                                \
     {                                                                                        \
-        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, 8, BlockSize)       \
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL_(quant_kernel, DTYPE_O, 8, BlockSize)      \
     }                                                                                        \
     else if(cols <= 16 * BlockSize)                                                          \
     {                                                                                        \
-        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, 16, BlockSize)      \
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL_(quant_kernel, DTYPE_O, 16, BlockSize)     \
     }                                                                                        \
     else if(cols <= 16 * BlockSize * 2)                                                      \
     {                                                                                        \
-        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, 16, BlockSize * 2)  \
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL_(quant_kernel, DTYPE_O, 16, BlockSize * 2) \
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
@@ -968,10 +981,17 @@ void smooth_per_token_scaled_quant(
     int32_t out_dim1 = out.dim() > 2 ? out.size(1) : 1;
     int32_t out_stride0 = out.stride(0);
     int32_t out_stride1 = out.dim() > 2 ? out.stride(1) : cols;
+    int32_t input_stride0_cols = input_stride0 / cols;
+    int32_t input_stride1_cols = input_stride1 / cols;
+    int32_t out_stride0_cols = out_stride0 / cols;
+    int32_t out_stride1_cols = out_stride1 / cols;
     int32_t smooth_scale_map_hash_size =
         smooth_scale_map_hash.has_value() ? smooth_scale_map_hash->numel() : 0;
     TORCH_CHECK(
         smooth_scale_map_hash_size <= 256, __func__, " smooth_scale_map_hash_size is too large, only support <= 256");
+    TORCH_CHECK((input_dim0 * input_dim1 == out_dim0 * out_dim1) && (input_dim0 == out_dim0 || input_dim0 == out_dim1), 
+        __func__, "This kernel view input as 3D (m,k,n) and output as 3D (m,k,n)/(k,m,n)");
+    const bool transpose_out_dim01 = input_dim0 != out_dim0;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
