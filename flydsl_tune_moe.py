@@ -24,7 +24,7 @@ class FlyDSLBatchTuner:
         untuned_csv: str,
         candidate_csv: str,
         output_csv: str,
-        cu_num: int = 80,
+        cu_num: int = 256,
     ):
         self.untuned_csv = untuned_csv
         self.candidate_csv = candidate_csv
@@ -169,8 +169,10 @@ class FlyDSLBatchTuner:
 
         # Handle q_dtype_a and q_dtype_w
         if key in ["q_dtype_a", "q_dtype_w"]:
+            # Use architecture-specific fp8 type from dtypes module
+            # gfx942 (MI300) uses e4m3fnuz, gfx950 uses e4m3fn
             qdtype_map = {
-                "fp8": "torch.float8_e4m3fnuz",
+                "fp8": str(dtypes.fp8),  # Auto-select based on GPU architecture
                 "int8": "torch.int8",
             }
             if isinstance(value, str):
@@ -365,8 +367,6 @@ class FlyDSLBatchTuner:
                 activation=act_type,
                 splitk=0,
                 dtype=dtype,
-                num_iters=10,
-                num_warmup=2,
             )
 
             # ========== Measure Stage2 time (using CK MoE method) ==========
@@ -391,8 +391,6 @@ class FlyDSLBatchTuner:
                 sorted_weights=test_data["sorted_weights"],
                 quant_type=q_type,
                 activation=act_type,
-                num_iters=10,
-                num_warmup=2,
             )
 
             # ========== Measure complete 2-stage time (using CK MoE method) ==========
@@ -415,8 +413,6 @@ class FlyDSLBatchTuner:
                 block_size_M=block_m,
                 dtype=dtype,
                 use_flydsl=True,
-                num_iters=10,
-                num_warmup=2,
             )
 
             # ========== Clean up GPU memory to reduce crash probability ==========
@@ -961,8 +957,12 @@ Examples:
 
 Untuned CSV Format:
   token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1
-  128,7168,512,8,2,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,0
-  256,8192,1024,16,4,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,0
+  128,7168,512,8,2,ActivationType.Silu,torch.bfloat16,fp8,fp8,QuantType.per_Token,1,0
+  256,8192,1024,16,4,ActivationType.Silu,torch.bfloat16,fp8,fp8,QuantType.per_Token,1,0
+  
+  Note: "fp8" will auto-select based on GPU architecture:
+    - gfx942 (MI300): torch.float8_e4m3fnuz
+    - gfx950: torch.float8_e4m3fn
         """,
     )
 
