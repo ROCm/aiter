@@ -81,7 +81,6 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     sum_blocks =
         aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), ck_tile::get_warp_size()>(
             sum_blocks);
-    sum_blocks *= params.num_heads_k;
     sum_blocks += params.num_batches * Traits::kFixedOverheadNumBlocks;
 
     if(lane_idx == 0)
@@ -95,8 +94,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     // expected payload handled by each cu part.
-    const int32_t average  = sum_blocks / params.num_splits;
-    const int32_t reminder = sum_blocks % params.num_splits;
+    const int32_t num_cu_per_khead = params.num_cu / params.num_heads_k;
+    const int32_t average          = sum_blocks / num_cu_per_khead;
+    const int32_t reminder         = sum_blocks % num_cu_per_khead;
 
     int32_t cid                    = 0; // CU ID
     int32_t cu_per_khead_group     = params.num_cu / params.num_heads_k;
@@ -438,9 +438,9 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
 
     const int32_t num_clusters = dev_prop.multiProcessorCount;
 
-    // TORCH_CHECK(num_heads_k % num_clusters == 0,
-    //             __func__,
-    //             ": only supports #heads evenly divisible by #num_cu.");
+    TORCH_CHECK(num_clusters % num_heads_k == 0,
+                __func__,
+                ": only supports #num_cu evenly divisible by #kv_heads.");
 
     int32_t num_batches    = context_lens.size(0);
     int32_t num_heads      = num_heads_k * num_heads_per_head_k;
