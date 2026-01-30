@@ -1795,13 +1795,13 @@ def flydsl_moe_stage1(
         w1_scale_1d,
         sorted_ids,
         sorted_eids,
-        sorted_w.view(-1).contiguous(),
+        sorted_w,
         num_valid_ids,
         bias1,
         token_num,
         inter_dim,
         model_dim,
-        int(blocks),
+        blocks,
     )
     return out
 
@@ -1883,7 +1883,7 @@ def flydsl_moe_stage2(
     E = w2.shape[0]
 
     tile_m = block_m if block_m is not None else 64
-    tile_n = 256
+    tile_n = 128
     tile_k = 128 if not is_wfp4_pipeline else 256
 
     sorted_ids = sorted_token_ids.contiguous()
@@ -1896,12 +1896,6 @@ def flydsl_moe_stage2(
         sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
     else:
         sorted_w = sorted_weights
-
-    a2_qt_flat = a2.contiguous().view(-1)
-    a2_scale_1d = a2_scale.view(-1).contiguous()
-    # w2_flat = w2.contiguous().view(E * model_dim, inter_dim)
-    w2_flat = w2.contiguous()
-    w2_scale_1d = w2_scale.view(-1).contiguous()
 
     try:
         if not is_wfp4_pipeline:
@@ -1953,19 +1947,19 @@ def flydsl_moe_stage2(
 
     exe2(
         out,
-        a2_qt_flat,
-        w2_flat.view(-1),
-        a2_scale_1d,
-        w2_scale_1d,
+        a2,
+        w2,
+        a2_scale,
+        w2_scale,
         sorted_ids,
         sorted_eids,
-        sorted_w.view(-1).contiguous(),
+        sorted_w,
         num_valid_ids,
         bias2,
         token_num,
         model_dim,
         inter_dim,
-        int(blocks),
+        blocks,
     )
     return out
 
