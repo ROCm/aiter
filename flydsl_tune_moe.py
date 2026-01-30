@@ -604,15 +604,56 @@ class FlyDSLBatchTuner:
             print(f"\n❌ No successful tile configurations!")
             return None
 
-        # Sort by performance
+        # ========== Group results by block_m ==========
+        # Key insight: Stage1 and Stage2 MUST use the same block_m for moe_sorting compatibility
+        from collections import defaultdict
+
+        results_by_block_m = defaultdict(list)
+        for r in successful_results:
+            block_m = r["config"]["block_m"]
+            results_by_block_m[block_m].append(r)
+
+        print(f"\n📊 Results grouped by block_m:")
+        for block_m in sorted(results_by_block_m.keys()):
+            print(
+                f"   block_m={block_m}: {len(results_by_block_m[block_m])} configurations"
+            )
+
+        # ========== For each block_m, find best Stage1 and best Stage2 ==========
+        best_configs_by_block_m = {}
+
+        for block_m, block_results in results_by_block_m.items():
+            # Find best Stage1 within this block_m group
+            best_s1 = min(block_results, key=lambda x: x["us1_time"])
+            # Find best Stage2 within this block_m group
+            best_s2 = min(block_results, key=lambda x: x["us2_time"])
+
+            # Combined time using best Stage1 + best Stage2 from SAME block_m
+            combined_us = best_s1["us1_time"] + best_s2["us2_time"]
+
+            best_configs_by_block_m[block_m] = {
+                "block_m": block_m,
+                "best_s1": best_s1,
+                "best_s2": best_s2,
+                "combined_us": combined_us,
+            }
+
+        # ========== Find overall best block_m (by combined time) ==========
+        best_block_m = min(
+            best_configs_by_block_m.keys(),
+            key=lambda bm: best_configs_by_block_m[bm]["combined_us"],
+        )
+        best_combo = best_configs_by_block_m[best_block_m]
+
+        # Sort by overall performance for ranking display
         successful_results.sort(key=lambda x: x["us_time"])
 
-        # Print top 3
-        print(f"\n📊 Performance Ranking (Top 3):")
+        # Print overall performance ranking (Top 3)
+        print(f"\n📊 Overall Performance Ranking (Top 3 - same tile for both stages):")
         print(
-            f"{'Rank':<6} {'Tile Config':<20} {'Time(us)':<12} {'Throughput(tflops)':<12} {'Bandwidth(GB/s)':<12}"
+            f"{'Rank':<6} {'Tile Config':<20} {'Total(us)':<12} {'Stage1(us)':<12} {'Stage2(us)':<12} {'TFLOPS':<12}"
         )
-        print(f"{'-'*68}")
+        print(f"{'-'*80}")
 
         for rank, result in enumerate(successful_results[:3], 1):
             tile_m = result["config"]["block_m"]
@@ -620,27 +661,101 @@ class FlyDSLBatchTuner:
             tile_k = self.candidate_tiles.iloc[result["tile_idx"]]["tile_k"]
             tile_str = f"{tile_m}x{tile_n}x{tile_k}"
             print(
-                f"{rank:<6} {tile_str:<20} {result['us_time']:<12.2f} {result['tflops']:<12.2f} {result['bw']:<12.2f}"
+                f"{rank:<6} {tile_str:<20} {result['us_time']:<12.2f} {result['us1_time']:<12.2f} "
+                f"{result['us2_time']:<12.2f} {result['tflops']:<12.2f}"
             )
 
-        # Return best configuration
-        best_result = successful_results[0]
-        best_config = best_result["config"].copy()
-        best_config["us"] = round(best_result["us_time"], 2)
-        best_config["us1"] = round(best_result["us1_time"], 2)
-        best_config["us2"] = round(best_result["us2_time"], 2)
-        best_config["bw"] = round(best_result["bw"], 2)
-        best_config["tflops"] = round(best_result["tflops"], 2)
+        # ========== Print best Stage1 + Stage2 per block_m ==========
+        print(f"\n{'='*80}")
+        print(f"🎯 Best Stage1 + Stage2 per block_m (SAME block_m constraint):")
+        print(f"{'='*80}")
 
-        tile_m = best_config["block_m"]
-        tile_n = self.candidate_tiles.iloc[best_result["tile_idx"]]["tile_n"]
-        tile_k = self.candidate_tiles.iloc[best_result["tile_idx"]]["tile_k"]
+        for block_m in sorted(best_configs_by_block_m.keys()):
+            combo = best_configs_by_block_m[block_m]
+            best_s1 = combo["best_s1"]
+            best_s2 = combo["best_s2"]
 
-        print(
-            f"\n✅ Best: {tile_m}x{tile_n}x{tile_k}, "
-            f"{best_result['us_time']:.2f} us, {best_result['tflops']:.2f} tflops, "
-            f"{best_result['bw']:.2f} GB/s\n"
+            s1_tile_n = self.candidate_tiles.iloc[best_s1["tile_idx"]]["tile_n"]
+            s1_tile_k = self.candidate_tiles.iloc[best_s1["tile_idx"]]["tile_k"]
+            s2_tile_n = self.candidate_tiles.iloc[best_s2["tile_idx"]]["tile_n"]
+            s2_tile_k = self.candidate_tiles.iloc[best_s2["tile_idx"]]["tile_k"]
+
+            marker = " ⭐ BEST" if block_m == best_block_m else ""
+            print(f"\n  block_m={block_m}{marker}")
+            print(
+                f"    Best Stage1: {block_m}x{s1_tile_n}x{s1_tile_k} → {best_s1['us1_time']:.2f} us"
+            )
+            print(f"      kernelName1: {best_s1['config']['kernelName1']}")
+            print(
+                f"    Best Stage2: {block_m}x{s2_tile_n}x{s2_tile_k} → {best_s2['us2_time']:.2f} us"
+            )
+            print(f"      kernelName2: {best_s2['config']['kernelName2']}")
+            print(f"    Combined: {combo['combined_us']:.2f} us")
+
+        # ========== Build output config with best block_m's Stage1 + Stage2 ==========
+        best_s1 = best_combo["best_s1"]
+        best_s2 = best_combo["best_s2"]
+
+        # Start with best_s1's config as base
+        best_config = best_s1["config"].copy()
+
+        # Override kernelName2 with best Stage2's kernel (SAME block_m)
+        best_config["kernelName2"] = best_s2["config"]["kernelName2"]
+
+        # Record timing info
+        best_config["us1"] = round(best_s1["us1_time"], 2)
+        best_config["us2"] = round(best_s2["us2_time"], 2)
+        best_config["us"] = round(best_combo["combined_us"], 2)
+
+        # Calculate combined performance metrics
+        if use_g1u1:
+            n = inter_dim * 2
+        else:
+            n = inter_dim
+        flop = (
+            token * n * model_dim * topk * 2  # gemm1
+            + topk * token * model_dim * inter_dim * 2  # gemm2
         )
+        best_config["tflops"] = round(flop / (best_combo["combined_us"] * 1e6), 2)
+
+        # Calculate bandwidth
+        dtype_bytes = 2 if dtype == torch.bfloat16 else 4
+        q_dtype_bytes = 1
+        input_bytes = token * model_dim * q_dtype_bytes
+        w1_bytes = expert * n * model_dim * q_dtype_bytes
+        w2_bytes = expert * model_dim * inter_dim * q_dtype_bytes
+        output_bytes = token * model_dim * dtype_bytes
+        scale_bytes = (token + expert * (n + model_dim)) * 4
+        total_bytes = input_bytes + w1_bytes + w2_bytes + output_bytes + scale_bytes
+        best_config["bw"] = round(
+            total_bytes / (best_combo["combined_us"] * 1e-6) / 1e9, 2
+        )
+
+        # block_m is the same for both stages now
+        best_config["block_m"] = best_block_m
+
+        # Extract tile info for display
+        s1_tile_n = self.candidate_tiles.iloc[best_s1["tile_idx"]]["tile_n"]
+        s1_tile_k = self.candidate_tiles.iloc[best_s1["tile_idx"]]["tile_k"]
+        s2_tile_n = self.candidate_tiles.iloc[best_s2["tile_idx"]]["tile_n"]
+        s2_tile_k = self.candidate_tiles.iloc[best_s2["tile_idx"]]["tile_k"]
+
+        print(f"\n{'='*80}")
+        print(f"✅ Final Output Configuration (block_m={best_block_m}):")
+        print(f"{'='*80}")
+        print(f"   kernelName1: {best_config['kernelName1']}")
+        print(
+            f"      → Stage1 tile: {best_block_m}x{s1_tile_n}x{s1_tile_k}, Time: {best_s1['us1_time']:.2f} us"
+        )
+        print(f"   kernelName2: {best_config['kernelName2']}")
+        print(
+            f"      → Stage2 tile: {best_block_m}x{s2_tile_n}x{s2_tile_k}, Time: {best_s2['us2_time']:.2f} us"
+        )
+        print(f"   Combined Time: {best_combo['combined_us']:.2f} us")
+        print(
+            f"   TFLOPS: {best_config['tflops']:.2f}, BW: {best_config['bw']:.2f} GB/s"
+        )
+        print(f"{'='*80}\n")
 
         return best_config
 
@@ -682,9 +797,10 @@ class FlyDSLBatchTuner:
         # Display summary
         print("📊 All Configurations Summary:")
         print(
-            f"{'Token':<8} {'Model':<8} {'Inter':<8} {'Expert':<8} {'TopK':<6} {'Best Tile':<20} {'Time(us)':<12} {'Throughput(tflops)':<12} {'Bandwidth(GB/s)':<12}"
+            f"{'Token':<8} {'Model':<8} {'Inter':<8} {'Expert':<8} {'TopK':<6} "
+            f"{'Best Tile':<16} {'Total(us)':<10} {'S1(us)':<10} {'S2(us)':<10} {'TFLOPS':<10}"
         )
-        print(f"{'-'*112}")
+        print(f"{'-'*108}")
 
         for config in all_best_configs:
             # Extract tile info from kernelName
@@ -696,9 +812,40 @@ class FlyDSLBatchTuner:
 
             print(
                 f"{config['token']:<8} {config['model_dim']:<8} {config['inter_dim']:<8} "
-                f"{config['expert']:<8} {config['topk']:<6} {tile_str:<20} "
-                f"{config['us']:<12.2f} {config['tflops']:<12.2f} {config['bw']:<12.2f}"
+                f"{config['expert']:<8} {config['topk']:<6} {tile_str:<16} "
+                f"{config['us']:<10.2f} {config['us1']:<10.2f} {config['us2']:<10.2f} {config['tflops']:<10.2f}"
             )
+
+        # Display selected kernels (best Stage1 + best Stage2 with SAME block_m)
+        print(f"\n{'='*80}")
+        print("🎯 Selected Kernels (Best Stage1 + Best Stage2, SAME block_m):")
+        print(f"{'='*80}")
+        print(
+            f"{'Token':<8} {'block_m':<8} {'kernelName1 (Best Stage1)':<45} {'S1(us)':<10}"
+        )
+        print(f"{'-'*80}")
+        for config in all_best_configs:
+            print(
+                f"{config['token']:<8} {config['block_m']:<8} {config['kernelName1']:<45} "
+                f"{config['us1']:<10.2f}"
+            )
+
+        print()
+        print(
+            f"{'Token':<8} {'block_m':<8} {'kernelName2 (Best Stage2)':<45} {'S2(us)':<10}"
+        )
+        print(f"{'-'*80}")
+        for config in all_best_configs:
+            print(
+                f"{config['token']:<8} {config['block_m']:<8} {config['kernelName2']:<45} "
+                f"{config['us2']:<10.2f}"
+            )
+
+        print(f"\n{'='*80}")
+        print(
+            "✅ Stage1 and Stage2 use the SAME block_m - compatible with moe_sorting!"
+        )
+        print(f"{'='*80}")
 
         return True
 
