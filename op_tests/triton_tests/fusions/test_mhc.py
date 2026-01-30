@@ -26,6 +26,7 @@ import pytest
 from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
 from op_tests.triton_tests.utils.mhc_ref import (
     mhc_torch,
+    mhc_lite_torch,
     sinkhorn_knopp_exp_domain_torch,
     sinkhorn_knopp_log_domain_torch,
     is_doubly_stochastic,
@@ -330,9 +331,6 @@ def test_mhc_output_range():
 # Split-K Tests
 # =============================================================================
 
-from unittest.mock import patch
-import sys
-
 
 def _make_split_k_config(num_ksplit):
     """Helper to create config with specified NUM_KSPLIT."""
@@ -356,8 +354,6 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
     """
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    # import aiter.ops.triton.fusions.mhc module
-    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
 
     x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, dtype)
 
@@ -369,13 +365,13 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         return_with_sinkhorn=False
     )
     
-    # Test: split-K kernel with patched config
-    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(num_ksplit)):
-        H_pre_split, H_post_split, H_res_split = fused_mhc(
-            x, phi_pre, phi_post, phi_res, 
-            alpha_pre, alpha_post, alpha_res, 
-            bias, n_streams
-        )
+    # Test: split-K kernel with config passed directly
+    H_pre_split, H_post_split, H_res_split = fused_mhc(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams,
+        config=_make_split_k_config(num_ksplit)
+    )
 
     torch.testing.assert_close(
         H_pre_split.to(torch.float32),
@@ -408,8 +404,6 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
     """
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    # import aiter.ops.triton.fusions.mhc module
-    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
 
     x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
 
@@ -421,13 +415,13 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
         return_with_sinkhorn=True
     )
     
-    # Test: split-K kernel with full mhc pipeline
-    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(num_ksplit)):
-        H_pre_split, H_post_split, H_res_split = mhc(
-            x, phi_pre, phi_post, phi_res, 
-            alpha_pre, alpha_post, alpha_res, 
-            bias, n_streams
-        )
+    # Test: split-K kernel with full mhc pipeline (config passed directly)
+    H_pre_split, H_post_split, H_res_split = mhc(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams,
+        config=_make_split_k_config(num_ksplit)
+    )
 
     torch.testing.assert_close(
         H_pre_split.to(torch.float32),
@@ -458,8 +452,6 @@ def test_split_k_various_splits(num_ksplit):
     including edge cases where num_ksplit may not evenly divide K.
     """
     torch.cuda.empty_cache()
-    # import aiter.ops.triton.fusions.mhc module
-    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
 
     M, n, C = 32, 4, 1024
     x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
@@ -472,13 +464,13 @@ def test_split_k_various_splits(num_ksplit):
         return_with_sinkhorn=False
     )
     
-    # Test: split-K kernel
-    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(num_ksplit)):
-        H_pre_split, H_post_split, H_res_split = fused_mhc(
-            x, phi_pre, phi_post, phi_res, 
-            alpha_pre, alpha_post, alpha_res, 
-            bias, n_streams
-        )
+    # Test: split-K kernel (config passed directly)
+    H_pre_split, H_post_split, H_res_split = fused_mhc(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams,
+        config=_make_split_k_config(num_ksplit)
+    )
 
     torch.testing.assert_close(
         H_pre_split.to(torch.float32),
@@ -502,8 +494,6 @@ def test_split_k_preallocated_output(M, n, C):
     Verifies that split-K correctly writes to user-provided output buffers.
     """
     torch.cuda.empty_cache()
-    # import aiter.ops.triton.fusions.mhc module
-    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
 
     x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
     n_squared = n * n
@@ -519,14 +509,14 @@ def test_split_k_preallocated_output(M, n, C):
         return_with_sinkhorn=False
     )
     
-    # Test with split-K and pre-allocated outputs
-    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(2)):
-        result_pre, result_post, result_res = fused_mhc(
-            x, phi_pre, phi_post, phi_res, 
-            alpha_pre, alpha_post, alpha_res, 
-            bias, n_streams,
-            out_pre=out_pre, out_post=out_post, out_res=out_res
-        )
+    # Test with split-K and pre-allocated outputs (config passed directly)
+    result_pre, result_post, result_res = fused_mhc(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams,
+        out_pre=out_pre, out_post=out_post, out_res=out_res,
+        config=_make_split_k_config(2)
+    )
 
     assert result_pre is out_pre
     assert result_post is out_post
@@ -559,8 +549,6 @@ def test_split_k_large_k():
     Validates correctness for typical mHC usage with large input features.
     """
     torch.cuda.empty_cache()
-    # import aiter.ops.triton.fusions.mhc module
-    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
 
     M, n, C = 64, 4, 2048  # K = n * C = 8192
     x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C)
@@ -573,13 +561,13 @@ def test_split_k_large_k():
         return_with_sinkhorn=False
     )
     
-    # Test with 4-way split
-    with patch.object(mhc_module, 'get_fused_mhc_config', return_value=_make_split_k_config(4)):
-        H_pre_split, H_post_split, H_res_split = fused_mhc(
-            x, phi_pre, phi_post, phi_res, 
-            alpha_pre, alpha_post, alpha_res, 
-            bias, n_streams
-        )
+    # Test with 4-way split (config passed directly)
+    H_pre_split, H_post_split, H_res_split = fused_mhc(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams,
+        config=_make_split_k_config(4)
+    )
 
     # Use slightly relaxed tolerance for larger K due to more accumulation steps
     torch.testing.assert_close(
@@ -852,3 +840,167 @@ def test_sk_output_range():
 
     assert torch.all(out >= 0.0), "Output has negative values"
     assert torch.all(out <= 1.0), "Output has values > 1"
+
+
+# =============================================================================
+# mHC-lite Mode Tests
+# =============================================================================
+
+
+def get_lite_test_shapes():
+    """
+    Generate test shapes for mHC-lite mode.
+    
+    Reuses get_test_shapes() but filters to n <= 4 since n! grows fast.
+    """
+    return [(M, n, C) for M, n, C in get_test_shapes() if n <= 4]
+
+
+@pytest.mark.parametrize("M, n, C", get_lite_test_shapes())
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_lite_correctness(M, n, C, dtype):
+    """
+    Test that Triton mhc() with hres_mode='lite' matches PyTorch reference.
+    
+    Validates correctness of the mHC-lite implementation (exact doubly stochastic).
+    """
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, dtype, hres_mode="lite")
+
+    H_pre_torch, H_post_torch, H_res_torch = mhc_lite_torch(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams
+    )
+    H_pre_triton, H_post_triton, H_res_triton = mhc(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams,
+        hres_mode="lite"
+    )
+
+    # Pre and post streams should match closely
+    torch.testing.assert_close(
+        H_pre_triton.to(torch.float32),
+        H_pre_torch.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_post_triton.to(torch.float32),
+        H_post_torch.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    # H_res should match - both are exact doubly stochastic
+    torch.testing.assert_close(
+        H_res_triton.to(torch.float32),
+        H_res_torch.to(torch.float32),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.parametrize("M, n, C", get_lite_test_shapes())
+def test_mhc_lite_doubly_stochastic(M, n, C):
+    """
+    Test that mHC-lite output H_res is exactly doubly stochastic.
+    
+    mHC-lite guarantees exact doubly stochasticity by construction
+    (via convex combination of permutation matrices).
+    """
+    torch.cuda.empty_cache()
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, hres_mode="lite")
+
+    _, _, H_res = mhc(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams,
+        hres_mode="lite"
+    )
+
+    # Reshape to (M, n, n) for doubly stochastic check
+    H_res_3d = H_res.view(M, n, n).to(torch.float32)
+
+    # Check doubly stochastic property
+    # Note: Using relaxed tolerance due to bfloat16 precision limitations in kernel
+    assert is_doubly_stochastic(H_res_3d, tol=5e-3), (
+        f"mHC-lite H_res is not doubly stochastic! "
+        f"Row sums: {H_res_3d.sum(dim=-1).mean():.6f}, "
+        f"Col sums: {H_res_3d.sum(dim=-2).mean():.6f}"
+    )
+
+
+@pytest.mark.parametrize("M, n, C", [(32, 4, 1024)])
+def test_mhc_lite_vs_sinkhorn_output_shape(M, n, C):
+    """
+    Test that both modes produce the same output shape for H_res.
+    
+    Both sinkhorn and lite modes should output H_res with shape (M, n²).
+    """
+    torch.cuda.empty_cache()
+
+    # Generate inputs for sinkhorn mode
+    x, phi_pre, phi_post, phi_res_sk, alpha_pre, alpha_post, alpha_res, bias_sk, n_streams = generate_mhc_inputs(M, n, C)
+    
+    # Generate inputs for lite mode
+    _, _, _, phi_res_lite, _, _, _, bias_lite, _ = generate_mhc_inputs(M, n, C, hres_mode="lite")
+
+    _, _, H_res_sinkhorn = mhc(
+        x, phi_pre, phi_post, phi_res_sk, alpha_pre, alpha_post, alpha_res, bias_sk, n_streams,
+        hres_mode="sinkhorn"
+    )
+    _, _, H_res_lite = mhc(
+        x, phi_pre, phi_post, phi_res_lite, alpha_pre, alpha_post, alpha_res, bias_lite, n_streams,
+        hres_mode="lite"
+    )
+
+    # Both should have shape (M, n²)
+    assert H_res_sinkhorn.shape == (M, n * n), f"Sinkhorn H_res shape mismatch: {H_res_sinkhorn.shape}"
+    assert H_res_lite.shape == (M, n * n), f"Lite H_res shape mismatch: {H_res_lite.shape}"
+
+
+@pytest.mark.parametrize("M, n, C", [(16, 4, 512)])
+def test_mhc_lite_output_range(M, n, C):
+    """
+    Test that mHC-lite H_res values are in valid range [0, 1].
+    
+    Since H_res is a convex combination of permutation matrices,
+    all values should be non-negative and at most 1.
+    """
+    torch.cuda.empty_cache()
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, hres_mode="lite")
+
+    _, _, H_res = mhc(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams,
+        hres_mode="lite"
+    )
+
+    H_res_f32 = H_res.to(torch.float32)
+    
+    assert torch.all(H_res_f32 >= -1e-6), f"H_res has negative values: min={H_res_f32.min()}"
+    assert torch.all(H_res_f32 <= 1.0 + 1e-6), f"H_res has values > 1: max={H_res_f32.max()}"
+
+
+@pytest.mark.parametrize("M, n, C", [(8, 2, 512), (16, 4, 512)])
+def test_fused_mhc_lite_correctness(M, n, C):
+    """
+    Test that fused_mhc() with hres_mode='lite' outputs exact doubly stochastic.
+    
+    Unlike mhc(), fused_mhc() doesn't apply Sinkhorn-Knopp post-processing,
+    so lite mode directly outputs the doubly stochastic matrix.
+    """
+    torch.cuda.empty_cache()
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, hres_mode="lite")
+
+    _, _, H_res = fused_mhc(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams,
+        hres_mode="lite"
+    )
+
+    # Reshape and check doubly stochastic
+    # Note: Using relaxed tolerance due to bfloat16 precision limitations in kernel
+    H_res_3d = H_res.view(M, n, n).to(torch.float32)
+    
+    assert is_doubly_stochastic(H_res_3d, tol=5e-3), (
+        "fused_mhc lite mode H_res is not doubly stochastic!"
+    )
