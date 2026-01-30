@@ -40,6 +40,8 @@ jobs:
         include:
           - runner: aiter-1gpu-runner
             label: MI325
+          - runner: aiter-mi355-1gpu
+            label: MI355
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
@@ -68,6 +70,7 @@ jobs:
 
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
+          --network=host \
           --shm-size=16G \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
