@@ -28,46 +28,51 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  define-runners:
-    runs-on: ubuntu-latest
-    needs: [check-signal]
-    outputs:
-      standard_runners: ${{ steps.machines.outputs.standard_runners }}
-      multigpu_runners: ${{ steps.machines.outputs.multigpu_runners }}
+  # define-runners:
+  #   runs-on: ubuntu-latest
+  #   needs: [check-signal]
+  #   outputs:
+  #     standard_runners: ${{ steps.machines.outputs.standard_runners }}
+  #     multigpu_runners: ${{ steps.machines.outputs.multigpu_runners }}
 
-    steps:
-      - name: Define whether runs on MI35X
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        id: machines
-        run: |
-          set -euo pipefail
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "It's main branch, running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-mi355-1gpu", "aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
-          #elif echo "${PR_TITLE}" | grep -qi "mi325"; then
-          #  echo "PR title contains 'MI325', running tests on MI325 and MI35X..."
-          #  echo 'standard_runners=["aiter-mi355-1gpu", "aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
-          #  echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
-          else
-            # echo "Not main branch and PR title does not contain mi325, only running on MI35X..."
-            echo 'standard_runners=["aiter-mi355-1gpu.cpx", "aiter-mi355-1gpu.cpx", "aiter-mi355-1gpu.cpx", "aiter-mi355-1gpu.cpx", "aiter-mi355-1gpu.cpx", "aiter-mi355-1gpu.cpx", "aiter-mi355-1gpu.cpx", "aiter-mi355-1gpu.cpx"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
-          fi
-          echo "$GITHUB_OUTPUT"
-    
-      - name: Show output variable
-        run: |
-          echo "Standard: ${{ steps.machines.outputs.standard_runners }}"
-          echo "Multipe: ${{ steps.machines.outputs.multigpu_runners }}"
+  #   steps:
+  #     - name: Define whether runs on MI35X
+  #       env:
+  #         PR_TITLE: ${{ github.event.pull_request.title }}
+  #       id: machines
+  #       run: |
+  #         set -euo pipefail
+  #         if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+  #           echo "It's main branch, running tests on MI325 and MI35X..."
+  #           echo 'standard_runners=["aiter-mi355-1gpu", "aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
+  #           echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
+  #         #elif echo "${PR_TITLE}" | grep -qi "mi325"; then
+  #         #  echo "PR title contains 'MI325', running tests on MI325 and MI35X..."
+  #         #  echo 'standard_runners=["aiter-mi355-1gpu", "aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
+  #         #  echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
+  #         else
+  #           # echo "Not main branch and PR title does not contain mi325, only running on MI35X..."
+  #           echo 'standard_runners=["aiter-mi355-1gpu", "aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
+  #           echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
+  #         fi
+  #         echo "$GITHUB_OUTPUT"
+  #   
+  #     - name: Show output variable
+  #       run: |
+  #         echo "Standard: ${{ steps.machines.outputs.standard_runners }}"
+  #         echo "Multigpu: ${{ steps.machines.outputs.multigpu_runners }}"
 
   standard:
-    needs: define-runners
+    name: Standard Tests (1 GPU)
+    needs: check-signal
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(needs.define-runners.outputs.standard_runners) }}
+        include:
+          - runner: aiter-mi355-1gpu.cpx
+            label: MI355
+          - runner: aiter-1gpu-runner
+            label: MI325
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -160,13 +165,16 @@ jobs:
           ./.github/scripts/clean_up_rocm.sh
 
   multi-gpu:
-    needs: define-runners
+    name: Multi-GPU Tests (8 GPU)
+    needs: check-signal
     # only run multi-gpu tests on main branch due to limited multi-gpu resources
     if: github.ref == 'refs/heads/main' 
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(needs.define-runners.outputs.multigpu_runners) }}
+        include:
+          - runner: aiter-mi355-8gpu
+          - runner: aiter-8gpu-runner
     runs-on: ${{ matrix.runner }}
 
     steps:

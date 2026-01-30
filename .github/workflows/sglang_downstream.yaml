@@ -25,9 +25,16 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
-    name: sglang integration
+    name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
-    runs-on: aiter-mi355-1gpu.cpx
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: aiter-mi355-1gpu.cpx
+            label: MI55
+
     env:
       SGL_BRANCH: v0.5.8
       GPU_ARCH: gfx950
@@ -115,12 +122,13 @@ jobs:
       - name: Evaluate Accuracy
         timeout-minutes: 120
         run: |
+          set -ex
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
           bash scripts/ci/amd_ci_exec.sh printenv | grep GPU_ARCH || true
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 ../registered/eval/test_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh python3 ../registered/quant/test_eval_fp8_accuracy.py
+          bash scripts/ci/amd_ci_exec.sh python3 ../registered/models/test_qwen_models.py
 
       # TODO: Clean up because some dependencies are installed under root user which can't be removed by runner, these dependencies should be installed as a non-root user
       - name: Clean Up

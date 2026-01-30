@@ -31,8 +31,15 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
-    runs-on: aiter-mi355-1gpu.cpx
+    name: Triton Tests (1 GPU)
+    runs-on: ${{ matrix.runner }}
     needs: [check-signal]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: aiter-mi355-1gpu.cpx
+            label: MI355
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"

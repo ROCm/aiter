@@ -32,6 +32,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_vllm_image:
+    name: Build vLLM Image
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
     runs-on: aiter-k8s-build
@@ -95,9 +96,10 @@ jobs:
           echo "Successfully prepared image: rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}"
 
   vllm_benchmark:
+    name: vLLM Benchmark (8 GPU)
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-mi355-8gpu.cpx
     needs: build_vllm_image
+    runs-on: aiter-mi355-8gpu.cpx
     strategy:
       fail-fast: false
       matrix:
