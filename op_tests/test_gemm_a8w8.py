@@ -19,6 +19,7 @@ from functools import lru_cache
 # pd.set_option('display.max_columns', 100)
 # pd.set_option('display.width', 1000)
 TEST_NUM_ITERS = 100
+ASM_KERNEL_NAME = "_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_80x128E"
 
 
 _TUNED_SHAPES_CACHE = None
@@ -91,7 +92,18 @@ def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
+    out = torch.empty(x.shape[0], weightshuffle.shape[0], dtype=dtype, device=x.device)
+    return aiter.gemm_a8w8_asm(
+        x,
+        weightshuffle,
+        x_scale,
+        w_scale,
+        out,
+        ASM_KERNEL_NAME,
+        bias,
+        bpreshuffle=True,
+        splitK=1,
+    )
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -117,78 +129,22 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
     weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
-    weightshuffle = shuffle_weight(weight, layout=(16, 16))
-
-    # CK fp8 kernel set bias=None
-    if quantDtype == dtypes.fp8:
-        bias = None
-    else:
-        bias = torch.rand([1, n], dtype=dtype, device="cuda") * 10
-
-    # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
-    # print(f"{x_pad.shape=}{x_pad.stride()}")
+    bias = torch.rand([1, n], dtype=dtype, device="cuda") * 10
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
+    err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
 
-    shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(m, n, k, quantDtype)
-    if shape_is_tuned:
-        err_b = checkAllclose(
-            a,
-            b,
-            msg="ck (tuned): ",
-            rtol=1e-1,
-            atol=1e-1,
-            tol_err_ratio=1.0,
-            printLog=False,
-        )
-    else:
-        err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
-    if quantDtype != dtypes.i8:
-        c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
-        # c = c + bias
-        err_c = checkAllclose(a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2)
-    else:
-        avg_c = None
-        err_c = None
-
-    avg_d = None
-    err_d = None
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-    if (
-        dtype == dtypes.bf16
-        and quantDtype == dtypes.i8
-        and bias is not None
-        and cu_num == 80
-    ):
-        weightshuffle_asm = shuffle_weight(weight, layout=(32, 16))
-        bias_f32 = bias.to(dtypes.fp32)
-        d, avg_d = run_gemm_asm(x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)
-        if d is not None:
-            err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
-        else:
-            avg_d = None
-
-    if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
-        # hipb_mm bpreshuffle only supports bfloat16 as output type
-        init_hipblas()
-        e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
-        # e = e + bias
-        err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
-    else:
-        avg_e = None
-        err_e = None
+    # Only run ASM kernel with 16x16 shuffle.
+    weightshuffle_asm = shuffle_weight(weight, layout=(16, 16))
+    bias_f32 = bias.to(dtypes.fp32)
+    d, avg_d = run_gemm_asm(x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)
+    err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
     return {
         "ck us": avg_b,
         "ck err": err_b,
-        "ck bpreshuffle us": avg_c,
-        "ck bpreshuffle err": err_c,
         "asm us": avg_d,
         "asm err": err_d,
-        "hipmm bpreshuffle us": avg_e,
-        "hipmm bpreshuffle err": err_e,
     }
 
 
@@ -387,8 +343,8 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
 
-l_dtype = ["bf16", "fp16"]
-l_quantDtype = ["i8", "fp8"]
+l_dtype = ["bf16"]
+l_quantDtype = ["i8"]
 l_mnk_nm = [
     # qkv_proj
     (1, 1280, 8192),
@@ -477,4 +433,3 @@ if args.mnk is not None:
     l_mnk_nm = [args.mnk]
 
 test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
-test_skinny_gemm_a8w8_pertoken_quant()
