@@ -648,16 +648,19 @@ def _mhc_lite_fused_split_kernel(
     n_blocks_post = n_blocks_pre
     n_blocks_res = tl.cdiv(N_FACTORIAL, BLOCK_N)  # n! dimension for lite
     
+    # Stream determination using clearer logic
+    threshold_post = n_blocks_pre + n_blocks_post
     is_pre_program = pid_n < n_blocks_pre
-    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
-    is_res_program = ~is_pre_program & ~is_post_program
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < threshold_post)
+    is_res_program = pid_n >= threshold_post
     
-    stream_offset = is_post_program.to(tl.int32) * n_blocks_pre + is_res_program.to(tl.int32) * (n_blocks_pre + n_blocks_post)
+    # Compute local block index within stream
+    stream_offset = is_post_program.to(tl.int32) * n_blocks_pre + is_res_program.to(tl.int32) * threshold_post
     local_pid_n = pid_n - stream_offset
     
     rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     
-    # Output dimension for this stream
+    # Output dimension for this stream (pre-compute for better performance)
     n_out = tl.where(is_res_program, N_FACTORIAL, n)  # n! for res, n for pre/post
     
     split_k_start = pid_k * SPLITK_BLOCK_SIZE
@@ -666,9 +669,7 @@ def _mhc_lite_fused_split_kernel(
     if split_k_start >= K:
         return
     
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-
+    # Pre-compute phi pointer and strides based on stream type (once, not per iteration)
     phi_ptr = tl.where(is_pre_program, phi_pre_ptr,
                        tl.where(is_post_program, phi_post_ptr, phi_res_ptr))
     stride_phi_k = tl.where(is_pre_program, stride_phi_pre_k,
@@ -676,29 +677,44 @@ def _mhc_lite_fused_split_kernel(
     stride_phi_n = tl.where(is_pre_program, stride_phi_pre_n,
                        tl.where(is_post_program, stride_phi_post_n, stride_phi_res_n))
     
+    # Initialize accumulators
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    
     k_span = split_k_end - split_k_start
     num_k_iter = tl.cdiv(k_span, BLOCK_K)
+    
+    # Pre-compute common masks and offsets
+    rm_mask = rm < M
+    rn_mask = rn_local < n_out
     
     for k_idx in range(num_k_iter):
         k = split_k_start + k_idx * BLOCK_K
         rk = k + tl.arange(0, BLOCK_K)
+        rk_mask = rk < split_k_end
         
+        # Load x tile with optimized masking
         x_tile = tl.load(
             x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
-            mask=(rm[:, None] < M) & (rk[None, :] < split_k_end),
+            mask=rm_mask[:, None] & rk_mask[None, :],
             other=0.0,
         )
         
+        # Load phi tile with optimized masking
         phi_tile = tl.load(
             phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
-            mask=(rk[:, None] < split_k_end) & (rn_local[None, :] < n_out),
+            mask=rk_mask[:, None] & rn_mask[None, :],
             other=0.0,
         )
         
+        # Accumulate matmul result
         acc += tl.dot(x_tile, phi_tile)
+        
+        # Accumulate squared norm (convert once)
         x_tile_f32 = x_tile.to(tl.float32)
         acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
     
+    # Select output accumulator buffer based on stream type
     acc_ptr = tl.where(is_pre_program, acc_pre_ptr,
                        tl.where(is_post_program, acc_post_ptr, acc_res_ptr))
     stride_acc_k = tl.where(is_pre_program, stride_acc_pre_k,
@@ -708,19 +724,20 @@ def _mhc_lite_fused_split_kernel(
     stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n,
                        tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n))
     
+    # Store accumulated results with pre-computed mask
     tl.store(
         acc_ptr + pid_k * stride_acc_k + rm[:, None] * stride_acc_m + rn_local[None, :] * stride_acc_n,
         acc,
-        mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+        mask=rm_mask[:, None] & rn_mask[None, :],
     )
     
-    if is_pre_program:
-        if local_pid_n == 0:
-            tl.store(
-                acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
-                acc_sq,
-                mask=rm < M,
-            )
+    # Store acc_sq only once per M-block (from first pre program)
+    if is_pre_program and local_pid_n == 0:
+        tl.store(
+            acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
+            acc_sq,
+            mask=rm_mask,
+        )
 
 
 @triton.jit
