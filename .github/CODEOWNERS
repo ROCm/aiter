@@ -6,9 +6,9 @@
 * @ROCm/TEAM_AITER
 
 # Triton files/bench/tests
-/aiter/ops/triton/ @vgokhale @azaidy
-/op_tests/triton_tests/ @vgokhale @azaidy
-/op_tests/op_benchmarks/triton/ @vgokhale @azaidy
+/aiter/ops/triton/ @ROCm/Triton_Kernels_Team
+/op_tests/triton_tests/ @ROCm/Triton_Kernels_Team
+/op_tests/op_benchmarks/triton/ @ROCm/Triton_Kernels_Team
 
 # Gluon files
-/aiter/ops/triton/gluon/ @vgokhale @azaidy @coderfeli
+/aiter/ops/triton/gluon/ @ROCm/Triton_Kernels_Team @coderfeli
