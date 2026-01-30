@@ -1979,6 +1979,7 @@ def sage_quant_v2(
     sm_scale=None,
     layout="bshd",
     smooth_k=True,
+    smooth_q=False,
 ):
     """
     Quantize Q and K tensors to INT8 with per-block scaling.
@@ -2020,9 +2021,11 @@ def sage_quant_v2(
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
-    # Apply K tensor smoothing following SageAttention approach
+    # Apply K/Q tensor smoothing following SageAttention approach
     if smooth_k:
         k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+    if smooth_q:
+        q = q - q.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
