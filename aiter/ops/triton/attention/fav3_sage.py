@@ -82,6 +82,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                 BLKK=BLKK,
                 layout=layout,
             )
+            q_descale_pre = None
+            k_descale_pre = None
         elif sage_version == fav3_sage.Sage_version.V2:
             q_quantized, q_descale, q_descale_pre, k_quantized, k_descale, k_descale_pre, v_quantized, v_descale = sage_quant_v2(
                 q,
