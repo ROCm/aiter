@@ -31,7 +31,7 @@ def select_2d_config(
     max_num_stages_2d = 4
     if head_size > 128:
         max_num_stages_2d = 2
-    if all_decode == False:
+    if not all_decode:
         num_stages_2d = 1
         num_warps = 2
     else:
@@ -59,12 +59,18 @@ def select_2d_config(
 
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms, is_kv_fp8, is_q_fp8
+    head_size,
+    block_size,
+    element_size,
+    max_seqlen_k,
+    target_num_prgms,
+    num_2d_prgms,
+    is_kv_fp8,
+    is_q_fp8,
 ):
     reduce_num_warps = 2
     attn_warps = 2
     TILE_SIZE = min(block_size, 64)
-    MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
@@ -118,18 +124,18 @@ def unified_attention(
     causal,
     window_size,
     block_table,
-    softcap = 0,
-    q_descale = None,
-    k_descale = None,
-    v_descale = None,
-    alibi_slopes = None,
-    output_scale = None,
-    qq_bias = None,
+    softcap=0,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    alibi_slopes=None,
+    output_scale=None,
+    qq_bias=None,
     # Optional tensor for sinks
-    sinks = None,
+    sinks=None,
     # Optional tensor for per-block FP8 KV scaling
-    k_block_scale = None, # [num_blks, num_kv_heads]
-    v_block_scale = None, # [num_blks, num_kv_heads]
+    k_block_scale=None,  # [num_blks, num_kv_heads]
+    v_block_scale=None,  # [num_blks, num_kv_heads]
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -143,11 +149,15 @@ def unified_attention(
     SLIDING_WINDOW = 1 + window_size[0]
     is_kv_fp8 = k.element_size() == 1 and v.element_size() == 1
     is_q_fp8 = q.element_size() == 1
-    
+
     if use_block_scale:
-        assert is_kv_fp8 and is_q_fp8 and k_descale is None, "block scale is only supported for fp8"
+        assert (
+            is_kv_fp8 and is_q_fp8 and k_descale is None
+        ), "block scale is only supported for fp8"
     elif is_kv_fp8 and not is_q_fp8:
-            assert k_descale is not None, "kv in fp8 and q is not fp8, then we need to have kv descale"
+        assert (
+            k_descale is not None
+        ), "kv in fp8 and q is not fp8, then we need to have kv descale"
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)

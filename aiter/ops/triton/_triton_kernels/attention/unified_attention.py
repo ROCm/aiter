@@ -638,7 +638,7 @@ def kernel_unified_attention_3d(
                 )
                 k_block_scales = tl.load(
                     k_block_scale_ptr + k_scale_offset,
-                ) 
+                )
                 K = K_load
             elif Q.dtype.is_fp8():
                 K = K_load
@@ -665,7 +665,7 @@ def kernel_unified_attention_3d(
                 )
                 v_block_scales = tl.load(
                     v_block_scale_ptr + v_scale_offset,
-                )  
+                )
                 V = V_load
             elif Q.dtype.is_fp8():
                 V = V_load
