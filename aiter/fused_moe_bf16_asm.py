@@ -83,7 +83,7 @@ def asm_moe(
     enable_fp32 = (
         fc2_smooth_scale is not None
         and is_g1u1
-        and (inter_dim % 384 == 0)
+        and (inter_dim % 384 == 0 or inter_dim % 320 == 0)
         and w1.dtype == dtypes.i8
         and a16
     )
