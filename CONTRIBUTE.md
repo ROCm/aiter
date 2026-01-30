@@ -81,11 +81,6 @@ For full development (Python + HIP/CK kernels):
 # Build all kernels from source
 pip install -e .
 ```
-
-### 4. Install Development Dependencies
-
-```bash
-pip install -r requirements/dev.txt
 ```
 
 ---
@@ -280,8 +275,8 @@ When developing or modifying HIP kernels:
 
 2. **Profile Memory Access Patterns**:
    ```bash
-   # Use rocprof to analyze kernel performance
-   rocprof --stats python tests/profile_kernel.py
+   # Use AITER_LOG_MORE=1 to analyze kernel performance
+   AITER_LOG_MORE=1 python3 op_tests/test_gemm_a8w8.py
    ```
 
 3. **Check Roofline Model**:
@@ -356,13 +351,8 @@ Always benchmark your changes:
 
 ```bash
 # Benchmark single operator
-python benchmarks/bench_rmsnorm.py --dtype fp16 --hidden-size 4096
+python op_tests/op_benchmarks/triton/bench_rmsnorm.py
 
-# Compare before/after
-python benchmarks/compare.py --baseline main --pr my-branch --op rmsnorm
-
-# Full model benchmark
-python benchmarks/bench_llama.py --model llama-7b --batch-size 32
 ```
 
 ### Performance Requirements
@@ -394,57 +384,9 @@ Arithmetic Intensity: 0.83 FLOPs/Byte (memory-bound as expected)
 
 ### Building Documentation
 
-AITER uses Sphinx for documentation:
+AITER uses deepwiki for documentation:
 
-```bash
-# Install documentation dependencies
-pip install -r requirements/docs.txt
-
-# Build docs
-cd docs/
-make html
-
-# View locally
-python -m http.server 8000 -d _build/html
-# Open http://localhost:8000
-```
-
-### Writing Documentation
-
-When adding features, update docs:
-
-1. **API Documentation**: Add docstrings to public functions
-   ```python
-   def new_operator(input: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
-       """
-       Apply new operator to input tensor.
-       
-       Args:
-           input: Input tensor of shape [batch, hidden_size]
-           epsilon: Small constant for numerical stability
-           
-       Returns:
-           Output tensor of same shape as input
-           
-       Example:
-           >>> x = torch.randn(32, 4096, dtype=torch.float16, device='cuda')
-           >>> y = new_operator(x)
-       """
-       pass
-   ```
-
-2. **Operator Guides**: Add operator-specific documentation
-   - Algorithm description
-   - Performance characteristics
-   - Memory usage
-   - Supported data types and shapes
-
-3. **Kernel Optimization Guides**: Document optimization techniques
-   - Memory access patterns
-   - Roofline analysis
-   - Tuning parameters
-
----
+https://deepwiki.com/ROCm/aiter
 
 ## Pull Requests
 
@@ -573,7 +515,6 @@ For new AMD GPU architectures:
 
 * **Issues**: [GitHub Issues](https://github.com/ROCm/aiter/issues)
 * **Discussions**: [GitHub Discussions](https://github.com/ROCm/aiter/discussions)
-* **Slack**: [Join our Slack workspace](#)
 
 ### Code of Conduct
 
@@ -583,9 +524,7 @@ We follow the [Contributor Covenant Code of Conduct](https://www.contributor-cov
 
 ## Developer Certificate of Origin (DCO)
 
-By contributing to AITER, you certify that your contribution was created in whole or in part by you and you have the right to submit it under the Apache 2.0 license.
-
-All commits must be signed off:
+By contributing to AITER, you certify that your contribution was created in whole or in part by you and that you have the right to submit it under the MIT License, as specified in this project's LICENSE
 
 ```bash
 git commit -s -m "Your commit message"
@@ -610,44 +549,6 @@ AITER uses a custom JIT system for compiling kernels. When modifying:
 2. **Dynamic Configuration**: Use `gen_func` in `@compile_ops` decorator
 3. **Blob Generation**: Add code generation commands to `blob_gen_cmd`
 
-See [JIT_COMPILE_FLOW_ANALYSIS.md](JIT_COMPILE_FLOW_ANALYSIS.md) for details.
-
-### Debugging Kernels
-
-```bash
-# Enable debug symbols
-export AITER_DEBUG=1
-
-# Keep intermediate files
-export AITER_SAVE_TEMPS=1
-
-# Verbose compilation
-export AITER_VERBOSE=1
-
-# Run with kernel debugging
-python tests/test_kernel.py
-```
-
-### Profiling Tools
-
-**rocprof**: Profile GPU kernels
-```bash
-rocprof --stats --basenames on python benchmark.py
-```
-
-**roctracer**: Trace HIP API calls
-```bash
-roctracer -o trace.json python benchmark.py
-```
-
-**Omniperf**: Detailed GPU profiling
-```bash
-omniperf profile -n my_profile -- python benchmark.py
-omniperf analyze -p workloads/my_profile/
-```
-
----
-
 ## FAQ
 
 **Q: My kernel compiles but is slower than expected. What should I check?**
@@ -657,7 +558,6 @@ A:
 2. Verify coalescing (check `MemUnitBusy`)
 3. Measure bandwidth utilization
 4. Compare against roofline model
-5. Profile with `omniperf` for detailed metrics
 
 **Q: How do I test on hardware I don't have access to?**
 
@@ -677,7 +577,7 @@ A:
 git fetch upstream
 git rebase upstream/main
 # Resolve conflicts
-git push --force-with-lease origin my-branch
+For more details, refer to the JIT compilation system documentation and comments in the relevant source files.
 ```
 
 **Q: Can I add a new third-party library dependency?**
