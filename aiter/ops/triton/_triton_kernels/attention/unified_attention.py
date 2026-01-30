@@ -61,6 +61,8 @@ def kernel_unified_attention_2d(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
+    k_block_scale_ptr,  # [num_blks, num_kv_heads] for per-block FP8 scaling
+    v_block_scale_ptr,  # [num_blks, num_kv_heads] for per-block FP8 scaling
     scale: tl.constexpr,  # float32
     k_scale,  # float32
     v_scale,  # float32
@@ -98,6 +100,11 @@ def kernel_unified_attention_2d(
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    USE_BLOCK_SCALE: tl.constexpr = False,  # bool, per-block FP8 scaling
+    stride_k_block_scale_0: tl.int64 = 0,  # int, stride for block dim
+    stride_k_block_scale_1: tl.int64 = 0,  # int, stride for kv_head dim
+    stride_v_block_scale_0: tl.int64 = 0,  # int, stride for block dim
+    stride_v_block_scale_1: tl.int64 = 0,  # int, stride for kv_head dim
     ALL_DECODE: tl.constexpr = False,  # bool
 ):
     kv_head_idx = tl.program_id(0)
@@ -236,7 +243,7 @@ def kernel_unified_attention_2d(
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         # to reduce the masking effect when not needed
-        if TILE_SIZE == BLOCK_SIZE:
+        if TILE_SIZE <= BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
         else:
             tile_mask = seq_offset < max_seq_prefix_len
@@ -268,7 +275,20 @@ def kernel_unified_attention_2d(
         )
 
         if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if USE_BLOCK_SCALE:
+                # Load per-block K scales: physical_block_idx is [TILE_SIZE]
+                # k_block_scale layout: [num_blks, num_kv_heads]
+                k_scale_offset = (
+                    physical_block_idx * stride_k_block_scale_0
+                    + kv_head_idx * stride_k_block_scale_1
+                )
+                k_block_scales = tl.load(
+                    k_block_scale_ptr + k_scale_offset,
+                    mask=tile_mask,
+                    other=1.0,
+                )  # [TILE_SIZE]
+                K = K_load
+            elif Q.dtype.is_fp8():
                 K = K_load
             else:
                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
@@ -284,7 +304,20 @@ def kernel_unified_attention_2d(
         )
 
         if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if USE_BLOCK_SCALE:
+                # Load per-block V scales: physical_block_idx is [TILE_SIZE]
+                # v_block_scale layout: [num_blks, num_kv_heads]
+                v_scale_offset = (
+                    physical_block_idx * stride_v_block_scale_0
+                    + kv_head_idx * stride_v_block_scale_1
+                )
+                v_block_scales = tl.load(
+                    v_block_scale_ptr + v_scale_offset,
+                    mask=tile_mask,
+                    other=1.0,
+                )  # [TILE_SIZE]
+                V = V_load
+            elif Q.dtype.is_fp8():
                 V = V_load
             else:
                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
@@ -293,7 +326,10 @@ def kernel_unified_attention_2d(
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        if USE_BLOCK_SCALE:
+            S = (qk_scale * k_block_scales[None, :]) * tl.dot(Q, K)
+        else:
+            S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -352,9 +388,16 @@ def kernel_unified_attention_2d(
         # update constants
         L = L * alpha + l_j
         M = m_j
-
+        if SLIDING_WINDOW:
+            qpos_lo = q_block_local_idx * BLOCK_Q
+            V = tl.where(
+                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
+            )
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        if USE_BLOCK_SCALE:
+            acc += tl.dot((P * v_block_scales[None, :]).to(V.dtype), V)
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -391,9 +434,11 @@ def kernel_unified_attention_3d(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
+    k_block_scale_ptr,  # [num_blks, num_kv_heads] for per-block FP8 scaling
+    v_block_scale_ptr,  # [num_blks, num_kv_heads] for per-block FP8 scaling
     scale,  # float32
-    k_scale,  # float32
-    v_scale,  # float32
+    k_scale,  # float32 (per-tensor scale)
+    v_scale,  # float32 (per-tensor scale)
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
@@ -424,6 +469,11 @@ def kernel_unified_attention_3d(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
+    USE_BLOCK_SCALE: tl.constexpr = False,  # bool, per-block FP8 scaling
+    stride_k_block_scale_0: tl.int64 = 0,  # int, stride for block dim
+    stride_k_block_scale_1: tl.int64 = 0,  # int, stride for kv_head dim
+    stride_v_block_scale_0: tl.int64 = 0,  # int, stride for block dim
+    stride_v_block_scale_1: tl.int64 = 0,  # int, stride for kv_head dim
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -547,7 +597,7 @@ def kernel_unified_attention_3d(
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
-        if TILE_SIZE == BLOCK_SIZE:
+        if TILE_SIZE <= BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
         else:
             tile_mask = seq_offset < max_seq_prefix_len
@@ -579,7 +629,18 @@ def kernel_unified_attention_3d(
         )
 
         if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if USE_BLOCK_SCALE:
+                # Load per-block K scales: physical_block_idx is [TILE_SIZE]
+                # k_block_scale layout: [num_blks, num_kv_heads]
+                k_scale_offset = (
+                    physical_block_idx * stride_k_block_scale_0
+                    + kv_head_idx * stride_k_block_scale_1
+                )
+                k_block_scales = tl.load(
+                    k_block_scale_ptr + k_scale_offset,
+                ) 
+                K = K_load
+            elif Q.dtype.is_fp8():
                 K = K_load
             else:
                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
@@ -595,7 +656,18 @@ def kernel_unified_attention_3d(
         )
 
         if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
+            if USE_BLOCK_SCALE:
+                # Load per-block V scales: physical_block_idx is [TILE_SIZE]
+                # v_block_scale layout: [num_blks, num_kv_heads]
+                v_scale_offset = (
+                    physical_block_idx * stride_v_block_scale_0
+                    + kv_head_idx * stride_v_block_scale_1
+                )
+                v_block_scales = tl.load(
+                    v_block_scale_ptr + v_scale_offset,
+                )  
+                V = V_load
+            elif Q.dtype.is_fp8():
                 V = V_load
             else:
                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
@@ -606,7 +678,10 @@ def kernel_unified_attention_3d(
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        if USE_BLOCK_SCALE:
+            S = (qk_scale * k_block_scales[None, :]) * tl.dot(Q, K)
+        else:
+            S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -664,9 +739,16 @@ def kernel_unified_attention_3d(
         # update constants
         L = L * alpha + l_j
         M = m_j
-
+        if SLIDING_WINDOW:
+            qpos_lo = q_block_local_idx * BLOCK_Q
+            V = tl.where(
+                (context_len + qpos_lo - seq_offset[:, None]) < SLIDING_WINDOW, V, 0.0
+            )
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        if USE_BLOCK_SCALE:
+            acc += tl.dot((P * v_block_scales[None, :]).to(V.dtype), V)
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
@@ -734,6 +816,7 @@ def reduce_segments(
     )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
+        offs_d = tl.arange(0, HEAD_SIZE_PADDED)
         dim_mask = offs_d < HEAD_SIZE
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)

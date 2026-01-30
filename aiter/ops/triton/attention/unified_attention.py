@@ -20,6 +20,8 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
+    is_kv_fp8,
+    is_q_fp8,
 ):
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -35,7 +37,7 @@ def select_2d_config(
     else:
         num_stages_2d = 3
         num_warps = 2
-        TILE_SIZE = block_size
+        TILE_SIZE = min(block_size, 64)
 
     if max_seqlen_q >= 256:
         BLOCK_M = 128
@@ -43,22 +45,25 @@ def select_2d_config(
         num_warps = 4
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
+    waves_per_eu = 2
+    if is_q_fp8 and is_kv_fp8:
+        waves_per_eu = 3
     return {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
         "TILE_SIZE": TILE_SIZE,
         "num_warps": num_warps,
         "num_stages": num_stages_2d,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
     }
 
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
+    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms, is_kv_fp8, is_q_fp8
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = block_size
+    TILE_SIZE = min(block_size, 64)
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
@@ -113,15 +118,18 @@ def unified_attention(
     causal,
     window_size,
     block_table,
-    softcap,
-    q_descale,
-    k_descale,
-    v_descale,
-    alibi_slopes=None,
-    output_scale=None,
-    qq_bias=None,
+    softcap = 0,
+    q_descale = None,
+    k_descale = None,
+    v_descale = None,
+    alibi_slopes = None,
+    output_scale = None,
+    qq_bias = None,
     # Optional tensor for sinks
-    sinks=None,
+    sinks = None,
+    # Optional tensor for per-block FP8 KV scaling
+    k_block_scale = None, # [num_blks, num_kv_heads]
+    v_block_scale = None, # [num_blks, num_kv_heads]
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -131,7 +139,15 @@ def unified_attention(
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
+    use_block_scale = k_block_scale is not None and v_block_scale is not None
     SLIDING_WINDOW = 1 + window_size[0]
+    is_kv_fp8 = k.element_size() == 1 and v.element_size() == 1
+    is_q_fp8 = q.element_size() == 1
+    
+    if use_block_scale:
+        assert is_kv_fp8 and is_q_fp8 and k_descale is None, "block scale is only supported for fp8"
+    elif is_kv_fp8 and not is_q_fp8:
+            assert k_descale is not None, "kv in fp8 and q is not fp8, then we need to have kv descale"
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -178,6 +194,8 @@ def unified_attention(
             max_seqlen_k,
             num_queries_per_kv,
             num_2d_prgms,
+            is_kv_fp8,
+            is_q_fp8,
         )
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
@@ -197,6 +215,8 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
+            k_block_scale_ptr=k_block_scale,
+            v_block_scale_ptr=v_block_scale,
             scale=softmax_scale,
             k_scale=k_descale,
             v_scale=v_descale,
@@ -229,6 +249,11 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             USE_FP8=output_scale is not None,
+            USE_BLOCK_SCALE=use_block_scale,
+            stride_k_block_scale_0=k_block_scale.stride(0) if use_block_scale else 0,
+            stride_k_block_scale_1=k_block_scale.stride(1) if use_block_scale else 0,
+            stride_v_block_scale_0=v_block_scale.stride(0) if use_block_scale else 0,
+            stride_v_block_scale_1=v_block_scale.stride(1) if use_block_scale else 0,
             ALL_DECODE=ALL_DECODE,
             **config,
         )
@@ -241,6 +266,8 @@ def unified_attention(
             max_seqlen_k,
             target_num_prgms,
             num_2d_prgms,
+            is_kv_fp8,
+            is_q_fp8,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
@@ -278,6 +305,8 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
+            k_block_scale_ptr=k_block_scale,
+            v_block_scale_ptr=v_block_scale,
             scale=softmax_scale,
             k_scale=k_descale,
             v_scale=v_descale,
@@ -308,6 +337,11 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
+            USE_BLOCK_SCALE=use_block_scale,
+            stride_k_block_scale_0=k_block_scale.stride(0) if use_block_scale else 0,
+            stride_k_block_scale_1=k_block_scale.stride(1) if use_block_scale else 0,
+            stride_v_block_scale_0=v_block_scale.stride(0) if use_block_scale else 0,
+            stride_v_block_scale_1=v_block_scale.stride(1) if use_block_scale else 0,
             ALL_DECODE=ALL_DECODE,
             **attn_config,
         )
