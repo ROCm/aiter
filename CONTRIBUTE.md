@@ -116,10 +116,10 @@ To manually run linters:
 
 ```bash
 # Python formatting
-black aiter/ tests/
+black aiter/ op_tests/
 
 # Python linting
-ruff check aiter/ tests/
+ruff check aiter/ op_tests/
 
 # C++/HIP formatting
 find csrc/ -name "*.cu" -o -name "*.h" -o -name "*.cpp" | xargs clang-format -i
