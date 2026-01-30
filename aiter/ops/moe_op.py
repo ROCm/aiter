@@ -499,9 +499,21 @@ def get_moe_stage_module(
     act = str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()
 
-    md_name = "module_moe_ck2stages"
+    md_name = ("_").join(
+        [
+            "module_moe_ck2stages",
+            Adtype,
+            Bdtype,
+            "preshuffle_on" if preshuffle_mode else "preshuffle_off",
+            Cdtype,
+            act,
+            quant_type,
+            f"mulWeightStage{mul_routed_weight_stage}",
+            "splitk" if is_splitk else "",
+        ]
+    )
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} -w {{}}"
     ]
 
     return md_name, blob_gen_cmd
