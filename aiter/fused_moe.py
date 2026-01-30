@@ -118,7 +118,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    use_flydsl=True,
+    use_flydsl=False,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -207,7 +207,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    use_flydsl: bool = True,
+    use_flydsl: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -1002,7 +1002,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
-    use_flydsl: bool = True,
+    use_flydsl: bool = False,
 ):
     quant_func = get_quant(quant_type)
     token_num_quant_moe_sort_switch = 1024
@@ -1051,7 +1051,7 @@ def fused_moe_2stages(
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
-        if _is_flydsl_available():
+        if use_flydsl and _is_flydsl_available():
             a2 = torch.empty(
                 (token_num, topk, inter_dim),
                 dtype=dtypes.fp8,
@@ -1155,7 +1155,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
-        if not _is_flydsl_available():
+        if not use_flydsl:
             a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
@@ -1713,9 +1713,9 @@ def flydsl_moe_stage1(
     # import pdb;pdb.set_trace()
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
-    sorted_size = int(sorted_ids.numel())
-    size_expert_ids_total = int(sorted_eids.numel())
-    blocks = int(size_expert_ids_total)
+    sorted_size = sorted_ids.shape[0]
+    size_expert_ids_total = sorted_eids.shape[0]
+    blocks = sorted_eids.shape[0]
 
     if sorted_weights is None:
         sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
@@ -1888,9 +1888,9 @@ def flydsl_moe_stage2(
 
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
-    sorted_size = int(sorted_ids.numel())
-    size_expert_ids_total = int(sorted_eids.numel())
-    blocks = int(size_expert_ids_total)
+    sorted_size = sorted_ids.shape[0]
+    size_expert_ids_total = sorted_eids.shape[0]
+    blocks = sorted_eids.shape[0]
 
     if sorted_weights is None:
         sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
