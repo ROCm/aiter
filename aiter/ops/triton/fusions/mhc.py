@@ -588,7 +588,6 @@ def _generate_permutation_matrices(n: int, device: torch.device, dtype: torch.dt
     
     # Generate all permutations of indices [0, 1, ..., n-1]
     perms = list(itertools.permutations(range(n)))
-    n_factorial = len(perms)
     
     # Convert permutations to permutation matrices directly on target device
     # For each permutation p, create matrix where M[i, p[i]] = 1
@@ -729,9 +728,11 @@ def mhc_lite(
     n_factorial = math.factorial(n)
     n_squared = n * n
     
+    # Validate phi_res has n! columns (one per permutation matrix). Instead of n² used in mHC
     assert phi_res.shape == (K, n_factorial), (
         f"phi_res shape mismatch: expected ({K}, {n_factorial}), got {phi_res.shape}"
     )
+    # Validate bias has n! + 2n elements (n! for res + n for pre + n for post)
     assert bias.shape[0] == n_factorial + 2 * n, (
         f"bias shape mismatch: expected ({n_factorial + 2 * n},), got {bias.shape}"
     )
@@ -767,7 +768,7 @@ def mhc_lite(
     BLOCK_N = config.pop("BLOCK_N", 16)
     BLOCK_K = config.pop("BLOCK_K", 64)
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
-    num_ksplit = config.pop("NUM_KSPLIT", 2)  # Default to 2 for parallelization
+    num_ksplit = config.pop("NUM_KSPLIT", 2)  # Default to 2 for split-reduce parallelization
     
     # Total bias size for kernel
     N = n_factorial + 2 * n
@@ -778,120 +779,118 @@ def mhc_lite(
     n_blocks_res = triton.cdiv(n_squared, BLOCK_N)
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
     
-    if num_ksplit > 1:
-        # Split-K path: use split and reduce kernels
-        splitk_block_size = triton.cdiv(K, num_ksplit)
-        actual_ksplit = triton.cdiv(K, splitk_block_size)
+    # Require split-reduce optimization (NUM_KSPLIT > 1)
+    assert num_ksplit > 1, "NUM_KSPLIT must be > 1 for split-reduce optimization"
+    
+    # Split-K path: use split and reduce kernels
+    splitk_block_size = triton.cdiv(K, num_ksplit)
+    actual_ksplit = triton.cdiv(K, splitk_block_size)
         
-        # Allocate intermediate buffers (float32 for precision)
-        acc_pre_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
-        acc_post_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
-        acc_res_partial = torch.empty((num_ksplit, M, n_factorial), dtype=torch.float32, device=x.device)  # n! not n²
-        acc_sq_partial = torch.empty((num_ksplit, M), dtype=torch.float32, device=x.device)
-        
-        # Launch split kernel with 3D grid: (M_blocks, N_blocks_total, NUM_KSPLIT)
-        grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
-        _mhc_lite_fused_split_kernel[grid_split](
-            x,
-            phi_pre,
-            phi_post,
-            phi_res,
-            acc_pre_partial,
-            acc_post_partial,
-            acc_res_partial,
-            acc_sq_partial,
-            # Dimensions
-            M=M,
-            K=K,
-            N=N,
-            n=n,
-            N_FACTORIAL=n_factorial,
-            # Input strides
-            stride_xm=x.stride(0),
-            stride_xk=x.stride(1),
-            stride_phi_pre_k=phi_pre.stride(0),
-            stride_phi_pre_n=phi_pre.stride(1),
-            stride_phi_post_k=phi_post.stride(0),
-            stride_phi_post_n=phi_post.stride(1),
-            stride_phi_res_k=phi_res.stride(0),
-            stride_phi_res_n=phi_res.stride(1),  # n! dimension
-            # Intermediate buffer strides
-            stride_acc_pre_k=acc_pre_partial.stride(0),
-            stride_acc_pre_m=acc_pre_partial.stride(1),
-            stride_acc_pre_n=acc_pre_partial.stride(2),
-            stride_acc_post_k=acc_post_partial.stride(0),
-            stride_acc_post_m=acc_post_partial.stride(1),
-            stride_acc_post_n=acc_post_partial.stride(2),
-            stride_acc_res_k=acc_res_partial.stride(0),
-            stride_acc_res_m=acc_res_partial.stride(1),
-            stride_acc_res_n=acc_res_partial.stride(2),  # n! dimension
-            stride_acc_sq_k=acc_sq_partial.stride(0),
-            stride_acc_sq_m=acc_sq_partial.stride(1),
-            # Block sizes
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            NUM_KSPLIT=num_ksplit,
-            SPLITK_BLOCK_SIZE=splitk_block_size,
-            **config,
-        )
-        
-        # Launch reduce kernel with 2D grid: (M_blocks, N_blocks_total)
-        grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-        _mhc_lite_fused_reduce_kernel[grid_reduce](
-            acc_pre_partial,
-            acc_post_partial,
-            acc_res_partial,
-            acc_sq_partial,
-            perm_mats,
-            alpha_pre,
-            alpha_post,
-            alpha_res,
-            bias,
-            out_pre,
-            out_post,
-            out_res,
-            # Dimensions
-            M=M,
-            K=K,
-            N=N,
-            n=n,
-            N_FACTORIAL=n_factorial,
-            N_FACTORIAL_POW2=n_factorial_pow2,
-            eps=eps,
-            # Intermediate buffer strides
-            stride_acc_pre_k=acc_pre_partial.stride(0),
-            stride_acc_pre_m=acc_pre_partial.stride(1),
-            stride_acc_pre_n=acc_pre_partial.stride(2),
-            stride_acc_post_k=acc_post_partial.stride(0),
-            stride_acc_post_m=acc_post_partial.stride(1),
-            stride_acc_post_n=acc_post_partial.stride(2),
-            stride_acc_res_k=acc_res_partial.stride(0),
-            stride_acc_res_m=acc_res_partial.stride(1),
-            stride_acc_res_n=acc_res_partial.stride(2),  # n! dimension
-            stride_acc_sq_k=acc_sq_partial.stride(0),
-            stride_acc_sq_m=acc_sq_partial.stride(1),
-            # Permutation matrix strides
-            stride_perm_idx=perm_mats.stride(0),
-            stride_perm_row=perm_mats.stride(1),
-            stride_perm_col=perm_mats.stride(2),
-            # Output strides
-            stride_pre_m=out_pre.stride(0),
-            stride_pre_n=out_pre.stride(1),
-            stride_post_m=out_post.stride(0),
-            stride_post_n=out_post.stride(1),
-            stride_res_m=out_res.stride(0),
-            stride_res_n=out_res.stride(1),
-            # Block sizes
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            NUM_KSPLIT=num_ksplit,
-            ACTUAL_KSPLIT=actual_ksplit,
-            **config,
-        )
-    else:
-        raise NotImplementedError(
-            "Use NUM_KSPLIT > 1 for split-reduce optimization."
-        )
+    # Allocate intermediate buffers (float32 for precision)
+    acc_pre_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
+    acc_post_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
+    acc_res_partial = torch.empty((num_ksplit, M, n_factorial), dtype=torch.float32, device=x.device)  # n! not n²
+    acc_sq_partial = torch.empty((num_ksplit, M), dtype=torch.float32, device=x.device)
+    
+    # Launch split kernel with 3D grid: (M_blocks, N_blocks_total, NUM_KSPLIT)
+    grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
+    _mhc_lite_fused_split_kernel[grid_split](
+        x,
+        phi_pre,
+        phi_post,
+        phi_res,
+        acc_pre_partial,
+        acc_post_partial,
+        acc_res_partial,
+        acc_sq_partial,
+        # Dimensions
+        M=M,
+        K=K,
+        N=N,
+        n=n,
+        N_FACTORIAL=n_factorial,
+        # Input strides
+        stride_xm=x.stride(0),
+        stride_xk=x.stride(1),
+        stride_phi_pre_k=phi_pre.stride(0),
+        stride_phi_pre_n=phi_pre.stride(1),
+        stride_phi_post_k=phi_post.stride(0),
+        stride_phi_post_n=phi_post.stride(1),
+        stride_phi_res_k=phi_res.stride(0),
+        stride_phi_res_n=phi_res.stride(1),  # n! dimension
+        # Intermediate buffer strides
+        stride_acc_pre_k=acc_pre_partial.stride(0),
+        stride_acc_pre_m=acc_pre_partial.stride(1),
+        stride_acc_pre_n=acc_pre_partial.stride(2),
+        stride_acc_post_k=acc_post_partial.stride(0),
+        stride_acc_post_m=acc_post_partial.stride(1),
+        stride_acc_post_n=acc_post_partial.stride(2),
+        stride_acc_res_k=acc_res_partial.stride(0),
+        stride_acc_res_m=acc_res_partial.stride(1),
+        stride_acc_res_n=acc_res_partial.stride(2),  # n! dimension
+        stride_acc_sq_k=acc_sq_partial.stride(0),
+        stride_acc_sq_m=acc_sq_partial.stride(1),
+        # Block sizes
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        NUM_KSPLIT=num_ksplit,
+        SPLITK_BLOCK_SIZE=splitk_block_size,
+        **config,
+    )
+    
+    # Launch reduce kernel with 2D grid: (M_blocks, N_blocks_total)
+    grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
+    _mhc_lite_fused_reduce_kernel[grid_reduce](
+        acc_pre_partial,
+        acc_post_partial,
+        acc_res_partial,
+        acc_sq_partial,
+        perm_mats,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        out_pre,
+        out_post,
+        out_res,
+        # Dimensions
+        M=M,
+        K=K,
+        N=N,
+        n=n,
+        N_FACTORIAL=n_factorial,
+        N_FACTORIAL_POW2=n_factorial_pow2,
+        eps=eps,
+        # Intermediate buffer strides
+        stride_acc_pre_k=acc_pre_partial.stride(0),
+        stride_acc_pre_m=acc_pre_partial.stride(1),
+        stride_acc_pre_n=acc_pre_partial.stride(2),
+        stride_acc_post_k=acc_post_partial.stride(0),
+        stride_acc_post_m=acc_post_partial.stride(1),
+        stride_acc_post_n=acc_post_partial.stride(2),
+        stride_acc_res_k=acc_res_partial.stride(0),
+        stride_acc_res_m=acc_res_partial.stride(1),
+        stride_acc_res_n=acc_res_partial.stride(2),  # n! dimension
+        stride_acc_sq_k=acc_sq_partial.stride(0),
+        stride_acc_sq_m=acc_sq_partial.stride(1),
+        # Permutation matrix strides
+        stride_perm_idx=perm_mats.stride(0),
+        stride_perm_row=perm_mats.stride(1),
+        stride_perm_col=perm_mats.stride(2),
+        # Output strides
+        stride_pre_m=out_pre.stride(0),
+        stride_pre_n=out_pre.stride(1),
+        stride_post_m=out_post.stride(0),
+        stride_post_n=out_post.stride(1),
+        stride_res_m=out_res.stride(0),
+        stride_res_n=out_res.stride(1),
+        # Block sizes
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        NUM_KSPLIT=num_ksplit,
+        ACTUAL_KSPLIT=actual_ksplit,
+        **config,
+    )
     
     return out_pre, out_post, out_res
