@@ -699,7 +699,6 @@ __device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt
     hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlBl);
 }
 
-template <uint32_t kPart>
 __device__ __forceinline__ void transpose_v(v8ui* p_v)
 {
     constexpr uint32_t perm_0 = 0x05010400;
@@ -707,36 +706,34 @@ __device__ __forceinline__ void transpose_v(v8ui* p_v)
     constexpr uint32_t perm_2 = 0x07060302;
     constexpr uint32_t perm_3 = 0x07030602;
 
-    static_assert((kPart == 0) || (kPart == 1), "Invalid part!");
+    const uint32_t t0_0 = __builtin_amdgcn_perm((*p_v)[2], (*p_v)[0], perm_0);
+    const uint32_t t2_0 = __builtin_amdgcn_perm((*p_v)[2], (*p_v)[0], perm_3);
+    const uint32_t t0_1 = __builtin_amdgcn_perm((*p_v)[3], (*p_v)[1], perm_0);
+    const uint32_t t2_1 = __builtin_amdgcn_perm((*p_v)[3], (*p_v)[1], perm_3);
 
-    const uint32_t w0 = (kPart == 0) ? (*p_v)[0] : (*p_v)[1];
-    const uint32_t w1 = (kPart == 0) ? (*p_v)[2] : (*p_v)[3];
-    const uint32_t w2 = (kPart == 0) ? (*p_v)[4] : (*p_v)[5];
-    const uint32_t w3 = (kPart == 0) ? (*p_v)[6] : (*p_v)[7];
+    const uint32_t t1_0 = __builtin_amdgcn_perm((*p_v)[6], (*p_v)[4], perm_0);
+    const uint32_t t3_0 = __builtin_amdgcn_perm((*p_v)[6], (*p_v)[4], perm_3);
+    const uint32_t t1_1 = __builtin_amdgcn_perm((*p_v)[7], (*p_v)[5], perm_0);
+    const uint32_t t3_1 = __builtin_amdgcn_perm((*p_v)[7], (*p_v)[5], perm_3);
 
-    const uint32_t t0 = __builtin_amdgcn_perm(w1, w0, perm_0);
-    const uint32_t t1 = __builtin_amdgcn_perm(w3, w2, perm_0);
-    const uint32_t r0 = __builtin_amdgcn_perm(t1, t0, perm_1);
-    const uint32_t r1 = __builtin_amdgcn_perm(t1, t0, perm_2);
-    const uint32_t t2 = __builtin_amdgcn_perm(w1, w0, perm_3);
-    const uint32_t t3 = __builtin_amdgcn_perm(w3, w2, perm_3);
-    const uint32_t r2 = __builtin_amdgcn_perm(t3, t2, perm_1);
-    const uint32_t r3 = __builtin_amdgcn_perm(t3, t2, perm_2);
+    const uint32_t r0_0 = __builtin_amdgcn_perm(t1_0, t0_0, perm_1);
+    const uint32_t r1_0 = __builtin_amdgcn_perm(t1_0, t0_0, perm_2);
+    const uint32_t r2_0 = __builtin_amdgcn_perm(t3_0, t2_0, perm_1);
+    const uint32_t r3_0 = __builtin_amdgcn_perm(t3_0, t2_0, perm_2);
 
-    if constexpr(kPart == 0)
-    {
-        (*p_v)[0] = r0;
-        (*p_v)[2] = r1;
-        (*p_v)[4] = r2;
-        (*p_v)[6] = r3;
-    }
-    else
-    {
-        (*p_v)[1] = r0;
-        (*p_v)[3] = r1;
-        (*p_v)[5] = r2;
-        (*p_v)[7] = r3;
-    }
+    const uint32_t r0_1 = __builtin_amdgcn_perm(t1_1, t0_1, perm_1);
+    const uint32_t r1_1 = __builtin_amdgcn_perm(t1_1, t0_1, perm_2);
+    const uint32_t r2_1 = __builtin_amdgcn_perm(t3_1, t2_1, perm_1);
+    const uint32_t r3_1 = __builtin_amdgcn_perm(t3_1, t2_1, perm_2);
+
+    (*p_v)[0] = r0_0;
+    (*p_v)[1] = r0_1;
+    (*p_v)[2] = r1_0;
+    (*p_v)[3] = r1_1;
+    (*p_v)[4] = r2_0;
+    (*p_v)[5] = r2_1;
+    (*p_v)[6] = r3_0;
+    (*p_v)[7] = r3_1;
 }
 
 template <bool kCheckBoundary, uint32_t GPR>
@@ -1269,7 +1266,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
 
             // GEMM on NoPE
-            __builtin_amdgcn_s_setprio(5);
             ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}([&](auto idx) {
                 using q_range_0 =
                     hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
@@ -1293,6 +1289,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 if constexpr(idx.value == k_q_nope_begin)
                 {
                     hk::mma_ABt(p_comp, kv_0, q_0);
+                    __builtin_amdgcn_s_setprio(4);
                 }
                 else
                 {
@@ -1328,7 +1325,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
             });
-            __builtin_amdgcn_s_setprio(1);
+            __builtin_amdgcn_s_setprio(2);
 
             // Start loading KV for next iteration
             kv_manager.template async_load_k_tile<0, kIsLastIter, kCheckBoundaryNext>(
@@ -1340,7 +1337,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             softmax_p0<kIsFirstIter, kCheckBoundary, k_p_comp_begin>(
                 &row_max, &rescale, kv_tile_start, kv_end, params.softmax_scale);
             softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
-            __builtin_amdgcn_s_setprio(0);
+            __builtin_amdgcn_s_setprio(1);
 
             kv_manager.template async_load_k_tile<128, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
@@ -1349,6 +1346,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             {
                 hk::mul_vgpr_pk2(oaccu, oaccu, rescale);
             }
+
+            __builtin_amdgcn_s_setprio(0);
 
             kv_manager.template async_load_k_tile<192, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
@@ -1377,8 +1376,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             kv_manager.template async_load_k_tile<256, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
-            transpose_v<0>(&v);
-            transpose_v<1>(&v);
+            transpose_v(&v);
             store_transposed_v_to_lds<T>(p_lds_vt, v);
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
@@ -1387,7 +1385,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             kv_manager.template async_load_k_tile<320, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
-            __builtin_amdgcn_s_setprio(4);
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
             ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
                 constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
@@ -1421,6 +1418,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 else
                 {
                     hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
+                }
+
+                if constexpr(idx.value == 0)
+                {
+                    __builtin_amdgcn_s_setprio(3);
                 }
 
                 asm volatile("s_waitcnt lgkmcnt(0)");
