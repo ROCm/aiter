@@ -1,3 +1,4 @@
+import argparse
 import copy
 import io
 import logging
@@ -85,10 +86,13 @@ class ModelBuilder:
         return Model(name=self.name, hq=self.hq, hkv=self.hkv, dqk=self.dqk, dv=self.dv)
 
 
+TpDegree = Literal[1, 2, 4, 8]
+
+
 @dataclass(kw_only=True)
 class TpModel:
     model: Model
-    tp: int = 1
+    tp: TpDegree = 1
 
     def __post_init__(self) -> None:
         assert self.tp > 0, "Tensor parallelism must be positive."
@@ -242,29 +246,183 @@ def get_models(model_filter: Optional[str] = None) -> Iterable[Model]:
 
 
 def get_tp_models(
-    models: Iterable[Model] = get_models(), tps: Iterable[int] = (1, 2, 4, 8)
+    models: Iterable[Model] = get_models(),
+    tps: Iterable[TpDegree] = get_args(TpDegree),
 ) -> Iterable[TpModel]:
-    return (TpModel(model=model, tp=tp) for model, tp in product(models, tps))
+    return tuple(TpModel(model=model, tp=tp) for model, tp in product(models, tps))
+
+
+@dataclass(kw_only=True)
+class Range:
+    start: int
+    inc: int
+    end: int
+
+    def __post_init__(self) -> None:
+        assert self.start > 0, "Start must be positive."
+        assert self.inc > 0, "Increment must be positive."
+        assert self.end > 0, "End must be positive."
+        assert self.end >= self.start, "End must be greater than or equal to start."
+
+    def to_range(self) -> range:
+        return range(self.start, self.end + 1, self.inc)
 
 
 def get_bench_args(
     kernels: Iterable[Kernel] = get_args(Kernel),
     layouts: Iterable[Layout] = get_args(Layout),
     tp_models: Iterable[TpModel] = get_tp_models(),
+    batch_range: Range = Range(start=1, inc=1, end=4),
+    seq_range: Range = Range(start=1024, inc=1024, end=5120),
 ) -> Iterable[BenchArgs]:
-    return (
-        BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=1, s=1024)
-        for kernel, layout, tp_model in product(kernels, layouts, tp_models)
+    return tuple(
+        BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=b, s=s)
+        for kernel, layout, tp_model, b, s in product(
+            kernels,
+            layouts,
+            tp_models,
+            batch_range.to_range(),
+            seq_range.to_range(),
+        )
     )
 
 
+def positive_int(value: str) -> int:
+    try:
+        int_value = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} is not an integer")
+    if int_value <= 0:
+        raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
+    return int_value
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Benchmark attention kernels with configurations of popular LLM models.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "-k",
+        "--kernel",
+        nargs="+",
+        choices=get_args(Kernel),
+        default=get_args(Kernel),
+        help="attention kernels (default: all)",
+    )
+    parser.add_argument(
+        "-l",
+        "--layout",
+        nargs="+",
+        choices=get_args(Layout),
+        default=get_args(Layout),
+        help="memory layouts (default: all)",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        type=str,
+        default=None,
+        help="model name filter (case-insensitive substring match, default: all models)",
+    )
+    parser.add_argument(
+        "-t",
+        "--tensor-parallelism",
+        nargs="+",
+        type=positive_int,
+        choices=get_args(TpDegree),
+        default=get_args(TpDegree),
+        help="tensor parallelism degrees (default: all)",
+    )
+    # Batch size arguments:
+    parser.add_argument(
+        "-bs",
+        "--batch-start",
+        type=positive_int,
+        default=1,
+        help="initial batch size (inclusive, default: 1)",
+    )
+    parser.add_argument(
+        "-bi",
+        "--batch-inc",
+        type=positive_int,
+        default=1,
+        help="batch size increment (default: 1)",
+    )
+    parser.add_argument(
+        "-be",
+        "--batch-end",
+        type=positive_int,
+        default=4,
+        help="final batch size (inclusive, default: 4)",
+    )
+    # Sequence length arguments:
+    parser.add_argument(
+        "-ss",
+        "--seq-start",
+        type=positive_int,
+        default=1024,
+        help="initial sequence length (inclusive, default: 1024)",
+    )
+    parser.add_argument(
+        "-si",
+        "--seq-inc",
+        type=positive_int,
+        default=1024,
+        help="sequence length increment (default: 1024)",
+    )
+    parser.add_argument(
+        "-se",
+        "--seq-end",
+        type=positive_int,
+        default=5120,
+        help="final sequence length (inclusive, default: 5120)",
+    )
+
+    args = parser.parse_args()
+
+    # Validate range constraints:
+    if args.batch_end < args.batch_start:
+        parser.error("--batch-end must be greater than or equal to --batch-start")
+    if args.seq_end < args.seq_start:
+        parser.error("--seq-end must be greater than or equal to --seq-start")
+
+    # Deduplicate and sort multi-value arguments:
+    args.kernel = sorted(set(args.kernel))
+    args.layout = sorted(set(args.layout))
+    args.tensor_parallelism = sorted(set(args.tensor_parallelism))
+
+    return args
+
+
 def main() -> None:
+    args = parse_args()
+
     disable_logs("matplotlib")
     logging.basicConfig(level=logging.DEBUG)
 
     logging.info("Benchmarking attention configurations...")
 
-    for ba in get_bench_args(kernels=("fwd",)):
+    bench_args = get_bench_args(
+        kernels=args.kernel,
+        layouts=args.layout,
+        tp_models=get_tp_models(
+            models=get_models(args.model),
+            tps=args.tensor_parallelism,
+        ),
+        batch_range=Range(
+            start=args.batch_start,
+            inc=args.batch_inc,
+            end=args.batch_end,
+        ),
+        seq_range=Range(
+            start=args.seq_start,
+            inc=args.seq_inc,
+            end=args.seq_end,
+        ),
+    )
+
+    for ba in bench_args:
         ms = run_bench_mha(ba)
         if ms is None:
             logging.info("%s => error!", ba)
