@@ -545,7 +545,7 @@ def ck_moe_stage1_fwd(
         activation.value,
         int(splitk) if splitk is not None else splitk,
         use_non_temporal_load,
-        dtype2str_dict[dst_type],
+        None if dst_type is None else dtype2str_dict[dst_type],
         is_shuffled=getattr(w1, "is_shuffled", False),
     )
     return out
