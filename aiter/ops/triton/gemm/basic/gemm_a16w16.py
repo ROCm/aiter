@@ -4,8 +4,11 @@
 from typing import Optional
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
+from aiter.ops.triton.gluon.gemm_a16w16 import (
     _gemm_a16_w16_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
+#    _gemm_a16_w16_kernel,
     _gemm_a16w16_reduce_kernel,
     _get_config,
 )
@@ -76,6 +79,15 @@ def gemm_a16w16(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
+    #config["BLOCK_SIZE_K"] = 32  # Fixed BLOCK_SIZE_K for A16W16
+    #config["GROUP_SIZE_M"] = 6
+    #config["num_stages"] = 3
+
+    config["BLOCK_SIZE_K"] = 64  # Fixed BLOCK_SIZE_K for A16W16
+    config["GROUP_SIZE_M"] = 4
+    config["num_stages"] = 2
+    #print(f"{config=}")
+    bias = None
     _gemm_a16_w16_kernel[grid](
         x,
         w,
