@@ -214,8 +214,8 @@ def run_bench_mha(args: BenchArgs) -> Optional[float]:
     return get_bench_result(args, out.getvalue(), err.getvalue())
 
 
-def get_models() -> Iterable[Model]:
-    return (
+def get_models(model_filter: Optional[str] = None) -> Iterable[Model]:
+    all_models = (
         Model.new("Llama3 405B").h_q_vk(128, 8).d(128).build(),
         Model.new("Llama3 70B").h_q_vk(64, 8).d(128).build(),
         Model.new("Llama3 8B").h_q_vk(32, 8).d(128).build(),
@@ -226,6 +226,19 @@ def get_models() -> Iterable[Model]:
         Model.new("DeepSeek R1 (Prefill)").h(128).d(56).build(),
         Model.new("DeepSeek R1 (Decode)").h(128).d_qk_v(192, 128).build(),
     )
+    if model_filter is not None:
+        model_filter = model_filter.strip().lower()
+        if not model_filter:  # Empty string after stripping
+            logging.debug("Empty model name filter, returning all models.")
+            return all_models
+        filtered_models = tuple(
+            model for model in all_models if model_filter in model.name.lower()
+        )
+        logging.debug("Number of filtered models: %d", len(filtered_models))
+        if not filtered_models:
+            logging.warning("There are no models after filtering by model name.")
+        return filtered_models
+    return all_models  # model_filter is None, return all
 
 
 def get_tp_models(
