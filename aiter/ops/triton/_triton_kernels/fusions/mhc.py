@@ -811,12 +811,16 @@ def _mhc_lite_fused_reduce_kernel(
     n_squared = n * n
     n_blocks_pre = tl.cdiv(n, BLOCK_N)
     n_blocks_post = n_blocks_pre
+    n_blocks_res = tl.cdiv(n_squared, BLOCK_N)
     
+    # Stream determination using clearer logic
+    threshold_post = n_blocks_pre + n_blocks_post
     is_pre_program = pid_n < n_blocks_pre
-    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
-    is_res_program = ~is_pre_program & ~is_post_program
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < threshold_post)
+    is_res_program = pid_n >= threshold_post
     
-    stream_offset = is_post_program.to(tl.int32) * n_blocks_pre + is_res_program.to(tl.int32) * (n_blocks_pre + n_blocks_post)
+    # Compute local block index within stream
+    stream_offset = is_post_program.to(tl.int32) * n_blocks_pre + is_res_program.to(tl.int32) * threshold_post
     local_pid_n = pid_n - stream_offset
     
     rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -840,10 +844,6 @@ def _mhc_lite_fused_reduce_kernel(
     if is_res_program:
         # mHC-Lite path: reduce logits → softmax → weighted permutation sum
         # STEP 1: Reduce logits across K-splits (M, n!)
-        n_blocks_res = tl.cdiv(n_squared, BLOCK_N)
-        if local_pid_n >= n_blocks_res:
-            return
-        
         # Allocate for n! logits per batch
         logits = tl.zeros([BLOCK_M, N_FACTORIAL_POW2], dtype=tl.float32) + float('-inf')
         
@@ -859,7 +859,7 @@ def _mhc_lite_fused_reduce_kernel(
                 logit_acc += logit_partial
             
             # Apply RMSNorm + alpha + bias
-            bias_val = tl.load(bias_ptr + (n + n + perm_idx), mask=(n + n + perm_idx) < N, other=0.0).to(tl.float32)
+            bias_val = tl.load(bias_ptr + (n + n + perm_idx)).to(tl.float32)
             logit_normalized = rsigma * alpha_res * logit_acc + bias_val
             
             perm_indices = tl.arange(0, N_FACTORIAL_POW2)
@@ -895,17 +895,19 @@ def _mhc_lite_fused_reduce_kernel(
         
         # Store H^res (already doubly stochastic)
         out_ptrs = out_res_ptr + rm[:, None] * stride_res_m + elem_indices[None, :] * stride_res_n
-        store_mask = (rm < M)[:, None] & elem_mask[None, :]
-        tl.store(out_ptrs, output.to(out_res_ptr.dtype.element_ty), mask=store_mask)
+        tl.store(out_ptrs, output.to(out_res_ptr.dtype.element_ty), mask=(rm[:, None] < M) & elem_mask[None, :])
         
     else:
-        # Standard mHC path for pre/post streams
+        # Standard path for pre/post streams
         n_out = n
+        
+        # Select intermediate buffer based on stream type
         acc_ptr = tl.where(is_pre_program, acc_pre_ptr, acc_post_ptr)
         stride_acc_k = tl.where(is_pre_program, stride_acc_pre_k, stride_acc_post_k)
         stride_acc_m = tl.where(is_pre_program, stride_acc_pre_m, stride_acc_post_m)
         stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n, stride_acc_post_n)
         
+        # Accumulate
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         for ks in range(ACTUAL_KSPLIT):
             acc_partial = tl.load(
@@ -915,14 +917,17 @@ def _mhc_lite_fused_reduce_kernel(
             )
             acc += acc_partial
         
+        # Load bias and compute output
         bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
         alpha_val = tl.where(is_pre_program, alpha_pre, alpha_post)
         
         out = rsigma[:, None] * alpha_val * acc + bias[None, :]
         
+        # Apply activation
         sigmoid_out = tl.sigmoid(out)
         out_activated = tl.where(is_pre_program, sigmoid_out, sigmoid_out * 2.0)
 
+        # Select output buffer and store
         out_ptr = tl.where(is_pre_program, out_pre_ptr, out_post_ptr)
         stride_out_m = tl.where(is_pre_program, stride_pre_m, stride_post_m)
         stride_out_n = tl.where(is_pre_program, stride_pre_n, stride_post_n)
