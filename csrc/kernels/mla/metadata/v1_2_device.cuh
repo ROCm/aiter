@@ -16,10 +16,9 @@ struct MlaMetadataV12Traits
     // <= -1: read from seqlens_qo_indptr
     // ==  0: read from MlaMetadataV1KernelParameter::uni_seqlen_qo
     // >=  1: read from MlaMetadataV12Traits::kUniSeqlenQo
-    static constexpr int32_t kUniSeqlenQo            = kUniSeqlenQo_;
-    static constexpr int32_t kFixedOverheadNumBlocks = 16;
-    static constexpr int32_t kIsSparse               = kIsSparse_;
-    static constexpr int32_t kLdsBatchInfo           = kLdsBatchInfo_;
+    static constexpr int32_t kUniSeqlenQo  = kUniSeqlenQo_;
+    static constexpr int32_t kIsSparse     = kIsSparse_;
+    static constexpr int32_t kLdsBatchInfo = kLdsBatchInfo_;
 };
 
 template <typename Traits>
@@ -92,7 +91,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_qo_tiles = get_num_qo_tiles(bid);
-        sum_blocks += (num_blocks + Traits::kFixedOverheadNumBlocks) * num_qo_tiles;
+        sum_blocks += (num_blocks + params.fixed_over_head_num_blocks) * num_qo_tiles;
 
         if constexpr(QoState::is_unique() == false)
         {
@@ -117,8 +116,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     // expected payload handled by each cu part.
     const int32_t payload = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
-                            Traits::kFixedOverheadNumBlocks;
-
+                            params.fixed_over_head_num_blocks;
+    const int32_t page_size   = params.page_size;
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
     int32_t curr_n_split_idx  = 0; // #cu parts used to handle current batch
@@ -150,7 +149,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
 
             // If current cu part is able to handle this batch of seqences
-            if(remain_payload >= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks))
+            if(remain_payload >= (remain_kv_blocks + params.fixed_over_head_num_blocks))
             {
                 const int32_t num_splits = curr_n_split_idx + 1;
 
@@ -164,21 +163,35 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
                                                     qo_state.get_end(curr_batch));
                     work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
-                    int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
-                    if constexpr(!Traits::kIsSparse)
+                    if(page_size == 1)
                     {
-                        if(params.qk_batch_ratio != 1)
+                        int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
+                        if constexpr(!Traits::kIsSparse)
                         {
-                            batch_tail =
-                                num_qo_tiles -
-                                (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo - 1;
+                            if(params.qk_batch_ratio != 1)
+                            {
+                                batch_tail =
+                                    num_qo_tiles -
+                                    (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo -
+                                    1;
+                            }
                         }
+                        work_info.kv_end = ck_tile::min(
+                            work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
+                            curr_kv_end - batch_tail);
+                        work_info.kv_offset = curr_kv_end - work_info.kv_end;
                     }
-                    work_info.kv_end    = ck_tile::min(work_info.kv_start +
-                                                        (remain_kv_blocks * params.kv_granularity),
-                                                    curr_kv_end - batch_tail);
-                    work_info.kv_offset = curr_kv_end - work_info.kv_end;
-
+                    else
+                    {
+                        work_info.kv_end = ck_tile::min(
+                            work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
+                            curr_kv_end);
+                        work_info.kv_offset =
+                            (curr_kv_end - work_info.kv_end == 0)
+                                ? 0
+                                : ((curr_kv_end - work_info.kv_end - 1) * page_size +
+                                   params.p_kv_last_page_lens[curr_batch]);
+                    }
                     // split related info
                     if(curr_n_split_idx > 0)
                     {
@@ -221,7 +234,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 tot_qo_tiles += 1;
                 num_works += 1;
 
-                remain_payload -= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks);
+                remain_payload -= (remain_kv_blocks + params.fixed_over_head_num_blocks);
 
                 // update state
                 curr_qo_tile_idx =
@@ -269,9 +282,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             }
             else
             {
-                if(remain_payload > Traits::kFixedOverheadNumBlocks)
+                if(remain_payload > params.fixed_over_head_num_blocks)
                 {
-                    const int32_t consuming_blks = remain_payload - Traits::kFixedOverheadNumBlocks;
+                    const int32_t consuming_blks =
+                        remain_payload - params.fixed_over_head_num_blocks;
 
                     auto fill_work_info = [&]() {
                         MlaWorkInfo work_info{};
@@ -282,21 +296,35 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                                         qo_state.get_end(curr_batch));
                         work_info.kv_start =
                             curr_kv_begin + (curr_kv_block * params.kv_granularity);
-                        int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
-                        if constexpr(!Traits::kIsSparse)
+                        if(page_size == 1)
                         {
-                            if(params.qk_batch_ratio != 1)
+                            int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
+                            if constexpr(!Traits::kIsSparse)
                             {
-                                batch_tail =
-                                    num_qo_tiles -
-                                    (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo -
-                                    1;
+                                if(params.qk_batch_ratio != 1)
+                                {
+                                    batch_tail = num_qo_tiles -
+                                                 (work_info.qo_start / params.qk_batch_ratio) %
+                                                     ori_seqlen_qo -
+                                                 1;
+                                }
                             }
+                            work_info.kv_end = ck_tile::min(
+                                work_info.kv_start + (consuming_blks * params.kv_granularity),
+                                curr_kv_end - batch_tail);
+                            work_info.kv_offset = curr_kv_end - work_info.kv_end;
                         }
-                        work_info.kv_end = ck_tile::min(
-                            work_info.kv_start + (consuming_blks * params.kv_granularity),
-                            curr_kv_end - batch_tail);
-                        work_info.kv_offset        = curr_kv_end - work_info.kv_end;
+                        else
+                        {
+                            work_info.kv_end = ck_tile::min(
+                                work_info.kv_start + (consuming_blks * params.kv_granularity),
+                                curr_kv_end);
+                            work_info.kv_offset =
+                                (curr_kv_end - work_info.kv_end == 0)
+                                    ? 0
+                                    : ((curr_kv_end - work_info.kv_end - 1) * page_size +
+                                       params.p_kv_last_page_lens[curr_batch]);
+                        }
                         work_info.partial_qo_loc   = partial_idx;
                         p_work_info_set[num_works] = work_info;
                     };
@@ -358,9 +386,11 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
 
 void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
                                   const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
+                                  const torch::Tensor& kv_last_page_lens, // [batch size]
                                   const int32_t num_heads_per_head_k,
                                   const int32_t num_heads_k,
                                   const bool is_causal,
+                                  const int32_t page_size,
                                   const int32_t kv_granularity,
                                   const int32_t max_seqlen_qo,
                                   const int32_t ori_uni_seqlen_qo,
@@ -428,18 +458,21 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.p_reduce_partial_map         = reduce_partial_map.data_ptr<int32_t>();
     params.p_seqlens_qo_indptr          = seqlens_qo_indptr.data_ptr<int32_t>();
     params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
+    params.p_kv_last_page_lens          = kv_last_page_lens.data_ptr<int32_t>();
     params.num_batches                  = num_batches;
     params.num_heads                    = num_heads_k * num_heads_per_head_k;
     params.num_cu                       = num_clusters;
     params.num_splits                   = num_splits;
     params.reduce_indptr_size           = reduce_indptr.size(0);
+    params.page_size                    = page_size;
     params.kv_granularity               = kv_granularity;
     params.kv_granularity_log2          = __builtin_ctz(kv_granularity);
     params.uni_seqlen_qo                = uni_seqlen_qo;
     params.ori_seqlen_qo                = ori_uni_seqlen_qo;
     params.is_causal                    = is_causal;
-    params.topk                         = topk;
+    params.topk                         = (topk < 0) ? topk : (topk + page_size - 1) / page_size;
     params.qk_batch_ratio               = qk_batch_ratio;
+    params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
 
     // launch kernel
     MLA_METADATA_DISPATCHER(

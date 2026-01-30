@@ -45,11 +45,13 @@ struct MlaMetadataV1KernelParameter
     // Inputs
     const int32_t* p_seqlens_qo_indptr;
     const int32_t* p_seqlens_kv_indptr;
+    const int32_t* p_kv_last_page_lens;
     int32_t num_batches;
     int32_t fixed_num_batches;
     int32_t num_heads;
     int32_t num_cu;
     int32_t reduce_indptr_size;
+    int32_t page_size;
     int32_t kv_granularity;
     int32_t kv_granularity_log2;
     int32_t uni_seqlen_qo;
@@ -58,6 +60,7 @@ struct MlaMetadataV1KernelParameter
     int32_t qk_batch_ratio;
     int32_t num_splits;
     bool is_causal;
+    int32_t fixed_over_head_num_blocks;
 };
 
 struct PaMetadataV1KernelParameter : MlaMetadataV1KernelParameter

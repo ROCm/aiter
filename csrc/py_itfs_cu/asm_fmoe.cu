@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_fmoe_configs.hpp"
 #include "moe_op.h"
@@ -87,13 +87,7 @@ class FMoeKernel
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0)
     {
-        const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-        std::string arch_name     = get_gpu_arch();
-        std::string hsa_path      = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
-        std::cout << "[aiter] hipModuleLoad: " << hsa_path.c_str() << " GetFunction: " << name;
-        HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
-        HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
-        std::cout << " Success" << std::endl;
+        load_asm_kernel(name, hsaco, module, kernel_func);
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
@@ -126,6 +126,8 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         nullptr, // seqlen_k_ptr
                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
                         cu_seqlen_kv_ptr, // cu_seqlen_k_ptr
+                        nullptr, // block_scale_seqstart_q_ptr
+                        nullptr, // block_scale_seqstart_k_ptr
                         sink_ptr, // sink_ptr
                         seqlen_q,
                         seqlen_k,
@@ -150,6 +152,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         nhead_stride_randval,
                         nhead_stride_lse,
                         nhead_stride_o,
+                        0, // nhead_stride_q_descale
+                        0, // nhead_stride_k_descale
+                        0, // nhead_stride_v_descale
                         batch_stride_q,
                         batch_stride_k,
                         batch_stride_v,
@@ -157,6 +162,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         batch_stride_randval,
                         batch_stride_lse,
                         batch_stride_o,
+                        0, // batch_stride_q_descale
+                        0, // batch_stride_k_descale
+                        0, // batch_stride_v_descale
                         mask.left,
                         mask.right,
                         mask.sink,
@@ -164,7 +172,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         0, // min_seqlen_q
                         p_dropout,
                         has_dropout_randval,
-                        drop_seed_offset};
+                        drop_seed_offset,
+                        128, // block_scale_size_q (per-block quantization block size)
+                        128}; // block_scale_size_kv (per-block quantization block size)
 }
 
 std::vector<at::Tensor>
