@@ -328,7 +328,7 @@ def fav3_sage_forward_func(
     if sage_version == fav3_sage.Sage_version.V3:
         sage_quant_func = sage_quant_v3
 
-    q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant_func(
+    q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale, v_mean = sage_quant_func(
         q,
         k,
         v,
@@ -347,7 +347,8 @@ def fav3_sage_forward_func(
         q_descale,
         k_descale,
         v_descale,
-        FP8_MAX,
+        v_mean=v_mean,
+        FP8_MAX=FP8_MAX,
         causal=causal,
         inference_mode=inference_mode,
         layout=layout,

@@ -346,6 +346,7 @@ def fav3_sage_func(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
+    v_mean: torch.Tensor = None,
     FP8_MAX: float = 240.0,
     k_mean: torch.Tensor = None,
     softmax_scale: Optional[float] = None,
@@ -489,7 +490,8 @@ def fav3_sage_func(
         int(window_size[1]),
         attention_chunk,
         softcap,
-        False,  # rotary_interleaved
+        False, # rotary_interleaved
+        v_mean,
         None,
         1,
         None,
@@ -497,7 +499,8 @@ def fav3_sage_func(
         return_lse,
         layout,
         config,
-        sage_version=sage_version
+        sage_version=sage_version,
+   
     )
 
     return out

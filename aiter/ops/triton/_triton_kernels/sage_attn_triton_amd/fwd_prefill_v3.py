@@ -656,7 +656,7 @@ def _sage_fwd_mask_v3(
         # tl.static_print("v", v)
         # tl.static_print("v_descale", v_descale)
 
-        acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1", fast_math=True,)
+        acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1")
 
     return acc, l_i, m_i
 
@@ -670,6 +670,7 @@ def sage_fwd_v3(
     Q_Descale,
     K_Descale,
     V_Descale,
+    V_mean,
     stride_qsz,
     stride_qsh,
     stride_qsblk,
@@ -679,6 +680,8 @@ def sage_fwd_v3(
     stride_vsz,
     stride_vsh,
     stride_vsn,
+    stride_vmz,
+    stride_vmh,
     LSE,
     Out,
     SD_MASK,
@@ -907,7 +910,14 @@ def sage_fwd_v3(
         + cu_seqlens_k_start * stride_ksblk
     )
     v_descale_offset = off_z * stride_vsz + off_h_k * stride_vsh
-
+    
+    v_mean_offset = (
+        V_mean
+        + off_z * stride_vmz
+        + off_h_k * stride_vmh
+        + offs_d_v[None, :]
+    )
+    v_mean = tl.load(v_mean_offset)
     q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
 
 
@@ -1285,6 +1295,9 @@ def sage_fwd_v3(
     if PADDED_HEAD_V:
         o_ptrs_mask = o_ptrs_mask & (offs_d_o[None, :] < ACTUAL_BLOCK_DMODEL_V)
 
+    # add v_mean back
+    acc = acc.to(Out.dtype.element_ty) + v_mean
+    
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
@@ -1320,6 +1333,7 @@ def fav3_sage_triton_impl_v3(
     v_descale: Optional[torch.Tensor],
     FP8_MAX: float,
     # seqused for FA v3
+    v_mean: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     # rotary (optional)
@@ -1541,6 +1555,9 @@ def fav3_sage_triton_impl_v3(
     stride_vsz, stride_vsn, stride_vsh, _ = map_dims(
         v_descale.stride(), bshd
     )
+    # print("v_mean", v_mean.shape, v_mean.stride())
+    stride_vmz, stride_vmh, _ = v_mean.stride()
+
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
     use_alibi, (stride_az, stride_ah) = (
@@ -1616,6 +1633,7 @@ def fav3_sage_triton_impl_v3(
         q_descale,
         k_descale,
         v_descale,
+        v_mean,
         stride_qsz,
         stride_qsh,
         stride_qsblk,
@@ -1625,6 +1643,8 @@ def fav3_sage_triton_impl_v3(
         stride_vsz,
         stride_vsh,
         stride_vsn,
+        stride_vmz,
+        stride_vmh,
         softmax_lse,
         o,
         sd_mask,
@@ -1794,11 +1814,15 @@ def sage_quant_v3(
         BLK_K=BLKK,
     )
     # v = v.permute(0, 1, 3, 2) if layout == "bhsd" else v.permute(0, 2, 3, 1)
+    v_mean = v.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+    v = v - v_mean
+    
     v_fp4, v_scale = downcast_to_mxfp(v, torch.uint8, axis=-2 if layout == "bhsd" else -3)
 
     # print("v_fp4.shape:", v_fp4.shape)
+    v_mean = v_mean.squeeze(1 if layout == "bshd" else 2)
 
-    return q_int8, q_scale, k_int8, k_scale, v_fp4, v_scale
+    return q_int8, q_scale, k_int8, k_scale, v_fp4, v_scale, v_mean
 
 @triton.jit
 def sage_quant_kernel(
