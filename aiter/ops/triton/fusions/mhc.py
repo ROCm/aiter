@@ -341,9 +341,13 @@ def mhc(
     out_res: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute mHC projection mapping with all three streams (equations 14-19 from the paper).
+    Compute mHC projection mapping (iterative Sinkhorn-Knopp).
 
-    This function implements:
+    mHC (manifold-constrained Hyper Connection) implements a novel neural architecture
+    component that projects inputs through three specialized streams with manifold
+    constraints. This is the standard implementation using iterative Sinkhorn-Knopp
+    refinement. This function implements:
+    
     - Eq 14: H̃ = x̃φ (matrix multiplication)
     - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
     - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
@@ -351,32 +355,48 @@ def mhc(
     - Eq 18: H^post = 2σ(H^post) - scaled sigmoid activation for post-stream
     - Eq 19: H^res = Sinkhorn(H^res) - project residual stream onto doubly stochastic
              manifold (identity activation followed by iterative row/column normalization)
+             Uses 20 iterations by default to converge to doubly stochastic matrices.
 
-    All operations are fused in optimized Triton kernels for maximum performance.
+    CHARACTERISTICS of standard mHC:
+    - Uses phi_res with shape (nC, n²) for direct residual projection
+    - Requires iterative Sinkhorn-Knopp refinement (20+ iterations typical)
+    - Produces high-quality doubly stochastic matrices through refinement
+    - Bias vector has shape (n² + 2n,)
+    - Two-stage process: fused operations (Eq 14-18) followed by Sinkhorn (Eq 19)
+
+    Equations 14-18 are fused in optimized Triton kernels with split-reduce for large K.
+    Equation 19 (Sinkhorn-Knopp) uses iterative log-domain normalization without split-reduce.
 
     Args:
         x: Input tensor with shape (M, nC) where M is batch/sequence length and
            nC is the input feature dimension (n × C in paper notation)
         phi_pre: Pre-stream projection matrix with shape (nC, n)
         phi_post: Post-stream projection matrix with shape (nC, n)
-        phi_res: Residual stream projection matrix with shape (nC, n²)
+        phi_res: Residual stream projection matrix with shape (nC, n²) where n² is
+                 the flattened size of the n×n mixing matrix.
         alpha_pre: Scaling factor α^pre for pre-stream (first n elements)
         alpha_post: Scaling factor α^post for post-stream (next n elements)
         alpha_res: Scaling factor α^res for residual stream (last n² elements)
-        bias: Bias vector b with shape (n² + 2n,) applied after scaling
+        bias: Bias vector b with shape (n² + 2n,) applied after scaling.
+              Contains biases for all three streams concatenated.
         n: Stream parameter - hyperparameter controlling manifold dimension.
            Determines output sizes: n (pre) + n (post) + n² (res) = n² + 2n
+           Typical values: 4, 8, 16
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
-        sinkhorn_iters: Number of Sinkhorn-Knopp iterations for Eq 19 (default: 20)
+        sinkhorn_iters: Number of Sinkhorn-Knopp iterations for Eq 19 (default: 20).
+                       More iterations improve convergence to doubly stochastic.
+                       Typically 10-20 iterations suffice for good approximation.
         out_pre (Optional[torch.Tensor]): Pre-allocated output for H^pre with shape (M, n)
         out_post (Optional[torch.Tensor]): Pre-allocated output for H^post with shape (M, n)
-        out_res (Optional[torch.Tensor]): Pre-allocated output for H^res with shape (M, n²)
+        out_res (Optional[torch.Tensor]): Pre-allocated output for H^res with shape (M, n²).
+                 Note: Will be iteratively refined by Sinkhorn-Knopp to be doubly stochastic.
 
     Returns:
         Tuple of three tensors (H_pre, H_post, H_res):
         - H_pre: (M, n) - manifold projection with sigmoid activation (H^{pre} ∈ ℝ^{M×n})
         - H_post: (M, n) - post-processing with scaled sigmoid (H^{post} ∈ ℝ^{M×n})
         - H_res: (M, n²) - doubly stochastic residual connection (H^{res} ∈ ℝ^{M×n²})
+                 **DOUBLY STOCHASTIC** after Sinkhorn-Knopp refinement
 
     Shape requirements:
         - x: (M, nC) where nC = n * C (flattened streams)
@@ -389,17 +409,32 @@ def mhc(
     Example:
         >>> M, n, C = 32, 4, 1024
         >>> nC = n * C  # 4096 input features
+        >>> 
         >>> x = torch.randn(M, nC, dtype=torch.bfloat16, device='cuda')
         >>> phi_pre = torch.randn(nC, n, dtype=torch.bfloat16, device='cuda')
         >>> phi_post = torch.randn(nC, n, dtype=torch.bfloat16, device='cuda')
-        >>> phi_res = torch.randn(nC, n*n, dtype=torch.bfloat16, device='cuda')
-        >>> bias = torch.randn(n*n + 2*n, dtype=torch.float32, device='cuda')
+        >>> phi_res = torch.randn(nC, n*n, dtype=torch.bfloat16, device='cuda')  # Note: n²
+        >>> bias = torch.randn(n*n + 2*n, dtype=torch.float32, device='cuda')  # Note: n² + 2n
         >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
         >>> 
         >>> # Full mHC with Sinkhorn-Knopp (Eq 14-19)
         >>> H_pre, H_post, H_res = mhc(x, phi_pre, phi_post, phi_res, 
-        ...                            alpha_pre, alpha_post, alpha_res, bias, n)
+        ...                            alpha_pre, alpha_post, alpha_res, bias, n,
+        ...                            sinkhorn_iters=20)
         >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
+        >>> 
+        >>> # Verify H_res is doubly stochastic (rows and columns sum to 1)
+        >>> H_res_matrix = H_res.view(M, n, n)
+        >>> row_sums = H_res_matrix.sum(dim=-1)  # Should be all 1s
+        >>> col_sums = H_res_matrix.sum(dim=-2)  # Should be all 1s
+
+    Reference:
+        Paper: "mHC: Manifold-constrained Hyper Connection"
+        
+        The standard mHC approach uses iterative Sinkhorn-Knopp algorithm to project
+        the residual stream onto the Birkhoff polytope (doubly stochastic matrices).
+        This ensures stable training and preserves identity mapping properties, but
+        requires 20+ iterations for convergence. See mhc_lite for an efficient alternative.
     """
     _LOGGER.info(
         f"MHC: calling fused_mhc() then sinkhorn_knopp() with {sinkhorn_iters} iterations"
@@ -584,54 +619,109 @@ def mhc_lite(
     config: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    TRUE mHC-Lite with split-reduce optimization and integrated Sinkhorn-Knopp.
+    Compute mHC-Lite projection mapping (non-iterative Sinkhorn-Knopp).
+
+    mHC-Lite (manifold-constrained Hyper Connection Lite) is a computationally efficient 
+    variant of mHC that eliminates the need for 20+ Sinkhorn-Knopp iterations by directly 
+    computing doubly stochastic matrices through a convex combination of permutation matrices. 
+    This is the optimized implementation with single-pass doubly stochastic projection. 
+    This function implements:
     
-    Unlike standard `fused_mhc()`, this function:
-    - Accepts phi_res with shape (nC, n!) instead of (nC, n²)
-    - Fuses Sinkhorn-Knopp into the forward pass
-    - Produces H_res that is doubly stochastic by construction
-    
-    Mathematical implementation:
-        1. H̃^res = x @ phi_res  → (M, n!)
-        2. a = softmax(α^res·H̃^res + b^res) → (M, n!) normalized weights
-        3. H^res = Σ_k a_k · P_k → (M, n²) doubly stochastic
-        
-    This integrates equations 14-19 into a single forward pass with split-reduce
-    optimization for large K dimensions.
-    
+    - Eq 14: H̃ = x̃φ (matrix multiplication)
+    - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
+    - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
+    - Eq 17: H^pre = σ(H^pre) - sigmoid activation for pre-stream
+    - Eq 18: H^post = 2σ(H^post) - scaled sigmoid activation for post-stream
+    - Eq 19 (optimized, eq 4 & 5 of "mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations"): 
+             H^res = Σ_k a_k · P_k where a = softmax(α^res·H̃^res + b^res)
+             Instead of iterative Sinkhorn-Knopp, compute H^res as a weighted sum
+             of all n! permutation matrices P_k, with weights a_k from softmax. 
+             Here P is the sequence of n × n permutation matrices.
+             This produces doubly stochastic matrices by construction since any
+             convex combination of permutation matrices is doubly stochastic. 
+
+    CHARACTERISTICS of mHC-Lite:
+    - Uses phi_res with shape (nC, n!)
+    - Produces n! logits instead of n² raw elements
+    - Applies softmax to obtain convex combination weights
+    - Fuses doubly stochastic projection into forward pass (no iteration needed)
+    - Bias vector has shape (n! + 2n,) instead of (n² + 2n,)
+    - Single-pass operation: all equations 14-19 executed in one kernel launch
+
+    All operations are fused in optimized Triton kernels with split-reduce for large K.
+    Unlike mhc, there's no separate Sinkhorn-Knopp stage. The optimized 
+    Eq 19 (softmax + permutation matrix combination) is integrated into the reduce kernel.
+
     Args:
-        x: Input tensor with shape (M, nC)
-        phi_pre: Pre-stream projection with shape (nC, n)
-        phi_post: Post-stream projection with shape (nC, n)
-        phi_res: Residual stream projection with shape (nC, n!) ← KEY DIFFERENCE
-        alpha_pre: Scaling factor α^pre for pre-stream
-        alpha_post: Scaling factor α^post for post-stream
-        alpha_res: Scaling factor α^res for residual stream
-        bias: Bias vector b with shape (n! + 2n,) ← Different from standard mHC
-        n: Stream parameter (manifold dimension)
+        x: Input tensor with shape (M, nC) where M is batch/sequence length and
+           nC is the input feature dimension (n × C in paper notation)
+        phi_pre: Pre-stream projection matrix with shape (nC, n)
+        phi_post: Post-stream projection matrix with shape (nC, n)
+        phi_res: Residual stream projection matrix with shape (nC, n!) where n! is
+                 the number of permutation matrices (factorial of n).
+        alpha_pre: Scaling factor α^pre for pre-stream (first n elements)
+        alpha_post: Scaling factor α^post for post-stream (next n elements)
+        alpha_res: Scaling factor α^res for residual stream (last n! elements)
+        bias: Bias vector b with shape (n! + 2n,) applied after scaling.
+              Contains biases for all three streams concatenated.
+        n: Stream parameter - hyperparameter controlling manifold dimension.
+           Determines output sizes: n (pre) + n (post) + n² (res) = n² + 2n
+           Also determines number of permutation matrices: n!
+           Typical values: 4 (24 perms), 5 (120 perms)
         eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
-        out_pre: Optional pre-allocated output for H^pre with shape (M, n)
-        out_post: Optional pre-allocated output for H^post with shape (M, n)
-        out_res: Optional pre-allocated output for H^res with shape (M, n²)
-        config: Kernel tuning parameters
-        
+        out_pre (Optional[torch.Tensor]): Pre-allocated output for H^pre with shape (M, n)
+        out_post (Optional[torch.Tensor]): Pre-allocated output for H^post with shape (M, n)
+        out_res (Optional[torch.Tensor]): Pre-allocated output for H^res with shape (M, n²).
+                Note: Despite phi_res having n! columns, the output H^res has shape (M, n²)
+                because it's the weighted sum of n²-element permutation matrices.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_M, BLOCK_N, BLOCK_K, NUM_KSPLIT).
+                                If None, automatically loaded from configuration files.
+
     Returns:
         Tuple of three tensors (H_pre, H_post, H_res):
-        - H_pre: (M, n) - pre-stream with sigmoid activation
-        - H_post: (M, n) - post-stream with scaled sigmoid
-        - H_res: (M, n²) - residual stream (DOUBLY STOCHASTIC by construction)
-        
+        - H_pre: (M, n) - manifold projection with sigmoid activation (H^{pre} ∈ ℝ^{M×n})
+        - H_post: (M, n) - post-processing with scaled sigmoid (H^{post} ∈ ℝ^{M×n})
+        - H_res: (M, n²) - doubly stochastic residual connection (H^{res} ∈ ℝ^{M×n²})
+                 **GUARANTEED DOUBLY STOCHASTIC** by construction (no iterations needed)
+
     Shape requirements:
-        - x: (M, nC)
+        - x: (M, nC) where nC = n * C (flattened streams)
         - phi_pre: (nC, n)
         - phi_post: (nC, n)
-        - phi_res: (nC, n!) ← Not (nC, n²)!
-        - bias: (n! + 2n,) ← Not (n² + 2n)!
+        - phi_res: (nC, n!)
+        - bias: (n! + 2n,)
         - outputs: H_pre (M, n), H_post (M, n), H_res (M, n²)
-    
+
+    Example:
+        >>> M, n, C = 32, 4, 1024
+        >>> nC = n * C  # 4096 input features
+        >>> n_factorial = math.factorial(n)  # 24 for n=4
+        >>> 
+        >>> x = torch.randn(M, nC, dtype=torch.bfloat16, device='cuda')
+        >>> phi_pre = torch.randn(nC, n, dtype=torch.bfloat16, device='cuda')
+        >>> phi_post = torch.randn(nC, n, dtype=torch.bfloat16, device='cuda')
+        >>> phi_res = torch.randn(nC, n_factorial, dtype=torch.bfloat16, device='cuda')  # Note: n! not n²
+        >>> bias = torch.randn(n_factorial + 2*n, dtype=torch.float32, device='cuda')  # Note: n! + 2n
+        >>> alpha_pre, alpha_post, alpha_res = 1.0, 1.5, 0.8
+        >>> 
+        >>> # mHC-Lite: Single forward pass, no Sinkhorn iterations needed!
+        >>> H_pre, H_post, H_res = mhc_lite(x, phi_pre, phi_post, phi_res, 
+        ...                                  alpha_pre, alpha_post, alpha_res, bias, n)
+        >>> H_pre.shape, H_post.shape, H_res.shape  # (32, 4), (32, 4), (32, 16)
+        >>> 
+        >>> # Verify H_res is doubly stochastic (rows and columns sum to 1)
+        >>> H_res_matrix = H_res.view(M, n, n)
+        >>> row_sums = H_res_matrix.sum(dim=-1)  # Should be all 1s
+        >>> col_sums = H_res_matrix.sum(dim=-2)  # Should be all 1s
+
     Reference:
-        "mHC-lite: You Don't Need 20 Sinkhorn-Knopp Iterations"
-        https://arxiv.org/abs/2601.05732
+        Paper: "mHC-Lite: You Don't Need 20 Sinkhorn-Knopp Iterations"
+        arXiv: https://arxiv.org/abs/2601.05732
+        
+        The key insight: Any convex combination of permutation matrices is doubly
+        stochastic. By projecting to n! logits, applying softmax (which gives convex
+        weights), and computing H^res = Σ_k softmax(logits)_k · P_k, we obtain a
+        doubly stochastic matrix without any iterative refinement.
     """
     # Input validation
     M, K = x.shape
