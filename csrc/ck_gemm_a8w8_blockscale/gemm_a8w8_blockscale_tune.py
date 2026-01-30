@@ -403,6 +403,7 @@ if __name__ == "__main__":
         "libtype",
         "kernelId",
         "preshuffleB",
+        "preshuffleQuant",
         "splitK",
         "us",
         "kernelName",

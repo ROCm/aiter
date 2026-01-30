@@ -49,14 +49,14 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16, preshuffleB=True):
+def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16, preshuffleB=True, preshuffleQuant=False):
     return aiter.gemm_a8w8_blockscale(
-        x, weight, x_scale, w_scale, dtype, preshuffleB=preshuffleB
+        x, weight, x_scale, w_scale, dtype, preshuffleB=preshuffleB, preshuffleQuant=preshuffleQuant
     )
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True):
+def test_gemm(dtype, m, n, k, ck_preshuffle=True, ck_preshuffle_quant=False):
     ret = {}
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
@@ -69,8 +69,12 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
+    # run_func = run_gemm_ck if ck_preshuffle else run_gemm_ck
+    # b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+
+
     b, avg_b = run_gemm_ck(
-        x, weight, x_scale, w_scale, dtype, preshuffleB=ck_preshuffle
+        x, weight, x_scale, w_scale, dtype, preshuffleB=ck_preshuffle, preshuffleQuant=ck_preshuffle_quant
     )
 
     err_ck = checkAllclose(a, b, msg="ck")
@@ -145,60 +149,10 @@ parser.add_argument(
     choices=[
         1,
         2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        288,
-        320,
-        352,
-        384,
-        416,
-        448,
-        480,
-        512,
-        1024,
-        2048,
-        4096,
-        6144,
-        8192,
-        10240,
     ],
     default=[
         1,
         2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        288,
-        320,
-        352,
-        384,
-        416,
-        448,
-        480,
-        512,
-        1024,
-        2048,
-        4096,
-        6144,
-        8192,
-        10240,
     ],
     help="""M of mnk.
     e.g.: -m 32""",
@@ -232,6 +186,16 @@ parser.add_argument(
         or --ck_preshuffle False
     """,
 )
+parser.add_argument(
+    "--ck_preshuffle_quant",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""weight scale quant or not.
+    e.g.: --ck_preshuffle_quant True
+        or --ck_preshuffle_quant False
+    """,
+)
 
 args = parser.parse_args()
 
@@ -241,8 +205,13 @@ for dtype in args.dtype:
     for m in args.m:
         for n, k in args.nk:
             for ck_p in args.ck_preshuffle:
-                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
-                df.append(ret)
+                if not ck_p:  # if ck_preshuffle is False, test both ck_preshuffle_quant True and False
+                    for ck_pq in args.ck_preshuffle_quant:
+                        ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p, ck_preshuffle_quant=ck_pq)
+                        df.append(ret)
+                else:
+                    ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p, ck_preshuffle_quant=False)
+                    df.append(ret)
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation

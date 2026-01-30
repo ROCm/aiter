@@ -23,8 +23,53 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_ = x_.contiguous()
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
-    x_.is_shuffled = True
+    x_.is_shuffled = True,
     return x_
+
+#def shuffle_weight_scale_cktile(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
+def shuffle_weight_scale_cktile(x: torch.Tensor, block_bq_k: int) -> torch.Tensor:    
+    """    
+    Shuffle tensor for block quantization.        
+    For 2D tensor [bqk, n]: permutes to interleave bqk dimension blocks    
+    For 5D tensor [n, nrepeat, nwarp, n_warp_tile, bqk]: permutes for TilePermuteN        
+    
+    Args:        
+        x: Input tensor of rank 2 or 5        
+        block_bq_k: Block size for bqk dimension            
+        
+    Returns:        
+        Shuffled tensor with same shape as input    
+    """    
+    rank = x.dim()        
+    
+    # if rank == 5:        
+    #     # Handle 5D tensor: [n, nrepeat, nwarp, n_warp_tile, bqk]        
+    #     n, nrepeat, nwarp, n_warp_tile, bqk = x.shape        
+    #     assert bqk % block_bq_k == 0, \            
+    #         f"shuffle_bq needs bqk dimension ({bqk}) to be a multiple of block_bq_k ({block_bq_k})"                
+        
+    #     # View as [n, nrepeat, nwarp, n_warp_tile, bqk/block_bq_k, block_bq_k]        
+    #     x_ = x.view(n, nrepeat, nwarp, n_warp_tile, bqk // block_bq_k, block_bq_k)        
+    #     # Permute {4, 0, 1, 2, 3, 5} → [bqk/block_bq_k, n, nrepeat, nwarp, n_warp_tile, block_bq_k]        
+    #     x_ = x_.permute(4, 0, 1, 2, 3, 5).contiguous()        
+    #     # View back to original shape        
+    #     return x_.view(*x.shape)            
+        
+    # elif rank == 2:        
+    # Handle 2D tensor: [bqk, n]        
+    bqk, n_ = x.shape        
+    assert bqk % block_bq_k == 0, \            
+        f"shuffle_bq needs bqk dimension ({bqk}) to be a multiple of block_bq_k ({block_bq_k})"                
+        
+    # View as [n, bqk/block_bq_k, block_bq_k] - matches C++ t_view layout        
+    x_ = x.view(n_, bqk // block_bq_k, block_bq_k)        
+    # Permute {1, 0, 2} → [bqk/block_bq_k, n, block_bq_k]        
+    x_ = x_.permute(1, 0, 2).contiguous()        
+    # View back to original shape        
+    return x_.view(*x.shape)            
+        
+    # else:        
+    #     raise ValueError(f"shuffle_bq expects either rank-2 or rank-5 tensor, got rank {rank}")
 
 
 def shuffle_weight_NK(

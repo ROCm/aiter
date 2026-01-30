@@ -92,7 +92,8 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                                           torch::Tensor& x_scale,
                                           torch::Tensor& w_scale,
                                           torch::Tensor& Y,
-                                          bool preshuffleB)
+                                          bool preshuffleB,
+                                          bool preshuffleQuant)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -104,12 +105,12 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
         blockscale_dispatch<TILE_FP32, TILE_FP16>(M, N, K)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuant);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
         blockscale_dispatch<TILE_FP32, TILE_BF16>(M, N, K)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuant);
     }
     else
     {

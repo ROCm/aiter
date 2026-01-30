@@ -165,6 +165,7 @@ def gemm_a8w8_blockscale_cktile(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     preshuffleB: bool = True,
+    preshuffleQuant: bool = False, #TODO: not sure about this
 ) -> torch.Tensor: ...
 
 
@@ -532,6 +533,7 @@ def gemm_a8w8_blockscale_fake(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     preshuffleB=False,
+    preshuffleQuant=False,
 ) -> torch.Tensor:
     m = XQ.shape[0]
     n = WQ.shape[0]
@@ -547,6 +549,7 @@ def gemm_a8w8_blockscale(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     preshuffleB: bool = False,
+    preshuffleQuant: bool = False,
     is_default_cktile: bool = False,
 ) -> torch.Tensor:
     assert dtype in [
@@ -559,6 +562,7 @@ def gemm_a8w8_blockscale(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     from aiter.jit.utils.chip_info import get_gfx
 
+    #TODO: not sure about preshuffleQuant
     # give the priority to gfx950 asm when possible
     if (
         preshuffleB
@@ -569,23 +573,27 @@ def gemm_a8w8_blockscale(
     ):
         return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
 
+    #TODO:: what changes needs to be done to config file for preshuffleQuant?
     # Get tuned config for gemm_a8w8_blockscale
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
 
-    # Helper functions for kernel calls based on preshuffleB parameter
-    def call_cktile(preshuffle: bool) -> torch.Tensor:
+    # Helper functions for kernel calls based on preshuffleB and preshuffleQuant parameters
+    def call_cktile(preshuffle: bool, preshuffle_quant: bool) -> torch.Tensor:
         return gemm_a8w8_blockscale_cktile(
             XQ,
             shuffle_weight_cktile(WQ, layout=(16, 16)) if preshuffle else WQ,
             x_scale,
-            w_scale,
+            shuffle_weight_scale_cktile(w_scale, block_bq_k=2) if preshuffle_quant else w_scale, #TODO:: how to pass block_bq_k = block_tile/groupsize_k
             Y,
             preshuffle,
+            preshuffle_quant,
         )
 
+
     def call_ck(preshuffle: bool) -> torch.Tensor:
+        # TODO: call_ck does not support preshuffleQuant, so should it just go to else ?
         if preshuffle:
             return gemm_a8w8_blockscale_bpreshuffle_ck(
                 XQ,
@@ -595,7 +603,7 @@ def gemm_a8w8_blockscale(
                 Y,
             )
         else:
-            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y) 
 
     # Determine which kernel library to use (cktile or ck)
     use_cktile = config is not None and config["libtype"] == "cktile"
@@ -607,22 +615,29 @@ def gemm_a8w8_blockscale(
         config_preshuffle = config["preshuffleB"]
         if isinstance(config_preshuffle, str):
             config_preshuffle = config_preshuffle.lower() == "true"
+
+        # Parse config preshuffleQuant if available
+        config_preshuffle_quant = config.get("preshuffleQuant", False)
+        if isinstance(config_preshuffle_quant, str):
+            config_preshuffle_quant = config_preshuffle_quant.lower() == "true"
     else:
         config_preshuffle = preshuffleB
-
-    # Use config's preshuffleB if config matches, otherwise use requested preshuffleB
-    effective_preshuffle = (
-        config_preshuffle
-        if (config is None or config_preshuffle == preshuffleB)
-        else preshuffleB
-    ) 
+        config_preshuffle_quant = preshuffleQuant
     
-    # Call the appropriate kernel based on the library type and preshuffle setting
-    return (
-        call_cktile(effective_preshuffle)
-        if use_cktile
-        else call_ck(effective_preshuffle)
-    )
+    # Enforce constraint: preshuffleB and preshuffleQuant can't both be true
+    if config_preshuffle and config_preshuffle_quant:
+        # preshuffleB takes priority, disable preshuffleQuant
+        config_preshuffle_quant = False
+
+    # If preshuffleQuant is requested, we must use cktile (ck doesn't support it)
+    if config_preshuffle_quant:
+        use_cktile = True
+
+    # Call the appropriate kernel based on the library type and preshuffle settings
+    if use_cktile:
+        return call_cktile(config_preshuffle, config_preshuffle_quant)
+    else:
+        return call_ck(config_preshuffle)
 
 
 def flatmm_a8w8_blockscale_ASM(
@@ -758,6 +773,7 @@ def gemm_a8w8_blockscale_cktile_tune(
     kernelId: int = 0,
     splitK: int = 0,
     preshuffleB: bool = True,
+    preshuffleQuant: bool = False, #TODO: not sure about this
 ) -> torch.Tensor: ...
 
 
