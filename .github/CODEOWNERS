@@ -5,6 +5,8 @@
 # the repo
 * @ROCm/TEAM_AITER
 
+/.github/CODEOWNERS @valarLip @coderfeli @vgokhale @azaidy
+
 # Triton files/bench/tests
 /aiter/ops/triton/ @ROCm/Triton_Kernels_Team
 /op_tests/triton_tests/ @ROCm/Triton_Kernels_Team
