@@ -1278,6 +1278,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     }
                 }
             }
+            kv_manager.template async_load_k_tile<0, kIsLastIter, kCheckBoundaryNext>(
+                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // GEMM on NoPE
             ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}([&](auto idx) {
@@ -1313,6 +1315,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
             });
 
+            kv_manager.template async_load_k_tile<64, kIsLastIter, kCheckBoundaryNext>(
+                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+
             // GEMM on RoPE
             ckt::static_for<k_q_rope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
                 using q_range_0 =
@@ -1341,21 +1346,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             });
             __builtin_amdgcn_s_setprio(2);
 
-            // Start loading KV for next iteration
-            kv_manager.template async_load_k_tile<0, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
-            kv_manager.template async_load_k_tile<64, kIsLastIter, kCheckBoundaryNext>(
+            kv_manager.template async_load_k_tile<128, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             float rescale;
             softmax_p0<kIsFirstIter, kCheckBoundary, k_p_comp_begin>(
                 &row_max, &rescale, kv_tile_start, kv_end, params.softmax_scale);
-            kv_manager.template async_load_k_tile<128, kIsLastIter, kCheckBoundaryNext>(
+            kv_manager.template async_load_k_tile<192, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
             softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
             __builtin_amdgcn_s_setprio(1);
 
-            kv_manager.template async_load_k_tile<192, kIsLastIter, kCheckBoundaryNext>(
+            kv_manager.template async_load_k_tile<256, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             if constexpr(kIsFirstIter == false)
@@ -1365,7 +1367,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
             __builtin_amdgcn_s_setprio(0);
 
-            kv_manager.template async_load_k_tile<256, kIsLastIter, kCheckBoundaryNext>(
+            kv_manager.template async_load_k_tile<320, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // Convert p from comp_t to kv_t
@@ -1389,7 +1391,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             kv_manager.load_v_to_gpr(&v, p_lds_kv_curr);
             asm volatile("s_waitcnt lgkmcnt(0)");
 
-            kv_manager.template async_load_k_tile<320, kIsLastIter, kCheckBoundaryNext>(
+            kv_manager.template async_load_k_tile<384, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             transpose_v(&v);
@@ -1398,7 +1400,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
-            kv_manager.template async_load_k_tile<384, kIsLastIter, kCheckBoundaryNext>(
+            kv_manager.template async_load_k_tile<448, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
@@ -1455,11 +1457,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 else
                 {
                     if constexpr(idx.value == 1)
-                    {
-                        kv_manager.template async_load_k_tile<448, kIsLastIter, kCheckBoundaryNext>(
-                            p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
-                    }
-                    else if constexpr(idx.value == 3)
                     {
                         kv_manager.template async_load_k_tile<512, kIsLastIter, kCheckBoundaryNext>(
                             p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
