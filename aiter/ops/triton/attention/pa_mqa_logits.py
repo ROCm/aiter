@@ -56,7 +56,9 @@ if triton_version >= Version("3.5.0"):
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
     )
 
-    enable_gluon_pa_mqa_logits = True
+    gluon_pa_mqa_logits_supported_arch = {"gfx940", "gfx941", "gfx942"}
+    gfx_version = get_gfx()
+    enable_gluon_pa_mqa_logits = gfx_version in gluon_pa_mqa_logits_supported_arch
     enable_jit_gluon_pa_mqa_logits_kernel = not enable_aot_gluon_pa_mqa_logits
 else:
     from triton.compiler import ASTSource
