@@ -1258,23 +1258,23 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 row_kv_ld_next     = row_kv_ld_next_next;
             }
 
-            if constexpr(kIsLastIter == false)
+            if constexpr((kIsLastIter == false) && (kCheckBoundaryNext == false))
             {
                 if((kv_tile_start + 2 * T::kBlockN) < kv_end)
                 {
-                    if constexpr(kCheckBoundaryNext)
-                    {
-                        row_kv_ld_next_next = get_kv_ld_row<true>(params.p_kv_indices,
-                                                                  kv_ld_row_base_idx,
-                                                                  kv_tile_start + 2 * T::kBlockN,
-                                                                  kv_end);
-                    }
-                    else
+                    if((kv_tile_start + 3 * T::kBlockN) <= kv_end)
                     {
                         row_kv_ld_next_next = get_kv_ld_row<false>(params.p_kv_indices,
                                                                    kv_ld_row_base_idx,
                                                                    kv_tile_start + 2 * T::kBlockN,
                                                                    kv_tile_end + 2 * T::kBlockN);
+                    }
+                    else
+                    {
+                        row_kv_ld_next_next = get_kv_ld_row<true>(params.p_kv_indices,
+                                                                  kv_ld_row_base_idx,
+                                                                  kv_tile_start + 2 * T::kBlockN,
+                                                                  kv_end);
                     }
                 }
             }
