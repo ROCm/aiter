@@ -53,6 +53,98 @@ def get_vector_size(dtype) -> int:
     return 16 // torch.tensor([], dtype=dtype).element_size()
 
 
+def get_rocm_version():
+    """
+    Get ROCm version from PyTorch.
+
+    Returns:
+        tuple (major, minor) or None if not using ROCm
+
+    Example:
+        >>> get_rocm_version()
+        (7, 2)  # ROCm 7.2
+    """
+    if not torch.version.hip:
+        return None
+
+    try:
+        # torch.version.hip returns string like "6.2.41133" or "6.2.41133-rocm6.2.2"
+        hip_version = torch.version.hip
+        parts = hip_version.split(".")
+        if len(parts) >= 2:
+            return (int(parts[0]), int(parts[1]))
+    except (ValueError, AttributeError):
+        pass
+
+    return None
+
+
+def get_gpu_arch():
+    """
+    Get GPU architecture (gcnArchName).
+
+    Returns:
+        str like "gfx942", "gfx950", etc., or None if cannot determine
+
+    Example:
+        >>> get_gpu_arch()
+        "gfx950"
+    """
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        # Get device properties
+        props = torch.cuda.get_device_properties(0)
+        # gcnArchName property contains architecture like "gfx942:sramecc+:xnack-"
+        if hasattr(props, "gcnArchName"):
+            arch_name = props.gcnArchName
+            # Extract base architecture (e.g., "gfx950" from "gfx950:sramecc+:xnack-")
+            if ":" in arch_name:
+                return arch_name.split(":")[0]
+            return arch_name
+    except (AttributeError, RuntimeError):
+        pass
+
+    return None
+
+
+def should_skip_rocm72_issue(causal, logits_soft_cap):
+    """
+    Check if test should be skipped due to ROCm 7.2 + gfx950 compiler issue.
+
+    FIXME: ROCm 7.2 on gfx950 has a compiler bug with causal=True + logits_soft_cap=0.0
+    configuration. This workaround should be removed once the compiler is fixed.
+
+    Args:
+        causal: Whether causal masking is enabled
+        logits_soft_cap: Soft cap value for logits
+
+    Returns:
+        True if test should be skipped on current ROCm version + GPU architecture
+    """
+    # Only check if the problematic configuration is used
+    if not (causal and logits_soft_cap == 0.0):
+        return False
+
+    # Check ROCm version
+    rocm_version = get_rocm_version()
+    if rocm_version is None:
+        return False  # Not ROCm, no need to skip
+
+    # Check GPU architecture
+    gpu_arch = get_gpu_arch()
+    if gpu_arch is None:
+        return False  # Cannot determine GPU, no need to skip
+
+    # Only skip on ROCm 7.2.x + gfx950
+    major, minor = rocm_version
+    if (major, minor) == (7, 2) and gpu_arch == "gfx950":
+        return True
+
+    return False
+
+
 def check_common_skip_conditions(
     is_input_fp8: bool,
     dtype,
@@ -501,6 +593,12 @@ def test_batch_prefill_page_size_1_linear_sglang(
     ):
         return
 
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
     # Build test tensors
     qo_lens = build_qo_lens(batch_size, qo_len, randomize=True)
     q_indptr_cpu = convert_lens_to_indptr(qo_lens)
@@ -734,6 +832,12 @@ def test_batch_prefill(
         k_vector_size_fp8,
         is_input_fp8,
         contiguous_kv,
+    ):
+        return {"status": "skipped"}
+
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
     ):
         return {"status": "skipped"}
 
@@ -1463,6 +1567,12 @@ def test_batch_prefill_kv_blockscale_pytest(
     logits_soft_cap,
 ):
     """Pytest wrapper for KV_BLOCKSCALE test."""
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
     run_batch_prefill_kv_blockscale(
         kvcache_layout="linear",
         table_layout=table_layout,
@@ -1517,6 +1627,12 @@ def run_batch_prefill_kv_blockscale(
     if skip_test_if(
         causal and kv_len < qo_len,
         "kv_len < qo_len is not allowed if causal=True",
+    ):
+        return {"status": "skipped"}
+
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
     ):
         return {"status": "skipped"}
 
