@@ -7,6 +7,7 @@ This module contains essential runtime utilities:
 - Tensor shape/stride helpers
 - FP8 type detection
 """
+
 import functools
 import os
 from dataclasses import dataclass
@@ -14,7 +15,6 @@ from typing import Literal, Optional, Union
 
 import torch
 import triton
-
 
 __all__ = [
     # Runtime info
@@ -46,7 +46,9 @@ __all__ = [
 ArchFamily = Literal["cdna", "rdna"]
 
 CDNA_ARCHS = frozenset({"gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx950"})
-RDNA_ARCHS = frozenset({"gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"})
+RDNA_ARCHS = frozenset(
+    {"gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"}
+)
 FP8_ARCHS = frozenset({"gfx942", "gfx950"})
 
 _RECOMMENDED_FP8_REPLACEMENTS: dict[str, dict[torch.dtype, torch.dtype]] = {
@@ -60,6 +62,7 @@ _RECOMMENDED_FP8_REPLACEMENTS: dict[str, dict[torch.dtype, torch.dtype]] = {
 @dataclass(frozen=True)
 class GpuArch:
     """GPU architecture information."""
+
     name: str  # e.g., "gfx942", "gfx1100"
     family: Optional[ArchFamily] = None
 
@@ -78,7 +81,7 @@ class GpuArch:
 
     def recommended_fp8_dtype(self, dtype: torch.dtype) -> torch.dtype:
         """Get the recommended FP8 dtype for this architecture.
-        
+
         Some architectures prefer different FP8 variants (e.g., fnuz vs fn).
         Returns the input dtype unchanged if no replacement is recommended.
         """
@@ -125,12 +128,14 @@ SHAPE_EXPECTATIONS: Literal["exact", "rounded"] = "exact"
 # -------------------------------
 # FP8
 # -------------------------------
-_FP8_DTYPES = frozenset({
-    torch.float8_e4m3fnuz,
-    torch.float8_e4m3fn,
-    torch.float8_e5m2,
-    torch.float8_e5m2fnuz,
-})
+_FP8_DTYPES = frozenset(
+    {
+        torch.float8_e4m3fnuz,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    }
+)
 
 
 def is_fp8(

@@ -1,7 +1,5 @@
-import os
-import warnings
 import torch
-from typing import Literal, Optional, Union, Tuple
+from typing import Literal, Optional, Tuple
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
@@ -46,7 +44,7 @@ def fwd(
     attention_chunk: int,
     softcap: float,
     rotary_interleaved: bool,
-    scheduler_metadata: None = None,
+    scheduler_metadata: Optional[torch.Tensor] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
@@ -69,7 +67,10 @@ def fwd(
         print("out:", out.shape if out is not None else None)
         print("cu_seqlens_q:", cu_seqlens_q.shape if cu_seqlens_q is not None else None)
         print("cu_seqlens_k:", cu_seqlens_k.shape if cu_seqlens_k is not None else None)
-        print("cu_seqlens_k_new:", cu_seqlens_k_new.shape if cu_seqlens_k_new is not None else None)
+        print(
+            "cu_seqlens_k_new:",
+            cu_seqlens_k_new.shape if cu_seqlens_k_new is not None else None,
+        )
         print("seqused_q:", seqused_q.shape if seqused_q is not None else None)
         print("seqused_k:", seqused_k.shape if seqused_k is not None else None)
         print("max_seqlen_q:", max_seqlen_q)
@@ -79,7 +80,10 @@ def fwd(
         print("leftpad_k:", leftpad_k.shape if leftpad_k is not None else None)
         print("rotary_cos:", rotary_cos.shape if rotary_cos is not None else None)
         print("rotary_sin:", rotary_sin.shape if rotary_sin is not None else None)
-        print("seqlens_rotary:", seqlens_rotary.shape if seqlens_rotary is not None else None)
+        print(
+            "seqlens_rotary:",
+            seqlens_rotary.shape if seqlens_rotary is not None else None,
+        )
         print("q_descale:", q_descale.shape if q_descale is not None else None)
         print("k_descale:", k_descale.shape if k_descale is not None else None)
         print("v_descale:", v_descale.shape if v_descale is not None else None)
@@ -161,7 +165,9 @@ def fwd(
         max_seqlens_q_local = max_seqlen_q
         if cu_seqlens_k is not None:
             cu_seqlens_k_local = cu_seqlens_k
-            assert max_seqlen_k is not None, "max_seqlen_k required when cu_seqlens_k provided"
+            assert (
+                max_seqlen_k is not None
+            ), "max_seqlen_k required when cu_seqlens_k provided"
             max_seqlens_k_local = max_seqlen_k
         else:
             cu_seqlens_k_local = None
@@ -418,11 +424,22 @@ def bwd(
     softcap: float,
     deterministic: bool,
     sm_margin: int = 0,
+    *,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor]:
     """
     Flash Attention v3 backward pass compatible interface for AMD Triton implementation.
 
     This function maps v3 parameters to the existing AMD Triton implementation.
+    Gradients are written in-place to dq, dk, dv if provided (or allocated internally).
+    Returns (delta,) matching the upstream FA3 API.
+
+    Args:
+        q_descale: Optional descale tensor for FP8 query (batch, nheads_k)
+        k_descale: Optional descale tensor for FP8 key (batch, nheads_k)
+        v_descale: Optional descale tensor for FP8 value (batch, nheads_k)
     """
 
     if DEBUG:
@@ -481,7 +498,7 @@ def bwd(
     dk = torch.zeros_like(k, dtype=grad_dtype) if dk is None else dk.zero_()
     dv = torch.zeros_like(v, dtype=grad_dtype) if dv is None else dv.zero_()
 
-    # Determine layout based on cu_seqlens
+    # Determine layout and set max sequence lengths
     layout: Literal["bshd", "bhsd", "thd"]
     if cu_seqlens_q is not None and cu_seqlens_k is not None:
         # Variable length sequence mode
@@ -494,12 +511,14 @@ def bwd(
         # Regular batch mode
         layout = "bshd"
         batch, seqlen_q, nheads_q, _ = q.shape
-        max_seqlen_q = q.shape[1] if max_seqlen_q is None else max_seqlen_q
-        max_seqlen_k = k.shape[1] if max_seqlen_k is None else max_seqlen_k
         # Create delta tensor - bshd: (B, Hq, Sq)
         delta = torch.zeros(
             (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
         )
+
+    # Set max sequence lengths (infer from tensor shapes if not provided)
+    max_seqlen_q = q.shape[1] if max_seqlen_q is None else max_seqlen_q
+    max_seqlen_k = k.shape[1] if max_seqlen_k is None else max_seqlen_k
 
     # V3 backward doesn't have dropout or alibi slopes
     dropout_p = 0.0
@@ -535,6 +554,9 @@ def bwd(
         philox_offset=philox_offset,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
 
     if DEBUG:
@@ -564,8 +586,8 @@ def bwd(
         delta.shape == expected_delta_shape
     ), f"[bwd_v3] delta shape {delta.shape} != {expected_delta_shape}"
 
-    # V3 expects (softmax_d, *rest)
-    # delta is the softmax_d in this case
+    # Return only delta to match upstream FA3 API
+    # dq, dk, dv are mutated in-place by attention_backward_triton_impl
     return (delta,)
 
 
@@ -574,7 +596,7 @@ def fwd_combine(
     lse_partial: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-) -> "torch.Tensor":
+) -> torch.Tensor:
     """
     Combine partial outputs from split attention computation.
 

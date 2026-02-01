@@ -1,5 +1,4 @@
 import torch
-import os
 from typing import Literal, Optional, Union
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
@@ -58,9 +57,9 @@ def fwd(
         print("window_size_right:", window_size_right)
         print("softcap:", softcap)
         print("return_softmax:", return_softmax)
-    
+
     if out is None:
-        out = torch.zeros_like(q) 
+        out = torch.zeros_like(q)
     else:
         out.zero_()
 
@@ -744,8 +743,8 @@ def fwd_kvcache(
 
     # Basic layout info for decode path
     layout: Literal["bshd"] = "bshd"
-    max_seqlen_q = q.shape[1]
-    max_seqlen_k = k_cache.shape[1]
+    q.shape[1]
+    k_cache.shape[1]
     cache_seqlens_tensor = (
         torch.tensor(cache_seqlens, device=q.device)
         if isinstance(cache_seqlens, int)

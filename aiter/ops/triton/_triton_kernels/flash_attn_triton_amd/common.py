@@ -2,9 +2,10 @@
 Triton kernel helper functions shared across flash attention modules.
 
 This module contains Triton JIT-compiled helper functions that are used within
-the main attention kernels (fwd_prefill, fwd_decode, bwd). These are kept 
+the main attention kernels (fwd_prefill, fwd_decode, bwd). These are kept
 separate from utils.py to allow stricter type checking on pure Python utilities.
 """
+
 from typing import Literal, Optional, Tuple, Union
 
 import torch
@@ -20,8 +21,8 @@ def compute_alibi_block(
 ):
     """
     Compute ALiBi (Attention with Linear Biases) block.
-    
-    When seqlen_k and seqlen_q are different, the diagonal sticks to the 
+
+    When seqlen_k and seqlen_q are different, the diagonal sticks to the
     bottom right of the attention matrix.
     """
     # e.g. alibi_slope = 1, seqlen_q = 2, seqlen_k = 5
@@ -305,8 +306,12 @@ def cast_to_fp8(
     )
     BLOCK_SIZE = 128
 
-    stride_batch, stride_head, stride_seq, stride_dim = get_stride_from_layout(x, layout)
-    stride_out_batch, stride_out_head, stride_out_seq, stride_out_dim = get_stride_from_layout(x_fp8, layout)
+    stride_batch, stride_head, stride_seq, stride_dim = get_stride_from_layout(
+        x, layout
+    )
+    stride_out_batch, stride_out_head, stride_out_seq, stride_out_dim = (
+        get_stride_from_layout(x_fp8, layout)
+    )
     stride_desc_batch, stride_desc_head = descale_factors.stride()
 
     grid = (batch, num_heads)
@@ -354,7 +359,9 @@ def _apply_rotary_kernel(
     if not is_varlen:
         batch, seqlen, nheads, headdim = x.shape
     else:
-        assert max_seqlen is not None, "If cu_seqlens is passed, max_seqlen must also be provided"
+        assert (
+            max_seqlen is not None
+        ), "If cu_seqlens is passed, max_seqlen must also be provided"
         total_seqlen, nheads, headdim = x.shape
         assert cu_seqlens is not None
         batch_p_1 = cu_seqlens.shape[0]
@@ -452,7 +459,9 @@ class _ApplyRotary(torch.autograd.Function):
         return out if not inplace else x
 
     @staticmethod
-    def backward(ctx, do: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
+    def backward(
+        ctx, do: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
         seqlen_offsets = ctx.seqlen_offsets
         if seqlen_offsets is None:
             cos, sin, cu_seqlens, seqlen_offsets = ctx.saved_tensors
@@ -494,7 +503,7 @@ def apply_rotary_emb(
         max_seqlen: required when `cu_seqlens` is provided.
     """
     original_dtype = x.dtype
-    is_fp8_input = original_dtype == getattr(torch, "float8_e4m3fn", None)
+    is_fp8_input = is_fp8(original_dtype)
     if is_fp8_input:
         target_dtype = (
             torch.bfloat16
@@ -505,7 +514,14 @@ def apply_rotary_emb(
         cos_up = cos.to(target_dtype) if cos.dtype != target_dtype else cos
         sin_up = sin.to(target_dtype) if sin.dtype != target_dtype else sin
         out_up = _ApplyRotary.apply(
-            x_up, cos_up, sin_up, interleaved, False, seqlen_offsets, cu_seqlens, max_seqlen
+            x_up,
+            cos_up,
+            sin_up,
+            interleaved,
+            False,
+            seqlen_offsets,
+            cu_seqlens,
+            max_seqlen,
         )
         if inplace:
             x.copy_(out_up.to(original_dtype))
@@ -541,11 +557,17 @@ def apply_rotary(
 
     if use_flatten:
         q_flat = q.reshape(B, S * H, D).unsqueeze(1)
-        q_flat = apply_rotary_emb(q_flat, cos, sin, interleaved=interleaved, seqlen_offsets=seqlen_offsets)
+        q_flat = apply_rotary_emb(
+            q_flat, cos, sin, interleaved=interleaved, seqlen_offsets=seqlen_offsets
+        )
         q = q_flat.view(B, 1, S * H, D).reshape(B, S, H, D)
     else:
-        q = apply_rotary_emb(q, cos, sin, interleaved=interleaved, seqlen_offsets=seqlen_offsets)
+        q = apply_rotary_emb(
+            q, cos, sin, interleaved=interleaved, seqlen_offsets=seqlen_offsets
+        )
 
     if k_new is not None:
-        k_new = apply_rotary_emb(k_new, cos, sin, interleaved=interleaved, seqlen_offsets=seqlen_offsets)
+        k_new = apply_rotary_emb(
+            k_new, cos, sin, interleaved=interleaved, seqlen_offsets=seqlen_offsets
+        )
     return q, k_new

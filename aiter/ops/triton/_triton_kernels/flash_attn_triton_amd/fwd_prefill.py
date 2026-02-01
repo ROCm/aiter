@@ -1,4 +1,3 @@
-import os
 import warnings
 import torch
 import triton
@@ -11,8 +10,6 @@ from .utils import (
     get_arch,
     is_fp8,
 )
-
-
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
     "IS_CAUSAL",
@@ -192,7 +189,7 @@ def _attn_fwd_inner(
 ):
     """
     Unified attention forward inner loop.
-    
+
     APPLY_MASK controls whether causal/window masking is applied:
     - False: Fast path for full blocks (no masking overhead)
     - True: Masked path with causal/window masking support
@@ -210,7 +207,7 @@ def _attn_fwd_inner(
         v_ptrs = v_base_ptrs + start_n * stride_vk
 
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
-        
+
         # Load K - different masking for APPLY_MASK vs non-masked
         if APPLY_MASK:
             # For masked blocks, check seqlen bounds
@@ -282,7 +279,9 @@ def _attn_fwd_inner(
                         )
                     else:
                         left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
-                        right_bound = row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
+                        right_bound = (
+                            row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
+                        )
                         window_mask = (col_idx_expanded < left_bound) | (
                             col_idx_expanded > right_bound
                         )
@@ -347,8 +346,12 @@ def _attn_fwd_inner(
         if ENABLE_DROPOUT:
             # Compute pointers for this block
             philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-            philox_ptrs = philox_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            
+            philox_ptrs = (
+                philox_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+
             # compute dropout mask
             rng_output = tl.rand(philox_seed, philox_ptrs)
             dropout_mask = rng_output > dropout_p
@@ -357,46 +360,74 @@ def _attn_fwd_inner(
             if RETURN_SCORES:
                 sd_mask_value = tl.where(dropout_mask, p, -p)
                 sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-                
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-                
+                sd_mask_ptrs = (
+                    sd_mask_base
+                    + offs_m[:, None] * stride_sm
+                    + kv_offs_n[None, :] * stride_sn
+                )
+
+                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                    kv_offs_n[None, :] < seqlen_k
+                )
+
                 if APPLY_MASK and IS_CAUSAL:
-                    causal_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk)
+                    causal_constraint = kv_offs_n[None, :] <= (
+                        offs_m[:, None] + seqlen_delta_qk
+                    )
                     sd_store_mask = sd_store_mask & causal_constraint
-                
+
                 if APPLY_MASK and USE_SLIDING_WINDOW:
                     if WINDOW_SIZE_LEFT < 0:
-                        window_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT)
+                        window_constraint = kv_offs_n[None, :] <= (
+                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                        )
                     else:
-                        left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (kv_offs_n[None, :] <= right_bound)
+                        left_bound = (
+                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                        )
+                        right_bound = (
+                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                        )
+                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (
+                            kv_offs_n[None, :] <= right_bound
+                        )
                     sd_store_mask = sd_store_mask & window_constraint
-                
+
                 tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
 
             # apply dropout mask in place
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
             sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-            sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-            
+            sd_mask_ptrs = (
+                sd_mask_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+
+            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                kv_offs_n[None, :] < seqlen_k
+            )
+
             if APPLY_MASK and IS_CAUSAL:
-                causal_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk)
+                causal_constraint = kv_offs_n[None, :] <= (
+                    offs_m[:, None] + seqlen_delta_qk
+                )
                 sd_store_mask = sd_store_mask & causal_constraint
-            
+
             if APPLY_MASK and USE_SLIDING_WINDOW:
                 if WINDOW_SIZE_LEFT < 0:
-                    window_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT)
+                    window_constraint = kv_offs_n[None, :] <= (
+                        offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                    )
                 else:
                     left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
                     right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (kv_offs_n[None, :] <= right_bound)
+                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (
+                        kv_offs_n[None, :] <= right_bound
+                    )
                 sd_store_mask = sd_store_mask & window_constraint
-            
+
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
@@ -406,7 +437,7 @@ def _attn_fwd_inner(
         else:
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
-        
+
         # Load V if not preloaded
         if not PRE_LOAD_V:
             if APPLY_MASK:
@@ -462,7 +493,7 @@ def compute_window_bounds(
 
     # Right boundary
     if IS_CAUSAL:
-        # Causal cap: col ≤ row + diag
+        # Causal cap: col <= row + diag
         right_min = tl.minimum(seqlen_k - 1, q_start + diag)
         right_max = tl.minimum(seqlen_k - 1, q_end + diag)
     else:
@@ -534,14 +565,14 @@ def handle_padded_last_block(
         # current 'full' range right edge
         full_right_block = clipped_left + n_full_blocks - 1
 
-        # If last_block is already beyond full_right_block, it's already in back-masked → nothing to do
+        # If last_block is already beyond full_right_block, it's already in back-masked -> nothing to do
         last_already_back_masked = last_block > full_right_block
         if not last_already_back_masked:
             # If the window starts past last_block, it was counted in front-masked
             if clipped_left > last_block:
                 n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
             else:
-                # Otherwise it was counted 'full' → move it out of full
+                # Otherwise it was counted 'full' -> move it out of full
                 n_full_blocks = tl.maximum(0, n_full_blocks - 1)
             # In both cases we need one more back-masked block
             n_back_masked_blocks = n_back_masked_blocks + 1
@@ -558,7 +589,7 @@ def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     # K blocks visualization:
     #         Block 0         Block 1         Block 2 (last)
     #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
-    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
+    #         ?---------?    ?---------?     ?---? ?---?
     #         full block     full block      valid  pad
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
@@ -611,7 +642,7 @@ def compute_block_masking(
             IS_CAUSAL,
         )
 
-        # window vanishes → early exit
+        # window vanishes -> early exit
         if right_max < left_min:
             return 0, 0, 0, 0, n_extra_tokens
 
@@ -650,16 +681,16 @@ def compute_block_masking(
             # ========== CAUSAL MODE: Classify K Blocks ==========
             # Calculate causal boundary for this Q block
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
-            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
-            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
-            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
-            #                            ↑ can see up to K5
+            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q0
+            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q1
+            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q2
+            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  <- Q3
+            #                           /\ can see up to K5
             #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  <- Q4
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  <- Q5
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  <- Q6
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  <- Q7
 
             # ------------------------------------------------------------
             # 1. figure out, in tokens, the right-most K position
@@ -667,7 +698,7 @@ def compute_block_masking(
             # ------------------------------------------------------------
             k_max_token = q_end + diag  # last visible K index
 
-            # this Q-block is entirely above the diagonal ⇒ nothing to do
+            # this Q-block is entirely above the diagonal => nothing to do
             if k_max_token < 0:
                 return 0, 0, 0, 0, n_extra_tokens
 
@@ -681,12 +712,12 @@ def compute_block_masking(
 
             # ------------------------------------------------------------
             # 3. classify those visible blocks
-            #    – we *never* skip or mask blocks in front, because causal
+            #    - we *never* skip or mask blocks in front, because causal
             #      attention always starts at K0
-            #    – the back side can require several masked blocks:
-            #         • intersection of the causal diagonal with K-grid
-            #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-            #         • plus one for partial K blocks at the causal boundary
+            #    - the back side can require several masked blocks:
+            #         o intersection of the causal diagonal with K-grid
+            #           (at most  ?BLOCK_M / BLOCK_N? blocks)
+            #         o plus one for partial K blocks at the causal boundary
             # ------------------------------------------------------------
             n_back_masked_blocks = BLOCK_M // BLOCK_N + 1
             n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
@@ -698,16 +729,16 @@ def compute_block_masking(
             # ========== NON-CAUSAL MODE ==========
             # Without causal mask, all positions can attend to all positions
             # Only need to handle the padding in the last block
-            #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9  ??  ??]
+            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
             #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
 
             n_front_skip_blocks = 0  # never skips the left side
             n_front_masked_blocks = 0  # ditto
@@ -1389,9 +1420,7 @@ def attention_forward_prefill_triton_impl(
         assert (
             softmax_lse.dtype == torch.float32
         ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
-        assert (
-            softmax_lse.device == q.device
-        ), f"softmax_lse must be on same device as q"
+        assert softmax_lse.device == q.device, "softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1477,9 +1506,7 @@ def attention_forward_prefill_triton_impl(
         assert (
             softmax_lse.dtype == torch.float32
         ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
-        assert (
-            softmax_lse.device == q.device
-        ), f"softmax_lse must be on same device as q"
+        assert softmax_lse.device == q.device, "softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1532,9 +1559,7 @@ def attention_forward_prefill_triton_impl(
     if IS_FP8:
         arch = get_arch()
         if not arch.supports_fp8:
-            raise RuntimeError(
-                f"{arch.name} does not support FP8"
-            )
+            raise RuntimeError(f"{arch.name} does not support FP8")
         FP8_MAX = torch.finfo(q.dtype).max
         rec_dtype = arch.recommended_fp8_dtype(q.dtype)
         if q.dtype != rec_dtype or k.dtype != rec_dtype or v.dtype != rec_dtype:
@@ -1591,7 +1616,7 @@ def attention_forward_prefill_triton_impl(
         stride_v_descale_z = v_descale.stride(0) if v_descale is not None else 0
 
         if DEBUG:
-            print(f"FP8 path triggered in fwd_prefill.py")
+            print("FP8 path triggered in fwd_prefill.py")
     else:
         FP8_MAX = None
         q_descale = k_descale = v_descale = None
@@ -1638,7 +1663,7 @@ def attention_forward_prefill_triton_impl(
         assert (
             sd_mask.shape[3] >= max_seqlens_k
         ), f"sd_mask.shape[3]={sd_mask.shape[3]} must be >= max_seqlens_k={max_seqlens_k}"
-        assert sd_mask.device == q.device, f"sd_mask must be on same device as q"
+        assert sd_mask.device == q.device, "sd_mask must be on same device as q"
 
         stride_sz, stride_sh, stride_sm, stride_sn = (
             sd_mask.stride(0),
@@ -1664,7 +1689,9 @@ def attention_forward_prefill_triton_impl(
     force_masking = arch.is_rdna
 
     # launch kernel
-    grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
+    def grid(META):
+        return (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
+
     attn_fwd[grid](
         q,
         k,
