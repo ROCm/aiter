@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -10,7 +10,6 @@ import itertools
 import argparse
 import triton
 import triton.language as tl
-import pandas as pd
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -31,9 +30,9 @@ def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
     x, y = x.double(), y.double()
-    # RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    # amax_diff = (x - y).abs().max().item()
+    amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
@@ -75,7 +74,7 @@ def ref_masked_attention(
 
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
 
-    l = attn_weights_exp.sum(-1)  # noqa: E741
+    l = attn_weights_exp.sum(-1)
 
     if is_fp8_q:
         attn_weights_fp8 = attn_weights_exp.to(dtype)
@@ -279,11 +278,11 @@ def triton_convert_req_index_to_global_index(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    # num_batches = kv_indptr.shape[0] - 1
+    num_batches = kv_indptr.shape[0] - 1
     num_tokens = token_indices.shape[0]
 
     # num_requests, max_num_blocks_per_req = block_table.shape
-    # max_num_blocks_per_req = 65536 * 32
+    max_num_blocks_per_req = 65536 * 32
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     # Ensure contiguous tensors on the same device
@@ -363,8 +362,8 @@ def test_mla(
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
-    # max_seqlen_kv = seq_lens_kv.max().item()
-    # total_qo = qo_indptr[-1].item()
+    max_seqlen_kv = seq_lens_kv.max().item()
+    total_qo = qo_indptr[-1].item()
     kv_buffer = torch.randn(
         (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
         dtype=torch.bfloat16,
@@ -374,7 +373,7 @@ def test_mla(
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    # us_asm = None
+    us_asm = None
     # if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
     #     us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
@@ -444,10 +443,9 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-    aiter.get_mla_metadata_v1(
+    meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
-        kv_last_page_lens,
         nhead // nhead_kv,
         nhead_kv,
         True,
@@ -457,7 +455,6 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        page_size=page_size,
         kv_granularity=max(page_size, 16),
         max_seqlen_qo=1,
         uni_seqlen_qo=1,
@@ -512,8 +509,6 @@ def test_mla(
             converted_indices.view(-1),
             kv_last_page_lens,
             1,
-            page_size,
-            nhead_kv,
             sm_scale,
             num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
@@ -575,8 +570,6 @@ def test_mla(
             converted_indices.view(-1),
             kv_last_page_lens,
             1,
-            page_size,
-            nhead_kv,
             sm_scale,
             num_kv_splits=max_split_per_batch,
             q_scale=q_scale,
@@ -599,7 +592,7 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        checkAllclose(
+        err_fp8 = checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
@@ -748,6 +741,8 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
+
+import pandas as pd
 
 args = parser.parse_args()
 list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
