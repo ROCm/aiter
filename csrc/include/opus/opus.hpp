@@ -828,7 +828,11 @@ template<typename T> constexpr bool is_dtype_v = is_dtype<remove_cvref_t<T>>::va
 
 REGISTER_DTYPE(fp32, float)
 REGISTER_DTYPE(bf16, unsigned short)
+#if __clang_major__ >= 20   // enable for rocm 7.0+
 REGISTER_DTYPE(fp16, __fp16)
+#else
+REGISTER_DTYPE(fp16, _Float16)
+#endif
 REGISTER_DTYPE(fp8 , _BitInt(8))
 REGISTER_DTYPE(bf8 , unsigned _BitInt(8))
 REGISTER_DTYPE(i32 , int32_t)
@@ -963,7 +967,7 @@ template<> OPUS_D float       min<float>(const float&a, const float&b) { return 
 
 template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = max(a, b); return max(max_0, max(min_0, c)); }
 template<> OPUS_D float       med3<float>(const float&a, const float&b, const float&c) { return __builtin_amdgcn_fmed3f(a, b, c); }
-template<> OPUS_D __fp16      med3<__fp16>(const __fp16&a, const __fp16&b, const __fp16&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
+template<> OPUS_D fp16_t      med3<fp16_t>(const fp16_t&a, const fp16_t&b, const fp16_t&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // buffer load/store related
 OPUS_D constexpr auto buffer_default_config() {
