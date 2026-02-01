@@ -197,13 +197,6 @@ template <index_t... Is> struct static_for_impl<seq<Is...>> { template <class F>
 }   // namespace impl
 template<index_t N, typename F> OPUS_H_D constexpr void static_for(F f) { impl::static_for_impl<make_index_seq<N>>{}(f); }
 
-template<typename F, typename... R, std::enable_if_t<(std::is_integral_v<R> && ...), bool> = true>
-OPUS_H_D constexpr void static_for(F f, R... range) {
-    if      constexpr (sizeof...(range) == 1) { auto end = std::get<0>(std::tie(range...));     for(index_t i = 0; i < end; i++) { f(i); } }
-    else if constexpr (sizeof...(range) == 2) { auto [start, end] = std::tie(range...);         for(index_t i = start; i < end; i++) { f(i); } }
-    else if constexpr (sizeof...(range) == 3) { auto [start, end, step] = std::tie(range...);   for(index_t i = start; i < end; i += step) { f(i); } }
-}
-
 template<typename F, typename... R, std::enable_if_t<(is_constant_v<R> && ...), bool> = true>
 OPUS_H_D constexpr void static_for(F f, R...) { impl::static_for_impl<make_index_seq<R::value...>>{}(f); }
 
@@ -377,6 +370,13 @@ template <index_t I0, index_t I1, index_t... Is, class T>  /*recursive get*/
 OPUS_H_D constexpr decltype(auto) get(T&& t) { return get<I1, Is...>(get<I0>(std::move(t))); }
 
 template <typename... T> OPUS_H_D constexpr auto make_tuple(T&&... xs) { return tuple<remove_cvref_t<T>...>(std::forward<T>(xs)...); }
+
+template<typename F, typename... R, std::enable_if_t<(std::is_integral_v<R> && ...), bool> = true>  // const integer based static_for loop
+OPUS_H_D constexpr void static_for(F f, R... range) {
+    if      constexpr (sizeof...(range) == 1) { auto end = get<0>(make_tuple(range...));        for(index_t i = 0; i < end; i++) { f(i); } }
+    else if constexpr (sizeof...(range) == 2) { auto [start, end] = make_tuple(range...);       for(index_t i = start; i < end; i++) { f(i); } }
+    else if constexpr (sizeof...(range) == 3) { auto [start, end, step] = make_tuple(range...); for(index_t i = start; i < end; i += step) { f(i); } }
+}
 
 namespace impl {
 template <typename T, index_t... Is> OPUS_H_D constexpr auto make_repeated_tuple(T&& x, seq<Is...>) { return opus::make_tuple((void(Is), std::forward<T>(x))...); }
