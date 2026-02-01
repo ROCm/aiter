@@ -17,8 +17,12 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/all.h>
+#include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
 
 #include "custom_all_reduce.cuh"
+
+// Sequence counter for profiling collective operations
+static std::atomic<int64_t> aiter_collective_seq_{0};
 
 // fake pointer type, must match fptr_t type in ops.h
 using fptr_t = int64_t;
@@ -136,6 +140,51 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 std::optional<torch::Tensor> reg_buffer)
 {
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    
+    // Add collective metadata to profiler traces via "record_param_comms" events.
+    // This enables performance analysis tools to identify collective operations and their parameters.
+    // See PyTorch's usage (pinned to commit a3bda4952b315b33297ea901a7c55c344ac7ff4c):
+    // - Macro definition: https://github.com/pytorch/pytorch/blob/a3bda4952b315b33297ea901a7c55c344ac7ff4c/torch/csrc/distributed/c10d/ParamCommsUtils.hpp#L136-L179
+    // - Usage in allreduce: https://github.com/pytorch/pytorch/blob/a3bda4952b315b33297ea901a7c55c344ac7ff4c/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L4508-L4524
+    std::vector<at::Tensor> input_tensors = {inp};
+    std::vector<at::Tensor> output_tensors = {out};
+    RECORD_PARAM_COMMS_DATA(
+        // seq: Sequence number tuple (collective_seq, is_p2p). Used to correlate events.
+        std::make_tuple(static_cast<int64_t>(aiter_collective_seq_++), false),
+        // pgName: Process group identifier tuple (pg_uid, pg_description).
+        std::make_tuple("aiter_custom_ar", "custom_allreduce"),
+        // inputTensors: List of input tensors for the collective.
+        input_tensors,
+        // outputTensors: List of output tensors for the collective.
+        output_tensors,
+        // rank: Current rank in the process group.
+        fa->rank_,
+        // collName: Name of the collective operation (e.g., "allreduce", "reduce_scatter").
+        "allreduce",
+        // inNelems: Number of input elements.
+        inp.numel(),
+        // outNelems: Number of output elements.
+        out.numel(),
+        // dType: Data type of the tensors.
+        inp.scalar_type(),
+        // inSplitSizes: Input split sizes (for operations like all_to_all, empty for allreduce).
+        std::vector<int64_t>(),
+        // outSplitSizes: Output split sizes (for operations like all_to_all, empty for allreduce).
+        std::vector<int64_t>(),
+        // globalRankStart: Starting global rank for this process group.
+        // TODO: CustomAllreduce doesn't currently store global rank mapping.
+        // Hardcoded to 0 assuming the group starts at global rank 0.
+        // Consider adding globalRankStart_ to CustomAllreduce if needed.
+        0,
+        // globalRankStride: Stride between global ranks in this process group.
+        // TODO: CustomAllreduce doesn't currently store global rank mapping.
+        // Hardcoded to 1 assuming contiguous rank assignment.
+        // Consider adding globalRankStride_ to CustomAllreduce if needed.
+        1,
+        // worldSize: Total number of ranks in the process group.
+        fa->world_size_);
+
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -157,8 +206,6 @@ void all_reduce(fptr_t _fa,
     {
         _all_reduce(_fa, inp, out, stream, use_new, open_fp8_quant);
     }
-    
-
 }
 
 void _reduce_scatter(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, hipStream_t stream)
