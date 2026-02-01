@@ -1305,7 +1305,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 if constexpr(idx.value == k_q_nope_begin)
                 {
                     hk::mma_ABt(p_comp, kv_0, q_0);
-                    __builtin_amdgcn_s_setprio(4);
+                    __builtin_amdgcn_s_setprio(5);
                 }
                 else
                 {
@@ -1344,7 +1344,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
             });
-            __builtin_amdgcn_s_setprio(2);
+            __builtin_amdgcn_s_setprio(3);
 
             kv_manager.template async_load_k_tile<128, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
@@ -1355,19 +1355,67 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             kv_manager.template async_load_k_tile<192, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
             softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
-            __builtin_amdgcn_s_setprio(1);
 
             kv_manager.template async_load_k_tile<256, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
+            // Transpose V
+            v8ui v;
+            kv_manager.load_v_to_gpr(&v, p_lds_kv_curr);
+            __builtin_amdgcn_s_setprio(2);
+
+            // For hiding LDS load latency
             if constexpr(kIsFirstIter == false)
             {
-                hk::mul_vgpr_pk2(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 0, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 1, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 2, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 3, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 4, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 5, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 6, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 7, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+            }
+
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            transpose_v(&v);
+            store_transposed_v_to_lds<T>(p_lds_vt, v);
+            __builtin_amdgcn_s_setprio(1);
+
+            kv_manager.template async_load_k_tile<320, kIsLastIter, kCheckBoundaryNext>(
+                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+
+            if constexpr(kIsFirstIter == false)
+            {
+                hk::bin_map_pk2<0, 8, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 9, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 10, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 11, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 12, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 13, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 14, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 15, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 16, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 17, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 18, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 19, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 20, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 21, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 22, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 23, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 24, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 25, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 26, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 27, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 28, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 29, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 30, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 31, hkm::mul_vgpr>(oaccu, oaccu, rescale);
             }
 
             __builtin_amdgcn_s_setprio(0);
 
-            kv_manager.template async_load_k_tile<320, kIsLastIter, kCheckBoundaryNext>(
+            kv_manager.template async_load_k_tile<384, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // Convert p from comp_t to kv_t
@@ -1384,18 +1432,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                "n"(src_idx + 3));
             });
 
-            // GEMM on PV
-
-            // Transpose
-            v8ui v;
-            kv_manager.load_v_to_gpr(&v, p_lds_kv_curr);
-            asm volatile("s_waitcnt lgkmcnt(0)");
-
-            kv_manager.template async_load_k_tile<384, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
-
-            transpose_v(&v);
-            store_transposed_v_to_lds<T>(p_lds_vt, v);
+            // Wait for transpose V to complete
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -1403,6 +1440,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             kv_manager.template async_load_k_tile<448, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
+            // GEMM on PV
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
             ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
                 constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
@@ -1440,7 +1478,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
                 if constexpr(idx.value == 0)
                 {
-                    __builtin_amdgcn_s_setprio(3);
+                    __builtin_amdgcn_s_setprio(4);
                 }
 
                 asm volatile("s_waitcnt lgkmcnt(0)");
