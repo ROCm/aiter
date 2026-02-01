@@ -13,7 +13,6 @@ from .utils import (
 )
 
 
-
 FWD_PREFILL_AUTOTUNE_KEYS = [
     "IS_CAUSAL",
     "dropout_p",
@@ -192,7 +191,7 @@ def _attn_fwd_inner(
 ):
     """
     Unified attention forward inner loop.
-    
+
     APPLY_MASK controls whether causal/window masking is applied:
     - False: Fast path for full blocks (no masking overhead)
     - True: Masked path with causal/window masking support
@@ -210,7 +209,7 @@ def _attn_fwd_inner(
         v_ptrs = v_base_ptrs + start_n * stride_vk
 
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
-        
+
         # Load K - different masking for APPLY_MASK vs non-masked
         if APPLY_MASK:
             # For masked blocks, check seqlen bounds
@@ -282,7 +281,9 @@ def _attn_fwd_inner(
                         )
                     else:
                         left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
-                        right_bound = row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
+                        right_bound = (
+                            row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
+                        )
                         window_mask = (col_idx_expanded < left_bound) | (
                             col_idx_expanded > right_bound
                         )
@@ -347,8 +348,12 @@ def _attn_fwd_inner(
         if ENABLE_DROPOUT:
             # Compute pointers for this block
             philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-            philox_ptrs = philox_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            
+            philox_ptrs = (
+                philox_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+
             # compute dropout mask
             rng_output = tl.rand(philox_seed, philox_ptrs)
             dropout_mask = rng_output > dropout_p
@@ -357,46 +362,74 @@ def _attn_fwd_inner(
             if RETURN_SCORES:
                 sd_mask_value = tl.where(dropout_mask, p, -p)
                 sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-                
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-                
+                sd_mask_ptrs = (
+                    sd_mask_base
+                    + offs_m[:, None] * stride_sm
+                    + kv_offs_n[None, :] * stride_sn
+                )
+
+                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                    kv_offs_n[None, :] < seqlen_k
+                )
+
                 if APPLY_MASK and IS_CAUSAL:
-                    causal_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk)
+                    causal_constraint = kv_offs_n[None, :] <= (
+                        offs_m[:, None] + seqlen_delta_qk
+                    )
                     sd_store_mask = sd_store_mask & causal_constraint
-                
+
                 if APPLY_MASK and USE_SLIDING_WINDOW:
                     if WINDOW_SIZE_LEFT < 0:
-                        window_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT)
+                        window_constraint = kv_offs_n[None, :] <= (
+                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                        )
                     else:
-                        left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (kv_offs_n[None, :] <= right_bound)
+                        left_bound = (
+                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                        )
+                        right_bound = (
+                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                        )
+                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (
+                            kv_offs_n[None, :] <= right_bound
+                        )
                     sd_store_mask = sd_store_mask & window_constraint
-                
+
                 tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
 
             # apply dropout mask in place
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
             sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-            sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-            
+            sd_mask_ptrs = (
+                sd_mask_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+
+            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                kv_offs_n[None, :] < seqlen_k
+            )
+
             if APPLY_MASK and IS_CAUSAL:
-                causal_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk)
+                causal_constraint = kv_offs_n[None, :] <= (
+                    offs_m[:, None] + seqlen_delta_qk
+                )
                 sd_store_mask = sd_store_mask & causal_constraint
-            
+
             if APPLY_MASK and USE_SLIDING_WINDOW:
                 if WINDOW_SIZE_LEFT < 0:
-                    window_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT)
+                    window_constraint = kv_offs_n[None, :] <= (
+                        offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                    )
                 else:
                     left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
                     right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (kv_offs_n[None, :] <= right_bound)
+                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (
+                        kv_offs_n[None, :] <= right_bound
+                    )
                 sd_store_mask = sd_store_mask & window_constraint
-            
+
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
@@ -406,7 +439,7 @@ def _attn_fwd_inner(
         else:
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
-        
+
         # Load V if not preloaded
         if not PRE_LOAD_V:
             if APPLY_MASK:
@@ -1532,9 +1565,7 @@ def attention_forward_prefill_triton_impl(
     if IS_FP8:
         arch = get_arch()
         if not arch.supports_fp8:
-            raise RuntimeError(
-                f"{arch.name} does not support FP8"
-            )
+            raise RuntimeError(f"{arch.name} does not support FP8")
         FP8_MAX = torch.finfo(q.dtype).max
         rec_dtype = arch.recommended_fp8_dtype(q.dtype)
         if q.dtype != rec_dtype or k.dtype != rec_dtype or v.dtype != rec_dtype:

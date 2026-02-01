@@ -33,14 +33,14 @@ MAX_BLOCK_M = 64
 def get_fwd_decode_configs(autotune: bool):
     """
     Returns configs for both the splitK kernel and reduce kernel.
-    
+
     Returns:
         (splitk_configs, reduce_config): Tuple of config lists for each kernel
     """
 
     if not autotune:
         arch = get_arch()
-        
+
         if arch.is_rdna:
             return (
                 [
@@ -79,17 +79,18 @@ def get_fwd_decode_configs(autotune: bool):
     # ===================== Autotune Sweep =====================
     arch = get_arch()
     splitk_configs = []
-    
+
     BLOCK_M_OPTIONS = [64, 32, 16]
     BLOCK_N_OPTIONS = [128, 64, 32, 16]
     NUM_WARPS_OPTIONS = [2, 4]
     NUM_STAGES_OPTIONS = [1]
     WAVES_PER_EU_OPTIONS = [4, 2, 1]
-    
+
     # Ensure BLOCK_M options don't exceed MAX_BLOCK_M
-    assert all(bm <= MAX_BLOCK_M for bm in BLOCK_M_OPTIONS), \
-        f"BLOCK_M_OPTIONS {BLOCK_M_OPTIONS} exceeds MAX_BLOCK_M {MAX_BLOCK_M}"
-    
+    assert all(
+        bm <= MAX_BLOCK_M for bm in BLOCK_M_OPTIONS
+    ), f"BLOCK_M_OPTIONS {BLOCK_M_OPTIONS} exceeds MAX_BLOCK_M {MAX_BLOCK_M}"
+
     for bm in BLOCK_M_OPTIONS:
         for bn in BLOCK_N_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
@@ -110,8 +111,7 @@ def get_fwd_decode_configs(autotune: bool):
     # Reduce kernel configs - sweep num_warps
     NUM_WARPS_REDUCE_OPTIONS = [2, 4]
     reduce_configs = [
-        triton.Config({}, num_stages=1, num_warps=nw)
-        for nw in NUM_WARPS_REDUCE_OPTIONS
+        triton.Config({}, num_stages=1, num_warps=nw) for nw in NUM_WARPS_REDUCE_OPTIONS
     ]
 
     return splitk_configs, reduce_configs
@@ -1005,15 +1005,23 @@ def attention_forward_decode_triton_impl(
         stride_vc_d = v_cache.stride(3)
     else:
         _, seqlen_kc, nheads_kc, dim_kc = get_shape_from_layout(k_cache, layout)
-        stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d = get_stride_from_layout(k_cache, layout)
+        stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d = get_stride_from_layout(
+            k_cache, layout
+        )
         _, seqlen_vc, nheads_vc, dim_vc = get_shape_from_layout(v_cache, layout)
-        stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d = get_stride_from_layout(v_cache, layout)
+        stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d = get_stride_from_layout(
+            v_cache, layout
+        )
         block_size_k = 0  # Not used
     if is_new_kv:
         _, seqlen_kn, nheads_kn, dim_kn = get_shape_from_layout(k_new, layout)
-        stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = get_stride_from_layout(k_new, layout)
+        stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = get_stride_from_layout(
+            k_new, layout
+        )
         _, seqlen_vn, nheads_vn, dim_vn = get_shape_from_layout(v_new, layout)
-        stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = get_stride_from_layout(v_new, layout)
+        stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = get_stride_from_layout(
+            v_new, layout
+        )
     else:
         _, seqlen_kn, nheads_kn, dim_kn = None, None, None, None
         stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = None, None, None, None
@@ -1120,9 +1128,7 @@ def attention_forward_decode_triton_impl(
     if IS_FP8:
         arch = get_arch()
         if not arch.supports_fp8:
-            raise RuntimeError(
-                f"{arch.name} does not support FP8"
-            )
+            raise RuntimeError(f"{arch.name} does not support FP8")
         rec_dtype = arch.recommended_fp8_dtype(q.dtype)
         if (
             q.dtype != rec_dtype

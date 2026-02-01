@@ -69,7 +69,10 @@ def fwd(
         print("out:", out.shape if out is not None else None)
         print("cu_seqlens_q:", cu_seqlens_q.shape if cu_seqlens_q is not None else None)
         print("cu_seqlens_k:", cu_seqlens_k.shape if cu_seqlens_k is not None else None)
-        print("cu_seqlens_k_new:", cu_seqlens_k_new.shape if cu_seqlens_k_new is not None else None)
+        print(
+            "cu_seqlens_k_new:",
+            cu_seqlens_k_new.shape if cu_seqlens_k_new is not None else None,
+        )
         print("seqused_q:", seqused_q.shape if seqused_q is not None else None)
         print("seqused_k:", seqused_k.shape if seqused_k is not None else None)
         print("max_seqlen_q:", max_seqlen_q)
@@ -79,7 +82,10 @@ def fwd(
         print("leftpad_k:", leftpad_k.shape if leftpad_k is not None else None)
         print("rotary_cos:", rotary_cos.shape if rotary_cos is not None else None)
         print("rotary_sin:", rotary_sin.shape if rotary_sin is not None else None)
-        print("seqlens_rotary:", seqlens_rotary.shape if seqlens_rotary is not None else None)
+        print(
+            "seqlens_rotary:",
+            seqlens_rotary.shape if seqlens_rotary is not None else None,
+        )
         print("q_descale:", q_descale.shape if q_descale is not None else None)
         print("k_descale:", k_descale.shape if k_descale is not None else None)
         print("v_descale:", v_descale.shape if v_descale is not None else None)
@@ -161,7 +167,9 @@ def fwd(
         max_seqlens_q_local = max_seqlen_q
         if cu_seqlens_k is not None:
             cu_seqlens_k_local = cu_seqlens_k
-            assert max_seqlen_k is not None, "max_seqlen_k required when cu_seqlens_k provided"
+            assert (
+                max_seqlen_k is not None
+            ), "max_seqlen_k required when cu_seqlens_k provided"
             max_seqlens_k_local = max_seqlen_k
         else:
             cu_seqlens_k_local = None
