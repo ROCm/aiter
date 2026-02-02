@@ -81,7 +81,8 @@ bool _is_weak_contiguous(torch::Tensor& t)
 }
 
 void _all_reduce(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, hipStream_t stream, bool use_new, bool open_fp8_quant)
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, hipStream_t stream, bool use_new,
+    bool open_fp8_quant, bool is_broadcast_reg_outptr)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
@@ -91,7 +92,7 @@ void _all_reduce(
         fa->allreduce<float>(stream,
                              reinterpret_cast<float*>(inp.data_ptr()),
                              reinterpret_cast<float*>(out.data_ptr()),
-                             out.numel(), use_new);
+                             out.numel(), use_new, is_broadcast_reg_outptr);
         break;
     }
     case at::ScalarType::Half: {
@@ -111,7 +112,7 @@ void _all_reduce(
             fa->allreduce<half>(stream,
                                 reinterpret_cast<half*>(inp.data_ptr()),
                                 reinterpret_cast<half*>(out.data_ptr()),
-                                out.numel(), use_new);
+                                out.numel(), use_new, is_broadcast_reg_outptr);
         }
         break;
     }
@@ -134,31 +135,86 @@ void all_reduce(fptr_t _fa,
                 torch::Tensor& out,
                 bool use_new,
                 bool open_fp8_quant,
-                std::optional<torch::Tensor> reg_buffer)
+                std::optional<torch::Tensor> reg_input_buffer,
+                std::optional<torch::Tensor> reg_output_buffer)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
     TORCH_CHECK_EQ(inp.numel(), out.numel());
 
-    if(reg_buffer.has_value())
+    torch::Tensor* typed_input_buffer = &inp;
+    torch::Tensor* typed_output_buffer = &out;
+
+    torch::Tensor typed_input_buffer_reg;
+    torch::Tensor typed_output_buffer_reg;
+
+    // In eager mode, broadcasting tmp_output_ptr will lead to unnecessary memcpy.
+    // So we check if the output buffer is registered and if so, we set is_broadcast_reg_outptr to false.
+    bool is_broadcast_reg_outptr = true;
+    if (reg_output_buffer.has_value())
     {
+        is_broadcast_reg_outptr = false;
+    }
+
+    if (!reg_input_buffer.has_value() && !reg_output_buffer.has_value())
+    {
+        // Graph mode: input and output are already registered, use directly
+        _all_reduce(_fa, inp, out, stream, use_new, open_fp8_quant, is_broadcast_reg_outptr);
+        return;
+    }
+
+    if(reg_input_buffer.has_value())
+    {
+        // Eager mode: use pre-registered buffers for both input and output
         auto input_size = inp.numel() * inp.element_size();
-        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
+        TORCH_CHECK(input_size <= reg_input_buffer.value().numel() * reg_input_buffer.value().element_size(),
                     "registered buffer is too small to contain the input");
-        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
+        
+        // Copy input to registered input buffer
+        HIP_CALL(hipMemcpyAsync(reg_input_buffer.value().data_ptr(),
                                 inp.data_ptr(),
                                 input_size,
                                 hipMemcpyDeviceToDevice,
                                 stream));
-        _all_reduce(_fa, reg_buffer.value(), out, stream, use_new, open_fp8_quant);
+        // Create typed views of the buffers with correct dtype and shape
+        typed_input_buffer_reg = torch::from_blob(
+            reg_input_buffer.value().data_ptr(),
+            {inp.numel()},
+            torch::TensorOptions().dtype(inp.dtype()).device(inp.device())
+        );
+        typed_input_buffer = &typed_input_buffer_reg;
     }
-    else
+        
+    if(reg_output_buffer.has_value() && is_broadcast_reg_outptr)
     {
-        _all_reduce(_fa, inp, out, stream, use_new, open_fp8_quant);
+        // Use registered output buffer, kernel writes directly to it
+        auto output_size = out.numel() * out.element_size();
+        TORCH_CHECK(output_size <= reg_output_buffer.value().numel() * reg_output_buffer.value().element_size(),
+                    "registered output buffer is too small to contain the output");
+        
+        typed_output_buffer_reg = torch::from_blob(
+            reg_output_buffer.value().data_ptr(),
+            {out.numel()},
+            torch::TensorOptions().dtype(out.dtype()).device(out.device())
+        );
+        typed_output_buffer = &typed_output_buffer_reg;
     }
+            
+    _all_reduce(_fa, *typed_input_buffer, *typed_output_buffer, stream, use_new,
+        open_fp8_quant, is_broadcast_reg_outptr);
     
-
+    if(reg_output_buffer.has_value() && is_broadcast_reg_outptr)
+    {
+        // Copy result from registered output buffer to actual output
+        auto output_size = out.numel() * out.element_size();
+        HIP_CALL(hipMemcpyAsync(out.data_ptr(),
+                                reg_output_buffer.value().data_ptr(),
+                                output_size,
+                                hipMemcpyDeviceToDevice,
+                                stream));
+    }
+        
 }
 
 void _reduce_scatter(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, hipStream_t stream)
@@ -366,13 +422,22 @@ void dispose(fptr_t _fa)
 
 int64_t meta_size() { return sizeof(aiter::Signal); }
 
-void register_buffer(fptr_t _fa,
+void register_input_buffer(fptr_t _fa,
                      torch::Tensor& t,
                      const std::vector<torch::Tensor>& handles,
                      const std::vector<int64_t>& offsets)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    fa->register_buffer(handles, offsets, t.data_ptr());
+    fa->register_input_buffer(handles, offsets, t.data_ptr());
+}
+
+void register_output_buffer(fptr_t _fa,
+                            torch::Tensor& t,
+                            const std::vector<torch::Tensor>& handles,
+                            const std::vector<int64_t>& offsets)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->register_output_buffer(handles, offsets, t.data_ptr());
 }
 
 std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa)
