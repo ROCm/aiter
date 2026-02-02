@@ -101,7 +101,7 @@ jobs:
           --network=host \
           --shm-size 32g \
           --cap-add=SYS_PTRACE \
-          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN }}}" \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           --security-opt seccomp=unconfined \
           -w /sglang-checkout \
           --name sglang_aiter_test \
