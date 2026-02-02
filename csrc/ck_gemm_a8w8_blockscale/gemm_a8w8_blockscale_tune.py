@@ -297,7 +297,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
         isPreshuffleB = args.preshuffle
