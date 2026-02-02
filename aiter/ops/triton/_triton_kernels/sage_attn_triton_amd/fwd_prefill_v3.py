@@ -160,7 +160,7 @@ def _sage_fwd_no_mask_v3(
 
         k_descale = tl.load(k_descale_ptr)
         k_descale_ptr += stride_ksblk
-        v_descale_ptr += stride_vsn * BLOCK_N//2
+        
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -172,7 +172,7 @@ def _sage_fwd_no_mask_v3(
             else:
                 v = tl.load(v_ptrs)
                 v_descale = tl.load(v_descale_ptr)
-
+            v_descale_ptr += stride_vsn * BLOCK_N//2
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
@@ -219,14 +219,23 @@ def _sage_fwd_no_mask_v3(
             else:
                 v = tl.load(v_ptrs)
                 v_descale = tl.load(v_descale_ptr)
+            v_descale_ptr += stride_vsn * BLOCK_N//2
 
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
         p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-        p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
-        acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1", fast_math=True,)
+        # p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
+        # fake quantization in order to estimate how fast it could be
+        e2m1_value = tl.reshape(
+            p, [BLOCK_M, BLOCK_N // 2, 2]
+        ).to(tl.uint8)
+        evens, odds = tl.split(e2m1_value)
+        p = evens | (odds << 4)
+        p_descale = tl.full((BLOCK_M, BLOCK_N//32), 1, dtype=tl.uint8)
+        
+        acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1")
 
     return acc, l_i, m_i
 
@@ -288,9 +297,6 @@ def _sage_fwd_mask_v3(
     WINDOW_SIZE_RIGHT: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
-    # seqlen diff
-    seqlen_delta_qk = seqlen_k - seqlen_q
-
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -312,7 +318,7 @@ def _sage_fwd_mask_v3(
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         k_descale = tl.load(k_descale_ptr)
         k_descale_ptr += stride_ksblk
-        v_descale_ptr += stride_vsn * BLOCK_N//2
+        
 
         if PRE_LOAD_V:
             if PADDED_HEAD_V:
@@ -323,6 +329,7 @@ def _sage_fwd_mask_v3(
             else:
                 v = tl.load(v_ptrs)
                 v_descale = tl.load(v_descale_ptr)
+            v_descale_ptr += stride_vsn * BLOCK_N//2
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
@@ -345,15 +352,6 @@ def _sage_fwd_mask_v3(
         qk += tl.dot(q, k) * (q_descale * k_descale)
         # qk_scaled = qk * SM_SCALE
         qk_scaled = qk
-
-        # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
-        # compute bias
-        if bias_base_ptrs is not None:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
 
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
@@ -380,6 +378,7 @@ def _sage_fwd_mask_v3(
         else:
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
+        
         if not PRE_LOAD_V:
             if PADDED_HEAD_V:
                 v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
@@ -389,13 +388,21 @@ def _sage_fwd_mask_v3(
             else:
                 v = tl.load(v_ptrs)
                 v_descale = tl.load(v_descale_ptr)
+            v_descale_ptr += stride_vsn * BLOCK_N//2
 
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
         p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-        p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
+        # p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
+        # fake quantization in order to estimate how fast it could be
+        e2m1_value = tl.reshape(
+            p, [BLOCK_M, BLOCK_N // 2, 2]
+        ).to(tl.uint8)
+        evens, odds = tl.split(e2m1_value)
+        p = evens | (odds << 4)
+        p_descale = tl.full((BLOCK_M, BLOCK_N//32), 1, dtype=tl.uint8)
 
         acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1")
 
