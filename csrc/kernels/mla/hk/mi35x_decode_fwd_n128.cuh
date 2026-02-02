@@ -130,6 +130,42 @@ struct HkMlaDecodeFwdParams
     void* p_dbg;
 };
 
+template <typename T, uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
+class QManagerV1
+{
+    private:
+    using q_t = typename T::q_t;
+
+    using q_nope_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<GPR_NOPE_START, GPR_NOPE_START + 32 - 1>>,
+        2>; // 32 vgprs
+    using q_rope_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<GPR_ROPE_START, GPR_ROPE_START + 4 - 1>>,
+        2>; // 4 vgprs
+
+    __device__ static hk::
+        art<q_t, T::kTileM, T::kQkNopeHeadDim, hk::row_l, hk::rt_16x32_s, q_nope_ranges>
+            q_nope_;
+    __device__ static hk::
+        art<q_t, T::kTileM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_s, q_rope_ranges>
+            q_rope_;
+
+    public:
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
+    {
+        return 0; // Not used
+    }
+
+    __device__ __forceinline__ static void load_q_to_gpr(const typename T::gl_q& q_buffer,
+                                                         const int32_t warp_idx,
+                                                         const int32_t q_start,
+                                                         const uintptr_t p_lds_q)
+    {
+        hk::load<2, 0>(q_nope_, q_buffer, {q_start, 0, 0, 0}, {0, warp_idx, 0, 0});
+        hk::load<2, T::kQkNopeHeadDim>(q_rope_, q_buffer, {q_start, 0, 0, 0}, {0, warp_idx, 0, 0});
+    }
+};
+
 template <bool kCheckBoundary>
 __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
                                                  const int32_t row_base,
@@ -1094,19 +1130,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         return;
     }
 
-    KvManagerV2<T> kv_manager;
-
-    // LDS tiles
-    extern __shared__ int32_t p_lds[];
-
-    constexpr uint32_t kSzLdsKv = kv_manager.get_lds_size_in_byte();
-    constexpr uint32_t kSzLdsTv = get_transposed_v_lds_size_in_byte<T>();
-
-    uintptr_t p_lds_kv_curr  = reinterpret_cast<uintptr_t>(p_lds);
-    uintptr_t p_lds_kv_next  = p_lds_kv_curr + kSzLdsKv;
-    const uintptr_t p_lds_vt = p_lds_kv_next + kSzLdsKv;
-    const uintptr_t p_lds_q  = p_lds_vt + kSzLdsTv;
-
     // Reg tiles
     constexpr uint32_t k_o_sz      = 128;
     constexpr uint32_t k_p_mfma_sz = 2;
@@ -1159,8 +1182,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hkdart::clobber<p_mfma_ranges>();
     hkdart::clobber<o_ranges>();
 
-    hk::art<q_t, T::kTileM, T::kQkNopeHeadDim, hk::row_l, hk::rt_16x32_s, q_nope_ranges> q_nope;
-    hk::art<q_t, T::kTileM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_s, q_rope_ranges> q_rope;
+    QManagerV1<T, k_q_nope_begin, k_q_rope_begin> q_manager;
+    KvManagerV2<T> kv_manager;
+
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_ranges> kv_1;
     hk::art<comp_t, T::kBlockN, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_ranges> p_comp;
@@ -1181,6 +1205,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hk::buffer_resource split_out_br =
         hk::make_buffer_resource(split_out_as_u64, 0xFFFFFFFF, 0x00020000);
 
+    // LDS tiles
+    extern __shared__ int32_t p_lds[];
+
+    constexpr uint32_t kSzLdsKv = kv_manager.get_lds_size_in_byte();
+    constexpr uint32_t kSzLdsTv = get_transposed_v_lds_size_in_byte<T>();
+
+    uintptr_t p_lds_kv_curr  = reinterpret_cast<uintptr_t>(p_lds);
+    uintptr_t p_lds_kv_next  = p_lds_kv_curr + kSzLdsKv;
+    const uintptr_t p_lds_vt = p_lds_kv_next + kSzLdsKv;
+    const uintptr_t p_lds_q  = p_lds_vt + kSzLdsTv;
+
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
         const int32_t partial_qo_loc = __builtin_amdgcn_readfirstlane(
@@ -1199,9 +1234,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         comp_t row_sum_e;
 
         // Load Q from VRAM to GPRs
-        hk::load<2, 0>(q_nope, params.query, {qo_start, 0, 0, 0}, {0, int32_t(warp_idx), 0, 0});
-        hk::load<2, T::kQkNopeHeadDim>(
-            q_rope, params.query, {qo_start, 0, 0, 0}, {0, int32_t(warp_idx), 0, 0});
+        q_manager.load_q_to_gpr(params.query, warp_idx, qo_start, p_lds_q);
 
         if(kv_len < T::kBlockN)
         {
