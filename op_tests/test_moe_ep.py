@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 import torch
 import aiter
 from aiter.test_common import (
@@ -19,6 +20,7 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter import ActivationType
 from aiter import pertoken_quant
 from aiter import dtypes
+from aiter import QuantType
 import argparse
 
 BLOCK_SIZE_M = 32
@@ -69,7 +71,32 @@ def asm_moe_test(
     expert_mask=None,
     local_expert_hash=None,
 ):
-
+    # Switch backend by env var:
+    # - AITER_USE_FLYDSL_MOE=0 -> asm_moe (original)
+    # - AITER_USE_FLYDSL_MOE=1 -> fused_moe(... use_flydsl=True) (FlyDSL 2-stage)
+    if os.environ.get("AITER_USE_FLYDSL_MOE", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    ):
+        return fused_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask=expert_mask,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_Token if fc1_scale is not None else QuantType.No,
+            doweight_stage1=False,
+            w1_scale=fc1_scale,
+            w2_scale=fc2_scale,
+            a1_scale=fc1_smooth_scale,
+            a2_scale=fc2_smooth_scale,
+            use_flydsl=True,
+        )
     return asm_moe(
         hidden_states,
         w1,
@@ -581,9 +608,9 @@ for test in l_test:
         for dtype in (
             [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
         ):
-            for m in [128] if args.token is None else args.token:
-                for hdim in [4096] if args.hidden_dim is None else args.hidden_dim:
-                    for idim in [1280] if args.inter_dim is None else args.inter_dim:
+            for m in [400] if args.token is None else args.token:
+                for hdim in [5120] if args.hidden_dim is None else args.hidden_dim:
+                    for idim in [1536] if args.inter_dim is None else args.inter_dim:
                         expert = 128 if args.expert is None else args.expert
                         topk = 6 if args.topk is None else args.topk
                         for ep in (

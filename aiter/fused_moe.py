@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 import os
@@ -111,6 +112,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    use_flydsl=False,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -136,6 +138,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        use_flydsl=use_flydsl,
     )
 
 
@@ -163,6 +166,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    use_flydsl: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -197,6 +201,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    use_flydsl: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -250,7 +255,7 @@ def fused_moe_(
         hidden_pad,
         intermediate_pad,
     )
-
+    # aiter.logger.info(f"meta block_m: {metadata.block_m}, block_size_M = {block_size_M}")
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
@@ -297,13 +302,13 @@ def fused_moe_(
             w1,
             w2,
             topk,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            isG1U1,
-            block_size_M,
+            sorted_ids=sorted_ids,
+            sorted_weights=sorted_weights,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            moe_out=moe_buf,
+            isG1U1=isG1U1,
+            block_size_M=block_size_M,
             activation=activation,
             quant_type=quant_type,
             doweight_stage1=doweight_stage1,
@@ -313,12 +318,16 @@ def fused_moe_(
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
+            expert_mask=expert_mask,
             num_local_tokens=num_local_tokens,
+            topk_ids=topk_ids,
+            topk_weights=topk_weight,
             # following for cktile support
             hidden_pad=hidden_pad,
             intermediate_pad=intermediate_pad,
             bias1=bias1,
             bias2=bias2,
+            use_flydsl=use_flydsl,
         )
 
 
@@ -717,6 +726,8 @@ def get_2stage_cfgs(
                 run_1stage = token > 16
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+        # Force disable 1stage for now.
+        run_1stage = False
 
         block_m = (
             BLOCK_SIZE_M
@@ -830,11 +841,25 @@ def get_2stage_cfgs(
                 torch.uint32,
                 dtypes.fp4x2,
                 dtypes.fp8,
+                dtypes.i8,
             ]
         )
     ):
-        return MOEMetadata(
-            functools.partial(
+        use_flydsl_stage2 = (
+            os.environ.get("AITER_USE_FLYDSL_MOE", "1")
+            in ("1", "true", "True", "YES", "yes")
+            and q_type == QuantType.per_Token
+            and q_dtype_a in (dtypes.fp8, dtypes.i8)
+            and q_dtype_w in (dtypes.fp8, dtypes.i8)
+            and use_g1u1
+            and activation == ActivationType.Silu
+        )
+        use_flydsl_stage1 = use_flydsl_stage2
+        flydsl_block_m = min(int(block_m) if block_m is not None else 64, 64)
+        stage1_func = (
+            functools.partial(flydsl_moe_stage1)
+            if use_flydsl_stage1
+            else functools.partial(
                 ck_moe_stage1,
                 kernelName=kernelName1,
                 activation=activation,
@@ -842,15 +867,34 @@ def get_2stage_cfgs(
                 dtype=dtype,
                 splitk=ksplit,
                 use_non_temporal_load=use_non_temporal_load,
-            ),
+            )
+        )
+        stage2_func = (
             functools.partial(
+                flydsl_moe_stage2,
+            )
+            if use_flydsl_stage2
+            else functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
-            ),
-            block_m,
+            )
+        )
+        if os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1":
+            logger.info("use_flydsl_stage2=%s", use_flydsl_stage2)
+            logger.info("use_flydsl_stage1=%s", use_flydsl_stage1)
+            logger.info("flydsl_block_m=%s", flydsl_block_m)
+            logger.info("stage1_func=%s", stage1_func)
+            logger.info("stage2_func=%s", stage2_func)
+            logger.info("block_m=%s", block_m)
+            logger.info("ksplit=%s", ksplit)
+            logger.info("run_1stage=%s", run_1stage)
+        return MOEMetadata(
+            stage1_func,
+            stage2_func,
+            flydsl_block_m if use_flydsl_stage1 else block_m,
             int(ksplit),
             run_1stage,
         )
@@ -902,12 +946,16 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    expert_mask: Optional[torch.Tensor] = None,
     num_local_tokens: Optional[torch.tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
     # following for cktile support
     hidden_pad=0,
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    use_flydsl: bool = False,
 ):
     quant_func = get_quant(quant_type)
     token_num_quant_moe_sort_switch = 1024
@@ -931,6 +979,31 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
     )
+
+    # SmoothQuant integration for FlyDSL int8 path:
+    # When using flydsl 2-stage, callers may pass per-expert smooth scales via a1_scale/a2_scale
+    # (shapes [E, model_dim] and [E, inter_dim] respectively). We must NOT pass these as "static"
+    # quant scales into per-token quant; instead:
+    # - stage1: build per-(token,slot) int8 X + per-(token,slot) scale_x
+    # - stage2: optionally apply smooth scale to a2 (per expert) before dynamic quantization.
+    is_flydsl_stage1 = getattr(metadata.stage1, "func", None) is flydsl_moe_stage1
+    smooth_a1 = None
+    smooth_a2 = None
+    if quant_type == QuantType.per_Token and is_flydsl_stage1:
+        if (
+            a1_scale is not None
+            and a1_scale.numel() == E * model_dim
+            and a1_scale.shape[-1] == model_dim
+        ):
+            smooth_a1 = a1_scale.view(E, model_dim).to(dtypes.fp32)
+            a1_scale = None
+        if (
+            a2_scale is not None
+            and a2_scale.numel() == E * inter_dim
+            and a2_scale.shape[-1] == inter_dim
+        ):
+            smooth_a2 = a2_scale.view(E, inter_dim).to(dtypes.fp32)
+            a2_scale = None
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -982,12 +1055,39 @@ def fused_moe_2stages(
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
-        a1, a1_scale = quant_func(
-            hidden_states,
-            scale=a1_scale,
-            quant_dtype=q_dtype_a,
-            num_rows=num_local_tokens,
-        )
+        if smooth_a1 is not None and q_dtype_a == dtypes.i8:
+            # Align with aiter asm path: use device kernel `moe_smoothquant_fwd` to build
+            # per-(token,slot) int8 activations + per-(token,slot) scale_x.
+            if topk_ids is None:
+                raise RuntimeError("FlyDSL int8smooth requires topk_ids")
+            # `moe_smoothquant_fwd` expects:
+            # - out: [token*topk, model_dim] int8
+            # - input: [token, model_dim] bf16/fp16
+            # - x_scale: [E, model_dim] (or [E,1,model_dim]) fp32
+            # - topk_ids: [token, topk] i32
+            # - y_scale: [token*topk] fp32
+            a1 = torch.empty(
+                (token_num * topk, model_dim), dtype=dtypes.i8, device=device
+            )
+            a1_scale = torch.empty((token_num * topk), dtype=dtypes.fp32, device=device)
+            topk_ids_sq = topk_ids
+            if expert_mask is not None and smooth_a1.shape[0] != expert_mask.numel():
+                topk_ids_sq = _get_local_expert_hash(expert_mask)[topk_ids_sq]
+
+            aiter.moe_smoothquant_fwd(
+                a1,
+                hidden_states,
+                smooth_a1.contiguous(),
+                topk_ids_sq.to(dtypes.i32),
+                a1_scale,
+            )
+        else:
+            a1, a1_scale = quant_func(
+                hidden_states,
+                scale=a1_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+            )
     else:
         assert (
             a1_scale is not None or quant_type == QuantType.No
@@ -1017,6 +1117,9 @@ def fused_moe_2stages(
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
+    if is_flydsl_stage1:
+        # FlyDSL stage1 needs the original token count (it may receive X already expanded to token*topk).
+        extra_stage1_args["tokens"] = token_num
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1091,13 +1194,51 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     else:
-        a2, a2_scale = quant_func(
-            a2,
-            scale=a2_scale,
-            quant_dtype=q_dtype_a,
-            num_rows=num_local_tokens,
-            num_rows_factor=topk,
-        )
+        if smooth_a2 is not None and q_dtype_a == dtypes.i8:
+            # Fuse stage2 SmoothQuant (scale select + mul + per-row dynamic quant) into ONE kernel.
+            # This avoids extra vectorized gather/copy/mul kernels that show up in profiling.
+            #
+            # Uses `smooth_per_token_scaled_quant`, which applies:
+            #   y = input * smooth_scale[smooth_scale_map[row]]
+            #   row_scale = max(abs(y)) / 127
+            #   out = round(y / row_scale)
+            #
+            # NOTE: `smooth_scale_map` is indexed by flattened row id (blockIdx.x), so the
+            # input layout must match `topk_ids` flatten order. For A2 we keep token-major:
+            #   row = token*topk + slot  (input is [token, topk, inter_dim] contiguous)
+            if topk_ids is None:
+                raise RuntimeError(
+                    "SmoothQuant stage2 requires topk_ids for smooth_scale_map"
+                )
+            a2_in = a2.view(token_num, topk, inter_dim).contiguous()
+            a2_out = torch.empty(
+                (token_num, topk, inter_dim), dtype=q_dtype_a, device=device
+            )
+            a2_scale = torch.empty(
+                (token_num, topk, 1), dtype=dtypes.fp32, device=device
+            )
+            topk_ids_sq2 = topk_ids
+            if expert_mask is not None and smooth_a2.shape[0] != expert_mask.numel():
+                topk_ids_sq2 = _get_local_expert_hash(expert_mask)[topk_ids_sq2]
+
+            aiter.smooth_per_token_scaled_quant(
+                a2_out,
+                a2_in,
+                a2_scale,
+                smooth_a2.contiguous(),
+                topk_ids_sq2.contiguous(),
+                num_rows=num_local_tokens,
+                num_rows_factor=topk,
+            )
+            a2 = a2_out
+        else:
+            a2, a2_scale = quant_func(
+                a2,
+                scale=a2_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+                num_rows_factor=topk,
+            )
         a2 = a2.view(token_num, topk, inter_dim)
 
     metadata.stage2(
@@ -1575,6 +1716,416 @@ def cktile_moe_stage1(
     return out
 
 
+# ---- FlyDSL compile/import caches (avoid per-call overhead) ----
+_FLYDSL_COMPILE_MOE_GEMM1 = None
+_FLYDSL_COMPILE_MOE_GEMM2 = None
+_FLYDSL_MOE_GEMM1_CACHE = {}
+_FLYDSL_MOE_GEMM2_CACHE = {}
+_FLYDSL_SCRATCH_CACHE = {}
+_LOCAL_EXPERT_HASH_CACHE = {}
+
+
+def _get_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
+    """Cache global->local expert id map for EP."""
+    key = (
+        int(expert_mask.device.index),
+        int(expert_mask.numel()),
+        int(expert_mask.data_ptr()),
+    )
+    cached = _LOCAL_EXPERT_HASH_CACHE.get(key)
+    if cached is not None and cached.device == expert_mask.device:
+        return cached
+    local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+    local_expert_hash[local_expert_hash > 0] -= 1
+    _LOCAL_EXPERT_HASH_CACHE[key] = local_expert_hash
+    return local_expert_hash
+
+
+def _get_flydsl_compile_fns():
+    global _FLYDSL_COMPILE_MOE_GEMM1, _FLYDSL_COMPILE_MOE_GEMM2
+    if _FLYDSL_COMPILE_MOE_GEMM1 is not None and _FLYDSL_COMPILE_MOE_GEMM2 is not None:
+        return _FLYDSL_COMPILE_MOE_GEMM1, _FLYDSL_COMPILE_MOE_GEMM2
+
+    import sys
+
+    DSL2_ROOT = os.environ.get("DSL2_ROOT", "/data/felix/dsl2")
+    FLIR_ROOT = os.environ.get("FLIR_ROOT", "/workspace/FLIR")
+    if DSL2_ROOT not in sys.path:
+        sys.path.insert(0, DSL2_ROOT)
+    if FLIR_ROOT not in sys.path:
+        sys.path.insert(0, FLIR_ROOT)
+    from kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2  # type: ignore
+
+    _FLYDSL_COMPILE_MOE_GEMM1 = compile_moe_gemm1
+    _FLYDSL_COMPILE_MOE_GEMM2 = compile_moe_gemm2
+    return _FLYDSL_COMPILE_MOE_GEMM1, _FLYDSL_COMPILE_MOE_GEMM2
+
+
+def flydsl_moe_stage1(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    block_m,
+    a1_scale,
+    w1_scale,
+    sorted_weights=None,
+    dtype=torch.bfloat16,
+    **_kwargs,
+):
+    if a1_scale is None or w1_scale is None:
+        raise RuntimeError("FlyDSL stage1 requires a1_scale and w1_scale")
+
+    # `tokens` is the original token count. For smoothquant int8 we may receive X already expanded
+    # to [tokens*topk, model_dim].
+    tokens = int(_kwargs.get("tokens", hidden_states.shape[0]))
+    token_num = tokens
+    E, _, model_dim = w1.shape
+    inter_dim = w2.shape[2]
+
+    # IMPORTANT: stage1/stage2 tile_m must match the sorting `block_m` used to build `sorted_*`.
+    # Allow env override only when it matches `block_m`.
+    tile_m = block_m if block_m is not None else 64
+    tile_m_env = int(os.environ.get("AITER_FLYDSL_MOE_TILE_M1", "0"))
+    if tile_m_env > 0 and tile_m_env % 16 == 0:
+        tile_m = tile_m_env
+        tile_m = 64
+    tile_n = int(os.environ.get("AITER_FLYDSL_MOE_TILE_N1", "128"))
+    tile_k = int(os.environ.get("AITER_FLYDSL_MOE_TILE_K1", "128"))
+    stage1_cshuffle = os.environ.get("AITER_FLYDSL_STAGE1_CSHUFFLE", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    sorted_size = int(sorted_ids.numel())
+    size_expert_ids_total = int(sorted_eids.numel())
+    blocks = int(size_expert_ids_total)
+
+    if sorted_weights is None:
+        sorted_w = torch.empty((0,), dtype=dtypes.fp32, device=sorted_ids.device)
+        doweight_stage1 = False
+    else:
+        sorted_w = sorted_weights
+        doweight_stage1 = True
+
+    debug_flydsl = os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1"
+    if debug_flydsl:
+        logger.info(
+            "[flydsl] stage1 inputs: tokens=%d topk=%d model_dim=%d inter_dim=%d block_m=%d",
+            token_num,
+            topk,
+            model_dim,
+            inter_dim,
+            tile_m,
+        )
+
+    # Infer in_dtype: fp8 / int8 / int8smooth (expanded X + per-route scale).
+    x_rows = int(hidden_states.shape[0])
+    is_token_slot = x_rows == (token_num * int(topk))
+    x_q = hidden_states.contiguous().view(x_rows, model_dim)
+    scale_x_1d = a1_scale.view(-1).contiguous()
+    w1_flat = w1.contiguous().view(E * (2 * inter_dim), model_dim)
+    w1_scale_1d = w1_scale.view(-1).contiguous()
+
+    compile_moe_gemm1, _compile_moe_gemm2 = _get_flydsl_compile_fns()
+
+    out_dtype = "bf16" if dtype == torch.bfloat16 else "f16"
+
+    # Optional: run stage1 with fp16 output (and optional CShuffle) then cast to bf16.
+    # This can be faster than bf16 output on some configs.
+    stage1_fp16_out = os.environ.get("AITER_FLYDSL_STAGE1_FP16_OUT", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    keep_fp16_for_stage2 = (
+        True  # hack here, bf16 out is slow. temp use fp16, todo fix bf16 atomic
+    )
+    out_kernel = out
+    out_dtype_kernel = out_dtype
+    if stage1_fp16_out and dtype == torch.bfloat16:
+        key_s = ("stage1_fp16_out", int(out.device.index), tuple(out.shape))
+        out_kernel = _FLYDSL_SCRATCH_CACHE.get(key_s)
+        if out_kernel is None or out_kernel.device != out.device:
+            out_kernel = torch.empty(out.shape, device=out.device, dtype=dtypes.fp16)
+            _FLYDSL_SCRATCH_CACHE[key_s] = out_kernel
+        out_kernel.zero_()
+        out_dtype_kernel = "f16"
+    if w1.dtype == dtypes.fp8:
+        in_dtype = "fp8"
+    elif w1.dtype == dtypes.i8:
+        in_dtype = "int8smooth" if is_token_slot else "int8"
+    else:
+        raise ValueError(f"FlyDSL stage1 unsupported w1 dtype: {w1.dtype}")
+
+    key1 = (
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        tile_m,
+        tile_n,
+        tile_k,
+        bool(doweight_stage1),
+        in_dtype,
+        out_dtype_kernel,
+        bool(stage1_cshuffle),  # use_cshuffle_epilog
+    )
+    exe1 = _FLYDSL_MOE_GEMM1_CACHE.get(key1)
+    if exe1 is None:
+        exe1 = compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=bool(doweight_stage1),
+            in_dtype=in_dtype,
+            out_dtype=out_dtype_kernel,
+            use_cshuffle_epilog=bool(stage1_cshuffle),
+        )
+        _FLYDSL_MOE_GEMM1_CACHE[key1] = exe1
+    exe1(
+        out_kernel,
+        x_q,
+        w1_flat,
+        scale_x_1d,
+        w1_scale_1d,
+        sorted_ids,
+        sorted_eids,
+        sorted_w.view(-1).contiguous(),
+        num_valid_ids,
+        token_num,
+        inter_dim,
+        model_dim,
+        int(blocks),
+    )
+    if out_kernel is not out:
+        if keep_fp16_for_stage2:
+            # Downstream stage2 smoothquant/quant will consume fp16 directly.
+            return out_kernel
+        out.copy_(out_kernel.to(dtypes.bf16))
+    return out
+
+
+# ---- FlyDSL compile/import caches (avoid per-call overhead) ----
+_FLYDSL_COMPILE_MOE_GEMM1 = None
+_FLYDSL_COMPILE_MOE_GEMM2 = None
+_FLYDSL_MOE_GEMM1_CACHE = {}
+_FLYDSL_MOE_GEMM2_CACHE = {}
+_FLYDSL_SCRATCH_CACHE = {}
+_LOCAL_EXPERT_HASH_CACHE = {}
+
+
+def _get_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
+    """Cache global->local expert id map for EP."""
+    key = (
+        int(expert_mask.device.index),
+        int(expert_mask.numel()),
+        int(expert_mask.data_ptr()),
+    )
+    cached = _LOCAL_EXPERT_HASH_CACHE.get(key)
+    if cached is not None and cached.device == expert_mask.device:
+        return cached
+    local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+    local_expert_hash[local_expert_hash > 0] -= 1
+    _LOCAL_EXPERT_HASH_CACHE[key] = local_expert_hash
+    return local_expert_hash
+
+
+def _get_flydsl_compile_fns():
+    global _FLYDSL_COMPILE_MOE_GEMM1, _FLYDSL_COMPILE_MOE_GEMM2
+    if _FLYDSL_COMPILE_MOE_GEMM1 is not None and _FLYDSL_COMPILE_MOE_GEMM2 is not None:
+        return _FLYDSL_COMPILE_MOE_GEMM1, _FLYDSL_COMPILE_MOE_GEMM2
+
+    import sys
+
+    DSL2_ROOT = os.environ.get("DSL2_ROOT", "/data/felix/dsl2")
+    FLIR_ROOT = os.environ.get("FLIR_ROOT", "/workspace/FLIR")
+    if DSL2_ROOT not in sys.path:
+        sys.path.insert(0, DSL2_ROOT)
+    if FLIR_ROOT not in sys.path:
+        sys.path.insert(0, FLIR_ROOT)
+    from kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2  # type: ignore
+
+    _FLYDSL_COMPILE_MOE_GEMM1 = compile_moe_gemm1
+    _FLYDSL_COMPILE_MOE_GEMM2 = compile_moe_gemm2
+    return _FLYDSL_COMPILE_MOE_GEMM1, _FLYDSL_COMPILE_MOE_GEMM2
+
+
+def flydsl_moe_stage1(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    block_m,
+    a1_scale,
+    w1_scale,
+    sorted_weights=None,
+    dtype=torch.bfloat16,
+    **_kwargs,
+):
+    if a1_scale is None or w1_scale is None:
+        raise RuntimeError("FlyDSL stage1 requires a1_scale and w1_scale")
+
+    # `tokens` is the original token count. For smoothquant int8 we may receive X already expanded
+    # to [tokens*topk, model_dim].
+    tokens = int(_kwargs.get("tokens", hidden_states.shape[0]))
+    token_num = tokens
+    E, _, model_dim = w1.shape
+    inter_dim = w2.shape[2]
+
+    # IMPORTANT: stage1/stage2 tile_m must match the sorting `block_m` used to build `sorted_*`.
+    # Allow env override only when it matches `block_m`.
+    tile_m = block_m if block_m is not None else 64
+    tile_m_env = int(os.environ.get("AITER_FLYDSL_MOE_TILE_M1", "0"))
+    if tile_m_env > 0 and tile_m_env % 16 == 0:
+        tile_m = tile_m_env
+        tile_m = 64
+    tile_n = int(os.environ.get("AITER_FLYDSL_MOE_TILE_N1", "128"))
+    tile_k = int(os.environ.get("AITER_FLYDSL_MOE_TILE_K1", "128"))
+    stage1_cshuffle = os.environ.get("AITER_FLYDSL_STAGE1_CSHUFFLE", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    sorted_size = int(sorted_ids.numel())
+    size_expert_ids_total = int(sorted_eids.numel())
+    blocks = int(size_expert_ids_total)
+
+    if sorted_weights is None:
+        sorted_w = torch.empty((0,), dtype=dtypes.fp32, device=sorted_ids.device)
+        doweight_stage1 = False
+    else:
+        sorted_w = sorted_weights
+        doweight_stage1 = True
+
+    debug_flydsl = os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1"
+    if debug_flydsl:
+        logger.info(
+            "[flydsl] stage1 inputs: tokens=%d topk=%d model_dim=%d inter_dim=%d block_m=%d",
+            token_num,
+            topk,
+            model_dim,
+            inter_dim,
+            tile_m,
+        )
+
+    # Infer in_dtype: fp8 / int8 / int8smooth (expanded X + per-route scale).
+    x_rows = int(hidden_states.shape[0])
+    is_token_slot = x_rows == (token_num * int(topk))
+    x_q = hidden_states.contiguous().view(x_rows, model_dim)
+    scale_x_1d = a1_scale.view(-1).contiguous()
+    w1_flat = w1.contiguous().view(E * (2 * inter_dim), model_dim)
+    w1_scale_1d = w1_scale.view(-1).contiguous()
+
+    compile_moe_gemm1, _compile_moe_gemm2 = _get_flydsl_compile_fns()
+
+    out_dtype = "bf16" if dtype == torch.bfloat16 else "f16"
+
+    # Optional: run stage1 with fp16 output (and optional CShuffle) then cast to bf16.
+    # This can be faster than bf16 output on some configs.
+    stage1_fp16_out = os.environ.get("AITER_FLYDSL_STAGE1_FP16_OUT", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    keep_fp16_for_stage2 = (
+        True  # hack here, bf16 out is slow. temp use fp16, todo fix bf16 atomic
+    )
+    out_kernel = out
+    out_dtype_kernel = out_dtype
+    if stage1_fp16_out and dtype == torch.bfloat16:
+        key_s = ("stage1_fp16_out", int(out.device.index), tuple(out.shape))
+        out_kernel = _FLYDSL_SCRATCH_CACHE.get(key_s)
+        if out_kernel is None or out_kernel.device != out.device:
+            out_kernel = torch.empty(out.shape, device=out.device, dtype=dtypes.fp16)
+            _FLYDSL_SCRATCH_CACHE[key_s] = out_kernel
+        out_kernel.zero_()
+        out_dtype_kernel = "f16"
+    if w1.dtype == dtypes.fp8:
+        in_dtype = "fp8"
+    elif w1.dtype == dtypes.i8:
+        in_dtype = "int8smooth" if is_token_slot else "int8"
+    else:
+        raise ValueError(f"FlyDSL stage1 unsupported w1 dtype: {w1.dtype}")
+
+    key1 = (
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        tile_m,
+        tile_n,
+        tile_k,
+        bool(doweight_stage1),
+        in_dtype,
+        out_dtype_kernel,
+        bool(stage1_cshuffle),  # use_cshuffle_epilog
+    )
+    exe1 = _FLYDSL_MOE_GEMM1_CACHE.get(key1)
+    if exe1 is None:
+        exe1 = compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=bool(doweight_stage1),
+            in_dtype=in_dtype,
+            out_dtype=out_dtype_kernel,
+            use_cshuffle_epilog=bool(stage1_cshuffle),
+        )
+        _FLYDSL_MOE_GEMM1_CACHE[key1] = exe1
+    exe1(
+        out_kernel,
+        x_q,
+        w1_flat,
+        scale_x_1d,
+        w1_scale_1d,
+        sorted_ids,
+        sorted_eids,
+        sorted_w.view(-1).contiguous(),
+        num_valid_ids,
+        token_num,
+        inter_dim,
+        model_dim,
+        int(blocks),
+    )
+    if out_kernel is not out:
+        if keep_fp16_for_stage2:
+            # Downstream stage2 smoothquant/quant will consume fp16 directly.
+            return out_kernel
+        out.copy_(out_kernel.to(dtypes.bf16))
+    return out
+
+
 def cktile_moe_stage2(
     a2,
     w1,
@@ -1623,6 +2174,287 @@ def cktile_moe_stage2(
         activation,
         block_m,
     )
+    return out
+
+
+def flydsl_moe_stage2(
+    a2,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    w2_scale,
+    a2_scale,
+    block_m,
+    sorted_weights=None,
+    **_kwargs,
+):
+    if w2_scale is None or a2_scale is None:
+        raise RuntimeError("FlyDSL stage2 requires a2_scale and w2_scale")
+
+    token_num, _, inter_dim = a2.shape
+    model_dim = w2.shape[1]
+    E = w2.shape[0]
+
+    tile_m = block_m if block_m is not None else 64
+    tile_m_env = int(os.environ.get("AITER_FLYDSL_MOE_TILE_M2", "0"))
+    if tile_m_env > 0 and tile_m_env % 16 == 0:
+        tile_m = tile_m_env
+    tile_n = int(os.environ.get("AITER_FLYDSL_MOE_TILE_N2", "256"))
+    tile_k = int(os.environ.get("AITER_FLYDSL_MOE_TILE_K2", "128"))
+    stage2_cshuffle = os.environ.get("AITER_FLYDSL_STAGE2_CSHUFFLE", "1") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    sorted_size = int(sorted_ids.numel())
+    size_expert_ids_total = int(sorted_eids.numel())
+    blocks = int(size_expert_ids_total)
+
+    if sorted_weights is None:
+        sorted_w = torch.zeros(
+            sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device
+        )
+    else:
+        sorted_w = sorted_weights
+
+    # Optional: avoid global atomics in stage2 by writing per-(token,slot) output and reducing.
+    # This is often faster for large topk / EP, and also reduces atomic contention.
+    # Support both legacy no_atomics (torch.sum) and new compile_moe_gemm2_ex (FlyDSL reduce kernel).
+    no_atomics = os.environ.get("AITER_FLYDSL_STAGE2_NO_ATOMICS", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    # New env var: use compile_moe_gemm2_ex with mode selection (AUTO/ATOMIC/REDUCE).
+    use_gemm2_ex = os.environ.get("AITER_FLYDSL_USE_GEMM2_EX", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    gemm2_mode = os.environ.get("AITER_FLYDSL_GEMM2_MODE", "AUTO").upper().strip()
+
+    a2_qt_flat = a2.contiguous().view(-1)
+    a2_scale_1d = a2_scale.view(-1).contiguous()
+    w2_flat = w2.contiguous().view(E * model_dim, inter_dim)
+    w2_scale_1d = w2_scale.view(-1).contiguous()
+
+    # NOTE: FlyDSL stage2 uses global atomics; keep output dtype consistent with `out`.
+    _compile_moe_gemm1, compile_moe_gemm2 = _get_flydsl_compile_fns()
+
+    if out.dtype == dtypes.bf16:
+        out_dtype = "bf16"
+    elif out.dtype == dtypes.fp16:
+        out_dtype = "fp16"
+    elif out.dtype == dtypes.fp32:
+        out_dtype = "f32"
+    else:
+        raise ValueError(
+            f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
+        )
+
+    # Optional fast path: run fp16 atomics then cast to bf16.
+    # This can be significantly faster than bf16 global atomics on some configs.
+    use_fp16_out = (
+        os.environ.get("AITER_FLYDSL_STAGE2_FP16_OUT", "0")
+        in ("1", "true", "True", "YES", "yes")
+        and out.dtype == dtypes.bf16
+        and not no_atomics
+        and not use_gemm2_ex  # compile_moe_gemm2_ex handles dtype internally
+    )
+    out_kernel = out
+    out_dtype_kernel = out_dtype
+    if use_fp16_out:
+        # Reuse fp16 scratch to avoid per-iter allocation overhead.
+        key_s = ("stage2_fp16_out", int(out.device.index), tuple(out.shape))
+        out_kernel = _FLYDSL_SCRATCH_CACHE.get(key_s)
+        if out_kernel is None or out_kernel.device != out.device:
+            out_kernel = torch.empty(out.shape, device=out.device, dtype=dtypes.fp16)
+            _FLYDSL_SCRATCH_CACHE[key_s] = out_kernel
+        out_kernel.zero_()
+        out_dtype_kernel = "fp16"
+    if w2.dtype == dtypes.fp8:
+        in_dtype = "fp8"
+    elif w2.dtype == dtypes.i8:
+        in_dtype = "int8"
+    else:
+        raise ValueError(f"FlyDSL stage2 unsupported w2 dtype: {w2.dtype}")
+
+    # Use compile_moe_gemm2_ex when requested (supports both atomic and reduce modes).
+    if use_gemm2_ex:
+        # Import at runtime to avoid circular dependency issues.
+        try:
+            from kernels.moe_gemm_2stage import compile_moe_gemm2_ex, MoeGemm2Mode
+        except ImportError:
+            logger.warning(
+                "AITER_FLYDSL_USE_GEMM2_EX=1 but compile_moe_gemm2_ex not available. "
+                "Falling back to compile_moe_gemm2."
+            )
+            use_gemm2_ex = False
+
+    if use_gemm2_ex:
+        # Map env var to MoeGemm2Mode enum.
+        if gemm2_mode == "ATOMIC":
+            mode_val = MoeGemm2Mode.ATOMIC
+        elif gemm2_mode == "REDUCE":
+            mode_val = MoeGemm2Mode.REDUCE
+        else:
+            mode_val = MoeGemm2Mode.AUTO
+
+        key2_ex = (
+            "gemm2_ex",
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            tile_m,
+            tile_n,
+            tile_k,
+            bool(sorted_weights is not None),
+            in_dtype,
+            out_dtype_kernel,
+            bool(stage2_cshuffle),
+            mode_val,
+        )
+        exe2 = _FLYDSL_MOE_GEMM2_CACHE.get(key2_ex)
+        if exe2 is None:
+            exe2 = compile_moe_gemm2_ex(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=E,
+                topk=topk,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                doweight_stage2=bool(sorted_weights is not None),
+                in_dtype=in_dtype,
+                out_dtype=out_dtype_kernel,
+                use_cshuffle_epilog=bool(stage2_cshuffle),
+                mode=mode_val,
+                tokens_hint=token_num,
+            )
+            _FLYDSL_MOE_GEMM2_CACHE[key2_ex] = exe2
+
+        # Launch kernel (wrapper handles atomic vs reduce internally).
+        exe2(
+            out_kernel if not use_fp16_out else out_kernel,
+            a2_qt_flat,
+            w2_flat.view(-1),
+            a2_scale_1d,
+            w2_scale_1d,
+            sorted_ids,
+            sorted_eids,
+            sorted_w.view(-1).contiguous(),
+            num_valid_ids,
+            token_num,
+            model_dim,
+            inter_dim,
+            int(blocks),
+        )
+        if use_fp16_out:
+            out.copy_(out_kernel.to(dtypes.bf16))
+        return out
+
+    # Legacy path: use compile_moe_gemm2 with accumulate flag.
+    key2 = (
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        tile_m,
+        tile_n,
+        tile_k,
+        bool(sorted_weights is not None),
+        in_dtype,
+        out_dtype_kernel,
+        bool(not no_atomics),
+        bool(stage2_cshuffle),
+    )
+    exe2 = _FLYDSL_MOE_GEMM2_CACHE.get(key2)
+    if exe2 is None:
+        exe2 = compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=bool(sorted_weights is not None),
+            in_dtype=in_dtype,
+            out_dtype=out_dtype_kernel,
+            accumulate=not no_atomics,
+            use_cshuffle_epilog=bool(stage2_cshuffle),
+        )
+        _FLYDSL_MOE_GEMM2_CACHE[key2] = exe2
+    if not no_atomics:
+        exe2(
+            out_kernel,
+            a2_qt_flat,
+            w2_flat.view(-1),
+            a2_scale_1d,
+            w2_scale_1d,
+            sorted_ids,
+            sorted_eids,
+            sorted_w.view(-1).contiguous(),
+            num_valid_ids,
+            token_num,
+            model_dim,
+            inter_dim,
+            int(blocks),
+        )
+        if use_fp16_out:
+            out.copy_(out_kernel.to(dtypes.bf16))
+        return out
+
+    # Scatter per-(token,slot) output then reduce over topk on the host side (legacy torch.sum path).
+    # IMPORTANT: scatter mode does not use atomics and may not write every element
+    # (e.g. masked/fake expert rows). Zero-init to keep unwritten entries deterministic.
+    key_s = (
+        "stage2_scatter_slots",
+        int(out.device.index),
+        tuple((token_num, topk, model_dim)),
+        str(out.dtype),
+    )
+    out_slots = _FLYDSL_SCRATCH_CACHE.get(key_s)
+    if (
+        out_slots is None
+        or out_slots.device != out.device
+        or out_slots.dtype != out.dtype
+    ):
+        out_slots = torch.empty(
+            (token_num, topk, model_dim), device=out.device, dtype=out.dtype
+        )
+        _FLYDSL_SCRATCH_CACHE[key_s] = out_slots
+    out_slots.zero_()
+    exe2(
+        out_slots.view(-1),
+        a2_qt_flat,
+        w2_flat.view(-1),
+        a2_scale_1d,
+        w2_scale_1d,
+        sorted_ids,
+        sorted_eids,
+        sorted_w.view(-1).contiguous(),
+        num_valid_ids,
+        token_num,
+        model_dim,
+        inter_dim,
+        int(blocks),
+    )
+    out.copy_(out_slots.sum(dim=1, dtype=torch.float32).to(out.dtype))
     return out
 
 
