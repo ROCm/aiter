@@ -152,20 +152,23 @@ def check_common_skip_conditions(
     kv_len: int,
     qo_len: int,
     contiguous_kv: bool,
+    return_lse: bool = False,
 ) -> bool:
     """
     Check common skip conditions shared across test functions.
     Returns True if test should be skipped.
     """
-    if skip_test_if(
-        is_input_fp8 and dtype != torch.bfloat16,
-        "FP8 tests use BF16 reference dtype only",
-    ):
-        return True
 
     if skip_test_if(
         causal and kv_len < qo_len,
         "kv_len < qo_len is not allowed if causal=True",
+    ):
+        return True
+
+    # FP8 is inference-only, no backward pass needed, so LSE is not required
+    if skip_test_if(
+        is_input_fp8 and return_lse,
+        "FP8 is inference-only, LSE not needed for backward pass",
     ):
         return True
 
@@ -224,13 +227,14 @@ def build_q_tensor_for_test(
     is_input_fp8: bool,
 ):
     """Build Q tensor, handling both FP8 and non-FP8 cases."""
+    # Use actual sum of qo_lens as total_q_tokens for correct shape
+    total_q_tokens = torch.sum(qo_lens).item()
     if is_input_fp8:
-        total_q_tokens = torch.sum(qo_lens).item()
         return torch.rand(
             total_q_tokens, num_qo_heads, head_dim, device="cuda", dtype=dtype
         )
     return build_q_tensor(
-        batch_size * qo_len, num_qo_heads, head_dim, dtype, q_init_min, q_init_max
+        total_q_tokens, num_qo_heads, head_dim, dtype, q_init_min, q_init_max
     )
 
 
@@ -294,7 +298,24 @@ def ref_masked_attention(
     causal: bool = False,
     window_left: int = -1,
     logits_soft_cap: float = 0.0,
+    return_lse: bool = False,
 ) -> torch.Tensor:
+    """
+    Reference implementation of masked attention.
+
+    Args:
+        query: [seqlen_q, num_heads, head_dim]
+        key: [seqlen_k, num_heads, head_dim]
+        value: [seqlen_k, num_heads, head_dim]
+        causal: whether to use causal mask
+        window_left: left window size for sliding window attention
+        logits_soft_cap: soft cap for logits (0.0 = disabled)
+        return_lse: whether to return log-sum-exp values
+
+    Returns:
+        If return_lse=False: output [seqlen_q, num_heads, head_dim]
+        If return_lse=True: (output, lse) where lse is [num_heads, seqlen_q]
+    """
     if causal:
         window_size = (window_left, 0)
     else:
@@ -305,7 +326,9 @@ def ref_masked_attention(
     seqlen_k = key.shape[0]
     scale = 1.0 / math.sqrt(head_dim)
 
+    # Compute scaled attention scores: [num_heads, seqlen_q, seqlen_k]
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
+
     if 0 < logits_soft_cap:
         mode = int(os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0))
         if mode == 0:
@@ -323,12 +346,22 @@ def ref_masked_attention(
             device=query.device,
         )
         attn_weights.masked_fill_(local_mask, float("-inf"))
+
+    # Compute LSE before softmax using torch.logsumexp
+    # This correctly handles fully-masked rows (all -inf) by returning -inf instead of nan
+    if return_lse:
+        # attn_weights: [num_heads, seqlen_q, seqlen_k]
+        lse = torch.logsumexp(attn_weights, dim=-1)  # [H, Q]
+
     attn_weights = torch.softmax(attn_weights, dim=-1)
     if window_size[0] >= 0 or window_size[1] >= 0:
         attn_weights = attn_weights.masked_fill(
             torch.all(local_mask, dim=-1, keepdim=True), 0.0
         )
     out = torch.einsum("hqk,khd->qhd", attn_weights, value.float())
+
+    if return_lse:
+        return out.to(query), lse.float()
     return out.to(query)
 
 
@@ -480,8 +513,20 @@ def build_reference_output(
     dtype,
     causal,
     logits_soft_cap,
+    return_lse=False,
 ):
+    """
+    Build reference output (and optionally LSE) for batch prefill.
+
+    Args:
+        return_lse: If True, also return LSE values.
+
+    Returns:
+        If return_lse=False: output tensor [total_q, num_heads, head_dim]
+        If return_lse=True: (output, lse) where lse is [total_q, num_heads]
+    """
     o_ref_list = []
+    lse_ref_list = []
     for i in range(len(q_indptr_cpu) - 1):
         perm_dims = [0, 1, 2, 3]
         perm_dims_last = [0, 1, 2]
@@ -512,11 +557,26 @@ def build_reference_output(
             ratio = qi.shape[1] // num_kv_heads
             ki = ki.repeat_interleave(ratio, dim=1)
             vi = vi.repeat_interleave(ratio, dim=1)
-        o_ref_list.append(
-            ref_masked_attention(
-                qi, ki, vi, causal=causal, logits_soft_cap=logits_soft_cap
-            )
+
+        result = ref_masked_attention(
+            qi,
+            ki,
+            vi,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            return_lse=return_lse,
         )
+        if return_lse:
+            o_ref_list.append(result[0])
+            # ref_masked_attention returns lse as [num_heads, seqlen_q]
+            # kernel also returns [num_heads, total_q], so no transpose needed
+            lse_ref_list.append(result[1])
+        else:
+            o_ref_list.append(result)
+
+    if return_lse:
+        # Concatenate along the seqlen dimension (dim=1 for [num_heads, seqlen_q])
+        return torch.cat(o_ref_list, dim=0), torch.cat(lse_ref_list, dim=1)
     return torch.cat(o_ref_list, dim=0)
 
 
@@ -527,6 +587,37 @@ def assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol):
         torch.testing.assert_close(
             out[start:end], o_ref[start:end], rtol=rtol, atol=atol
         )
+
+
+def assert_lse_matches_reference(
+    lse_kernel: torch.Tensor,
+    lse_ref: torch.Tensor,
+    rtol: float = 1e-3,
+    atol: float = 1e-3,
+):
+    """
+    Compare kernel LSE output against reference LSE.
+
+    Both should be [total_q, num_heads] and float32.
+    Uses same tolerance logic as CK's fmha_fwd_runner.hpp.
+    """
+    assert (
+        lse_kernel.shape == lse_ref.shape
+    ), f"LSE shape mismatch: kernel={lse_kernel.shape}, ref={lse_ref.shape}"
+    assert (
+        lse_kernel.dtype == torch.float32
+    ), f"Kernel LSE should be float32, got {lse_kernel.dtype}"
+    assert (
+        lse_ref.dtype == torch.float32
+    ), f"Reference LSE should be float32, got {lse_ref.dtype}"
+
+    # CK's check_err with allow_infinity_ref=true
+    torch.testing.assert_close(
+        lse_kernel,
+        lse_ref,
+        rtol=rtol,
+        atol=atol,
+    )
 
 
 @pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
@@ -549,6 +640,7 @@ def assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol):
 @pytest.mark.parametrize("kv_init_min,kv_init_max", [(-5, 5)])
 @pytest.mark.parametrize("kv_dim", [4, 3])
 @pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("seed", [19378])
 def test_batch_prefill_page_size_1_linear_sglang(
     input_dtype,
@@ -567,6 +659,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
     kv_init_max,
     kv_dim,
     contiguous_kv,
+    return_lse,
     seed,
 ):
     if seed is not None:
@@ -579,7 +672,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
 
     # Skip conditions
     if check_common_skip_conditions(
-        is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv
+        is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv, return_lse
     ):
         return
     if check_layout_skip_conditions(
@@ -640,7 +733,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
     max_kv_len = torch.max(kv_lens).item()
 
     # Build reference output (shared between FP8 and non-FP8)
-    o_ref = build_reference_output(
+    ref_result = build_reference_output(
         q,
         q_indptr_cpu,
         kv_cache["kv_data_fp32"],
@@ -652,7 +745,13 @@ def test_batch_prefill_page_size_1_linear_sglang(
         dtype,
         causal,
         logits_soft_cap,
+        return_lse=return_lse,
     )
+    if return_lse:
+        o_ref, lse_ref = ref_result
+    else:
+        o_ref = ref_result
+        lse_ref = None
 
     if is_input_fp8:
         q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
@@ -689,6 +788,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
                 "linear",
             )
 
+        # Note: FP8 is inference-only, LSE not needed
         out_fp8 = aiter.mha_batch_prefill_func(
             q_quant,
             k_cache_fp8,
@@ -748,7 +848,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
         assert k_cache.is_contiguous() == contiguous_kv
         assert v_cache.is_contiguous() == contiguous_kv
 
-        out = aiter.mha_batch_prefill_func(
+        kernel_result = aiter.mha_batch_prefill_func(
             q,
             k_cache,
             v_cache,
@@ -760,9 +860,20 @@ def test_batch_prefill_page_size_1_linear_sglang(
             causal=causal,
             logits_soft_cap=logits_soft_cap,
             kv_last_page_lens=kv_last_page_len_gpu,
+            return_lse=return_lse,
         )
+        if return_lse:
+            out, lse_kernel = kernel_result
+        else:
+            out = kernel_result
+            lse_kernel = None
+
         rtol, atol = get_tolerances(dtype)
         assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
+
+        # Compare LSE if requested
+        if return_lse:
+            assert_lse_matches_reference(lse_kernel, lse_ref)
 
 
 @pytest.mark.parametrize("kvcache_layout", ["linear", "vectorized"])
@@ -789,6 +900,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
 @pytest.mark.parametrize("q_init_min,q_init_max", [(-10, 10)])
 @pytest.mark.parametrize("kv_init_min,kv_init_max", [(-5, 5)])
 @pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize("seed", [19378])
 def test_batch_prefill(
     kvcache_layout,
@@ -809,6 +921,7 @@ def test_batch_prefill(
     kv_init_min,
     kv_init_max,
     contiguous_kv,
+    return_lse,
     seed,
     profile=False,
 ):
@@ -821,7 +934,7 @@ def test_batch_prefill(
 
     # Skip conditions
     if check_common_skip_conditions(
-        is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv
+        is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv, return_lse
     ):
         return {"status": "skipped"}
     if check_layout_skip_conditions(
@@ -895,7 +1008,7 @@ def test_batch_prefill(
         seqlen_k_gpu = kv_lens.to(0).int()
 
     # Build reference output (shared between FP8 and non-FP8)
-    o_ref = build_reference_output(
+    ref_result = build_reference_output(
         q,
         q_indptr_cpu,
         kv_cache["kv_data_fp32"],
@@ -907,7 +1020,13 @@ def test_batch_prefill(
         dtype,
         causal,
         logits_soft_cap,
+        return_lse=return_lse,
     )
+    if return_lse:
+        o_ref, lse_ref = ref_result
+    else:
+        o_ref = ref_result
+        lse_ref = None
 
     profile_result = {"status": "passed"}
 
@@ -939,6 +1058,7 @@ def test_batch_prefill(
         )
 
         # Run FP8 kernel (with optional profiling)
+        # Note: FP8 is inference-only, LSE not needed
         fp8_result = run_ck(
             batch_size,
             num_kv_heads,
@@ -1009,7 +1129,7 @@ def test_batch_prefill(
             assert k_cache.is_contiguous() == contiguous_kv
             assert v_cache.is_contiguous() == contiguous_kv
 
-        # Run kernel (with optional profiling)
+        # Run kernel (with optional profiling and LSE)
         run_result = run_ck(
             batch_size,
             num_kv_heads,
@@ -1027,15 +1147,28 @@ def test_batch_prefill(
             block_table=block_table_gpu,
             seqlen_k=seqlen_k_gpu,
             profile=profile,
+            return_lse=return_lse,
         )
         if profile:
-            out, time_us, tflops = run_result
+            if return_lse:
+                out, lse_kernel, time_us, tflops = run_result
+            else:
+                out, time_us, tflops = run_result
+                lse_kernel = None
             profile_result = {"status": "passed", "time_us": time_us, "tflops": tflops}
         else:
-            out = run_result
+            if return_lse:
+                out, lse_kernel = run_result
+            else:
+                out = run_result
+                lse_kernel = None
 
         rtol, atol = get_tolerances(dtype)
         assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
+
+        # Compare LSE if requested
+        if return_lse:
+            assert_lse_matches_reference(lse_kernel, lse_ref)
 
     # Suppress return value in pytest to avoid PytestReturnNotNoneWarning
     if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -1098,13 +1231,16 @@ def run_ck(
     block_table=None,
     seqlen_k=None,
     profile=False,
+    return_lse=False,
 ):
     """
-    Run CK kernel with optional profiling.
+    Run CK kernel with optional profiling and LSE output.
 
     Returns:
-        If profile=False: out tensor
-        If profile=True: (out tensor, time_us, tflops)
+        If profile=False and return_lse=False: out tensor
+        If profile=False and return_lse=True: (out tensor, lse tensor)
+        If profile=True and return_lse=False: (out tensor, time_us, tflops)
+        If profile=True and return_lse=True: (out tensor, lse tensor, time_us, tflops)
     """
     kernel_args = (
         q,
@@ -1126,10 +1262,11 @@ def run_ck(
         kv_last_page_lens=kv_last_page_lens,
         block_table=block_table,
         seqlen_k=seqlen_k,
+        return_lse=return_lse,
     )
 
     if profile:
-        out, time_us = profile_func(
+        result, time_us = profile_func(
             aiter.mha_batch_prefill_func, *kernel_args, **kernel_kwargs
         )
         nheads_q = q.shape[1]
@@ -1145,10 +1282,14 @@ def run_ck(
             causal,
         )
         tflops = efficiency(total_flops, time_us)
-        return out, time_us, tflops
+        if return_lse:
+            out, lse = result
+            return out, lse, time_us, tflops
+        else:
+            return result, time_us, tflops
     else:
-        out = aiter.mha_batch_prefill_func(*kernel_args, **kernel_kwargs)
-        return out
+        result = aiter.mha_batch_prefill_func(*kernel_args, **kernel_kwargs)
+        return result
 
 
 def vectorize_kv_cache(
@@ -1566,7 +1707,10 @@ def test_batch_prefill_kv_blockscale_pytest(
     table_layout,
     logits_soft_cap,
 ):
-    """Pytest wrapper for KV_BLOCKSCALE test."""
+    """Pytest wrapper for KV_BLOCKSCALE test.
+
+    Note: LSE testing is not included because FP8 is inference-only (no backward pass).
+    """
     if skip_test_if(
         should_skip_rocm72_issue(causal, logits_soft_cap),
         "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
@@ -1943,6 +2087,14 @@ parser.add_argument(
     action="store_true",
     help="Enable profiling mode",
 )
+parser.add_argument(
+    "--return_lse",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""Enable LSE (log-sum-exp) output and comparison with reference.
+    e.g.: --return_lse true""",
+)
 
 
 if __name__ == "__main__":
@@ -1959,6 +2111,7 @@ if __name__ == "__main__":
         input_dtype,
         quant_method,
         contiguous_kv,
+        return_lse,
     ) in itertools.product(
         args.pagesize,
         args.causal,
@@ -1969,6 +2122,7 @@ if __name__ == "__main__":
         args.input_dtype,
         args.quant_method,
         [True, False],  # contiguous_kv
+        args.return_lse,
     ):
         # Validate quant_method and input_dtype combinations:
         # - fp16/bf16 must use quant_method="none"
@@ -2023,6 +2177,7 @@ if __name__ == "__main__":
                 contiguous_kv=contiguous_kv,
                 seed=19378,
                 profile=args.profile,
+                return_lse=return_lse,
             )
 
         # Build result row
@@ -2041,6 +2196,7 @@ if __name__ == "__main__":
             "causal": causal,
             "soft_cap": logits_soft_cap,
             "contig": contiguous_kv,
+            "lse": "-" if input_dtype == "fp8" else return_lse,
             "status": result.get("status", "passed") if result else "passed",
             "time_us": f"{time_us:.2f}" if time_us is not None else "-",
             "tflops": f"{tflops:.2f}" if tflops is not None else "-",

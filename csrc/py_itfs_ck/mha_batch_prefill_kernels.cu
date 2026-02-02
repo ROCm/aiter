@@ -387,11 +387,11 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         TORCH_CHECK(kv_block_descale_tensor.stride(-1) == 1,
                     "kv_block_descale must have contiguous last dimension");
 
-        args.kv_block_descale_ptr          = kv_block_descale_tensor.data_ptr();
+        args.kv_block_descale_ptr           = kv_block_descale_tensor.data_ptr();
         // Strides: [num_block, num_kv_head, 2]
-        args.kv_block_descale_stride_block = kv_block_descale_tensor.stride(0);
-        args.kv_block_descale_stride_head  = kv_block_descale_tensor.stride(1);
-        args.kv_block_descale_stride_kv    = kv_block_descale_tensor.stride(2);
+        args.nblock_stride_kv_block_descale = kv_block_descale_tensor.stride(0);
+        args.nhead_stride_kv_block_descale  = kv_block_descale_tensor.stride(1);
+        args.kv_stride_kv_block_descale     = kv_block_descale_tensor.stride(2);
     }
 
     return args;
