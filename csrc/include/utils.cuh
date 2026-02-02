@@ -149,20 +149,20 @@ struct L2Flusher {
     float* buf;
 
     L2Flusher() : buf(nullptr) {
-        CHECK_HIP(hipMalloc(&buf, FLUSH_SIZE * sizeof(float)));
-        CHECK_HIP(hipMemset(buf, 0, FLUSH_SIZE * sizeof(float)));
+        HIP_CALL(hipMalloc(&buf, FLUSH_SIZE * sizeof(float)));
+        HIP_CALL(hipMemset(buf, 0, FLUSH_SIZE * sizeof(float)));
     }
 
     ~L2Flusher() {
         if (buf)
-            CHECK_HIP(hipFree(buf));
+            HIP_CALL(hipFree(buf));
     }
 
     void flush() {
         int block_size = 256;
         int num_blocks = (FLUSH_SIZE + block_size - 1) / block_size;
         flush_l2_kernel<<<num_blocks, block_size>>>(buf, FLUSH_SIZE);
-        CHECK_HIP(hipDeviceSynchronize());
+        HIP_CALL(hipDeviceSynchronize());
     }
 };
 
@@ -194,23 +194,23 @@ struct BenchTimer {
     hipEvent_t start, stop;
 
     BenchTimer() {
-        CHECK_HIP(hipEventCreate(&start));
-        CHECK_HIP(hipEventCreate(&stop));
+        HIP_CALL(hipEventCreate(&start));
+        HIP_CALL(hipEventCreate(&stop));
     }
 
     ~BenchTimer() {
-        CHECK_HIP(hipEventDestroy(start));
-        CHECK_HIP(hipEventDestroy(stop));
+        HIP_CALL(hipEventDestroy(start));
+        HIP_CALL(hipEventDestroy(stop));
     }
 
-    void record_start() { CHECK_HIP(hipEventRecord(start)); }
+    void record_start() { HIP_CALL(hipEventRecord(start)); }
 
-    void record_stop() { CHECK_HIP(hipEventRecord(stop)); }
+    void record_stop() { HIP_CALL(hipEventRecord(stop)); }
 
     float elapsed_ms() {
-        CHECK_HIP(hipEventSynchronize(stop));
+        HIP_CALL(hipEventSynchronize(stop));
         float ms = 0.0f;
-        CHECK_HIP(hipEventElapsedTime(&ms, start, stop));
+        HIP_CALL(hipEventElapsedTime(&ms, start, stop));
         return ms;
     }
 };
@@ -312,21 +312,21 @@ struct HostProfiler {
     HostProfiler(int num_blocks_, int max_entries_per_block_)
         : num_blocks(num_blocks_), max_entries_per_block(max_entries_per_block_) {
         buffer_size = num_blocks * (1 + max_entries_per_block * 4) * sizeof(int64_t);
-        CHECK_HIP(hipMalloc(&d_buffer, buffer_size));
-        CHECK_HIP(hipMemset(d_buffer, 0, buffer_size));
+        HIP_CALL(hipMalloc(&d_buffer, buffer_size));
+        HIP_CALL(hipMemset(d_buffer, 0, buffer_size));
         h_buffer = (int64_t*)malloc(buffer_size);
     }
 
     ~HostProfiler() {
         if (d_buffer)
-            CHECK_HIP(hipFree(d_buffer));
+            HIP_CALL(hipFree(d_buffer));
         if (h_buffer)
             free(h_buffer);
     }
 
     int64_t* device_ptr() { return d_buffer; }
 
-    void download() { CHECK_HIP(hipMemcpy(h_buffer, d_buffer, buffer_size, hipMemcpyDeviceToHost)); }
+    void download() { HIP_CALL(hipMemcpy(h_buffer, d_buffer, buffer_size, hipMemcpyDeviceToHost)); }
 
     void print_summary() {
         download();

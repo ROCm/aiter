@@ -54,12 +54,12 @@ struct MHCLayerWeights {
         expansion_rate = n;
         dynamic_h = use_dynamic;
 
-        CHECK_CUDA(hipMalloc(&rmsnorm_weight, C * sizeof(floatX)));
+        HIP_CALL(hipMalloc(&rmsnorm_weight, C * sizeof(floatX)));
 
         if (dynamic_h) {
             int nC = n * C;
             int total_H_dim = n + n + n * n;
-            CHECK_CUDA(hipMalloc(&phi_combined, total_H_dim * nC * sizeof(floatX)));
+            HIP_CALL(hipMalloc(&phi_combined, total_H_dim * nC * sizeof(floatX)));
             phi_pre = phi_combined;
             phi_post = phi_combined + n * nC;
             phi_res = phi_combined + 2 * n * nC;
@@ -70,9 +70,9 @@ struct MHCLayerWeights {
             phi_res = nullptr;
         }
 
-        CHECK_CUDA(hipMalloc(&b_pre, n * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&b_post, n * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&b_res, n * n * sizeof(float)));
+        HIP_CALL(hipMalloc(&b_pre, n * sizeof(float)));
+        HIP_CALL(hipMalloc(&b_post, n * sizeof(float)));
+        HIP_CALL(hipMalloc(&b_res, n * n * sizeof(float)));
 
         alpha_pre = alpha_init;
         alpha_post = alpha_init;
@@ -133,37 +133,37 @@ struct MHCLayerBuffers {
         expansion_rate = n;
         dynamic_h = use_dynamic_h;
 
-        CHECK_CUDA(hipMalloc(&x_expanded, B * n * C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&x_aggregated_bf16, B * C * sizeof(floatX)));
-        CHECK_CUDA(hipMalloc(&x_aggregated_f32, B * C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&rms_values, B * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&layer_out_bf16, B * C * sizeof(floatX)));
-        CHECK_CUDA(hipMalloc(&layer_out_f32, B * C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&y_distributed, B * n * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&x_expanded, B * n * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&x_aggregated_bf16, B * C * sizeof(floatX)));
+        HIP_CALL(hipMalloc(&x_aggregated_f32, B * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&rms_values, B * sizeof(float)));
+        HIP_CALL(hipMalloc(&layer_out_bf16, B * C * sizeof(floatX)));
+        HIP_CALL(hipMalloc(&layer_out_f32, B * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&y_distributed, B * n * C * sizeof(float)));
         if (needs_x_mixed) {
-            CHECK_CUDA(hipMalloc(&x_mixed, B * n * C * sizeof(float)));
+            HIP_CALL(hipMalloc(&x_mixed, B * n * C * sizeof(float)));
         }
-        CHECK_CUDA(hipMalloc(&output, B * n * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&output, B * n * C * sizeof(float)));
 
         if (dynamic_h) {
             int nC = n * C;
             int total_H_dim = n + n + n * n;
-            CHECK_CUDA(hipMalloc(&x_flat_bf16, B * nC * sizeof(floatX)));
-            CHECK_CUDA(hipMalloc(&rms_dynamic, B * sizeof(float)));
-            CHECK_CUDA(hipMalloc(&H_proj_raw, B * total_H_dim * sizeof(float)));
+            HIP_CALL(hipMalloc(&x_flat_bf16, B * nC * sizeof(floatX)));
+            HIP_CALL(hipMalloc(&rms_dynamic, B * sizeof(float)));
+            HIP_CALL(hipMalloc(&H_proj_raw, B * total_H_dim * sizeof(float)));
             fused_rms_matmul.init(B, total_H_dim, nC);
-            CHECK_CUDA(hipMalloc(&sinkhorn_M, B * n * n * sizeof(float)));
-            CHECK_CUDA(hipMalloc(&H_pre_activated, B * n * sizeof(float)));
-            CHECK_CUDA(hipMalloc(&H_post_activated, B * n * sizeof(float)));
-            CHECK_CUDA(hipMalloc(&H_res_tilde, B * n * n * sizeof(float)));
+            HIP_CALL(hipMalloc(&sinkhorn_M, B * n * n * sizeof(float)));
+            HIP_CALL(hipMalloc(&H_pre_activated, B * n * sizeof(float)));
+            HIP_CALL(hipMalloc(&H_post_activated, B * n * sizeof(float)));
+            HIP_CALL(hipMalloc(&H_res_tilde, B * n * n * sizeof(float)));
         } else {
             x_flat_bf16 = nullptr;
             rms_dynamic = nullptr;
             H_proj_raw = nullptr;
-            CHECK_CUDA(hipMalloc(&sinkhorn_M, n * n * sizeof(float)));
-            CHECK_CUDA(hipMalloc(&H_pre_activated, n * sizeof(float)));
-            CHECK_CUDA(hipMalloc(&H_post_activated, n * sizeof(float)));
-            CHECK_CUDA(hipMalloc(&H_res_tilde, n * n * sizeof(float)));
+            HIP_CALL(hipMalloc(&sinkhorn_M, n * n * sizeof(float)));
+            HIP_CALL(hipMalloc(&H_pre_activated, n * sizeof(float)));
+            HIP_CALL(hipMalloc(&H_post_activated, n * sizeof(float)));
+            HIP_CALL(hipMalloc(&H_res_tilde, n * n * sizeof(float)));
         }
 
         initialized = true;
@@ -225,25 +225,25 @@ struct MHCLayerGradients {
     MHCLayerGradients() : initialized(false), workspace_dH(nullptr), workspace_dM(nullptr) {}
 
     void init(int B, int C, int n) {
-        CHECK_CUDA(hipMalloc(&d_x_expanded, B * n * C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_H_pre, n * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_rmsnorm_weight, C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_H_post, n * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_H_res, n * n * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_x_aggregated, B * C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_layer_out, B * C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_y_distributed, B * n * C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_x_mixed, B * n * C * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_M, n * n * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_x_expanded, B * n * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_H_pre, n * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_rmsnorm_weight, C * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_H_post, n * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_H_res, n * n * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_x_aggregated, B * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_layer_out, B * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_y_distributed, B * n * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_x_mixed, B * n * C * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_M, n * n * sizeof(float)));
 
-        CHECK_CUDA(hipMalloc(&d_H_pre_activated, n * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_H_post_activated, n * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&d_H_res_exp, n * n * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_H_pre_activated, n * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_H_post_activated, n * sizeof(float)));
+        HIP_CALL(hipMalloc(&d_H_res_exp, n * n * sizeof(float)));
 
         constexpr int BLOCK_SIZE = 256;
         workspace_num_blocks = min(128, (B * C + BLOCK_SIZE - 1) / BLOCK_SIZE);
-        CHECK_CUDA(hipMalloc(&workspace_dH, workspace_num_blocks * n * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&workspace_dM, workspace_num_blocks * n * n * sizeof(float)));
+        HIP_CALL(hipMalloc(&workspace_dH, workspace_num_blocks * n * sizeof(float)));
+        HIP_CALL(hipMalloc(&workspace_dM, workspace_num_blocks * n * n * sizeof(float)));
 
         initialized = true;
     }
@@ -274,10 +274,10 @@ struct MHCLayerGradients {
     }
 
     void zero_weight_grads(int C, int n, hipStream_t stream = nullptr) {
-        CHECK_CUDA(hipMemsetAsync(d_H_pre, 0, n * sizeof(float), stream));
-        CHECK_CUDA(hipMemsetAsync(d_rmsnorm_weight, 0, C * sizeof(float), stream));
-        CHECK_CUDA(hipMemsetAsync(d_H_post, 0, n * sizeof(float), stream));
-        CHECK_CUDA(hipMemsetAsync(d_H_res, 0, n * n * sizeof(float), stream));
+        HIP_CALL(hipMemsetAsync(d_H_pre, 0, n * sizeof(float), stream));
+        HIP_CALL(hipMemsetAsync(d_rmsnorm_weight, 0, C * sizeof(float), stream));
+        HIP_CALL(hipMemsetAsync(d_H_post, 0, n * sizeof(float), stream));
+        HIP_CALL(hipMemsetAsync(d_H_res, 0, n * n * sizeof(float), stream));
     }
 };
 
@@ -459,7 +459,7 @@ struct MHCLayer {
         }
 
         if (s == nullptr) {
-            CHECK_CUDA(hipStreamCreate(&stream));
+            HIP_CALL(hipStreamCreate(&stream));
             owns_stream = true;
         } else {
             stream = s;
@@ -467,8 +467,8 @@ struct MHCLayer {
         }
 
         if (use_pipelining) {
-            CHECK_CUDA(hipStreamCreate(&sinkhorn_stream));
-            CHECK_CUDA(hipEventCreate(&sinkhorn_done));
+            HIP_CALL(hipStreamCreate(&sinkhorn_stream));
+            HIP_CALL(hipEventCreate(&sinkhorn_done));
         }
 
         initialized = true;
@@ -515,19 +515,19 @@ struct MHCLayer {
         int n = config.expansion_rate;
         int nC = n * C;
 
-        CHECK_CUDA(hipMemcpyAsync(weights.rmsnorm_weight, h_rmsnorm_weight, C * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.rmsnorm_weight, h_rmsnorm_weight, C * sizeof(floatX),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.phi_pre, h_phi_pre, nC * n * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.phi_pre, h_phi_pre, nC * n * sizeof(floatX),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.phi_post, h_phi_post, nC * n * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.phi_post, h_phi_post, nC * n * sizeof(floatX),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.phi_res, h_phi_res, nC * n * n * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.phi_res, h_phi_res, nC * n * n * sizeof(floatX),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.b_pre, h_b_pre, n * sizeof(float),
+        HIP_CALL(hipMemcpyAsync(weights.b_pre, h_b_pre, n * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.b_post, h_b_post, n * sizeof(float),
+        HIP_CALL(hipMemcpyAsync(weights.b_post, h_b_post, n * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.b_res, h_b_res, n * n * sizeof(float),
+        HIP_CALL(hipMemcpyAsync(weights.b_res, h_b_res, n * n * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
 
         weights.alpha_pre = alpha_pre;
@@ -540,13 +540,13 @@ struct MHCLayer {
         int C = config.hidden_dim;
         int n = config.expansion_rate;
 
-        CHECK_CUDA(hipMemcpyAsync(weights.rmsnorm_weight, h_rmsnorm_weight, C * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.rmsnorm_weight, h_rmsnorm_weight, C * sizeof(floatX),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.b_pre, h_b_pre, n * sizeof(float),
+        HIP_CALL(hipMemcpyAsync(weights.b_pre, h_b_pre, n * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.b_post, h_b_post, n * sizeof(float),
+        HIP_CALL(hipMemcpyAsync(weights.b_post, h_b_post, n * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
-        CHECK_CUDA(hipMemcpyAsync(weights.b_res, h_b_res, n * n * sizeof(float),
+        HIP_CALL(hipMemcpyAsync(weights.b_res, h_b_res, n * n * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
     }
 
@@ -578,7 +578,7 @@ struct MHCLayer {
         int C = config.hidden_dim;
         int n = config.expansion_rate;
 
-        CHECK_CUDA(hipMemcpyAsync(buffers.x_expanded, x_expanded, B * n * C * sizeof(float),
+        HIP_CALL(hipMemcpyAsync(buffers.x_expanded, x_expanded, B * n * C * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
 
         if (config.use_dynamic_h) {
@@ -591,7 +591,7 @@ struct MHCLayer {
                 sinkhorn_knopp_forward_fused_exp(buffers.sinkhorn_M, buffers.H_res_tilde,
                                                  weights.b_res, n, n, config.sinkhorn_iters,
                                                  config.eps, sinkhorn_stream);
-                CHECK_CUDA(hipEventRecord(sinkhorn_done, sinkhorn_stream));
+                HIP_CALL(hipEventRecord(sinkhorn_done, sinkhorn_stream));
             }
 
             stream_aggregate_bf16_fused_sigmoid(buffers.x_aggregated_bf16, buffers.H_pre_activated,
@@ -602,7 +602,7 @@ struct MHCLayer {
                                                  weights.b_res, n, n, config.sinkhorn_iters,
                                                  config.eps, stream);
             } else {
-                CHECK_CUDA(hipStreamWaitEvent(stream, sinkhorn_done, 0));
+                HIP_CALL(hipStreamWaitEvent(stream, sinkhorn_done, 0));
             }
         }
 
@@ -633,7 +633,7 @@ struct MHCLayer {
         int C = config.hidden_dim;
         int n = config.expansion_rate;
 
-        CHECK_CUDA(hipMemcpyAsync(buffers.x_expanded, d_x_expanded, B * n * C * sizeof(float),
+        HIP_CALL(hipMemcpyAsync(buffers.x_expanded, d_x_expanded, B * n * C * sizeof(float),
                                    hipMemcpyDeviceToDevice, stream));
 
         if (config.use_dynamic_h) {
@@ -646,7 +646,7 @@ struct MHCLayer {
                 sinkhorn_knopp_forward_fused_exp(buffers.sinkhorn_M, buffers.H_res_tilde,
                                                  weights.b_res, n, n, config.sinkhorn_iters,
                                                  config.eps, sinkhorn_stream);
-                CHECK_CUDA(hipEventRecord(sinkhorn_done, sinkhorn_stream));
+                HIP_CALL(hipEventRecord(sinkhorn_done, sinkhorn_stream));
             }
 
             stream_aggregate_bf16_fused_sigmoid(buffers.x_aggregated_bf16, buffers.H_pre_activated,
@@ -657,7 +657,7 @@ struct MHCLayer {
                                                  weights.b_res, n, n, config.sinkhorn_iters,
                                                  config.eps, stream);
             } else {
-                CHECK_CUDA(hipStreamWaitEvent(stream, sinkhorn_done, 0));
+                HIP_CALL(hipStreamWaitEvent(stream, sinkhorn_done, 0));
             }
         }
 
@@ -728,6 +728,6 @@ struct MHCLayer {
                          stream);
     }
 
-    void sync() { CHECK_CUDA(hipStreamSynchronize(stream)); }
+    void sync() { HIP_CALL(hipStreamSynchronize(stream)); }
 };
 } // namespace mhc

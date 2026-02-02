@@ -117,7 +117,7 @@ void mhc_layer_fwd(torch::Tensor &out,
     layer.init(cfg, stream);
 
     const size_t C_bytes = static_cast<size_t>(C) * sizeof(mhc::floatX);
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.rmsnorm_weight,
+    HIP_CALL(hipMemcpyAsync(layer.weights.rmsnorm_weight,
                                rmsnorm_weight.data_ptr(),
                                C_bytes,
                                hipMemcpyDeviceToDevice,
@@ -127,33 +127,33 @@ void mhc_layer_fwd(torch::Tensor &out,
     const size_t phi_post_bytes = static_cast<size_t>(nC) * n * sizeof(mhc::floatX);
     const size_t phi_res_bytes = static_cast<size_t>(nC) * n2 * sizeof(mhc::floatX);
 
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.phi_pre,
+    HIP_CALL(hipMemcpyAsync(layer.weights.phi_pre,
                                phi_pre.data_ptr(),
                                phi_pre_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.phi_post,
+    HIP_CALL(hipMemcpyAsync(layer.weights.phi_post,
                                phi_post.data_ptr(),
                                phi_post_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.phi_res,
+    HIP_CALL(hipMemcpyAsync(layer.weights.phi_res,
                                phi_res.data_ptr(),
                                phi_res_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
 
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.b_pre,
+    HIP_CALL(hipMemcpyAsync(layer.weights.b_pre,
                                b_pre.data_ptr(),
                                static_cast<size_t>(n) * sizeof(float),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.b_post,
+    HIP_CALL(hipMemcpyAsync(layer.weights.b_post,
                                b_post.data_ptr(),
                                static_cast<size_t>(n) * sizeof(float),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.b_res,
+    HIP_CALL(hipMemcpyAsync(layer.weights.b_res,
                                b_res.data_ptr(),
                                static_cast<size_t>(n2) * sizeof(float),
                                hipMemcpyDeviceToDevice,
@@ -166,7 +166,7 @@ void mhc_layer_fwd(torch::Tensor &out,
     layer.forward_device(x_expanded.data_ptr<float>());
 
     const size_t out_bytes = static_cast<size_t>(B) * n * C * sizeof(float);
-    CHECK_CUDA(hipMemcpyAsync(out.data_ptr<float>(),
+    HIP_CALL(hipMemcpyAsync(out.data_ptr<float>(),
                                layer.get_output(),
                                out_bytes,
                                hipMemcpyDeviceToDevice,
@@ -255,7 +255,7 @@ void mhc_layer_fwd_debug(torch::Tensor &out,
     layer.init(cfg, stream);
 
     const size_t C_bytes = static_cast<size_t>(C) * sizeof(mhc::floatX);
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.rmsnorm_weight,
+    HIP_CALL(hipMemcpyAsync(layer.weights.rmsnorm_weight,
                                rmsnorm_weight.data_ptr(),
                                C_bytes,
                                hipMemcpyDeviceToDevice,
@@ -265,33 +265,33 @@ void mhc_layer_fwd_debug(torch::Tensor &out,
     const size_t phi_post_bytes = static_cast<size_t>(nC) * n * sizeof(mhc::floatX);
     const size_t phi_res_bytes = static_cast<size_t>(nC) * n2 * sizeof(mhc::floatX);
 
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.phi_pre,
+    HIP_CALL(hipMemcpyAsync(layer.weights.phi_pre,
                                phi_pre.data_ptr(),
                                phi_pre_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.phi_post,
+    HIP_CALL(hipMemcpyAsync(layer.weights.phi_post,
                                phi_post.data_ptr(),
                                phi_post_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.phi_res,
+    HIP_CALL(hipMemcpyAsync(layer.weights.phi_res,
                                phi_res.data_ptr(),
                                phi_res_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
 
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.b_pre,
+    HIP_CALL(hipMemcpyAsync(layer.weights.b_pre,
                                b_pre.data_ptr(),
                                static_cast<size_t>(n) * sizeof(float),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.b_post,
+    HIP_CALL(hipMemcpyAsync(layer.weights.b_post,
                                b_post.data_ptr(),
                                static_cast<size_t>(n) * sizeof(float),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer.weights.b_res,
+    HIP_CALL(hipMemcpyAsync(layer.weights.b_res,
                                b_res.data_ptr(),
                                static_cast<size_t>(n2) * sizeof(float),
                                hipMemcpyDeviceToDevice,
@@ -304,43 +304,43 @@ void mhc_layer_fwd_debug(torch::Tensor &out,
     layer.forward_device(x_expanded.data_ptr<float>());
 
     const size_t out_bytes = static_cast<size_t>(B) * n * C * sizeof(float);
-    CHECK_CUDA(hipMemcpyAsync(out.data_ptr<float>(),
+    HIP_CALL(hipMemcpyAsync(out.data_ptr<float>(),
                                layer.get_output(),
                                out_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
 
-    CHECK_CUDA(hipMemcpyAsync(H_proj_raw.data_ptr<float>(),
+    HIP_CALL(hipMemcpyAsync(H_proj_raw.data_ptr<float>(),
                                layer.buffers.H_proj_raw,
                                static_cast<size_t>(B) * total_H_dim * sizeof(float),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(H_pre.data_ptr<float>(),
+    HIP_CALL(hipMemcpyAsync(H_pre.data_ptr<float>(),
                                layer.buffers.H_pre_activated,
                                static_cast<size_t>(B) * n * sizeof(float),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(H_post.data_ptr<float>(),
+    HIP_CALL(hipMemcpyAsync(H_post.data_ptr<float>(),
                                layer.buffers.H_post_activated,
                                static_cast<size_t>(B) * n * sizeof(float),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(M.data_ptr<float>(),
+    HIP_CALL(hipMemcpyAsync(M.data_ptr<float>(),
                                layer.buffers.sinkhorn_M,
                                static_cast<size_t>(B) * n2 * sizeof(float),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(x_agg_bf16.data_ptr(),
+    HIP_CALL(hipMemcpyAsync(x_agg_bf16.data_ptr(),
                                layer.buffers.x_aggregated_bf16,
                                static_cast<size_t>(B) * C * sizeof(mhc::floatX),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(layer_out_bf16.data_ptr(),
+    HIP_CALL(hipMemcpyAsync(layer_out_bf16.data_ptr(),
                                layer.buffers.layer_out_bf16,
                                static_cast<size_t>(B) * C * sizeof(mhc::floatX),
                                hipMemcpyDeviceToDevice,
                                stream));
-    CHECK_CUDA(hipMemcpyAsync(rms_values.data_ptr<float>(),
+    HIP_CALL(hipMemcpyAsync(rms_values.data_ptr<float>(),
                                layer.buffers.rms_values,
                                static_cast<size_t>(B) * sizeof(float),
                                hipMemcpyDeviceToDevice,

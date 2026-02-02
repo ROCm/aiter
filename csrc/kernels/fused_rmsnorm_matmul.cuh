@@ -242,39 +242,39 @@ struct MatmulDescriptors {
 
 inline void init_matmul_descriptors(MatmulDescriptors& desc, int M, int N, int K,
                                     size_t workspace_size = 32 * 1024 * 1024) {
-    CHECK_CUBLAS(hipblasLtCreate(&desc.handle));
+    CHECK_COND(hipblasLtCreate(&desc.handle) == HIPBLAS_STATUS_SUCCESS);
 
     hipblasComputeType_t compute_type = HIPBLAS_COMPUTE_32F;
     hipDataType ab_type = HIP_R_16BF;
     hipDataType c_type = HIP_R_32F;
     hipDataType scale_type = HIP_R_32F;
 
-    CHECK_CUBLAS(hipblasLtMatmulDescCreate(&desc.matmul_desc, compute_type, scale_type));
+    CHECK_COND(hipblasLtMatmulDescCreate(&desc.matmul_desc, compute_type, scale_type) == HIPBLAS_STATUS_SUCCESS);
 
     hipblasOperation_t trans_a = HIPBLAS_OP_T;
     hipblasOperation_t trans_b = HIPBLAS_OP_N;
-    CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(desc.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
-                                                &trans_a, sizeof(trans_a)));
-    CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(desc.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
-                                                &trans_b, sizeof(trans_b)));
+    CHECK_COND(hipblasLtMatmulDescSetAttribute(desc.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
+                                                &trans_a, sizeof(trans_a)) == HIPBLAS_STATUS_SUCCESS);
+    CHECK_COND(hipblasLtMatmulDescSetAttribute(desc.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
+                                                &trans_b, sizeof(trans_b)) == HIPBLAS_STATUS_SUCCESS);
 
     // Use column-major layouts and swap operands:
     // op(A) = B_row (N x K) via A_desc (K x N) with transA = T
     // op(B) = A_row^T (K x M) via B_desc (K x M) with transB = N
     // C_desc is (N x M) column-major, which matches row-major (M x N) layout.
-    CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&desc.A_desc, ab_type, K, N, K));
-    CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&desc.B_desc, ab_type, K, M, K));
-    CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&desc.C_desc, c_type, N, M, N));
+    CHECK_COND(hipblasLtMatrixLayoutCreate(&desc.A_desc, ab_type, K, N, K) == HIPBLAS_STATUS_SUCCESS);
+    CHECK_COND(hipblasLtMatrixLayoutCreate(&desc.B_desc, ab_type, K, M, K) == HIPBLAS_STATUS_SUCCESS);
+    CHECK_COND(hipblasLtMatrixLayoutCreate(&desc.C_desc, c_type, N, M, N) == HIPBLAS_STATUS_SUCCESS);
 
-    CHECK_CUBLAS(hipblasLtMatmulPreferenceCreate(&desc.preference));
-    CHECK_CUBLAS(hipblasLtMatmulPreferenceSetAttribute(desc.preference,
+    CHECK_COND(hipblasLtMatmulPreferenceCreate(&desc.preference) == HIPBLAS_STATUS_SUCCESS);
+    CHECK_COND(hipblasLtMatmulPreferenceSetAttribute(desc.preference,
                                                       HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                                      &workspace_size, sizeof(workspace_size)));
+                                                      &workspace_size, sizeof(workspace_size)) == HIPBLAS_STATUS_SUCCESS);
 
     int returned_results = 0;
-    CHECK_CUBLAS(hipblasLtMatmulAlgoGetHeuristic(
+    CHECK_COND(hipblasLtMatmulAlgoGetHeuristic(
         desc.handle, desc.matmul_desc, desc.A_desc, desc.B_desc, desc.C_desc, desc.C_desc,
-        desc.preference, 1, &desc.heuristic, &returned_results));
+        desc.preference, 1, &desc.heuristic, &returned_results) == HIPBLAS_STATUS_SUCCESS);
 
     if (returned_results == 0) {
         fprintf(stderr, "No cuBLASLt algorithm found for row-major matmul\n");
@@ -282,7 +282,7 @@ inline void init_matmul_descriptors(MatmulDescriptors& desc, int M, int N, int K
     }
 
     desc.workspace_size = workspace_size;
-    CHECK_CUDA(hipMalloc(&desc.workspace, workspace_size));
+    HIP_CALL(hipMalloc(&desc.workspace, workspace_size));
 }
 
 inline void destroy_matmul_descriptors(MatmulDescriptors& desc) {
@@ -297,9 +297,9 @@ inline void destroy_matmul_descriptors(MatmulDescriptors& desc) {
 
 inline void matmul_forward(MatmulDescriptors& desc, float* out, const floatX* A, const floatX* B,
                            float alpha, float beta, hipStream_t stream = nullptr) {
-    CHECK_CUBLAS(hipblasLtMatmul(desc.handle, desc.matmul_desc, &alpha, A, desc.A_desc, B,
+    CHECK_COND(hipblasLtMatmul(desc.handle, desc.matmul_desc, &alpha, A, desc.A_desc, B,
                                 desc.B_desc, &beta, out, desc.C_desc, out, desc.C_desc,
-                                &desc.heuristic.algo, desc.workspace, desc.workspace_size, stream));
+                                &desc.heuristic.algo, desc.workspace, desc.workspace_size, stream) == HIPBLAS_STATUS_SUCCESS);
 }
 
 struct FusedRMSNormMatmul {
@@ -318,7 +318,7 @@ struct FusedRMSNormMatmul {
         eps = epsilon;
 
         init_matmul_descriptors(matmul_desc, M, N, K);
-        CHECK_CUDA(hipMalloc(&rms_buffer, M * sizeof(float)));
+        HIP_CALL(hipMalloc(&rms_buffer, M * sizeof(float)));
         initialized = true;
     }
 
@@ -408,7 +408,7 @@ inline void compute_rms_pdl(float* rms_out, const floatX* inp, int N, int C, flo
     config.attrs = attrs;
     config.numAttrs = 1;
 
-    CHECK_CUDA(
+    HIP_CALL(
         cudaLaunchKernelEx(&config, compute_rms_pdl_kernel<BLOCK_SIZE>, rms_out, inp, N, C, eps));
 #else
     compute_rms_pdl_kernel<BLOCK_SIZE>
@@ -432,7 +432,7 @@ struct FusedRMSNormMatmulPDL {
         eps = epsilon;
 
         init_matmul_descriptors(matmul_desc, M, N, K);
-        CHECK_CUDA(hipMalloc(&rms_buffer, M * sizeof(float)));
+        HIP_CALL(hipMalloc(&rms_buffer, M * sizeof(float)));
         initialized = true;
     }
 
@@ -566,61 +566,61 @@ struct FusedRMSNormMatmulBackward {
         K = k;
 
         workspace_size = 32 * 1024 * 1024;
-        CHECK_CUDA(hipMalloc(&workspace, workspace_size));
-        CHECK_CUDA(hipMalloc(&grad_scaled_buffer, M * N * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&K_buffer, M * K * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&x_fp32_buffer, M * K * sizeof(float)));
-        CHECK_CUDA(hipMalloc(&W_fp32_buffer, N * K * sizeof(float)));
+        HIP_CALL(hipMalloc(&workspace, workspace_size));
+        HIP_CALL(hipMalloc(&grad_scaled_buffer, M * N * sizeof(float)));
+        HIP_CALL(hipMalloc(&K_buffer, M * K * sizeof(float)));
+        HIP_CALL(hipMalloc(&x_fp32_buffer, M * K * sizeof(float)));
+        HIP_CALL(hipMalloc(&W_fp32_buffer, N * K * sizeof(float)));
 
-        CHECK_CUBLAS(hipblasLtCreate(&handle));
+        CHECK_COND(hipblasLtCreate(&handle) == HIPBLAS_STATUS_SUCCESS);
 
-        CHECK_CUBLAS(hipblasLtMatmulDescCreate(&dW_matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        CHECK_COND(hipblasLtMatmulDescCreate(&dW_matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) == HIPBLAS_STATUS_SUCCESS);
         hipblasOperation_t trans_a = HIPBLAS_OP_T;
         hipblasOperation_t trans_b = HIPBLAS_OP_N;
-        CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(dW_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
-                                                    &trans_a, sizeof(trans_a)));
-        CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(dW_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
-                                                    &trans_b, sizeof(trans_b)));
+        CHECK_COND(hipblasLtMatmulDescSetAttribute(dW_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
+                                                    &trans_a, sizeof(trans_a)) == HIPBLAS_STATUS_SUCCESS);
+        CHECK_COND(hipblasLtMatmulDescSetAttribute(dW_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
+                                                    &trans_b, sizeof(trans_b)) == HIPBLAS_STATUS_SUCCESS);
 
-        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dW_grad_desc, HIP_R_32F, M, N, M));
-        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dW_x_desc, HIP_R_32F, M, K, M));
-        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dW_out_desc, HIP_R_32F, N, K, N));
+        CHECK_COND(hipblasLtMatrixLayoutCreate(&dW_grad_desc, HIP_R_32F, M, N, M) == HIPBLAS_STATUS_SUCCESS);
+        CHECK_COND(hipblasLtMatrixLayoutCreate(&dW_x_desc, HIP_R_32F, M, K, M) == HIPBLAS_STATUS_SUCCESS);
+        CHECK_COND(hipblasLtMatrixLayoutCreate(&dW_out_desc, HIP_R_32F, N, K, N) == HIPBLAS_STATUS_SUCCESS);
 
-        CHECK_CUBLAS(hipblasLtMatmulPreferenceCreate(&dW_pref));
-        CHECK_CUBLAS(hipblasLtMatmulPreferenceSetAttribute(dW_pref,
+        CHECK_COND(hipblasLtMatmulPreferenceCreate(&dW_pref) == HIPBLAS_STATUS_SUCCESS);
+        CHECK_COND(hipblasLtMatmulPreferenceSetAttribute(dW_pref,
                                                           HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                                          &workspace_size, sizeof(workspace_size)));
+                                                          &workspace_size, sizeof(workspace_size)) == HIPBLAS_STATUS_SUCCESS);
 
         int returned = 0;
-        CHECK_CUBLAS(hipblasLtMatmulAlgoGetHeuristic(handle, dW_matmul_desc, dW_grad_desc, dW_x_desc,
+        CHECK_COND(hipblasLtMatmulAlgoGetHeuristic(handle, dW_matmul_desc, dW_grad_desc, dW_x_desc,
                                                     dW_out_desc, dW_out_desc, dW_pref, 1,
-                                                    &dW_heuristic, &returned));
+                                                    &dW_heuristic, &returned) == HIPBLAS_STATUS_SUCCESS);
         if (returned == 0) {
             fprintf(stderr, "No cuBLASLt algorithm found for dW backward matmul\n");
             exit(EXIT_FAILURE);
         }
 
-        CHECK_CUBLAS(hipblasLtMatmulDescCreate(&dx_matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        CHECK_COND(hipblasLtMatmulDescCreate(&dx_matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) == HIPBLAS_STATUS_SUCCESS);
         trans_a = HIPBLAS_OP_N;
         trans_b = HIPBLAS_OP_N;
-        CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(dx_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
-                                                    &trans_a, sizeof(trans_a)));
-        CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(dx_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
-                                                    &trans_b, sizeof(trans_b)));
+        CHECK_COND(hipblasLtMatmulDescSetAttribute(dx_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
+                                                    &trans_a, sizeof(trans_a)) == HIPBLAS_STATUS_SUCCESS);
+        CHECK_COND(hipblasLtMatmulDescSetAttribute(dx_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
+                                                    &trans_b, sizeof(trans_b)) == HIPBLAS_STATUS_SUCCESS);
 
-        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dx_grad_desc, HIP_R_32F, M, N, M));
-        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dx_W_desc, HIP_R_32F, N, K, N));
-        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dx_out_desc, HIP_R_32F, M, K, M));
+        CHECK_COND(hipblasLtMatrixLayoutCreate(&dx_grad_desc, HIP_R_32F, M, N, M) == HIPBLAS_STATUS_SUCCESS);
+        CHECK_COND(hipblasLtMatrixLayoutCreate(&dx_W_desc, HIP_R_32F, N, K, N) == HIPBLAS_STATUS_SUCCESS);
+        CHECK_COND(hipblasLtMatrixLayoutCreate(&dx_out_desc, HIP_R_32F, M, K, M) == HIPBLAS_STATUS_SUCCESS);
 
-        CHECK_CUBLAS(hipblasLtMatmulPreferenceCreate(&dx_pref));
-        CHECK_CUBLAS(hipblasLtMatmulPreferenceSetAttribute(dx_pref,
+        CHECK_COND(hipblasLtMatmulPreferenceCreate(&dx_pref) == HIPBLAS_STATUS_SUCCESS);
+        CHECK_COND(hipblasLtMatmulPreferenceSetAttribute(dx_pref,
                                                           HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                                          &workspace_size, sizeof(workspace_size)));
+                                                          &workspace_size, sizeof(workspace_size)) == HIPBLAS_STATUS_SUCCESS);
 
         returned = 0;
-        CHECK_CUBLAS(hipblasLtMatmulAlgoGetHeuristic(handle, dx_matmul_desc, dx_grad_desc, dx_W_desc,
+        CHECK_COND(hipblasLtMatmulAlgoGetHeuristic(handle, dx_matmul_desc, dx_grad_desc, dx_W_desc,
                                                     dx_out_desc, dx_out_desc, dx_pref, 1,
-                                                    &dx_heuristic, &returned));
+                                                    &dx_heuristic, &returned) == HIPBLAS_STATUS_SUCCESS);
         if (returned == 0) {
             fprintf(stderr, "No cuBLASLt algorithm found for dx backward matmul\n");
             exit(EXIT_FAILURE);
@@ -673,15 +673,15 @@ struct FusedRMSNormMatmulBackward {
             <<<num_blocks, BLOCK_SIZE, 0, stream>>>(grad_scaled_buffer, grad_output, rms, M, N);
 
         float alpha = 1.0f, beta = 0.0f;
-        CHECK_CUBLAS(hipblasLtMatmul(handle, dW_matmul_desc, &alpha, grad_scaled_buffer,
+        CHECK_COND(hipblasLtMatmul(handle, dW_matmul_desc, &alpha, grad_scaled_buffer,
                                     dW_grad_desc, x_fp32_buffer, dW_x_desc, &beta, dW, dW_out_desc,
                                     dW, dW_out_desc, &dW_heuristic.algo, workspace, workspace_size,
-                                    stream));
+                                    stream) == HIPBLAS_STATUS_SUCCESS);
 
-        CHECK_CUBLAS(hipblasLtMatmul(handle, dx_matmul_desc, &alpha, grad_scaled_buffer,
+        CHECK_COND(hipblasLtMatmul(handle, dx_matmul_desc, &alpha, grad_scaled_buffer,
                                     dx_grad_desc, W_fp32_buffer, dx_W_desc, &beta, K_buffer,
                                     dx_out_desc, K_buffer, dx_out_desc, &dx_heuristic.algo,
-                                    workspace, workspace_size, stream));
+                                    workspace, workspace_size, stream) == HIPBLAS_STATUS_SUCCESS);
 
         int num_warps = BLOCK_SIZE / 32;
         size_t shared_mem = num_warps * sizeof(float);

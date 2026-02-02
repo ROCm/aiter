@@ -5,6 +5,7 @@
 #include <hip/hip_fp16.h>
 #include <hipblaslt/hipblaslt.h>
 #include <hip/hip_cooperative_groups.h>
+#include "aiter_hip_common.h"
 
 namespace cooperative_groups {
 template <typename T>
@@ -42,21 +43,5 @@ struct RMSNormParams {
     float eps;
 };
 
-#define CHECK_HIP(call) mhc::check_hip((call), __FILE__, __LINE__)
-#define CHECK_CUBLAS(call) mhc::check_cublas((call), __FILE__, __LINE__)
-#define CHECK_CUDA(call) CHECK_HIP(call)
-
-inline void check_hip(hipError_t err, const char* file, int line) {
-    if (err != hipSuccess) {
-        fprintf(stderr, "HIP error at %s:%d: %s\n", file, line, hipGetErrorString(err));
-        exit(EXIT_FAILURE);
-    }
-}
-
-inline void check_cublas(hipblasStatus_t status, const char* file, int line) {
-    if (status != HIPBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "hipBLASLt error at %s:%d: %d\n", file, line, (int)status);
-        exit(EXIT_FAILURE);
-    }
-}
+// Use aiter's common HIP/CHECK macros (HIP_CALL, CHECK_COND) instead of local wrappers.
 } // namespace mhc
