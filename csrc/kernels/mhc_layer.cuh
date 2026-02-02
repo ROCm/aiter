@@ -7,7 +7,7 @@
 #include "rmsnorm.cuh"
 #include "sinkhorn_knopp.cuh"
 #include "stream_ops.cuh"
-#include "../include/utils.cuh"
+#include "../include/mhc_layer.h"
 
 namespace mhc {
 
