@@ -100,9 +100,13 @@ def get_2stage_config_simple(
     is_smoothquant,
 ):
     if is_smoothquant and (dtype == dtypes.i8 or dtype == torch.int8 or str(dtype) == "torch.int8"):
-        print(f"[aiter] Enabling 2-stage MOE for smoothquant with dtype={dtype}")
-        return True, 32, 0, "", ""
+        # Check if inter_dim is supported by the 2-stage Int8 kernel (currently requires multiple of 384)
+        if inter_dim % 384 == 0:
+            print(f"[aiter] Enabling 2-stage MOE for smoothquant with dtype={dtype}")
+            # The available kernel uses 64x384 tile, so block_m must be 64
+            return True, 64, 0, "", ""
     return False, 32, 0, "", ""
+
 def asm_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -234,8 +238,14 @@ def asm_moe(
             else dtypes.fp8
         )
         if fc1_smooth_scale is not None:
-            a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
-            a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
+            is_int8 = w1.dtype == dtypes.i8 or w1.dtype == torch.int8
+            if is_int8:
+                # 2-stage shape: [TOPK, BATCH, MODEL_DIM]
+                a8 = torch.empty((topk, M, model_dim), dtype=a8_type, device=device)
+                a8_scale = torch.empty((topk, M, 1), dtype=dtypes.fp32, device=device)
+            else:
+                a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
+                a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
 
             # moe_smoothquant_fwd need topk_ids which contains local_expert_id
             if expert_mask is not None:
@@ -275,7 +285,6 @@ def asm_moe(
         # Check for 2-stage execution
         is_smoothquant = fc1_smooth_scale is not None
         run_2stage = False
-        run_2stage = True
         if is_smoothquant:
             (run_2stage, block_m_2s, ksplit_2s, kernelName1, kernelName2) = (
                 get_2stage_config_simple(
@@ -294,7 +303,8 @@ def asm_moe(
             # Stage 1: ASM Kernel
             # Allocate intermediate buffer [M, topk, inter_dim + pad_len] (Int8)
             # Pad length calculation: 4 bytes (float32) scale per 128 int8 elements
-            pad_len = (inter_dim + 32) // 32  
+            pad_len = (inter_dim + 32) // 32
+            pad_len = (pad_len + 3) // 4 * 4
             inter_states = torch.empty(
                 (M, topk, inter_dim + pad_len), dtype=dtypes.i8, device=device
             )
@@ -307,7 +317,7 @@ def asm_moe(
                 sorted_ids,
                 sorted_expert_ids,
                 num_valid_ids,
-                inter_states,
+                inter_states[..., :inter_dim],
                 inter_dim,
                 kernelName1,
                 block_m_2s,
@@ -321,7 +331,7 @@ def asm_moe(
                 sorted_weights if doweight_stage1 else None,
             )
 
-            # Stage 2: ASM Kernel (New API)
+            # Stage 2: ASM Kernel 
             # inter_states is already Int8, no explicit pertoken_quant needed
             # Extract scale from padded region for Stage2
             # Note: inter_states[..., inter_dim:] must be viewable as float32 (pad_len % 4 == 0)

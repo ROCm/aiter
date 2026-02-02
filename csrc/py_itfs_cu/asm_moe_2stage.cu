@@ -140,8 +140,7 @@ static CFG* get_cfg(torch::Tensor& inp,
         return &cfg_fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1;
     }
     else if(inp.scalar_type() == at::ScalarType::Char && w1.scalar_type() == at::ScalarType::Char &&
-            (out.scalar_type() == at::ScalarType::Char) && quant_type == QuantType::per_Token &&
-            !do_weight)
+            (out.scalar_type() == at::ScalarType::Char) && quant_type == QuantType::per_Token)
     {
         return &cfg_fmoe_stage1_int8_pertokenInt8_g1u1;
     }
@@ -260,9 +259,31 @@ void moe_stage1_g1u1(
 
     CFG* config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    int model_dim       = input.size(1);
-    int hidden_dim      = inter_dim;
-    int sub_X_cnt       = sorted_expert_ids.size(0);
+    int model_dim  = input.size(-1);
+    int hidden_dim = inter_dim;
+
+    int token_cnt;
+    // Handle [TOPK, BATCH, DIM] vs [BATCH, TOPK, DIM]
+    // token_cnt should be BATCH count based on Host Code implication
+    if(input.dim() == 3 && input.size(0) == out.size(1) && input.size(1) == out.size(0))
+    {
+        token_cnt = input.size(1);
+    }
+    else
+    {
+        token_cnt = input.size(0);
+    }
+    int topk = out.size(1);
+    int eprt = w1.size(0);
+
+    // User specified logic for gdy / sub_X_cnt calculation
+    // sub_X -> block_m
+    // batch -> token_cnt
+    // sz_sep -> gdy
+    long long sz_stp = (long long)topk * token_cnt + (long long)eprt * block_m - topk;
+    sz_stp           = (sz_stp + block_m - 1) / block_m;
+    int sub_X_cnt    = sorted_expert_ids.size(0);
+
     std::string arch_id = get_gpu_arch();
     kernelName          = !kernelName.empty() ? arch_id + kernelName : "";
     if(kernelName.empty())
@@ -292,13 +313,7 @@ void moe_stage1_g1u1(
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
-    int token_cnt = input.size(0);
-    int topk      = out.size(1);
-
     // const char *enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
-
-    int dim         = w2.size(1);
-    int eprt        = w1.size(0);
     const auto& cfg = it->second;
     uint32_t sub_GU = cfg.tile_n;
     TORCH_CHECK(block_m == cfg.tile_m,
@@ -308,13 +323,22 @@ void moe_stage1_g1u1(
                 " need block_m == ",
                 cfg.tile_m);
 
-    int stride_X  = input.stride(0) * input.element_size();
-    int stride_GU = dim * w1.element_size();
+    int stride_X;
+    if(input.dim() == 3 && input.size(0) == out.size(1) && input.size(1) == out.size(0))
+    {
+        stride_X = input.stride(1) * input.element_size();
+    }
+    else
+    {
+        stride_X = input.stride(0) * input.element_size();
+    }
+    int stride_GU = model_dim * w1.element_size();
 
     int stride_expert_GU    = stride_GU * inter_dim;
     int stride_expert_GUDQN = w1_scale.has_value() ? w1_scale.value().stride(0) * sizeof(float) : 0;
     int stride_expert_SMTDQN = inter_dim * sizeof(float);
-    int stride_O             = out.stride(0) * out.element_size();
+    int stride_O             = topk * inter_dim * out.element_size();
+
     if(inter_dim * 2 == w1.size(1))
     {
         stride_expert_GU *= 2;
@@ -333,7 +357,7 @@ void moe_stage1_g1u1(
 
     args.ptr_STP    = sorted_token_ids.data_ptr();
     args.ptr_SEP    = sorted_expert_ids.data_ptr();
-    args.dim        = dim;
+    args.dim        = model_dim;
     args.hidden_dim = inter_dim;
     args.token_cnt  = token_cnt;
     args.eprt_cnt   = eprt;
@@ -364,10 +388,10 @@ void moe_stage1_g1u1(
 
     int bdx = 256;
     int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);
-    int gdy = sub_X_cnt;
+    int gdy = sz_stp; // sub_X_cnt;
     int gdz = k_num;
 
-    printf("####stage1 arg start############");
+    printf("#### stage1 arg start ############\n");
     std::cout << "dim:" << args.dim << std::endl;
     std::cout << "hidden:" << args.hidden_dim << std::endl;
     std::cout << "token:" << args.token_cnt << std::endl;
@@ -375,7 +399,7 @@ void moe_stage1_g1u1(
     std::cout << "Xs:" << args.Xs << std::endl;
     std::cout << "GUs:" << args.GUs << std::endl;
     std::cout << "Os:" << args.Os << std::endl;
-    std::cout << "GUs:" << args.eGUs << std::endl;
+    std::cout << "eGUs:" << args.eGUs << std::endl;
     std::cout << "GUQs:" << args.eGUQs << std::endl;
     std::cout << "SMQs:" << args.eSMQs << std::endl;
     std::cout << "topk:" << args.topk << std::endl;
@@ -418,13 +442,23 @@ void moe_stage2_g1u1(
     CFG* config_map = get_cfg_stage2(inter_states, out, w2, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
-    int inter_dim       = w2.size(2); // w2: [expert, model_dim, inter_dim]
-    int sub_X_cnt       = sorted_expert_ids.size(0);
+    int inter_dim = inter_states.size(-1); // inter_states: [..., inter_dim]
+
+    int sub_X_cnt;
+    if(num_valid_ids.numel() > 0)
+    {
+        int valid_token_cnt = num_valid_ids[0].item<int>();
+        sub_X_cnt           = (valid_token_cnt + block_m - 1) / block_m;
+    }
+    else
+    {
+        sub_X_cnt = sorted_expert_ids.size(0);
+    }
     std::string arch_id = get_gpu_arch();
     kernelName          = !kernelName.empty() ? arch_id + kernelName : "";
     if(kernelName.empty())
     {
-        kernelName = get_heuristic_kernel(sub_X_cnt, out.size(2), block_m, config_map, arch_id);
+        kernelName = get_heuristic_kernel(sub_X_cnt, out.size(-1), block_m, config_map, arch_id);
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -445,12 +479,21 @@ void moe_stage2_g1u1(
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
-    int token_cnt = inter_states.size(0);
+    int token_cnt;
 
-    int dim         = out.size(2); // Model dim
+    if(inter_states.dim() == 3)
+    {
+        token_cnt = inter_states.size(0);
+    }
+    else
+    {
+        token_cnt = inter_states.size(0);
+    }
+
+    int dim         = out.size(-1);
     int eprt        = w2.size(0);
     const auto& cfg = it->second;
-    uint32_t sub_GU = cfg.tile_n;
+    uint32_t sub_D  = cfg.tile_n;
     TORCH_CHECK(block_m == cfg.tile_m,
                 __func__,
                 " kernel: ",
@@ -458,15 +501,18 @@ void moe_stage2_g1u1(
                 " need block_m == ",
                 cfg.tile_m);
 
-    // Stride calculations based on tensor layout
-    int stride_X =
-        inter_states.stride(1) * inter_states.element_size(); // Stride of padded input (row stride)
-    int stride_D        = w2.stride(1) * w2.element_size();   // w2 stride (row stride)
-    int stride_Scale_X  = a2_scale.has_value() ? a2_scale.value().stride(0) * sizeof(float) : 0;
-    int stride_expert_D = w2.stride(0) * w2.element_size(); // w2 expert stride
-    int stride_expert_scale_D =
-        w2_scale.has_value() ? w2_scale.value().stride(0) * sizeof(float) : 0;
-    int stride_O = out.stride(1) * out.element_size(); // output stride (row stride)
+    int stride_X = inter_dim * inter_states.element_size();
+
+    int stride_D = inter_dim * w2.element_size();
+
+    int stride_Scale_X = a2_scale.has_value() ? a2_scale.value().stride(0) * sizeof(float) : 0;
+
+    int stride_expert_D = inter_dim * dim * w2.element_size();
+
+    int stride_expert_scale_D = w2_scale.has_value() ? dim * sizeof(float) : 0;
+
+    int dbl_o    = (splitk > 1) ? 2 : 1;
+    int stride_O = dim * out.element_size() * dbl_o;
 
     Kernel2Args args;
     size_t arg_size = sizeof(args);
@@ -494,7 +540,7 @@ void moe_stage2_g1u1(
     args.splitk                = splitk;
     args.ptr_SWBuffer = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
 
-    uint32_t k_num = 1 << splitk;
+    uint32_t k_num = 1;
 
     void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
                       &args,
@@ -503,11 +549,11 @@ void moe_stage2_g1u1(
                       HIP_LAUNCH_PARAM_END};
 
     int bdx = 256;
-    int gdx = ((dim + sub_GU - 1) / sub_GU);
+    int gdx = ((dim + sub_D - 1) / sub_D);
     int gdy = sub_X_cnt;
     int gdz = k_num;
 
-    printf("####stage2 arg start############");
+    printf("#### stage2 arg start ############\n ");
     printf("args.ptr_OBuffer  = %p\n", args.ptr_OBuffer);
     printf("args.ptr_XBuffer  = %p\n", args.ptr_XBuffer);
     printf("args.ptr_DBuffer  = %p\n", args.ptr_DBuffer);
