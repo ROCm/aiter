@@ -97,6 +97,7 @@ jobs:
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout" \
           --ipc=host --group-add video \
+          --network=host \
           --shm-size 32g \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \

@@ -92,10 +92,6 @@ jobs:
             git submodule update --init --recursive --depth 1 --jobs 4
           fi
 
-      - name: Clean up Rocm processes
-        run: |
-          ./.github/scripts/clean_up_rocm.sh
-
       - name: Run the container
         run: |
           set -ex
@@ -158,11 +154,6 @@ jobs:
         if: always()
         run: |
           docker rm -f aiter_test || true
-  
-      - name: Clean up Rocm processes
-        if: always()
-        run: |
-          ./.github/scripts/clean_up_rocm.sh
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
