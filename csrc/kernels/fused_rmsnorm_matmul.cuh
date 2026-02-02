@@ -251,16 +251,20 @@ inline void init_matmul_descriptors(MatmulDescriptors& desc, int M, int N, int K
 
     CHECK_CUBLAS(cublasLtMatmulDescCreate(&desc.matmul_desc, compute_type, scale_type));
 
-    cublasOperation_t trans_a = CUBLAS_OP_N;
-    cublasOperation_t trans_b = CUBLAS_OP_T;
+    cublasOperation_t trans_a = CUBLAS_OP_T;
+    cublasOperation_t trans_b = CUBLAS_OP_N;
     CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(desc.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA,
                                                 &trans_a, sizeof(trans_a)));
     CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(desc.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB,
                                                 &trans_b, sizeof(trans_b)));
 
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.A_desc, ab_type, M, K, M));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.B_desc, ab_type, N, K, N));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.C_desc, c_type, M, N, M));
+    // Use column-major layouts and swap operands:
+    // op(A) = B_row (N x K) via A_desc (K x N) with transA = T
+    // op(B) = A_row^T (K x M) via B_desc (K x M) with transB = N
+    // C_desc is (N x M) column-major, which matches row-major (M x N) layout.
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.A_desc, ab_type, K, N, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.B_desc, ab_type, K, M, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.C_desc, c_type, N, M, N));
 
     CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&desc.preference));
     CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(desc.preference,
@@ -329,7 +333,7 @@ struct FusedRMSNormMatmul {
     void forward(float* out, const floatX* inp, const floatX* proj_weight,
                  cudaStream_t stream = nullptr) {
         compute_rms(rms_buffer, inp, M, K, eps, stream);
-        matmul_forward(matmul_desc, out, inp, proj_weight, 1.0f, 0.0f, stream);
+        matmul_forward(matmul_desc, out, proj_weight, inp, 1.0f, 0.0f, stream);
         divide_by_rms(out, rms_buffer, M, N, stream);
     }
 
@@ -443,7 +447,7 @@ struct FusedRMSNormMatmulPDL {
     void forward(float* out, const floatX* inp, const floatX* proj_weight,
                  cudaStream_t stream = nullptr) {
         compute_rms_pdl(rms_buffer, inp, M, K, eps, stream);
-        matmul_forward(matmul_desc, out, inp, proj_weight, 1.0f, 0.0f, stream);
+        matmul_forward(matmul_desc, out, proj_weight, inp, 1.0f, 0.0f, stream);
         divide_by_rms(out, rms_buffer, M, N, stream);
     }
 

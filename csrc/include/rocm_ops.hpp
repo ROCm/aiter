@@ -1532,6 +1532,30 @@ namespace py = pybind11;
           py::arg("alpha_res"),                                                          \
           py::arg("sinkhorn_iters"),                                                     \
           py::arg("eps"),                                                                \
+          py::arg("use_pdl") = true);                                                     \
+    m.def("mhc_layer_fwd_debug",                                                          \
+          &aiter::mhc_layer_fwd_debug,                                                    \
+          py::arg("out"),                                                                 \
+          py::arg("x_expanded"),                                                          \
+          py::arg("rmsnorm_weight"),                                                      \
+          py::arg("phi_pre"),                                                             \
+          py::arg("phi_post"),                                                            \
+          py::arg("phi_res"),                                                             \
+          py::arg("b_pre"),                                                               \
+          py::arg("b_post"),                                                              \
+          py::arg("b_res"),                                                               \
+          py::arg("alpha_pre"),                                                          \
+          py::arg("alpha_post"),                                                         \
+          py::arg("alpha_res"),                                                          \
+          py::arg("sinkhorn_iters"),                                                     \
+          py::arg("eps"),                                                                \
+          py::arg("H_proj_raw"),                                                         \
+          py::arg("H_pre"),                                                              \
+          py::arg("H_post"),                                                             \
+          py::arg("M"),                                                                  \
+          py::arg("x_agg_bf16"),                                                         \
+          py::arg("layer_out_bf16"),                                                     \
+          py::arg("rms_values"),                                                         \
           py::arg("use_pdl") = true);
 
 #define SAMPLE_PYBIND                                                                \
