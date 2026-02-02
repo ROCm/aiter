@@ -52,6 +52,9 @@ jobs:
         run: |
           git clone -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git
 
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+
       - name: Pull SGlang base image
         run: |
           docker pull ${{ env.SGL_IMAGE }}
