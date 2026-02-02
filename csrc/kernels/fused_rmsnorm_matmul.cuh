@@ -122,26 +122,6 @@ inline void compute_rms(float* rms_out, const __hip_bfloat16* inp, int N, int C,
     int num_warps = BLOCK_SIZE / 32;
     size_t shared_mem = num_warps * sizeof(float);
 
-#ifdef MHC_ENABLE_PDL
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchConfig_t config = {};
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    config.blockDim = {BLOCK_SIZE, 1, 1};
-    config.gridDim = {(unsigned int)N, 1, 1};
-    config.dynamicSmemBytes = shared_mem;
-    config.stream = stream;
-
-    if (C % 8 == 0 && C >= 64) {
-        cudaLaunchKernelEx(&config, compute_rms_kernel_vectorized<BLOCK_SIZE>, rms_out, inp, N, C,
-                           eps);
-    } else {
-        cudaLaunchKernelEx(&config, compute_rms_kernel<BLOCK_SIZE>, rms_out, inp, N, C, eps);
-    }
-#else
     if (C % 8 == 0 && C >= 64) {
         compute_rms_kernel_vectorized<BLOCK_SIZE>
             <<<N, BLOCK_SIZE, shared_mem, stream>>>(rms_out, inp, N, C, eps);
@@ -149,7 +129,6 @@ inline void compute_rms(float* rms_out, const __hip_bfloat16* inp, int N, int C,
         compute_rms_kernel<BLOCK_SIZE>
             <<<N, BLOCK_SIZE, shared_mem, stream>>>(rms_out, inp, N, C, eps);
     }
-#endif
 }
 
 template<int BLOCK_SIZE>
@@ -201,31 +180,11 @@ inline void divide_by_rms(float* out, const float* rms, int M, int N,
                           hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 256;
 
-#ifdef MHC_ENABLE_PDL
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchConfig_t config = {};
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    config.blockDim = {BLOCK_SIZE, 1, 1};
-    config.gridDim = {(unsigned int)M, 1, 1};
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-
-    if (N % 4 == 0 && N >= 16) {
-        cudaLaunchKernelEx(&config, divide_by_rms_kernel_vectorized<BLOCK_SIZE>, out, rms, M, N);
-    } else {
-        cudaLaunchKernelEx(&config, divide_by_rms_kernel<BLOCK_SIZE>, out, rms, M, N);
-    }
-#else
     if (N % 4 == 0 && N >= 16) {
         divide_by_rms_kernel_vectorized<BLOCK_SIZE><<<M, BLOCK_SIZE, 0, stream>>>(out, rms, M, N);
     } else {
         divide_by_rms_kernel<BLOCK_SIZE><<<M, BLOCK_SIZE, 0, stream>>>(out, rms, M, N);
     }
-#endif
 }
 
 struct MatmulDescriptors {
@@ -395,25 +354,8 @@ inline void compute_rms_pdl(float* rms_out, const __hip_bfloat16* inp, int N, in
     int num_warps = BLOCK_SIZE / 32;
     size_t shared_mem = num_warps * sizeof(float);
 
-#ifdef MHC_ENABLE_PDL
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchConfig_t config = {};
-    config.gridDim = dim3(N);
-    config.blockDim = dim3(BLOCK_SIZE);
-    config.dynamicSmemBytes = shared_mem;
-    config.stream = stream;
-    config.attrs = attrs;
-    config.numAttrs = 1;
-
-    HIP_CALL(
-        cudaLaunchKernelEx(&config, compute_rms_pdl_kernel<BLOCK_SIZE>, rms_out, inp, N, C, eps));
-#else
     compute_rms_pdl_kernel<BLOCK_SIZE>
         <<<N, BLOCK_SIZE, shared_mem, stream>>>(rms_out, inp, N, C, eps);
-#endif
 }
 
 struct FusedRMSNormMatmulPDL {

@@ -212,92 +212,6 @@ __global__ void sinkhorn_knopp_kernel(float* __restrict__ out, const float* __re
     }
 }
 
-template<int TILE_M, int TILE_N, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_pdl_kernel(float* __restrict__ out, const float* __restrict__ inp,
-                                          int M, int N, int num_iters, float eps) {
-    extern __shared__ float smem[];
-    float* tile = smem;
-    float* row_sums = smem + TILE_M * TILE_N;
-    float* col_sums = row_sums + TILE_M;
-
-    int tile_row = blockIdx.y * TILE_M;
-    int tile_col = blockIdx.x * TILE_N;
-
-    int rows_in_tile = min(TILE_M, M - tile_row);
-    int cols_in_tile = min(TILE_N, N - tile_col);
-
-    for (int i = threadIdx.x; i < TILE_M * TILE_N; i += BLOCK_SIZE) {
-        int local_r = i / TILE_N;
-        int local_c = i % TILE_N;
-        int global_r = tile_row + local_r;
-        int global_c = tile_col + local_c;
-
-        if (global_r < M && global_c < N) {
-            tile[i] = inp[global_r * N + global_c];
-        } else {
-            tile[i] = 0.0f;
-        }
-    }
-    __syncthreads();
-
-    for (int iter = 0; iter < num_iters; iter++) {
-        for (int r = threadIdx.x; r < TILE_M; r += BLOCK_SIZE) {
-            float sum = 0.0f;
-#pragma unroll 4
-            for (int c = 0; c < TILE_N; c++) {
-                sum += tile[r * TILE_N + c];
-            }
-            row_sums[r] = sum;
-        }
-        __syncthreads();
-
-        for (int i = threadIdx.x; i < TILE_M * TILE_N; i += BLOCK_SIZE) {
-            int r = i / TILE_N;
-            float row_sum = row_sums[r];
-            if (row_sum > eps) {
-                tile[i] /= row_sum;
-            }
-        }
-        __syncthreads();
-
-        for (int c = threadIdx.x; c < TILE_N; c += BLOCK_SIZE) {
-            float sum = 0.0f;
-#pragma unroll 4
-            for (int r = 0; r < TILE_M; r++) {
-                sum += tile[r * TILE_N + c];
-            }
-            col_sums[c] = sum;
-        }
-        __syncthreads();
-
-        for (int i = threadIdx.x; i < TILE_M * TILE_N; i += BLOCK_SIZE) {
-            int c = i % TILE_N;
-            float col_sum = col_sums[c];
-            if (col_sum > eps) {
-                tile[i] /= col_sum;
-            }
-        }
-        __syncthreads();
-    }
-
-#if __CUDA_ARCH__ >= 900
-    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
-
-    for (int i = threadIdx.x; i < TILE_M * TILE_N; i += BLOCK_SIZE) {
-        int local_r = i / TILE_N;
-        int local_c = i % TILE_N;
-        int global_r = tile_row + local_r;
-        int global_c = tile_col + local_c;
-
-        if (global_r < M && global_c < N) {
-            out[global_r * N + global_c] = tile[i];
-        }
-    }
-}
-
 template<int MAX_DIM, int BLOCK_SIZE>
 __global__ void sinkhorn_knopp_single_block_kernel(float* __restrict__ out,
                                                    const float* __restrict__ inp, int M, int N,
@@ -470,26 +384,8 @@ inline void sinkhorn_knopp_forward_fused_exp(float* out, float* H_res_exp, const
         size_t smem_size =
             MAX_DIM * MAX_DIM * sizeof(float) + MAX_DIM * sizeof(float) + MAX_DIM * sizeof(float);
 
-#ifdef MHC_ENABLE_PDL
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-        cudaLaunchConfig_t config = {};
-        config.numAttrs = 1;
-        config.attrs = attrs;
-        config.blockDim = {BLOCK_SIZE, 1, 1};
-        config.gridDim = {1, 1, 1};
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-
-        cudaLaunchKernelEx(&config,
-                           sinkhorn_knopp_single_block_fused_exp_kernel<MAX_DIM, BLOCK_SIZE>, out,
-                           H_res_exp, inp, M, N, num_iters, eps);
-#else
         sinkhorn_knopp_single_block_fused_exp_kernel<MAX_DIM, BLOCK_SIZE>
             <<<1, BLOCK_SIZE, smem_size, stream>>>(out, H_res_exp, inp, M, N, num_iters, eps);
-#endif
     } else if (M <= 128 && N <= 128) {
         constexpr int MAX_DIM = 128;
         size_t smem_size =
@@ -500,90 +396,9 @@ inline void sinkhorn_knopp_forward_fused_exp(float* out, float* H_res_exp, const
                             hipFuncAttributeMaxDynamicSharedMemorySize,
                             smem_size);
 
-#ifdef MHC_ENABLE_PDL
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-        cudaLaunchConfig_t config = {};
-        config.numAttrs = 1;
-        config.attrs = attrs;
-        config.blockDim = {BLOCK_SIZE, 1, 1};
-        config.gridDim = {1, 1, 1};
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-
-        cudaLaunchKernelEx(&config, kernel, out, H_res_exp, inp, M, N, num_iters, eps);
-#else
         kernel<<<1, BLOCK_SIZE, smem_size, stream>>>(out, H_res_exp, inp, M, N, num_iters, eps);
-#endif
     } else {
         fprintf(stderr, "sinkhorn_knopp_forward_fused_exp: M > 128 or N > 128 not supported\n");
-    }
-}
-
-template<int MAX_DIM, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_single_block_pdl_kernel(float* __restrict__ out,
-                                                       const float* __restrict__ inp, int M, int N,
-                                                       int num_iters, float eps) {
-    extern __shared__ float smem[];
-    float* tile = smem;
-    float* row_sums = smem + MAX_DIM * MAX_DIM;
-    float* col_sums = row_sums + MAX_DIM;
-
-    int total_elems = M * N;
-
-    for (int i = threadIdx.x; i < total_elems; i += BLOCK_SIZE) {
-        tile[i] = inp[i];
-    }
-    __syncthreads();
-
-    for (int iter = 0; iter < num_iters; iter++) {
-        for (int r = threadIdx.x; r < M; r += BLOCK_SIZE) {
-            float sum = 0.0f;
-            for (int c = 0; c < N; c++) {
-                sum += tile[r * N + c];
-            }
-            row_sums[r] = sum;
-        }
-        __syncthreads();
-
-        for (int i = threadIdx.x; i < total_elems; i += BLOCK_SIZE) {
-            int r = i / N;
-            float row_sum = row_sums[r];
-            if (row_sum > eps) {
-                tile[i] /= row_sum;
-            }
-        }
-        __syncthreads();
-
-        for (int c = threadIdx.x; c < N; c += BLOCK_SIZE) {
-            float sum = 0.0f;
-            for (int r = 0; r < M; r++) {
-                sum += tile[r * N + c];
-            }
-            col_sums[c] = sum;
-        }
-        __syncthreads();
-
-        for (int i = threadIdx.x; i < total_elems; i += BLOCK_SIZE) {
-            int c = i % N;
-            float col_sum = col_sums[c];
-            if (col_sum > eps) {
-                tile[i] /= col_sum;
-            }
-        }
-        __syncthreads();
-    }
-
-#if __CUDA_ARCH__ >= 900
-    if (threadIdx.x == 0) {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
-
-    for (int i = threadIdx.x; i < total_elems; i += BLOCK_SIZE) {
-        out[i] = tile[i];
     }
 }
 
@@ -996,25 +811,8 @@ inline void sinkhorn_knopp_forward_batched(float* out, const float* inp, int B, 
         constexpr int THREADS_PER_BLOCK = 256;
         int num_blocks = (B + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
-#ifdef MHC_ENABLE_PDL
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-        cudaLaunchConfig_t config = {};
-        config.numAttrs = 1;
-        config.attrs = attrs;
-        config.blockDim = {THREADS_PER_BLOCK, 1, 1};
-        config.gridDim = {(unsigned int)num_blocks, 1, 1};
-        config.dynamicSmemBytes = 0;
-        config.stream = stream;
-
-        cudaLaunchKernelEx(&config, sinkhorn_knopp_batched_n4_kernel<4>, out, inp, B, num_iters,
-                           eps);
-#else
         sinkhorn_knopp_batched_n4_kernel<4>
             <<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(out, inp, B, num_iters, eps);
-#endif
         return;
     }
 
@@ -1030,25 +828,8 @@ inline void sinkhorn_knopp_forward_batched(float* out, const float* inp, int B, 
 
     size_t smem_size = N_MAX * N_MAX * sizeof(float) + 2 * N_MAX * sizeof(float);
 
-#ifdef MHC_ENABLE_PDL
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchConfig_t config = {};
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    config.blockDim = {BLOCK_SIZE, 1, 1};
-    config.gridDim = {(unsigned int)B, 1, 1};
-    config.dynamicSmemBytes = smem_size;
-    config.stream = stream;
-
-    cudaLaunchKernelEx(&config, sinkhorn_knopp_batched_kernel<N_MAX, BLOCK_SIZE>, out, inp, B, n,
-                       num_iters, eps);
-#else
     sinkhorn_knopp_batched_kernel<N_MAX, BLOCK_SIZE>
         <<<B, BLOCK_SIZE, smem_size, stream>>>(out, inp, B, n, num_iters, eps);
-#endif
 }
 
 } // namespace mhc

@@ -339,26 +339,9 @@ inline void stream_aggregate_bf16_fused_sigmoid(__hip_bfloat16* out, float* H_pr
 
     if (use_vec4) {
         int blocks = (B * (C / 4) + BLOCK - 1) / BLOCK;
-#ifdef MHC_ENABLE_PDL
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t config = {};
-        config.numAttrs = 1;
-        config.attrs = attrs;
-        config.blockDim = {BLOCK, 1, 1};
-        config.gridDim = {(unsigned int)blocks, 1, 1};
-        config.dynamicSmemBytes = 0;
-        config.stream = stream;
-
-#define DISPATCH_AGGREGATE_VEC4(MAX_N_VAL)                                                         \
-    cudaLaunchKernelEx(&config, stream_aggregate_bf16_fused_sigmoid_vec4_kernel<BLOCK, MAX_N_VAL>, \
-                       out, H_pre_activated, inp, H_pre_raw, B, n, C)
-#else
 #define DISPATCH_AGGREGATE_VEC4(MAX_N_VAL)                                                         \
     stream_aggregate_bf16_fused_sigmoid_vec4_kernel<BLOCK, MAX_N_VAL>                              \
         <<<blocks, BLOCK, 0, stream>>>(out, H_pre_activated, inp, H_pre_raw, B, n, C)
-#endif
         if (n <= 4) {
             DISPATCH_AGGREGATE_VEC4(4);
         } else if (n <= 8) {
@@ -371,26 +354,9 @@ inline void stream_aggregate_bf16_fused_sigmoid(__hip_bfloat16* out, float* H_pr
 #undef DISPATCH_AGGREGATE_VEC4
     } else {
         int blocks = (B * C + BLOCK - 1) / BLOCK;
-#ifdef MHC_ENABLE_PDL
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t config = {};
-        config.numAttrs = 1;
-        config.attrs = attrs;
-        config.blockDim = {BLOCK, 1, 1};
-        config.gridDim = {(unsigned int)blocks, 1, 1};
-        config.dynamicSmemBytes = 0;
-        config.stream = stream;
-
-#define DISPATCH_AGGREGATE_FUSED(MAX_N_VAL)                                                        \
-    cudaLaunchKernelEx(&config, stream_aggregate_bf16_fused_sigmoid_kernel<BLOCK, MAX_N_VAL>, out, \
-                       H_pre_activated, inp, H_pre_raw, B, n, C)
-#else
 #define DISPATCH_AGGREGATE_FUSED(MAX_N_VAL)                                                        \
     stream_aggregate_bf16_fused_sigmoid_kernel<BLOCK, MAX_N_VAL>                                   \
         <<<blocks, BLOCK, 0, stream>>>(out, H_pre_activated, inp, H_pre_raw, B, n, C)
-#endif
         if (n <= 4) {
             DISPATCH_AGGREGATE_FUSED(4);
         } else if (n <= 8) {
@@ -413,26 +379,9 @@ inline void stream_distribute_mix_add_fused(float* out, float* H_post_activated,
     constexpr int BLOCK = 256;
     int blocks = (B * n * C + BLOCK - 1) / BLOCK;
 
-#ifdef MHC_ENABLE_PDL
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-    cudaLaunchConfig_t config = {};
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    config.blockDim = {BLOCK, 1, 1};
-    config.gridDim = {(unsigned int)blocks, 1, 1};
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-
-#define DISPATCH_MIX_ADD_FUSED(MAX_N_VAL)                                                          \
-    cudaLaunchKernelEx(&config, stream_distribute_mix_add_fused_kernel<BLOCK, MAX_N_VAL>, out,     \
-                       H_post_activated, x_inp, y_norm, H_post_raw, M, B, n, C)
-#else
 #define DISPATCH_MIX_ADD_FUSED(MAX_N_VAL)                                                          \
     stream_distribute_mix_add_fused_kernel<BLOCK, MAX_N_VAL><<<blocks, BLOCK, 0, stream>>>(        \
         out, H_post_activated, x_inp, y_norm, H_post_raw, M, B, n, C)
-#endif
 
     if (n <= 4) {
         DISPATCH_MIX_ADD_FUSED(4);
@@ -532,26 +481,9 @@ inline void stream_aggregate_bf16_dynamic(__hip_bfloat16* out, const float* inp,
 
     if (use_vec4) {
         int blocks = (B * (C / 4) + BLOCK - 1) / BLOCK;
-#ifdef MHC_ENABLE_PDL
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t config = {};
-        config.numAttrs = 1;
-        config.attrs = attrs;
-        config.blockDim = {BLOCK, 1, 1};
-        config.gridDim = {(unsigned int)blocks, 1, 1};
-        config.dynamicSmemBytes = 0;
-        config.stream = stream;
-
-#define DISPATCH_AGGREGATE_DYN_VEC4(MAX_N_VAL)                                                     \
-    cudaLaunchKernelEx(&config, stream_aggregate_bf16_dynamic_vec4_kernel<BLOCK, MAX_N_VAL>, out,  \
-                       inp, H_pre, B, n, C)
-#else
 #define DISPATCH_AGGREGATE_DYN_VEC4(MAX_N_VAL)                                                     \
     stream_aggregate_bf16_dynamic_vec4_kernel<BLOCK, MAX_N_VAL>                                    \
         <<<blocks, BLOCK, 0, stream>>>(out, inp, H_pre, B, n, C)
-#endif
         if (n <= 4) {
             DISPATCH_AGGREGATE_DYN_VEC4(4);
         } else if (n <= 8) {
@@ -564,26 +496,9 @@ inline void stream_aggregate_bf16_dynamic(__hip_bfloat16* out, const float* inp,
 #undef DISPATCH_AGGREGATE_DYN_VEC4
     } else {
         int blocks = (B * C + BLOCK - 1) / BLOCK;
-#ifdef MHC_ENABLE_PDL
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t config = {};
-        config.numAttrs = 1;
-        config.attrs = attrs;
-        config.blockDim = {BLOCK, 1, 1};
-        config.gridDim = {(unsigned int)blocks, 1, 1};
-        config.dynamicSmemBytes = 0;
-        config.stream = stream;
-
-#define DISPATCH_AGGREGATE_DYN(MAX_N_VAL)                                                          \
-    cudaLaunchKernelEx(&config, stream_aggregate_bf16_dynamic_kernel<BLOCK, MAX_N_VAL>, out, inp,  \
-                       H_pre, B, n, C)
-#else
 #define DISPATCH_AGGREGATE_DYN(MAX_N_VAL)                                                          \
     stream_aggregate_bf16_dynamic_kernel<BLOCK, MAX_N_VAL>                                         \
         <<<blocks, BLOCK, 0, stream>>>(out, inp, H_pre, B, n, C)
-#endif
         if (n <= 4) {
             DISPATCH_AGGREGATE_DYN(4);
         } else if (n <= 8) {
@@ -606,26 +521,9 @@ inline void stream_distribute_mix_add_fused_dynamic(float* out, const float* x_i
     constexpr int BLOCK = 256;
     int blocks = (B * n * C + BLOCK - 1) / BLOCK;
 
-#ifdef MHC_ENABLE_PDL
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-    cudaLaunchConfig_t config = {};
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    config.blockDim = {BLOCK, 1, 1};
-    config.gridDim = {(unsigned int)blocks, 1, 1};
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-
-#define DISPATCH_MIX_ADD_DYN(MAX_N_VAL)                                                            \
-    cudaLaunchKernelEx(&config, stream_distribute_mix_add_dynamic_kernel<BLOCK, MAX_N_VAL>, out,   \
-                       x_inp, y_norm, H_post, M, B, n, C)
-#else
 #define DISPATCH_MIX_ADD_DYN(MAX_N_VAL)                                                            \
     stream_distribute_mix_add_dynamic_kernel<BLOCK, MAX_N_VAL>                                     \
         <<<blocks, BLOCK, 0, stream>>>(out, x_inp, y_norm, H_post, M, B, n, C)
-#endif
 
     if (n <= 4) {
         DISPATCH_MIX_ADD_DYN(4);

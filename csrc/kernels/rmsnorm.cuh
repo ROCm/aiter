@@ -200,27 +200,6 @@ inline void rmsnorm_forward_with_rms(__hip_bfloat16* out, float* rms_out, const 
     dim3 grid(N);
     dim3 block(BLOCK_SIZE);
 
-#ifdef MHC_ENABLE_PDL
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    cudaLaunchConfig_t config = {};
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    config.blockDim = block;
-    config.gridDim = grid;
-    config.dynamicSmemBytes = shared_mem;
-    config.stream = stream;
-
-    if (C % 8 == 0 && C >= 64) {
-        cudaLaunchKernelEx(&config, rmsnorm_kernel_vectorized<BLOCK_SIZE, true>, out, rms_out, inp,
-                           weight, N, C, eps);
-    } else {
-        cudaLaunchKernelEx(&config, rmsnorm_kernel<BLOCK_SIZE, true>, out, rms_out, inp, weight, N,
-                           C, eps);
-    }
-#else
     if (C % 8 == 0 && C >= 64) {
         rmsnorm_kernel_vectorized<BLOCK_SIZE, true>
             <<<grid, block, shared_mem, stream>>>(out, rms_out, inp, weight, N, C, eps);
@@ -228,7 +207,6 @@ inline void rmsnorm_forward_with_rms(__hip_bfloat16* out, float* rms_out, const 
         rmsnorm_kernel<BLOCK_SIZE, true>
             <<<grid, block, shared_mem, stream>>>(out, rms_out, inp, weight, N, C, eps);
     }
-#endif
 }
 template<int BLOCK_SIZE>
 __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __restrict__ d_weight,
