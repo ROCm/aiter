@@ -147,8 +147,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Clean up Rocm processes
-        run: ./.github/scripts/clean_up_rocm.sh
+      - name: Sync submodules
+        run: |
+          set -euo pipefail
+          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
+            echo "It's main branch, syncing latest CK..."
+            git submodule sync
+            git submodule update --init --recursive --remote --depth 1 --jobs 4
+          else
+            echo "It's a PR branch, syncing specific CK..."
+            git submodule sync
+            git submodule update --init --recursive --depth 1 --jobs 4
+          fi
 
       - name: Run the container
         run: |
@@ -206,11 +216,6 @@ jobs:
         if: always()
         run: |
           docker rm -f aiter_test || true
-  
-      - name: Clean up Rocm processes
-        if: always()
-        run: |
-          ./.github/scripts/clean_up_rocm.sh
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
