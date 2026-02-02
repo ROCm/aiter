@@ -271,6 +271,7 @@ def test_fmoe_ep(
         # b implement
         w1b = shuffle_weight(w1)
         w2b = shuffle_weight(w2)
+        local_expert_hash = None
         if expert_mask is not None and use_smooth:
             local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
             local_expert_hash[local_expert_hash > 0] -= 1
@@ -600,7 +601,7 @@ for test in l_test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8smoothquant":
