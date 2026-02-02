@@ -811,6 +811,13 @@ OPUS_H_D constexpr auto set_slice(C&& dst_c, V&& src_c, S&&...ss) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // BELOW IS AMDGPU SPECIFIC TYPES/ARCH/INTRINSICS
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
+// address space attribute
+#if defined(__HIP_DEVICE_COMPILE__)
+    #define OPUS_LDS_ADDR __attribute__((address_space(3)))
+#else
+    #define OPUS_LDS_ADDR
+#endif
+
 // dtype, suffix is "_t", and register corresponding ext_vector_type, and a specialization of is_dtype
 #define REGISTER_DTYPE(dtype_base_, dtype_impl_)        \
     using dtype_base_ ## _t    = dtype_impl_;           \
@@ -1108,15 +1115,15 @@ struct smem {
     static constexpr index_t vector_size = vector_traits<T>::size();
     template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
 
-    OPUS_D smem(void* ptr_) : ptr(reinterpret_cast<char*>(ptr_)) {}
+    OPUS_D smem(void* ptr_) : ptr((OPUS_LDS_ADDR char*)ptr_) {}
 
-    template<index_t vec = 1> OPUS_D auto _load(int v_os/* in unit of byte*/) { using type = vector_type<vec>; return *reinterpret_cast<type*>(ptr + v_os); }
+    template<index_t vec = 1> OPUS_D auto _load(int v_os/* in unit of byte*/) { using type = vector_type<vec>; return *reinterpret_cast<OPUS_LDS_ADDR type*>(ptr + v_os); }
 
     template<index_t vec = 1, typename V>
     OPUS_D void _store(const V& x, int v_os/* in unit of byte*/) {
         static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
         using type = vector_type<vec>;
-        *reinterpret_cast<type*>(ptr + v_os) = __builtin_bit_cast(type, x);
+        *reinterpret_cast<OPUS_LDS_ADDR type*>(ptr + v_os) = __builtin_bit_cast(type, x);
     }
 
     template<index_t vec = 1> OPUS_D auto load(int v_os) { return _load<vec>(v_os * sizeof(T)); }
@@ -1176,7 +1183,7 @@ struct smem {
             store<vec>(v_, u(ids...));
         });
     }
-    char * ptr; // in unit of byte
+    OPUS_LDS_ADDR char* ptr; // in unit of byte
 };
 
 template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
