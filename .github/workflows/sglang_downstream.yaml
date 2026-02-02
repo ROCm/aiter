@@ -25,14 +25,22 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
-    name: sglang integration
+    if: ${{ !github.event.pull_request.head.repo.fork }}
+    name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
-    runs-on: aiter-1gpu-runner
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: aiter-1gpu-runner
+            label: MI325
+
     env:
-      SGL_BRANCH: v0.5.6
+      SGL_BRANCH: v0.5.8
       GPU_ARCH: gfx942
       GPU_ARCH_CI: mi300 # used in sglang ci scripts
-      SGL_IMAGE: rocm/sgl-dev:v0.5.6-rocm700-mi30x-20251208
+      SGL_IMAGE: rocm/sgl-dev:v0.5.8-rocm700-mi30x-20260127
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -90,9 +98,10 @@ jobs:
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
           -v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout" \
           --ipc=host --group-add video \
+          --network=host \
           --shm-size 32g \
           --cap-add=SYS_PTRACE \
-          -e HF_TOKEN="${HF_TOKEN:-}" \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           --security-opt seccomp=unconfined \
           -w /sglang-checkout \
           --name sglang_aiter_test \
@@ -108,6 +117,8 @@ jobs:
       - name: Install dependencies
         run: |
           cd sglang
+          git config user.name "aiter-ci" && git config user.email "aiter-ci@amd.com"
+          git fetch origin 2c9b43b5135846f40f66c4e543589bf303c1c07c && git cherry-pick FETCH_HEAD # https://github.com/charlesHsuGG/sglang/commit/2c9b43b5135846f40f66c4e543589bf303c1c07c
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
           sed -i "4s/^GPU_ARCH=.*/GPU_ARCH=\"${GPU_ARCH_CI}\"/" scripts/ci/amd_ci_install_dependency.sh
           bash scripts/ci/amd_ci_install_dependency.sh
@@ -115,12 +126,13 @@ jobs:
       - name: Evaluate Accuracy
         timeout-minutes: 120
         run: |
+          set -ex
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
           bash scripts/ci/amd_ci_exec.sh printenv | grep GPU_ARCH || true
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 ../registered/eval/test_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh python3 ../registered/quant/test_eval_fp8_accuracy.py
+          bash scripts/ci/amd_ci_exec.sh python3 ../registered/models/test_qwen_models.py
 
       # TODO: Clean up because some dependencies are installed under root user which can't be removed by runner, these dependencies should be installed as a non-root user
       - name: Clean Up
