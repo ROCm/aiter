@@ -3,8 +3,9 @@
 
 import argparse
 import torch
+import pandas as pd
 import aiter
-from aiter.test_common import checkAllclose
+from aiter.test_common import checkAllclose, run_perftest
 
 
 def sinkhorn_ref(M, iters):
@@ -176,6 +177,8 @@ def run_case(
     eps=1e-5,
     ref_device="cuda",
     debug_intermediates=False,
+    num_iters=100,
+    num_warmup=10,
 ):
     device = "cuda"
     torch.manual_seed(42)
@@ -198,7 +201,9 @@ def run_case(
     b_post = torch.zeros(n, device=device, dtype=torch.float32)
     b_res = (torch.rand(n * n, device=device, dtype=torch.float32) * 2.0 - 1.0) * 0.01
 
-    out = aiter.mhc_layer(
+    # Measure aiter kernel time
+    out, us_aiter = run_perftest(
+        aiter.mhc_layer,
         x_expanded,
         rmsnorm_weight,
         phi_pre,
@@ -212,9 +217,13 @@ def run_case(
         alpha_res=0.01,
         sinkhorn_iters=sinkhorn_iters,
         eps=eps,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
     )
 
-    ref_bf16_like = mhc_layer_ref(
+    # Measure torch reference time (bf16-like on CUDA)
+    ref_bf16_like, us_torch_bf16 = run_perftest(
+        mhc_layer_ref,
         x_expanded.to(ref_device),
         rmsnorm_weight.to(ref_device),
         phi_pre.to(ref_device),
@@ -228,9 +237,14 @@ def run_case(
         0.01,
         sinkhorn_iters,
         eps,
-    ).to(device)
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+    )
+    ref_bf16_like = ref_bf16_like.to(device)
 
-    ref_fp32_cuda = mhc_layer_ref_fp32(
+    # Measure torch reference time (fp32 on CUDA)
+    ref_fp32_cuda, us_torch_fp32 = run_perftest(
+        mhc_layer_ref_fp32,
         x_expanded,
         rmsnorm_weight.float(),
         phi_pre.float(),
@@ -244,6 +258,8 @@ def run_case(
         0.01,
         sinkhorn_iters,
         eps,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
     )
 
     ref_fp32_cpu = mhc_layer_ref_fp32(
@@ -263,14 +279,10 @@ def run_case(
     ).to(device)
 
     torch.cuda.synchronize()
-    msg = f"[mhc_layer bf16_like] B={B}, C={C}, n={n}"
-    checkAllclose(ref_bf16_like, out, atol=0.1, rtol=1e-2, msg=msg)
-    msg = f"[mhc_layer fp32_cuda] B={B}, C={C}, n={n}"
-    checkAllclose(ref_fp32_cuda, out, atol=0.1, rtol=1e-2, msg=msg)
-    msg = f"[mhc_layer fp32_cpu] B={B}, C={C}, n={n}"
-    checkAllclose(ref_fp32_cpu, out, atol=0.1, rtol=1e-2, msg=msg)
-    msg = f"[mhc_layer fp32 cpu vs cuda] B={B}, C={C}, n={n}"
-    checkAllclose(ref_fp32_cpu, ref_fp32_cuda, atol=1e-5, rtol=1e-5, msg=msg)
+    err_bf16 = checkAllclose(ref_bf16_like, out, atol=0.1, rtol=1e-2, msg=f"[mhc_layer bf16_like] B={B}, C={C}, n={n}")
+    err_fp32 = checkAllclose(ref_fp32_cuda, out, atol=0.1, rtol=1e-2, msg=f"[mhc_layer fp32_cuda] B={B}, C={C}, n={n}")
+    checkAllclose(ref_fp32_cpu, out, atol=0.1, rtol=1e-2, msg=f"[mhc_layer fp32_cpu] B={B}, C={C}, n={n}")
+    checkAllclose(ref_fp32_cpu, ref_fp32_cuda, atol=1e-5, rtol=1e-5, msg=f"[mhc_layer fp32 cpu vs cuda] B={B}, C={C}, n={n}")
 
     if debug_intermediates:
         debug = aiter.mhc_layer_debug(
@@ -354,6 +366,16 @@ def run_case(
             msg=f"[dbg rms_values] B={B}, C={C}, n={n}",
         )
 
+    return {
+        "B": B,
+        "C": C,
+        "n": n,
+        "error": err_fp32,
+        "us_aiter": us_aiter,
+        "us_torch_bf16": us_torch_bf16,
+        "us_torch_fp32": us_torch_fp32,
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -374,6 +396,18 @@ def main():
         "--debug-intermediates",
         action="store_true",
         help="compare debug intermediates from kernel vs reference",
+    )
+    parser.add_argument(
+        "--num-iters",
+        type=int,
+        default=100,
+        help="number of iterations for performance test (default: 100)",
+    )
+    parser.add_argument(
+        "--num-warmup",
+        type=int,
+        default=10,
+        help="number of warmup iterations (default: 10)",
     )
     args = parser.parse_args()
 
@@ -397,14 +431,38 @@ def main():
         ]
         configs = list(dict.fromkeys(configs))
 
+    df = []
     for B, C, n in configs:
-        run_case(
+        print(f"\n{'='*60}")
+        print(f"Testing: B={B}, C={C}, n={n}")
+        print(f"{'='*60}")
+        ret = run_case(
             B,
             C,
             n,
             ref_device=args.ref_device,
             debug_intermediates=args.debug_intermediates,
+            num_iters=args.num_iters,
+            num_warmup=args.num_warmup,
         )
+        df.append({
+            "B": ret["B"],
+            "C": ret["C"],
+            "n": ret["n"],
+            "error": ret["error"],
+            "time_us (aiter)": ret["us_aiter"],
+            "time_us (torch_bf16)": ret["us_torch_bf16"],
+            "time_us (torch_fp32)": ret["us_torch_fp32"],
+        })
+
+    df = pd.DataFrame(df)
+
+    # Add speedup columns
+    df["speedup (aiter vs torch_bf16)"] = df["time_us (torch_bf16)"] / df["time_us (aiter)"]
+    df["speedup (aiter vs torch_fp32)"] = df["time_us (torch_fp32)"] / df["time_us (aiter)"]
+
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mhc_layer summary (markdown):\n%s", df_md)
 
 
 if __name__ == "__main__":
