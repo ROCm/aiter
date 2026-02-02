@@ -8,7 +8,6 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
-import pandas as pd
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -25,157 +24,13 @@ def check_support(dtype, kv_dtype, nhead):
     return True
 
 
-def init_3buffer_kv_cache(
-    num_page: int,
-    page_size: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    scale_dim: int,
-) -> tuple:
-    """
-    Initialize KV cache for 3BUFFER layout with FP8 quantization.
-
-    Generates random KV cache data and applies per-channel quantization to the nope buffer.
-
-    Args:
-        num_page: Number of pages
-        page_size: Size of each page (block size)
-        kv_lora_rank: Rank of KV LoRA (nope dimension)
-        qk_rope_head_dim: Dimension of RoPE (rope dimension)
-        scale_dim: Number of scale factors per nope buffer
-
-    Returns:
-        tuple containing:
-            - kv_buffer: Concatenated buffer (BF16), shape (num_page, page_size, 1, kv_lora_rank + qk_rope_head_dim)
-            - kv_nope_buffer_fp8: Quantized nope buffer (FP8), shape (num_page, page_size, 1, kv_lora_rank)
-            - kv_nope_scale_factors_fp32: Scale factors (FP32), shape (num_page, page_size, 1, scale_dim)
-            - kv_rope_buffer_bf16: Rope buffer (BF16), shape (num_page, page_size, 1, qk_rope_head_dim)
-            - kv_nope_buffer_fp32: Original nope buffer (FP32), shape (num_page, page_size, 1, kv_lora_rank)
-    """
-    assert (
-        kv_lora_rank % scale_dim == 0
-    ), f"kv_lora_rank ({kv_lora_rank}) must be divisible by scale_dim ({scale_dim})"
-
-    kv_nope_buffer_fp32 = torch.randn(
-        (num_page, page_size, 1, kv_lora_rank), dtype=torch.float32
-    )
-    kv_rope_buffer_bf16 = torch.randn(
-        (num_page, page_size, 1, qk_rope_head_dim),
-        dtype=torch.bfloat16,
-    )
-
-    # Create full KV buffer (for golden reference without quantization)
-    kv_buffer = torch.cat(
-        [kv_nope_buffer_fp32.to(torch.bfloat16), kv_rope_buffer_bf16], dim=-1
-    )
-
-    # Generate random scale factors
-    # scale_values = [1.0, 2.0, 4.0, 8.0]
-    scale_values = [1.0, 1.0, 1.0, 1.0]
-    scale_indices = torch.randint(
-        0, len(scale_values), size=(num_page, page_size, 1, scale_dim)
-    )
-    kv_nope_scale_factors_fp32 = torch.tensor(
-        [scale_values[idx] for idx in scale_indices.flatten()], dtype=torch.float32
-    ).reshape(num_page, page_size, 1, scale_dim)
-
-    # Apply per-channel scaling and quantize to FP8
-    kv_nope_scaled_buffer = kv_nope_buffer_fp32.reshape(
-        num_page, page_size, 1, scale_dim, kv_lora_rank // scale_dim
-    ) / kv_nope_scale_factors_fp32.reshape(num_page, page_size, 1, scale_dim, 1)
-
-    kv_nope_buffer_fp8 = kv_nope_scaled_buffer.reshape(
-        num_page, page_size, 1, kv_lora_rank
-    ).to(dtypes.fp8)
-
-    return (
-        kv_buffer,
-        kv_nope_buffer_fp8,
-        kv_nope_scale_factors_fp32,
-        kv_rope_buffer_bf16,
-        kv_nope_buffer_fp32,
-    )
-
-
-def split_3buffer_kv_cache(
-    kv_buffer_bytes: torch.Tensor,
-    page_size: int,
-    nhead_kv: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    scale_dim: int,
-) -> tuple:
-    """
-    Split concatenated KV cache buffer back into 3 separate buffers.
-
-    This is the inverse operation of concatenating after flattening last 3 dimensions.
-
-    Args:
-        kv_buffer_bytes: Concatenated buffer (uint8), shape (num_page, page_size*656)
-                        where 656 = 512(nope) + 16(scale) + 128(rope)
-        page_size: Size of each page (block size)
-        nhead_kv: Number of heads in the KV cache
-        kv_lora_rank: Rank of KV LoRA (nope dimension)
-        qk_rope_head_dim: Dimension of RoPE (rope dimension)
-        scale_dim: Number of scale factors per nope buffer
-
-    Returns:
-        tuple containing:
-            - kv_nope_buffer_fp8: Quantized nope buffer (FP8), shape (num_page, page_size, 1, kv_lora_rank)
-            - kv_nope_scale_factors_fp32: Scale factors (FP32), shape (num_page, page_size, 1, scale_dim)
-            - kv_rope_buffer_bf16: Rope buffer (BF16), shape (num_page, page_size, 1, qk_rope_head_dim)
-    """
-    num_page = kv_buffer_bytes.shape[0]
-
-    nope_total_bytes = page_size * nhead_kv * kv_lora_rank * 1  # FP8: 1 byte/elem
-    scale_total_bytes = page_size * nhead_kv * scale_dim * 4  # FP32: 4 bytes/elem
-    rope_total_bytes = page_size * nhead_kv * qk_rope_head_dim * 2  # BF16: 2 bytes/elem
-
-    nope_flat = kv_buffer_bytes[:, 0:nope_total_bytes]
-    scale_flat = kv_buffer_bytes[
-        :, nope_total_bytes : nope_total_bytes + scale_total_bytes
-    ]
-    rope_flat = kv_buffer_bytes[
-        :,
-        nope_total_bytes
-        + scale_total_bytes : nope_total_bytes
-        + scale_total_bytes
-        + rope_total_bytes,
-    ]
-
-    nope_bytes = nope_flat.reshape(num_page, page_size, nhead_kv, kv_lora_rank * 1)
-    scale_bytes = scale_flat.reshape(num_page, page_size, nhead_kv, scale_dim * 4)
-    rope_bytes = rope_flat.reshape(num_page, page_size, nhead_kv, qk_rope_head_dim * 2)
-
-    # Convert bytes back to original dtypes
-    kv_nope_buffer_fp8 = (
-        nope_bytes.contiguous()
-        .view(dtypes.fp8)
-        .reshape(num_page, page_size, nhead_kv, kv_lora_rank)
-    )
-
-    kv_nope_scale_factors_fp32 = (
-        scale_bytes.contiguous()
-        .view(torch.float32)
-        .reshape(num_page, page_size, nhead_kv, scale_dim)
-    )
-
-    kv_rope_buffer_bf16 = (
-        rope_bytes.contiguous()
-        .view(torch.bfloat16)
-        .reshape(num_page, page_size, nhead_kv, qk_rope_head_dim)
-    )
-
-    return kv_nope_buffer_fp8, kv_nope_scale_factors_fp32, kv_rope_buffer_bf16
-
-
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
     x, y = x.double(), y.double()
-    # RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    # amax_diff = (x - y).abs().max().item()
+    amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
@@ -195,12 +50,13 @@ def ref_masked_attention(
     q_scale=None,
     kv_scale=None,
 ):
+
     if is_fp8_q and q_scale is not None:
         scale *= q_scale
     if is_fp8_kvc and kv_scale is not None:
         scale *= kv_scale
-    attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
 
+    attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
         s_q = query.shape[0]
         s_k = key.shape[0]
@@ -211,82 +67,32 @@ def ref_masked_attention(
         attn_weights += attn_bias
 
     lse = attn_weights.logsumexp(dim=-1)
+
     m = attn_weights.max(-1).values
+
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
-    l = attn_weights_exp.sum(-1)  # noqa: E741
+
+    l = attn_weights_exp.sum(-1)
+
     if is_fp8_q:
         attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
+
     out = out / l.transpose(0, 1).unsqueeze(-1)
+
     if is_fp8_kvc and kv_scale is not None:
         out *= kv_scale
     return out.to(dtype), lse
 
 
-def torch_mla_extend_3buffer(
-    q,  # [total_q, nheads, headdim_q]
-    kvc_cache,  # [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    kv_last_page_lens,
-    page_size,
-    nhead_kv,
-    sm_scale,
-    kv_lora_rank,
-    qk_rope_head_dim,
-    dtype,
-    is_causal=True,
-    q_scale=None,
-    kv_scale=None,
-    scale_dim=4,
-):
-    num_page = kvc_cache.shape[0]
-    kv_nope_buffer_fp8, kv_nope_scale_factors_fp32, kv_rope_buffer_bf16 = (
-        split_3buffer_kv_cache(
-            kvc_cache, page_size, nhead_kv, kv_lora_rank, qk_rope_head_dim, scale_dim
-        )
-    )
-
-    kv_nope_buffer_fp32 = kv_nope_buffer_fp8.to(torch.float32).reshape(
-        num_page, page_size, nhead_kv, scale_dim, -1
-    ) * kv_nope_scale_factors_fp32.reshape(num_page, page_size, nhead_kv, scale_dim, 1)
-    kvc_cache_bf16 = torch.cat(
-        [
-            kv_nope_buffer_fp32.reshape(num_page, page_size, nhead_kv, kv_lora_rank).to(
-                torch.bfloat16
-            ),
-            kv_rope_buffer_bf16,
-        ],
-        dim=-1,
-    )
-
-    return torch_mla_extend(
-        q,
-        kvc_cache_bf16,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_lens,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        dtype,
-        is_causal,
-        q_scale,
-        kv_scale,
-    )
-
-
 def torch_mla_extend(
     q,  # [total_q, nheads, headdim_q]
-    kvc_cache,  # [num_page, page_size, nhead_kv, qk_head_dim]
+    kvc_cache,  # [num_page * page_size, nhead_kv, qk_head_dim]
     qo_indptr,
     kv_indptr,
     kv_indices,
-    kv_last_page_lens,
     sm_scale,
     kv_lora_rank,
     qk_rope_head_dim,
@@ -295,7 +101,6 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    num_page, page_size, nhead_kv, _ = kvc_cache.shape
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
 
@@ -313,9 +118,7 @@ def torch_mla_extend(
     os = []
     lses = []
     for i in range(bs):
-        cur_num_page = kvs[i].shape[0]
-        real_kv_seq_len = (cur_num_page - 1) * page_size + kv_last_page_lens.tolist()[i]
-        kvc = kvs[i].flatten(0, 1)[:real_kv_seq_len,]
+        kvc = kvs[i]
         q = qs[i]
         k = kvc
         v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
@@ -354,8 +157,6 @@ def test_mla(
     decode_qlen,
     max_split_per_batch,
     non_persistent_mode,
-    paged_layout,
-    scale_dim,
 ):
     ret = {}
 
@@ -369,7 +170,6 @@ def test_mla(
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int)
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
-    kv_block_nums = torch.empty(batch_size, dtype=torch.int)
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     if varlen:
         for i in range(batch_size):
@@ -378,54 +178,27 @@ def test_mla(
             seq_lens_qo[i] = max(
                 min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
             )
-            kv_block_nums[i] = (seq_lens_kv[i] + page_size - 1) // page_size
-            if seq_lens_kv[i] % page_size == 0:
-                kv_last_page_lens[i] = page_size
-            else:
-                kv_last_page_lens[i] = seq_lens_kv[i] % page_size
     else:
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
-        kv_block_nums.fill_((ctx_lens + page_size - 1) // page_size)
-        if ctx_lens % page_size == 0:
-            kv_last_page_lens.fill_(page_size)
-        else:
-            kv_last_page_lens.fill_(ctx_lens % page_size)
 
-    kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
-    num_page = kv_indptr[-1].item()
-    kv_indices = torch.randperm(num_page, dtype=torch.int)
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
+    kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
-    # max_seqlen_kv = seq_lens_kv.max().item()
-    # total_qo = qo_indptr[-1].item()
-    total_kv = seq_lens_kv.sum().item()
-
+    max_seqlen_kv = seq_lens_kv.max().item()
+    total_qo = qo_indptr[-1].item()
+    total_kv = kv_indptr[-1].item()
     kv_buffer = torch.randn(
-        (num_page, page_size, 1, kv_lora_rank + qk_rope_head_dim),
+        (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
         dtype=torch.bfloat16,
     )
-
-    kv_nope_scale_factors_fp32 = None
-    kv_nope_buffer_fp8 = None
-    kv_rope_buffer_bf16 = None
-
-    if paged_layout == "3BUFFER":
-        (
-            kv_buffer,
-            kv_nope_buffer_fp8,
-            kv_nope_scale_factors_fp32,
-            kv_rope_buffer_bf16,
-            _,
-        ) = init_3buffer_kv_cache(
-            num_page, page_size, kv_lora_rank, qk_rope_head_dim, scale_dim
-        )
 
     # for none absorb (mha)
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    # us_asm = None
+    us_asm = None
     # if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
     #     us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
@@ -449,7 +222,6 @@ def test_mla(
         qo_indptr,
         kv_indptr,
         kv_indices,
-        kv_last_page_lens,
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
@@ -507,10 +279,9 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-    aiter.get_mla_metadata_v1(
+    meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
-        kv_last_page_lens,
         nhead // nhead_kv,
         nhead_kv,
         True,
@@ -520,8 +291,7 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        page_size=page_size,
-        kv_granularity=max(1, 16 // page_size),
+        kv_granularity=max(page_size, 16),
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,
@@ -531,66 +301,10 @@ def test_mla(
         dtype_kv=kvtype,
     )
 
-    def test_absorb_decode_bf16_fp8():
-        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        kv_buffer_fp8 = kv_buffer.to(kvtype)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
-
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
-            q,
-            kv_buffer_fp8,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            dtype=out_dtype,
-            is_causal=True,
-            q_scale=None,
-            kv_scale=kv_scale,
-        )
-
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
-            q,
-            kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_qo,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            num_kv_splits=max_split_per_batch,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
-            kv_scale=kv_scale,
-        )
-
-        err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        checkAllclose(
-            out_ref_fp8,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        return err, us_asm_decode
-
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
+
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
@@ -601,8 +315,6 @@ def test_mla(
             kv_indices,
             kv_last_page_lens,
             max_seqlen_qo,
-            page_size,
-            nhead_kv,
             sm_scale,
             num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
@@ -642,7 +354,6 @@ def test_mla(
             qo_indptr,
             kv_indptr,
             kv_indices,
-            kv_last_page_lens,
             sm_scale,
             kv_lora_rank,
             qk_rope_head_dim,
@@ -662,8 +373,6 @@ def test_mla(
             kv_indices,
             kv_last_page_lens,
             max_seqlen_qo,
-            page_size,
-            nhead_kv,
             sm_scale,
             num_kv_splits=max_split_per_batch,
             q_scale=q_scale,
@@ -687,99 +396,21 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        checkAllclose(
+        err_fp8 = checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
 
-        cal_diff(out_ref, out_asm, "out", True)
-        return err, us_asm_decode
-
-    def test_absorb_decode_3buffer():
-
-        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-
-        # convert to bytes
-        nope_bytes = kv_nope_buffer_fp8.view(torch.uint8)
-        scale_bytes = kv_nope_scale_factors_fp32.view(torch.uint8)
-        rope_bytes = kv_rope_buffer_bf16.view(torch.uint8)
-        kv_buffer_bytes = torch.cat(
-            [nope_bytes.flatten(1), scale_bytes.flatten(1), rope_bytes.flatten(1)],
-            dim=-1,
-        )
-
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend_3buffer(
-            q,
-            kv_buffer_bytes,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            dtype=out_dtype,
-            is_causal=True,
-            scale_dim=scale_dim,
-        )
-
-        checkAllclose(
-            out_ref,
-            out_ref_fp8,
-            msg="mla_decode-absorb_fp8    [golden fp8 vs golden]:......",
-        )
-
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
-            q,
-            kv_buffer_bytes,
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_qo,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            num_kv_splits=max_split_per_batch,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=non_persistent_mode,
-        )
-
-        err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        checkAllclose(
-            out_ref_fp8,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
     err = None
     us_asm_decode = 1e12
-
-    if paged_layout == "3BUFFER" and not non_persistent_mode:
-        err, us_asm_decode = test_absorb_decode_3buffer()
-    elif dtype == torch.bfloat16 and kvtype == dtypes.fp8:
-        err, us_asm_decode = test_absorb_decode_bf16_fp8()
-    elif dtype == torch.bfloat16:
+    if dtype == torch.bfloat16:
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8:
         err, us_asm_decode = test_absorb_decode_fp8()
-
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
@@ -806,6 +437,7 @@ block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
 list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)]
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -822,7 +454,7 @@ parser.add_argument(
     "-qn",
     "--qk_nope_head_dim",
     type=int,
-    default=512,
+    default=128,
     help="""qk nope head dim.
     e.g.: -qn 512""",
 )
@@ -920,25 +552,8 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
-parser.add_argument(
-    "-pl",
-    "--paged_layout",
-    type=str,
-    choices=["LEGACY", "3BUFFER"],
-    default="LEGACY",
-    help="""kv paged layout for persistent mode.
-        LEGACY: kv buffer is common buffer with nope and rope parts.
-        3BUFFER: kv buffer is 3-buffer with nope, kv_scale and rope parts.
-        e.g.: -pl 3BUFFER""",
-)
-parser.add_argument(
-    "-sd",
-    "--scale_dim",
-    type=int,
-    default=4,
-    help="""scale dim.
-    e.g.: -sd 4""",
-)
+
+import pandas as pd
 
 args = parser.parse_args()
 list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
@@ -967,8 +582,6 @@ for nhead, decode_qlen in list_nhead:
                 decode_qlen=decode_qlen,
                 max_split_per_batch=max_split_per_batch,
                 non_persistent_mode=args.non_persistent_mode,
-                paged_layout=args.paged_layout,
-                scale_dim=args.scale_dim,
             )
             df.append(ret)
     df = pd.DataFrame(df)
