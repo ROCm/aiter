@@ -421,7 +421,7 @@ __global__ void sinkhorn_knopp_single_block_fused_exp_kernel(float* __restrict__
 }
 
 inline void sinkhorn_knopp_forward(float* out, const float* inp, int M, int N, int num_iters,
-                                   float eps, cudaStream_t stream = nullptr) {
+                                   float eps, hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 256;
 
     if (M == 32 && N == 32) {
@@ -462,7 +462,7 @@ inline void sinkhorn_knopp_forward(float* out, const float* inp, int M, int N, i
 
 inline void sinkhorn_knopp_forward_fused_exp(float* out, float* H_res_exp, const float* inp, int M,
                                              int N, int num_iters, float eps,
-                                             cudaStream_t stream = nullptr) {
+                                             hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 256;
 
     if (M <= 64 && N <= 64) {
@@ -804,7 +804,7 @@ sinkhorn_knopp_backward_kernel(float* __restrict__ d_inp, const float* __restric
 
 inline void sinkhorn_knopp_backward(float* d_inp, const float* grad, const float* M_out,
                                     const float* M_inp, int N, int num_iters, float eps,
-                                    cudaStream_t stream = nullptr) {
+                                    hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 256;
 
     if (N <= 32 && num_iters <= 20) {
@@ -991,7 +991,7 @@ __global__ void sinkhorn_knopp_batched_kernel(float* __restrict__ out,
 
 inline void sinkhorn_knopp_forward_batched(float* out, const float* inp, int B, int n,
                                            int num_iters, float eps,
-                                           cudaStream_t stream = nullptr) {
+                                           hipStream_t stream = nullptr) {
     if (n == 4) {
         constexpr int THREADS_PER_BLOCK = 256;
         int num_blocks = (B + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;

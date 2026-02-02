@@ -27,7 +27,7 @@ def mhc_layer_fwd(
     use_pdl: bool = True,
 ) -> None:
     """
-    MHC layer forward (CUDA/HIP).
+    MHC layer forward
     """
     ...
 
@@ -58,7 +58,7 @@ def mhc_layer_fwd_debug(
     use_pdl: bool = True,
 ) -> None:
     """
-    MHC layer forward with debug intermediates (CUDA/HIP).
+    MHC layer forward with debug intermediates
     """
     ...
 

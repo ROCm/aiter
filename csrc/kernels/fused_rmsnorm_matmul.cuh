@@ -117,7 +117,7 @@ __global__ void compute_rms_kernel_vectorized(float* __restrict__ rms_out,
 }
 
 inline void compute_rms(float* rms_out, const floatX* inp, int N, int C, float eps,
-                        cudaStream_t stream = nullptr) {
+                        hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
     size_t shared_mem = num_warps * sizeof(float);
@@ -198,7 +198,7 @@ __global__ void divide_by_rms_kernel_vectorized(float* __restrict__ out,
 }
 
 inline void divide_by_rms(float* out, const float* rms, int M, int N,
-                          cudaStream_t stream = nullptr) {
+                          hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 256;
 
 #ifdef MHC_ENABLE_PDL
@@ -229,50 +229,50 @@ inline void divide_by_rms(float* out, const float* rms, int M, int N,
 }
 
 struct MatmulDescriptors {
-    cublasLtHandle_t handle;
-    cublasLtMatmulDesc_t matmul_desc;
-    cublasLtMatrixLayout_t A_desc;
-    cublasLtMatrixLayout_t B_desc;
-    cublasLtMatrixLayout_t C_desc;
-    cublasLtMatmulPreference_t preference;
-    cublasLtMatmulHeuristicResult_t heuristic;
+    hipblasLtHandle_t handle;
+    hipblasLtMatmulDesc_t matmul_desc;
+    hipblasLtMatrixLayout_t A_desc;
+    hipblasLtMatrixLayout_t B_desc;
+    hipblasLtMatrixLayout_t C_desc;
+    hipblasLtMatmulPreference_t preference;
+    hipblasLtMatmulHeuristicResult_t heuristic;
     void* workspace;
     size_t workspace_size;
 };
 
 inline void init_matmul_descriptors(MatmulDescriptors& desc, int M, int N, int K,
                                     size_t workspace_size = 32 * 1024 * 1024) {
-    CHECK_CUBLAS(cublasLtCreate(&desc.handle));
+    CHECK_CUBLAS(hipblasLtCreate(&desc.handle));
 
-    cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+    hipblasComputeType_t compute_type = HIPBLAS_COMPUTE_32F;
     hipDataType ab_type = HIP_R_16BF;
     hipDataType c_type = HIP_R_32F;
     hipDataType scale_type = HIP_R_32F;
 
-    CHECK_CUBLAS(cublasLtMatmulDescCreate(&desc.matmul_desc, compute_type, scale_type));
+    CHECK_CUBLAS(hipblasLtMatmulDescCreate(&desc.matmul_desc, compute_type, scale_type));
 
-    cublasOperation_t trans_a = CUBLAS_OP_T;
-    cublasOperation_t trans_b = CUBLAS_OP_N;
-    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(desc.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+    hipblasOperation_t trans_a = HIPBLAS_OP_T;
+    hipblasOperation_t trans_b = HIPBLAS_OP_N;
+    CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(desc.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
                                                 &trans_a, sizeof(trans_a)));
-    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(desc.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+    CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(desc.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
                                                 &trans_b, sizeof(trans_b)));
 
     // Use column-major layouts and swap operands:
     // op(A) = B_row (N x K) via A_desc (K x N) with transA = T
     // op(B) = A_row^T (K x M) via B_desc (K x M) with transB = N
     // C_desc is (N x M) column-major, which matches row-major (M x N) layout.
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.A_desc, ab_type, K, N, K));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.B_desc, ab_type, K, M, K));
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&desc.C_desc, c_type, N, M, N));
+    CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&desc.A_desc, ab_type, K, N, K));
+    CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&desc.B_desc, ab_type, K, M, K));
+    CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&desc.C_desc, c_type, N, M, N));
 
-    CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&desc.preference));
-    CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(desc.preference,
-                                                      CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+    CHECK_CUBLAS(hipblasLtMatmulPreferenceCreate(&desc.preference));
+    CHECK_CUBLAS(hipblasLtMatmulPreferenceSetAttribute(desc.preference,
+                                                      HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                       &workspace_size, sizeof(workspace_size)));
 
     int returned_results = 0;
-    CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(
+    CHECK_CUBLAS(hipblasLtMatmulAlgoGetHeuristic(
         desc.handle, desc.matmul_desc, desc.A_desc, desc.B_desc, desc.C_desc, desc.C_desc,
         desc.preference, 1, &desc.heuristic, &returned_results));
 
@@ -282,22 +282,22 @@ inline void init_matmul_descriptors(MatmulDescriptors& desc, int M, int N, int K
     }
 
     desc.workspace_size = workspace_size;
-    CHECK_CUDA(cudaMalloc(&desc.workspace, workspace_size));
+    CHECK_CUDA(hipMalloc(&desc.workspace, workspace_size));
 }
 
 inline void destroy_matmul_descriptors(MatmulDescriptors& desc) {
-    cublasLtMatmulPreferenceDestroy(desc.preference);
-    cublasLtMatrixLayoutDestroy(desc.A_desc);
-    cublasLtMatrixLayoutDestroy(desc.B_desc);
-    cublasLtMatrixLayoutDestroy(desc.C_desc);
-    cublasLtMatmulDescDestroy(desc.matmul_desc);
-    cublasLtDestroy(desc.handle);
-    cudaFree(desc.workspace);
+    hipblasLtMatmulPreferenceDestroy(desc.preference);
+    hipblasLtMatrixLayoutDestroy(desc.A_desc);
+    hipblasLtMatrixLayoutDestroy(desc.B_desc);
+    hipblasLtMatrixLayoutDestroy(desc.C_desc);
+    hipblasLtMatmulDescDestroy(desc.matmul_desc);
+    hipblasLtDestroy(desc.handle);
+    hipFree(desc.workspace);
 }
 
 inline void matmul_forward(MatmulDescriptors& desc, float* out, const floatX* A, const floatX* B,
-                           float alpha, float beta, cudaStream_t stream = nullptr) {
-    CHECK_CUBLAS(cublasLtMatmul(desc.handle, desc.matmul_desc, &alpha, A, desc.A_desc, B,
+                           float alpha, float beta, hipStream_t stream = nullptr) {
+    CHECK_CUBLAS(hipblasLtMatmul(desc.handle, desc.matmul_desc, &alpha, A, desc.A_desc, B,
                                 desc.B_desc, &beta, out, desc.C_desc, out, desc.C_desc,
                                 &desc.heuristic.algo, desc.workspace, desc.workspace_size, stream));
 }
@@ -318,20 +318,20 @@ struct FusedRMSNormMatmul {
         eps = epsilon;
 
         init_matmul_descriptors(matmul_desc, M, N, K);
-        CHECK_CUDA(cudaMalloc(&rms_buffer, M * sizeof(float)));
+        CHECK_CUDA(hipMalloc(&rms_buffer, M * sizeof(float)));
         initialized = true;
     }
 
     void destroy() {
         if (initialized) {
             destroy_matmul_descriptors(matmul_desc);
-            cudaFree(rms_buffer);
+            hipFree(rms_buffer);
             initialized = false;
         }
     }
 
     void forward(float* out, const floatX* inp, const floatX* proj_weight,
-                 cudaStream_t stream = nullptr) {
+                 hipStream_t stream = nullptr) {
         compute_rms(rms_buffer, inp, M, K, eps, stream);
         matmul_forward(matmul_desc, out, proj_weight, inp, 1.0f, 0.0f, stream);
         divide_by_rms(out, rms_buffer, M, N, stream);
@@ -390,7 +390,7 @@ __global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const floatX
 }
 
 inline void compute_rms_pdl(float* rms_out, const floatX* inp, int N, int C, float eps,
-                            cudaStream_t stream = nullptr) {
+                            hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
     size_t shared_mem = num_warps * sizeof(float);
@@ -432,20 +432,20 @@ struct FusedRMSNormMatmulPDL {
         eps = epsilon;
 
         init_matmul_descriptors(matmul_desc, M, N, K);
-        CHECK_CUDA(cudaMalloc(&rms_buffer, M * sizeof(float)));
+        CHECK_CUDA(hipMalloc(&rms_buffer, M * sizeof(float)));
         initialized = true;
     }
 
     void destroy() {
         if (initialized) {
             destroy_matmul_descriptors(matmul_desc);
-            cudaFree(rms_buffer);
+            hipFree(rms_buffer);
             initialized = false;
         }
     }
 
     void forward(float* out, const floatX* inp, const floatX* proj_weight,
-                 cudaStream_t stream = nullptr) {
+                 hipStream_t stream = nullptr) {
         compute_rms_pdl(rms_buffer, inp, M, K, eps, stream);
         matmul_forward(matmul_desc, out, proj_weight, inp, 1.0f, 0.0f, stream);
         divide_by_rms(out, rms_buffer, M, N, stream);
@@ -531,20 +531,20 @@ __global__ void rms_correction_kernel(float* __restrict__ dx, const float* __res
 }
 
 struct FusedRMSNormMatmulBackward {
-    cublasLtHandle_t handle;
-    cublasLtMatmulDesc_t dW_matmul_desc;
-    cublasLtMatrixLayout_t dW_grad_desc;
-    cublasLtMatrixLayout_t dW_x_desc;
-    cublasLtMatrixLayout_t dW_out_desc;
-    cublasLtMatmulPreference_t dW_pref;
-    cublasLtMatmulHeuristicResult_t dW_heuristic;
+    hipblasLtHandle_t handle;
+    hipblasLtMatmulDesc_t dW_matmul_desc;
+    hipblasLtMatrixLayout_t dW_grad_desc;
+    hipblasLtMatrixLayout_t dW_x_desc;
+    hipblasLtMatrixLayout_t dW_out_desc;
+    hipblasLtMatmulPreference_t dW_pref;
+    hipblasLtMatmulHeuristicResult_t dW_heuristic;
 
-    cublasLtMatmulDesc_t dx_matmul_desc;
-    cublasLtMatrixLayout_t dx_grad_desc;
-    cublasLtMatrixLayout_t dx_W_desc;
-    cublasLtMatrixLayout_t dx_out_desc;
-    cublasLtMatmulPreference_t dx_pref;
-    cublasLtMatmulHeuristicResult_t dx_heuristic;
+    hipblasLtMatmulDesc_t dx_matmul_desc;
+    hipblasLtMatrixLayout_t dx_grad_desc;
+    hipblasLtMatrixLayout_t dx_W_desc;
+    hipblasLtMatrixLayout_t dx_out_desc;
+    hipblasLtMatmulPreference_t dx_pref;
+    hipblasLtMatmulHeuristicResult_t dx_heuristic;
 
     void* workspace;
     size_t workspace_size;
@@ -566,33 +566,33 @@ struct FusedRMSNormMatmulBackward {
         K = k;
 
         workspace_size = 32 * 1024 * 1024;
-        CHECK_CUDA(cudaMalloc(&workspace, workspace_size));
-        CHECK_CUDA(cudaMalloc(&grad_scaled_buffer, M * N * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&K_buffer, M * K * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&x_fp32_buffer, M * K * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&W_fp32_buffer, N * K * sizeof(float)));
+        CHECK_CUDA(hipMalloc(&workspace, workspace_size));
+        CHECK_CUDA(hipMalloc(&grad_scaled_buffer, M * N * sizeof(float)));
+        CHECK_CUDA(hipMalloc(&K_buffer, M * K * sizeof(float)));
+        CHECK_CUDA(hipMalloc(&x_fp32_buffer, M * K * sizeof(float)));
+        CHECK_CUDA(hipMalloc(&W_fp32_buffer, N * K * sizeof(float)));
 
-        CHECK_CUBLAS(cublasLtCreate(&handle));
+        CHECK_CUBLAS(hipblasLtCreate(&handle));
 
-        CHECK_CUBLAS(cublasLtMatmulDescCreate(&dW_matmul_desc, CUBLAS_COMPUTE_32F, HIP_R_32F));
-        cublasOperation_t trans_a = CUBLAS_OP_T;
-        cublasOperation_t trans_b = CUBLAS_OP_N;
-        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(dW_matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+        CHECK_CUBLAS(hipblasLtMatmulDescCreate(&dW_matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        hipblasOperation_t trans_a = HIPBLAS_OP_T;
+        hipblasOperation_t trans_b = HIPBLAS_OP_N;
+        CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(dW_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
                                                     &trans_a, sizeof(trans_a)));
-        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(dW_matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+        CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(dW_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
                                                     &trans_b, sizeof(trans_b)));
 
-        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&dW_grad_desc, HIP_R_32F, M, N, M));
-        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&dW_x_desc, HIP_R_32F, M, K, M));
-        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&dW_out_desc, HIP_R_32F, N, K, N));
+        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dW_grad_desc, HIP_R_32F, M, N, M));
+        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dW_x_desc, HIP_R_32F, M, K, M));
+        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dW_out_desc, HIP_R_32F, N, K, N));
 
-        CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&dW_pref));
-        CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(dW_pref,
-                                                          CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        CHECK_CUBLAS(hipblasLtMatmulPreferenceCreate(&dW_pref));
+        CHECK_CUBLAS(hipblasLtMatmulPreferenceSetAttribute(dW_pref,
+                                                          HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                           &workspace_size, sizeof(workspace_size)));
 
         int returned = 0;
-        CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(handle, dW_matmul_desc, dW_grad_desc, dW_x_desc,
+        CHECK_CUBLAS(hipblasLtMatmulAlgoGetHeuristic(handle, dW_matmul_desc, dW_grad_desc, dW_x_desc,
                                                     dW_out_desc, dW_out_desc, dW_pref, 1,
                                                     &dW_heuristic, &returned));
         if (returned == 0) {
@@ -600,25 +600,25 @@ struct FusedRMSNormMatmulBackward {
             exit(EXIT_FAILURE);
         }
 
-        CHECK_CUBLAS(cublasLtMatmulDescCreate(&dx_matmul_desc, CUBLAS_COMPUTE_32F, HIP_R_32F));
-        trans_a = CUBLAS_OP_N;
-        trans_b = CUBLAS_OP_N;
-        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(dx_matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA,
+        CHECK_CUBLAS(hipblasLtMatmulDescCreate(&dx_matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        trans_a = HIPBLAS_OP_N;
+        trans_b = HIPBLAS_OP_N;
+        CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(dx_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA,
                                                     &trans_a, sizeof(trans_a)));
-        CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(dx_matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB,
+        CHECK_CUBLAS(hipblasLtMatmulDescSetAttribute(dx_matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB,
                                                     &trans_b, sizeof(trans_b)));
 
-        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&dx_grad_desc, HIP_R_32F, M, N, M));
-        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&dx_W_desc, HIP_R_32F, N, K, N));
-        CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&dx_out_desc, HIP_R_32F, M, K, M));
+        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dx_grad_desc, HIP_R_32F, M, N, M));
+        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dx_W_desc, HIP_R_32F, N, K, N));
+        CHECK_CUBLAS(hipblasLtMatrixLayoutCreate(&dx_out_desc, HIP_R_32F, M, K, M));
 
-        CHECK_CUBLAS(cublasLtMatmulPreferenceCreate(&dx_pref));
-        CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(dx_pref,
-                                                          CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        CHECK_CUBLAS(hipblasLtMatmulPreferenceCreate(&dx_pref));
+        CHECK_CUBLAS(hipblasLtMatmulPreferenceSetAttribute(dx_pref,
+                                                          HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                           &workspace_size, sizeof(workspace_size)));
 
         returned = 0;
-        CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(handle, dx_matmul_desc, dx_grad_desc, dx_W_desc,
+        CHECK_CUBLAS(hipblasLtMatmulAlgoGetHeuristic(handle, dx_matmul_desc, dx_grad_desc, dx_W_desc,
                                                     dx_out_desc, dx_out_desc, dx_pref, 1,
                                                     &dx_heuristic, &returned));
         if (returned == 0) {
@@ -631,30 +631,30 @@ struct FusedRMSNormMatmulBackward {
 
     void destroy() {
         if (initialized) {
-            cublasLtMatmulPreferenceDestroy(dW_pref);
-            cublasLtMatrixLayoutDestroy(dW_grad_desc);
-            cublasLtMatrixLayoutDestroy(dW_x_desc);
-            cublasLtMatrixLayoutDestroy(dW_out_desc);
-            cublasLtMatmulDescDestroy(dW_matmul_desc);
+            hipblasLtMatmulPreferenceDestroy(dW_pref);
+            hipblasLtMatrixLayoutDestroy(dW_grad_desc);
+            hipblasLtMatrixLayoutDestroy(dW_x_desc);
+            hipblasLtMatrixLayoutDestroy(dW_out_desc);
+            hipblasLtMatmulDescDestroy(dW_matmul_desc);
 
-            cublasLtMatmulPreferenceDestroy(dx_pref);
-            cublasLtMatrixLayoutDestroy(dx_grad_desc);
-            cublasLtMatrixLayoutDestroy(dx_W_desc);
-            cublasLtMatrixLayoutDestroy(dx_out_desc);
-            cublasLtMatmulDescDestroy(dx_matmul_desc);
+            hipblasLtMatmulPreferenceDestroy(dx_pref);
+            hipblasLtMatrixLayoutDestroy(dx_grad_desc);
+            hipblasLtMatrixLayoutDestroy(dx_W_desc);
+            hipblasLtMatrixLayoutDestroy(dx_out_desc);
+            hipblasLtMatmulDescDestroy(dx_matmul_desc);
 
-            cublasLtDestroy(handle);
-            cudaFree(workspace);
-            cudaFree(grad_scaled_buffer);
-            cudaFree(K_buffer);
-            cudaFree(x_fp32_buffer);
-            cudaFree(W_fp32_buffer);
+            hipblasLtDestroy(handle);
+            hipFree(workspace);
+            hipFree(grad_scaled_buffer);
+            hipFree(K_buffer);
+            hipFree(x_fp32_buffer);
+            hipFree(W_fp32_buffer);
             initialized = false;
         }
     }
 
     void backward(float* dW, float* dx_out, const float* grad_output, const floatX* x,
-                  const floatX* weight, const float* rms, cudaStream_t stream = nullptr) {
+                  const floatX* weight, const float* rms, hipStream_t stream = nullptr) {
         constexpr int BLOCK_SIZE = 256;
 
         int total_x = M * K;
@@ -673,12 +673,12 @@ struct FusedRMSNormMatmulBackward {
             <<<num_blocks, BLOCK_SIZE, 0, stream>>>(grad_scaled_buffer, grad_output, rms, M, N);
 
         float alpha = 1.0f, beta = 0.0f;
-        CHECK_CUBLAS(cublasLtMatmul(handle, dW_matmul_desc, &alpha, grad_scaled_buffer,
+        CHECK_CUBLAS(hipblasLtMatmul(handle, dW_matmul_desc, &alpha, grad_scaled_buffer,
                                     dW_grad_desc, x_fp32_buffer, dW_x_desc, &beta, dW, dW_out_desc,
                                     dW, dW_out_desc, &dW_heuristic.algo, workspace, workspace_size,
                                     stream));
 
-        CHECK_CUBLAS(cublasLtMatmul(handle, dx_matmul_desc, &alpha, grad_scaled_buffer,
+        CHECK_CUBLAS(hipblasLtMatmul(handle, dx_matmul_desc, &alpha, grad_scaled_buffer,
                                     dx_grad_desc, W_fp32_buffer, dx_W_desc, &beta, K_buffer,
                                     dx_out_desc, K_buffer, dx_out_desc, &dx_heuristic.algo,
                                     workspace, workspace_size, stream));

@@ -245,11 +245,11 @@ distribute_add_fused_kernel(float* __restrict__ out, float* __restrict__ H_post_
 
 class StreamMixTC {
   public:
-    cublasLtHandle_t handle;
-    cublasLtMatmulDesc_t matmulDesc;
-    cublasLtMatrixLayout_t Mdesc, Xdesc, Ydesc;
-    cublasLtMatmulPreference_t preference;
-    cublasLtMatmulHeuristicResult_t heuristic;
+    hipblasLtHandle_t handle;
+    hipblasLtMatmulDesc_t matmulDesc;
+    hipblasLtMatrixLayout_t Mdesc, Xdesc, Ydesc;
+    hipblasLtMatmulPreference_t preference;
+    hipblasLtMatmulHeuristicResult_t heuristic;
     void* workspace;
     size_t workspace_size;
     int B, n, C;
@@ -261,63 +261,63 @@ class StreamMixTC {
         C = C_;
         workspace_size = 4 * 1024 * 1024;
 
-        cublasLtCreate(&handle);
-        cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, HIP_R_32F);
+        hipblasLtCreate(&handle);
+        hipblasLtMatmulDescCreate(&matmulDesc, HIPBLAS_COMPUTE_32F, HIP_R_32F);
 
-        cublasOperation_t trans_a = CUBLAS_OP_N;
-        cublasOperation_t trans_b = CUBLAS_OP_T;
-        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a,
+        hipblasOperation_t trans_a = HIPBLAS_OP_N;
+        hipblasOperation_t trans_b = HIPBLAS_OP_T;
+        hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a,
                                        sizeof(trans_a));
-        cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b,
+        hipblasLtMatmulDescSetAttribute(matmulDesc, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b,
                                        sizeof(trans_b));
 
-        cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
-        cublasLtMatrixLayoutCreate(&Xdesc, HIP_R_32F, B * C, n, n);
-        cublasLtMatrixLayoutSetAttribute(Xdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+        hipblasLtOrder_t row_order = HIPBLASLT_ORDER_ROW;
+        hipblasLtMatrixLayoutCreate(&Xdesc, HIP_R_32F, B * C, n, n);
+        hipblasLtMatrixLayoutSetAttribute(Xdesc, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
                                          sizeof(row_order));
-        cublasLtMatrixLayoutCreate(&Mdesc, HIP_R_32F, n, n, n);
-        cublasLtMatrixLayoutSetAttribute(Mdesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+        hipblasLtMatrixLayoutCreate(&Mdesc, HIP_R_32F, n, n, n);
+        hipblasLtMatrixLayoutSetAttribute(Mdesc, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
                                          sizeof(row_order));
-        cublasLtMatrixLayoutCreate(&Ydesc, HIP_R_32F, B * C, n, n);
-        cublasLtMatrixLayoutSetAttribute(Ydesc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+        hipblasLtMatrixLayoutCreate(&Ydesc, HIP_R_32F, B * C, n, n);
+        hipblasLtMatrixLayoutSetAttribute(Ydesc, HIPBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
                                          sizeof(row_order));
 
-        cublasLtMatmulPreferenceCreate(&preference);
-        cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        hipblasLtMatmulPreferenceCreate(&preference);
+        hipblasLtMatmulPreferenceSetAttribute(preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                              &workspace_size, sizeof(workspace_size));
 
         int returned_results = 0;
-        cublasLtMatmulAlgoGetHeuristic(handle, matmulDesc, Xdesc, Mdesc, Ydesc, Ydesc, preference,
+        hipblasLtMatmulAlgoGetHeuristic(handle, matmulDesc, Xdesc, Mdesc, Ydesc, Ydesc, preference,
                                        1, &heuristic, &returned_results);
 
-        cudaMalloc(&workspace, workspace_size);
+        hipMalloc(&workspace, workspace_size);
         initialized = true;
     }
 
     void destroy() {
         if (!initialized)
             return;
-        cublasLtMatmulPreferenceDestroy(preference);
-        cublasLtMatrixLayoutDestroy(Mdesc);
-        cublasLtMatrixLayoutDestroy(Xdesc);
-        cublasLtMatrixLayoutDestroy(Ydesc);
-        cublasLtMatmulDescDestroy(matmulDesc);
-        cublasLtDestroy(handle);
-        cudaFree(workspace);
+        hipblasLtMatmulPreferenceDestroy(preference);
+        hipblasLtMatrixLayoutDestroy(Mdesc);
+        hipblasLtMatrixLayoutDestroy(Xdesc);
+        hipblasLtMatrixLayoutDestroy(Ydesc);
+        hipblasLtMatmulDescDestroy(matmulDesc);
+        hipblasLtDestroy(handle);
+        hipFree(workspace);
         initialized = false;
     }
 
-    void forward(float* out, const float* inp, const float* M, cudaStream_t stream = nullptr) {
+    void forward(float* out, const float* inp, const float* M, hipStream_t stream = nullptr) {
         float alpha = 1.0f, beta = 0.0f;
-        cublasLtMatmul(handle, matmulDesc, &alpha, inp, Xdesc, M, Mdesc, &beta, out, Ydesc, out,
+        hipblasLtMatmul(handle, matmulDesc, &alpha, inp, Xdesc, M, Mdesc, &beta, out, Ydesc, out,
                        Ydesc, &heuristic.algo, workspace, workspace_size, stream);
     }
 
     void forward_fused_distribute_add(float* out, float* H_post_activated, const float* inp,
                                       const floatX* y_norm, const float* M, const float* H_post_raw,
-                                      float* mix_out, cudaStream_t stream = nullptr) {
+                                      float* mix_out, hipStream_t stream = nullptr) {
         float alpha = 1.0f, beta = 0.0f;
-        cublasLtMatmul(handle, matmulDesc, &alpha, inp, Xdesc, M, Mdesc, &beta, mix_out, Ydesc,
+        hipblasLtMatmul(handle, matmulDesc, &alpha, inp, Xdesc, M, Mdesc, &beta, mix_out, Ydesc,
                        mix_out, Ydesc, &heuristic.algo, workspace, workspace_size, stream);
 
         constexpr int BLOCK = 256, MAX_N = 64;
@@ -331,7 +331,7 @@ class StreamMixTC {
 
 inline void stream_aggregate_bf16_fused_sigmoid(floatX* out, float* H_pre_activated,
                                                 const float* inp, const float* H_pre_raw, int B,
-                                                int n, int C, cudaStream_t stream = nullptr) {
+                                                int n, int C, hipStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
 
     // Use vectorized kernel when C is aligned to 4
@@ -409,7 +409,7 @@ inline void stream_aggregate_bf16_fused_sigmoid(floatX* out, float* H_pre_activa
 inline void stream_distribute_mix_add_fused(float* out, float* H_post_activated, const float* x_inp,
                                             const floatX* y_norm, const float* H_post_raw,
                                             const float* M, int B, int n, int C,
-                                            cudaStream_t stream = nullptr) {
+                                            hipStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
     int blocks = (B * n * C + BLOCK - 1) / BLOCK;
 
@@ -526,7 +526,7 @@ __global__ void stream_distribute_mix_add_dynamic_kernel(
 }
 
 inline void stream_aggregate_bf16_dynamic(floatX* out, const float* inp, const float* H_pre, int B,
-                                          int n, int C, cudaStream_t stream = nullptr) {
+                                          int n, int C, hipStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
     bool use_vec4 = (C % 4 == 0) && (C >= 64);
 
@@ -602,7 +602,7 @@ inline void stream_aggregate_bf16_dynamic(floatX* out, const float* inp, const f
 inline void stream_distribute_mix_add_fused_dynamic(float* out, const float* x_inp,
                                                     const floatX* y_norm, const float* H_post,
                                                     const float* M, int B, int n, int C,
-                                                    cudaStream_t stream = nullptr) {
+                                                    hipStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
     int blocks = (B * n * C + BLOCK - 1) / BLOCK;
 
@@ -731,7 +731,7 @@ __global__ void reduce_partials_kernel(float* __restrict__ out, const float* __r
 inline void stream_aggregate_backward(float* d_inp, float* d_H_pre, const float* grad,
                                       const float* inp, const float* H_pre, int B, int n, int C,
                                       float* workspace, int workspace_num_blocks,
-                                      cudaStream_t stream = nullptr) {
+                                      hipStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
     int blocks_dx = (B * n * C + BLOCK - 1) / BLOCK;
 
@@ -959,7 +959,7 @@ inline void stream_distribute_mix_backward_fused(float* d_x, float* d_y_norm, fl
                                                  const float* H_post, int B, int n, int C,
                                                  float* workspace_M, float* workspace_H,
                                                  int workspace_num_blocks,
-                                                 cudaStream_t stream = nullptr) {
+                                                 hipStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
 
 #define DISPATCH_DIST_BWD(MAX_N_VAL)                                                               \

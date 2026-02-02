@@ -173,7 +173,7 @@ __global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __res
 }
 
 inline void rmsnorm_forward(floatX* out, const floatX* inp, const floatX* weight, int N, int C,
-                            float eps, cudaStream_t stream = nullptr) {
+                            float eps, hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
     size_t shared_mem = num_warps * sizeof(float);
@@ -192,7 +192,7 @@ inline void rmsnorm_forward(floatX* out, const floatX* inp, const floatX* weight
 
 inline void rmsnorm_forward_with_rms(floatX* out, float* rms_out, const floatX* inp,
                                      const floatX* weight, int N, int C, float eps,
-                                     cudaStream_t stream = nullptr) {
+                                     hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
     size_t shared_mem = num_warps * sizeof(float);
@@ -296,7 +296,7 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
 
 inline void rmsnorm_backward(float* d_inp, float* d_weight, const float* grad, const floatX* inp,
                              const floatX* weight, const float* rms, int N, int C,
-                             cudaStream_t stream = nullptr) {
+                             hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
     size_t shared_mem = num_warps * sizeof(float);
