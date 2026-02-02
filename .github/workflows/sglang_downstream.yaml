@@ -25,6 +25,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
@@ -100,7 +101,7 @@ jobs:
           --network=host \
           --shm-size 32g \
           --cap-add=SYS_PTRACE \
-          -e HF_TOKEN="${HF_TOKEN:-}" \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN }}}" \
           --security-opt seccomp=unconfined \
           -w /sglang-checkout \
           --name sglang_aiter_test \
