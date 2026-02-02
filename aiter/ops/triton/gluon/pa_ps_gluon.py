@@ -162,7 +162,7 @@ def pa_ps_kernel(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
-    if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
+    if COMPUTE_TYPE.is_fp8():
         MFMA_INSTR_K: gl.constexpr = 32
     else:
         MFMA_INSTR_K: gl.constexpr = 16
@@ -213,24 +213,14 @@ def pa_ps_kernel(
     )
 
     # Key cache layout - optimized for block-wise access patterns
-    blocked_key_layout_fp8: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1, 1, KV_16B_ELEMENT_COUNT],
-        threads_per_warp=[1, 4, 16, 1],
-        warps_per_cta=[1, 1, 4, 1],
-        order=[3, 2, 1, 0],
-    )
-
-    key_warps_per_cta_f16: gl.constexpr = (
+    key_warps_per_cta: gl.constexpr = (
         [4, 1, 1, 1] if KV_BLOCK_SIZE == 16 else [1, 1, 4, 1]
     )
-    blocked_key_layout_f16: gl.constexpr = gl.BlockedLayout(
+    blocked_key_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1, 1, KV_16B_ELEMENT_COUNT],
         threads_per_warp=[1, 4, 16, 1],
-        warps_per_cta=key_warps_per_cta_f16,
+        warps_per_cta=key_warps_per_cta,
         order=[3, 2, 1, 0],
-    )
-    blocked_key_layout: gl.constexpr = (
-        blocked_key_layout_fp8 if KV_16B_ELEMENT_COUNT == 16 else blocked_key_layout_f16
     )
 
     # QK Matrix multiplication layout using AMD MFMA instructions
@@ -287,23 +277,13 @@ def pa_ps_kernel(
         value_threads_per_warp: gl.constexpr = (
             [4, 1, 16, 1] if KV_BLOCK_SIZE == 16 else [1, 4, 16, 1]
         )
-        blocked_value_layout_f16: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 1, 1, 8],
+        blocked_value_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 1, 1, KV_16B_ELEMENT_COUNT],
             threads_per_warp=value_threads_per_warp,
             warps_per_cta=[1, 1, 4, 1],
             order=[3, 2, 1, 0],
         )
-        blocked_value_layout_fp8: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 1, 1, 16],
-            threads_per_warp=value_threads_per_warp,
-            warps_per_cta=[1, 1, 4, 1],
-            order=[3, 2, 1, 0],
-        )
-        blocked_value_layout: gl.constexpr = (
-            blocked_value_layout_fp8
-            if KV_16B_ELEMENT_COUNT == 16
-            else blocked_value_layout_f16
-        )
+
         value_dim1_offsets = gl.arange(
             0,
             KV_BLOCK_SIZE // KV_16B_ELEMENT_COUNT,
@@ -422,6 +402,11 @@ def pa_ps_kernel(
     if QUERY_QUANT_MODE == 0:
         # Per-tensor quantization
         query_scale_value = tl.load(query_scale)
+    
+    if KV_QUANT_MODE == 0:
+        # Per-tensor quantization
+        key_scale_value = tl.load(key_scale)
+        value_scale_value = tl.load(value_scale)
 
     for i in range(work_start_idx, work_end_idx):
         work_info_item = work_info + i * 8
