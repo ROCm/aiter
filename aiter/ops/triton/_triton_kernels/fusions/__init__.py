@@ -5,8 +5,6 @@ from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
     _mhc_fused_reduce_kernel,
-    _mhc_lite_fused_split_kernel,
-    _mhc_lite_fused_reduce_kernel,
     _sinkhorn_knopp_log_domain_kernel,
 )
 
@@ -14,7 +12,5 @@ __all__ = [
     "_mhc_fused_kernel",
     "_mhc_fused_split_kernel",
     "_mhc_fused_reduce_kernel",
-    "_mhc_lite_fused_split_kernel",
-    "_mhc_lite_fused_reduce_kernel",
     "_sinkhorn_knopp_log_domain_kernel",
 ]

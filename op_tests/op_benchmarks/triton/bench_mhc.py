@@ -28,7 +28,7 @@ logging.basicConfig(
     force=True
 )
 
-from aiter.ops.triton.fusions.mhc import mhc, mhc_lite, fused_mhc, sinkhorn_knopp
+from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
 from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
@@ -96,8 +96,6 @@ def run_benchmark(args):
     benchmark_name += f"_{hres_mode}"
     if mode == "full":
         benchmark_name += f"_full_sinkhorn{sinkhorn_iters}"
-    elif mode == "full_lite":
-        benchmark_name += "_full_lite_zero_iter"
     elif mode == "fused":
         benchmark_name += "_fused_only"
     elif mode == "sinkhorn":
@@ -204,11 +202,6 @@ def run_benchmark(args):
             mem_read += mem_sinkhorn / 2
             mem_write += mem_sinkhorn / 2
             total_mem = mem_read + mem_write
-        elif mode == "full_lite":
-            # mHC-Lite: includes permutation matrices (n!, n, n) in read
-            n_factorial = math.factorial(n)
-            mem_read += n_factorial * n * n * elem_size  # perm_mats
-            total_mem = mem_read + mem_write
         elif mode == "fused":
             total_mem = mem_read + mem_write
         elif mode == "sinkhorn":
@@ -223,12 +216,6 @@ def run_benchmark(args):
                 bias, n_streams,
                 hres_mode=hres_mode,
                 sinkhorn_iters=sinkhorn_iters
-            )
-        elif mode == "full_lite":
-            fn = lambda: mhc_lite(
-                x, phi_pre, phi_post, phi_res,
-                alpha_pre, alpha_post, alpha_res,
-                bias, n_streams
             )
         elif mode == "fused":
             fn = lambda: fused_mhc(
