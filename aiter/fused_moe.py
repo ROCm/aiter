@@ -74,6 +74,27 @@ def moe_sorting(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
+def get_topk_valid_mask(
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build valid_mask [token_num, topk] for EP mode.
+
+    Args:
+        topk_ids: [token_num, topk] i32 - Global expert IDs
+        expert_mask: [total_experts] i32 - Binary mask (1=valid, 0=fake/masked)
+
+    Returns:
+        valid_mask: [token_num, topk] i8 - 1 for valid slots, 0 for fake experts
+    """
+    if expert_mask is None:
+        # Non-EP mode: all slots are valid
+        return torch.ones(topk_ids.shape, dtype=dtypes.i8, device=topk_ids.device)
+    else:
+        # EP mode: mask based on expert_mask
+        return expert_mask[topk_ids].to(dtypes.i8)
+
+
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
 @functools.lru_cache(maxsize=2048)
@@ -1241,6 +1262,15 @@ def fused_moe_2stages(
             )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    # Build valid_mask for EP mode
+    valid_mask = None
+    if topk_ids is not None and expert_mask is not None:
+        valid_mask = get_topk_valid_mask(topk_ids, expert_mask)
+
+    # Add valid_mask to extra_stage2_args if available
+    if valid_mask is not None:
+        extra_stage2_args["valid_mask"] = valid_mask
+
     metadata.stage2(
         a2,
         w1,
@@ -2190,6 +2220,7 @@ def flydsl_moe_stage2(
     a2_scale,
     block_m,
     sorted_weights=None,
+    valid_mask=None,
     **_kwargs,
 ):
     if w2_scale is None or a2_scale is None:
@@ -2327,6 +2358,7 @@ def flydsl_moe_stage2(
             out_dtype_kernel,
             bool(stage2_cshuffle),
             mode_val,
+            valid_mask is not None,  # Add to cache key
         )
         exe2 = _FLYDSL_MOE_GEMM2_CACHE.get(key2_ex)
         if exe2 is None:
@@ -2344,6 +2376,7 @@ def flydsl_moe_stage2(
                 use_cshuffle_epilog=bool(stage2_cshuffle),
                 mode=mode_val,
                 tokens_hint=token_num,
+                valid_mask=valid_mask,
             )
             _FLYDSL_MOE_GEMM2_CACHE[key2_ex] = exe2
 
