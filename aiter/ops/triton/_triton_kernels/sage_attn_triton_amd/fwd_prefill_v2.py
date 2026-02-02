@@ -1972,8 +1972,6 @@ def sage_quant_v2(
     k,
     v,
     FP8_TYPE,
-    is_q_fp4=True,
-    is_k_fp4=True,
     FP8_MAX=None,
     FP4_MAX=None,
     BLKQ=128,
@@ -1982,6 +1980,8 @@ def sage_quant_v2(
     layout="bshd",
     smooth_k=True,
     smooth_q=False,
+    is_q_fp4=True,
+    is_k_fp4=True,
 ):
     """
     Quantize Q and K tensors to INT8 with per-block scaling.
