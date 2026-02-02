@@ -248,7 +248,7 @@ def fused_moe_(
         hidden_pad,
         intermediate_pad,
     )
-
+    # aiter.logger.info(f"meta block_m: {metadata.block_m}, block_size_M = {block_size_M}")
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
@@ -790,7 +790,7 @@ def get_2stage_cfgs(
             and activation == ActivationType.Silu
         )
         use_flydsl_stage1 = use_flydsl_stage2
-        flydsl_block_m = int(block_m) if block_m is not None else 64
+        flydsl_block_m = min(int(block_m) if block_m is not None else 64, 64)
         stage1_func = (
             functools.partial(flydsl_moe_stage1)
             if use_flydsl_stage1
@@ -1697,14 +1697,10 @@ def flydsl_moe_stage1(
     # IMPORTANT: stage1/stage2 tile_m must match the sorting `block_m` used to build `sorted_*`.
     # Allow env override only when it matches `block_m`.
     tile_m = block_m if block_m is not None else 64
-    tile_m_env = os.environ.get("AITER_FLYDSL_MOE_TILE_M1", "")
-    if tile_m_env:
-        try:
-            tile_m_env_i = int(tile_m_env)
-            if block_m is None or tile_m_env_i == int(block_m):
-                tile_m = tile_m_env_i
-        except ValueError:
-            pass
+    tile_m_env = int(os.environ.get("AITER_FLYDSL_MOE_TILE_M1", "0"))
+    if tile_m_env > 0 and tile_m_env % 16 == 0:
+        tile_m = tile_m_env
+        tile_m = 64
     tile_n = int(os.environ.get("AITER_FLYDSL_MOE_TILE_N1", "128"))
     tile_k = int(os.environ.get("AITER_FLYDSL_MOE_TILE_K1", "128"))
     stage1_cshuffle = os.environ.get("AITER_FLYDSL_STAGE1_CSHUFFLE", "0") in (
@@ -1904,14 +1900,9 @@ def flydsl_moe_stage2(
     E = w2.shape[0]
 
     tile_m = block_m if block_m is not None else 64
-    tile_m_env = os.environ.get("AITER_FLYDSL_MOE_TILE_M2", "")
-    if tile_m_env:
-        try:
-            tile_m_env_i = int(tile_m_env)
-            if block_m is None or tile_m_env_i == int(block_m):
-                tile_m = tile_m_env_i
-        except ValueError:
-            pass
+    tile_m_env = int(os.environ.get("AITER_FLYDSL_MOE_TILE_M2", "0"))
+    if tile_m_env > 0 and tile_m_env % 16 == 0:
+        tile_m = tile_m_env
     tile_n = int(os.environ.get("AITER_FLYDSL_MOE_TILE_N2", "256"))
     tile_k = int(os.environ.get("AITER_FLYDSL_MOE_TILE_K2", "128"))
     stage2_cshuffle = os.environ.get("AITER_FLYDSL_STAGE2_CSHUFFLE", "1") in (
