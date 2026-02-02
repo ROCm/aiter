@@ -176,9 +176,10 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             softcap,
             False,  # rotary_interleaved
             None,
+            None,
             1,
             None,
-            sm_margin,  # scheduler_metadata, num_splits, pack_gqa, sm_margin
+            sm_margin,  # v_mean, scheduler_metadata, num_splits, pack_gqa, sm_margin
             return_lse,
             layout,
             config,

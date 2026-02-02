@@ -11,6 +11,8 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import get_sage_fwd_configs, compute_block_masking 
 
+from .hadamard_rotation import apply_hadamard_rotation_qk
+
 @triton.jit
 def _sage_fwd_no_mask_v2(
     acc,
@@ -1692,6 +1694,8 @@ def sage_quant_v2(
         num_stages=3,
         num_warps=8
     )
+
+    #q, k = apply_hadamard_rotation_qk(q, k, BLKQ, BLKK) 
 
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     # q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
