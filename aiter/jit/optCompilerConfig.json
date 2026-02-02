@@ -197,6 +197,23 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_mhc_layer": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mhc_layer_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/mhc_layer.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": [
+            "'-lhipblaslt'"
+        ],
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels'",
+            "f'{AITER_CSRC_DIR}/include'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_gemm_common": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_common_pybind.cu'",

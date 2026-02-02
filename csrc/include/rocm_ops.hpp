@@ -1515,6 +1515,25 @@ namespace py = pybind11;
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
 
+#define MHC_LAYER_PYBIND                                                                  \
+    m.def("mhc_layer_fwd",                                                                \
+          &aiter::mhc_layer_fwd,                                                          \
+          py::arg("out"),                                                                 \
+          py::arg("x_expanded"),                                                          \
+          py::arg("rmsnorm_weight"),                                                      \
+          py::arg("phi_pre"),                                                             \
+          py::arg("phi_post"),                                                            \
+          py::arg("phi_res"),                                                             \
+          py::arg("b_pre"),                                                               \
+          py::arg("b_post"),                                                              \
+          py::arg("b_res"),                                                               \
+          py::arg("alpha_pre"),                                                          \
+          py::arg("alpha_post"),                                                         \
+          py::arg("alpha_res"),                                                          \
+          py::arg("sinkhorn_iters"),                                                     \
+          py::arg("eps"),                                                                \
+          py::arg("use_pdl") = true);
+
 #define SAMPLE_PYBIND                                                                \
     m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
     m.def("random_sample_outer_exponential",                                         \
