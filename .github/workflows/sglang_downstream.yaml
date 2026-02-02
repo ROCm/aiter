@@ -116,6 +116,7 @@ jobs:
       - name: Install dependencies
         run: |
           cd sglang
+          git config user.name "aiter-ci" && git config user.email "aiter-ci@amd.com"
           git fetch origin 2c9b43b5135846f40f66c4e543589bf303c1c07c && git cherry-pick FETCH_HEAD # https://github.com/charlesHsuGG/sglang/commit/2c9b43b5135846f40f66c4e543589bf303c1c07c
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
           sed -i "4s/^GPU_ARCH=.*/GPU_ARCH=\"${GPU_ARCH_CI}\"/" scripts/ci/amd_ci_install_dependency.sh
