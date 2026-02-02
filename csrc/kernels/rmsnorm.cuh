@@ -11,8 +11,8 @@ namespace cg = cooperative_groups;
 namespace mhc {
 
 template<int BLOCK_SIZE, bool OUTPUT_RMS = false>
-__global__ void rmsnorm_kernel(floatX* __restrict__ out, float* __restrict__ rms_out,
-                               const floatX* __restrict__ inp, const floatX* __restrict__ weight,
+__global__ void rmsnorm_kernel(__hip_bfloat16* __restrict__ out, float* __restrict__ rms_out,
+                               const __hip_bfloat16* __restrict__ inp, const __hip_bfloat16* __restrict__ weight,
                                int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -21,8 +21,8 @@ __global__ void rmsnorm_kernel(floatX* __restrict__ out, float* __restrict__ rms
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
-    floatX* o = out + idx * C;
+    const __hip_bfloat16* x = inp + idx * C;
+    __hip_bfloat16* o = out + idx * C;
 
     extern __shared__ float shared[];
     float* s_sum_sq = shared;
@@ -64,14 +64,14 @@ __global__ void rmsnorm_kernel(floatX* __restrict__ out, float* __restrict__ rms
     for (int i = threadIdx.x; i < C; i += BLOCK_SIZE) {
         float val = (float)x[i];
         float w = (float)weight[i];
-        o[i] = (floatX)(val * rms_inv * w);
+        o[i] = (__hip_bfloat16)(val * rms_inv * w);
     }
 }
 
 template<int BLOCK_SIZE, bool OUTPUT_RMS = false>
-__global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __restrict__ rms_out,
-                                          const floatX* __restrict__ inp,
-                                          const floatX* __restrict__ weight, int N, int C,
+__global__ void rmsnorm_kernel_vectorized(__hip_bfloat16* __restrict__ out, float* __restrict__ rms_out,
+                                          const __hip_bfloat16* __restrict__ inp,
+                                          const __hip_bfloat16* __restrict__ weight, int N, int C,
                                           float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -80,8 +80,8 @@ __global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __res
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
-    floatX* o = out + idx * C;
+    const __hip_bfloat16* x = inp + idx * C;
+    __hip_bfloat16* o = out + idx * C;
 
     extern __shared__ float shared[];
     float* s_sum_sq = shared;
@@ -96,7 +96,7 @@ __global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __res
 
     for (int i = threadIdx.x; i < C_vec; i += BLOCK_SIZE) {
         vec_t v = x_vec[i];
-        nv_bfloat162* bf_v = reinterpret_cast<nv_bfloat162*>(&v);
+        __hip_bfloat162* bf_v = reinterpret_cast<__hip_bfloat162*>(&v);
 
 #pragma unroll
         for (int j = 0; j < 4; j++) {
@@ -146,11 +146,11 @@ __global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __res
         vec_t xv = x_vec[i];
         vec_t wv = w_vec[i];
 
-        nv_bfloat162* bf_x = reinterpret_cast<nv_bfloat162*>(&xv);
-        nv_bfloat162* bf_w = reinterpret_cast<nv_bfloat162*>(&wv);
+        __hip_bfloat162* bf_x = reinterpret_cast<__hip_bfloat162*>(&xv);
+        __hip_bfloat162* bf_w = reinterpret_cast<__hip_bfloat162*>(&wv);
 
         vec_t ov;
-        nv_bfloat162* bf_o = reinterpret_cast<nv_bfloat162*>(&ov);
+        __hip_bfloat162* bf_o = reinterpret_cast<__hip_bfloat162*>(&ov);
 
 #pragma unroll
         for (int j = 0; j < 4; j++) {
@@ -168,11 +168,11 @@ __global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __res
     for (int i = remainder_start + threadIdx.x; i < C; i += BLOCK_SIZE) {
         float val = (float)x[i];
         float w = (float)weight[i];
-        o[i] = (floatX)(val * rms_inv * w);
+        o[i] = (__hip_bfloat16)(val * rms_inv * w);
     }
 }
 
-inline void rmsnorm_forward(floatX* out, const floatX* inp, const floatX* weight, int N, int C,
+inline void rmsnorm_forward(__hip_bfloat16* out, const __hip_bfloat16* inp, const __hip_bfloat16* weight, int N, int C,
                             float eps, hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
@@ -190,8 +190,8 @@ inline void rmsnorm_forward(floatX* out, const floatX* inp, const floatX* weight
     }
 }
 
-inline void rmsnorm_forward_with_rms(floatX* out, float* rms_out, const floatX* inp,
-                                     const floatX* weight, int N, int C, float eps,
+inline void rmsnorm_forward_with_rms(__hip_bfloat16* out, float* rms_out, const __hip_bfloat16* inp,
+                                     const __hip_bfloat16* weight, int N, int C, float eps,
                                      hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
@@ -233,8 +233,8 @@ inline void rmsnorm_forward_with_rms(floatX* out, float* rms_out, const floatX* 
 template<int BLOCK_SIZE>
 __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __restrict__ d_weight,
                                         const float* __restrict__ grad,
-                                        const floatX* __restrict__ inp,
-                                        const floatX* __restrict__ weight,
+                                        const __hip_bfloat16* __restrict__ inp,
+                                        const __hip_bfloat16* __restrict__ weight,
                                         const float* __restrict__ rms, int N, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -243,7 +243,7 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
+    const __hip_bfloat16* x = inp + idx * C;
     const float* g = grad + idx * C;
     float* dx = d_inp + idx * C;
     float r = rms[idx];
@@ -294,8 +294,8 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
     }
 }
 
-inline void rmsnorm_backward(float* d_inp, float* d_weight, const float* grad, const floatX* inp,
-                             const floatX* weight, const float* rms, int N, int C,
+inline void rmsnorm_backward(float* d_inp, float* d_weight, const float* grad, const __hip_bfloat16* inp,
+                             const __hip_bfloat16* weight, const float* rms, int N, int C,
                              hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;

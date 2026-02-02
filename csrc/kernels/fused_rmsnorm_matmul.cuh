@@ -13,7 +13,7 @@ namespace cg = cooperative_groups;
 namespace mhc {
 
 template<int BLOCK_SIZE>
-__global__ void compute_rms_kernel(float* __restrict__ rms_out, const floatX* __restrict__ inp,
+__global__ void compute_rms_kernel(float* __restrict__ rms_out, const __hip_bfloat16* __restrict__ inp,
                                    int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -22,7 +22,7 @@ __global__ void compute_rms_kernel(float* __restrict__ rms_out, const floatX* __
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
+    const __hip_bfloat16* x = inp + idx * C;
 
     extern __shared__ float shared[];
 
@@ -56,7 +56,7 @@ __global__ void compute_rms_kernel(float* __restrict__ rms_out, const floatX* __
 
 template<int BLOCK_SIZE>
 __global__ void compute_rms_kernel_vectorized(float* __restrict__ rms_out,
-                                              const floatX* __restrict__ inp, int N, int C,
+                                              const __hip_bfloat16* __restrict__ inp, int N, int C,
                                               float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -65,7 +65,7 @@ __global__ void compute_rms_kernel_vectorized(float* __restrict__ rms_out,
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
+    const __hip_bfloat16* x = inp + idx * C;
 
     extern __shared__ float shared[];
 
@@ -79,7 +79,7 @@ __global__ void compute_rms_kernel_vectorized(float* __restrict__ rms_out,
 
     for (int i = threadIdx.x; i < C_vec; i += BLOCK_SIZE) {
         vec_t v = x_vec[i];
-        nv_bfloat162* bf_v = reinterpret_cast<nv_bfloat162*>(&v);
+        __hip_bfloat162* bf_v = reinterpret_cast<__hip_bfloat162*>(&v);
 
 #pragma unroll
         for (int j = 0; j < 4; j++) {
@@ -116,7 +116,7 @@ __global__ void compute_rms_kernel_vectorized(float* __restrict__ rms_out,
     }
 }
 
-inline void compute_rms(float* rms_out, const floatX* inp, int N, int C, float eps,
+inline void compute_rms(float* rms_out, const __hip_bfloat16* inp, int N, int C, float eps,
                         hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
@@ -295,7 +295,7 @@ inline void destroy_matmul_descriptors(MatmulDescriptors& desc) {
     hipFree(desc.workspace);
 }
 
-inline void matmul_forward(MatmulDescriptors& desc, float* out, const floatX* A, const floatX* B,
+inline void matmul_forward(MatmulDescriptors& desc, float* out, const __hip_bfloat16* A, const __hip_bfloat16* B,
                            float alpha, float beta, hipStream_t stream = nullptr) {
     CHECK_COND(hipblasLtMatmul(desc.handle, desc.matmul_desc, &alpha, A, desc.A_desc, B,
                                 desc.B_desc, &beta, out, desc.C_desc, out, desc.C_desc,
@@ -330,7 +330,7 @@ struct FusedRMSNormMatmul {
         }
     }
 
-    void forward(float* out, const floatX* inp, const floatX* proj_weight,
+    void forward(float* out, const __hip_bfloat16* inp, const __hip_bfloat16* proj_weight,
                  hipStream_t stream = nullptr) {
         compute_rms(rms_buffer, inp, M, K, eps, stream);
         matmul_forward(matmul_desc, out, proj_weight, inp, 1.0f, 0.0f, stream);
@@ -341,7 +341,7 @@ struct FusedRMSNormMatmul {
 };
 
 template<int BLOCK_SIZE>
-__global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const floatX* __restrict__ inp,
+__global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const __hip_bfloat16* __restrict__ inp,
                                        int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -350,7 +350,7 @@ __global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const floatX
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
+    const __hip_bfloat16* x = inp + idx * C;
 
     extern __shared__ float shared[];
 
@@ -389,7 +389,7 @@ __global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const floatX
 #endif
 }
 
-inline void compute_rms_pdl(float* rms_out, const floatX* inp, int N, int C, float eps,
+inline void compute_rms_pdl(float* rms_out, const __hip_bfloat16* inp, int N, int C, float eps,
                             hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
@@ -444,7 +444,7 @@ struct FusedRMSNormMatmulPDL {
         }
     }
 
-    void forward(float* out, const floatX* inp, const floatX* proj_weight,
+    void forward(float* out, const __hip_bfloat16* inp, const __hip_bfloat16* proj_weight,
                  hipStream_t stream = nullptr) {
         compute_rms_pdl(rms_buffer, inp, M, K, eps, stream);
         matmul_forward(matmul_desc, out, proj_weight, inp, 1.0f, 0.0f, stream);
@@ -455,7 +455,7 @@ struct FusedRMSNormMatmulPDL {
 };
 
 template<int BLOCK_SIZE>
-__global__ void bf16_to_fp32_kernel(float* __restrict__ out, const floatX* __restrict__ inp,
+__global__ void bf16_to_fp32_kernel(float* __restrict__ out, const __hip_bfloat16* __restrict__ inp,
                                     int total) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx >= total)
@@ -479,7 +479,7 @@ __global__ void scale_grad_by_rms_kernel(float* __restrict__ grad_scaled,
 
 template<int BLOCK_SIZE>
 __global__ void rms_correction_kernel(float* __restrict__ dx, const float* __restrict__ K_buf,
-                                      const floatX* __restrict__ x, const float* __restrict__ rms,
+                                      const __hip_bfloat16* __restrict__ x, const float* __restrict__ rms,
                                       int M, int K_dim) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
@@ -490,7 +490,7 @@ __global__ void rms_correction_kernel(float* __restrict__ dx, const float* __res
 
     extern __shared__ float shared[];
 
-    const floatX* x_row = x + row * K_dim;
+    const __hip_bfloat16* x_row = x + row * K_dim;
     const float* K_row = K_buf + row * K_dim;
     float* dx_row = dx + row * K_dim;
     float r = rms[row];
@@ -653,8 +653,8 @@ struct FusedRMSNormMatmulBackward {
         }
     }
 
-    void backward(float* dW, float* dx_out, const float* grad_output, const floatX* x,
-                  const floatX* weight, const float* rms, hipStream_t stream = nullptr) {
+    void backward(float* dW, float* dx_out, const float* grad_output, const __hip_bfloat16* x,
+                  const __hip_bfloat16* weight, const float* rms, hipStream_t stream = nullptr) {
         constexpr int BLOCK_SIZE = 256;
 
         int total_x = M * K;

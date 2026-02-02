@@ -9,16 +9,16 @@
 namespace mhc {
 
 template<int BLOCK_SIZE>
-__global__ void float_to_bf16_kernel(floatX* __restrict__ out, const float* __restrict__ inp,
+__global__ void float_to_bf16_kernel(__hip_bfloat16* __restrict__ out, const float* __restrict__ inp,
                                      int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
-        out[idx] = (floatX)inp[idx];
+        out[idx] = (__hip_bfloat16)inp[idx];
     }
 }
 
 template<int BLOCK_SIZE>
-__global__ void bf16_to_float_kernel(float* __restrict__ out, const floatX* __restrict__ inp,
+__global__ void bf16_to_float_kernel(float* __restrict__ out, const __hip_bfloat16* __restrict__ inp,
                                      int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
@@ -26,13 +26,13 @@ __global__ void bf16_to_float_kernel(float* __restrict__ out, const floatX* __re
     }
 }
 
-inline void float_to_bf16(floatX* out, const float* inp, int size, hipStream_t stream = nullptr) {
+inline void float_to_bf16(__hip_bfloat16* out, const float* inp, int size, hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 256;
     int num_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     float_to_bf16_kernel<BLOCK_SIZE><<<num_blocks, BLOCK_SIZE, 0, stream>>>(out, inp, size);
 }
 
-inline void bf16_to_float(float* out, const floatX* inp, int size, hipStream_t stream = nullptr) {
+inline void bf16_to_float(float* out, const __hip_bfloat16* inp, int size, hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 256;
     int num_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     bf16_to_float_kernel<BLOCK_SIZE><<<num_blocks, BLOCK_SIZE, 0, stream>>>(out, inp, size);
@@ -46,9 +46,9 @@ __device__ __forceinline__ float fast_sigmoid(float x) {
     return 1.0f / (1.0f + fast_exp(-x));
 }
 
-__device__ __forceinline__ nv_bfloat162 mhc_floats2bfloat162(float x, float y) {
+__device__ __forceinline__ __hip_bfloat162 mhc_floats2bfloat162(float x, float y) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || defined(__HIP_DEVICE_COMPILE__)
-    nv_bfloat162 out;
+    __hip_bfloat162 out;
     out.x = __float2bfloat16(x);
     out.y = __float2bfloat16(y);
     return out;

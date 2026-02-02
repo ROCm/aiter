@@ -26,10 +26,6 @@ __device__ __forceinline__ T reduce(::cooperative_groups::thread_block_tile<32> 
 
 namespace mhc {
 
-using floatX = __hip_bfloat16;
-using nv_bfloat16 = __hip_bfloat16;
-using nv_bfloat162 = __hip_bfloat162;
-using floatN = float;
 
 struct MHCConfig {
     int sinkhorn_iters;

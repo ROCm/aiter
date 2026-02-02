@@ -27,12 +27,12 @@ struct MHCLayerConfig {
 };
 
 struct MHCLayerWeights {
-    floatX* rmsnorm_weight;
+    __hip_bfloat16* rmsnorm_weight;
 
-    floatX* phi_combined;
-    floatX* phi_pre;
-    floatX* phi_post;
-    floatX* phi_res;
+    __hip_bfloat16* phi_combined;
+    __hip_bfloat16* phi_pre;
+    __hip_bfloat16* phi_post;
+    __hip_bfloat16* phi_res;
 
     float* b_pre;
     float* b_post;
@@ -54,12 +54,12 @@ struct MHCLayerWeights {
         expansion_rate = n;
         dynamic_h = use_dynamic;
 
-        HIP_CALL(hipMalloc(&rmsnorm_weight, C * sizeof(floatX)));
+        HIP_CALL(hipMalloc(&rmsnorm_weight, C * sizeof(__hip_bfloat16)));
 
         if (dynamic_h) {
             int nC = n * C;
             int total_H_dim = n + n + n * n;
-            HIP_CALL(hipMalloc(&phi_combined, total_H_dim * nC * sizeof(floatX)));
+            HIP_CALL(hipMalloc(&phi_combined, total_H_dim * nC * sizeof(__hip_bfloat16)));
             phi_pre = phi_combined;
             phi_post = phi_combined + n * nC;
             phi_res = phi_combined + 2 * n * nC;
@@ -99,17 +99,17 @@ struct MHCLayerWeights {
 
 struct MHCLayerBuffers {
     float* x_expanded;
-    floatX* x_aggregated_bf16;
+    __hip_bfloat16* x_aggregated_bf16;
     float* x_aggregated_f32;
     float* rms_values;
-    floatX* layer_out_bf16;
+    __hip_bfloat16* layer_out_bf16;
     float* layer_out_f32;
     float* y_distributed;
     float* sinkhorn_M;
     float* x_mixed;
     float* output;
 
-    floatX* x_flat_bf16;
+    __hip_bfloat16* x_flat_bf16;
     float* rms_dynamic;
     float* H_proj_raw;
 
@@ -134,10 +134,10 @@ struct MHCLayerBuffers {
         dynamic_h = use_dynamic_h;
 
         HIP_CALL(hipMalloc(&x_expanded, B * n * C * sizeof(float)));
-        HIP_CALL(hipMalloc(&x_aggregated_bf16, B * C * sizeof(floatX)));
+        HIP_CALL(hipMalloc(&x_aggregated_bf16, B * C * sizeof(__hip_bfloat16)));
         HIP_CALL(hipMalloc(&x_aggregated_f32, B * C * sizeof(float)));
         HIP_CALL(hipMalloc(&rms_values, B * sizeof(float)));
-        HIP_CALL(hipMalloc(&layer_out_bf16, B * C * sizeof(floatX)));
+        HIP_CALL(hipMalloc(&layer_out_bf16, B * C * sizeof(__hip_bfloat16)));
         HIP_CALL(hipMalloc(&layer_out_f32, B * C * sizeof(float)));
         HIP_CALL(hipMalloc(&y_distributed, B * n * C * sizeof(float)));
         if (needs_x_mixed) {
@@ -148,7 +148,7 @@ struct MHCLayerBuffers {
         if (dynamic_h) {
             int nC = n * C;
             int total_H_dim = n + n + n * n;
-            HIP_CALL(hipMalloc(&x_flat_bf16, B * nC * sizeof(floatX)));
+            HIP_CALL(hipMalloc(&x_flat_bf16, B * nC * sizeof(__hip_bfloat16)));
             HIP_CALL(hipMalloc(&rms_dynamic, B * sizeof(float)));
             HIP_CALL(hipMalloc(&H_proj_raw, B * total_H_dim * sizeof(float)));
             fused_rms_matmul.init(B, total_H_dim, nC);
@@ -507,21 +507,21 @@ struct MHCLayer {
         initialized = false;
     }
 
-    void set_weights_dynamic(const floatX* h_rmsnorm_weight, const floatX* h_phi_pre,
-                             const floatX* h_phi_post, const floatX* h_phi_res,
+    void set_weights_dynamic(const __hip_bfloat16* h_rmsnorm_weight, const __hip_bfloat16* h_phi_pre,
+                             const __hip_bfloat16* h_phi_post, const __hip_bfloat16* h_phi_res,
                              const float* h_b_pre, const float* h_b_post, const float* h_b_res,
                              float alpha_pre, float alpha_post, float alpha_res) {
         int C = config.hidden_dim;
         int n = config.expansion_rate;
         int nC = n * C;
 
-        HIP_CALL(hipMemcpyAsync(weights.rmsnorm_weight, h_rmsnorm_weight, C * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.rmsnorm_weight, h_rmsnorm_weight, C * sizeof(__hip_bfloat16),
                                    hipMemcpyHostToDevice, stream));
-        HIP_CALL(hipMemcpyAsync(weights.phi_pre, h_phi_pre, nC * n * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.phi_pre, h_phi_pre, nC * n * sizeof(__hip_bfloat16),
                                    hipMemcpyHostToDevice, stream));
-        HIP_CALL(hipMemcpyAsync(weights.phi_post, h_phi_post, nC * n * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.phi_post, h_phi_post, nC * n * sizeof(__hip_bfloat16),
                                    hipMemcpyHostToDevice, stream));
-        HIP_CALL(hipMemcpyAsync(weights.phi_res, h_phi_res, nC * n * n * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.phi_res, h_phi_res, nC * n * n * sizeof(__hip_bfloat16),
                                    hipMemcpyHostToDevice, stream));
         HIP_CALL(hipMemcpyAsync(weights.b_pre, h_b_pre, n * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
@@ -535,12 +535,12 @@ struct MHCLayer {
         weights.alpha_res = alpha_res;
     }
 
-    void set_weights_static(const floatX* h_rmsnorm_weight, const float* h_b_pre,
+    void set_weights_static(const __hip_bfloat16* h_rmsnorm_weight, const float* h_b_pre,
                             const float* h_b_post, const float* h_b_res) {
         int C = config.hidden_dim;
         int n = config.expansion_rate;
 
-        HIP_CALL(hipMemcpyAsync(weights.rmsnorm_weight, h_rmsnorm_weight, C * sizeof(floatX),
+        HIP_CALL(hipMemcpyAsync(weights.rmsnorm_weight, h_rmsnorm_weight, C * sizeof(__hip_bfloat16),
                                    hipMemcpyHostToDevice, stream));
         HIP_CALL(hipMemcpyAsync(weights.b_pre, h_b_pre, n * sizeof(float),
                                    hipMemcpyHostToDevice, stream));
@@ -550,7 +550,7 @@ struct MHCLayer {
                                    hipMemcpyHostToDevice, stream));
     }
 
-    void set_weights(const floatX* h_rmsnorm_weight, const float* h_H_pre, const float* h_H_post,
+    void set_weights(const __hip_bfloat16* h_rmsnorm_weight, const float* h_H_pre, const float* h_H_post,
                      const float* h_H_res) {
         set_weights_static(h_rmsnorm_weight, h_H_pre, h_H_post, h_H_res);
     }

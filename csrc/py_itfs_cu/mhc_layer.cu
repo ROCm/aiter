@@ -116,16 +116,16 @@ void mhc_layer_fwd(torch::Tensor &out,
     mhc::MHCLayer layer;
     layer.init(cfg, stream);
 
-    const size_t C_bytes = static_cast<size_t>(C) * sizeof(mhc::floatX);
+    const size_t C_bytes = static_cast<size_t>(C) * sizeof(__hip_bfloat16);
     HIP_CALL(hipMemcpyAsync(layer.weights.rmsnorm_weight,
                                rmsnorm_weight.data_ptr(),
                                C_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
 
-    const size_t phi_pre_bytes = static_cast<size_t>(nC) * n * sizeof(mhc::floatX);
-    const size_t phi_post_bytes = static_cast<size_t>(nC) * n * sizeof(mhc::floatX);
-    const size_t phi_res_bytes = static_cast<size_t>(nC) * n2 * sizeof(mhc::floatX);
+    const size_t phi_pre_bytes = static_cast<size_t>(nC) * n * sizeof(__hip_bfloat16);
+    const size_t phi_post_bytes = static_cast<size_t>(nC) * n * sizeof(__hip_bfloat16);
+    const size_t phi_res_bytes = static_cast<size_t>(nC) * n2 * sizeof(__hip_bfloat16);
 
     HIP_CALL(hipMemcpyAsync(layer.weights.phi_pre,
                                phi_pre.data_ptr(),
@@ -254,16 +254,16 @@ void mhc_layer_fwd_debug(torch::Tensor &out,
     mhc::MHCLayer layer;
     layer.init(cfg, stream);
 
-    const size_t C_bytes = static_cast<size_t>(C) * sizeof(mhc::floatX);
+    const size_t C_bytes = static_cast<size_t>(C) * sizeof(__hip_bfloat16);
     HIP_CALL(hipMemcpyAsync(layer.weights.rmsnorm_weight,
                                rmsnorm_weight.data_ptr(),
                                C_bytes,
                                hipMemcpyDeviceToDevice,
                                stream));
 
-    const size_t phi_pre_bytes = static_cast<size_t>(nC) * n * sizeof(mhc::floatX);
-    const size_t phi_post_bytes = static_cast<size_t>(nC) * n * sizeof(mhc::floatX);
-    const size_t phi_res_bytes = static_cast<size_t>(nC) * n2 * sizeof(mhc::floatX);
+    const size_t phi_pre_bytes = static_cast<size_t>(nC) * n * sizeof(__hip_bfloat16);
+    const size_t phi_post_bytes = static_cast<size_t>(nC) * n * sizeof(__hip_bfloat16);
+    const size_t phi_res_bytes = static_cast<size_t>(nC) * n2 * sizeof(__hip_bfloat16);
 
     HIP_CALL(hipMemcpyAsync(layer.weights.phi_pre,
                                phi_pre.data_ptr(),
@@ -332,12 +332,12 @@ void mhc_layer_fwd_debug(torch::Tensor &out,
                                stream));
     HIP_CALL(hipMemcpyAsync(x_agg_bf16.data_ptr(),
                                layer.buffers.x_aggregated_bf16,
-                               static_cast<size_t>(B) * C * sizeof(mhc::floatX),
+                               static_cast<size_t>(B) * C * sizeof(__hip_bfloat16),
                                hipMemcpyDeviceToDevice,
                                stream));
     HIP_CALL(hipMemcpyAsync(layer_out_bf16.data_ptr(),
                                layer.buffers.layer_out_bf16,
-                               static_cast<size_t>(B) * C * sizeof(mhc::floatX),
+                               static_cast<size_t>(B) * C * sizeof(__hip_bfloat16),
                                hipMemcpyDeviceToDevice,
                                stream));
     HIP_CALL(hipMemcpyAsync(rms_values.data_ptr<float>(),
