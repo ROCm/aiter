@@ -50,8 +50,8 @@ def _get_sage_v2_fwd_configs():
         "BLOCK_M": 256,
         "BLOCK_N": 128,
         "waves_per_eu": 2,
-        "PRE_LOAD_V": False,
-        "num_stages": 4,
+        "PRE_LOAD_V": True,
+        "num_stages": 5,
         "num_warps": 8,
     }
 

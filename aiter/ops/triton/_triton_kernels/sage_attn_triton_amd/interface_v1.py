@@ -310,9 +310,7 @@ def fwd(
 
     # print("sage_version", sage_version)
     # print(sage_version == Sage_version.V1)
-    sage_func = fav3_sage_triton_impl
-    if sage_version == Sage_version.V2:
-        sage_func = fav3_sage_triton_impl_v2
+    
     
     if sage_version == Sage_version.V3:
         sage_func = fav3_sage_triton_impl_v3
@@ -352,42 +350,46 @@ def fwd(
             seqlens_rotary=seqlens_rotary,
             config=config,
         )
-
-    sage_func(
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            sd_mask,
-            softmax_scale,
-            alibi_slopes,
-            causal_flag,
-            window_size_left,
-            window_size_right,
-            None,
-            layout,
-            cu_seqlens_q_local,
-            cu_seqlens_k_local,
-            max_seqlens_q_local,
-            max_seqlens_k_local,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            return_softmax,
-            USE_EXP2,
-            q_descale,
-            k_descale,
-            v_descale,
-            FP8_MAX,
-            seqused_q,
-            seqused_k,
-            rotary_cos=rotary_cos,
-            rotary_sin=rotary_sin,
-            rotary_interleaved=rotary_interleaved,
-            seqlens_rotary=seqlens_rotary,
-            config=config,
-        )
+    else:
+        sage_func = fav3_sage_triton_impl
+        if sage_version == Sage_version.V2:
+            sage_func = fav3_sage_triton_impl_v2
+        
+        sage_func(
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                sd_mask,
+                softmax_scale,
+                alibi_slopes,
+                causal_flag,
+                window_size_left,
+                window_size_right,
+                None,
+                layout,
+                cu_seqlens_q_local,
+                cu_seqlens_k_local,
+                max_seqlens_q_local,
+                max_seqlens_k_local,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                return_softmax,
+                USE_EXP2,
+                q_descale,
+                k_descale,
+                v_descale,
+                FP8_MAX,
+                seqused_q,
+                seqused_k,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
+                seqlens_rotary=seqlens_rotary,
+                config=config,
+            )
 
     if DEBUG:
         print("interface_sage_v1.py::fwd outputs")

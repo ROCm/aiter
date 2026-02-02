@@ -17,53 +17,81 @@ from aiter.ops.triton._triton_kernels.sage_attn_triton_amd.fwd_prefill import ge
 import triton
 import triton.language as tl
 
-# @triton.jit
-# def _quantize_p_mxfp4(p, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-#     GROUP_SIZE: tl.constexpr = 32
+
+@triton.jit
+def _get_max_quant_val(dtype: tl.constexpr):
+    if dtype == tl.uint8:
+        return 6.0
+    elif dtype == tl.float8e5:
+        return 57344.0
+    elif dtype == tl.float8e4nv:
+        return 448.0
+    else:
+        tl.static_assert(False, f"Invalid {dtype=}")
+
+@triton.jit
+def static_compute_mx_quant_and_scale(
+    src_tensor,
+    valid_src_mask,
+    mx_tensor_dtype: tl.constexpr,
+    DEQUANT_SCALE_ROUNDING_MODE: tl.constexpr = 0,
+):
+    BLOCK_SIZE_OUT_DIM: tl.constexpr = src_tensor.shape[0]
+    BLOCK_SIZE_QUANT_DIM: tl.constexpr = src_tensor.shape[1]
+    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = src_tensor.shape[1] // 32
     
-#     # 1. Scaling Logic (Group of 32)
-#     p_reshaped = tl.view(p, [BLOCK_M, BLOCK_N // GROUP_SIZE, GROUP_SIZE])
-#     p_abs = tl.abs(p_reshaped)
-#     max_val = tl.max(p_abs, axis=2)
+    dequant_scale = 1.0 / _get_max_quant_val(mx_tensor_dtype)
+    dequant_scale_exponent = (
+            dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
+        ) & 0x7F800000
+    dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
+    # quant_scale = tl.where(dequant_scale_rounded == 0, 0, 1.0 / dequant_scale_rounded)
+
+    f32_tensor = src_tensor.to(tl.float32)
+    quant_tensor = f32_tensor / dequant_scale_rounded
+
+
+    # First, we simply extract the exponent part of the scales and store the result
+    dequant_scale_exponent = (dequant_scale_exponent >> 23).to(tl.uint8)
+
+    dequant_scale_tensor = tl.full((BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE), dequant_scale_exponent, dtype=tl.uint8)
+
+    quant_tensor = quant_tensor.to(tl.uint32, bitcast=True)
+    signs = quant_tensor & 0x80000000
+    exponents = (quant_tensor >> 23) & 0xFF
+    mantissas = quant_tensor & 0x7FFFFF
+
+    # 0.25 <= x < 0.75 maps to 0.5, a denormal number
+    E8_BIAS = 127
+    E2_BIAS = 1
+    # Move implicit bit 1 at the beginning to mantissa for denormals
+    adjusted_exponents = tl.core.sub(
+        E8_BIAS, exponents + 1, sanitize_overflow=False
+    )
+    mantissas = tl.where(
+        exponents < E8_BIAS,
+        (0x400000 | (mantissas >> 1)) >> adjusted_exponents,
+        mantissas,
+    )
+
+    # For normal numbers, we change the bias from 127 to 1, and for subnormals, we keep exponent as 0.
+    exponents = tl.maximum(exponents, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
+
+    # Combine sign, exponent, and mantissa, while saturating
+    # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
+    e2m1_tmp = tl.minimum((((exponents << 2) | (mantissas >> 21)) + 1) >> 1, 0x7)
+    e2m1_value = ((signs >> 28) | e2m1_tmp).to(tl.uint8)
+
+    e2m1_value = tl.reshape(
+        e2m1_value, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM // 2, 2]
+    )
+    evens, odds = tl.split(e2m1_value)
+    out_tensor = evens | (odds << 4)
+
     
-#     # Scale to the max representable value of E2M1 (which is 6.0)
-#     # p_scaled is the "Shared Exponent"
-#     p_scale = max_val / 6.0
-#     p_scale = tl.where(p_scale == 0, 1e-5, p_scale)
-    
-#     # Normalize p
-#     p_norm = p_reshaped / p_scale[:, :, None]
-    
-#     # 2. Map to E2M1 Bits (S1E2M1)
-#     # Range: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-#     sign = tl.where(p_norm < 0, 0x8, 0x0)
-#     abs_p = tl.abs(p_norm)
-    
-#     # Manual quantization to E2M1 bit patterns
-#     # This is a simplified hardware-like mapping
-#     ebits = tl.where(abs_p >= 4.0, 0x6, 
-#              tl.where(abs_p >= 2.0, 0x4,
-#              tl.where(abs_p >= 1.0, 0x2, 0x0)))
-    
-#     mbits = tl.where((abs_p >= 1.5) & (abs_p < 2.0) | 
-#                      (abs_p >= 3.0) & (abs_p < 4.0) | 
-#                      (abs_p >= 6.0), 0x1, 0x0)
-    
-#     # Combine bits into 4-bit nibbles
-#     fp4_nibbles = (sign | ebits | mbits).to(tl.uint8)
-    
-#     # 3. Packing into uint8
-#     # We take two 4-bit nibbles and pack them into one uint8
-#     # Reshape to separate even and odd elements for packing
-#     p_for_packing = tl.view(fp4_nibbles, [BLOCK_M, BLOCK_N // 2, 2])
-    
-#     low_nibble = tl.view(p_for_packing[:, :, 0], [BLOCK_M, BLOCK_N // 2])
-#     high_nibble = tl.view(p_for_packing[:, :, 1], [BLOCK_M, BLOCK_N // 2])
-    
-#     # Shift high nibble and OR with low nibble
-#     packed_p = (high_nibble << 4) | (low_nibble & 0x0F)
-    
-#     return packed_p, p_scale
+
+    return out_tensor, dequant_scale_tensor
+
 
 @triton.jit
 def _sage_fwd_no_mask_v3(
@@ -153,22 +181,6 @@ def _sage_fwd_no_mask_v3(
         qk += tl.dot(q, k) * (q_descale * k_descale)
         # qk_scaled = qk * SM_SCALE
         qk_scaled = qk
-        if USE_ALIBI:
-            # compute the global position of each token within the sequence
-            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-            )
-            qk_scaled += alibi_block
-
-        # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
-        # compute bias
-        if bias_base_ptrs is not None:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
 
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
@@ -187,51 +199,6 @@ def _sage_fwd_no_mask_v3(
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
-        if ENABLE_DROPOUT:
-            # Compute pointers for this block
-            philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-            philox_ptrs = (
-                philox_base
-                + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
-            )
-
-            # compute dropout mask
-            rng_output = tl.rand(philox_seed, philox_ptrs)
-            dropout_mask = rng_output > dropout_p
-
-            # return scores with negative values for dropped vals (only if RETURN_SCORES is True)
-            if RETURN_SCORES:
-                sd_mask_value = tl.where(dropout_mask, p, -p)
-                sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = (
-                    sd_mask_base
-                    + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
-                )
-
-                # Compute mask for sd_mask storage
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                    kv_offs_n[None, :] < seqlen_k
-                )
-                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
-
-            # apply dropout mask in place
-            p = tl.where(dropout_mask, p, 0.0)
-        elif RETURN_SCORES:
-            # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-            sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-            sd_mask_ptrs = (
-                sd_mask_base
-                + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
-            )
-
-            # Compute mask for sd_mask storage
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                kv_offs_n[None, :] < seqlen_k
-            )
-            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
@@ -257,16 +224,8 @@ def _sage_fwd_no_mask_v3(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-
         p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
-        
-        # tl.static_print("BLOCK_M", BLOCK_M)
-        # tl.static_print("BLOCK_N", BLOCK_N)
-        # tl.static_print("p", p)
-        # tl.static_print("p_descale", p_descale)
-        # tl.static_print("v", v)
-        # tl.static_print("v_descale", v_descale)
         acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1", fast_math=True,)
 
     return acc, l_i, m_i
@@ -387,108 +346,6 @@ def _sage_fwd_mask_v3(
         # qk_scaled = qk * SM_SCALE
         qk_scaled = qk
 
-        if USE_ALIBI:
-            # compute the global position of each token within the sequence
-            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-            )
-            qk_scaled += alibi_block
-
-        if USE_SLIDING_WINDOW:
-            if IS_CAUSAL:
-                # ========== CAUSAL SLIDING WINDOW MASKING ==========
-                # For causal sliding window, we need to apply both constraints:
-                # 1. Causal: col_idx <= row_idx + (seqlen_k - seqlen_q)
-                # 2. Sliding window: row_idx - window_left <= col_idx <= row_idx + window_right
-
-                # Get positions
-                row_idx = offs_m  # Query positions
-                col_idx = kv_offs_n  # Key positions
-
-                # Expand for broadcasting
-                row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
-                col_idx_expanded = col_idx[None, :]  # [1, BLOCK_N]
-
-                # Apply causal constraint: can only attend to positions before or at the diagonal
-                causal_offset = seqlen_k - seqlen_q
-                causal_mask = col_idx_expanded > (row_idx_expanded + causal_offset)
-
-                # Apply sliding window constraint
-                if WINDOW_SIZE_LEFT < 0:
-                    # Only right window constraint
-                    window_mask = col_idx_expanded > (
-                        row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
-                    )
-                else:
-                    # Both left and right window constraints
-                    # Adjust window bounds by causal offset
-                    left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
-                    right_bound = row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
-
-                    # Can't attend to positions outside the window
-                    window_mask = (col_idx_expanded < left_bound) | (
-                        col_idx_expanded > right_bound
-                    )
-
-                # Final mask is the union of both constraints (True = cannot attend)
-                mask = causal_mask | window_mask
-
-                # Apply mask
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
-            else:
-                # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
-                # Exactly matching reference construct_local_mask:
-                # row_idx = query positions, col_idx = key positions
-                # sk = seqlen_k, sq = seqlen_q
-
-                # Get positions
-                row_idx = offs_m  # Query positions
-                col_idx = kv_offs_n  # Key positions
-
-                # sk and sq from reference (no padding masks in this test)
-                sk = seqlen_k
-                sq = seqlen_q
-
-                # Expand for broadcasting
-                row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
-                col_idx_expanded = col_idx[None, :]  # [1, BLOCK_N]
-
-                # Reference logic for mask computation
-                if WINDOW_SIZE_LEFT < 0:
-                    # Reference: return col_idx > row_idx + sk - sq + window_size[1]
-                    mask = col_idx_expanded > (
-                        row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
-                    )
-                else:
-                    # Reference:
-                    # sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
-                    # return torch.logical_or(
-                    #     col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
-                    #     col_idx < row_idx + sk - sq - window_size[0],
-                    # )
-                    # Create sk tensor with proper shape for broadcasting
-                    # sk represents the key sequence length, which should be compared per column
-                    sk_full = tl.full((1, BLOCK_N), sk, dtype=tl.int32)
-
-                    # Compute boundaries
-                    right_bound_val = row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
-                    right_bound = tl.minimum(right_bound_val, sk_full)
-                    left_bound = row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
-
-                    # Mask where True = cannot attend (matching reference)
-                    mask = (col_idx_expanded > right_bound) | (
-                        col_idx_expanded < left_bound
-                    )
-
-                # Apply mask (set to -inf where mask is True)
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
-        else:
-            if IS_CAUSAL:
-                causal_boundary = start_n + offs_n - seqlen_delta_qk
-                causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-                qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
-
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
@@ -501,18 +358,7 @@ def _sage_fwd_mask_v3(
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
 
-        # scale and subtract max
-        # IMPORTANT: Handle the case where all values are -inf
-        # When m_ij = -inf and qk_scaled = -inf, subtraction gives NaN
-        # We need to handle this explicitly
-        if USE_SLIDING_WINDOW:
-            # Check if this block has any valid values (m_ij != -inf)
-            # For rows where everything is -inf, set q_shifted to -inf (not NaN)
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
-            )
-        else:
-            q_shifted = qk_scaled - m_ij[:, None]
+        q_shifted = qk_scaled - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -523,108 +369,7 @@ def _sage_fwd_mask_v3(
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
-        if ENABLE_DROPOUT:
-            # Compute pointers for this block
-            philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-            philox_ptrs = (
-                philox_base
-                + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
-            )
-
-            # compute dropout mask
-            rng_output = tl.rand(philox_seed, philox_ptrs)
-            dropout_mask = rng_output > dropout_p
-
-            # return scores with negative values for dropped vals (only if RETURN_SCORES is True)
-            if RETURN_SCORES:
-                sd_mask_value = tl.where(dropout_mask, p, -p)
-                sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = (
-                    sd_mask_base
-                    + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
-                )
-
-                # Compute mask for sd_mask storage - include bounds check
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                    kv_offs_n[None, :] < seqlen_k
-                )
-
-                # Add causal mask if applicable to prevent writing to invalid positions
-                if IS_CAUSAL:
-                    seqlen_delta_qk = seqlen_k - seqlen_q
-                    causal_constraint = kv_offs_n[None, :] <= (
-                        offs_m[:, None] + seqlen_delta_qk
-                    )
-                    sd_store_mask = sd_store_mask & causal_constraint
-
-                # Add sliding window mask if applicable
-                if USE_SLIDING_WINDOW:
-                    seqlen_delta_qk = seqlen_k - seqlen_q
-                    if WINDOW_SIZE_LEFT < 0:
-                        # Only right window constraint
-                        window_constraint = kv_offs_n[None, :] <= (
-                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        )
-                    else:
-                        # Both left and right window constraints
-                        left_bound = (
-                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        )
-                        right_bound = (
-                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        )
-                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                            kv_offs_n[None, :] <= right_bound
-                        )
-                    sd_store_mask = sd_store_mask & window_constraint
-
-                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
-
-            # apply dropout mask in place
-            p = tl.where(dropout_mask, p, 0.0)
-        elif RETURN_SCORES:
-            # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-            sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-            sd_mask_ptrs = (
-                sd_mask_base
-                + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
-            )
-
-            # Compute mask for sd_mask storage - include bounds check
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                kv_offs_n[None, :] < seqlen_k
-            )
-
-            # Add causal mask if applicable
-            if IS_CAUSAL:
-                seqlen_delta_qk = seqlen_k - seqlen_q
-                causal_constraint = kv_offs_n[None, :] <= (
-                    offs_m[:, None] + seqlen_delta_qk
-                )
-                sd_store_mask = sd_store_mask & causal_constraint
-
-            # Add sliding window mask if applicable
-            if USE_SLIDING_WINDOW:
-                seqlen_delta_qk = seqlen_k - seqlen_q
-                if WINDOW_SIZE_LEFT < 0:
-                    # Only right window constraint
-                    window_constraint = kv_offs_n[None, :] <= (
-                        offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    )
-                else:
-                    # Both left and right window constraints
-                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                    right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                        kv_offs_n[None, :] <= right_bound
-                    )
-                sd_store_mask = sd_store_mask & window_constraint
-
-            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
-
+       
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
@@ -651,10 +396,6 @@ def _sage_fwd_mask_v3(
 
         p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
-        # tl.static_print("p", p)
-        # tl.static_print("p_descale", p_descale)
-        # tl.static_print("v", v)
-        # tl.static_print("v_descale", v_descale)
 
         acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1")
 
