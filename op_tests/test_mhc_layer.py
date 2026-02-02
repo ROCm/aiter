@@ -445,23 +445,54 @@ def main():
             num_iters=args.num_iters,
             num_warmup=args.num_warmup,
         )
+        
+        # Calculate throughput (GB/s)
+        # Memory: input (B*n*C*4) + output (B*n*C*4) + weights + intermediates
+        # Approximate: 2 * B * n * C * sizeof(float) for main data movement
+        data_bytes = 2 * ret["B"] * ret["n"] * ret["C"] * 4  # float32
+        
+        def calc_throughput_gbps(time_us):
+            if time_us > 0:
+                return (data_bytes / 1e9) / (time_us / 1e6)  # GB/s
+            return 0.0
+        
         df.append({
             "B": ret["B"],
             "C": ret["C"],
             "n": ret["n"],
-            "error": ret["error"],
-            "time_us (aiter)": ret["us_aiter"],
-            "time_us (torch_bf16)": ret["us_torch_bf16"],
-            "time_us (torch_fp32)": ret["us_torch_fp32"],
+            "err": ret["error"],
+            "time_us\n(aiter)": ret["us_aiter"],
+            "time_us\n(torch_bf16)": ret["us_torch_bf16"],
+            "time_us\n(torch_fp32)": ret["us_torch_fp32"],
+            "GB/s\n(aiter)": calc_throughput_gbps(ret["us_aiter"]),
+            "GB/s\n(torch_bf16)": calc_throughput_gbps(ret["us_torch_bf16"]),
+            "GB/s\n(torch_fp32)": calc_throughput_gbps(ret["us_torch_fp32"]),
         })
 
     df = pd.DataFrame(df)
 
     # Add speedup columns
-    df["speedup (aiter vs torch_bf16)"] = df["time_us (torch_bf16)"] / df["time_us (aiter)"]
-    df["speedup (aiter vs torch_fp32)"] = df["time_us (torch_fp32)"] / df["time_us (aiter)"]
+    df["speedup\n(vs bf16)"] = df["time_us\n(torch_bf16)"] / df["time_us\n(aiter)"]
+    df["speedup\n(vs fp32)"] = df["time_us\n(torch_fp32)"] / df["time_us\n(aiter)"]
 
-    df_md = df.to_markdown(index=False)
+    # Format floating point columns
+    float_fmt = {
+        "time_us\n(aiter)": "{:.2f}".format,
+        "time_us\n(torch_bf16)": "{:.2f}".format,
+        "time_us\n(torch_fp32)": "{:.2f}".format,
+        "GB/s\n(aiter)": "{:.2f}".format,
+        "GB/s\n(torch_bf16)": "{:.2f}".format,
+        "GB/s\n(torch_fp32)": "{:.2f}".format,
+        "speedup\n(vs bf16)": "{:.2f}".format,
+        "speedup\n(vs fp32)": "{:.2f}".format,
+    }
+    
+    df_formatted = df.copy()
+    for col, fmt in float_fmt.items():
+        if col in df_formatted.columns:
+            df_formatted[col] = df_formatted[col].apply(fmt)
+
+    df_md = df_formatted.to_markdown(index=False)
     aiter.logger.info("mhc_layer summary (markdown):\n%s", df_md)
 
 
