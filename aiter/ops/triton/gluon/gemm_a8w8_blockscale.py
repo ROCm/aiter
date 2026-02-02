@@ -18,6 +18,24 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cp
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_gemm_a8w8_blockscale_old_repr = make_kernel_repr(
+    "_gemm_a8w8_blockscale_kernel_old_gluon",
+    [
+        "GROUP_K",
+        "GROUP_N",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+    ],
+)
 
 @triton.heuristics(
     {
@@ -26,7 +44,7 @@ from triton.experimental.gluon.language.amd.cdna4 import async_copy as cp
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@gluon.jit
+@gluon.jit(repr=_gemm_a8w8_blockscale_old_repr)
 def _gemm_a8w8_blockscale_kernel_old(
     # Pointers to matrices
     a_ptr,
@@ -494,7 +512,8 @@ def buffer_load_to_lds(
 
 
 @gluon.jit
-def load_scales_and_advance_ptrs(
+def buffer_load_scales(
+    k_read,
     a_scale_ptr,
     b_scale_ptr,
     offs_a_scale,
@@ -504,23 +523,24 @@ def load_scales_and_advance_ptrs(
     offs_ks_step: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
+    offs_a_scale_tmp = offs_a_scale + k_read * offs_ks_step * stride_ascale_k
+    offs_b_scale_tmp = offs_b_scale + k_read * offs_ks_step * stride_bscale_k
+
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
-        offsets=offs_a_scale,
+        offsets=offs_a_scale_tmp,
         cache=cache_modifier,
     )
     b_scale = gl.amd.cdna4.buffer_load(
         ptr=b_scale_ptr,
-        offsets=offs_b_scale,
+        offsets=offs_b_scale_tmp,
         cache=cache_modifier,
     )
-    a_scale_ptr += offs_ks_step * stride_ascale_k
-    b_scale_ptr += offs_ks_step * stride_bscale_k
 
-    # for scales, load into mfma layout is faster than convert_layout into mfma layout after load, but the perf diff is small
+    # for scales, converting layout on offsets is faster than loading scales using linear layout and converting layout on the scales
     # a_scale = gl.convert_layout(a_scale, layout=gl.SliceLayout(1, mfma_layout))
     # b_scale = gl.convert_layout(b_scale, layout=gl.SliceLayout(0, mfma_layout))
-    return a_scale, b_scale, a_scale_ptr, b_scale_ptr
+    return a_scale, b_scale
 
 
 @gluon.jit
@@ -540,9 +560,6 @@ def load_from_lds_and_mfma(
     cur_a = smem_a.index(k % num_stages).load(layout=dot_a_layout)
     cur_b = smem_b.index(k % num_stages).load(layout=dot_b_layout)
 
-    # mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-    # acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
-
     mfma_out = gl.amd.cdna4.mfma_scaled(
         a=cur_a,
         a_scale=None,
@@ -558,16 +575,35 @@ def load_from_lds_and_mfma(
     return k + 1, acc
 
 
+_gemm_a8w8_blockscale_repr = make_kernel_repr(
+    "_gemm_a8w8_blockscale_kernel_gluon",
+    [
+        "GROUP_K",
+        "GROUP_N",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "USE_ASYNC_LOAD",
+        "cache_modifier",
+    ],
+)
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
-        "USE_ASYNC_LOAD": lambda args: args["num_stages"] > 1
-        and args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "USE_ASYNC_LOAD": lambda args: False,
+        # "USE_ASYNC_LOAD": lambda args: args["num_stages"] > 1
+        # and args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
-@gluon.jit
+@gluon.jit(repr=_gemm_a8w8_blockscale_repr)
 def _gemm_a8w8_blockscale_kernel(
     # Pointers to matrices
     a_ptr,
@@ -605,8 +641,8 @@ def _gemm_a8w8_blockscale_kernel(
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
     USE_ASYNC_LOAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
     cache_modifier: gl.constexpr,
     num_stages: gl.constexpr,
     FP8_FORMAT: gl.constexpr = "e4m3",
@@ -665,15 +701,9 @@ def _gemm_a8w8_blockscale_kernel(
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
     )
-    # mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-    #     version=4,
-    #     instr_shape=[16, 16, 64],  # V_MFMA_F32_16X16X32_FP8_FP8 instruction
-    #     transposed=True,
-    #     warps_per_cta=[NUM_WARPS // 2, 2],
-    # )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 128],  # V_MFMA_F32_16X16X32_FP8_FP8 instruction
+        instr_shape=[16, 16, 128],
         transposed=True,
         # warps_per_cta=[2, NUM_WARPS // 2],
         warps_per_cta=[NUM_WARPS // 2, 2],
@@ -685,12 +715,6 @@ def _gemm_a8w8_blockscale_kernel(
     shared_b: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[0, 1]
     )
-    # shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
-    #     vec=16, per_phase=2, max_phase=8, order=[0]
-    # )
-    # shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
-    #     vec=16, per_phase=2, max_phase=8, order=[0]
-    # )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
     )
@@ -730,7 +754,7 @@ def _gemm_a8w8_blockscale_kernel(
         offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
         # Create pointers for the scales
-        # for scales, load into mfma layout is faster than convert_layout into mfma layout after load
+        # for scales, converting layout on offsets is faster than loading scales using linear layout and converting layout on the scales
         offs_ams = gl.convert_layout(offs_am, layout=gl.SliceLayout(1, mfma_layout))
         offs_bns = gl.convert_layout(offs_bn, layout=gl.SliceLayout(0, mfma_layout))
         # offs_ams = offs_am
@@ -815,7 +839,8 @@ def _gemm_a8w8_blockscale_kernel(
             if USE_ASYNC_LOAD:
                 cp.wait_group(num_stages - 1)
 
-            a_scale, b_scale, a_scale_ptr, b_scale_ptr = load_scales_and_advance_ptrs(
+            a_scale, b_scale = buffer_load_scales(
+                k_read,
                 a_scale_ptr,
                 b_scale_ptr,
                 offs_a_scale,
@@ -845,7 +870,8 @@ def _gemm_a8w8_blockscale_kernel(
             if USE_ASYNC_LOAD:
                 cp.wait_group(num_stages - 2 - i)
 
-            a_scale, b_scale, a_scale_ptr, b_scale_ptr = load_scales_and_advance_ptrs(
+            a_scale, b_scale = buffer_load_scales(
+                k_read,
                 a_scale_ptr,
                 b_scale_ptr,
                 offs_a_scale,
@@ -855,6 +881,7 @@ def _gemm_a8w8_blockscale_kernel(
                 offs_ks_step,
                 cache_modifier,
             )
+
             k_read, acc = load_from_lds_and_mfma(
                 k_read,
                 smem_a,
@@ -1053,6 +1080,7 @@ def gemm_a8w8_blockscale(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    old=False,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -1106,10 +1134,6 @@ def gemm_a8w8_blockscale(
     else:
         y_pp = None
 
-    # print()
-    # for k, v in config.items():
-    #     print(k, v)
-    # print()
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]
@@ -1117,7 +1141,11 @@ def gemm_a8w8_blockscale(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
-    _gemm_a8w8_blockscale_kernel[grid](
+    if old:
+        fn = _gemm_a8w8_blockscale_kernel_old
+    else:
+        fn = _gemm_a8w8_blockscale_kernel
+    fn[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

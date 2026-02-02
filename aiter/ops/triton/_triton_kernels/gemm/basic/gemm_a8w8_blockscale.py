@@ -20,6 +20,7 @@ _gemm_a8w8_blockscale_repr = make_kernel_repr(
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
         "GRID_MN",
+        "use_buffer_ops",
         "cache_modifier",
     ],
 )
@@ -81,6 +82,7 @@ def _gemm_a8w8_blockscale_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    use_buffer_ops: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -203,8 +205,13 @@ def _gemm_a8w8_blockscale_kernel(
         c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        if use_buffer_ops:
+            offs_cm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
+            offs_cn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)).to(tl.int64)
+        else:
+            offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+            
         c_ptrs = (
             c_ptr
             + stride_cm * offs_cm[:, None]

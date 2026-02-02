@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils._triton.env import get_env
 
 _LOGGER = AiterTritonLogger()
 
@@ -120,6 +121,7 @@ def gemm_a8w8_blockscale(
         x_scale.stride(1),
         w_scale.stride(0),
         w_scale.stride(1),
+        use_buffer_ops=get_env()["use_buffer_ops"],
         **config,
     )
 

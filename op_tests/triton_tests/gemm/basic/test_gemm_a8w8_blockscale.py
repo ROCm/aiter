@@ -93,28 +93,28 @@ def get_x_vals():
         (32, 2112, 7168),
         (64, 2112, 7168),
         (128, 2112, 7168),
+        (1024, 2112, 7168),
         (16, 3072, 1536),
         (32, 3072, 1536),
         (64, 3072, 1536),
         (128, 3072, 1536),
+        (1024, 3072, 1536),
         (16, 7168, 2048),
         (32, 7168, 2048),
         (64, 7168, 2048),
         (128, 7168, 2048),
+        (1024, 7168, 2048),
         (16, 4608, 7168),
         (32, 4608, 7168),
         (64, 4608, 7168),
         (128, 4608, 7168),
+        (1024, 4608, 7168),
         (16, 7168, 2304),
         (32, 7168, 2304),
         (64, 7168, 2304),
         (128, 7168, 2304),
+        (1024, 7168, 2304),
     ]
-    # x_vals = [
-    #     (16, 16, 128*10+57),
-    #     (16, 16, 128*10+128),
-    #     (16, 7168, 2304),
-    # ]
     # x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
@@ -193,7 +193,7 @@ def generate_gemm_a8w8_blockscale_inputs(
     "impl",
     [
         "gluon",
-        # "triton",
+        "triton",
         # "triton_shuffle",
     ],
 )
@@ -228,19 +228,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             shuffle=("_shuffle" in impl),
         )
     )
-    x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
-        generate_gemm_a8w8_blockscale_inputs(
-            M,
-            N,
-            K,
-            block_shape_n,
-            block_shape_k,
-            dtype=dtype,
-            layout=layout,
-            output=output,
-            shuffle=("_shuffle" in impl),
-        )
-    )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
@@ -253,15 +240,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 
-    # from triton.testing import runtime
-
-    # di = runtime.driver.active.get_device_interface()
-    # cache = runtime.driver.active.get_empty_cache_for_benchmark()
-    # for _ in range(250):
-    #     cache.zero_()
-    #     di.synchronize()
-    #     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
-    #     di.synchronize()
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
