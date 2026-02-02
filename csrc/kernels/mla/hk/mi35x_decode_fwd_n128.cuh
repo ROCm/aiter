@@ -222,22 +222,21 @@ class KvManagerV1
         return kWarpOffset * (T::kQkHeadDim / kNumColsPerWarp);
     }
 
-    __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx()
+    __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
     {
         const uint32_t lane_idx = ckt::get_lane_id();
         return lane_idx / 2;
     }
 
-    __device__ __forceinline__ static uint32_t get_kv_ld_col_base()
+    __device__ __forceinline__ static uint32_t get_kv_ld_col_base(const int32_t warp_idx)
     {
-        const uint32_t warp_idx = ckt::get_warp_id();
         const uint32_t lane_idx = ckt::get_lane_id();
         return warp_idx * 8 + (lane_idx % 2) * 4;
     }
 
-    __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const uintptr_t p_lds_kv)
+    __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const int32_t warp_idx,
+                                                                       const uintptr_t p_lds_kv)
     {
-        const uint32_t warp_idx = ckt::get_warp_id();
         return p_lds_kv + warp_idx * kWarpOffset;
     }
 
@@ -261,6 +260,7 @@ class KvManagerV1
     //        kNumBytesPerThrPerRnd(4)
     template <uint32_t kColOffset, bool kIsLastIter, bool kCheckBoundary = true>
     __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
+                                                             const uint32_t warp_idx,
                                                              const typename T::gl_kv& kv_buffer,
                                                              const int32_t row,
                                                              const int32_t col_base)
@@ -270,7 +270,6 @@ class KvManagerV1
             static_assert(((kColOffset % 64) == 0) && (kColOffset < 576),
                           "async_load_k(): Unsupported column offset!");
 
-            const uint32_t warp_idx = ckt::get_warp_id();
             const uint32_t lane_idx = ckt::get_lane_id();
 
             const uintptr_t p_lds_kv_warp =
@@ -302,6 +301,7 @@ class KvManagerV1
 
     template <bool kIsLastIter, bool kCheckBoundary>
     __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
+                                                        const uint32_t warp_idx,
                                                         const int32_t* p_kv_indices,
                                                         const typename T::gl_kv& kv_buffer,
                                                         const int32_t kv_ld_row_base_idx,
@@ -311,29 +311,29 @@ class KvManagerV1
     {
         if constexpr(kIsLastIter == false)
         {
-            const uintptr_t p_lds_kv_warp = get_p_lds_kv_warp_base(p_lds_kv);
+            const uintptr_t p_lds_kv_warp = get_p_lds_kv_warp_base(warp_idx, p_lds_kv);
 
             const int32_t row_kv_ld = get_kv_ld_row<kCheckBoundary>(
                 p_kv_indices, kv_ld_row_base_idx, kv_tile_start, kv_tile_end);
 
             async_load_k_tile<0, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<64, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<128, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<192, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<256, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<320, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<384, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<448, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<512, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
         }
     }
 
@@ -375,9 +375,9 @@ class KvManagerV1
     }
 
     // Load un-transposed vector from LDS to GPR.
-    __device__ __forceinline__ static void load_v_to_gpr(v8ui* p_result, const uintptr_t p_lds_v)
+    __device__ __forceinline__ static void
+    load_v_to_gpr(v8ui* p_result, const uint32_t warp_idx, const uintptr_t p_lds_v)
     {
-        const uint32_t warp_idx = ckt::get_warp_id();
         const uint32_t lane_idx = ckt::get_lane_id();
 
         // Each warp takes 16x128 elements. Each thread takes 4x8 elements block-wise column-major
@@ -435,7 +435,7 @@ class KvManagerV2
     //   warp[2]: row[ 4- 5], row[20-21], warp[3]: row[ 6- 7], row[22-23]
     //   warp[4]: row[ 8- 9], row[24-25], warp[5]: row[10-11], row[26-27]
     //   warp[6]: row[12-13], row[28-29], warp[7]: row[14-15], row[30-31]
-    __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx()
+    __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
     {
         constexpr uint32_t kNumRowsPerWarp     = 4;                   // 4 rows per warp.
         constexpr uint32_t kNumRowGroupPerWarp = kNumRowsPerWarp / 2; // 4 / 2 = 2
@@ -444,22 +444,21 @@ class KvManagerV2
         constexpr uint32_t kNumThreadsPerRowGroup =
             ckt::get_warp_size() / kNumRowGroupPerWarp; // 64 / 2 = 32
 
-        const uint32_t warp_idx = ckt::get_warp_id();
         const uint32_t lane_idx = ckt::get_lane_id();
         // (lane_idx / 32) * 16 + (lane_idx / 16) % 2 + warp_idx * 2
         return (lane_idx / kNumThreadsPerRowGroup) * kRowGroupStride +
                (lane_idx / kRowGroupStride) % kNumRowsPerRowGroup + warp_idx * kNumRowsPerRowGroup;
     }
 
-    __device__ __forceinline__ static uint32_t get_kv_ld_col_base()
+    __device__ __forceinline__ static uint32_t get_kv_ld_col_base(const int32_t warp_idx)
     {
         const uint32_t lane_idx = ckt::get_lane_id();
         return (lane_idx % 16) * 4;
     }
 
-    __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const uintptr_t p_lds_kv)
+    __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const int32_t warp_idx,
+                                                                       const uintptr_t p_lds_kv)
     {
-        const uint32_t warp_idx = ckt::get_warp_id();
         return p_lds_kv + warp_idx * kNumBytesPerSubBlock;
     }
 
@@ -484,6 +483,7 @@ class KvManagerV2
     // 2DW padding
     template <uint32_t kColOffset, bool kIsLastIter, bool kCheckBoundary = true>
     __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
+                                                             const uint32_t warp_idx,
                                                              const typename T::gl_kv& kv_buffer,
                                                              const int32_t row,
                                                              const int32_t col_base)
@@ -495,7 +495,6 @@ class KvManagerV2
 
             constexpr uint32_t kBlockIdx = kColOffset / 64;
 
-            const uint32_t warp_idx = ckt::get_warp_id();
             const uint32_t lane_idx = ckt::get_lane_id();
 
             const uintptr_t p_lds_kv_warp =
@@ -527,6 +526,7 @@ class KvManagerV2
 
     template <bool kIsLastIter, bool kCheckBoundary>
     __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
+                                                        const uint32_t warp_idx,
                                                         const int32_t* p_kv_indices,
                                                         const typename T::gl_kv& kv_buffer,
                                                         const int32_t kv_ld_row_base_idx,
@@ -536,29 +536,29 @@ class KvManagerV2
     {
         if constexpr(kIsLastIter == false)
         {
-            const uintptr_t p_lds_kv_warp = get_p_lds_kv_warp_base(p_lds_kv);
+            const uintptr_t p_lds_kv_warp = get_p_lds_kv_warp_base(warp_idx, p_lds_kv);
 
             const int32_t row_kv_ld = get_kv_ld_row<kCheckBoundary>(
                 p_kv_indices, kv_ld_row_base_idx, kv_tile_start, kv_tile_end);
 
             async_load_k_tile<0, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<64, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<128, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<192, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<256, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<320, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<384, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<448, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
             async_load_k_tile<512, false, kCheckBoundary>(
-                p_lds_kv_warp, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
         }
     }
 
@@ -606,9 +606,9 @@ class KvManagerV2
     }
 
     // Load un-transposed vector from LDS to GPR.
-    __device__ __forceinline__ static void load_v_to_gpr(v8ui* p_result, const uintptr_t p_lds_v)
+    __device__ __forceinline__ static void
+    load_v_to_gpr(v8ui* p_result, const uint32_t warp_idx, const uintptr_t p_lds_v)
     {
-        const uint32_t warp_idx = ckt::get_warp_id();
         const uint32_t lane_idx = ckt::get_lane_id();
 
         // Each warp takes 16x128 elements. Each thread takes 4x8 elements block-wise column-major
@@ -681,6 +681,7 @@ __device__ __forceinline__ constexpr uint32_t get_transposed_v_lds_size_in_byte(
 
 template <typename T>
 __device__ __forceinline__ void store_transposed_v_to_lds(const uintptr_t p_lds_vt,
+                                                          const uint32_t warp_idx,
                                                           const v8ui& v_transposed)
 {
     using kv_t = T::kv_t;
@@ -692,7 +693,6 @@ __device__ __forceinline__ void store_transposed_v_to_lds(const uintptr_t p_lds_
     constexpr uint32_t kNumBlocksPerRow            = T::kVoHeadDim / kNumColsPerThr; // 512 / 8 = 64
     constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;           // 64 + 2 = 66
 
-    const uint32_t warp_idx = ckt::get_warp_id();
     const uint32_t lane_idx = ckt::get_lane_id();
 
     // 4x8 block-wise row major layout. No padding between rows or columns.
@@ -1194,8 +1194,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     // Runtime constants
     const uint32_t warp_idx           = ckt::get_warp_id();
     const uint32_t lane_idx           = ckt::get_lane_id();
-    const uint32_t kv_ld_row_base_idx = kv_manager.get_kv_ld_row_base_idx();
-    const uint32_t kv_ld_col_base     = kv_manager.get_kv_ld_col_base();
+    const uint32_t kv_ld_row_base_idx = kv_manager.get_kv_ld_row_base_idx(warp_idx);
+    const uint32_t kv_ld_col_base     = kv_manager.get_kv_ld_col_base(warp_idx);
 
     std::uintptr_t out_as_int       = reinterpret_cast<std::uintptr_t>(params.final_output.raw_ptr);
     std::uint64_t out_as_u64        = static_cast<std::uint64_t>(out_as_int);
@@ -1239,6 +1239,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         if(kv_len < T::kBlockN)
         {
             kv_manager.template async_load_k<false, true>(p_lds_kv_curr,
+                                                          warp_idx,
                                                           params.p_kv_indices,
                                                           params.kv_buffer,
                                                           kv_ld_row_base_idx,
@@ -1249,6 +1250,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         else
         {
             kv_manager.template async_load_k<false, false>(p_lds_kv_curr,
+                                                           warp_idx,
                                                            params.p_kv_indices,
                                                            params.kv_buffer,
                                                            kv_ld_row_base_idx,
@@ -1287,7 +1289,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             int32_t row_kv_ld_next;
             if constexpr(kIsLastIter == false)
             {
-                p_lds_kv_next_warp = kv_manager.get_p_lds_kv_warp_base(p_lds_kv_next);
+                p_lds_kv_next_warp = kv_manager.get_p_lds_kv_warp_base(warp_idx, p_lds_kv_next);
                 row_kv_ld_next     = row_kv_ld_next_next;
             }
 
@@ -1312,7 +1314,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 }
             }
             kv_manager.template async_load_k_tile<0, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // GEMM on NoPE
             ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}([&](auto idx) {
@@ -1349,7 +1351,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             });
 
             kv_manager.template async_load_k_tile<64, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // GEMM on RoPE
             ckt::static_for<k_q_rope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
@@ -1380,21 +1382,21 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             __builtin_amdgcn_s_setprio(3);
 
             kv_manager.template async_load_k_tile<128, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             float rescale;
             softmax_p0<kIsFirstIter, kCheckBoundary, k_p_comp_begin>(
                 &row_max, &rescale, kv_tile_start, kv_end, params.softmax_scale);
             kv_manager.template async_load_k_tile<192, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
             softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
 
             kv_manager.template async_load_k_tile<256, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // Transpose V
             v8ui v;
-            kv_manager.load_v_to_gpr(&v, p_lds_kv_curr);
+            kv_manager.load_v_to_gpr(&v, warp_idx, p_lds_kv_curr);
             __builtin_amdgcn_s_setprio(2);
 
             // For hiding LDS load latency
@@ -1412,11 +1414,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
             asm volatile("s_waitcnt lgkmcnt(0)");
             transpose_v(&v);
-            store_transposed_v_to_lds<T>(p_lds_vt, v);
+            store_transposed_v_to_lds<T>(p_lds_vt, warp_idx, v);
             __builtin_amdgcn_s_setprio(1);
 
             kv_manager.template async_load_k_tile<320, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             if constexpr(kIsFirstIter == false)
             {
@@ -1449,7 +1451,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             __builtin_amdgcn_s_setprio(0);
 
             kv_manager.template async_load_k_tile<384, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // Convert p from comp_t to kv_t
             ckt::static_for<k_p_comp_begin, k_p_comp_end + 1, 4>{}([&](auto idx) {
@@ -1471,7 +1473,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             __builtin_amdgcn_sched_barrier(0);
 
             kv_manager.template async_load_k_tile<448, kIsLastIter, kCheckBoundaryNext>(
-                p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // GEMM on PV
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
@@ -1530,7 +1532,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     if constexpr(idx.value == 1)
                     {
                         kv_manager.template async_load_k_tile<512, kIsLastIter, kCheckBoundaryNext>(
-                            p_lds_kv_next_warp, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                            p_lds_kv_next_warp,
+                            warp_idx,
+                            params.kv_buffer,
+                            row_kv_ld_next,
+                            kv_ld_col_base);
                     }
                 }
             });
