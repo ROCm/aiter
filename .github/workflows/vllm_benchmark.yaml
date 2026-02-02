@@ -14,7 +14,7 @@ concurrency:
 env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
-  BASE_IMAGE: rocm/vllm-dev:nightly@sha256:7ac43a3fcb1a9f46fd7575701a587154ad478cc6cf2c19d170f8378ecdb540d9
+  BASE_IMAGE: rocm/vllm-dev:nightly
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
