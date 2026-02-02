@@ -139,9 +139,6 @@ def mhc_layer_ref_intermediates(
     H_proj_res = torch.matmul(x_flat_bf16.float(), phi_res_bf16.float().t())
     H_proj_raw = torch.cat([H_proj_pre, H_proj_post, H_proj_res], dim=1) / rms
 
-    phi_combined = torch.cat([phi_pre_bf16, phi_post_bf16, phi_res_bf16], dim=0)
-    H_proj_raw_alt = torch.matmul(phi_combined.float(), x_flat_bf16.float().t()).t() / rms
-    H_proj_raw_alt_nodiv = torch.matmul(phi_combined.float(), x_flat_bf16.float().t()).t()
 
     proj_pre = H_proj_raw[:, :n]
     proj_post = H_proj_raw[:, n : 2 * n]
@@ -162,8 +159,6 @@ def mhc_layer_ref_intermediates(
 
     return {
         "H_proj_raw": H_proj_raw,
-        "H_proj_raw_alt": H_proj_raw_alt,
-        "H_proj_raw_alt_nodiv": H_proj_raw_alt_nodiv,
         "H_pre": H_pre,
         "H_post": H_post,
         "M": M,
@@ -315,20 +310,6 @@ def run_case(
             atol=1e-2,
             rtol=1e-2,
             msg=f"[dbg H_proj_raw] B={B}, C={C}, n={n}",
-        )
-        checkAllclose(
-            ref_dbg["H_proj_raw_alt"],
-            debug["H_proj_raw"],
-            atol=1e-2,
-            rtol=1e-2,
-            msg=f"[dbg H_proj_raw_alt] B={B}, C={C}, n={n}",
-        )
-        checkAllclose(
-            ref_dbg["H_proj_raw_alt_nodiv"],
-            debug["H_proj_raw"],
-            atol=1e-2,
-            rtol=1e-2,
-            msg=f"[dbg H_proj_raw_alt_nodiv] B={B}, C={C}, n={n}",
         )
         checkAllclose(
             ref_dbg["H_pre"],
