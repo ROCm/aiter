@@ -1,10 +1,35 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+#include <cmath>
+#include <functional>
+#include <unordered_map>
+
+#include <torch/extension.h>
+
+#include "gemm_common.h"
+
 #include "gemm_a8w8_blockscale_cktile_common.cuh"
 #include "gemm_a8w8_blockscale_cktile_lookup.h"
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
-#include "gemm_a8w8_blockscale_common.h"
+
+using BlockwiseKernel = std::function<torch::Tensor(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
+
+// Define a custom hash function for std::tuple<int, int, int>
+struct IntTupleHash
+{
+    size_t operator()(const std::tuple<int, int, int>& t) const
+    {
+        auto hash1 = std::hash<int>{}(std::get<0>(t));
+        auto hash2 = std::hash<int>{}(std::get<1>(t));
+        auto hash3 = std::hash<int>{}(std::get<2>(t));
+        return hash1 ^ hash2 ^ hash3;
+    }
+};
+
+using BlockwiseKernelMap =
+    std::unordered_map<std::tuple<int, int, int>, BlockwiseKernel, IntTupleHash>;
 
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
@@ -58,15 +83,16 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     }
 
     // Default tile kernel
-    return a8w8_blockscale_cktile_128x128x256_1x4x1_16x16x32_intrawave_0x0x0x0_1<DDataType,
-                                                                                 EDataType>;
+    return a8w8_blockscale_cktile_128x128x256_1x4x1_16x16x128_intrawave_0x0x0_1<DDataType,
+                                                                               EDataType>;
 }
 
 torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                                           torch::Tensor& WQ,
                                           torch::Tensor& x_scale,
                                           torch::Tensor& w_scale,
-                                          torch::Tensor& Y)
+                                          torch::Tensor& Y,
+                                          bool preshuffleB)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -77,11 +103,13 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<TILE_FP32, TILE_FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<TILE_FP32, TILE_FP16>(M, N, K)(
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<TILE_FP32, TILE_BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<TILE_FP32, TILE_BF16>(M, N, K)(
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
     }
     else
     {

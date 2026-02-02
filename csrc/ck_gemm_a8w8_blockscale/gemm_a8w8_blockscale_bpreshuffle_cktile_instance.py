@@ -69,7 +69,7 @@ class TileKernelInstance:
 # fmt: off
 # Candidate and default kernel instances for tile gemm a8w8 blockscale
 # These instances are used for generating the kernel code and tuning.
-candidate_kernels_cktile_dict = {
+candidate_kernels_bpreshuffle_cktile_dict = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
     # K_Tile = 128, M_Warp x N_Warp = 1 x 4, WarpTile = 16 x 16 x 32
     0:   TileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
@@ -106,8 +106,8 @@ candidate_kernels_cktile_dict = {
 }
 
 
-default_kernels_cktile_dict = {
-   #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC  | UsePersistentKernel | BlockPerCu |
-    -1:  TileKernelInstance(  128,     128,      128,     1,        4,       1,        16,            16,           128,       "Intrawave",        False,             False,         False,             1      ), 
+default_kernels_bpreshuffle_cktile_dict = {
+   #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
+    -1:  TileKernelInstance(  128,     128,      128,     1,        4,       1,        16,            16,          128,       "Intrawave",        False,            False,          False,             1      ), 
 }
 # fmt: on
