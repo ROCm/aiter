@@ -263,10 +263,8 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
         ],
-        "flags_extra_hip": [
-            "'-mllvm -greedy-reverse-local-assignment=1'",
-            "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
-        ],
+        "flags_extra_hip": "['-mllvm -enable-noalias-to-md-conversion=1', '-mllvm -greedy-reverse-local-assignment=1'] + (['-DCK_TILE_EIGHTWARP_SUP'] if get_gfx().startswith('gfx95') else [])",
+
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle": {
@@ -644,6 +642,9 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
         ],
+        "flags_extra_hip": "['-mllvm -enable-noalias-to-md-conversion=1', '-mllvm -greedy-reverse-local-assignment=1'] + (['-DCK_TILE_EIGHTWARP_SUP'] if get_gfx().startswith('gfx95') else [])",
+
+
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle_tune": {
