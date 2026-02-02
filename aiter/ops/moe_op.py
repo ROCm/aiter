@@ -203,6 +203,8 @@ def moe_stage1_g1u1(
     quant_type: Optional[Enum] = QuantType.No.value,
     a1_scale: Optional[Tensor] = None,
     w1_scale: Optional[Tensor] = None,
+    fc2_smooth_scale: Optional[Tensor] = None,
+    fc2_scale: Optional[Tensor] = None,
     sorted_weights: Optional[Tensor] = None,
 ) -> None: ...
 
@@ -306,6 +308,25 @@ def ck_moe_stage1(
     dst_type: Optional[str] = None,
 ) -> None: ...
 
+@compile_ops("module_moe_asm")
+def moe_stage2_g1u1(
+    inter_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str,
+    block_m: int,
+    w2_scale: Optional[Tensor] = None,
+    a2_scale: Optional[Tensor] = None,
+    sorted_weights: Optional[Tensor] = None,
+    quant_type: Optional[Enum] = QuantType.No.value,
+    activation: Optional[Enum] = ActivationType.Silu.value,
+    splitk: Optional[int] = 1,
+) -> None: ...
 
 @compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage2)
 def ck_moe_stage2(
