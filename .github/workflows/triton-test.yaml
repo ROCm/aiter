@@ -51,6 +51,9 @@ jobs:
           fetch-depth: 1
           submodules: 'recursive'
 
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        
       - name: Run the container
         run: |
           set -ex
