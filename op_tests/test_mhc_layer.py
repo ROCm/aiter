@@ -7,7 +7,7 @@ import aiter
 from aiter.test_common import checkAllclose
 
 
-def sinkhorn_cpu(M, iters):
+def sinkhorn_ref(M, iters):
     for _ in range(iters):
         row_sum = M.sum(dim=-1, keepdim=True)
         M = torch.where(row_sum > 1e-8, M / row_sum, M)
@@ -17,6 +17,55 @@ def sinkhorn_cpu(M, iters):
 
 
 def mhc_layer_ref(
+    x_expanded,
+    rmsnorm_weight,
+    phi_pre,
+    phi_post,
+    phi_res,
+    b_pre,
+    b_post,
+    b_res,
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    sinkhorn_iters,
+    eps,
+):
+    B, n, C = x_expanded.shape
+    nC = n * C
+    n2 = n * n
+
+    x_flat = x_expanded.reshape(B, nC)
+    x_flat_bf16 = x_flat.to(torch.bfloat16)
+    phi_pre_bf16 = phi_pre.to(torch.bfloat16)
+    phi_post_bf16 = phi_post.to(torch.bfloat16)
+    phi_res_bf16 = phi_res.to(torch.bfloat16)
+
+    rms = torch.sqrt(x_flat_bf16.float().pow(2).mean(dim=1, keepdim=True) + eps)
+    rms_inv = 1.0 / rms
+
+    proj_pre = torch.matmul(x_flat_bf16.float(), phi_pre_bf16.float().t())
+    proj_post = torch.matmul(x_flat_bf16.float(), phi_post_bf16.float().t())
+    proj_res = torch.matmul(x_flat_bf16.float(), phi_res_bf16.float().t())
+
+    H_pre = torch.sigmoid(alpha_pre * proj_pre * rms_inv + b_pre.view(1, n))
+    H_post = 2.0 * torch.sigmoid(alpha_post * proj_post * rms_inv + b_post.view(1, n))
+    H_res = torch.exp(alpha_res * proj_res * rms_inv + b_res.view(1, n2))
+
+    M = sinkhorn_ref(H_res.view(B, n, n), sinkhorn_iters)
+
+    x_agg = torch.sum(H_pre.unsqueeze(-1) * x_expanded, dim=1)
+    x_agg_bf16 = x_agg.to(torch.bfloat16)
+    rms_agg = torch.sqrt(x_agg_bf16.float().pow(2).mean(dim=1, keepdim=True) + eps)
+    x_normed = x_agg_bf16.float() / rms_agg * rmsnorm_weight.to(torch.bfloat16).float().view(1, C)
+
+    mix = torch.matmul(M, x_expanded)
+    dist = H_post.unsqueeze(-1) * x_normed.unsqueeze(1)
+    out = mix + dist
+    return out
+
+
+def mhc_layer_ref_fp32(
     x_expanded,
     rmsnorm_weight,
     phi_pre,
@@ -47,7 +96,7 @@ def mhc_layer_ref(
     H_post = 2.0 * torch.sigmoid(alpha_post * proj_post * rms_inv + b_post.view(1, n))
     H_res = torch.exp(alpha_res * proj_res * rms_inv + b_res.view(1, n2))
 
-    M = sinkhorn_cpu(H_res.view(B, n, n), sinkhorn_iters)
+    M = sinkhorn_ref(H_res.view(B, n, n), sinkhorn_iters)
 
     x_agg = torch.sum(H_pre.unsqueeze(-1) * x_expanded, dim=1)
     rms_agg = torch.sqrt(x_agg.pow(2).mean(dim=1, keepdim=True) + eps)
@@ -59,7 +108,7 @@ def mhc_layer_ref(
     return out
 
 
-def run_case(B, C, n, sinkhorn_iters=20, eps=1e-5):
+def run_case(B, C, n, sinkhorn_iters=20, eps=1e-5, ref_device="cuda"):
     device = "cuda"
     torch.manual_seed(42)
 
@@ -97,7 +146,39 @@ def run_case(B, C, n, sinkhorn_iters=20, eps=1e-5):
         eps=eps,
     )
 
-    ref = mhc_layer_ref(
+    ref_bf16_like = mhc_layer_ref(
+        x_expanded.to(ref_device),
+        rmsnorm_weight.to(ref_device),
+        phi_pre.to(ref_device),
+        phi_post.to(ref_device),
+        phi_res.to(ref_device),
+        b_pre.to(ref_device),
+        b_post.to(ref_device),
+        b_res.to(ref_device),
+        0.01,
+        0.01,
+        0.01,
+        sinkhorn_iters,
+        eps,
+    ).to(device)
+
+    ref_fp32_cuda = mhc_layer_ref_fp32(
+        x_expanded,
+        rmsnorm_weight.float(),
+        phi_pre.float(),
+        phi_post.float(),
+        phi_res.float(),
+        b_pre,
+        b_post,
+        b_res,
+        0.01,
+        0.01,
+        0.01,
+        sinkhorn_iters,
+        eps,
+    )
+
+    ref_fp32_cpu = mhc_layer_ref_fp32(
         x_expanded.cpu(),
         rmsnorm_weight.cpu().float(),
         phi_pre.cpu().float(),
@@ -114,8 +195,14 @@ def run_case(B, C, n, sinkhorn_iters=20, eps=1e-5):
     ).to(device)
 
     torch.cuda.synchronize()
-    msg = f"[mhc_layer] B={B}, C={C}, n={n}"
-    checkAllclose(ref, out, atol=0.1, rtol=1e-2, msg=msg)
+    msg = f"[mhc_layer bf16_like] B={B}, C={C}, n={n}"
+    checkAllclose(ref_bf16_like, out, atol=0.1, rtol=1e-2, msg=msg)
+    msg = f"[mhc_layer fp32_cuda] B={B}, C={C}, n={n}"
+    checkAllclose(ref_fp32_cuda, out, atol=0.1, rtol=1e-2, msg=msg)
+    msg = f"[mhc_layer fp32_cpu] B={B}, C={C}, n={n}"
+    checkAllclose(ref_fp32_cpu, out, atol=0.1, rtol=1e-2, msg=msg)
+    msg = f"[mhc_layer fp32 cpu vs cuda] B={B}, C={C}, n={n}"
+    checkAllclose(ref_fp32_cpu, ref_fp32_cuda, atol=1e-5, rtol=1e-5, msg=msg)
 
 
 def main():
@@ -126,6 +213,13 @@ def main():
     parser.add_argument("--B", type=int, default=None, help="batch size")
     parser.add_argument("--C", type=int, default=None, help="hidden dim")
     parser.add_argument("--n", type=int, default=None, help="expansion rate")
+    parser.add_argument(
+        "--ref-device",
+        type=str,
+        choices=["cpu", "cuda"],
+        default="cuda",
+        help="reference device (default: cuda)",
+    )
     args = parser.parse_args()
 
     configs = [
@@ -149,7 +243,7 @@ def main():
         configs = list(dict.fromkeys(configs))
 
     for B, C, n in configs:
-        run_case(B, C, n)
+        run_case(B, C, n, ref_device=args.ref_device)
 
 
 if __name__ == "__main__":
