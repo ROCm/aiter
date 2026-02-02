@@ -2025,7 +2025,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     hipGetDeviceProperties(&dev_prop, dev);
     uint32_t num_cu = dev_prop.multiProcessorCount;
 
-    bool use_1stage = (m <= 2 && (n == 4096 || n == 2048 || n == 1024));
+    bool use_1stage = (m <= 16 && (n == 4096 || n == 2048 || n == 1024));
 #define MAYBE_DISPATCH_1S_KERNEL(NGPUS) \
     if (use_1stage) { \
         if (n == 4096) { \
