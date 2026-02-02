@@ -1147,10 +1147,6 @@ def fused_moe_2stages(
             topk_ids_sq2 = topk_ids
             if expert_mask is not None and smooth_a2.shape[0] != expert_mask.numel():
                 topk_ids_sq2 = _get_local_expert_hash(expert_mask)[topk_ids_sq2]
-                # Map global expert IDs to local expert IDs for EP. TODO(yada) figure out why this is needed
-                # local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
-                # local_expert_hash[expert_mask == 0] = -1
-                # topk_ids_sq2 = local_expert_hash[topk_ids_sq2]
 
             aiter.smooth_per_token_scaled_quant(
                 a2_out,
