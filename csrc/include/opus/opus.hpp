@@ -56,7 +56,6 @@ using index_t = int;
 
 template<index_t I> struct number : public std::integral_constant<index_t, I> {};
 template<bool B>    struct bool_constant : public std::bool_constant<B> {};
-
 typedef bool_constant<true>  true_type;
 typedef bool_constant<false> false_type;
 
@@ -79,7 +78,6 @@ OPUS_LEFT_UNARY_OP(+)
 OPUS_LEFT_UNARY_OP(-)
 OPUS_LEFT_UNARY_OP(~)
 OPUS_LEFT_UNARY_OP(!)
-
 OPUS_BINARY_OP(+)
 OPUS_BINARY_OP(-)
 OPUS_BINARY_OP(*)
@@ -102,6 +100,8 @@ OPUS_BINARY_OP(<=)
 #undef OPUS_LEFT_UNARY_OP
 #undef OPUS_BINARY_OP
 
+template<class T, class... R> constexpr bool is_any_of() noexcept { return (std::is_same_v<T, R> || ...); }
+template<class T, class... R> static constexpr bool is_any_of_v = is_any_of<T, R...>();
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // underscore, useful struture to mock
 struct underscore { /*who am I*/ };
@@ -123,13 +123,11 @@ template <index_t... Is>
 class seq {
 public:
     using value_type = index_t;
-
     OPUS_H_D static constexpr index_t size() { return sizeof...(Is);}
     OPUS_H_D constexpr value_type operator[](index_t i) const { return data[i]; }
     OPUS_H_D static constexpr value_type at(index_t i) { return data[i]; }
     template <index_t I> OPUS_H_D static constexpr value_type at()          { return data[I]; }
     template <index_t I> OPUS_H_D static constexpr value_type at(number<I>) { return data[I]; }
-
 private:
     static constexpr value_type data[sizeof...(Is) + 1] = {Is..., value_type{}};
 };
@@ -195,13 +193,6 @@ template <index_t... Is> struct static_for_impl<seq<Is...>> { template <class F>
 }   // namespace impl
 template<index_t N, typename F> OPUS_H_D constexpr void static_for(F f) { impl::static_for_impl<make_index_seq<N>>{}(f); }
 
-template<typename F, typename... R, std::enable_if_t<(std::is_integral_v<R> && ...), bool> = true>
-OPUS_H_D constexpr void static_for(F f, R... range) {
-    if      constexpr (sizeof...(range) == 1) { auto end = std::get<0>(std::tie(range...));     for(index_t i = 0; i < end; i++) { f(i); } }
-    else if constexpr (sizeof...(range) == 2) { auto [start, end] = std::tie(range...);         for(index_t i = start; i < end; i++) { f(i); } }
-    else if constexpr (sizeof...(range) == 3) { auto [start, end, step] = std::tie(range...);   for(index_t i = start; i < end; i += step) { f(i); } }
-}
-
 template<typename F, typename... R, std::enable_if_t<(is_constant_v<R> && ...), bool> = true>
 OPUS_H_D constexpr void static_for(F f, R...) { impl::static_for_impl<make_index_seq<R::value...>>{}(f); }
 
@@ -219,6 +210,9 @@ template<index_t... N, typename F> OPUS_H_D constexpr void static_ford(seq<N...>
 template <class... T> struct tuple;
 template<index_t... N, typename F> OPUS_H_D constexpr void static_ford(tuple<number<N>...>, F f) { impl::static_ford_impl<seq<N...>>{}(f); }
 
+template<typename T, typename R = void> struct get_value_type { using type = remove_cvref_t<T>; };
+template<typename T, typename R = void> using get_value_t = typename get_value_type<T, R>::type;
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // array, enhanced C like array style
 template <typename T, index_t N>
@@ -229,7 +223,6 @@ struct array {
     OPUS_H_D constexpr array() = default;
     OPUS_H_D constexpr array(const type& o) { static_for<N>([&](auto i){ content[i.value] = o[i.value]; }); }
     OPUS_H_D constexpr type& operator=(const type o) { static_for<N>([&](auto i){ content[i.value] = o[i.value]; }); return *this; }
-
     template<typename...Z, std::enable_if_t<(std::is_same_v<remove_cvref_t<Z>, value_type> && ...), bool> = true>
     OPUS_H_D constexpr array(Z&&... zs) : content{zs...}  { /* used for make_array */ }
 #endif
@@ -239,7 +232,6 @@ struct array {
     template<index_t I> OPUS_H_D constexpr const value_type& operator[](number<I>) const { return content[I]; }
     OPUS_H_D constexpr void fill(const T& value) { static_for<N>([&](auto i){ content[i.value] = value; }); }
     OPUS_H_D constexpr void clear() { fill(static_cast<T>(0)); }
-
     OPUS_H_D static constexpr bool empty() { return size() == 0; }
     OPUS_H_D static constexpr index_t size() { return N; }
 
@@ -257,6 +249,7 @@ template <typename T, index_t N> OPUS_H_D constexpr void fill(array<T,N>& a, T c
 template<typename T> struct is_array : false_type {};
 template<typename T, index_t N> struct is_array<array<T, N>> : true_type {};
 template<typename T> constexpr bool is_array_v = is_array<remove_cvref_t<T>>::value;
+template<typename T> struct get_value_type<T, std::enable_if_t<is_array_v<T>>> { using type = typename T::value_type; };
 
 namespace impl {
 template<typename> struct is_ref_wrapper : std::false_type{};
@@ -268,10 +261,9 @@ template<typename... Types>
 struct array_return_type_helper<void, Types...> : std::common_type<Types...> {
     static_assert(std::conjunction_v<not_ref_wrapper<Types>...>, "Types cannot contain reference_wrappers when D is void");
 };
-
 template<typename D, typename... Types> using array_return_type = opus::array<typename array_return_type_helper<D, Types...>::type, sizeof...(Types)>;
 }
-template<typename D = void, typename... Types> constexpr impl::array_return_type<D, Types...> make_array(Types&&... t) { return {std::forward<Types>(t)...}; }
+template<typename D = void, typename... Types> OPUS_H_D constexpr impl::array_return_type<D, Types...> make_array(Types&&... t) { return {std::forward<Types>(t)...}; }
 
 template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T const& t) { static_assert(I < T::size()); return t[number<I>{}]; }
 template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&  t)      { static_assert(I < T::size()); return t[number<I>{}]; }
@@ -348,8 +340,13 @@ struct tuple : impl::tuple_base<make_index_seq<sizeof...(T)>, T...> {
     template <typename... U, typename std::enable_if<sizeof...(U) == sizeof...(T) && sizeof...(U) >= 2, bool>::type = false>
     OPUS_H_D constexpr tuple(U&&... u) : base(std::forward<U>(u)...) {}
 };
-
 template<typename... T> __host__ __device__ tuple(T&&...) -> tuple<remove_cvref_t<T>...>;
+
+namespace impl {
+template<typename T, typename S> struct tuple_array_helper;
+template<typename T, index_t... Is> struct tuple_array_helper<T, seq<Is...>> { using type = tuple<decltype((Is, remove_cvref_t<T>{}))...>; };
+}
+template<typename T, index_t N> using tuple_array = typename impl::tuple_array_helper<T, make_index_seq<N>>::type;  // alias for tuple<T, T....>, Nx Ts
 
 // get the I-th type within the tuple, recursive implementation
 template<index_t I, class T>                   struct tuple_element;
@@ -365,6 +362,13 @@ template <index_t I0, index_t I1, index_t... Is, class T>  /*recursive get*/
 OPUS_H_D constexpr decltype(auto) get(T&& t) { return get<I1, Is...>(get<I0>(std::move(t))); }
 
 template <typename... T> OPUS_H_D constexpr auto make_tuple(T&&... xs) { return tuple<remove_cvref_t<T>...>(std::forward<T>(xs)...); }
+
+template<typename F, typename... R, std::enable_if_t<(std::is_integral_v<R> && ...), bool> = true>  // const integer based static_for loop
+OPUS_H_D constexpr void static_for(F f, R... range) {
+    if      constexpr (sizeof...(range) == 1) { auto end = get<0>(make_tuple(range...));        for(index_t i = 0; i < end; i++) { f(i); } }
+    else if constexpr (sizeof...(range) == 2) { auto [start, end] = make_tuple(range...);       for(index_t i = start; i < end; i++) { f(i); } }
+    else if constexpr (sizeof...(range) == 3) { auto [start, end, step] = make_tuple(range...); for(index_t i = start; i < end; i += step) { f(i); } }
+}
 
 namespace impl {
 template <typename T, index_t... Is> OPUS_H_D constexpr auto make_repeated_tuple(T&& x, seq<Is...>) { return opus::make_tuple((void(Is), std::forward<T>(x))...); }
@@ -394,6 +398,7 @@ OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, 
 template <typename> struct is_tuple : false_type {};
 template <typename... T> struct is_tuple<opus::tuple<T...>> : true_type {};
 template <typename T> static constexpr bool is_tuple_v = is_tuple<remove_cvref_t<T>>::value;
+template<typename T> struct get_value_type<T, std::enable_if_t<is_tuple_v<T>>> { using type = tuple_element_t<0, T>; };   // TODO: get the first element type
 
 template<typename T> OPUS_H_D constexpr std::enable_if_t<is_tuple_v<T>, index_t> size(T&&) { return remove_cvref_t<T>::size(); /* tuple size */}
 template<typename T> OPUS_H_D constexpr std::enable_if_t<is_tuple_v<T>, index_t> size()    { return remove_cvref_t<T>::size(); /* tuple size */}
@@ -644,7 +649,6 @@ OPUS_H_D constexpr auto layout_to_issue_space() {
     using issue_space = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, single_issue_space, fallback_issue_space_y>;
     return issue_space{};
 }
-
 template<typename issue_space, int vec = 1>
 OPUS_H_D constexpr auto vectorize_issue_space(issue_space, number<vec> = {}) {
     constexpr index_t vec_from_issue_space = get<size<issue_space>() - 1>(issue_space{}).value;     // here we get the original last dim length(which should be y dim)
@@ -655,7 +659,6 @@ OPUS_H_D constexpr auto vectorize_issue_space(issue_space, number<vec> = {}) {
         else                                                  return item;    }, issue_space{});
     return issue_space_vec;
 }
-
 template <index_t vec, typename Layout>
 OPUS_H_D constexpr auto layout_to_vectorized_issue_space() {
     constexpr auto issue_space = layout_to_issue_space<Layout>();
@@ -674,7 +677,6 @@ OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
     static_ford(issue_space_vec, [&](auto ... ids){ offsets[u_linear(ids...)] = u(ids...); });
     return offsets;
 }
-
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
 template <typename V_, index_t N_> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
@@ -683,7 +685,6 @@ struct vector {
     using value_type           = remove_cvref_t<V_>;
     using type = value_type __attribute__((ext_vector_type(N))); // this is danguous
 };
-
 template <typename T, index_t N> using vector_t = typename vector<T, N>::type;
 
 template <typename> struct is_vector : false_type {};
@@ -704,11 +705,12 @@ template <typename T> struct vector_traits : public impl::vector_traits_impl<rem
 template<typename T> OPUS_H_D constexpr std::enable_if_t<is_vector_v<T>, index_t> size(T&&) {  return vector_traits<T>::size();   /* vector size */}
 template<typename T> OPUS_H_D constexpr std::enable_if_t<is_vector_v<T>, index_t> size()    {  return vector_traits<T>::size();   /* vector size */}
 
+template<typename T> struct get_value_type<T, std::enable_if_t<is_vector_v<T>>> { using type = typename vector_traits<T>::dtype; };
+
 namespace impl {
 template<typename D, typename...> struct vector_return_type_helper { using type = D; };
 template<typename... Types>
 struct vector_return_type_helper<void, Types...> : std::common_type<Types...> { static_assert(std::conjunction_v<not_ref_wrapper<Types>...>, "Types cannot contain reference_wrappers when D is void"); };
-
 template<typename D, typename... Types> using vector_return_type = opus::vector_t<typename vector_return_type_helper<D, Types...>::type, sizeof...(Types)>;
 }
 template<typename D = void, typename... Types> constexpr impl::vector_return_type<D, Types...> make_vector(Types&&... t) { return {std::forward<Types>(t)...}; }
@@ -789,16 +791,12 @@ OPUS_H_D constexpr auto set_slice_impl(C&& dst_c, V&& src_c, seq<Ds...>, seq<Ss.
 // (1).[end] : 0.... end, (2).[start, end] : start...end, (3).[start, end, step], start...end but with step as interval (default is 1)
 template<typename C, typename... S, std::enable_if_t<is_vector_v<C> && (is_constant_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl(std::forward<C>(c), make_index_seq<(S::value) ...>{}); }
-
 template<index_t len, typename C, typename... S, std::enable_if_t<is_vector_v<C> && (std::is_integral_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl_i<len>(std::forward<C>(c), ss...); }
-
 template<typename C, typename... S, std::enable_if_t<is_array_v<C> && (is_constant_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl(std::forward<C>(c), make_index_seq<(S::value) ...>{}); }
-
 template<index_t len, typename C, typename... S, std::enable_if_t<is_array_v<C> && (std::is_integral_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl_i<len>(std::forward<C>(c), ss...); }
-
 template<typename C, typename... S, std::enable_if_t<is_tuple_v<C> && (is_constant_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl(std::forward<C>(c), make_index_seq<(S::value) ...>{}); }
 
@@ -827,14 +825,19 @@ template<typename T> struct is_dtype : false_type {};
 template<typename T> constexpr bool is_dtype_v = is_dtype<remove_cvref_t<T>>::value;    // use this!
 
 REGISTER_DTYPE(fp32, float)
-REGISTER_DTYPE(bf16, unsigned short)
+#if __clang_major__ >= 20   // enable for rocm 7.0+
+REGISTER_DTYPE(bf16, __bf16)
 REGISTER_DTYPE(fp16, __fp16)
+#else
+REGISTER_DTYPE(bf16, unsigned short)
+REGISTER_DTYPE(fp16, _Float16)
+#endif
 REGISTER_DTYPE(fp8 , _BitInt(8))
 REGISTER_DTYPE(bf8 , unsigned _BitInt(8))
 REGISTER_DTYPE(i32 , int32_t)
 REGISTER_DTYPE(u32 , uint32_t)
 REGISTER_DTYPE(i16 , int16_t)
-// REGISTER_DTYPE(u16 , uint16_t)
+REGISTER_DTYPE(u16 , uint16_t)
 REGISTER_DTYPE(i8  , int8_t)
 REGISTER_DTYPE(u8  , uint8_t)
 
@@ -851,19 +854,33 @@ OPUS_D bf16_t fp32_to_bf16_rtn_asm(const float& x) {
 
 OPUS_D constexpr auto fp16_to_fp32(const fp16_t& x) { return static_cast<fp32_t>(x); }
 OPUS_D constexpr auto fp32_to_fp16(const fp32_t& x) { return static_cast<fp16_t>(x); }
-OPUS_D constexpr auto bf16_to_fp32(const bf16_t& x) { union { u32_t i; float f; } u = {static_cast<u32_t>(x) << 16}; return u.f;}
+OPUS_D constexpr auto bf16_to_fp32(const bf16_t& x) { union { u32_t i; float f; } u = {static_cast<u32_t>(__builtin_bit_cast(uint16_t, x)) << 16}; return u.f;}
+OPUS_D constexpr uint16_t fp32_to_bf16_rtn_raw(float f)
+{
+    uint32_t bits = __builtin_bit_cast(uint32_t, f);
+    if(~bits & 0x7f800000) { bits += 0x7fff + ((bits >> 16) & 1); /* Round to nearest even */ }
+    else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
+    return uint16_t(bits >> 16);
+}
+#if defined(__gfx950__) && __clang_major__ >= 20
+template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950 has instruction conversion, leave 'rm' here for compatiblity
+OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
+#else
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
-    if      constexpr (rm == 1) {u32_t z = __builtin_bit_cast(u32_t, x); return static_cast<bf16_t>(z >> 16) | (!(~z & 0x7f800000) && (z & 0xffff));}
-    else if constexpr (rm == 2) {u32_t z = __builtin_bit_cast(u32_t, x); return static_cast<bf16_t>(z >> 16);}
+    if      constexpr (rm == 0) {return __builtin_bit_cast(bf16_t, fp32_to_bf16_rtn_raw(x)); }
+    else if constexpr (rm == 1) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<uint16_t>(z | (!(~z & 0x7f800000) && (z & 0xffff) ? 0x10000 : 0) >> 16)); }
+    else if constexpr (rm == 2) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<uint16_t>(z >> 16)); }
     else if constexpr (rm == 3) { return fp32_to_bf16_rtn_asm(x); }
 }
+#endif
 
-#define OPUS_CAST_DEFINE(d_, s_) template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, s_ ## _t>, bool> = true> \
+#define OPUS_CAST_DEFINE(d_, s_) template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, s_ ## _t> && std::is_same_v<D, d_ ## _t>, bool> = true> \
                                     OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return s_ ## _to_ ## d_(s, std::forward<Aux>(aux)...); }
-
 OPUS_CAST_DEFINE(fp16, fp32)
 OPUS_CAST_DEFINE(fp32, fp16)
+OPUS_CAST_DEFINE(bf16, fp32)
+OPUS_CAST_DEFINE(fp32, bf16)
 
 namespace impl {
 // implement a "pack" of data, storage should pad to multiple of byte(8bit)
@@ -891,6 +908,11 @@ template <typename S, uint32_t B, bool X> struct is_packs<impl::dpacks<S, B, X>>
 template <typename S, uint32_t B, uint32_t E, uint32_t M, bool X> struct is_packs<impl::fpacks<S, B, E, M, X>> : true_type {};
 template <typename T> static constexpr bool is_packs_v = is_packs<remove_cvref_t<T>>::value;
 
+// how many real data within one byte
+template <typename T, typename = void> struct num_packs { static constexpr int value = 1; };
+template <typename T> struct num_packs<T, std::enable_if_t<is_packs_v<T>>> { static constexpr int value = T::num_packs; };
+template <typename T> static constexpr int num_packs_v = num_packs<T>::value;
+
 template <typename T> struct sizeof_bits { static constexpr int value = int(sizeof(T) * 8); };
 template <> struct sizeof_bits<void> { static constexpr int value = 0; };
 template <typename S, uint32_t B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
@@ -912,24 +934,185 @@ OPUS_DEFINE_DPACKS(uint4_t, uint8_t, 4, false)          // uint4x2
 OPUS_DEFINE_FPACKS(fp4_t,   uint8_t, 4, 2, 1, true)     // fp4x2
 OPUS_DEFINE_FPACKS(e8m0_t,  uint8_t, 8, 8, 0, false)    // fp4x2
 
-template<typename D, typename S, typename... Aux, std::enable_if_t<is_vector_v<S>, bool> = true>
-OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
-    vector_t<D, size<S>()> r; static_for([&](auto i){ r[i.value] = cast<D>(s[i.value], std::forward<Aux>(aux)...); }, number<size<S>()>{}); return r;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wuninitialized"
+#pragma clang diagnostic ignored "-Wc++20-extensions"
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x2(const S& s, number<sel> = {}) {
+    int w ; w = __builtin_amdgcn_cvt_pk_fp8_f32(s[0], s[1], w, sel);
+    return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x4(const S& s) {
+    int w ; w = __builtin_amdgcn_cvt_pk_fp8_f32(s[0], s[1], w, 0); w = __builtin_amdgcn_cvt_pk_fp8_f32(s[2], s[3], w, 1);
+    return __builtin_bit_cast(fp8x4_t, w);
+}
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp8x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x2(const S& s, number<sel> = {}) {
+    union { int bitwise; S f8_packs[2]; } value; value.f8_packs[0] = s;
+    return __builtin_amdgcn_cvt_pk_f32_fp8(value.bitwise, sel);
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp8x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x4(const S& s) {
+    int bitwise = __builtin_bit_cast(int, s);
+    auto x = __builtin_amdgcn_cvt_pk_f32_fp8(bitwise, 0); auto y = __builtin_amdgcn_cvt_pk_f32_fp8(bitwise, 1);
+    return fp32x4_t{x[0], x[1], y[0], y[1]};
 }
 
 namespace impl {
-template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_tuple_v<S>, bool> = true>
-OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) { return make_tuple(cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...); }
-
-template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_array_v<S>, bool> = true>
-OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) { return make_array(cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...); }
+template<typename S, index_t... Xs>     OPUS_D constexpr decltype(auto) fold_as_tuple_of_vec(const S& s, seq<Xs...>) {
+    static_assert(size<S>() % sizeof...(Xs) == 0);
+    constexpr index_t Y_len = size<S>() / sizeof...(Xs);
+    auto gen_ = [&]<index_t X, index_t... Ys>(number<X>, seq<Ys...>){ return vector_t<get_value_t<S>, Y_len>{get<X * Y_len + Ys>(s)...}; };
+    return make_tuple(gen_(number<Xs>{}, make_index_seq<Y_len>{})...);
+}
+template<typename S, index_t... Xs>     OPUS_D constexpr decltype(auto) fold_as_tuple_of_arr(const S& s, seq<Xs...>) {
+    static_assert(size<S>() % sizeof...(Xs) == 0);
+    constexpr index_t Y_len = size<S>() / sizeof...(Xs);
+    auto gen_ = [&]<index_t X, index_t... Ys>(number<X>, seq<Ys...>){ return array<get_value_t<S>, Y_len>{get<X * Y_len + Ys>(s)...}; };
+    return make_tuple(gen_(number<Xs>{}, make_index_seq<Y_len>{})...);
+}
+template<typename S, index_t fold_size, std::enable_if_t<is_tuple_v<S> || is_vector_v<S> || is_array_v<S>, bool> = true>
+OPUS_D constexpr decltype(auto) fold_as_container_of_vec(const S& s, number<fold_size>) {
+    static_assert(size<S>() % fold_size == 0);
+    return fold_as_tuple_of_vec(s, make_index_seq<size<S>() / fold_size>{});
+}
+template<typename S, index_t fold_size, std::enable_if_t<is_tuple_v<S> || is_vector_v<S> || is_array_v<S>, bool> = true>
+OPUS_D constexpr decltype(auto) fold_as_container_of_arr(const S& s, number<fold_size>) {
+    static_assert(size<S>() % fold_size == 0);
+    return fold_as_tuple_of_arr(s, make_index_seq<size<S>() / fold_size>{});
+}
+} // namespace impl
+#if defined(__gfx950__)
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
+    u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, sel);
+    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& s, float scale = 1.0f) {
+    u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, 0); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[2], s[3], scale, 1);
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& s, float scale = 1.0f) {
+    u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, 0); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[2], s[3], scale, 1);
+    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[4], s[5], scale, 2); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[6], s[7], scale, 3);
+    return __builtin_bit_cast(array<fp4_t, 4>, w);
+}
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
+    return __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(static_cast<u32_t>(__builtin_bit_cast(u8_t, s)), scale, sel);
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& s, float scale = 1.0f) {
+    auto ss = static_cast<u32_t>(__builtin_bit_cast(u16_t, s));
+    auto x = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 0); auto y = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 1);
+    return fp32x4_t{x[0], x[1], y[0], y[1]};
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 1.0f) {
+    auto ss = static_cast<u32_t>(__builtin_bit_cast(u32_t, s));
+    auto x = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 0); auto y = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 1);
+    auto z = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 2); auto w = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 3);
+    return fp32x8_t{x[0], x[1], y[0], y[1], z[0], z[1], w[0], w[1]};
 }
 
-template<typename D, typename S, typename... Aux, std::enable_if_t<is_tuple_v<S>, bool> = true>
-OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return impl::cast_impl<D>(s, make_index_seq<size<S>()>{}, std::forward<Aux>(aux)...); }
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
+    union { uint32_t bitwise; fp4_t f4_pack[4]; } value;
+    value.bitwise = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(value.bitwise, s, scale, sel);
+    return value.fp4_pack[0];
+}
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(s, scale, sel); }
+#else
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& s, float scale = 1.0f) { return array<fp4_t, 1>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& s, float scale = 1.0f) { return array<fp4_t, 2>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& s, float scale = 1.0f) { return array<fp4_t, 4>{}; }
+template<typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& s, float scale = 1.0f) { return fp32x2_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& s, float scale = 1.0f) { return fp32x4_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 1.0f) { return fp32x8_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 1.0f) { return fp4_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f) { return bf16x2_t{}; }
+#endif
+#pragma clang diagnostic pop
 
-template<typename D, typename S, typename... Aux, std::enable_if_t<is_array_v<S>, bool> = true>
-OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return impl::cast_impl<D>(s, make_index_seq<size<S>()>{}, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x2_t> && std::is_same_v<D, fp8_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp8_packed_x2(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x4_t> && std::is_same_v<D, fp8_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp8_packed_x4(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp8x2_t> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp8_to_fp32_packed_x2(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp8x4_t> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp8_to_fp32_packed_x4(s, std::forward<Aux>(aux)...); }
+
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x2_t> && std::is_same_v<D, fp4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp4_packed_x2(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x4_t> && std::is_same_v<D, fp4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp4_packed_x4(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x8_t> && std::is_same_v<D, fp4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp4_packed_x8(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x2(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x4(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x8(s, std::forward<Aux>(aux)...); }
+
+namespace impl {
+// rocm-7.1.1, when there are multiple invokes of this kernel (across different __global__ in same compile target ?) will fail to inline below function
+template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_vector_v<S>, bool> = true>
+OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) {
+    return impl::vector_return_type<void, decltype(cast<D>(get<Is>(s), std::forward<Aux>(aux)...))...>{cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...}; }
+    //return opus::make_vector(cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...); }
+template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_tuple_v<S>, bool> = true>
+OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) {
+    return tuple<remove_cvref_t<decltype(cast<D>(get<Is>(s), std::forward<Aux>(aux)...))>...>(cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...); }
+    // return opus::make_tuple(cast<D>(get<Is>(s), std::forward<Aux>(aux)...) ...   ); }
+template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_array_v<S>, bool> = true>
+OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) {
+    return impl::array_return_type<void, decltype(cast<D>(get<Is>(s), std::forward<Aux>(aux)...))...>{cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...}; }
+    // return opus::make_array(cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...); }
+}
+
+// entry point for vectorized cast(), non-dpacks
+template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v<S> || is_tuple_v<S> || is_array_v<S>) && !is_packs_v<D> && !is_packs_v<get_value_t<S>>)
+    && !(is_any_of_v<S, fp32x2_t, fp32x4_t>&& std::is_same_v<D, fp8_t >)
+    && !(is_any_of_v<S, fp8x2_t , fp8x4_t >&& std::is_same_v<D, fp32_t>)
+, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
+    if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x4N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x2N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 4 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x4N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 2 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x2N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+    else   return impl::cast_impl<D>(s, make_index_seq<size<S>()>{}, std::forward<Aux>(aux)...); }
+
+// entry point for vectorized cast(), for dpacks
+template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v<S> || is_tuple_v<S> || is_array_v<S>) && (is_packs_v<D> || is_packs_v<get_value_t<S>>))
+    && !(is_any_of_v<S, fp32x2_t, fp32x4_t, fp32x8_t> && std::is_same_v<D, fp4_t >)         // fp32
+    && !(is_any_of_v<S, fp4_t, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>, tuple_array<fp4_t, 1>, tuple_array<fp4_t, 2>, tuple_array<fp4_t, 4>> && std::is_same_v<D, fp32_t>)
+, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
+    constexpr index_t num_packs_ = [&](){   // TODO: how to consider both D and S are packs?
+        if constexpr (is_packs_v<D>) { static_assert(size<S>() % D::num_packs == 0); return D::num_packs; } // TODO: do not support cast pack data one by one
+        else                         { return get_value_t<S>::num_packs; } }();
+    if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 8 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x8N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<8>{}), make_index_seq<size<S>() / 8>{}, std::forward<Aux>(aux)...); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x4N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x2N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 4 == 0) { // fp4 -> fp32 , x8N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 2 == 0) { // fp4 -> fp32 , x4N
+                    return impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+    else            return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<num_packs_>{}), make_index_seq<size<S>() / num_packs_>{}, std::forward<Aux>(aux)...);
+}
 
 #undef OPUS_DEFINE_DPACKS
 #undef OPUS_DEFINE_FPACKS
@@ -963,7 +1146,7 @@ template<> OPUS_D float       min<float>(const float&a, const float&b) { return 
 
 template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = max(a, b); return max(max_0, max(min_0, c)); }
 template<> OPUS_D float       med3<float>(const float&a, const float&b, const float&c) { return __builtin_amdgcn_fmed3f(a, b, c); }
-template<> OPUS_D __fp16      med3<__fp16>(const __fp16&a, const __fp16&b, const __fp16&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
+template<> OPUS_D fp16_t      med3<fp16_t>(const fp16_t&a, const fp16_t&b, const fp16_t&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // buffer load/store related
 OPUS_D constexpr auto buffer_default_config() {
@@ -977,7 +1160,6 @@ OPUS_D constexpr auto buffer_default_config() {
     return 0xffffffff;
 #endif
 }
-
 OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, uint32_t size = 0xffffffff, uint32_t config = buffer_default_config()) {
     return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(static_cast<const void*>(ptr)), 0, size, config); // void *p, short stride, int num, int flags
 }
@@ -1595,7 +1777,7 @@ template<index_t cached_vec = 0, typename M, typename C, std::enable_if_t<is_tup
 template<index_t cached_vec = 0, typename M, typename C, std::enable_if_t<is_tuple_v<C>, bool> = true> OPUS_D constexpr auto partition_layout_c_packed(M&& mma, C&& p_coord) { return mma.template layout_c_packed<cached_vec>(std::forward<C>(p_coord)); }
 #undef OPUS_KP_
 
-} // namespace
+} // namespace opus
 
 // call this macro within your kernel body to have fast access to opus types
 #define OPUS_USING_COMMON_TYPES  \
