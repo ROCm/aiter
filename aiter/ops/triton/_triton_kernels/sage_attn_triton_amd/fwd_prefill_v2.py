@@ -1972,8 +1972,10 @@ def sage_quant_v2(
     k,
     v,
     FP8_TYPE,
-    FP8_MAX,
-    PRE_SCALE_MAX=6.0,
+    is_q_fp4=True,
+    is_k_fp4=True,
+    FP8_MAX=None,
+    FP4_MAX=None,
     BLKQ=128,
     BLKK=64,
     sm_scale=None,
@@ -2002,6 +2004,11 @@ def sage_quant_v2(
         k_smooth: K smoothing factors applied (or None if smooth_k=False)
     """
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+
+    if FP8_MAX is None:
+        FP8_MAX = torch.finfo(FP8_TYPE).max
+    if FP4_MAX is None:
+        FP4_MAX = 6.0
 
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
@@ -2068,6 +2075,9 @@ def sage_quant_v2(
     q_task_count = b * h_qo * Q_NUM_BLKS
     k_task_count = b * h_kv * K_NUM_BLKS
 
+    Q_MAX = FP4_MAX if is_q_fp4 else FP8_MAX
+    K_MAX = FP4_MAX if is_k_fp4 else FP8_MAX
+
     grid = (q_task_count + k_task_count,)
 
     sage_v2_pre_quant_kernel[grid](
@@ -2097,17 +2107,22 @@ def sage_quant_v2(
         qo_len,
         kv_len,
         triton.next_power_of_2(kv_len),
-        PRE_SCALE_MAX=PRE_SCALE_MAX,
+        Q_MAX=Q_MAX,
+        K_MAX=K_MAX,
         D=head_dim,
         BLK_Q=BLKQ,
         BLK_K=BLKK,
     )
 
 
-    q_fp4, q_scale = downcast_to_mxfp_rne(q_bf16, torch.uint8, axis=-1)
-    # q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
-    k_fp4, k_scale = downcast_to_mxfp_rne(k_bf16, torch.uint8, axis=-1)
-    # k_fp4, k_scale = downcast_to_mxfp(k, aiter.dtypes.fp8, axis=-1)
+    if is_q_fp4:
+        q_fp4, q_scale = downcast_to_mxfp_rne(q_bf16, torch.uint8, axis=-1)
+    else:
+        q_fp4, q_scale = downcast_to_mxfp_rne(q_bf16, aiter.dtypes.fp8, axis=-1)
+    if is_k_fp4:
+        k_fp4, k_scale = downcast_to_mxfp_rne(k_bf16, torch.uint8, axis=-1)
+    else:
+        k_fp4, k_scale = downcast_to_mxfp_rne(k_bf16, aiter.dtypes.fp8, axis=-1)
 
     return q_fp4, q_scale, q_scale_pre, k_fp4, k_scale, k_scale_pre, v_fp8, v_scale
 
@@ -2140,7 +2155,8 @@ def sage_v2_pre_quant_kernel(
     SEQLEN_Q,
     SEQLEN_K,
     SEQLEN_K_PADDED: tl.constexpr,
-    PRE_SCALE_MAX: tl.constexpr,
+    Q_MAX: tl.constexpr,
+    K_MAX: tl.constexpr,
     D: tl.constexpr,
     BLK_Q: tl.constexpr,
     BLK_K: tl.constexpr,
@@ -2171,7 +2187,7 @@ def sage_v2_pre_quant_kernel(
             q_input_ptrs,
             q_output_ptrs,
             q_scale_ptrs,
-            PRE_SCALE_MAX,
+            Q_MAX,
             offs_qn[:, None] < SEQLEN_Q,
             sm_scale=sm_scale,
         )
@@ -2197,7 +2213,7 @@ def sage_v2_pre_quant_kernel(
             k_input_ptrs,
             k_output_ptrs,
             k_scale_ptrs,
-            PRE_SCALE_MAX,
+            K_MAX,
             offs_kn[:, None] < SEQLEN_K,
         )
 
