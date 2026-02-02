@@ -595,9 +595,9 @@
         //}
         block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
      }
-     if(threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
-        printf("tokenIdx: %d,  threadIdx.x: %d, block_max: %f\n", tokenIdx, threadIdx.x, block_max);
-    if(isK)
+     if(threadIdx.x == 0)
+        printf("tokenIdx: %d,  threadIdx.x: %d , blockIdx.x: %d, blockIdx.y: %d, block_max: %f\n", tokenIdx, threadIdx.x, blockIdx.x, blockIdx.y, block_max);
+    if(isK)qsef
     {
         float k_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
