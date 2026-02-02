@@ -42,6 +42,52 @@ namespace py = pybind11;
     m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
     m.def("tanh", &aiter_tanh, "apply for tanh.");
 
+#define MHC_LAYER_PYBIND                                                                      \
+    m.def("mhc_layer_forward",                                                                \
+          &mhc_layer_forward,                                                                 \
+          "MHC Layer forward pass with static H parameters.",                                 \
+          py::arg("x_expanded"),                                                              \
+          py::arg("rmsnorm_weight"),                                                          \
+          py::arg("H_pre"),                                                                   \
+          py::arg("H_post"),                                                                  \
+          py::arg("H_res"),                                                                   \
+          py::arg("eps") = 1e-5f,                                                             \
+          py::arg("sinkhorn_iters") = 20);                                                    \
+    m.def("mhc_layer_forward_dynamic",                                                        \
+          &mhc_layer_forward_dynamic,                                                         \
+          "MHC Layer forward pass with dynamic H parameters.",                                \
+          py::arg("x_expanded"),                                                              \
+          py::arg("rmsnorm_weight"),                                                          \
+          py::arg("phi_pre"),                                                                 \
+          py::arg("phi_post"),                                                                \
+          py::arg("phi_res"),                                                                 \
+          py::arg("b_pre"),                                                                   \
+          py::arg("b_post"),                                                                  \
+          py::arg("b_res"),                                                                   \
+          py::arg("alpha_pre") = 0.01f,                                                       \
+          py::arg("alpha_post") = 0.01f,                                                      \
+          py::arg("alpha_res") = 0.01f,                                                       \
+          py::arg("eps") = 1e-5f,                                                             \
+          py::arg("sinkhorn_iters") = 20);                                                    \
+    m.def("sinkhorn_knopp_forward",                                                           \
+          &sinkhorn_knopp_forward,                                                            \
+          "Sinkhorn-Knopp normalization to doubly stochastic matrix.",                        \
+          py::arg("inp"),                                                                     \
+          py::arg("num_iters") = 20,                                                          \
+          py::arg("eps") = 1e-5f);                                                            \
+    m.def("stream_aggregate_forward",                                                         \
+          &stream_aggregate_forward,                                                          \
+          "Stream aggregate: out[b,c] = sum_i(H_pre[i] * x[b,i,c]).",                         \
+          py::arg("x_expanded"),                                                              \
+          py::arg("H_pre"));                                                                  \
+    m.def("stream_distribute_mix_add_forward",                                                \
+          &stream_distribute_mix_add_forward,                                                 \
+          "Stream distribute mix add: out[b,i,c] = H_post[i]*y[b,c] + sum_j(M[i,j]*x[b,j,c]).",\
+          py::arg("x_expanded"),                                                              \
+          py::arg("y"),                                                                       \
+          py::arg("H_post"),                                                                  \
+          py::arg("M"));
+
 #define ATTENTION_ASM_MLA_PYBIND               \
     m.def("mla_decode_stage1_asm_fwd",         \
           &mla_decode_stage1_asm_fwd,          \
