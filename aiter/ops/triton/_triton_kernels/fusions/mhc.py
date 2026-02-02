@@ -478,6 +478,524 @@ def _mhc_fused_reduce_kernel(
     )
 
 
+# =============================================================================
+# mHC-lite Kernels (Birkhoff-von Neumann reparameterization)
+# =============================================================================
+#
+# mHC-lite replaces iterative Sinkhorn-Knopp with exact doubly stochastic
+# matrices via the Birkhoff-von Neumann theorem:
+#   H_res = softmax(logits) @ P
+# where P is the stack of all n! permutation matrices.
+# This guarantees exact doubly stochasticity by construction.
+
+
+@triton.jit
+def _compute_hres_mhc_lite(
+    out,           # (BLOCK_M, BLOCK_N) logits - padded for Triton
+    perm_ptr,      # (n_factorial, n_squared) permutation matrices
+    stride_perm_k,
+    stride_perm_ij,
+    n_squared: tl.constexpr,    # n*n: output dimension
+    n_factorial: tl.constexpr,  # n!: number of permutation matrices
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Compute exact doubly stochastic H_res via Birkhoff-von Neumann theorem.
+    
+    Computes H_res = softmax(logits) @ P where:
+    - logits: (BLOCK_M, n_factorial) raw weights for each permutation matrix
+    - P: (n_factorial, n_squared) stacked permutation matrices
+    - Result: (BLOCK_M, n_squared) convex combination = exact doubly stochastic
+    """
+    LOG2_E: tl.constexpr = 1.4426950408889634  # 1/ln(2)
+    LN_2: tl.constexpr = 0.6931471805599453    # ln(2)
+    
+    col_idx = tl.arange(0, BLOCK_N)
+    n_factorial_mask = col_idx[None, :] < n_factorial
+    out_masked = tl.where(n_factorial_mask, out, float('-inf'))
+    
+    # Log-domain softmax: logsumexp then subtract
+    out_max = tl.max(out_masked, axis=1, keep_dims=True)
+    out_shifted = out_masked - out_max
+    exp_shifted = tl.exp2(out_shifted * LOG2_E)
+    sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
+    log_sum_exp = out_max + tl.log2(sum_exp) * LN_2
+    
+    log_alpha = out_masked - log_sum_exp
+    alpha = tl.exp2(log_alpha * LOG2_E)  # (BLOCK_M, n_factorial) convex coefficients
+    
+    # Load permutation matrices P: (n_factorial, n_squared) padded to (BLOCK_N, BLOCK_N)
+    row_idx = tl.arange(0, BLOCK_N)[:, None]
+    col_idx_2d = tl.arange(0, BLOCK_N)[None, :]
+    perm_mask = (row_idx < n_factorial) & (col_idx_2d < n_squared)
+    P = tl.load(
+        perm_ptr + row_idx * stride_perm_k + col_idx_2d * stride_perm_ij,
+        mask=perm_mask,
+        other=0.0
+    )
+    
+    # H_res = alpha @ P: (BLOCK_M, n_factorial) @ (n_factorial, n_squared) -> (BLOCK_M, n_squared)
+    H_res = tl.dot(alpha, P)
+    
+    return H_res
+
+
+@triton.jit
+def _mhc_fused_lite_kernel(
+    x_ptr,
+    phi_pre_ptr,
+    phi_post_ptr,
+    phi_res_ptr,         # (nC, n!) for lite mode
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    bias_ptr,
+    out_pre_ptr,
+    out_post_ptr,
+    out_res_ptr,         # Output is still (M, n²)
+    perm_ptr,            # (n!, n²) permutation matrices (flattened)
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,     # n! + 2n for lite mode
+    n: tl.constexpr,
+    n_squared: tl.constexpr,
+    n_factorial: tl.constexpr,
+    eps: tl.constexpr,
+    stride_xm,
+    stride_xk,
+    stride_phi_pre_k,
+    stride_phi_pre_n,
+    stride_phi_post_k,
+    stride_phi_post_n,
+    stride_phi_res_k,
+    stride_phi_res_n,
+    stride_pre_m,
+    stride_pre_n,
+    stride_post_m,
+    stride_post_n,
+    stride_res_m,
+    stride_res_n,
+    stride_perm_k,
+    stride_perm_ij,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+):
+    """
+    Fused kernel for mHC-lite (equations 14-18 with Birkhoff-von Neumann for H_res).
+    
+    Same as _mhc_fused_kernel but with different H_res activation:
+    - Pre/Post streams: identical (sigmoid, 2*sigmoid)
+    - Res stream: softmax(logits) @ permutation_matrices -> exact doubly stochastic
+    
+    Grid structure: (M_blocks, N_blocks_total) where N_blocks = cdiv(n, BLOCK_N) for pre/post + 1 for res
+    For lite mode, res stream must fit in a single block for softmax computation.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    
+    # Pre/post streams use standard block calculation, res stream must be 1 block
+    n_blocks_pre = tl.cdiv(n, BLOCK_N)
+    n_blocks_post = tl.cdiv(n, BLOCK_N)
+    # n_blocks_res = 1 (implicit, res stream is everything after pre+post)
+    
+    is_pre_program = pid_n < n_blocks_pre
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
+    is_res_program = ~is_pre_program & ~is_post_program
+    
+    is_pre_f32 = is_pre_program.to(tl.float32)
+    is_post_f32 = is_post_program.to(tl.float32)
+    is_res_f32 = is_res_program.to(tl.float32)
+    is_post_i32 = is_post_program.to(tl.int32)
+    is_res_i32 = is_res_program.to(tl.int32)
+    
+    stream_offset = is_post_i32 * n_blocks_pre + is_res_i32 * (n_blocks_pre + n_blocks_post)
+    local_pid_n = pid_n - stream_offset
+    
+    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Output dimension for this stream:
+    # - pre/post: n
+    # - res: n_factorial (for matmul), but output is n_squared
+    n_out_phi = n + (n_factorial - n) * is_res_i32  # phi_res has n_factorial columns
+    
+    # Global column index for bias lookup
+    col_offset = n * (is_post_i32 + 2 * is_res_i32)
+    rn_global = rn_local + col_offset
+    
+    # MATMUL (Eq 14) + RMS ACCUMULATION (Eq 15)
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    phi_ptr = tl.where(is_pre_program, phi_pre_ptr,
+                       tl.where(is_post_program, phi_post_ptr, phi_res_ptr))
+    stride_phi_k = tl.where(is_pre_program, stride_phi_pre_k,
+                       tl.where(is_post_program, stride_phi_post_k, stride_phi_res_k))
+    stride_phi_n = tl.where(is_pre_program, stride_phi_pre_n,
+                       tl.where(is_post_program, stride_phi_post_n, stride_phi_res_n))
+    
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        
+        x_tile = tl.load(
+            x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
+            mask=(rm[:, None] < M) & (rk[None, :] < K),
+            other=0.0,
+        )
+        
+        phi_tile = tl.load(
+            phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
+            mask=(rk[:, None] < K) & (rn_local[None, :] < n_out_phi),
+            other=0.0,
+        )
+        
+        acc += tl.dot(x_tile, phi_tile)
+        x_tile_f32 = x_tile.to(tl.float32)
+        acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
+    
+    # RMS NORMALIZATION (Eq 15)
+    rms = tl.sqrt(acc_sq / K + eps)
+    rsigma = 1.0 / rms
+    
+    # BIAS + ALPHA SCALING (Eq 16)
+    bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
+    alpha_val = is_pre_f32 * alpha_pre + is_post_f32 * alpha_post + is_res_f32 * alpha_res
+    
+    out = rsigma[:, None] * alpha_val * acc + bias[None, :]
+    
+    # Apply stream-specific activation
+    sigmoid_out = tl.sigmoid(out)
+    out_activated_prepost = sigmoid_out * (1.0 + is_post_f32)
+    
+    # For res stream: apply mHC-lite (softmax + perm combination)
+    if is_res_program:
+        out_res = _compute_hres_mhc_lite(
+            out, perm_ptr, stride_perm_k, stride_perm_ij,
+            n_squared, n_factorial, BLOCK_M, BLOCK_N
+        )
+        # Output dimension changes from n_factorial to n_squared
+        n_out_store = n_squared
+    else:
+        out_res = out
+        n_out_store = n
+    
+    out_activated = is_res_f32 * out_res + (1.0 - is_res_f32) * out_activated_prepost
+
+    out_ptr = tl.where(is_pre_program, out_pre_ptr,
+                       tl.where(is_post_program, out_post_ptr, out_res_ptr))
+    stride_out_m = tl.where(is_pre_program, stride_pre_m,
+                       tl.where(is_post_program, stride_post_m, stride_res_m))
+    stride_out_n = tl.where(is_pre_program, stride_pre_n,
+                       tl.where(is_post_program, stride_post_n, stride_res_n))
+    
+    # For res stream, store n_squared elements; for pre/post, store n elements
+    n_out_final = n + (n_squared - n) * is_res_i32
+    
+    tl.store(
+        out_ptr + rm[:, None] * stride_out_m + rn_local[None, :] * stride_out_n,
+        out_activated,
+        mask=(rm[:, None] < M) & (rn_local[None, :] < n_out_final),
+    )
+
+
+@triton.jit
+def _mhc_fused_split_lite_kernel(
+    x_ptr,
+    phi_pre_ptr,
+    phi_post_ptr,
+    phi_res_ptr,
+    # Intermediate output buffers (float32)
+    acc_pre_ptr,      # (NUM_KSPLIT, M, n)
+    acc_post_ptr,     # (NUM_KSPLIT, M, n)
+    acc_res_ptr,      # (NUM_KSPLIT, M, n!) for lite mode
+    acc_sq_ptr,       # (NUM_KSPLIT, M)
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    n: tl.constexpr,
+    n_squared: tl.constexpr,
+    n_factorial: tl.constexpr,
+    stride_xm,
+    stride_xk,
+    stride_phi_pre_k,
+    stride_phi_pre_n,
+    stride_phi_post_k,
+    stride_phi_post_n,
+    stride_phi_res_k,
+    stride_phi_res_n,
+    stride_acc_pre_k,
+    stride_acc_pre_m,
+    stride_acc_pre_n,
+    stride_acc_post_k,
+    stride_acc_post_m,
+    stride_acc_post_n,
+    stride_acc_res_k,
+    stride_acc_res_m,
+    stride_acc_res_n,
+    stride_acc_sq_k,
+    stride_acc_sq_m,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Split-K kernel for mHC-lite - computes partial results.
+    
+    Grid structure: (M_blocks, N_blocks_total, NUM_KSPLIT)
+    For lite mode, res stream processes n_factorial columns.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    
+    # Pre/post streams use standard block calculation, res stream must be 1 block
+    n_blocks_pre = tl.cdiv(n, BLOCK_N)
+    n_blocks_post = tl.cdiv(n, BLOCK_N)
+    # n_blocks_res = 1 (implicit)
+    
+    is_pre_program = pid_n < n_blocks_pre
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
+    is_res_program = ~is_pre_program & ~is_post_program
+    
+    is_res_i32 = is_res_program.to(tl.int32)
+    
+    stream_offset = is_post_program.to(tl.int32) * n_blocks_pre + is_res_i32 * (n_blocks_pre + n_blocks_post)
+    local_pid_n = pid_n - stream_offset
+    
+    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    # Output dimension for this stream
+    n_out = n + (n_factorial - n) * is_res_i32  # n for pre/post, n_factorial for res
+    
+    split_k_start = pid_k * SPLITK_BLOCK_SIZE
+    split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+    
+    if split_k_start >= K:
+        return
+    
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    phi_ptr = tl.where(is_pre_program, phi_pre_ptr,
+                       tl.where(is_post_program, phi_post_ptr, phi_res_ptr))
+    stride_phi_k = tl.where(is_pre_program, stride_phi_pre_k,
+                       tl.where(is_post_program, stride_phi_post_k, stride_phi_res_k))
+    stride_phi_n = tl.where(is_pre_program, stride_phi_pre_n,
+                       tl.where(is_post_program, stride_phi_post_n, stride_phi_res_n))
+    
+    k_span = split_k_end - split_k_start
+    num_k_iter = tl.cdiv(k_span, BLOCK_K)
+    
+    for k_idx in range(num_k_iter):
+        k = split_k_start + k_idx * BLOCK_K
+        rk = k + tl.arange(0, BLOCK_K)
+        
+        x_tile = tl.load(
+            x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
+            mask=(rm[:, None] < M) & (rk[None, :] < split_k_end),
+            other=0.0,
+        )
+        
+        phi_tile = tl.load(
+            phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
+            mask=(rk[:, None] < split_k_end) & (rn_local[None, :] < n_out),
+            other=0.0,
+        )
+        
+        acc += tl.dot(x_tile, phi_tile)
+        x_tile_f32 = x_tile.to(tl.float32)
+        acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
+    
+    acc_ptr = tl.where(is_pre_program, acc_pre_ptr,
+                       tl.where(is_post_program, acc_post_ptr, acc_res_ptr))
+    stride_acc_k = tl.where(is_pre_program, stride_acc_pre_k,
+                       tl.where(is_post_program, stride_acc_post_k, stride_acc_res_k))
+    stride_acc_m = tl.where(is_pre_program, stride_acc_pre_m,
+                       tl.where(is_post_program, stride_acc_post_m, stride_acc_res_m))
+    stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n,
+                       tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n))
+    
+    tl.store(
+        acc_ptr + pid_k * stride_acc_k + rm[:, None] * stride_acc_m + rn_local[None, :] * stride_acc_n,
+        acc,
+        mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+    )
+    
+    if is_pre_program:
+        if local_pid_n == 0:
+            tl.store(
+                acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
+                acc_sq,
+                mask=rm < M,
+            )
+
+
+@triton.jit
+def _mhc_fused_reduce_lite_kernel(
+    # Intermediate buffers (input)
+    acc_pre_ptr,
+    acc_post_ptr,
+    acc_res_ptr,      # (NUM_KSPLIT, M, n!) for lite mode
+    acc_sq_ptr,
+    # Parameters for post-processing
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    bias_ptr,
+    # Final outputs
+    out_pre_ptr,
+    out_post_ptr,
+    out_res_ptr,      # Output is still (M, n²)
+    perm_ptr,         # (n!, n²) permutation matrices
+    # Dimensions
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    n: tl.constexpr,
+    n_squared: tl.constexpr,
+    n_factorial: tl.constexpr,
+    eps: tl.constexpr,
+    # Strides for intermediate buffers
+    stride_acc_pre_k,
+    stride_acc_pre_m,
+    stride_acc_pre_n,
+    stride_acc_post_k,
+    stride_acc_post_m,
+    stride_acc_post_n,
+    stride_acc_res_k,
+    stride_acc_res_m,
+    stride_acc_res_n,
+    stride_acc_sq_k,
+    stride_acc_sq_m,
+    # Strides for final outputs
+    stride_pre_m,
+    stride_pre_n,
+    stride_post_m,
+    stride_post_n,
+    stride_res_m,
+    stride_res_n,
+    stride_perm_k,
+    stride_perm_ij,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    ACTUAL_KSPLIT: tl.constexpr,
+):
+    """
+    Reduce kernel for mHC-lite - combines partial results and applies mHC-lite activation.
+    
+    Grid structure: (M_blocks, N_blocks_total)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    
+    # Pre/post streams use standard block calculation, res stream must be 1 block
+    n_blocks_pre = tl.cdiv(n, BLOCK_N)
+    n_blocks_post = tl.cdiv(n, BLOCK_N)
+    # n_blocks_res = 1 (implicit)
+    
+    is_pre_program = pid_n < n_blocks_pre
+    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
+    is_res_program = ~is_pre_program & ~is_post_program
+    
+    is_pre_f32 = is_pre_program.to(tl.float32)
+    is_post_f32 = is_post_program.to(tl.float32)
+    is_res_f32 = is_res_program.to(tl.float32)
+    is_post_i32 = is_post_program.to(tl.int32)
+    is_res_i32 = is_res_program.to(tl.int32)
+    
+    stream_offset = is_post_i32 * n_blocks_pre + is_res_i32 * (n_blocks_pre + n_blocks_post)
+    local_pid_n = pid_n - stream_offset
+    
+    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    col_offset = n * (is_post_i32 + 2 * is_res_i32)
+    rn_global = rn_local + col_offset
+    
+    # For intermediate buffers: n for pre/post, n_factorial for res
+    n_out_acc = n + (n_factorial - n) * is_res_i32
+    
+    acc_ptr = tl.where(is_pre_program, acc_pre_ptr,
+                       tl.where(is_post_program, acc_post_ptr, acc_res_ptr))
+    stride_acc_k = tl.where(is_pre_program, stride_acc_pre_k,
+                       tl.where(is_post_program, stride_acc_post_k, stride_acc_res_k))
+    stride_acc_m = tl.where(is_pre_program, stride_acc_pre_m,
+                       tl.where(is_post_program, stride_acc_post_m, stride_acc_res_m))
+    stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n,
+                       tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n))
+    
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for ks in range(ACTUAL_KSPLIT):
+        acc_partial = tl.load(
+            acc_ptr + ks * stride_acc_k + rm[:, None] * stride_acc_m + rn_local[None, :] * stride_acc_n,
+            mask=(rm[:, None] < M) & (rn_local[None, :] < n_out_acc),
+            other=0.0,
+        )
+        acc += acc_partial
+    
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for ks in range(ACTUAL_KSPLIT):
+        acc_sq_partial = tl.load(
+            acc_sq_ptr + ks * stride_acc_sq_k + rm * stride_acc_sq_m,
+            mask=rm < M,
+            other=0.0,
+        )
+        acc_sq += acc_sq_partial
+    
+    # RMS NORMALIZATION (Eq 15)
+    rms = tl.sqrt(acc_sq / K + eps)
+    rsigma = 1.0 / rms
+    
+    # BIAS + ALPHA SCALING (Eq 16)
+    bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
+    alpha_val = is_pre_f32 * alpha_pre + is_post_f32 * alpha_post + is_res_f32 * alpha_res
+    
+    out = rsigma[:, None] * alpha_val * acc + bias[None, :]
+    
+    # Apply stream-specific activation
+    sigmoid_out = tl.sigmoid(out)
+    out_activated_prepost = sigmoid_out * (1.0 + is_post_f32)
+    
+    # For res stream: apply mHC-lite
+    if is_res_program:
+        out_res = _compute_hres_mhc_lite(
+            out, perm_ptr, stride_perm_k, stride_perm_ij,
+            n_squared, n_factorial, BLOCK_M, BLOCK_N
+        )
+        n_out_store = n_squared
+    else:
+        out_res = out
+        n_out_store = n
+    
+    out_activated = is_res_f32 * out_res + (1.0 - is_res_f32) * out_activated_prepost
+
+    out_ptr = tl.where(is_pre_program, out_pre_ptr,
+                       tl.where(is_post_program, out_post_ptr, out_res_ptr))
+    stride_out_m = tl.where(is_pre_program, stride_pre_m,
+                       tl.where(is_post_program, stride_post_m, stride_res_m))
+    stride_out_n = tl.where(is_pre_program, stride_pre_n,
+                       tl.where(is_post_program, stride_post_n, stride_res_n))
+    
+    n_out_final = n + (n_squared - n) * is_res_i32
+    
+    tl.store(
+        out_ptr + rm[:, None] * stride_out_m + rn_local[None, :] * stride_out_n,
+        out_activated,
+        mask=(rm[:, None] < M) & (rn_local[None, :] < n_out_final),
+    )
+
+
 @triton.jit
 def _sinkhorn_knopp_log_domain_kernel(
     # Pointers

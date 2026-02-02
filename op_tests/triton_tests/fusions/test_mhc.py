@@ -26,10 +26,12 @@ import pytest
 from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
 from op_tests.triton_tests.utils.mhc_ref import (
     mhc_torch,
+    mhc_lite_torch,
     sinkhorn_knopp_exp_domain_torch,
     sinkhorn_knopp_log_domain_torch,
     is_doubly_stochastic,
     generate_mhc_inputs,
+    generate_mhc_lite_inputs,
     get_test_shapes,
     get_sk_test_shapes,
 )
@@ -601,6 +603,190 @@ def test_split_k_large_k():
         rtol=5e-2,
     )
 
+
+# =============================================================================
+# mHC-lite Tests (Birkhoff-von Neumann reparameterization)
+# =============================================================================
+
+
+def get_lite_test_shapes():
+    """Test shapes for mHC-lite (limited to smaller n due to n! growth)."""
+    shapes = []
+    for M in [16, 32, 64, 128, 256, 512, 1024]:
+        for n in [2, 4]:  # n! grows fast, so limit to small n
+            for C in [512, 1024, 2048]:
+                shapes.append((M, n, C))
+    return shapes
+
+
+@pytest.mark.parametrize("M, n, C", get_lite_test_shapes())
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_lite_correctness(M, n, C, dtype):
+    """
+    Test that Triton mhc() with hres_mode='lite' matches PyTorch reference.
+    
+    Validates mHC-lite produces correct output via Birkhoff-von Neumann reparameterization.
+    """
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_lite_inputs(M, n, C, dtype)
+
+    H_pre_torch, H_post_torch, H_res_torch = mhc_lite_torch(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams
+    )
+    H_pre_triton, H_post_triton, H_res_triton = mhc(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams, hres_mode="lite"
+    )
+
+    torch.testing.assert_close(
+        H_pre_triton.to(torch.float32),
+        H_pre_torch.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_post_triton.to(torch.float32),
+        H_post_torch.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_res_triton.to(torch.float32),
+        H_res_torch.to(torch.float32),
+        atol=1e-2 if C < 1024 else 5e-2,
+        rtol=1e-2 if C < 1024 else 5e-2,
+    )
+
+
+@pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 4, 512)])
+def test_mhc_lite_doubly_stochastic(M, n, C):
+    """
+    Test that mHC-lite H_res is exactly doubly stochastic.
+    
+    mHC-lite guarantees exact doubly stochasticity by construction (no Sinkhorn needed).
+    """
+    torch.cuda.empty_cache()
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_lite_inputs(M, n, C)
+
+    H_pre, H_post, H_res = mhc(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams, hres_mode="lite"
+    )
+
+    # Pre-stream (Eq 17): sigmoid output should be in [0, 1]
+    assert torch.all(H_pre >= 0.0), "Pre-stream has values < 0"
+    assert torch.all(H_pre <= 1.0), "Pre-stream has values > 1"
+
+    # Post-stream (Eq 18): 2*sigmoid output should be in [0, 2]
+    assert torch.all(H_post >= 0.0), "Post-stream has values < 0"
+    assert torch.all(H_post <= 2.0), "Post-stream has values > 2"
+    
+    # Res-stream: exact doubly stochastic (by construction, no tolerance needed for structure)
+    n_squared = n * n
+    assert H_res.shape == (M, n_squared), f"Res-stream shape mismatch"
+    
+    # Verify doubly stochastic property
+    H_res_3d = H_res.view(M, n, n).to(torch.float32)
+    # mHC-lite should be exactly doubly stochastic, use tight tolerance
+    assert is_doubly_stochastic(H_res_3d, tol=1e-2), (
+        f"Lite mode res-stream is not doubly stochastic. "
+        f"Row sums: {H_res_3d.sum(dim=-1)}, Col sums: {H_res_3d.sum(dim=-2)}"
+    )
+
+
+@pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048)])
+@pytest.mark.parametrize("num_ksplit", [2, 4])
+def test_split_k_lite_correctness(M, n, C, num_ksplit):
+    """
+    Test split-K implementation for mHC-lite matches non-split-K.
+    
+    Validates that splitting the K dimension works correctly for lite mode.
+    """
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    mhc_module = sys.modules['aiter.ops.triton.fusions.mhc']
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_lite_inputs(M, n, C)
+
+    # Reference: PyTorch implementation
+    H_pre_ref, H_post_ref, H_res_ref = mhc_lite_torch(
+        x, phi_pre, phi_post, phi_res, 
+        alpha_pre, alpha_post, alpha_res, 
+        bias, n_streams
+    )
+    
+    # Test: split-K kernel with patched config
+    with patch.object(mhc_module, 'get_mhc_config', return_value=(_make_split_k_config(num_ksplit), True)):
+        H_pre_split, H_post_split, H_res_split = fused_mhc(
+            x, phi_pre, phi_post, phi_res, 
+            alpha_pre, alpha_post, alpha_res, 
+            bias, n_streams, hres_mode="lite"
+        )
+
+    torch.testing.assert_close(
+        H_pre_split.to(torch.float32),
+        H_pre_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_post_split.to(torch.float32),
+        H_post_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        H_res_split.to(torch.float32),
+        H_res_ref.to(torch.float32),
+        atol=1e-2 if C < 1024 else 5e-2,
+        rtol=1e-2 if C < 1024 else 5e-2,
+    )
+
+
+@pytest.mark.parametrize("M, n, C", [(16, 4, 512), (32, 4, 1024)])
+def test_mhc_lite_preallocated_output(M, n, C):
+    """
+    Test mhc() with hres_mode='lite' using pre-allocated output tensors.
+    """
+    torch.cuda.empty_cache()
+
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_lite_inputs(M, n, C)
+    n_squared = n * n
+    out_pre = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    out_post = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
+
+    H_pre_ref, H_post_ref, H_res_ref = mhc_lite_torch(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams
+    )
+    result_pre, result_post, result_res = mhc(
+        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams,
+        hres_mode="lite", out_pre=out_pre, out_post=out_post, out_res=out_res
+    )
+
+    assert result_pre is out_pre
+    assert result_post is out_post
+    assert result_res is out_res
+
+    torch.testing.assert_close(
+        out_pre.to(torch.float32),
+        H_pre_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        out_post.to(torch.float32),
+        H_post_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        out_res.to(torch.float32),
+        H_res_ref.to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
 
 # =============================================================================
 # Sinkhorn-Knopp Tests

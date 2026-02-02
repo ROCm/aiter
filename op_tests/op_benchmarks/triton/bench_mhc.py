@@ -6,12 +6,17 @@ Benchmark for mHC (manifold-constrained Hyper Connection) fused kernel.
 
 Measures performance of the Triton implementation across various input shapes
 and configurations, reporting time, throughput (TFLOPS), and bandwidth.
+
+Supports two modes:
+- Standard mHC with Sinkhorn-Knopp (default)
+- mHC-lite with Birkhoff-von Neumann reparameterization (--use_mhc_lite)
 """
 
 import sys
 import argparse
 import logging
 from itertools import product
+from math import factorial
 import torch
 import triton
 
@@ -23,7 +28,7 @@ logging.basicConfig(
 )
 
 from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
-from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
+from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs, generate_mhc_lite_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
@@ -63,6 +68,15 @@ def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
     mode = args.mode
     sinkhorn_iters = args.sinkhorn_iters
+    use_mhc_lite = args.use_mhc_lite
+    
+    # Validate mode combinations
+    if use_mhc_lite and mode != "full":
+        raise ValueError(
+            f"Only --mode full is valid with --use_mhc_lite. "
+            f"Got --mode {mode}. mHC-lite produces exact doubly stochastic output "
+            f"without Sinkhorn iterations, so 'fused' and 'sinkhorn' modes don't apply."
+        )
     
     configs = get_benchmark_configs(args)
     x_vals_list = configs
@@ -86,7 +100,9 @@ def run_benchmark(args):
         line_vals = [metric_map.get(args.metric, "throughput(TFLOPS)")]
     
     benchmark_name = get_caller_name_no_ext()
-    if mode == "full":
+    if use_mhc_lite:
+        benchmark_name += "_lite"
+    elif mode == "full":
         benchmark_name += f"_full_sinkhorn{sinkhorn_iters}"
     elif mode == "fused":
         benchmark_name += "_fused_only"
@@ -108,79 +124,113 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_mhc_kernel(M, n, C, provider):
         """Benchmark mHC kernel for given configuration."""
-        # Generate inputs
-        x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = \
-            generate_mhc_inputs(M, n, C, dtype)
+        # Generate inputs based on mode
+        if use_mhc_lite:
+            x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = \
+                generate_mhc_lite_inputs(M, n, C, dtype)
+            n_factorial = factorial(n)
+        else:
+            x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = \
+                generate_mhc_inputs(M, n, C, dtype)
         
         # Compute FLOPs for mHC operation
         nC = n * C
-        N = n * n + 2 * n
+        n_squared = n * n
         
-        # Standard GEMM FLOPs (2*M*N*K for matrix multiply)
-        # Eq 14: x @ phi for 3 streams
-        # - x @ phi_pre: (M, nC) @ (nC, n) = 2*M*nC*n
-        # - x @ phi_post: (M, nC) @ (nC, n) = 2*M*nC*n  
-        # - x @ phi_res: (M, nC) @ (nC, n*n) = 2*M*nC*n*n
-        flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * (n * n)
-        
-        # Eq 15: RMS normalization - M rows, each with nC elements
-        # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
-        flops_rms = 4.0 * M * nC
-        
-        # Eq 19: Sinkhorn-Knopp (separate kernel)
-        # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
-        # Per normalization: sum + divide ≈ 2n ops per row/col
-        # Total per iteration: 2 * 2 * M * n * n = 4 * M * n * n ops
-        flops_sinkhorn = 4.0 * M * n * n * sinkhorn_iters
-        
-        if mode == "full":
-            total_flops = flops_matmul + flops_rms + flops_sinkhorn
-        elif mode == "fused":
-            total_flops = flops_matmul + flops_rms
-        elif mode == "sinkhorn":
-            total_flops = flops_sinkhorn
-        
-        # Compute memory traffic
-        elem_size = 2  # bf16/fp16 = 2 bytes
-        bias_size = 4  # bias is fp32 = 4 bytes
-        
-        # Memory reads:
-        # - x: (M, nC)
-        # - phi_pre, phi_post, phi_res: (nC, n), (nC, n), (nC, n*n)
-        # - bias: (N,) in fp32
-        mem_read = (
-            M * nC * elem_size +  # x
-            nC * n * elem_size +  # phi_pre
-            nC * n * elem_size +  # phi_post
-            nC * n * n * elem_size +  # phi_res
-            N * bias_size  # bias
-        )
-        
-        # Memory writes:
-        # - out_pre: (M, n)
-        # - out_post: (M, n)
-        # - out_res: (M, n*n)
-        mem_write = (
-            M * n * elem_size +  # out_pre
-            M * n * elem_size +  # out_post
-            M * n * n * elem_size  # out_res
-        )
-        
-        # Sinkhorn-Knopp memory traffic (in-place operations)
-        mem_sinkhorn = 2 * M * n * n * elem_size * sinkhorn_iters
-        
-        if mode == "full":
-            mem_read += mem_sinkhorn / 2
-            mem_write += mem_sinkhorn / 2
+        if use_mhc_lite:
+            # mHC-lite: phi_res has n! columns, then softmax + matmul with permutation matrices
+            n_factorial = factorial(n)
+            N = n_factorial + 2 * n
+            
+            # Matmul FLOPs: x @ phi_res is (M, nC) @ (nC, n!)
+            flops_matmul = (
+                2.0 * M * nC * n +           # x @ phi_pre
+                2.0 * M * nC * n +           # x @ phi_post
+                2.0 * M * nC * n_factorial   # x @ phi_res (n! columns)
+            )
+            
+            # RMS normalization
+            flops_rms = 3.0 * M * nC
+            
+            # Softmax over n! elements: exp + sum + divide ≈ 3 * n! per row
+            flops_softmax = 3.0 * M * n_factorial
+            
+            # Permutation combination: (M, n!) @ (n!, n²) matmul
+            flops_perm = 2.0 * M * n_factorial * n_squared
+            
+            total_flops = flops_matmul + flops_rms + flops_softmax + flops_perm
+            
+            # Memory traffic for lite mode
+            elem_size = x.element_size()  # 2 for bf16/fp16, 4 for fp32
+            bias_size = bias.element_size()  # bias dtype (typically fp32)
+            mem_read = (
+                M * nC * elem_size +           # x
+                nC * n * elem_size +           # phi_pre
+                nC * n * elem_size +           # phi_post
+                nC * n_factorial * elem_size + # phi_res (n! columns)
+                N * bias_size +                # bias
+                n_factorial * n_squared * 4    # permutation matrices (float32)
+            )
+            mem_write = (
+                M * n * elem_size +       # out_pre
+                M * n * elem_size +       # out_post
+                M * n_squared * elem_size # out_res
+            )
             total_mem = mem_read + mem_write
-        elif mode == "fused":
-            total_mem = mem_read + mem_write
-        elif mode == "sinkhorn":
-            # Sinkhorn-only: read/write H_res matrix
-            total_mem = mem_sinkhorn
+        else:
+            N = n_squared + 2 * n
+            
+            # Standard GEMM FLOPs (2*M*N*K for matrix multiply)
+            flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * n_squared
+            
+            # RMS normalization
+            flops_rms = 4.0 * M * nC
+            
+            # Sinkhorn-Knopp
+            flops_sinkhorn = 4.0 * M * n_squared * sinkhorn_iters
+            
+            if mode == "full":
+                total_flops = flops_matmul + flops_rms + flops_sinkhorn
+            elif mode == "fused":
+                total_flops = flops_matmul + flops_rms
+            elif mode == "sinkhorn":
+                total_flops = flops_sinkhorn
+            
+            # Memory traffic
+            elem_size = x.element_size()  # 2 for bf16/fp16, 4 for fp32
+            bias_size = bias.element_size()  # bias dtype (typically fp32)
+            mem_read = (
+                M * nC * elem_size +
+                nC * n * elem_size +
+                nC * n * elem_size +
+                nC * n_squared * elem_size +
+                N * bias_size
+            )
+            mem_write = (
+                M * n * elem_size +
+                M * n * elem_size +
+                M * n_squared * elem_size
+            )
+            mem_sinkhorn = 2 * M * n_squared * elem_size * sinkhorn_iters
+            
+            if mode == "full":
+                mem_read += mem_sinkhorn / 2
+                mem_write += mem_sinkhorn / 2
+                total_mem = mem_read + mem_write
+            elif mode == "fused":
+                total_mem = mem_read + mem_write
+            elif mode == "sinkhorn":
+                total_mem = mem_sinkhorn
         
         # Create benchmark function
-        if mode == "full":
+        if use_mhc_lite:
+            fn = lambda: mhc(
+                x, phi_pre, phi_post, phi_res,
+                alpha_pre, alpha_post, alpha_res,
+                bias, n_streams,
+                hres_mode="lite"
+            )
+        elif mode == "full":
             fn = lambda: mhc(
                 x, phi_pre, phi_post, phi_res,
                 alpha_pre, alpha_post, alpha_res,
@@ -195,7 +245,6 @@ def run_benchmark(args):
             )
         elif mode == "sinkhorn":
             # Sinkhorn-only: benchmark just the Sinkhorn-Knopp kernel
-            # Pre-generate H_res for fair comparison
             _, _, H_res_input = fused_mhc(
                 x, phi_pre, phi_post, phi_res,
                 alpha_pre, alpha_post, alpha_res,
@@ -207,7 +256,7 @@ def run_benchmark(args):
         # Benchmark
         ms = triton.testing.do_bench(fn)
         
-        # Return requested metric based on provider string (following bench_diffusion_attention pattern)
+        # Return requested metric based on provider string
         if "ms" in provider:
             return ms
         elif "TFLOPS" in provider:
@@ -269,6 +318,13 @@ def parse_args():
         type=int,
         default=20,
         help="Number of Sinkhorn-Knopp iterations (default: 20)"
+    )
+    parser.add_argument(
+        "--use_mhc_lite",
+        action="store_true",
+        default=False,
+        help="Use mHC-lite (Birkhoff-von Neumann) instead of Sinkhorn-Knopp. "
+             "Only --mode full is valid with this option."
     )
     
     # Output options

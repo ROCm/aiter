@@ -6,12 +6,14 @@ PyTorch reference implementations for mHC (manifold-constrained Hyper Connection
 
 This module provides reference implementations for validating Triton kernels:
 - mhc_torch: Reference for mHC projection mapping (Eq 14-19)
+- mhc_lite_torch: Reference for mHC-lite (exact doubly stochastic via Birkhoff-von Neumann)
 - sinkhorn_knopp_exp_domain_torch: Sinkhorn-Knopp in exponential domain
 - sinkhorn_knopp_log_domain_torch: Sinkhorn-Knopp in log domain
 - is_doubly_stochastic: Helper to validate doubly stochastic matrices
 
 Also provides test input generation utilities:
 - generate_mhc_inputs: Generate test inputs for mHC mapping
+- generate_mhc_lite_inputs: Generate test inputs for mHC-lite mapping
 - get_test_shapes: Test shape configurations for mHC
 - get_sk_test_shapes: Test shape configurations for Sinkhorn-Knopp
 
@@ -20,9 +22,11 @@ Notation (from mHC paper arXiv:2512.24880v2):
     - n: Stream parameter controlling manifold dimension
     - C: Hidden dimension per stream
     - nC: Total flattened input dimension (K in kernel, K = n × C)
-    - N: Total output dimension (n² + 2n)
+    - N: Total output dimension (n² + 2n for sinkhorn, n! + 2n for lite)
 """
 
+from itertools import permutations as itertools_permutations
+from math import factorial
 import torch
 
 
@@ -121,6 +125,103 @@ def mhc_torch(
         H_res = H_res_ds.view(M, -1)  # Reshape back to (M, n²)
     else:
         H_res = H_res.to(torch.float32)
+    
+    # Return three separate streams
+    return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
+
+
+def mhc_lite_torch(
+    x: torch.Tensor,
+    phi_pre: torch.Tensor,
+    phi_post: torch.Tensor,
+    phi_res: torch.Tensor,
+    alpha_pre: float,
+    alpha_post: float,
+    alpha_res: float,
+    bias: torch.Tensor,
+    n: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    PyTorch reference implementation of mHC-lite projection mapping.
+
+    Uses Birkhoff-von Neumann theorem for exact doubly stochastic H_res:
+    H_res = softmax(logits) @ P where P is the stack of all n! permutation matrices.
+
+    Implements:
+    - Eq 14: H̃ = x̃φ (matrix multiplication)
+    - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
+    - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
+    - Eq 17: H^pre = σ(H^pre) (sigmoid activation for pre-stream)
+    - Eq 18: H^post = 2σ(H^post) (scaled sigmoid activation for post-stream)
+    - H_res = softmax(logits) @ P (exact doubly stochastic via permutation combination)
+
+    Args:
+        x: Input x_l with shape (M, nC) - flattened n-stream residual
+        phi_pre: Projection φ^pre with shape (nC, n)
+        phi_post: Projection φ^post with shape (nC, n)
+        phi_res: Projection φ^res with shape (nC, n!) for lite mode
+        alpha_pre: Scaling factor α^pre for pre-stream
+        alpha_post: Scaling factor α^post for post-stream
+        alpha_res: Scaling factor α^res for residual stream
+        bias: Bias vector b with shape (n! + 2n,)
+        n: Stream parameter controlling manifold dimension
+        eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
+
+    Returns:
+        Tuple of three tensors (H_pre, H_post, H_res):
+        - H_pre: (M, n) manifold projection with sigmoid
+        - H_post: (M, n) post-processing with 2*sigmoid
+        - H_res: (M, n²) exact doubly stochastic residual connection
+    """
+    x_f32 = x.to(torch.float32)
+    n_factorial = factorial(n)
+    n_squared = n * n
+    
+    # Eq 15: r = ||x̃||₂ / √(nC)
+    mean_sq = torch.mean(x_f32 ** 2, dim=-1, keepdim=True)
+    rms = torch.sqrt(mean_sq + eps)
+    x_norm = x_f32 / rms
+
+    # Eq 14: H̃ = x̃φ - compute each stream separately
+    phi_pre_f32 = phi_pre.to(torch.float32)
+    phi_post_f32 = phi_post.to(torch.float32)
+    phi_res_f32 = phi_res.to(torch.float32)
+    
+    H_tilde_pre = x_norm @ phi_pre_f32  # (M, n)
+    H_tilde_post = x_norm @ phi_post_f32  # (M, n)
+    H_tilde_res = x_norm @ phi_res_f32  # (M, n!)
+
+    # Split bias
+    bias_f32 = bias.to(torch.float32)
+    bias_pre = bias_f32[:n]
+    bias_post = bias_f32[n:2*n]
+    bias_res = bias_f32[2*n:]
+
+    # Eq 16: Apply stream-specific scaling and bias
+    H_pre = alpha_pre * H_tilde_pre + bias_pre
+    H_post = alpha_post * H_tilde_post + bias_post
+    H_res_logits = alpha_res * H_tilde_res + bias_res  # (M, n!)
+    
+    # Eq 17: Apply sigmoid activation to pre-stream
+    H_pre = torch.sigmoid(H_pre)
+    
+    # Eq 18: Apply scaled sigmoid activation to post-stream
+    H_post = 2.0 * torch.sigmoid(H_post)
+    
+    # mHC-lite: Apply softmax to get convex coefficients, then multiply with permutation matrices
+    # Generate all n! permutation matrices
+    all_perms = list(itertools_permutations(range(n)))
+    P = torch.zeros(n_factorial, n_squared, device=x.device, dtype=torch.float32)
+    for k, perm in enumerate(all_perms):
+        for i, j in enumerate(perm):
+            P[k, i * n + j] = 1.0
+    
+    # softmax over n! dimension to get convex coefficients
+    alpha_coeffs = torch.softmax(H_res_logits, dim=-1)  # (M, n!)
+    
+    # H_res = alpha @ P: (M, n!) @ (n!, n²) -> (M, n²)
+    H_res = alpha_coeffs @ P
     
     # Return three separate streams
     return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
@@ -292,6 +393,58 @@ def generate_mhc_inputs(
     alpha_res = 0.5 + torch.rand(1).item()
 
     # bias (Eq 13)
+    bias = torch.randn(N_total, dtype=torch.float32, device=device) * 0.1
+
+    return x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n
+
+
+def generate_mhc_lite_inputs(
+    M: int,
+    n: int,
+    C: int,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """
+    Generate test inputs for mHC-lite mapping.
+
+    Args:
+        M: Batch/sequence dimension
+        n: Stream parameter (manifold dimension controller)
+        C: Hidden dimension per stream
+        dtype: Tensor dtype (bfloat16 or float16)
+        device: Device to create tensors on (default: 'cuda')
+
+    Returns:
+        Tuple of (x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n) where:
+        - x: (M, nC) flattened n-stream residual input
+        - phi_pre: (nC, n) pre-stream projection matrix
+        - phi_post: (nC, n) post-stream projection matrix
+        - phi_res: (nC, n!) residual stream projection matrix (n! columns for lite mode)
+        - alpha_pre: α^pre scaling factor for pre-stream
+        - alpha_post: α^post scaling factor for post-stream
+        - alpha_res: α^res scaling factor for residual stream
+        - bias: (n! + 2n,) bias vector b
+        - n: stream parameter (returned for convenience)
+    """
+    nC = n * C  # Total flattened dimension
+    n_factorial = factorial(n)
+    N_total = n_factorial + 2 * n  # n! + 2n
+
+    # flattened n-stream residual
+    x = torch.randn(M, nC, dtype=dtype, device=device)
+
+    # Separate projection matrices for each stream
+    phi_pre = torch.randn(nC, n, dtype=dtype, device=device) * 0.1
+    phi_post = torch.randn(nC, n, dtype=dtype, device=device) * 0.1
+    phi_res = torch.randn(nC, n_factorial, dtype=dtype, device=device) * 0.1  # n! columns
+
+    # scaling factors
+    alpha_pre = 0.5 + torch.rand(1).item()
+    alpha_post = 0.5 + torch.rand(1).item()
+    alpha_res = 0.5 + torch.rand(1).item()
+
+    # bias
     bias = torch.randn(N_total, dtype=torch.float32, device=device) * 0.1
 
     return x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n
