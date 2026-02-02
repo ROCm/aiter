@@ -2,7 +2,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
-#include "../include/mhc_types.h"
+#include "../include/mhc_layer.h"
 #include "fused_rmsnorm_matmul.cuh"
 #include "rmsnorm.cuh"
 #include "sinkhorn_knopp.cuh"

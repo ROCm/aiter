@@ -6,7 +6,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
-#include "../include/mhc_types.h"
+#include "../include/mhc_layer.h"
 
 namespace cg = cooperative_groups;
 

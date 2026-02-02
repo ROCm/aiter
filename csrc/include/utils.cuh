@@ -4,7 +4,7 @@
 #include <cmath>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
-#include "mhc_types.h"
+#include "mhc_layer.h"
 
 namespace mhc {
 

@@ -4,7 +4,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_cooperative_groups.h>
 #include <hip/hip_cooperative_groups.h>
-#include "../include/mhc_types.h"
+#include "../include/mhc_layer.h"
 #include "../include/utils.cuh"
 
 namespace cg = cooperative_groups;
