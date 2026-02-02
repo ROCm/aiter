@@ -33,11 +33,11 @@
     },
     "M_LEQ_16384": {
         "BLOCK_M": 64,
-        "BLOCK_K": 128,
+        "BLOCK_K": 64,
         "waves_per_eu": 2,
         "num_stages": 1,
         "num_warps": 4,
-        "NUM_KSPLIT": 4
+        "NUM_KSPLIT": 2
     },
     "any": {
         "BLOCK_M": 64,
