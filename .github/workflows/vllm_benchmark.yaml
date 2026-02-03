@@ -155,10 +155,3 @@ jobs:
           docker stop aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
           docker rm -f aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
           docker rmi rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
-
-  skip-job:
-    if: ${{ github.event.pull_request.head.repo.fork }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip reason
-        run: echo "It's a fork repository, skipping tests."
