@@ -255,9 +255,10 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
-        use_flydsl=dsl,
+        use_flydsl=True,
         num_iters=5,
         num_warmup=2,
+        testGraph=True,
     )
     err = checkAllclose(
         out2_ref,

@@ -1802,6 +1802,7 @@ def flydsl_moe_stage1(
         inter_dim,
         model_dim,
         blocks,
+        torch.cuda.current_stream().cuda_stream,
     )
     return out
 
@@ -1960,6 +1961,7 @@ def flydsl_moe_stage2(
         model_dim,
         inter_dim,
         blocks,
+        torch.cuda.current_stream().cuda_stream,
     )
     return out
 
