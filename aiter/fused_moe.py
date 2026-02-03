@@ -1077,31 +1077,63 @@ def fused_moe_2stages(
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
         if smooth_a1 is not None and q_dtype_a == dtypes.i8:
-            # Align with aiter asm path: use device kernel `moe_smoothquant_fwd` to build
-            # per-(token,slot) int8 activations + per-(token,slot) scale_x.
+            # Use smooth_per_token_scaled_quant with transpose for compatibility
+            # This replaces moe_smoothquant_fwd with equivalent functionality
             if topk_ids is None:
                 raise RuntimeError("FlyDSL int8smooth requires topk_ids")
-            # `moe_smoothquant_fwd` expects:
-            # - out: [token*topk, model_dim] int8
-            # - input: [token, model_dim] bf16/fp16
-            # - x_scale: [E, model_dim] (or [E,1,model_dim]) fp32
-            # - topk_ids: [token, topk] i32
-            # - y_scale: [token*topk] fp32
+
+            # Allocate output in flat format [token*topk, model_dim]
             a1 = torch.empty(
                 (token_num * topk, model_dim), dtype=dtypes.i8, device=device
             )
             a1_scale = torch.empty((token_num * topk), dtype=dtypes.fp32, device=device)
-            topk_ids_sq = topk_ids
-            if expert_mask is not None and smooth_a1.shape[0] != expert_mask.numel():
-                topk_ids_sq = _get_local_expert_hash(expert_mask)[topk_ids_sq]
 
-            aiter.moe_smoothquant_fwd(
-                a1,
-                hidden_states,
-                smooth_a1.contiguous(),
-                topk_ids_sq.to(dtypes.i32),
-                a1_scale,
+            topk_ids_sq = topk_ids
+            local_expert_hash = None
+            if expert_mask is not None and smooth_a1.shape[0] != expert_mask.numel():
+                local_expert_hash = _get_local_expert_hash(expert_mask)
+
+            # Call smooth_per_token_scaled_quant with proper layout transformations:
+            # - Output: reshape [token*topk, model_dim] -> [topk, token, model_dim] -> transpose -> [token, topk, model_dim]
+            # - Input: reshape [token, model_dim] -> [token, 1, model_dim] -> expand -> [token, topk, model_dim]
+            aiter.smooth_per_token_scaled_quant(
+                a1.view(topk, token_num, model_dim).transpose(
+                    0, 1
+                ),  # [token, topk, model_dim]
+                hidden_states.view(token_num, 1, model_dim).expand(
+                    -1, topk, -1
+                ),  # [token, topk, model_dim]
+                a1_scale,  # [token*topk] - kernel reshapes to [token, topk, 1] internally
+                smooth_a1.contiguous(),  # [E, model_dim]
+                topk_ids_sq.to(
+                    dtypes.i32
+                ),  # [token, topk] - passed as smooth_scale_map
+                smooth_scale_map_hash=local_expert_hash,  # Optional EP hash for global->local mapping
+                enable_ps=True,
             )
+            # a1 now in correct flat format [token*topk, model_dim] for downstream kernels
+            a1 = a1.view(-1, model_dim)
+
+            # TODO(yadai): keep it first as reference, remove it later.
+            # OLD IMPLEMENTATION (commented out - replaced with smooth_per_token_scaled_quant above)
+            # # Align with aiter asm path: use device kernel `moe_smoothquant_fwd` to build
+            # # per-(token,slot) int8 activations + per-(token,slot) scale_x.
+            # # `moe_smoothquant_fwd` expects:
+            # # - out: [token*topk, model_dim] int8
+            # # - input: [token, model_dim] bf16/fp16
+            # # - x_scale: [E, model_dim] (or [E,1,model_dim]) fp32
+            # # - topk_ids: [token, topk] i32
+            # # - y_scale: [token*topk] fp32
+            # topk_ids_sq = topk_ids
+            # if expert_mask is not None and smooth_a1.shape[0] != expert_mask.numel():
+            #     topk_ids_sq = _get_local_expert_hash(expert_mask)[topk_ids_sq]
+            # aiter.moe_smoothquant_fwd(
+            #     a1,
+            #     hidden_states,
+            #     smooth_a1.contiguous(),
+            #     topk_ids_sq.to(dtypes.i32),
+            #     a1_scale,
+            # )
         else:
             a1, a1_scale = quant_func(
                 hidden_states,
