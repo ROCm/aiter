@@ -59,6 +59,9 @@ __device__ constexpr int reg_2_col_q()
 // Main part
 // ================================================================
 
+typedef uint32_t v8ui __attribute__((ext_vector_type(8)));
+typedef uint32_t v4ui __attribute__((ext_vector_type(4)));
+
 template <typename q_t_, typename kv_t_, typename out_t_, int32_t kQoNumHead_>
 struct HkMlaDecodeFwdTraits
 {
@@ -166,6 +169,168 @@ class QManagerV1
     }
 };
 
+template <typename T, uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
+class QManagerV2
+{
+    private:
+    using q_t = typename T::q_t;
+
+    uint32_t src_lane_0;
+    uint32_t src_lane_1;
+    uint64_t use_src1_s;
+
+    public:
+    __device__ QManagerV2()
+    {
+        const uint32_t lane_idx = ckt::get_lane_id();
+        src_lane_0              = (lane_idx % 16) * 4 + (lane_idx / 32);
+        src_lane_1              = src_lane_0 + 2;
+        src_lane_0 *= 4; // the address passed in ds_bpermute_b32 is tid * 4
+        src_lane_1 *= 4;
+
+        const uint32_t use_src1_v = (lane_idx / 16) % 2;
+        asm volatile("v_cmp_ne_u32 %0, %1, %2" : "=s"(use_src1_s) : "v"(use_src1_v), "v"(0));
+    }
+
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
+    {
+        return 0; // Not used
+    }
+
+    __device__ __forceinline__ void load_q_to_gpr(const typename T::gl_q& q_buffer,
+                                                  const int32_t warp_idx,
+                                                  const int32_t q_start,
+                                                  const uintptr_t p_lds_q)
+    {
+        // Each warp loads 16x64 each time. Each lane handles 1x16 elements.
+        // Since dtype should be fp8, a buffer_load_dwordx4 is used to load all 1x16 elements.
+        constexpr uint32_t kNumRowsPerWarp = 16;
+        constexpr uint32_t kNumColsPerWarp = 64;
+        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;      // 16*64=1024
+        constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / ckt::get_warp_size(); // 1024/64=16
+        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;      // 64/16=4
+
+        auto buffer_load_dwordx4 = [](const __amdgpu_buffer_rsrc_t& srsrc,
+                                      const uint32_t v_offset,
+                                      const uint32_t s_offset,
+                                      const uint32_t i_offset) {
+            v4ui result;
+
+            asm volatile("buffer_load_dwordx4 %0, %1, %2, %3 offen offset:%4"
+                         : "=v"(result)
+                         : "v"(v_offset), "s"(srsrc), "s"(s_offset), "i"(i_offset)
+                         : "memory");
+
+            return result;
+        };
+
+        auto shuffle_data = [&]<uint32_t GPR_START>(const v4ui& data) {
+            uint32_t src_lane_0_reg_0;
+            uint32_t src_lane_0_reg_1;
+            uint32_t src_lane_0_reg_2;
+            uint32_t src_lane_0_reg_3;
+            uint32_t src_lane_1_reg_0;
+            uint32_t src_lane_1_reg_1;
+            uint32_t src_lane_1_reg_2;
+            uint32_t src_lane_1_reg_3;
+
+            asm volatile("ds_bpermute_b32 %0, %8, %10\n\t"
+                         "ds_bpermute_b32 %2, %8, %12\n\t"
+                         "ds_bpermute_b32 %1, %8, %11\n\t"
+                         "ds_bpermute_b32 %3, %8, %13\n\t"
+                         "s_barrier\n\t" // for both perf and quality
+                         "ds_bpermute_b32 %4, %9, %10\n\t"
+                         "ds_bpermute_b32 %6, %9, %12\n\t"
+                         "ds_bpermute_b32 %5, %9, %11\n\t"
+                         "ds_bpermute_b32 %7, %9, %13"
+                         : "=v"(src_lane_0_reg_0),
+                           "=v"(src_lane_0_reg_1),
+                           "=v"(src_lane_0_reg_2),
+                           "=v"(src_lane_0_reg_3),
+                           "=v"(src_lane_1_reg_0),
+                           "=v"(src_lane_1_reg_1),
+                           "=v"(src_lane_1_reg_2),
+                           "=v"(src_lane_1_reg_3)
+                         : "v"(src_lane_0),
+                           "v"(src_lane_1),
+                           "v"(data[0]),
+                           "v"(data[1]),
+                           "v"(data[2]),
+                           "v"(data[3]));
+
+            asm volatile("s_waitcnt lgkmcnt(6)\n\t"
+                         "v_cndmask_b32 v[%0], %4, %8, %12\n\t"
+                         "s_waitcnt lgkmcnt(4)\n\t"
+                         "v_cndmask_b32 v[%1], %5, %9, %12\n\t"
+                         "s_waitcnt lgkmcnt(2)\n\t"
+                         "v_cndmask_b32 v[%2], %6, %10, %12\n\t"
+                         "s_waitcnt lgkmcnt(0)\n\t"
+                         "v_cndmask_b32 v[%3], %7, %11, %12"
+                         :
+                         : "i"(GPR_START),
+                           "i"(GPR_START + 1),
+                           "i"(GPR_START + 2),
+                           "i"(GPR_START + 3),
+                           "v"(src_lane_0_reg_0),
+                           "v"(src_lane_0_reg_1),
+                           "v"(src_lane_1_reg_0),
+                           "v"(src_lane_1_reg_1),
+                           "v"(src_lane_0_reg_2),
+                           "v"(src_lane_0_reg_3),
+                           "v"(src_lane_1_reg_2),
+                           "v"(src_lane_1_reg_3),
+                           "s"(use_src1_s));
+        };
+
+        const uint32_t lane_idx = ckt::get_lane_id();
+
+        q_t* p_q_buffer = &q_buffer[{q_start, 0, 0, 0}];
+        const __amdgpu_buffer_rsrc_t srsrc =
+            __builtin_amdgcn_make_buffer_rsrc(p_q_buffer, 0, 0xffffffff, 0x00020000);
+
+        const uint32_t s_offset = warp_idx * kNumRowsPerWarp * T::kQkHeadDim * sizeof(q_t);
+        const uint32_t row      = lane_idx / kNumLanesPerRow;
+        const uint32_t col      = (lane_idx % kNumLanesPerRow) * kNumElemPerLane;
+        const uint32_t v_offset = (row * T::kQkHeadDim + col) * sizeof(q_t);
+
+        v4ui data_0 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 0 * kNumColsPerWarp);
+        v4ui data_1 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 1 * kNumColsPerWarp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        v4ui data_2 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 2 * kNumColsPerWarp);
+        __builtin_amdgcn_s_setprio(7);
+        shuffle_data.template operator()<GPR_NOPE_START + 0>(data_0);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(6);
+        data_0 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 3 * kNumColsPerWarp);
+        shuffle_data.template operator()<GPR_NOPE_START + 4>(data_1);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(5);
+        data_1 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 4 * kNumColsPerWarp);
+        shuffle_data.template operator()<GPR_NOPE_START + 8>(data_2);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(4);
+        data_2 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 5 * kNumColsPerWarp);
+        shuffle_data.template operator()<GPR_NOPE_START + 12>(data_0);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(3);
+        data_0 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 6 * kNumColsPerWarp);
+        shuffle_data.template operator()<GPR_NOPE_START + 16>(data_1);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(2);
+        data_1 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 7 * kNumColsPerWarp);
+        shuffle_data.template operator()<GPR_NOPE_START + 20>(data_2);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(1);
+        data_2 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 8 * kNumColsPerWarp);
+        shuffle_data.template operator()<GPR_NOPE_START + 24>(data_0);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(0);
+        shuffle_data.template operator()<GPR_NOPE_START + 28>(data_1);
+        asm volatile("s_waitcnt vmcnt(0)");
+        shuffle_data.template operator()<GPR_ROPE_START>(data_2);
+    }
+};
+
 template <bool kCheckBoundary>
 __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
                                                  const int32_t row_base,
@@ -190,8 +355,6 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
 
     return row_kv_ld;
 }
-
-typedef uint32_t v8ui __attribute__((ext_vector_type(8)));
 
 template <typename T>
 class KvManagerV1
@@ -1182,7 +1345,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hkdart::clobber<p_mfma_ranges>();
     hkdart::clobber<o_ranges>();
 
-    QManagerV1<T, k_q_nope_begin, k_q_rope_begin> q_manager;
+    QManagerV2<T, k_q_nope_begin, k_q_rope_begin> q_manager;
     KvManagerV2<T> kv_manager;
 
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
@@ -1235,6 +1398,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
         // Load Q from VRAM to GPRs
         q_manager.load_q_to_gpr(params.query, warp_idx, qo_start, p_lds_q);
+        __builtin_amdgcn_sched_barrier(0);
 
         if(kv_len < T::kBlockN)
         {
