@@ -32,63 +32,8 @@
     CHECK_CONTIGUOUS(x)
 
 namespace {
-template <typename T, int vec_size>
-struct alignas(sizeof(T) * vec_size) vec_t
-{
-    T data[vec_size];
-    __device__ __forceinline__ T& operator[](int i) { return data[i]; }
-    __device__ __forceinline__ T const& operator[](int i) const { return data[i]; }
-    __device__ __forceinline__ void load(const T* ptr)
-    {
-        *this = *reinterpret_cast<vec_t<T, vec_size>*>(const_cast<T*>(ptr));
-    }
-    __device__ __forceinline__ void loop_load(const T* ptr)
-    {
-#pragma unroll
-        for(int i = 0; i < vec_size; ++i)
-        {
-            data[i] = ptr[i];
-        }
-    }
-    __device__ __forceinline__ void store(T* ptr)
-    {
-        *reinterpret_cast<vec_t<T, vec_size>*>(ptr) = *this;
-    }
-    __device__ __forceinline__ void loop_store(T* ptr)
-    {
-#pragma unroll
-        for(int i = 0; i < vec_size; ++i)
-        {
-            ptr[i] = data[i];
-        }
-    }
-    __device__ __forceinline__ void nontemporal_load(const T* ptr)
-    {
-        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
-#pragma unroll
-        for(int i = 0; i < ITERS; ++i)
-        {
-            reinterpret_cast<uint32_t*>(&data)[i] = __builtin_nontemporal_load((uint32_t*)ptr + i);
-        }
-    }
-    __device__ __forceinline__ void nontemporal_store(T* ptr)
-    {
-        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
-#pragma unroll
-        for(int i = 0; i < ITERS; ++i)
-        {
-            __builtin_nontemporal_store(reinterpret_cast<uint32_t*>(&data)[i], (uint32_t*)ptr + i);
-        }
-    }
-    __device__ __forceinline__ void fill(T val)
-    {
-#pragma unroll
-        for(int i = 0; i < vec_size; ++i)
-        {
-            data[i] = val;
-        }
-    }
-};
+
+using mrope_utils::vec_t;
 
 template <typename Func, typename T>
 __inline__ __device__ T warpReduceSum(Func func, T val)
@@ -634,4 +579,5 @@ void fused_qk_norm_rope_cache_quant_shuffle(
 
     DISPATCH_BY_KV_CACHE_DTYPE(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_QUANT);
 }
+
 } // namespace aiter

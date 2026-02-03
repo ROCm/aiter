@@ -31,7 +31,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from aiter import (
     dtypes,
-    fused_qk_norm_mrope_3d_cache_quant_shuffle,
+    fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
 )
 
 # from custom_op import CustomOp
@@ -1423,7 +1423,7 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
                 if return_kv
                 else None
             )
-            fused_qk_norm_mrope_3d_cache_quant_shuffle(
+            fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
                 qkv,
                 q_weight,
                 k_weight,

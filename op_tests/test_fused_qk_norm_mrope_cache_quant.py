@@ -342,7 +342,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
         x = 16 // k_cache.element_size()
 
     if is_mrope:
-        aiter.fused_qk_norm_mrope_3d_cache_quant_shuffle(
+        aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             qkv,
             qw,
             kw,

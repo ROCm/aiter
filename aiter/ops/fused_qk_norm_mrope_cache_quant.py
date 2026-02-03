@@ -7,7 +7,7 @@ from typing import List, Optional
 
 
 @compile_ops("module_fused_qk_norm_mrope_cache_quant_shuffle")
-def fused_qk_norm_mrope_3d_cache_quant_shuffle(
+def fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     qkv: Tensor,
     qw: Tensor,
     kw: Tensor,
