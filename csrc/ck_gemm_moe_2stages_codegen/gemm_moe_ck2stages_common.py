@@ -398,7 +398,7 @@ def get_gemm1_kernels_list(
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
         if arch == "gfx950":
-            if  preshuffle:
+            if preshuffle:
                 tag = "a4w4"
             else:
                 tag = "a4w4_bns"
