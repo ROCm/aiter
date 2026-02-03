@@ -4,7 +4,6 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "py_itfs_common.h"
-#include "mhc_layer.h"
 #include "mhc_layer.cuh"
 
 namespace aiter {

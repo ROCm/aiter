@@ -3,9 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_cooperative_groups.h>
-#include <hip/hip_cooperative_groups.h>
-#include "../include/mhc_layer.h"
-#include "../include/mhc_layer.h"
+#include "../include/mhc_layer.cuh"
 
 namespace cg = cooperative_groups;
 

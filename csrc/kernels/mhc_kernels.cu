@@ -2,9 +2,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
-#include "../include/mhc_layer.h"
 #include "sinkhorn_knopp.cuh"
-#include "../include/mhc_layer.h"
 
 namespace cg = cooperative_groups;
 
@@ -616,13 +614,6 @@ __global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const __hip_
             rms_out[idx] = rms;
         }
     }
-
-#if __CUDA_ARCH__ >= 900
-    __syncthreads();
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
 }
 
 inline void compute_rms_pdl(float* rms_out, const __hip_bfloat16* inp, int N, int C, float eps,
