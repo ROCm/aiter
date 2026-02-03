@@ -53,6 +53,7 @@ def fwd(
     sage_version: Sage_version = Sage_version.V1,
     q_descale_pre: Optional[torch.Tensor] = None,
     k_descale_pre: Optional[torch.Tensor] = None,
+    delta_s: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sage Attention v1 forward pass compatible interface for AMD Triton implementation.
@@ -156,6 +157,11 @@ def fwd(
             "k_descale_pre:",
             k_descale_pre.dtype if k_descale_pre is not None else None,
             k_descale_pre.shape if k_descale_pre is not None else None,
+        )
+        print(
+            "delta_s for Q smoothing:",
+            delta_s.dtype if delta_s is not None else None,
+            delta_s.shape if delta_s is not None else None,
         )
         print(
             "v_descale:",
@@ -324,6 +330,7 @@ def fwd(
     extra_args = {} if sage_version == Sage_version.V1 else {
         "q_descale_pre": q_descale_pre,
         "k_descale_pre": k_descale_pre,
+        "delta_s": delta_s,
     }
 
     sage_func(

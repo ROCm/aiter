@@ -22,6 +22,7 @@ def _sage_fwd_no_mask_v2(
     q,
     k_base_ptrs,
     v_base_ptrs,
+    delta_s_ptr,
     bias_base_ptrs,
     stride_kn,
     stride_vk,
@@ -93,6 +94,10 @@ def _sage_fwd_no_mask_v2(
         k_descale_pre = tl.load(k_descale_pre_ptr)
         k_descale_pre_ptr += 1
 
+        delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
+        delta_s = tl.load(delta_s_ptrs)
+        delta_s_ptr += stride_ds_k
+
         # Optionally preload V
         if PRE_LOAD_V:
             if PADDED_HEAD_V:
@@ -103,6 +108,7 @@ def _sage_fwd_no_mask_v2(
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+        qk += delta_s[None, :]
 
         # -- compute qk ----
         qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * (q_descale_pre * k_descale_pre)
@@ -221,6 +227,7 @@ def _sage_fwd_mask_v2(
     q,
     k_base_ptrs,
     v_base_ptrs,
+    delta_s_ptr,
     bias_base_ptrs,
     stride_kn,
     stride_vk,
@@ -236,6 +243,7 @@ def _sage_fwd_mask_v2(
     sd_mask,
     stride_sz,
     stride_sh,
+    stride_ds_k,
     off_z,
     off_h_q,
     offs_m,
@@ -303,11 +311,16 @@ def _sage_fwd_mask_v2(
         k_descale_pre = tl.load(k_descale_pre_ptr)
         k_descale_pre_ptr += 1
 
+        delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
+        delta_s = tl.load(delta_s_ptrs)
+        delta_s_ptr += stride_ds_k
+
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+        qk += delta_s[None, :]
 
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -885,6 +898,7 @@ def sage_fwd_v2(
     Q_Descale_Pre,
     K_Descale,
     K_Descale_Pre,
+    Delta_S,
     V_Descale,
     FP8_MAX,
     stride_qsz,
@@ -897,6 +911,8 @@ def sage_fwd_v2(
     stride_ksn,
     stride_kspz,
     stride_ksph,
+    stride_ds_q,
+    stride_ds_k,
     stride_vsz,
     stride_vsh,
     LSE,
@@ -1071,6 +1087,8 @@ def sage_fwd_v2(
         + cu_seqlens_k_start
     )
 
+    delta_s_offset = start_m * stride_ds_q
+
     v_descale = tl.load(
         V_Descale
         + off_z * stride_vsz
@@ -1204,6 +1222,8 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks
 
+        delta_s_ptr = Delta_S + delta_s_offset + n_front_skip_blocks * stride_ds_k
+
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
             l_i,
@@ -1211,6 +1231,7 @@ def sage_fwd_v2(
             q,
             k_ptrs,
             v_ptrs,
+            delta_s_ptr,
             bias_ptrs,
             stride_kn,
             stride_vk,
@@ -1226,6 +1247,7 @@ def sage_fwd_v2(
             SD_MASK,
             stride_sz,
             stride_sh,
+            stride_ds_k,
             off_z,
             off_h_q,
             offs_m,
@@ -1279,6 +1301,8 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks
 
+        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks) * stride_ds_k
+
         acc, l_i, m_i = _sage_fwd_no_mask_v2(
             acc,
             l_i,
@@ -1286,6 +1310,7 @@ def sage_fwd_v2(
             q,
             k_ptrs,
             v_ptrs,
+            delta_s_ptr,
             bias_ptrs,
             stride_kn,
             stride_vk,
@@ -1301,6 +1326,7 @@ def sage_fwd_v2(
             SD_MASK,
             stride_sz,
             stride_sh,
+            stride_ds_k,
             off_z,
             off_h_q,
             offs_m,
@@ -1354,6 +1380,8 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
 
+        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * stride_ds_k
+
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
             l_i,
@@ -1361,6 +1389,7 @@ def sage_fwd_v2(
             q,
             k_ptrs,
             v_ptrs,
+            delta_s_ptr,
             bias_ptrs,
             stride_kn,
             stride_vk,
@@ -1376,6 +1405,7 @@ def sage_fwd_v2(
             SD_MASK,
             stride_sz,
             stride_sh,
+            stride_ds_k,
             off_z,
             off_h_q,
             offs_m,
@@ -1582,6 +1612,7 @@ def fav3_sage_triton_impl_v2(
     config: Optional[dict] = None,
     q_descale_pre: Optional[torch.Tensor] = None,
     k_descale_pre: Optional[torch.Tensor] = None,
+    delta_s: Optional[torch.Tensor] = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1809,6 +1840,11 @@ def fav3_sage_triton_impl_v2(
     stride_qspz, stride_qsph, _ = q_descale_pre.stride()
     stride_kspz, stride_ksph, _ = k_descale_pre.stride()
 
+    if delta_s is not None:
+        stride_ds_q, stride_ds_k, _ = delta_s.stride()
+    else:
+        stride_ds_q, stride_ds_k, _ = (0, 0, 0)
+
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
 
@@ -1886,6 +1922,7 @@ def fav3_sage_triton_impl_v2(
         q_descale_pre,
         k_descale,
         k_descale_pre,
+        delta_s, 
         v_descale,
         FP8_MAX,
         stride_qsz,
@@ -1898,6 +1935,8 @@ def fav3_sage_triton_impl_v2(
         stride_ksn,
         stride_kspz,
         stride_ksph,
+        stride_ds_q,
+        stride_ds_k,
         stride_vsz,
         stride_vsh,
         softmax_lse,
@@ -1979,7 +2018,7 @@ def sage_quant_v2(
     sm_scale=None,
     layout="bshd",
     smooth_k=True,
-    smooth_q=False,
+    smooth_q=True,
     is_q_fp4=True,
     is_k_fp4=True,
 ):
@@ -2031,18 +2070,39 @@ def sage_quant_v2(
     # Apply K/Q tensor smoothing following SageAttention approach
     if smooth_k:
         k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
-    if smooth_q:
-        q = q - q.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
-
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
+    delta_s = None
+    if smooth_q:
+        delta_s = torch.empty((Q_NUM_BLKS, K_NUM_BLKS, BLKK), device=q.device, dtype=q.dtype)
+        grid = (b, h_qo, Q_NUM_BLKS)
+        q_smooth_kernel[grid](
+            q,
+            k,
+            delta_s,
+            qo_len, 
+            kv_len,
+            stride_bz_q,
+            stride_h_q,
+            stride_seq_q,
+            stride_bz_k,
+            stride_h_k,
+            stride_seq_k,
+            delta_s.stride(0),
+            delta_s.stride(1),
+            Q_NUM_BLKS=Q_NUM_BLKS,
+            K_NUM_BLKS=K_NUM_BLKS,
+            D=head_dim,
+            BLOCK_M=BLKQ,
+            BLOCK_N=BLKK,
+        )
+
+
     v_task_count = b * h_kv * K_NUM_BLKS
-
     grid = (v_task_count,)
-
     # call sage_quant_kernel
     sage_quant_v_kernel[grid](
         v,
@@ -2124,7 +2184,7 @@ def sage_quant_v2(
     else:
         k_fp4, k_scale = downcast_to_mxfp_rne(k_bf16, aiter.dtypes.fp8, axis=-1)
 
-    return q_fp4, q_scale, q_scale_pre, k_fp4, k_scale, k_scale_pre, v_fp8, v_scale
+    return q_fp4, q_scale, q_scale_pre, k_fp4, k_scale, k_scale_pre, v_fp8, v_scale, delta_s
 
 
 @triton.jit
@@ -2217,6 +2277,66 @@ def sage_v2_pre_quant_kernel(
             offs_kn[:, None] < SEQLEN_K,
         )
 
+@triton.jit
+def q_smooth_kernel(
+    Q,
+    K,
+    Delta_S,
+    seqlen_q,
+    seqlen_k,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_dsm,
+    stride_dsn,
+    Q_NUM_BLKS: tl.constexpr,
+    K_NUM_BLKS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+
+    off_z = tl.program_id(0)
+    off_h = tl.program_id(1)
+    start_m = tl.program_id(2)
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+
+    q_offset = (
+        Q + off_z * stride_qz + off_h * stride_qh
+    )
+    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d[None, :]
+    q_ptrs_mask = offs_m[:, None] < seqlen_q
+    q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
+
+    #q = calculate mean of q
+    solid_M = tl.minimum(BLOCK_M, seqlen_q - (start_m * BLOCK_M))
+    q = tl.sum(q, 0, keep_dims=True) / solid_M # 1 x D vector
+
+    delta_s_offset = Delta_S + start_m * stride_dsm
+
+    k_offset = (
+        K + off_z * stride_kz + off_h * stride_kh
+    )
+
+    for start_n in range(K_NUM_BLKS):
+        k_ptrs = k_offset + offs_d[:, None] + offs_n[None, :] * stride_kn
+        k_ptrs_mask = offs_n[None, :] < seqlen_k
+        k_offset += BLOCK_N * stride_kn
+        k = tl.load(k_ptrs, mask=k_ptrs_mask, other=0.0)
+
+        delta_s = tl.dot(q.to(Q.type.element_ty), k) # 1 x BLOCK_N
+        delta_s = tl.reshape(delta_s, [BLOCK_N])
+
+        delta_s_ptrs = delta_s_offset + offs_n
+        delta_s_offset += stride_dsn
+
+        tl.store(delta_s_ptrs, delta_s.to(Delta_S.type.element_ty))
 
 @triton.jit
 def sage_quant_v_kernel(

@@ -379,6 +379,7 @@ def fav3_sage_func(
     sage_version: fav3_sage.Sage_version = fav3_sage.Sage_version.V1,
     q_descale_pre: Optional[torch.Tensor] = None,
     k_descale_pre: Optional[torch.Tensor] = None,
+    delta_s: Optional[torch.Tensor] = None,
 ):
     """
     SageAttention v1.
@@ -473,6 +474,13 @@ def fav3_sage_func(
             num_k_blocks,
         ), f"k_descale_pre shape {k_descale.shape} != expected {(batch, num_kv_heads, num_k_blocks)}"
 
+    if delta_s is not None:
+        assert delta_s.shape == (
+            num_q_blocks,
+            num_k_blocks,
+            BLKK,
+        ), f"delta_s shape {delta_s.shape} != expected {(num_q_blocks, num_k_blocks, BLKK)}"
+
 
     # Validate unsupported features
     if attention_chunk not in (0, 1):
@@ -528,6 +536,7 @@ def fav3_sage_func(
         sage_version=sage_version,
         q_descale_pre=q_descale_pre,
         k_descale_pre=k_descale_pre,
+        delta_s=delta_s
     )
 
     return out

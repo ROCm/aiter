@@ -347,7 +347,7 @@ def fav3_sage_forward_func(
             sage_version=fav3_sage.Sage_version.V1
         )
     else:
-        q_fp4, q_descale, q_descale_pre, k_fp4, k_descale, k_descale_pre, v_fp8, v_descale = sage_quant_v2(
+        q_fp4, q_descale, q_descale_pre, k_fp4, k_descale, k_descale_pre, v_fp8, v_descale, delta_s = sage_quant_v2(
             q,
             k,
             v,
@@ -374,6 +374,7 @@ def fav3_sage_forward_func(
             sage_version=fav3_sage.Sage_version.V2,
             q_descale_pre=q_descale_pre,
             k_descale_pre=k_descale_pre,
+            delta_s=delta_s,
         )
 
 def create_benchmark_configs(args):
