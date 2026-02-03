@@ -42,33 +42,37 @@ def _compute_hres_mhc_lite(
     
     """
     LOG2_E: tl.constexpr = 1.4426950408889634  # 1/ln(2)
-    LN_2: tl.constexpr = 0.6931471805599453    # ln(2)
     
     col_idx = tl.arange(0, BLOCK_N)
     n_factorial_mask = col_idx[None, :] < n_factorial
     out_masked = tl.where(n_factorial_mask, out, float('-inf'))
     
-    # Log-domain softmax: logsumexp then subtract
+    # Optimized softmax: direct exp-normalize (faster than log-domain for small n_factorial)
     out_max = tl.max(out_masked, axis=1, keep_dims=True)
-    out_shifted = out_masked - out_max
-    exp_shifted = tl.exp2(out_shifted * LOG2_E)
-    sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
-    log_sum_exp = out_max + tl.log2(sum_exp) * LN_2
+    exp_shifted = tl.exp2((out_masked - out_max) * LOG2_E)
+    sum_exp = tl.sum(tl.where(n_factorial_mask, exp_shifted, 0.0), axis=1, keep_dims=True)
+    alpha = exp_shifted / sum_exp  # (BLOCK_M, n_factorial) convex coefficients
     
-    log_alpha = out_masked - log_sum_exp
-    alpha = tl.exp2(log_alpha * LOG2_E)  # (BLOCK_M, n_factorial) convex coefficients, padding ~0
+    # Initialize output accumulator
+    H_res = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     
-    # Load permutation matrices P: (n_factorial, n_squared) padded to (BLOCK_N, BLOCK_N)
-    row_idx = tl.arange(0, BLOCK_N)[:, None]
-    col_idx = tl.arange(0, BLOCK_N)[None, :]
-    perm_mask = (row_idx < n_factorial) & (col_idx < n_squared)
-    P = tl.load(
-        perm_ptr + row_idx * stride_perm_k + col_idx * stride_perm_ij,
-        mask=perm_mask,
-        other=0.0
-    )
-    
-    H_res = tl.dot(alpha, P)
+    # Loop over permutations and use tl.fma (fused multiply-add) for accumulation
+    for perm_idx in tl.static_range(n_factorial):
+        # Load permutation matrix P[perm_idx] - a vector of n_squared elements
+        elem_idx = tl.arange(0, BLOCK_N)
+        elem_mask = elem_idx < n_squared
+        perm_vals = tl.load(
+            perm_ptr + perm_idx * stride_perm_k + elem_idx * stride_perm_ij,
+            mask=elem_mask,
+            other=0.0
+        ).to(tl.float32)
+        
+        # Extract weight for this permutation (alpha[:, perm_idx]). Use masking to extract the column
+        weight_mask = (col_idx == perm_idx)
+        weight_val = tl.sum(tl.where(weight_mask[None, :], alpha, 0.0), axis=1)
+        
+        # Fused multiply-add: H_res += weight_val * perm_vals
+        H_res = tl.fma(weight_val[:, None], perm_vals[None, :], H_res)
     
     return H_res
 
