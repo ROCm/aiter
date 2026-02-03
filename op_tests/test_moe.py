@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 import torch
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
-from aiter.fused_moe import torch_moe, fused_topk
+from aiter.fused_moe import torch_moe, fused_topk, fused_moe
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant
 from aiter.int4_utils import *
-from aiter import ActivationType
+from aiter import ActivationType, QuantType
 import argparse
 
 BLOCK_SIZE_M = 32
@@ -73,6 +74,32 @@ def asm_moe_test(
     a16=False,
     activation=ActivationType.Silu,
 ):
+    # NOTE: keep the test code unchanged for inputs and reference.
+    # Switch backend by env var:
+    # - AITER_USE_FLYDSL_MOE=0 -> asm_moe (original)
+    # - AITER_USE_FLYDSL_MOE=1 -> fused_moe(... use_flydsl=True) (FlyDSL 2-stage)
+    if os.environ.get("AITER_USE_FLYDSL_MOE", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    ):
+        return fused_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation=activation,
+            quant_type=QuantType.per_Token if fc1_scale is not None else QuantType.No,
+            doweight_stage1=False,
+            w1_scale=fc1_scale,
+            w2_scale=fc2_scale,
+            a1_scale=fc1_smooth_scale,
+            a2_scale=fc2_smooth_scale,
+            use_flydsl=True,
+        )
     return asm_moe(
         hidden_states,
         w1,
