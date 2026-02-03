@@ -403,7 +403,7 @@ def fav3_sage_func(
 
     # Use provided config or get default config
     if config is None:
-        config = get_sage_fwd_configs()
+        config = get_sage_fwd_configs(sage_version=sage_version)
     # assert len(config) == 1, f"Number of best config is expected to be 1, got {len(config)}"
     # config = config[0].all_kwargs()
     BLKQ = config["BLOCK_M"]

@@ -19,7 +19,7 @@ def _get_sage_v1_fwd_configs():
             "BLOCK_N": 128,
             "waves_per_eu": 2,
             "PRE_LOAD_V": False,
-            "num_stages": 5,
+            "num_stages": 3,
             "num_warps": 8,
         }
     elif arch == "gfx942":
@@ -51,17 +51,19 @@ def _get_sage_v2_fwd_configs():
         "BLOCK_N": 128,
         "waves_per_eu": 2,
         "PRE_LOAD_V": False,
-        "num_stages": 5,
+        "num_stages": 3,
         "num_warps": 8,
     }
 
 
 def get_sage_fwd_configs(sage_version=Sage_version.V1):
-    return (
+    config =  (
         _get_sage_v1_fwd_configs()
         if sage_version == Sage_version.V1
         else _get_sage_v2_fwd_configs()
     )
+    # print("config", config)
+    return config
 
 
 @triton.jit

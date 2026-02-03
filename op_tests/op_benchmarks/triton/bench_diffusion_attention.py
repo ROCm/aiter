@@ -548,11 +548,13 @@ def bench_kernel(q, k, v, args, provider):
         _, HK, N_CTX_K, D_HEAD_V = v.shape
     assert args.sage_version in [1, 2, 3], f"Unsupported sage version {args.sage_version}"
 
+
     sage_version = fav3_sage.Sage_version.V1
     if args.sage_version == 2:
         sage_version = fav3_sage.Sage_version.V2
     if args.sage_version == 3:
         sage_version = fav3_sage.Sage_version.V3
+
 
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = args.k_smooth
