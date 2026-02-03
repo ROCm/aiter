@@ -144,6 +144,7 @@ def _sage_fwd_no_mask_v3(
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
+    p_descale = tl.full((BLOCK_M, BLOCK_N//32), 1, dtype=tl.uint8)
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
@@ -228,14 +229,14 @@ def _sage_fwd_no_mask_v3(
         p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         # p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
         # fake quantization in order to estimate how fast it could be
-        e2m1_value = tl.reshape(
-            p, [BLOCK_M, BLOCK_N // 2, 2]
-        ).to(tl.uint8)
-        evens, odds = tl.split(e2m1_value)
-        p = evens | (odds << 4)
-        p_descale = tl.full((BLOCK_M, BLOCK_N//32), 1, dtype=tl.uint8)
-        
-        acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1")
+        # e2m1_value = tl.reshape(
+        #     p, [BLOCK_M, BLOCK_N // 2, 2]
+        # ).to(tl.uint8)
+        # evens, odds = tl.split(e2m1_value)
+        # p = evens | (odds << 4)
+        # p_descale = tl.full((BLOCK_M, BLOCK_N//32), 1, dtype=tl.uint8)
+        # tl.static_print("v_descale_ptr:", v_descale_ptr)
+        acc += tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1")
 
     return acc, l_i, m_i
 
@@ -297,7 +298,7 @@ def _sage_fwd_mask_v3(
     WINDOW_SIZE_RIGHT: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
-
+    p_descale = tl.full((BLOCK_M, BLOCK_N//32), 1, dtype=tl.uint8)
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
@@ -397,14 +398,14 @@ def _sage_fwd_mask_v3(
         p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         # p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
         # fake quantization in order to estimate how fast it could be
-        e2m1_value = tl.reshape(
-            p, [BLOCK_M, BLOCK_N // 2, 2]
-        ).to(tl.uint8)
-        evens, odds = tl.split(e2m1_value)
-        p = evens | (odds << 4)
-        p_descale = tl.full((BLOCK_M, BLOCK_N//32), 1, dtype=tl.uint8)
-
-        acc += tl.dot_scaled(p, p_descale, "e2m1", v, v_descale, "e2m1")
+        # e2m1_value = tl.reshape(
+        #     p, [BLOCK_M, BLOCK_N // 2, 2]
+        # ).to(tl.uint8)
+        # evens, odds = tl.split(e2m1_value)
+        # p = evens | (odds << 4)
+        # p_descale = tl.full((BLOCK_M, BLOCK_N//32), 1, dtype=tl.uint8)
+        # tl.static_print("v_descale_ptr:", v_descale_ptr)
+        acc += tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1")
 
     return acc, l_i, m_i
 
@@ -713,6 +714,7 @@ def sage_fwd_v3(
             + offs_d_vs[:, None]
         )
 
+
         acc, l_i, m_i = _sage_fwd_mask_v3(
             acc,
             l_i,
@@ -788,6 +790,8 @@ def sage_fwd_v3(
             + offs_d_vs[:, None]
         )
 
+        # tl.static_print("v_descale_ptr before no_mask:", v_descale_ptr)
+
         acc, l_i, m_i = _sage_fwd_no_mask_v3(
             acc,
             l_i,
@@ -859,9 +863,10 @@ def sage_fwd_v3(
         v_descale_ptr = (
             V_Descale
             + v_descale_offset
-            + (block_min//SCALE_GROUP_SIZE + offs_n[None, :]) * stride_vsn
+            + (block_min//SCALE_GROUP_SIZE + offs_vsn[None, :]) * stride_vsn
             + offs_d_vs[:, None]
         )
+        # tl.static_print("v_descale_ptr before mask:", v_descale_ptr)
         acc, l_i, m_i = _sage_fwd_mask_v3(
             acc,
             l_i,
