@@ -1266,7 +1266,7 @@ def _flash_attn_forward(
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (q_descale is not None)
         # support per tensor and per head quant scale
-        ret = ret and (q_descale.dim() == 2 and q_descale.shape == (batch_size, nhead_k))
+        # ret = ret and (q_descale.dim() == 2 and q_descale.shape == (batch_size, nhead_k))
         return ret
 
     def can_impl_fmha_v3_fwd():
@@ -2011,7 +2011,7 @@ def _flash_attn_varlen_forward(
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (q_descale is not None)
         # support per tensor and per head quant scale
-        ret = ret and (q_descale.dim() == 2 and q_descale.shape == (batch_size, nhead_k))
+        # ret = ret and (q_descale.dim() == 2 and q_descale.shape == (batch_size, nhead_k))
         return ret
 
     def can_impl_fmha_v3_fwd():
