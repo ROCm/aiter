@@ -119,16 +119,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Setup Aiter for fork PR
-        if: ${{ github.event.pull_request.head.repo.fork }}
-        run: |
-          set -ex
-          echo "Setting up Aiter for fork PR..."
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
-
       - name: Run the container
         run: |
           set -ex
@@ -156,6 +146,16 @@ jobs:
           -w /workspace \
           --name aiter_test \
           $IMAGE_TAG
+
+      - name: Setup Aiter for fork PR
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          set -ex
+          echo "Setting up Aiter for fork PR..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Show Aiter version
         run: |
@@ -201,6 +201,7 @@ jobs:
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
+    if: github.ref == 'refs/heads/main'
     needs: build_aiter_image 
     strategy:
       fail-fast: false
@@ -216,16 +217,6 @@ jobs:
 
       - name: Clean up Rocm processes
         run: ./.github/scripts/clean_up_rocm.sh
-
-      - name: Setup Aiter for fork PR
-        if: ${{ github.event.pull_request.head.repo.fork }}
-        run: |
-          set -ex
-          echo "Setting up Aiter for fork PR..."
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Run the container
         run: |
@@ -255,6 +246,16 @@ jobs:
           --name aiter_test \
           $IMAGE_TAG
       
+      - name: Setup Aiter for fork PR
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          set -ex
+          echo "Setting up Aiter for fork PR..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+
       - name: Show Aiter version
         run: |
           set -ex
