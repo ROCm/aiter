@@ -180,9 +180,12 @@ def fused_mhc(
     # Pop block sizes from config, or compute defaults
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     # BLOCK_N: Column tile size (must be power of 2 for Triton arange)
-    # fit both input weights and output matrix
-    BLOCK_N = max(n_factorial, n_squared) if hres_lite_mode else n_squared
-    BLOCK_N = triton.next_power_of_2(BLOCK_N)
+    # Allow config to override for different problem sizes (e.g., BLOCK_N=32 for small C)
+    if hres_lite_mode:
+        BLOCK_N = config.pop("BLOCK_N", 16)  # Default to 16, but configurable per C value
+    else:
+        # For sinkhorn mode, fit the n² output matrix (ignore config)
+        BLOCK_N = triton.next_power_of_2(n_squared)
     # Ensure BLOCK_K doesn't exceed K dimension
     BLOCK_K = config.pop("BLOCK_K", 64)
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
