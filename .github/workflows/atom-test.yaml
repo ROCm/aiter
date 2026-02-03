@@ -108,8 +108,6 @@ jobs:
           cat /tmp/env_file.txt
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
-          -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-          -w /workspace \
           --ipc=host --group-add video \
           --shm-size=16G \
           --privileged \
@@ -121,7 +119,7 @@ jobs:
           -e ATOM_DISABLE_MMAP=true \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
-          --name atom_test \
+          --name atom_aiter_test \
           rocm/aiter-ci:atom-test
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
@@ -129,11 +127,11 @@ jobs:
       - name: Check shm size
         run: |
           df -h /dev/shm
-          docker exec atom_test df -h /dev/shm
+          docker exec atom_aiter_test df -h /dev/shm
     
       - name: Check version
         run: |
-          docker exec atom_test bash -lc "pip show amd-aiter atom && pip list"
+          docker exec atom_aiter_test bash -lc "pip show amd-aiter atom && pip list"
 
       - name: Run ATOM simple inference
         timeout-minutes: 30
@@ -146,7 +144,7 @@ jobs:
           model_path="${{ matrix.model_path }}"
           echo "Model path: $model_path"
 
-          docker exec atom_test bash -lc "
+          docker exec atom_aiter_test bash -lc "
             set -euo pipefail
             python3 -m atom.examples.simple_inference \
               --model \"$model_path\" \
@@ -166,12 +164,12 @@ jobs:
           echo ""
           echo "========== Launching ATOM server =========="
           model_path="${{ matrix.model_path }}"
-          docker exec atom_test bash -lc "
+          docker exec atom_aiter_test bash -lc "
             .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
           "
           echo ""
           echo "========== Running accuracy test =========="
-          docker exec atom_test bash -lc "
+          docker exec atom_aiter_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           "
 
@@ -185,5 +183,5 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          docker stop atom_test || true
-          docker rm atom_test || true
+          docker stop atom_aiter_test || true
+          docker rm atom_aiter_test || true
