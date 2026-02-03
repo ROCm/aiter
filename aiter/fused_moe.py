@@ -19,10 +19,14 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
+from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
 
-
+# Optional one-time in-place preshuffle for FlyDSL.
+# NOTE: This mutates weight tensors in-place (layout changes). Only enable if you
+# intend to run FlyDSL kernels (and not CK kernels that expect the original layout).
+_FLYDSL_SHUFFLED_WEIGHT_PTRS: set[int] = set()
 def moe_sorting(
     topk_ids,
     topk_weights,
@@ -103,6 +107,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    use_flydsl: bool = False,
 ):
     # fast path for small batches
     if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
@@ -165,6 +170,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        use_flydsl=use_flydsl,
     )
 
 
@@ -192,6 +198,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    use_flydsl: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -226,6 +233,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    use_flydsl: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -278,6 +286,18 @@ def fused_moe_(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        _env_policy_tag="|".join(
+            [
+                os.environ.get("AITER_USE_FLYDSL_MOE", ""),
+                os.environ.get("AITER_FLYDSL_MOE_MIN_TOKENS", ""),
+                os.environ.get("AITER_FLYDSL_MOE_ALLOW_SMALL", ""),
+                os.environ.get("AITER_USE_FLYDSL_MOE_STAGE1", ""),
+                os.environ.get("AITER_USE_FLYDSL_MOE_STAGE2", ""),
+                os.environ.get("AITER_FLYDSL_MOE_BLOCK_M", ""),
+                os.environ.get("AITER_FLYDSL_MOE_COMPACT_EXPERTS", ""),
+                os.environ.get("AITER_FLYDSL_MOE_COMPACT_MAX_TOKENS", ""),
+            ]
+        ),
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -351,6 +371,7 @@ def fused_moe_(
             intermediate_pad=intermediate_pad,
             bias1=bias1,
             bias2=bias2,
+            use_flydsl=use_flydsl,
         )
 
 
@@ -623,6 +644,9 @@ def get_2stage_cfgs(
     doweight_stage1,
     hidden_pad,
     intermediate_pad,
+    # IMPORTANT: include env-controlled routing into cache key.
+    # Otherwise switching env vars (FlyDSL on/off, min tokens, etc.) would reuse stale metadata.
+    _env_policy_tag: str = "",
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -850,22 +874,86 @@ def get_2stage_cfgs(
             ]
         )
     ):
-        return MOEMetadata(
+        # FlyDSL MoE 2-stage path (optional, env-controlled)
+        #
+        # IMPORTANT: default is **disabled** for safety/stability. Enable explicitly via
+        # `export AITER_USE_FLYDSL_MOE=1` when you want to try the FlyDSL kernels.
+        use_flydsl_stage2 = (
+            os.environ.get("AITER_USE_FLYDSL_MOE", "1")
+            in ("1", "true", "True", "YES", "yes")
+            and q_type == QuantType.per_Token
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp8
+            and use_g1u1
+            and activation == ActivationType.Silu
+        )
+        use_flydsl_stage1 = use_flydsl_stage2
+
+        # Allow overriding stage1/stage2 independently for debugging:
+        #   export AITER_USE_FLYDSL_MOE_STAGE1=0/1
+        #   export AITER_USE_FLYDSL_MOE_STAGE2=0/1
+        def _env_bool(name: str, default: bool) -> bool:
+            v = os.environ.get(name, None)
+            if v is None:
+                return default
+            return str(v) in ("1", "true", "True", "YES", "yes")
+
+        use_flydsl_stage1 = _env_bool("AITER_USE_FLYDSL_MOE_STAGE1", use_flydsl_stage1)
+        use_flydsl_stage2 = _env_bool("AITER_USE_FLYDSL_MOE_STAGE2", use_flydsl_stage2)
+
+        # Keep FlyDSL block_m consistent with the selected block_m (used by
+        # moe_sorting) unless explicitly overridden. Changing block_m changes the
+        # sorting layout, so defaulting to a fixed value can break correctness.
+        default_flydsl_block_m = int(block_m) if block_m is not None else 64
+        flydsl_block_m = int(
+            os.environ.get("AITER_FLYDSL_MOE_BLOCK_M", str(default_flydsl_block_m))
+        )
+        if flydsl_block_m <= 0:
+            flydsl_block_m = default_flydsl_block_m
+        stage1_func = (
             functools.partial(
+                flydsl_moe_stage1,
+                kernelName=kernelName1,
+                activation=activation,
+                quant_type=q_type,
+                splitk=int(ksplit),
+                dtype=dtype,
+            )
+            if use_flydsl_stage1
+            else functools.partial(
                 ck_moe_stage1,
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
                 dtype=dtype,
                 splitk=ksplit,
-            ),
+            )
+        )
+        stage2_func = (
             functools.partial(
+                flydsl_moe_stage2,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+            )
+            if use_flydsl_stage2
+            else functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
-            ),
-            block_m,
+            )
+        )
+        if use_flydsl_stage1 or use_flydsl_stage2:
+            logger.info(
+                "[fused_moe] enable FlyDSL stage1/stage2 (block_m=%s, ksplit=%s)",
+                flydsl_block_m,
+                int(ksplit),
+            )
+        return MOEMetadata(
+            stage1_func,
+            stage2_func,
+            flydsl_block_m if use_flydsl_stage1 else block_m,
             int(ksplit),
             run_1stage,
         )
@@ -923,6 +1011,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    use_flydsl: bool = False,
 ):
     quant_func = get_quant(quant_type)
     token_num_quant_moe_sort_switch = 1024
@@ -945,6 +1034,18 @@ def fused_moe_2stages(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        _env_policy_tag="|".join(
+            [
+                os.environ.get("AITER_USE_FLYDSL_MOE", ""),
+                os.environ.get("AITER_FLYDSL_MOE_MIN_TOKENS", ""),
+                os.environ.get("AITER_FLYDSL_MOE_ALLOW_SMALL", ""),
+                os.environ.get("AITER_USE_FLYDSL_MOE_STAGE1", ""),
+                os.environ.get("AITER_USE_FLYDSL_MOE_STAGE2", ""),
+                os.environ.get("AITER_FLYDSL_MOE_BLOCK_M", ""),
+                os.environ.get("AITER_FLYDSL_MOE_COMPACT_EXPERTS", ""),
+                os.environ.get("AITER_FLYDSL_MOE_COMPACT_MAX_TOKENS", ""),
+            ]
+        ),
     )
     if (
         quant_type == QuantType.per_1x32
@@ -987,7 +1088,7 @@ def fused_moe_2stages(
                 quant_dtype=q_dtype_a,
                 num_rows=num_local_tokens,
             )
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = moe_mxfp4_sort(
                 a1_scale,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
@@ -1088,7 +1189,7 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
                 num_rows_factor=topk,
             )
-            a2_scale = fp4_utils.moe_mxfp4_sort(
+            a2_scale = moe_mxfp4_sort(
                 a2_scale[: token_num * topk, :].view(token_num, topk, -1),
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
@@ -1588,6 +1689,342 @@ def cktile_moe_stage1(
     return out
 
 
+def flydsl_moe_stage1(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    block_m,
+    a1_scale,
+    w1_scale,
+    sorted_weights=None,
+    kernelName="",
+    quant_type=aiter.QuantType.No,
+    activation=ActivationType.Silu,
+    splitk: int = 1,
+    dtype=None,
+    **_kwargs,
+):
+    if a1_scale is None or w1_scale is None:
+        raise RuntimeError("FlyDSL stage1 requires a1_scale and w1_scale")
+
+    token_num = hidden_states.shape[0]
+    E, w1_n, model_dim = w1.shape
+    inter_dim = w2.shape[2]
+    if w1_n != 2 * inter_dim:
+        raise ValueError(
+            f"FlyDSL stage1 expects G1U1 weights (w1_n == 2*inter_dim), got w1.shape={w1.shape}, w2.shape={w2.shape}"
+        )
+
+    tile_m = int(block_m) if block_m is not None else 64
+    tile_n = 64 # 128
+    tile_k = 128
+    # Decode/small-token fix (NO kernel changes):
+    # FlyDSL stage1 kernel expects CK-style preshuffled W1 layout, but model weights are not
+    # preshuffled. For small tokens, only a handful of experts are actually touched.
+    #
+    # We slice only the active experts, preshuffle that small slice, and remap expert ids
+    # to a compact [0..E_active) range. This keeps decode on FlyDSL but avoids full-weight
+    # preshuffle/copies (which would be prohibitively expensive).
+    _compact = os.environ.get("AITER_FLYDSL_MOE_COMPACT_EXPERTS", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    try:
+        _compact_max_tokens = int(os.environ.get("AITER_FLYDSL_MOE_COMPACT_MAX_TOKENS", "256"))
+    except Exception:
+        _compact_max_tokens = 256
+    if _compact and int(token_num) <= int(_compact_max_tokens) and num_valid_ids is not None:
+        try:
+            from aiter.ops.shuffle import shuffle_weight  # type: ignore
+
+            # num_valid_ids[0] is the max valid sorted rows (padded length).
+            valid_rows = int(num_valid_ids[0].item())
+            if valid_rows > 0:
+                num_blocks = (valid_rows + int(tile_m) - 1) // int(tile_m)
+                num_blocks = min(int(num_blocks), int(sorted_expert_ids.numel()))
+                if num_blocks > 0:
+                    blk_eids = sorted_expert_ids[:num_blocks].to(torch.int64)
+                    # Keep order stable: experts are already grouped; unique_consecutive is enough.
+                    uniq_eids = torch.unique_consecutive(blk_eids)
+                    # Remap each block expert id -> [0..E_active)
+                    # Build mapping via searchsorted on uniq (since uniq is in encounter order, not sorted).
+                    # For small decode, uniq_eids is tiny; use a small loop for clarity.
+                    remap = {}
+                    for i in range(int(uniq_eids.numel())):
+                        remap[int(uniq_eids[i].item())] = i
+                    mapped = torch.empty_like(blk_eids, dtype=torch.int32)
+                    for i in range(int(blk_eids.numel())):
+                        mapped[i] = int(remap[int(blk_eids[i].item())])
+                    sorted_expert_ids = torch.cat(
+                        [mapped.to(sorted_expert_ids.dtype), sorted_expert_ids[num_blocks:]],
+                        dim=0,
+                    )
+
+                    # Slice weights/scales to active experts only.
+                    w1 = w1.index_select(0, uniq_eids).contiguous()
+                    w2 = w2.index_select(0, uniq_eids).contiguous()
+                    if w1_scale is not None:
+                        w1_scale = w1_scale.index_select(0, uniq_eids).contiguous()
+                    # Note: stage1 does not use w2_scale; do not touch it here.
+
+                    # Preshuffle the *small* sliced weights to match FlyDSL's expected layout.
+                    w1 = shuffle_weight(w1, layout=(16, 16))
+                    w2 = shuffle_weight(w2, layout=(16, 16))
+                    E = int(w1.shape[0])
+        except Exception as e:
+            logger.warning("[flydsl] compact-experts stage1 path failed (ignored): %s", str(e))
+
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    blocks = int(sorted_eids.numel())
+
+    # FlyDSL kernels expect `num_valid_ids[0]` == max valid sorted rows (padded length).
+    # Some builds return a length-2 tensor; keep only the first element to avoid ambiguity.
+    if num_valid_ids is not None and num_valid_ids.numel() > 1:
+        num_valid_ids = num_valid_ids[:1].contiguous()
+
+    if sorted_weights is None:
+        sorted_w = torch.zeros(
+            sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device
+        )
+        doweight_stage1 = False
+    else:
+        sorted_w = sorted_weights
+        doweight_stage1 = True
+
+    debug_flydsl = os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1"
+    if debug_flydsl:
+        logger.info(
+            "[flydsl] stage1 inputs: tokens=%d topk=%d model_dim=%d inter_dim=%d block_m=%d",
+            token_num,
+            topk,
+            model_dim,
+            inter_dim,
+            tile_m,
+        )
+
+    x_q = hidden_states.contiguous().view(token_num, model_dim)
+    # FlyDSL kernels take f32 scales. Some upstream paths may provide fp16/fp8 scales;
+    # always upcast to f32 to avoid reinterpret-cast bugs.
+    scale_x_1d = a1_scale.view(-1).contiguous().to(torch.float32)
+    w1_flat = w1.contiguous().view(E * (2 * inter_dim), model_dim)
+    w1_scale_1d = w1_scale.view(-1).contiguous().to(torch.float32)
+
+    import sys
+
+    DSL2_ROOT = os.environ.get("DSL2_ROOT", None)
+    if not DSL2_ROOT:
+        raise RuntimeError(
+            "FlyDSL path not found. Please set environment variable, e.g. "
+            "`export DSL2_ROOT=/path/to/FlyDSL`"
+        )
+    if DSL2_ROOT not in sys.path:
+        sys.path.insert(0, DSL2_ROOT)
+
+    from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
+
+    # Keep output dtype consistent with the provided `out` tensor to avoid
+    # silent dtype mismatch (which can affect numerical results/precision).
+    if out.dtype in (torch.bfloat16, dtypes.bf16):
+        out_dtype = "bf16"
+    elif out.dtype in (torch.float16, dtypes.fp16):
+        out_dtype = "f16"
+    else:
+        raise ValueError(
+            f"FlyDSL stage1 only supports out dtype in (fp16, bf16), got {out.dtype}"
+        )
+    exe1 = compile_moe_gemm1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=bool(doweight_stage1),
+        in_dtype="fp8",
+        out_dtype=out_dtype,
+        use_cshuffle_epilog=False,
+    )
+    exe1(
+        out,
+        x_q,
+        w1_flat,
+        scale_x_1d,
+        w1_scale_1d,
+        sorted_ids,
+        sorted_eids,
+        sorted_w.view(-1).contiguous(),
+        num_valid_ids,
+        token_num,
+        inter_dim,
+        model_dim,
+        int(blocks),
+    )
+
+    # Debug hook: run CK in parallel and diff (small tokens only).
+    # Enable with:
+    #   export AITER_FLYDSL_MOE_COMPARE=1
+    # Optional knobs:
+    #   export AITER_FLYDSL_MOE_COMPARE_MAX_TOKENS=256
+    #   export AITER_FLYDSL_MOE_COMPARE_STAGE1=1
+    #   export AITER_FLYDSL_MOE_COMPARE_ASSERT=1
+    #   export AITER_FLYDSL_MOE_COMPARE_MAX_ABS=<float>
+    try:
+        _cmp = os.environ.get("AITER_FLYDSL_MOE_COMPARE", "0") in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        )
+        _cmp_s1 = os.environ.get("AITER_FLYDSL_MOE_COMPARE_STAGE1", "1") in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        )
+        _cmp_max_tokens = int(os.environ.get("AITER_FLYDSL_MOE_COMPARE_MAX_TOKENS", "256"))
+    except Exception:
+        _cmp = False
+        _cmp_s1 = False
+        _cmp_max_tokens = 0
+    if _cmp and _cmp_s1 and int(token_num) <= int(_cmp_max_tokens):
+        out_ck = torch.empty_like(out)
+        ck_moe_stage1(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            out=out_ck,
+            topk=topk,
+            block_m=block_m,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+            kernelName=kernelName,
+            sorted_weights=sorted_weights,
+            quant_type=quant_type,
+            activation=activation,
+            splitk=int(splitk),
+            dtype=dtype,
+        )
+        diff = (out.to(torch.float32) - out_ck.to(torch.float32)).abs()
+        max_abs = float(diff.max().item()) if diff.numel() else 0.0
+        mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+        if diff.numel():
+            flat_idx = int(diff.view(-1).argmax().item())
+            t = flat_idx // (int(topk) * int(inter_dim))
+            rem = flat_idx % (int(topk) * int(inter_dim))
+            s = rem // int(inter_dim)
+            d = rem % int(inter_dim)
+        else:
+            t = s = d = 0
+        logger.warning(
+            "[flydsl-compare][stage1] tokens=%d topk=%d inter=%d kernel=%s max_abs=%.6g mean_abs=%.6g argmax=(t=%d,s=%d,d=%d)",
+            int(token_num),
+            int(topk),
+            int(inter_dim),
+            str(kernelName),
+            max_abs,
+            mean_abs,
+            int(t),
+            int(s),
+            int(d),
+        )
+
+        # Optional verbose info + shuffle experiments for diagnosing layout mismatches.
+        _verbose = os.environ.get("AITER_FLYDSL_MOE_COMPARE_VERBOSE", "0") in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        )
+        if _verbose:
+            logger.warning(
+                "[flydsl-compare][stage1][meta] w1.dtype=%s w2.dtype=%s a1_scale.dtype=%s a1_scale.shape=%s w1_scale.dtype=%s w1_scale.shape=%s w1.is_shuffled=%s",
+                str(getattr(w1, "dtype", None)),
+                str(getattr(w2, "dtype", None)),
+                str(getattr(a1_scale, "dtype", None)),
+                str(tuple(a1_scale.shape) if hasattr(a1_scale, "shape") else None),
+                str(getattr(w1_scale, "dtype", None)),
+                str(tuple(w1_scale.shape) if hasattr(w1_scale, "shape") else None),
+                str(getattr(w1, "is_shuffled", None)),
+            )
+
+            _try_shuf = os.environ.get("AITER_FLYDSL_MOE_STAGE1_TRY_W1_SHUFFLE", "0") in (
+                "1",
+                "true",
+                "True",
+                "YES",
+                "yes",
+            )
+            if _try_shuf:
+                try:
+                    from aiter.ops.shuffle import shuffle_weight  # type: ignore
+
+                    _layout_s = os.environ.get("AITER_FLYDSL_MOE_STAGE1_W1_SHUFFLE_LAYOUT", "16,16")
+                    parts = [p.strip() for p in str(_layout_s).split(",") if p.strip()]
+                    layout = (int(parts[0]), int(parts[1])) if len(parts) == 2 else (16, 16)
+                    w1_shuf = shuffle_weight(w1, layout=layout)
+                    w1_shuf_flat = w1_shuf.contiguous().view(E * (2 * inter_dim), model_dim)
+                    out_try = torch.empty_like(out)
+                    exe1(
+                        out_try,
+                        x_q,
+                        w1_shuf_flat,
+                        scale_x_1d,
+                        w1_scale_1d,
+                        sorted_ids,
+                        sorted_eids,
+                        sorted_w.view(-1).contiguous(),
+                        num_valid_ids,
+                        token_num,
+                        inter_dim,
+                        model_dim,
+                        int(blocks),
+                    )
+                    diff2 = (out_try.to(torch.float32) - out_ck.to(torch.float32)).abs()
+                    max_abs2 = float(diff2.max().item()) if diff2.numel() else 0.0
+                    mean_abs2 = float(diff2.mean().item()) if diff2.numel() else 0.0
+                    logger.warning(
+                        "[flydsl-compare][stage1][try_w1_shuffle] layout=%s max_abs=%.6g mean_abs=%.6g",
+                        str(layout),
+                        max_abs2,
+                        mean_abs2,
+                    )
+                except Exception as e:
+                    logger.warning("[flydsl-compare][stage1][try_w1_shuffle] failed: %s", str(e))
+        try:
+            _max_allow = float(os.environ.get("AITER_FLYDSL_MOE_COMPARE_MAX_ABS", "0.5"))
+            _do_assert = os.environ.get("AITER_FLYDSL_MOE_COMPARE_ASSERT", "0") in (
+                "1",
+                "true",
+                "True",
+                "YES",
+                "yes",
+            )
+        except Exception:
+            _max_allow = 0.5
+            _do_assert = False
+        if _do_assert and max_abs > _max_allow:
+            raise RuntimeError(
+                f"[flydsl-compare][stage1] max_abs={max_abs} exceeds threshold={_max_allow} (kernel={kernelName})"
+            )
+    return out
+
+
 def cktile_moe_stage2(
     a2,
     w1,
@@ -1636,6 +2073,236 @@ def cktile_moe_stage2(
         activation,
         block_m,
     )
+    return out
+
+
+def flydsl_moe_stage2(
+    a2,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    w2_scale,
+    a2_scale,
+    block_m,
+    sorted_weights=None,
+    kernelName="",
+    quant_type=aiter.QuantType.No,
+    activation=ActivationType.Silu,
+    **_kwargs,
+):
+    if w2_scale is None or a2_scale is None:
+        raise RuntimeError("FlyDSL stage2 requires a2_scale and w2_scale")
+
+    token_num, _, inter_dim = a2.shape
+    model_dim = w2.shape[1]
+    E = w2.shape[0]
+    # Same compact-experts trick for stage2 (keep expert ids consistent).
+    _compact = os.environ.get("AITER_FLYDSL_MOE_COMPACT_EXPERTS", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    try:
+        _compact_max_tokens = int(os.environ.get("AITER_FLYDSL_MOE_COMPACT_MAX_TOKENS", "256"))
+    except Exception:
+        _compact_max_tokens = 256
+    if _compact and int(token_num) <= int(_compact_max_tokens) and num_valid_ids is not None:
+        try:
+            from aiter.ops.shuffle import shuffle_weight  # type: ignore
+
+            valid_rows = int(num_valid_ids[0].item())
+            if valid_rows > 0:
+                num_blocks = (valid_rows + int(block_m) - 1) // int(block_m)
+                num_blocks = min(int(num_blocks), int(sorted_expert_ids.numel()))
+                if num_blocks > 0:
+                    blk_eids = sorted_expert_ids[:num_blocks].to(torch.int64)
+                    uniq_eids = torch.unique_consecutive(blk_eids)
+                    remap = {}
+                    for i in range(int(uniq_eids.numel())):
+                        remap[int(uniq_eids[i].item())] = i
+                    mapped = torch.empty_like(blk_eids, dtype=torch.int32)
+                    for i in range(int(blk_eids.numel())):
+                        mapped[i] = int(remap[int(blk_eids[i].item())])
+                    sorted_expert_ids = torch.cat(
+                        [mapped.to(sorted_expert_ids.dtype), sorted_expert_ids[num_blocks:]],
+                        dim=0,
+                    )
+                    w2 = w2.index_select(0, uniq_eids).contiguous()
+                    if w2_scale is not None:
+                        w2_scale = w2_scale.index_select(0, uniq_eids).contiguous()
+                    # Keep w1 consistent if needed by downstream signatures
+                    try:
+                        w1 = w1.index_select(0, uniq_eids).contiguous()
+                    except Exception:
+                        pass
+                    w2 = shuffle_weight(w2, layout=(16, 16))
+                    E = int(w2.shape[0])
+        except Exception as e:
+            logger.warning("[flydsl] compact-experts stage2 path failed (ignored): %s", str(e))
+
+    tile_m = int(block_m) if block_m is not None else 64
+    tile_n = 256
+    tile_k = 64 # 128
+
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    blocks = int(sorted_eids.numel())
+
+    # FlyDSL kernels expect `num_valid_ids[0]` == max valid sorted rows (padded length).
+    if num_valid_ids is not None and num_valid_ids.numel() > 1:
+        num_valid_ids = num_valid_ids[:1].contiguous()
+
+    if sorted_weights is None:
+        sorted_w = torch.zeros(
+            sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device
+        )
+    else:
+        sorted_w = sorted_weights
+
+    a2_qt_flat = a2.contiguous().view(-1)
+    a2_scale_1d = a2_scale.view(-1).contiguous().to(torch.float32)
+    w2_flat = w2.contiguous().view(E * model_dim, inter_dim)
+    w2_scale_1d = w2_scale.view(-1).contiguous().to(torch.float32)
+
+    import sys
+
+    DSL2_ROOT = os.environ.get("DSL2_ROOT", None)
+    if not DSL2_ROOT:
+        raise RuntimeError(
+            "FlyDSL path not found. Please set environment variable, e.g. "
+            "`export DSL2_ROOT=/path/to/FlyDSL`"
+        )
+    if DSL2_ROOT not in sys.path:
+        sys.path.insert(0, DSL2_ROOT)
+
+    from kernels.moe_gemm_2stage import compile_moe_gemm2  # type: ignore
+
+    if out.dtype == dtypes.bf16:
+        out_dtype = "bf16"
+    elif out.dtype == dtypes.fp16:
+        out_dtype = "f16"
+    elif out.dtype == dtypes.fp32:
+        out_dtype = "f32"
+    else:
+        raise ValueError(
+            f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
+        )
+
+    # Debug hook: run CK in parallel and diff (small tokens only).
+    # We must capture the baseline output *before* running FlyDSL because stage2 may
+    # accumulate into `out` depending on kernel path.
+    try:
+        _cmp = os.environ.get("AITER_FLYDSL_MOE_COMPARE", "0") in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        )
+        _cmp_s2 = os.environ.get("AITER_FLYDSL_MOE_COMPARE_STAGE2", "1") in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        )
+        _cmp_max_tokens = int(os.environ.get("AITER_FLYDSL_MOE_COMPARE_MAX_TOKENS", "256"))
+    except Exception:
+        _cmp = False
+        _cmp_s2 = False
+        _cmp_max_tokens = 0
+    _do_cmp = _cmp and _cmp_s2 and int(token_num) <= int(_cmp_max_tokens)
+    out_base = out.clone() if _do_cmp else None
+
+    exe2 = compile_moe_gemm2(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage2=bool(sorted_weights is not None),
+        in_dtype="fp8",
+        out_dtype=out_dtype,
+    )
+    exe2(
+        out,
+        a2_qt_flat,
+        w2_flat.view(-1),
+        a2_scale_1d,
+        w2_scale_1d,
+        sorted_ids,
+        sorted_eids,
+        sorted_w.view(-1).contiguous(),
+        num_valid_ids,
+        token_num,
+        model_dim,
+        inter_dim,
+        int(blocks),
+    )
+    if _do_cmp:
+        out_ck = out_base.clone()  # type: ignore[union-attr]
+        aiter.ck_moe_stage2_fwd(
+            a2,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out_ck,
+            topk,
+            kernelName,
+            w2_scale,
+            a2_scale,
+            block_m,
+            sorted_weights,
+            quant_type,
+            activation,
+        )
+        diff = (out.to(torch.float32) - out_ck.to(torch.float32)).abs()
+        max_abs = float(diff.max().item()) if diff.numel() else 0.0
+        mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+        if diff.numel():
+            flat_idx = int(diff.view(-1).argmax().item())
+            t = flat_idx // int(model_dim)
+            d = flat_idx % int(model_dim)
+        else:
+            t = d = 0
+        logger.warning(
+            "[flydsl-compare][stage2] tokens=%d topk=%d model=%d inter=%d kernel=%s max_abs=%.6g mean_abs=%.6g argmax=(t=%d,d=%d)",
+            int(token_num),
+            int(topk),
+            int(model_dim),
+            int(inter_dim),
+            str(kernelName),
+            max_abs,
+            mean_abs,
+            int(t),
+            int(d),
+        )
+        try:
+            _max_allow = float(os.environ.get("AITER_FLYDSL_MOE_COMPARE_MAX_ABS", "0.5"))
+            _do_assert = os.environ.get("AITER_FLYDSL_MOE_COMPARE_ASSERT", "0") in (
+                "1",
+                "true",
+                "True",
+                "YES",
+                "yes",
+            )
+        except Exception:
+            _max_allow = 0.5
+            _do_assert = False
+        if _do_assert and max_abs > _max_allow:
+            raise RuntimeError(
+                f"[flydsl-compare][stage2] max_abs={max_abs} exceeds threshold={_max_allow} (kernel={kernelName})"
+            )
     return out
 
 
