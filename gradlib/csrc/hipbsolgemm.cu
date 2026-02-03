@@ -483,6 +483,7 @@ void append_hip_tuning_csv(
   hipDataType C_data_type, int32_t ldc, int64_t stride_c,
   hipblasComputeType_t compute_type, int32_t batch_count, bool write_header_if_missing) {
     
+  /*
   std::ifstream infile(filename, std::ios::ate);
   std::ofstream file(filename, std::ios::app);
   
@@ -574,6 +575,73 @@ void append_hip_tuning_csv(
   file << oss.str();
 
   file.close();
+  */
+    int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+
+    flock(fd, LOCK_EX);
+
+    bool need_header = false;
+    off_t file_size = lseek(fd, 0, SEEK_END);
+    if (file_size == 0 && write_header_if_missing) {
+        need_header = true;
+    }
+
+    std::ostringstream oss;
+
+    if (need_header) {
+        oss << "preshuffle, use_rowwise, trans_a, trans_b, m, n, k, "
+               "A_data_type, lda, stride_a, "
+               "B_data_type, ldb, stride_b, "
+               "C_data_type, ldc, stride_c, "
+               "compute_type, batch_count, algo_index, kernel_name\n";
+    }
+
+    int algo_index = hipblaslt_ext::getIndexFromAlgo(algo);
+    std::string kernel_name =
+        std::string(hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, algo));
+
+    auto boolToString = [](bool val) -> const char* {
+        return val ? "true" : "false";
+    };
+
+    auto opToString = [](hipblasOperation_t op) -> const char* {
+        return (op == HIPBLAS_OP_T) ? "T" :
+               (op == HIPBLAS_OP_N) ? "N" : "<?>"; };
+
+    auto dataTypeToString = [](hipDataType t) -> const char* {
+        switch (t) {
+            case HIP_R_32F: return "f32_r";
+            case HIP_R_16F: return "f16_r";
+            case HIP_R_16BF: return "bf16_r";
+            case HIP_R_8F_E4M3_FNUZ: return "f8_e4m3_fnuz_r";
+            default: return "<?>"; }
+    };
+
+    auto computeTypeToString = [](hipblasComputeType_t t) -> const char* {
+        return (t == HIPBLAS_COMPUTE_32F) ? "f32_r" : "<?>"; };
+
+    oss << boolToString(bpreshuffle) << ","
+        << boolToString(use_rowwise) << ","
+        << opToString(trans_a) << ","
+        << opToString(trans_b) << ","
+        << m << "," << n << "," << k << ","
+        << dataTypeToString(A_data_type) << ","
+        << lda << "," << static_cast<long long>(stride_a) << ","
+        << dataTypeToString(B_data_type) << ","
+        << ldb << "," << static_cast<long long>(stride_b) << ","
+        << dataTypeToString(C_data_type) << ","
+        << ldc << "," << static_cast<long long>(stride_c) << ","
+        << computeTypeToString(compute_type) << ","
+        << batch_count << ","
+        << algo_index << ","
+        << kernel_name << "\n";
+
+    std::string out = oss.str();
+    write(fd, out.c_str(), out.size());
+
+    flock(fd, LOCK_UN);
+    close(fd);
 }
 
 /**
