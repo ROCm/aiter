@@ -57,6 +57,8 @@ namespace py = pybind11;
           py::arg("work_indptr"),              \
           py::arg("work_info_set"),            \
           py::arg("max_seqlen_q"),             \
+          py::arg("page_size"),                \
+          py::arg("nhead_kv"),                 \
           py::arg("softmax_scale"),            \
           py::arg("splitData"),                \
           py::arg("splitLse"),                 \
@@ -411,7 +413,8 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
-          py::arg("reg_buffer") = std::nullopt);                                               \
+          py::arg("reg_input_buffer") = std::nullopt,                                               \
+          py::arg("reg_output_buffer") = std::nullopt);                                               \
     m.def("fused_allreduce_rmsnorm",                                                           \
           &aiter::fused_allreduce_rmsnorm,                                                     \
           py::arg("_fa"),                                                                      \
@@ -427,9 +430,16 @@ namespace py = pybind11;
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
-    m.def("register_buffer",                                                                   \
-          &aiter::register_buffer,                                                             \
-          "register_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",             \
+    m.def("register_input_buffer",                                                                   \
+          &aiter::register_input_buffer,                                                             \
+          "register_input_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",             \
+          py::arg("_fa"),                                                                      \
+          py::arg("t"),                                                                        \
+          py::arg("handles"),                                                                  \
+          py::arg("offsets"));                                                                 \
+    m.def("register_output_buffer",                                                            \
+          &aiter::register_output_buffer,                                                      \
+          "register_output_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",      \
           py::arg("_fa"),                                                                      \
           py::arg("t"),                                                                        \
           py::arg("handles"),                                                                  \
@@ -1656,6 +1666,7 @@ namespace py = pybind11;
           "get_mla_metadata_v1",                         \
           py::arg("seqlens_qo_indptr"),                  \
           py::arg("seqlens_kv_indptr"),                  \
+          py::arg("kv_last_page_lens"),                  \
           py::arg("num_heads_per_head_k"),               \
           py::arg("num_heads_k"),                        \
           py::arg("is_causal"),                          \
@@ -1665,6 +1676,7 @@ namespace py = pybind11;
           py::arg("reduce_indptr"),                      \
           py::arg("reduce_final_map"),                   \
           py::arg("reduce_partial_map"),                 \
+          py::arg("page_size")           = 1,            \
           py::arg("kv_granularity")      = 16,           \
           py::arg("max_seqlen_qo")       = -1,           \
           py::arg("uni_seqlen_qo")       = -1,           \
@@ -1746,3 +1758,39 @@ namespace py = pybind11;
           py::arg("rowEnds")   = torch::Tensor(), \
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1);
+
+#define RMSNORM_QUANT_PYBIND                 \
+    m.def("add_rmsnorm_quant",               \
+          &aiter::add_rmsnorm_quant,         \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("residual_in"),            \
+          py::arg("residual_out"),           \
+          py::arg("scale"),                  \
+          py::arg("weight"),                 \
+          py::arg("epsilon"),                \
+          py::arg("group_size")    = 0,      \
+          py::arg("shuffle_scale") = false); \
+    m.def("add_rmsnorm",                     \
+          &aiter::add_rmsnorm,               \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("residual_in"),            \
+          py::arg("residual_out"),           \
+          py::arg("weight"),                 \
+          py::arg("epsilon"));               \
+    m.def("rmsnorm_quant",                   \
+          &aiter::rmsnorm_quant,             \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("scale"),                  \
+          py::arg("weight"),                 \
+          py::arg("epsilon"),                \
+          py::arg("group_size")    = 0,      \
+          py::arg("shuffle_scale") = false); \
+    m.def("rmsnorm",                         \
+          &aiter::rmsnorm,                   \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("weight"),                 \
+          py::arg("epsilon"));
