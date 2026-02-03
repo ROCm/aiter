@@ -126,6 +126,7 @@ jobs:
 
       - name: Check shm size
         run: |
+          df -h # for testing
           df -h /dev/shm
           docker exec atom_aiter_test df -h /dev/shm
     
