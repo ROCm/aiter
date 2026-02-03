@@ -119,6 +119,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      
       - name: Run the container
         run: |
           set -ex
@@ -216,8 +219,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Clean up Rocm processes
-        run: ./.github/scripts/clean_up_rocm.sh
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
 
       - name: Run the container
         run: |
