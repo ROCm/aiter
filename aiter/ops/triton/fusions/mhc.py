@@ -574,8 +574,9 @@ def mhc_lite(
     if out_res is None:
         out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
     
-    # Generate permutation matrices (cached)
-    perm_mats = _generate_permutation_matrices(n, x.device, x.dtype)
+    # Generate permutation matrices (cached) and flatten for efficient tl.dot
+    perm_mats = _generate_permutation_matrices(n, x.device, x.dtype)  # (n!, n, n)
+    perm_mats_flat = perm_mats.reshape(n_factorial, n_squared).contiguous()  # (n!, n²)
     
     # Find next power of 2 >= n_factorial for vectorized softmax
     n_factorial_pow2 = 1 << (n_factorial - 1).bit_length()
@@ -672,7 +673,7 @@ def mhc_lite(
             acc_post_partial,
             acc_res_partial,
             acc_sq_partial,
-            perm_mats,
+            perm_mats_flat,
             alpha_pre,
             alpha_post,
             alpha_res,
@@ -700,10 +701,9 @@ def mhc_lite(
             stride_acc_res_n=acc_res_partial.stride(2),  # n! dimension
             stride_acc_sq_k=acc_sq_partial.stride(0),
             stride_acc_sq_m=acc_sq_partial.stride(1),
-            # Permutation matrix strides
-            stride_perm_idx=perm_mats.stride(0),
-            stride_perm_row=perm_mats.stride(1),
-            stride_perm_col=perm_mats.stride(2),
+            # Permutation matrix strides (flattened: n!, n²)
+            stride_perm_fact=perm_mats_flat.stride(0),
+            stride_perm_elem=perm_mats_flat.stride(1),
             # Output strides
             stride_pre_m=out_pre.stride(0),
             stride_pre_n=out_pre.stride(1),
@@ -733,7 +733,7 @@ def mhc_lite(
             out_pre,
             out_post,
             out_res,
-            perm_mats,
+            perm_mats_flat,
             # Dimensions
             M=M,
             K=K,
@@ -758,10 +758,9 @@ def mhc_lite(
             stride_post_n=out_post.stride(1),
             stride_res_m=out_res.stride(0),
             stride_res_n=out_res.stride(1),
-            # Permutation matrix strides
-            stride_perm_idx=perm_mats.stride(0),
-            stride_perm_row=perm_mats.stride(1),
-            stride_perm_col=perm_mats.stride(2),
+            # Permutation matrix strides (flattened: n!, n²)
+            stride_perm_fact=perm_mats_flat.stride(0),
+            stride_perm_elem=perm_mats_flat.stride(1),
             # Block sizes
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,

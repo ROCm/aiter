@@ -502,7 +502,7 @@ def _mhc_lite_fused_kernel(
     out_pre_ptr,
     out_post_ptr,
     out_res_ptr,
-    perm_mats_ptr,     # (n!, n, n) permutation matrices
+    perm_mats_ptr,     # (n!, n²) flattened permutation matrices
     M: tl.constexpr,   # rows: x.shape[0] - the batch/sequence dimension
     K: tl.constexpr,   # input features: nC = x.shape[1]
     N: tl.constexpr,   # output features: n! + 2n - total output dimension
@@ -524,9 +524,8 @@ def _mhc_lite_fused_kernel(
     stride_post_n,
     stride_res_m,
     stride_res_n,
-    stride_perm_idx,
-    stride_perm_row,
-    stride_perm_col,
+    stride_perm_fact,  # stride for n! dimension of flattened perm_mats
+    stride_perm_elem,  # stride for n² dimension of flattened perm_mats
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -673,21 +672,17 @@ def _mhc_lite_fused_kernel(
         elem_indices = elem_start + tl.arange(0, BLOCK_N)
         elem_mask = elem_indices < n_squared
         
-        row_coords = elem_indices // n
-        col_coords = elem_indices % n
+        # Load permutation tile: (N_FACTORIAL_POW2, BLOCK_N) from flattened perm_mats (n!, n²)
+        perm_fact_idx = tl.arange(0, N_FACTORIAL_POW2)[:, None]
+        perm_elem_idx = elem_start + tl.arange(0, BLOCK_N)[None, :]
+        perm_tile = tl.load(
+            perm_mats_ptr + perm_fact_idx * stride_perm_fact + perm_elem_idx * stride_perm_elem,
+            mask=(perm_fact_idx < N_FACTORIAL) & (perm_elem_idx < n_squared),
+            other=0.0
+        ).to(tl.float32)
         
-        output = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        
-        # Weighted sum of permutation matrices using loop + fma
-        for perm_idx in tl.static_range(N_FACTORIAL):
-            perm_ptrs = perm_mats_ptr + perm_idx * stride_perm_idx + row_coords * stride_perm_row + col_coords * stride_perm_col
-            perm_vals = tl.load(perm_ptrs, mask=elem_mask, other=0.0).to(tl.float32)
-            
-            perm_indices = tl.arange(0, N_FACTORIAL_POW2)
-            weight_mask = perm_indices == perm_idx
-            perm_weights = tl.sum(tl.where(weight_mask[None, :], weights, 0.0), axis=1)
-            
-            output = tl.fma(perm_weights[:, None], perm_vals[None, :], output)
+        # Matrix multiply: (BLOCK_M, N_FACTORIAL_POW2) @ (N_FACTORIAL_POW2, BLOCK_N) -> (BLOCK_M, BLOCK_N)
+        output = tl.dot(weights, perm_tile, out_dtype=tl.float32)
         
         # Store H^res
         out_ptrs = out_res_ptr + rm[:, None] * stride_res_m + elem_indices[None, :] * stride_res_n
@@ -862,8 +857,8 @@ def _mhc_lite_fused_reduce_kernel(
     acc_post_ptr,     # (NUM_KSPLIT, M, n)
     acc_res_ptr,      # (NUM_KSPLIT, M, n!) - logits
     acc_sq_ptr,       # (NUM_KSPLIT, M)
-    # Permutation matrices
-    perm_mats_ptr,    # (n!, n, n)
+    # Permutation matrices (flattened)
+    perm_mats_ptr,    # (n!, n²) flattened permutation matrices
     # Parameters
     alpha_pre,
     alpha_post,
@@ -893,10 +888,9 @@ def _mhc_lite_fused_reduce_kernel(
     stride_acc_res_n,
     stride_acc_sq_k,
     stride_acc_sq_m,
-    # Permutation matrix strides
-    stride_perm_idx,
-    stride_perm_row,
-    stride_perm_col,
+    # Permutation matrix strides (flattened: n!, n²)
+    stride_perm_fact,  # stride for n! dimension
+    stride_perm_elem,  # stride for n² dimension
     # Output strides
     stride_pre_m,
     stride_pre_n,
@@ -987,26 +981,23 @@ def _mhc_lite_fused_reduce_kernel(
         sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
         weights = exp_shifted / sum_exp  # (BLOCK_M, N_FACTORIAL_POW2)
         
-        # STEP 3: Weighted sum of permutation matrices
+        # STEP 3: Weighted sum of permutation matrices using tl.dot
         # Compute which n² elements this program handles
         elem_start = local_pid_n * BLOCK_N
         elem_indices = elem_start + tl.arange(0, BLOCK_N)
         elem_mask = elem_indices < n_squared
         
-        row_coords = elem_indices // n
-        col_coords = elem_indices % n
+        # Load permutation tile: (N_FACTORIAL_POW2, BLOCK_N) from flattened perm_mats (n!, n²)
+        perm_fact_idx = tl.arange(0, N_FACTORIAL_POW2)[:, None]
+        perm_elem_idx = elem_start + tl.arange(0, BLOCK_N)[None, :]
+        perm_tile = tl.load(
+            perm_mats_ptr + perm_fact_idx * stride_perm_fact + perm_elem_idx * stride_perm_elem,
+            mask=(perm_fact_idx < N_FACTORIAL) & (perm_elem_idx < n_squared),
+            other=0.0
+        ).to(tl.float32)
         
-        output = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        
-        for perm_idx in tl.static_range(N_FACTORIAL):
-            perm_ptrs = perm_mats_ptr + perm_idx * stride_perm_idx + row_coords * stride_perm_row + col_coords * stride_perm_col
-            perm_vals = tl.load(perm_ptrs, mask=elem_mask, other=0.0).to(tl.float32)
-            
-            perm_indices = tl.arange(0, N_FACTORIAL_POW2)
-            weight_mask = perm_indices == perm_idx
-            perm_weights = tl.sum(tl.where(weight_mask[None, :], weights, 0.0), axis=1)
-            
-            output = tl.fma(perm_weights[:, None], perm_vals[None, :], output)
+        # Matrix multiply: (BLOCK_M, N_FACTORIAL_POW2) @ (N_FACTORIAL_POW2, BLOCK_N) -> (BLOCK_M, BLOCK_N)
+        output = tl.dot(weights, perm_tile, out_dtype=tl.float32)
         
         # Store H^res (already doubly stochastic)
         out_ptrs = out_res_ptr + rm[:, None] * stride_res_m + elem_indices[None, :] * stride_res_n
