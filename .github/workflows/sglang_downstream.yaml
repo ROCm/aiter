@@ -25,6 +25,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
@@ -50,6 +51,9 @@ jobs:
       - name: Clone sglang repo
         run: |
           git clone -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git
+
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
 
       - name: Pull SGlang base image
         run: |
@@ -100,7 +104,7 @@ jobs:
           --network=host \
           --shm-size 32g \
           --cap-add=SYS_PTRACE \
-          -e HF_TOKEN="${HF_TOKEN:-}" \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           --security-opt seccomp=unconfined \
           -w /sglang-checkout \
           --name sglang_aiter_test \
@@ -116,6 +120,8 @@ jobs:
       - name: Install dependencies
         run: |
           cd sglang
+          git config user.name "aiter-ci" && git config user.email "aiter-ci@amd.com"
+          git fetch origin 2c9b43b5135846f40f66c4e543589bf303c1c07c && git cherry-pick FETCH_HEAD # https://github.com/charlesHsuGG/sglang/commit/2c9b43b5135846f40f66c4e543589bf303c1c07c
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
           sed -i "4s/^GPU_ARCH=.*/GPU_ARCH=\"${GPU_ARCH_CI}\"/" scripts/ci/amd_ci_install_dependency.sh
           bash scripts/ci/amd_ci_install_dependency.sh
