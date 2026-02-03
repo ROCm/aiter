@@ -507,17 +507,6 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-    kv_granularity = (
-        (2**30)
-        if (
-            nhead == 32
-            and max_seqlen_qo == 4
-            and dtype == dtypes.fp8
-            and kvtype == dtypes.fp8
-        )
-        else max(page_size, 16)
-    )
-
     aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
