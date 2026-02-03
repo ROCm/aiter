@@ -34,6 +34,16 @@ jobs:
     runs-on: aiter-k8s-build
     needs: check-signal
     steps:
+      - name: Check whether it's a fork PR
+        run: |
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            echo "It's a fork PR"
+            exit 1
+          else
+            echo "It's not a fork PR"
+            exit 0
+          fi
+
       - name: Checkout code
         if: ${{ !github.event.pull_request.head.repo.fork }}
         uses: actions/checkout@v4
