@@ -33,18 +33,19 @@ jobs:
 
   atom_benchmark:
     needs: [check-signal]
+    name: ATOM Benchmark 
     strategy:
       fail-fast: false
       matrix:
         include:
           - model_name: "DeepSeek-R1-0528"
-            label: MI325 (8 GPU)
+            label: MI325
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             runner: aiter-8gpu-runner
           - model_name: "gpt-oss-120b"
-            label: MI355 (1 GPU)
+            label: MI355
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: |
@@ -117,6 +118,7 @@ jobs:
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
+          -e ATOM_DISABLE_MMAP=true \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom_test \
