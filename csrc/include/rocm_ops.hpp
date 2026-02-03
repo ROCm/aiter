@@ -1518,7 +1518,8 @@ namespace py = pybind11;
     m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);
+    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle); \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle", &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \

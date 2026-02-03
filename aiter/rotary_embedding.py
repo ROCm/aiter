@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from aiter import (
     dtypes,
     fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
+    fused_qk_norm_rope_cache_pts_quant_shuffle,
 )
 
 # from custom_op import CustomOp
@@ -1261,33 +1262,32 @@ class RotaryEmbeddingFusedQKNorm(nn.Module):
                 if return_kv
                 else None
             )
-            raise NotImplementedError("fused_rope_rms_set_kv not supported yet")
-            # fused_rope_rms_set_kv(
-            #     qkv,
-            #     q_weight,
-            #     k_weight,
-            #     self.cos_sin_cache,
-            #     positions,
-            #     num_tokens,
-            #     num_heads_q,
-            #     num_heads_k,
-            #     num_heads_v,
-            #     self.head_size,
-            #     self.is_neox_style,
-            #     eps,
-            #     q_out,
-            #     fused_set_kv_buffer_arg.kv_cache[0],
-            #     fused_set_kv_buffer_arg.kv_cache[1],
-            #     fused_set_kv_buffer_arg.cache_loc,
-            #     fused_set_kv_buffer_arg.k_scale,
-            #     fused_set_kv_buffer_arg.v_scale,
-            #     k_out,
-            #     v_out,
-            #     return_kv,
-            #     fused_set_kv_buffer_arg.use_shuffle_layout,
-            #     fused_set_kv_buffer_arg.block_size,
-            #     fused_set_kv_buffer_arg.x,
-            # )
+            fused_qk_norm_rope_cache_pts_quant_shuffle(
+                qkv,
+                q_weight,
+                k_weight,
+                self.cos_sin_cache,
+                positions,
+                num_tokens,
+                num_heads_q,
+                num_heads_k,
+                num_heads_v,
+                self.head_size,
+                self.is_neox_style,
+                eps,
+                q_out,
+                fused_set_kv_buffer_arg.kv_cache[0],
+                fused_set_kv_buffer_arg.kv_cache[1],
+                fused_set_kv_buffer_arg.cache_loc,
+                fused_set_kv_buffer_arg.k_scale,
+                fused_set_kv_buffer_arg.v_scale,
+                k_out,
+                v_out,
+                return_kv,
+                fused_set_kv_buffer_arg.use_shuffle_layout,
+                fused_set_kv_buffer_arg.block_size,
+                fused_set_kv_buffer_arg.x,
+            )
             if return_kv:
                 return q_out, k_out, v_out
             else:

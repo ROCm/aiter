@@ -371,7 +371,33 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
             x,
         )
     else:
-        raise NotImplementedError("not implemented")
+        # For non-mrope case, use fused_rope_rms_set_kv (now supports k_out/v_out)
+        aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            q_out,
+            k_cache,
+            v_cache,
+            kv_loc,
+            torch.tensor(k_scale),
+            torch.tensor(v_scale),
+            k_out,
+            v_out,
+            return_kv,
+            use_shuffle_layout,
+            block_size,
+            x,
+        )
     return None
 
 
@@ -680,6 +706,7 @@ if __name__ == "__main__":
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
     page_sizes = [16]  # Test two page sizes for shuffle layout
+
     for kv_cache_dtype in kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
             for use_shuffle_layout in use_shuffle_layouts:
@@ -709,3 +736,32 @@ if __name__ == "__main__":
                                             page_size=page_size,
                                             max_positions=args.max_positions,
                                         )
+
+    for kv_cache_dtype in kv_cache_dtypes:
+        for test_return_kv in test_return_kv_flags:
+            for use_shuffle_layout in use_shuffle_layouts:
+                # For shuffle layout, test both page sizes; for normal layout, skip page_size
+                page_size_list = page_sizes if use_shuffle_layout else [0]
+                for page_size in page_size_list:
+                    for is_neox_style in args.neox_style:
+                        for num_token in args.token:
+                            for num_head in args.head:
+                                for i, head_size in enumerate(args.head_sizes):
+                                    test_mrope_3d_rms_set_kv_shuffle(
+                                        args.dtype,
+                                        num_token,
+                                        num_head,
+                                        num_head,
+                                        num_head,
+                                        head_size,
+                                        is_neox_style,
+                                        None,
+                                        None,
+                                        eps=1e-6,
+                                        is_mrope=False,
+                                        kv_cache_dtype=kv_cache_dtype,
+                                        test_return_kv=test_return_kv,
+                                        use_shuffle_layout=use_shuffle_layout,
+                                        page_size=page_size,
+                                        max_positions=args.max_positions,
+                                    )
