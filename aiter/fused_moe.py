@@ -114,6 +114,9 @@ def fused_moe(
     topk_weight,
     topk_ids,
     expert_mask: Optional[torch.tensor] = None,  # EP
+    local_expert_hash: Optional[
+        torch.Tensor
+    ] = None,  # EP: pre-computed hash for optimization
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
@@ -144,6 +147,7 @@ def fused_moe(
         topk_weight=topk_weight,
         topk_ids=topk_ids,
         expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
         activation=activation.value,
         quant_type=quant_type.value,
         doweight_stage1=doweight_stage1,
@@ -170,6 +174,9 @@ def fused_moe_fake(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[
+        torch.Tensor
+    ] = None,  # EP: pre-computed hash for optimization
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
@@ -205,6 +212,9 @@ def fused_moe_(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[
+        torch.Tensor
+    ] = None,  # EP: pre-computed hash for optimization
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
@@ -340,6 +350,7 @@ def fused_moe_(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
             num_local_tokens=num_local_tokens,
             topk_ids=topk_ids,
             topk_weights=topk_weight,
@@ -968,6 +979,9 @@ def fused_moe_2stages(
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     expert_mask: Optional[torch.Tensor] = None,
+    local_expert_hash: Optional[
+        torch.Tensor
+    ] = None,  # EP: pre-computed hash for optimization
     num_local_tokens: Optional[torch.tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
@@ -1089,8 +1103,11 @@ def fused_moe_2stages(
             a1_scale = torch.empty((token_num * topk), dtype=dtypes.fp32, device=device)
 
             topk_ids_sq = topk_ids
-            local_expert_hash = None
-            if expert_mask is not None and smooth_a1.shape[0] != expert_mask.numel():
+            if (
+                local_expert_hash is None
+                and expert_mask is not None
+                and smooth_a1.shape[0] != expert_mask.numel()
+            ):
                 local_expert_hash = _get_local_expert_hash(expert_mask)
 
             # Call smooth_per_token_scaled_quant with proper layout transformations:
@@ -1272,7 +1289,9 @@ def fused_moe_2stages(
             )
             topk_ids_sq2 = topk_ids
             if expert_mask is not None and smooth_a2.shape[0] != expert_mask.numel():
-                topk_ids_sq2 = _get_local_expert_hash(expert_mask)[topk_ids_sq2]
+                if local_expert_hash is None:
+                    local_expert_hash = _get_local_expert_hash(expert_mask)
+                topk_ids_sq2 = local_expert_hash[topk_ids_sq2]
 
             aiter.smooth_per_token_scaled_quant(
                 a2_out,
