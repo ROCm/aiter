@@ -169,7 +169,7 @@ static CFG* get_cfg_stage2(torch::Tensor& inter_states,
 {
     if(inter_states.scalar_type() == at::ScalarType::Char &&
        w2.scalar_type() == at::ScalarType::Char && out.scalar_type() == at::ScalarType::BFloat16 &&
-       quant_type == QuantType::per_Token && !do_weight)
+       quant_type == QuantType::per_Token && do_weight)
     {
         return &cfg_fmoe_stage2_bf16_pertokenInt8_g1u1;
     }
@@ -262,19 +262,9 @@ void moe_stage1_g1u1(
     int model_dim  = input.size(-1);
     int hidden_dim = inter_dim;
 
-    int token_cnt;
-    // Handle [TOPK, BATCH, DIM] vs [BATCH, TOPK, DIM]
-    // token_cnt should be BATCH count based on Host Code implication
-    if(input.dim() == 3 && input.size(0) == out.size(1) && input.size(1) == out.size(0))
-    {
-        token_cnt = input.size(1);
-    }
-    else
-    {
-        token_cnt = input.size(0);
-    }
-    int topk = out.size(1);
-    int eprt = w1.size(0);
+    int token_cnt = input.size(-2);
+    int topk      = out.size(1);
+    int eprt      = w1.size(0);
 
     // User specified logic for gdy / sub_X_cnt calculation
     // sub_X -> block_m
@@ -323,15 +313,7 @@ void moe_stage1_g1u1(
                 " need block_m == ",
                 cfg.tile_m);
 
-    int stride_X;
-    if(input.dim() == 3 && input.size(0) == out.size(1) && input.size(1) == out.size(0))
-    {
-        stride_X = input.stride(1) * input.element_size();
-    }
-    else
-    {
-        stride_X = input.stride(0) * input.element_size();
-    }
+    int stride_X  = input.stride(-2) * input.element_size();
     int stride_GU = model_dim * w1.element_size();
 
     int stride_expert_GU    = stride_GU * inter_dim;
@@ -391,20 +373,20 @@ void moe_stage1_g1u1(
     int gdy = sz_stp; // sub_X_cnt;
     int gdz = k_num;
 
-    printf("#### stage1 arg start ############\n");
-    std::cout << "dim:" << args.dim << std::endl;
-    std::cout << "hidden:" << args.hidden_dim << std::endl;
-    std::cout << "token:" << args.token_cnt << std::endl;
-    std::cout << "eprt:" << args.eprt_cnt << std::endl;
-    std::cout << "Xs:" << args.Xs << std::endl;
-    std::cout << "GUs:" << args.GUs << std::endl;
-    std::cout << "Os:" << args.Os << std::endl;
-    std::cout << "eGUs:" << args.eGUs << std::endl;
-    std::cout << "GUQs:" << args.eGUQs << std::endl;
-    std::cout << "SMQs:" << args.eSMQs << std::endl;
-    std::cout << "topk:" << args.topk << std::endl;
-    std::cout << "splitk:" << args.splitk << std::endl;
-    printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    // printf("#### stage1 arg start ############\n");
+    // std::cout << "dim:" << args.dim << std::endl;
+    // std::cout << "hidden:" << args.hidden_dim << std::endl;
+    // std::cout << "token:" << args.token_cnt << std::endl;
+    // std::cout << "eprt:" << args.eprt_cnt << std::endl;
+    // std::cout << "Xs:" << args.Xs << std::endl;
+    // std::cout << "GUs:" << args.GUs << std::endl;
+    // std::cout << "Os:" << args.Os << std::endl;
+    // std::cout << "eGUs:" << args.eGUs << std::endl;
+    // std::cout << "GUQs:" << args.eGUQs << std::endl;
+    // std::cout << "SMQs:" << args.eSMQs << std::endl;
+    // std::cout << "topk:" << args.topk << std::endl;
+    // std::cout << "splitk:" << args.splitk << std::endl;
+    // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -433,8 +415,8 @@ void moe_stage2_g1u1(
     std::optional<torch::Tensor> sorted_weights =
         std::nullopt, // [max_num_tokens_padded], do_weight==true need
     QuantType quant_type      = QuantType::No,
-    ActivationType activation = ActivationType::Silu,
-    int splitk                = 1)
+    ActivationType activation = ActivationType::No,
+    int splitk                = 0)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inter_states));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -479,16 +461,7 @@ void moe_stage2_g1u1(
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
-    int token_cnt;
-
-    if(inter_states.dim() == 3)
-    {
-        token_cnt = inter_states.size(0);
-    }
-    else
-    {
-        token_cnt = inter_states.size(0);
-    }
+    int token_cnt = inter_states.size(0);
 
     int dim         = out.size(-1);
     int eprt        = w2.size(0);
@@ -553,30 +526,30 @@ void moe_stage2_g1u1(
     int gdy = sub_X_cnt;
     int gdz = k_num;
 
-    printf("#### stage2 arg start ############\n ");
-    printf("args.ptr_OBuffer  = %p\n", args.ptr_OBuffer);
-    printf("args.ptr_XBuffer  = %p\n", args.ptr_XBuffer);
-    printf("args.ptr_DBuffer  = %p\n", args.ptr_DBuffer);
-    printf("args.ptr_XCBuffer = %p\n", args.ptr_XCBuffer);
-    printf("args.ptr_ScaleXBuffer = %p\n", args.ptr_ScaleXBuffer);
-    printf("args.ptr_ScaleDBuffer = %p\n", args.ptr_ScaleDBuffer);
-    printf("args.ptr_STPBuffer = %p\n", args.ptr_STPBuffer);
-    printf("args.ptr_SEPBuffer = %p\n", args.ptr_SEPBuffer);
-    printf("args.dim = %u\n", args.dim);
-    printf("args.hidden_dim = %u\n", args.hidden_dim);
-    printf("args.token_cnt = %u\n", args.token_cnt);
-    printf("args.eprt_cnt = %u\n", args.eprt_cnt);
-    printf("args.stride_X = %u\n", args.stride_X);
-    printf("args.stride_D = %u\n", args.stride_D);
-    printf("args.stride_O = %u\n", args.stride_O);
-    printf("args.stride_expert_D = %u\n", args.stride_expert_D);
-    printf("args.stride_expert_scale_D = %u\n", args.stride_expert_scale_D);
-    printf("args.topk = %u\n", args.topk);
-    printf("args.splitk = %u\n", args.splitk);
-    printf("args.ptr_SWBuffer = %p\n", args.ptr_SWBuffer);
-    printf("gdx = %d\n", gdx);
-    printf("gdy = %d\n", gdy);
-    printf("gdz = %d\n", gdz);
+    // printf("#### stage2 arg start ############\n ");
+    // printf("args.ptr_OBuffer  = %p\n", args.ptr_OBuffer);
+    // printf("args.ptr_XBuffer  = %p\n", args.ptr_XBuffer);
+    // printf("args.ptr_DBuffer  = %p\n", args.ptr_DBuffer);
+    // printf("args.ptr_XCBuffer = %p\n", args.ptr_XCBuffer);
+    // printf("args.ptr_ScaleXBuffer = %p\n", args.ptr_ScaleXBuffer);
+    // printf("args.ptr_ScaleDBuffer = %p\n", args.ptr_ScaleDBuffer);
+    // printf("args.ptr_STPBuffer = %p\n", args.ptr_STPBuffer);
+    // printf("args.ptr_SEPBuffer = %p\n", args.ptr_SEPBuffer);
+    // printf("args.dim = %u\n", args.dim);
+    // printf("args.hidden_dim = %u\n", args.hidden_dim);
+    // printf("args.token_cnt = %u\n", args.token_cnt);
+    // printf("args.eprt_cnt = %u\n", args.eprt_cnt);
+    // printf("args.stride_X = %u\n", args.stride_X);
+    // printf("args.stride_D = %u\n", args.stride_D);
+    // printf("args.stride_O = %u\n", args.stride_O);
+    // printf("args.stride_expert_D = %u\n", args.stride_expert_D);
+    // printf("args.stride_expert_scale_D = %u\n", args.stride_expert_scale_D);
+    // printf("args.topk = %u\n", args.topk);
+    // printf("args.splitk = %u\n", args.splitk);
+    // printf("args.ptr_SWBuffer = %p\n", args.ptr_SWBuffer);
+    // printf("gdx = %d\n", gdx);
+    // printf("gdy = %d\n", gdy);
+    // printf("gdz = %d\n", gdz);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

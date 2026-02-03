@@ -1275,7 +1275,7 @@ namespace py = pybind11;
           py::arg("sorted_weights") = std::nullopt,                            \
           py::arg("quant_type")     = QuantType::No,                           \
           py::arg("activation")     = ActivationType::Silu,                    \
-          py::arg("splitk")         = 1);                                      \
+          py::arg("splitk")         = 0);                                      \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND             \

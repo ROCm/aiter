@@ -68,7 +68,7 @@ def asm_moe_stage2(
     quant_type,
     activation,
     splitk,
-):
+):          
     return aiter.moe_stage2_g1u1(
         inter_states,
         w1,
@@ -102,7 +102,6 @@ def get_2stage_config_simple(
     if is_smoothquant and (dtype == dtypes.i8 or dtype == torch.int8 or str(dtype) == "torch.int8"):
         # Check if inter_dim is supported by the 2-stage Int8 kernel (currently requires multiple of 384)
         if inter_dim % 384 == 0:
-            print(f"[aiter] Enabling 2-stage MOE for smoothquant with dtype={dtype}")
             # The available kernel uses 64x384 tile, so block_m must be 64
             return True, 64, 0, "", ""
     return False, 32, 0, "", ""
@@ -300,15 +299,22 @@ def asm_moe(
             )
 
         if run_2stage:
-            # Stage 1: ASM Kernel
-            # Allocate intermediate buffer [M, topk, inter_dim + pad_len] (Int8)
-            # Pad length calculation: 4 bytes (float32) scale per 128 int8 elements
-            pad_len = (inter_dim + 32) // 32
-            pad_len = (pad_len + 3) // 4 * 4
-            inter_states = torch.empty(
-                (M, topk, inter_dim + pad_len), dtype=dtypes.i8, device=device
-            )
-            doweight_stage1 = True
+
+            total_tokens = M * topk
+            data_size = total_tokens * inter_dim
+            scale_size = data_size // 32  # 4 bytes scale per 128 bytes data
+            
+            # Allocate flat buffer for Data + Scale
+            flat_buffer = torch.empty(data_size + scale_size, dtype=dtypes.i8, device=device)
+            
+            # View for Data: [M, topk, inter_dim]
+            inter_states = flat_buffer[:data_size].view(M, topk, inter_dim)
+            
+            # View for Scale: [M, topk, inter_dim/32/4] -> float32
+            # inter_dim=384 -> 12 bytes scale -> 3 floats
+            scale_view = flat_buffer[data_size:].view(torch.float32)
+            # scale_view.fill_(1.0) # Init to 1.0 for debugging
+            doweight_stage1 = False
 
             aiter.moe_stage1_g1u1(
                 a8,
@@ -317,7 +323,7 @@ def asm_moe(
                 sorted_ids,
                 sorted_expert_ids,
                 num_valid_ids,
-                inter_states[..., :inter_dim],
+                inter_states,
                 inter_dim,
                 kernelName1,
                 block_m_2s,
@@ -331,16 +337,13 @@ def asm_moe(
                 sorted_weights if doweight_stage1 else None,
             )
 
-            # Stage 2: ASM Kernel 
-            # inter_states is already Int8, no explicit pertoken_quant needed
-            # Extract scale from padded region for Stage2
-            # Note: inter_states[..., inter_dim:] must be viewable as float32 (pad_len % 4 == 0)
-            a2_scale = inter_states[..., inter_dim:].view(torch.float32)
 
-            # Slicing inter_states[..., :inter_dim] creates a strided tensor.
-            # Ensure Stage 2 kernel supports stride != width.
+            num_scales = inter_dim // 128
+            a2_scale = scale_view.view(M, topk, num_scales)
+            
+            # Stage 2: ASM Kernel 
             asm_moe_stage2(
-                inter_states[..., :inter_dim],
+                inter_states,
                 w1,
                 w2,
                 sorted_ids,
@@ -355,7 +358,7 @@ def asm_moe(
                 sorted_weights if not doweight_stage1 else None,
                 QuantType.per_Token.value,
                 activation.value,
-                1,  # splitk
+                0,  # splitk
             )
             return moe_buf
                 
