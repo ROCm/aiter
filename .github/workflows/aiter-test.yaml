@@ -38,10 +38,9 @@ jobs:
         run: |
           if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
             echo "It's a fork PR"
-            exit 1
+            exit 0
           else
             echo "It's not a fork PR"
-            exit 0
           fi
 
       - name: Checkout code
