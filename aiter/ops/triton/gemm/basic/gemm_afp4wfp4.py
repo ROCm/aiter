@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
 import torch
@@ -438,8 +438,12 @@ def gemm_afp4wfp4_preshuffle(
 
     M, K = x.shape
     N, K = w.shape
+    # recover true N, K shape
     N = N * 16
     K = K // 16
+
+    assert N % 32 == 0, f"{N=} has to be divisible by 32"
+    assert K % (256 // 2) == 0, f"{K=} has to be divisible by (256 // 2)"
 
     if config is None:
         config, _ = _get_config(M, N, K, True)

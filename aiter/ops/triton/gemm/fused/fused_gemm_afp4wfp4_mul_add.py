@@ -302,6 +302,9 @@ def fused_gemm_afp4wfp4_preshuffle_add_mul(
     N = N * 16
     K = K // 16
 
+    assert N % 32 == 0, f"{N=} has to be divisible by 32"
+    assert K % (256 // 2) == 0, f"{K=} has to be divisible by (256 // 2)"
+
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 

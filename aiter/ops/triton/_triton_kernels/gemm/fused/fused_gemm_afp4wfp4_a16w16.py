@@ -445,9 +445,10 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
                 pid_k * (SPLITK_BLOCK_SIZE // 2) * 16 + offs_k_fp4_shuffle_arr
             )
 
-            offs_b_fp4_n = (
-                pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)
-            ) % N_fp4
+            # because weight has to be padded to multiple of 32, so that % (N // 16) is no longer required for weight
+            offs_b_fp4_n = pid_n * (BLOCK_SIZE_N // 16) + tl.arange(
+                0, BLOCK_SIZE_N // 16
+            )  # % (N_fp4 // 16)
             a_fp4_ptrs = a_fp4_ptr + (
                 offs_am[:, None] * stride_a_fp4_m
                 + offs_k_fp4_split[None, :] * stride_a_fp4_k
@@ -457,9 +458,10 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
                 + offs_k_fp4_shuffle[None, :] * stride_b_fp4_k
             )
 
-            offs_b_fp4_scale_n = (
-                pid_n * (BLOCK_SIZE_N // 32) + tl.arange(0, (BLOCK_SIZE_N // 32))
-            ) % N_fp4
+            # because weight has to be padded to multiple of 32, so that % (N // 32) is no longer required for weight_scale
+            offs_b_fp4_scale_n = pid_n * (BLOCK_SIZE_N // 32) + tl.arange(
+                0, (BLOCK_SIZE_N // 32)
+            )  # % (N_fp4 // 32)
             offs_k_fp4_scale = (
                 pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE) * 32
             ) + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE * 32)

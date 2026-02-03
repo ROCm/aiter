@@ -258,6 +258,9 @@ def gemm_a16wfp4_preshuffle_(
     N = N * 16
     K = K // 16
 
+    assert N % 32 == 0, f"{N=} has to be divisible by 32"
+    assert K % (256 // 2) == 0, f"{K=} has to be divisible by (256 // 2)"
+
     if config is None:
         config, _ = _get_config(M, N, K, True)
     else:

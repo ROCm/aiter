@@ -5,6 +5,7 @@ from typing import Optional
 import os
 import torch
 import triton
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
@@ -64,11 +65,17 @@ def fused_gemm_afp4wfp4_a16w16(
         f"FUSED_GEMM_A8W8_BLOCKSCALE_A16W16: x_fp4={tuple(x_fp4.shape)} w_fp4={tuple(w_fp4.shape)} x_fp4_scale={tuple(x_fp4_scale.shape)} w_fp4_scale={tuple(w_fp4_scale.shape)} x_bf16={tuple(x_bf16.shape)} w_bf16={tuple(w_bf16.shape)}"
     )
 
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+
     M, K = x_fp4.shape
     N_fp4, K = w_fp4.shape
     if is_fp4_preshuffled:
         N_fp4 = N_fp4 * 16
         K = K // 16
+
+        assert N_fp4 % 32 == 0, f"{N_fp4=} has to be divisible by 32"
+        assert K % (256 // 2) == 0, f"{K=} has to be divisible by (256 // 2)"
+
     M, _ = x_bf16.shape
     N_bf16, _ = w_bf16.shape
 
