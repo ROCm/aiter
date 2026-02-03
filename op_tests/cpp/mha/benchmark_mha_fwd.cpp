@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "ck_tile/host.hpp"
 #include "ck_tile/ref/naive_attention.hpp"
 #include "mha_fwd.h"
@@ -1144,8 +1144,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     auto oacc_element_func = [&]() {
         if constexpr(std::is_same_v<DataTypeConfig, ck_tile::fp8_t>)
-            return ck_tile::composes(ck_tile::saturates<ck_tile::fp8_t>{},
-                                     ck_tile::scales{scale_o});
+            // return ck_tile::composes(ck_tile::saturates<ck_tile::fp8_t>{},
+            //                 ck_tile::scales{scale_o});
+            return ck_tile::identity{};
         else
             return ck_tile::identity{};
     }();
