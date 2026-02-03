@@ -162,7 +162,7 @@ jobs:
     name: Multi-GPU Tests (8 GPU)
     needs: check-signal
     # only run multi-gpu tests on main branch due to limited multi-gpu resources
-    if: github.ref == 'refs/heads/main' 
+    # if: github.ref == 'refs/heads/main' 
     strategy:
       fail-fast: false
       matrix:
@@ -213,6 +213,15 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
+      - name: Update RCCL
+        run: |
+          set -ex
+          echo "Remove current RCCL"
+          docker exec -w /workspace aiter_test bash -c "pip show rccl || true && pip uninstall -y rccl || true"
+          echo "Updating RCCL..."
+          docker exec -w /workspace aiter_test bash -c "pip install cmake && git clone https://github.com/ROCm/rccl.git /app/rccl/ && cd /app/rccl/ && ./install.sh -p --amdgpu_targets='gfx942;gfx950'"
+          docker exec -w /workspace aiter_test bash -c "DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /app/rccl/build/release/*.deb && rm -rf /app/rccl/build"
+
       - name: Setup pip config
         run: |
           docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
@@ -228,6 +237,7 @@ jobs:
           bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Tests
+        timeout-minutes: 120
         run: |
           set -ex
           docker exec \
