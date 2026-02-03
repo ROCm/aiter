@@ -279,7 +279,7 @@ void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
 }
 
 void _fused_allreduce_rmsnorm(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual_inp, torch::Tensor& residual_out, torch::Tensor& out, torch::Tensor& w, int eps, int m, int n, hipStream_t stream)
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual_inp, torch::Tensor& residual_out, torch::Tensor& out, torch::Tensor& w, int eps, int m, int n, bool use_1stage, hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
@@ -292,7 +292,7 @@ void _fused_allreduce_rmsnorm(
                              reinterpret_cast<float*>(residual_out.data_ptr()),
                              reinterpret_cast<float*>(out.data_ptr()),
                              reinterpret_cast<float*>(w.data_ptr()),
-                             eps, m, n);
+                             eps, m, n, use_1stage);
         break;
     }
     case at::ScalarType::Half: {
@@ -302,7 +302,7 @@ void _fused_allreduce_rmsnorm(
                              reinterpret_cast<half*>(residual_out.data_ptr()),
                              reinterpret_cast<half*>(out.data_ptr()),
                              reinterpret_cast<half*>(w.data_ptr()),
-                             eps, m, n);
+                             eps, m, n, use_1stage);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -313,7 +313,7 @@ void _fused_allreduce_rmsnorm(
                              reinterpret_cast<__hip_bfloat16*>(residual_out.data_ptr()),
                              reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
                              reinterpret_cast<__hip_bfloat16*>(w.data_ptr()),
-                             eps, m, n);
+                             eps, m, n, use_1stage);
         break;
     }
 #endif
@@ -329,7 +329,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                 torch::Tensor& out,
                 torch::Tensor& w,
                 float eps,
-                std::optional<torch::Tensor> reg_buffer)
+                std::optional<torch::Tensor> reg_buffer,
+                bool use_1stage)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
@@ -350,11 +351,11 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                                 input_size,
                                 hipMemcpyDeviceToDevice,
                                 stream));
-        _fused_allreduce_rmsnorm(_fa, reg_buffer.value(), res_inp, res_out, out, w, eps, m, n, stream);
+        _fused_allreduce_rmsnorm(_fa, reg_buffer.value(), res_inp, res_out, out, w, eps, m, n, use_1stage, stream);
     }
     else
     {
-      _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out, w, eps, m, n, stream);
+      _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out, w, eps, m, n, use_1stage, stream);
     }
 }
 

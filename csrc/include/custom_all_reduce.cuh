@@ -2008,7 +2008,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    T* weight,
                                    float eps,
                                    int m,
-                                   int n)
+                                   int n,
+                                   bool use_1stage)
 {
     auto d   = packed_t<T>::P::size;
     int size = m * n;
@@ -2025,20 +2026,34 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     hipGetDeviceProperties(&dev_prop, dev);
     uint32_t num_cu = dev_prop.multiProcessorCount;
 
-    bool use_1stage = (m <= 16 && (n == 4096 || n == 2048 || n == 1024));
-#define MAYBE_DISPATCH_1S_KERNEL(NGPUS) \
-    if (use_1stage) { \
-        if (n == 4096) { \
-            allreduce_fusion_kernel_1stage_launcher<T, T, NGPUS, 4096>(ptrs, sg_, self_sg_, rank_, \
-                    residual_inp, residual_out, output, weight, nullptr, size, eps, stream); \
-        } else if (n == 2048) { \
-            allreduce_fusion_kernel_1stage_launcher<T, T, NGPUS, 2048>(ptrs, sg_, self_sg_, rank_, \
-                    residual_inp, residual_out, output, weight, nullptr, size, eps, stream); \
-        } else { \
-            allreduce_fusion_kernel_1stage_launcher<T, T, NGPUS, 1024>(ptrs, sg_, self_sg_, rank_, \
-                    residual_inp, residual_out, output, weight, nullptr, size, eps, stream); \
-        } \
-        return; \
+    use_1stage = (use_1stage && (n == 4096 || n == 2048 || n == 1024 || n == 512));
+#define DISPATCH_1S_KERNEL(NGPUS, N)                                          \
+    case N: {                                                                 \
+        allreduce_fusion_kernel_1stage_launcher<T, T, NGPUS, N>(ptrs,         \
+                                                                sg_,          \
+                                                                self_sg_,     \
+                                                                rank_,        \
+                                                                residual_inp, \
+                                                                residual_out, \
+                                                                output,       \
+                                                                weight,       \
+                                                                nullptr,      \
+                                                                size,         \
+                                                                eps,          \
+                                                                stream);      \
+        return;                                                               \
+    }
+#define MAYBE_DISPATCH_1S_KERNEL(NGPUS)                                  \
+    if(use_1stage)                                                       \
+    {                                                                    \
+        switch(n)                                                        \
+        {                                                                \
+            DISPATCH_1S_KERNEL(NGPUS, 4096)                              \
+            DISPATCH_1S_KERNEL(NGPUS, 2048)                              \
+            DISPATCH_1S_KERNEL(NGPUS, 1024)                              \
+            DISPATCH_1S_KERNEL(NGPUS, 512)                               \
+        default: printf("fused 1stage allreduce rmsnorm N-dim error\n"); \
+        }                                                                \
     }
 
     // step 1, run reduce-scatter + allgather cross device save

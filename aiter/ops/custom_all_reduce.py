@@ -61,6 +61,7 @@ def fused_allreduce_rmsnorm(
     w: torch.Tensor,
     eps: float,
     reg_buffer: Optional[torch.Tensor] = None,
+    use_1stage: bool = False,
 ) -> None: ...
 
 
