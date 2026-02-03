@@ -134,6 +134,19 @@ jobs:
         run: |
           docker exec atom_aiter_test bash -lc "pip show amd-aiter atom && pip list"
 
+      - name: Download Models
+        if: ${{ matrix.model_name == 'DeepSeek-R1-0528' }}
+        run: |
+          if [ -d "/run" ]; then
+            echo "/run directory found, downloading model to /run/${{ matrix.model_path }}"
+            if ! docker exec atom_aiter_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /run/${{ matrix.model_path }}"; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/run directory not found, skipping model download"
+          fi
+
       - name: Run ATOM simple inference
         timeout-minutes: 30
         run: |
@@ -142,7 +155,11 @@ jobs:
           echo ""
           echo "========== Running test =========="
   
-          model_path="${{ matrix.model_path }}"
+          if [ -d "/run" ]; then
+            model_path="/run/${{ matrix.model_path }}"
+          else
+            model_path="${{ matrix.model_path }}"
+          fi
           echo "Model path: $model_path"
 
           docker exec atom_aiter_test bash -lc "
@@ -164,7 +181,11 @@ jobs:
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          model_path="${{ matrix.model_path }}"
+          if [ -d "/run" ]; then
+            model_path="/run/${{ matrix.model_path }}"
+          else
+            model_path="${{ matrix.model_path }}"
+          fi
           docker exec atom_aiter_test bash -lc "
             .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
           "
