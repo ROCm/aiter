@@ -793,12 +793,46 @@ def main():
         action='store_true', 
         help='Keep temporary Python scripts and rocprofv3 CSV files'
     )
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume profiling (skip already-profiled kernels)'
+    )
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Force re-profile all kernels (ignore existing results)'
+    )
     
     args = parser.parse_args()
     
     kernels = get_kernels(args.input)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
+    
+    output_file = output_dir / "kernels_with_counters.csv"
+    
+    # Load existing profiling results for resume mode
+    existing_results = []
+    profiled_kernels = set()
+    
+    if args.resume and output_file.exists() and not args.force:
+        print(f'\n--resume mode: Loading existing results from {output_file}')
+        existing_df = pd.read_csv(output_file)
+        profiled_kernels = set(existing_df.apply(
+            lambda r: (r['config_idx'], r['kernel_name'], r['stage']),
+            axis=1
+        ))
+        existing_results = existing_df.to_dict('records')
+        print(f'  Found {len(existing_results)} profiled kernels')
+        print(f'  Will profile {len(kernels) - len(existing_results)} remaining kernels')
+    elif args.force:
+        print('\n--force mode: Re-profiling all kernels')
+    elif output_file.exists():
+        print(f'\nWARNING: Output file {output_file} already exists!')
+        print('  Use --resume to skip completed kernels')
+        print('  Use --force to overwrite')
+        return
     
     num_kernels = len(kernels)
     num_counters = sum(len(c) for c in COUNTER_GROUPS.values())
@@ -817,11 +851,19 @@ def main():
     
     skipped_count = 0
     profiled_count = 0
+    new_results = []
     
     for idx, (_, row) in enumerate(kernels.iterrows(), 1):
         error_value = str(row.get('error', '')).strip()
         if error_value == 'failed':
             print(f"[{idx}/{num_kernels}] Skipping failed kernel: {row['kernel_name'][:40]}")
+            skipped_count += 1
+            continue
+        
+        # Skip if already profiled (resume mode)
+        kernel_key = (row['config_idx'], row['kernel_name'], row['stage'])
+        if kernel_key in profiled_kernels:
+            print(f"[{idx}/{num_kernels}] [SKIP] Already profiled: {row['kernel_name'][:40]}")
             skipped_count += 1
             continue
         
@@ -837,30 +879,39 @@ def main():
         
         result_row = dict(row)
         result_row.update(counter_data)
+        new_results.append(result_row)
         profiled_count += 1
         
-        pd.DataFrame([result_row]).to_csv(
-            output_file, 
-            mode='a', 
-            header=(profiled_count == 1), 
-            index=False
-        )
+        # INCREMENTAL SAVE: Save after each kernel to avoid data loss
+        combined_results = existing_results + new_results
+        temp_df = pd.DataFrame(combined_results)
+        temp_df = temp_df.sort_values(['config_idx', 'stage', 'kernel_type'])
+        temp_df.to_csv(output_file, index=False)
+        print(f"  ✓ Saved progress ({len(combined_results)} total kernels)")
     
-    # Read final results for summary
-    if profiled_count > 0:
-        results_df = pd.read_csv(output_file)
-        new_col_count = len(results_df.columns)
+    # Final save with complete results
+    if existing_results or new_results:
+        combined_results = existing_results + new_results
+        results_df = pd.DataFrame(combined_results)
+        results_df = results_df.sort_values(['config_idx', 'stage', 'kernel_type'])
+        results_df.to_csv(output_file, index=False)
     else:
-        new_col_count = original_col_count
+        print("\nNo results to save")
+        return
+    
+    new_col_count = len(results_df.columns)
     
     moe_utils.print_section_header("RESULTS SUMMARY")
     print(f"Output file: {output_file}")
     print(f"Total kernels in input: {num_kernels}")
-    print(f"Skipped (failed): {skipped_count}")
-    print(f"Profiled: {profiled_count}")
+    print(f"Skipped: {skipped_count}")
+    print(f"Profiled (new): {profiled_count}")
+    print(f"Total saved: {len(results_df)}")
+    print(f"  Existing: {len(existing_results)}")
+    print(f"  New: {len(new_results)}")
     print(f"Original columns: {original_col_count}")
     print(f"Profiling columns added: {new_col_count - original_col_count}")
-    if profiled_count > 0 and new_col_count > original_col_count:
+    if len(results_df) > 0 and new_col_count > original_col_count:
         print(f"New columns:")
         for col in results_df.columns[original_col_count:]:
             print(f"  - {col}")

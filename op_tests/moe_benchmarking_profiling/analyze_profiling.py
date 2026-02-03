@@ -191,85 +191,94 @@ def create_hover_text(row: pd.Series) -> str:
 
 def aggregate_2stage_kernels(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate stage1 and stage2 kernels for end-to-end 2-stage analysis.
+    Create ALL valid 2-stage combinations per config, ranked by performance.
     
-    For each config_idx with both stage1 and stage2:
-    - Combines MFMA_FLOPS from both stages
-    - Sums execution times (stage1 + stage2 + quantization overhead)
-    - Computes combined OI and TFLOPs/s
+    For each config_idx:
+    - Creates all valid stage1 + stage2 combinations (matching block_m)
+    - Ranks combinations by total time (1st, 2nd, 3rd best, etc.)
+    - Computes combined metrics for each combination
     
     Args:
         df: DataFrame with profiling results
         
     Returns:
-        DataFrame with aggregated 2-stage kernel metrics
+        DataFrame with all 2-stage combinations, including rank
     """
-    # Filter only 2-stage kernels
     df_2stage = df[df['stage'].isin(['stage1', 'stage2'])].copy()
     
-    # Group by config_idx to find pairs
-    grouped = df_2stage.groupby('config_idx')
+    all_combinations = []
     
-    combined_rows = []
-    for config_idx, group in grouped:
-        if len(group) != 2:
-            continue  # Skip if not exactly 2 stages
+    for config_idx in df_2stage['config_idx'].unique():
+        config_data = df_2stage[df_2stage['config_idx'] == config_idx]
         
-        # Separate stage1 and stage2
-        stage1 = group[group['stage'] == 'stage1'].iloc[0]
-        stage2 = group[group['stage'] == 'stage2'].iloc[0]
+        stage1_kernels = config_data[config_data['stage'] == 'stage1']
+        stage2_kernels = config_data[config_data['stage'] == 'stage2']
         
-        # Aggregate metrics
-        total_mfma_flops = stage1['MFMA_FLOPS'] + stage2['MFMA_FLOPS']
-        total_time_us = stage1['time_us'] + stage2['time_us']
-        quant_time_us = stage1['quant_time_us']
-        total_time_with_quant = total_time_us + quant_time_us
+        if len(stage1_kernels) == 0 or len(stage2_kernels) == 0:
+            continue
         
-        # Memory transfers
-        total_fetch = stage1['FETCH_SIZE'] + stage2['FETCH_SIZE']
-        total_write = stage1['WRITE_SIZE'] + stage2['WRITE_SIZE']
-        total_bytes = (total_fetch + total_write) * 1024
+        # Create all valid combinations for this config
+        config_combinations = []
         
-        # Combined metrics
-        combined_oi = total_mfma_flops / total_bytes if total_bytes > 0 else 0
-        combined_tflops_mfma = total_mfma_flops / total_time_with_quant / 1e6
-        # Bandwidth: (total_bytes * 1e6 / time_us) / 1e9 = total_bytes / time_us / 1000
-        combined_bandwidth_gb = total_bytes / total_time_with_quant / 1000 if total_time_with_quant > 0 else 0
+        for _, s1 in stage1_kernels.iterrows():
+            for _, s2 in stage2_kernels.iterrows():
+                # Only combine if block_m matches
+                if s1['block_m'] != s2['block_m']:
+                    continue
+                
+                # Aggregate metrics
+                total_mfma_flops = s1['MFMA_FLOPS'] + s2['MFMA_FLOPS']
+                total_time_us = s1['time_us'] + s2['time_us']
+                quant_time_us = s1['quant_time_us']
+                total_time_with_quant = total_time_us + quant_time_us
+                
+                # Memory transfers
+                total_fetch = s1['FETCH_SIZE'] + s2['FETCH_SIZE']
+                total_write = s1['WRITE_SIZE'] + s2['WRITE_SIZE']
+                total_bytes = (total_fetch + total_write) * 1024
+                
+                # Combined metrics
+                combined_oi = total_mfma_flops / total_bytes if total_bytes > 0 else 0
+                combined_tflops_mfma = total_mfma_flops / total_time_with_quant / 1e6
+                combined_bandwidth_gb = total_bytes / total_time_with_quant / 1000 if total_time_with_quant > 0 else 0
+                
+                config_combinations.append({
+                    'config_idx': config_idx,
+                    'kernel_name_stage1': s1['kernel_name'],
+                    'kernel_name_stage2': s2['kernel_name'],
+                    'kernel_name': f"2-stage: {s1['kernel_type']}/{s2['kernel_type']}",
+                    'kernel_type': '2-stage',
+                    'stage': '2-stage-combined',
+                    'time_us': total_time_with_quant,
+                    'time_stage1_us': s1['time_us'],
+                    'time_stage2_us': s2['time_us'],
+                    'quant_time_us': quant_time_us,
+                    'MFMA_FLOPS': total_mfma_flops,
+                    'OI': combined_oi,
+                    'tflops_mfma': combined_tflops_mfma,
+                    'bandwidth_gb': combined_bandwidth_gb,
+                    'error': f"{(float(s1['error'].rstrip('%')) + float(s2['error'].rstrip('%'))) / 2:.2f}%",
+                    'error_pct': (s1['error_pct'] + s2['error_pct']) / 2,
+                    # Preserve metadata
+                    'token': s1['token'],
+                    'model_dim': s1['model_dim'],
+                    'inter_dim': s1['inter_dim'],
+                    'expert': s1['expert'],
+                    'topk': s1['topk'],
+                    'dtype': s1['dtype'],
+                    'q_dtype_a': s1['q_dtype_a'],
+                    'q_dtype_w': s1['q_dtype_w'],
+                    'q_type': s1['q_type'],
+                    'act_type': s1['act_type'],
+                })
         
-        # Create combined row
-        combined = {
-            'config_idx': config_idx,
-            'kernel_name_stage1': stage1['kernel_name'],
-            'kernel_name_stage2': stage2['kernel_name'],
-            'kernel_name': f"2-stage: {stage1['kernel_type']}/{stage2['kernel_type']}",
-            'kernel_type': '2-stage',
-            'stage': '2-stage-combined',
-            'time_us': total_time_with_quant,
-            'time_stage1_us': stage1['time_us'],
-            'time_stage2_us': stage2['time_us'],
-            'quant_time_us': quant_time_us,
-            'MFMA_FLOPS': total_mfma_flops,
-            'OI': combined_oi,
-            'tflops_mfma': combined_tflops_mfma,
-            'bandwidth_gb': combined_bandwidth_gb,
-            'error': f"{(float(stage1['error'].rstrip('%')) + float(stage2['error'].rstrip('%'))) / 2:.2f}%",
-            'error_pct': (stage1['error_pct'] + stage2['error_pct']) / 2,
-            # Preserve metadata
-            'token': stage1['token'],
-            'model_dim': stage1['model_dim'],
-            'inter_dim': stage1['inter_dim'],
-            'expert': stage1['expert'],
-            'topk': stage1['topk'],
-            'dtype': stage1['dtype'],
-            'q_dtype_a': stage1['q_dtype_a'],
-            'q_dtype_w': stage1['q_dtype_w'],
-            'q_type': stage1['q_type'],
-            'act_type': stage1['act_type'],
-        }
-        
-        combined_rows.append(combined)
+        # Rank combinations for this config by total time (fastest = rank 1)
+        config_combinations.sort(key=lambda x: x['time_us'])
+        for rank, combo in enumerate(config_combinations, 1):
+            combo['rank'] = rank
+            all_combinations.append(combo)
     
-    return pd.DataFrame(combined_rows)
+    return pd.DataFrame(all_combinations)
 
 
 def create_hover_text_2stage(row: pd.Series) -> str:
@@ -501,26 +510,56 @@ def build_roofline_2stage_plot(df_individual: pd.DataFrame,
             showlegend=True
         ))
     
-    # Add 2-stage combined kernels (orange circles)
+    # Add 2-stage combined kernels with rank-based coloring
     if len(df_combined) > 0:
-        hover = df_combined.apply(create_hover_text_2stage, axis=1)
+        # Color palette for ranks (1st, 2nd, 3rd, 4th+)
+        rank_colors = {
+            1: '#1f77b4',  # Blue - 1st best
+            2: '#ff7f0e',  # Orange - 2nd best
+            3: '#2ca02c',  # Green - 3rd best
+        }
+        default_color = '#d62728'  # Red - 4th+ best
         
-        fig.add_trace(go.Scatter(
-            x=df_combined["OI"],
-            y=df_combined["tflops_mfma"],
-            mode="markers",
-            name="2-stage MoE (combined)",
-            marker=dict(
-                size=8,
-                color='orange',
-                line=dict(width=0.5, color='white'),
-                opacity=0.75,
-                symbol='circle'
-            ),
-            text=hover,
-            hovertemplate="%{text}<extra></extra>",
-            showlegend=True
-        ))
+        # Group by rank and plot
+        for rank in sorted(df_combined['rank'].unique()):
+            rank_data = df_combined[df_combined['rank'] == rank]
+            color = rank_colors.get(rank, default_color)
+            
+            hover = rank_data.apply(
+                lambda r: (
+                    f"<b>Rank #{r['rank']} for Config</b><br>"
+                    f"<b>Stage 1:</b> {r['kernel_name_stage1'][:35]}<br>"
+                    f"<b>Stage 2:</b> {r['kernel_name_stage2'][:35]}<br>"
+                    f"<br>cfg_idx={r['config_idx']}, token={r['token']}, "
+                    f"mdim={r['model_dim']}, idim={r['inter_dim']}<br>"
+                    f"<br><b>Performance:</b><br>"
+                    f"TFLOPs/s: {r['tflops_mfma']:.2f}<br>"
+                    f"Total Time: {r['time_us']:.1f} µs<br>"
+                    f"  • Stage1: {r['time_stage1_us']:.1f} µs<br>"
+                    f"  • Stage2: {r['time_stage2_us']:.1f} µs<br>"
+                    f"OI: {r['OI']:.3f} FLOP/Byte"
+                ),
+                axis=1
+            )
+            
+            rank_label = f"Rank {rank}" if rank <= 3 else f"Rank 4+"
+            
+            fig.add_trace(go.Scatter(
+                x=rank_data["OI"],
+                y=rank_data["tflops_mfma"],
+                mode="markers",
+                name=f"2-stage ({rank_label})",
+                marker=dict(
+                    size=8,
+                    color=color,
+                    line=dict(width=0.5, color='white'),
+                    opacity=0.75,
+                    symbol='square'
+                ),
+                text=hover,
+                hovertemplate="%{text}<extra></extra>",
+                showlegend=True
+            ))
     
     # OI range from both datasets
     if len(df_1stage) > 0 and len(df_combined) > 0:

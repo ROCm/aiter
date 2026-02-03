@@ -51,7 +51,9 @@ import moe_utils
 
 def run_kernel_benchmarks(config_file: str, 
                           output_file: str,
-                          error_log_file: str) -> pd.DataFrame:
+                          error_log_file: str,
+                          resume: bool = False,
+                          force: bool = False) -> pd.DataFrame:
     """
     Run all kernel combinations for configurations in the input file.
     
@@ -59,6 +61,8 @@ def run_kernel_benchmarks(config_file: str,
         config_file: Path to input CSV with configuration
         output_file: Path to output CSV with all results
         error_log_file: Path to error log file
+        resume: If True, skip already-benchmarked configs
+        force: If True, ignore existing results and re-run all
         
     Returns:
         DataFrame with all benchmark results
@@ -71,6 +75,25 @@ def run_kernel_benchmarks(config_file: str,
         
     config_df = pd.read_csv(config_file)
     print(f"Loaded {len(config_df)} configurations from {config_file}")
+    
+    # Load existing results for resume mode
+    existing_results = []
+    existing_configs = set()
+    
+    if resume and os.path.exists(output_file) and not force:
+        print(f"\n--resume mode: Loading existing results from {output_file}")
+        existing_df = pd.read_csv(output_file)
+        existing_configs = set(existing_df['config_idx'].unique())
+        existing_results = existing_df.to_dict('records')
+        print(f"  Found results for {len(existing_configs)} configs")
+        print(f"  Will benchmark {len(config_df) - len(existing_configs)} remaining configs")
+    elif force:
+        print("\n--force mode: Re-running all configs")
+    elif os.path.exists(output_file):
+        print(f"\nWARNING: Output file {output_file} already exists!")
+        print("  Use --resume to skip completed configs")
+        print("  Use --force to overwrite")
+        return None
     
     # Open error log file
     error_log = open(error_log_file, 'w')
@@ -100,8 +123,16 @@ def run_kernel_benchmarks(config_file: str,
     all_results = []
     
     for idx, row in config_df.iterrows():
+        # Use config_idx from input file if it exists, otherwise use row index
+        config_idx = row.get('config_idx', idx)
+        
+        # Skip if already benchmarked (resume mode)
+        if config_idx in existing_configs:
+            print(f"\n[SKIP] Config {config_idx} already benchmarked (use --force to re-run)")
+            continue
+        
         moe_utils.print_section_header(
-            f"Processing configuration {idx + 1}/{len(config_df)}",
+            f"Processing configuration {idx + 1}/{len(config_df)} (config_idx={config_idx})",
             char='='
         )
         moe_utils.print_config_summary(row)
@@ -259,7 +290,7 @@ def run_kernel_benchmarks(config_file: str,
             
             result_dict = {
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'config_idx': idx,
+                'config_idx': config_idx,
                 'token': row['token'],
                 'model_dim': row['model_dim'],
                 'inter_dim': row['inter_dim'],
@@ -306,17 +337,28 @@ def run_kernel_benchmarks(config_file: str,
     error_log.write(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     error_log.close()
     
-    if not all_results:
+    # Merge with existing results if in resume mode
+    if existing_results and all_results:
+        print(f"\nMerging {len(existing_results)} existing + {len(all_results)} new results...")
+        combined_results = existing_results + all_results
+        results_df = pd.DataFrame(combined_results)
+    elif existing_results:
+        print(f"\nNo new results - using {len(existing_results)} existing results")
+        results_df = pd.DataFrame(existing_results)
+    elif all_results:
+        results_df = pd.DataFrame(all_results)
+    else:
         print("No results collected!")
         return None
     
     # Final save with sorting
-    results_df = pd.DataFrame(all_results)
     results_df = results_df.sort_values(['config_idx', 'token', 'time_us'])
     results_df.to_csv(output_file, index=False)
     
     moe_utils.print_section_header("BENCHMARKING COMPLETE")
-    print(f"Saved {len(results_df)} kernel results to {output_file}")
+    print(f"Saved {len(results_df)} total kernel results to {output_file}")
+    print(f"  Existing: {len(existing_results)}")
+    print(f"  New: {len(all_results)}")
     print(f"Error log saved to: {error_log_file}")
     
     # Print summary
@@ -430,7 +472,7 @@ def generate_all_combinations(valid_df: pd.DataFrame, output_file: str) -> pd.Da
 
 
 def select_best_kernels(valid_df: pd.DataFrame, output_file: str) -> pd.DataFrame:
-    """Select the best kernels for each configuration."""
+    """Select the best kernels for each configuration, including both ASM and CK variants."""
     unique_configs = valid_df['config_idx'].unique()
     moe_utils.print_section_header(f"Selecting best kernels for {len(unique_configs)} configurations")
     
@@ -440,50 +482,17 @@ def select_best_kernels(valid_df: pd.DataFrame, output_file: str) -> pd.DataFram
         config_data = valid_df[valid_df['config_idx'] == config_idx]
         config_info = config_data.iloc[0]
         
-        best_2stage, best_1stage, winner_type = moe_utils.select_best_kernels_for_config(config_data)
+        # Get list of selected kernels (includes best + opposite type for each stage)
+        selected_kernels = moe_utils.select_best_kernels_for_config(config_data)
         
-        print(f"\nConfig {config_idx}: {winner_type} selected")
+        print(f"\nConfig {config_idx}: Selected {len(selected_kernels)} kernels")
         moe_utils.print_config_summary(config_info)
         
-        if winner_type == '2-stage' and best_2stage:
-            s1 = best_2stage['stage1']
-            s2 = best_2stage['stage2']
-            quant_time = best_2stage['quant_time_us']
-            
-            # Add both stage1 and stage2 kernels
-            for stage_kernel, stage_name in [(s1, 'stage1'), (s2, 'stage2')]:
-                profiling_rows.append({
-                    'config_idx': config_idx,
-                    'token': config_info['token'],
-                    'model_dim': config_info['model_dim'],
-                    'inter_dim': config_info['inter_dim'],
-                    'expert': config_info['expert'],
-                    'topk': config_info['topk'],
-                    'act_type': config_info['act_type'],
-                    'dtype': config_info['dtype'],
-                    'q_dtype_a': config_info['q_dtype_a'],
-                    'q_dtype_w': config_info['q_dtype_w'],
-                    'q_type': config_info['q_type'],
-                    'use_g1u1': config_info['use_g1u1'],
-                    'doweight_stage1': config_info['doweight_stage1'],
-                    'kernel_type': stage_kernel['kernel_type'],
-                    'stage': stage_kernel['stage'],
-                    'block_m': stage_kernel['block_m'],
-                    'kernel_name': stage_kernel['kernel_name'],
-                    'time_us': stage_kernel['time_us'],
-                    'quant_time_us': quant_time,
-                    'error': stage_kernel['error'],
-                    'tflops': stage_kernel['tflops'],
-                    'bandwidth_gb': stage_kernel['bandwidth_gb'],
-                })
-            
-            print(f"  Stage1: {s1['kernel_name'][:50]} - {s1['time_us']:.2f} μs")
-            print(f"  Stage2: {s2['kernel_name'][:50]} - {s2['time_us']:.2f} μs")
-            print(f"  Total: {best_2stage['total_time_us']:.2f} μs")
+        # Get quantization time
+        quant_time = config_data['quant_time_us'].iloc[0] if len(config_data) > 0 else 0
         
-        elif winner_type == '1-stage' and best_1stage is not None:
-            ks = best_1stage
-            
+        # Add all selected kernels
+        for kernel in selected_kernels:
             profiling_rows.append({
                 'config_idx': config_idx,
                 'token': config_info['token'],
@@ -498,18 +507,18 @@ def select_best_kernels(valid_df: pd.DataFrame, output_file: str) -> pd.DataFram
                 'q_type': config_info['q_type'],
                 'use_g1u1': config_info['use_g1u1'],
                 'doweight_stage1': config_info['doweight_stage1'],
-                'kernel_type': ks['kernel_type'],
-                'stage': ks['stage'],
-                'block_m': ks['block_m'],
-                'kernel_name': ks['kernel_name'],
-                'time_us': ks['time_us'],
-                'quant_time_us': 0,
-                'error': ks['error'],
-                'tflops': ks['tflops'],
-                'bandwidth_gb': ks['bandwidth_gb'],
+                'kernel_type': kernel['kernel_type'],
+                'stage': kernel['stage'],
+                'block_m': kernel['block_m'],
+                'kernel_name': kernel['kernel_name'],
+                'time_us': kernel['time_us'],
+                'quant_time_us': quant_time if kernel['stage'] in ['stage1', 'stage2'] else 0,
+                'error': kernel['error'],
+                'tflops': kernel['tflops'],
+                'bandwidth_gb': kernel['bandwidth_gb'],
             })
             
-            print(f"  Kernel: {ks['kernel_name'][:50]} - {ks['time_us']:.2f} μs")
+            print(f"  {kernel['stage']:12} {kernel['kernel_type']:4} {kernel['kernel_name'][:45]:45} {kernel['time_us']:8.2f} μs")
     
     profiling_df = pd.DataFrame(profiling_rows)
     profiling_df.to_csv(output_file, index=False)
@@ -519,6 +528,8 @@ def select_best_kernels(valid_df: pd.DataFrame, output_file: str) -> pd.DataFram
     print(f"  Stage1: {len(profiling_df[profiling_df['stage'] == 'stage1'])}")
     print(f"  Stage2: {len(profiling_df[profiling_df['stage'] == 'stage2'])}")
     print(f"  1-stage: {len(profiling_df[profiling_df['stage'] == 'asm_1stage'])}")
+    print(f"  ASM kernels: {len(profiling_df[profiling_df['kernel_type'] == 'asm'])}")
+    print(f"  CK kernels: {len(profiling_df[profiling_df['kernel_type'] == 'ck'])}")
     print(f"Saved to: {output_file}")
     
     return profiling_df
@@ -531,8 +542,8 @@ def main():
     )
     parser.add_argument(
         "-i", "--input",
-        default="configs/tuned_configs_for_benchmark.csv",
-        help="Input configuration CSV file (default: configs/tuned_configs_for_benchmark.csv)"
+        default="configs/configs_for_benchmark.csv",
+        help="Input configuration CSV file (default: configs/configs_for_benchmark.csv)"
     )
     parser.add_argument(
         "-o", "--output",
@@ -544,6 +555,16 @@ def main():
         type=float,
         default=50.0,
         help="Maximum error percentage to consider valid (default: 50.0)"
+    )
+    parser.add_argument(
+        "--resume",
+        action='store_true',
+        help="Resume from existing results (skip already-benchmarked configs)"
+    )
+    parser.add_argument(
+        "--force",
+        action='store_true',
+        help="Force re-run all configs (ignore existing results)"
     )
     
     args = parser.parse_args()
@@ -564,7 +585,8 @@ def main():
     print(f"Error threshold: {args.error_threshold}%")
     
     # STEP 1: Run benchmarks
-    results_df = run_kernel_benchmarks(args.input, benchmark_file, error_log_file)
+    results_df = run_kernel_benchmarks(args.input, benchmark_file, error_log_file, 
+                                      resume=args.resume, force=args.force)
     
     if results_df is None:
         print("\nNo results generated. Check your configuration.")

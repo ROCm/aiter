@@ -169,73 +169,93 @@ def filter_valid_results(df: pd.DataFrame, error_threshold_pct: float = 50.0) ->
     return valid_df
 
 
-def select_best_kernels_for_config(config_results: pd.DataFrame) -> Tuple[Optional[Dict], Optional[pd.Series], str]:
+def select_best_kernels_for_config(config_results: pd.DataFrame) -> List[pd.Series]:
     """
-    Select the overall best kernel approach for a single configuration.
+    Select best kernels for profiling, ensuring both ASM and CK coverage.
     
-    Compares 2-stage vs 1-stage and returns the fastest approach.
+    For each config, selects:
+    - Best stage1 kernel + best of opposite type (ASM/CK)
+    - Best stage2 kernel + best of opposite type (ASM/CK)
+    - Best 1-stage kernel
     
     Args:
         config_results: DataFrame with all results for a single configuration
     
     Returns:
-        Tuple of (best_2stage_combo, best_1stage, winner_type)
-        where winner_type is '2-stage' or '1-stage'
+        List of kernel Series to profile (deduplicated)
     """
+    selected_kernels = []
+    seen_kernels = set()  # Track (stage, kernel_name) to avoid duplicates
+    
     # Separate by stage
     stage1_results = config_results[config_results['stage'] == 'stage1']
     stage2_results = config_results[config_results['stage'] == 'stage2']
     onestage_results = config_results[config_results['stage'] == 'asm_1stage']
     
-    # Get quantization time (same for all in this config)
-    quant_time = config_results['quant_time_us'].iloc[0] if len(config_results) > 0 else 0
+    # === STAGE 1 SELECTION ===
+    if len(stage1_results) > 0:
+        # Best stage1 overall
+        best_s1 = stage1_results.loc[stage1_results['time_us'].idxmin()]
+        key = ('stage1', best_s1['kernel_name'])
+        if key not in seen_kernels:
+            seen_kernels.add(key)
+            selected_kernels.append(best_s1)
+        
+        # Best of opposite type
+        if best_s1['kernel_type'] == 'asm':
+            ck_s1 = stage1_results[stage1_results['kernel_type'] == 'ck']
+            if len(ck_s1) > 0:
+                best_ck_s1 = ck_s1.loc[ck_s1['time_us'].idxmin()]
+                key = ('stage1', best_ck_s1['kernel_name'])
+                if key not in seen_kernels:
+                    seen_kernels.add(key)
+                    selected_kernels.append(best_ck_s1)
+        else:  # best is CK
+            asm_s1 = stage1_results[stage1_results['kernel_type'] == 'asm']
+            if len(asm_s1) > 0:
+                best_asm_s1 = asm_s1.loc[asm_s1['time_us'].idxmin()]
+                key = ('stage1', best_asm_s1['kernel_name'])
+                if key not in seen_kernels:
+                    seen_kernels.add(key)
+                    selected_kernels.append(best_asm_s1)
     
-    # Find best 2-stage combination
-    best_2stage = None
-    best_2stage_time = float('inf')
+    # === STAGE 2 SELECTION ===
+    stage2_results = config_results[config_results['stage'] == 'stage2']
+    if len(stage2_results) > 0:
+        # Best stage2 overall
+        best_s2 = stage2_results.loc[stage2_results['time_us'].idxmin()]
+        key = ('stage2', best_s2['kernel_name'])
+        if key not in seen_kernels:
+            seen_kernels.add(key)
+            selected_kernels.append(best_s2)
+        
+        # Best of opposite type
+        if best_s2['kernel_type'] == 'asm':
+            ck_s2 = stage2_results[stage2_results['kernel_type'] == 'ck']
+            if len(ck_s2) > 0:
+                best_ck_s2 = ck_s2.loc[ck_s2['time_us'].idxmin()]
+                key = ('stage2', best_ck_s2['kernel_name'])
+                if key not in seen_kernels:
+                    seen_kernels.add(key)
+                    selected_kernels.append(best_ck_s2)
+        else:  # best is CK
+            asm_s2 = stage2_results[stage2_results['kernel_type'] == 'asm']
+            if len(asm_s2) > 0:
+                best_asm_s2 = asm_s2.loc[asm_s2['time_us'].idxmin()]
+                key = ('stage2', best_asm_s2['kernel_name'])
+                if key not in seen_kernels:
+                    seen_kernels.add(key)
+                    selected_kernels.append(best_asm_s2)
     
-    if len(stage1_results) > 0 and len(stage2_results) > 0:
-        # For each block_m value, find best stage1 + stage2 combination
-        for block_m in sorted(stage1_results['block_m'].unique()):
-            s1_for_blockm = stage1_results[stage1_results['block_m'] == block_m]
-            s2_for_blockm = stage2_results[stage2_results['block_m'] == block_m]
-            
-            if len(s1_for_blockm) > 0 and len(s2_for_blockm) > 0:
-                # Find fastest stage1 and stage2 kernels for this block_m
-                best_s1 = s1_for_blockm.loc[s1_for_blockm['time_us'].idxmin()]
-                best_s2 = s2_for_blockm.loc[s2_for_blockm['time_us'].idxmin()]
-                
-                # Calculate total 2-stage time
-                total_time = best_s1['time_us'] + quant_time + best_s2['time_us']
-                
-                if total_time < best_2stage_time:
-                    best_2stage_time = total_time
-                    best_2stage = {
-                        'block_m': block_m,
-                        'total_time_us': total_time,
-                        'stage1': best_s1,
-                        'stage2': best_s2,
-                        'quant_time_us': quant_time
-                    }
-    
-    # Find best 1-stage kernel
-    best_1stage = None
+    # === 1-STAGE SELECTION ===
     if len(onestage_results) > 0:
-        best_1stage = onestage_results.loc[onestage_results['time_us'].idxmin()]
+        best_1s = onestage_results.loc[onestage_results['time_us'].idxmin()]
+        key = ('asm_1stage', best_1s['kernel_name'])
+        if key not in seen_kernels:
+            seen_kernels.add(key)
+            selected_kernels.append(best_1s)
     
-    # Compare and select winner
-    candidates = []
-    if best_2stage:
-        candidates.append(('2-stage', best_2stage['total_time_us']))
-    if best_1stage is not None:
-        candidates.append(('1-stage', best_1stage['time_us']))
-    
-    if not candidates:
-        return None, None, 'none'
-    
-    winner_type, _ = min(candidates, key=lambda x: x[1])
-    
-    return best_2stage, best_1stage, winner_type
+    return selected_kernels
 
 
 # ============================================================================
