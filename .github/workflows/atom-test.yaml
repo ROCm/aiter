@@ -14,7 +14,7 @@ concurrency:
 env:
   ATOM_BRANCH: "main"
   ATOM_REPOSITORY_URL: "ROCm/ATOM"
-  BASE_IMAGE: "rocm/atom:latest"
+  BASE_IMAGE: "rocm/atom-dev:latest"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/Aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
