@@ -339,6 +339,8 @@ def parse_args():
 
 def main():
     """Main entry point."""
+    import torch
+    torch.cuda.set_device(2)
     args = parse_args()
     
     if args.print_vgpr:
