@@ -151,6 +151,7 @@ jobs:
         if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           set -ex
+          git submodule sync && git submodule update --init --recursive --depth 1 --jobs 4
           echo "Setting up Aiter for fork PR..."
           docker exec \
           -w /workspace \
