@@ -192,10 +192,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self, input_, res_inp_, weight_, eps
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
-        m = input_.numel() // n
+        total_bytes = input_.numel() * input_.element_size()
         can_use_fuse_ar_rms = (
             n <= 16384
-            and input_.numel() * input_.element_size() < 8 * 1024 * 8192
+            and total_bytes < 8 * 1024 * 8192
             and self.world_size != 6
         )
         ca_comm = self.ca_comm
@@ -205,7 +205,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_)
             and can_use_fuse_ar_rms
         ):
-            use_1stage = True if m <= 16 else False
+            use_1stage = True if total_bytes <= 128 * 1024 else False
             out, res_out = ca_comm.custom_fused_ar_rms(input_, res_inp_, weight_, eps, use_1stage)
             assert out is not None
             assert res_out is not None
