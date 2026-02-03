@@ -1115,7 +1115,7 @@ struct smem {
     static constexpr index_t vector_size = vector_traits<T>::size();
     template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
 
-    OPUS_D smem(void* ptr_) : ptr((OPUS_LDS_ADDR char*)ptr_) {}
+    OPUS_D smem(void* ptr_) : ptr(reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<uintptr_t>(ptr_))) {}
 
     template<index_t vec = 1> OPUS_D auto _load(int v_os/* in unit of byte*/) { using type = vector_type<vec>; return *reinterpret_cast<OPUS_LDS_ADDR type*>(ptr + v_os); }
 
