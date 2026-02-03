@@ -234,29 +234,32 @@ class QManagerV2
             uint32_t src_lane_1_reg_2;
             uint32_t src_lane_1_reg_3;
 
-            asm volatile("ds_bpermute_b32 %0, %8, %10\n\t"
-                         "ds_bpermute_b32 %2, %8, %12\n\t"
-                         "ds_bpermute_b32 %1, %8, %11\n\t"
-                         "ds_bpermute_b32 %3, %8, %13\n\t"
-                         "s_barrier\n\t" // for both perf and quality
-                         "ds_bpermute_b32 %4, %9, %10\n\t"
-                         "ds_bpermute_b32 %6, %9, %12\n\t"
-                         "ds_bpermute_b32 %5, %9, %11\n\t"
-                         "ds_bpermute_b32 %7, %9, %13"
+            asm volatile("ds_bpermute_b32 %0, %4, %5\n\t"
+                         "ds_bpermute_b32 %2, %4, %7\n\t"
+                         "ds_bpermute_b32 %1, %4, %6\n\t"
+                         "ds_bpermute_b32 %3, %4, %8"
                          : "=v"(src_lane_0_reg_0),
                            "=v"(src_lane_0_reg_1),
                            "=v"(src_lane_0_reg_2),
-                           "=v"(src_lane_0_reg_3),
-                           "=v"(src_lane_1_reg_0),
+                           "=v"(src_lane_0_reg_3)
+                         : "v"(src_lane_0), "v"(data[0]), "v"(data[1]), "v"(data[2]), "v"(data[3]));
+
+            // Workaround for quality issue under 8 waves mode. The results of wave 4-7 may be
+            // incorrect if there are more than 4 ds_bpermute_b32 launched in short term.
+            if constexpr(T::kNumWarps > 4)
+            {
+                __builtin_amdgcn_s_barrier();
+            }
+
+            asm volatile("ds_bpermute_b32 %0, %4, %5\n\t"
+                         "ds_bpermute_b32 %2, %4, %7\n\t"
+                         "ds_bpermute_b32 %1, %4, %6\n\t"
+                         "ds_bpermute_b32 %3, %4, %8"
+                         : "=v"(src_lane_1_reg_0),
                            "=v"(src_lane_1_reg_1),
                            "=v"(src_lane_1_reg_2),
                            "=v"(src_lane_1_reg_3)
-                         : "v"(src_lane_0),
-                           "v"(src_lane_1),
-                           "v"(data[0]),
-                           "v"(data[1]),
-                           "v"(data[2]),
-                           "v"(data[3]));
+                         : "v"(src_lane_1), "v"(data[0]), "v"(data[1]), "v"(data[2]), "v"(data[3]));
 
             asm volatile("s_waitcnt lgkmcnt(6)\n\t"
                          "v_cndmask_b32 v[%0], %4, %8, %12\n\t"
