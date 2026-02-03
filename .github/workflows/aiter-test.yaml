@@ -99,7 +99,8 @@ jobs:
       
   standard:
     name: Standard Tests (1 GPU)
-    needs: build_aiter_image
+    needs: build_aiter_image 
+    if: ${{ needs.build_aiter_image.result == 'success' || needs.build_aiter_image.result == 'skipped' }}
     strategy:
       fail-fast: false
       matrix:
@@ -196,8 +197,8 @@ jobs:
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
-    if: github.ref == 'refs/heads/main'
-    needs: build_aiter_image
+    needs: build_aiter_image 
+    if: ${{ github.ref == 'refs/heads/main' && needs.build_aiter_image.result == 'success' || needs.build_aiter_image.result == 'skipped' }}
     strategy:
       fail-fast: false
       matrix:
