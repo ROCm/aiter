@@ -91,6 +91,9 @@ jobs:
             git submodule sync
             git submodule update --init --recursive --depth 1 --jobs 4
           fi
+      
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
 
       - name: Run the container
         run: |

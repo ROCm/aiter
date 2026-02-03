@@ -94,12 +94,11 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     // expected payload handled by each cu part.
-    const int32_t num_cu_per_khead = params.num_cu / params.num_heads_k;
-    const int32_t average          = sum_blocks / num_cu_per_khead;
-    const int32_t reminder         = sum_blocks % num_cu_per_khead;
+    const int32_t num_splits_per_khead = params.num_splits / params.num_heads_k;
+    const int32_t average              = sum_blocks / num_splits_per_khead;
+    const int32_t reminder             = sum_blocks % num_splits_per_khead;
 
     int32_t cid                    = 0; // CU ID
-    int32_t cu_per_khead_group     = params.num_cu / params.num_heads_k;
     int32_t num_works              = 0;
     int32_t last_reduce_indptr     = 0;
     int32_t global_reduce_tile_idx = 0;
@@ -130,7 +129,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         while(cid < params.num_cu)
         {
             int32_t remain_payload =
-                ((cid % cu_per_khead_group) < reminder) ? (average + 1) : average;
+                ((cid % num_splits_per_khead) < reminder) ? (average + 1) : average;
             while(curr_batch < params.num_batches)
             {
                 const int32_t packed_qo_len =
@@ -436,20 +435,19 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
     hipGetDevice(&dev);
     hipGetDeviceProperties(&dev_prop, dev);
 
-    const int32_t num_clusters = dev_prop.multiProcessorCount;
-
-    TORCH_CHECK(num_clusters % num_heads_k == 0,
-                __func__,
-                ": only supports #num_cu evenly divisible by #kv_heads.");
+    const int32_t num_cu = dev_prop.multiProcessorCount;
 
     int32_t num_batches    = context_lens.size(0);
     int32_t num_heads      = num_heads_k * num_heads_per_head_k;
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
-    int32_t num_splits = max_split_per_batch < 0
-                             ? num_clusters
-                             : min(num_clusters, max_split_per_batch * num_batches);
+    int32_t num_splits =
+        max_split_per_batch < 0 ? num_cu : min(num_cu, max_split_per_batch * num_batches);
+
+    TORCH_CHECK(num_splits % num_heads_k == 0,
+                __func__,
+                ": only supports #num_splits evenly divisible by #kv_heads.");
 
     PaMetadataV1KernelParameter params = {};
     params.p_work_metadata_ptrs        = work_metadata_ptrs.data_ptr<uint64_t>();
@@ -464,7 +462,7 @@ void get_pa_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [bat
     params.num_batches                 = num_batches;
     params.num_heads                   = num_heads_k * num_heads_per_head_k;
     params.num_heads_k                 = num_heads_k;
-    params.num_cu                      = num_clusters;
+    params.num_cu                      = num_cu;
     params.num_splits                  = num_splits;
     params.reduce_indptr_size          = reduce_indptr.size(0);
     params.qhead_granularity           = num_heads_per_head_k;
