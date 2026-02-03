@@ -34,13 +34,8 @@ jobs:
     runs-on: aiter-k8s-build
     needs: check-signal
     steps:
-      - name: Check whether it's a fork PR
-        if: ${{ github.event.pull_request.head.repo.fork }}
-        run: |
-          echo "It's a fork PR, skipping this step (will not fail)."
-          exit 0
-
       - name: Checkout code
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         uses: actions/checkout@v4
 
       # - name: Prepare docker config
@@ -51,6 +46,7 @@ jobs:
       #     echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
       
       - name: Generate Dockerfile
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.DOCKER_IMAGE }}
@@ -85,20 +81,24 @@ jobs:
           EOF
 
       - name: Show Dockerfile
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: cat Dockerfile.mod
 
       - name: Build Docker image
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
       - name: Push Docker image
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           docker push $IMAGE_TAG
 
       - name: Success message
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
       
