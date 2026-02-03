@@ -73,9 +73,14 @@ def smoothquant_quantize(
     smooth_scale = smooth_scale.to(torch.float32).contiguous()
     
     # Choose kernel based on K size
-    # For small K, use single-pass kernel; for large K, use two-pass
-    if K <= 8192:
-        BLOCK_M = min(triton.next_power_of_2(M), 32)
+    # Use single-pass for K <= 1024, otherwise use multi-pass (iterates over K)
+    # Key insight: BLOCK_K should be small enough to fit in registers
+    MAX_SINGLE_PASS_K = 1024  # Maximum K for single-pass kernel
+    
+    BLOCK_M = min(triton.next_power_of_2(M), 32)
+    
+    if K <= MAX_SINGLE_PASS_K:
+        # Single pass: load entire row at once
         BLOCK_K = triton.next_power_of_2(K)
         grid = (triton.cdiv(M, BLOCK_M),)
         
@@ -89,8 +94,9 @@ def smoothquant_quantize(
             num_warps=4,
         )
     else:
-        BLOCK_M = min(triton.next_power_of_2(M), 32)
-        BLOCK_K = 1024
+        # Multi-pass: iterate over K dimension with smaller blocks
+        # Use BLOCK_K that balances parallelism and register pressure
+        BLOCK_K = 256  # Good for most GPUs
         grid = (triton.cdiv(M, BLOCK_M),)
         
         _smoothquant_fuse_quant_kernel[grid](
@@ -116,8 +122,8 @@ def quantize_weights_int8(
         w: Weight tensor in bf16/fp16/fp32 [E, K, N] or [K, N]
         
     Returns:
-        w_int8: Quantized int8 weights
-        w_scale: Per-output-channel scale [E, N] or [N]
+        w_int8: Quantized int8 weights (contiguous)
+        w_scale: Per-output-channel scale [E, N] or [N] (contiguous)
     """
     if w.ndim == 2:
         # [K, N] -> add expert dimension
@@ -141,6 +147,11 @@ def quantize_weights_int8(
     w_scaled = w_fp32 / w_scale[:, None, :]
     w_int8 = w_scaled.round().clamp(-127, 127).to(torch.int8)
     
+    # Ensure contiguous memory layout for efficient access
+    # Layout [E, K, N] with N contiguous is optimal for the GEMM kernel
+    w_int8 = w_int8.contiguous()
+    w_scale = w_scale.contiguous()
+    
     if squeeze_output:
         w_int8 = w_int8.squeeze(0)
         w_scale = w_scale.squeeze(0)
@@ -154,31 +165,59 @@ def quantize_weights_int8(
 
 
 def get_kernel_config(m, n, k, routing_data):
-    """Get optimized kernel configuration based on problem size."""
+    """
+    Get optimized kernel configuration for int8 GEMM on AMD MI355.
+    
+    Key optimizations for int8:
+    - Larger BLOCK_K (128-256) for int8 to maximize arithmetic intensity
+    - Larger BLOCK_N (128-256) for better parallelism
+    - More pipeline stages (3-4) for latency hiding
+    - Appropriate num_warps for occupancy
+    """
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
+    
+    # Use more pipeline stages for int8 GEMM
+    num_stages = 3
 
     split_k = 1
     if block_m == 16:
-        block_n = 64
-        block_k = 256
+        # Small batch: use smaller blocks for better occupancy
+        block_n = 128  # Increased from 64 for better parallelism
+        block_k = 128  # Reduced for better pipelining with int8
         num_warps = 4
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
         grid = grid_m * grid_n * split_k
-        while block_n >= 64 and grid < 256:
+        
+        # Adjust block_n to ensure enough parallelism
+        while block_n > 32 and grid < 256:
             block_n = block_n // 2
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
+    elif block_m == 32:
+        # Medium batch: balance between parallelism and efficiency
+        if n <= 1024:
+            block_n = 128
+            block_k = 128
+            num_warps = 4
+        elif n <= 4096:
+            block_n = 256
+            block_k = 128
+            num_warps = 8
+        else:
+            block_n = 256
+            block_k = 128
+            num_warps = 8
     else:
+        # Large batch (block_m >= 64): maximize throughput
         block_n = 256
-        block_k = 256
+        block_k = 128
         num_warps = 8
 
     return {
