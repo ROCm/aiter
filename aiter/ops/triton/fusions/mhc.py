@@ -749,11 +749,10 @@ def mhc_lite(
     if out_res is None:
         out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
     
-    # Generate permutation matrices (cached)
+    # Generate permutation matrices (cached) and flatten to 2D for tl.dot approach
     perm_mats = _generate_permutation_matrices(n, x.device, x.dtype)
-    
-    # Find next power of 2 >= n_factorial for vectorized softmax
-    n_factorial_pow2 = 1 << (n_factorial - 1).bit_length()
+    # Flatten from (n!, n, n) to (n!, n²) for efficient tl.dot
+    perm_mats_flat = perm_mats.view(n_factorial, n_squared).contiguous()
     
     # Load configuration
     C = K // n
@@ -768,19 +767,24 @@ def mhc_lite(
     BLOCK_N = config.pop("BLOCK_N", 16)
     BLOCK_K = config.pop("BLOCK_K", 64)
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
-    num_ksplit = config.pop("NUM_KSPLIT", 2)  # Default to 2 for split-reduce parallelization
+    # mhc_lite only has split-reduce kernels, so enforce minimum of 2
+    num_ksplit = max(config.pop("NUM_KSPLIT", 2), 2)
+    
+    # Ensure BLOCK_N >= max(n_factorial, n_squared) for tl.dot approach
+    # This ensures all logits and outputs fit in a single block
+    min_block_n = max(n_factorial, n_squared)
+    BLOCK_N = max(BLOCK_N, triton.next_power_of_2(min_block_n))
     
     # Total bias size for kernel
     N = n_factorial + 2 * n
     
     # Calculate total output blocks: pre + post + res
+    # For split kernel: res uses n_factorial blocks
+    # For reduce kernel: res also uses n_factorial blocks (with BLOCK_N >= n_factorial, this is 1)
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
     n_blocks_post = triton.cdiv(n, BLOCK_N)
-    n_blocks_res = triton.cdiv(n_squared, BLOCK_N)
+    n_blocks_res = triton.cdiv(n_factorial, BLOCK_N)  # Use n_factorial, not n_squared
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
-    
-    # Require split-reduce optimization (NUM_KSPLIT > 1)
-    assert num_ksplit > 1, "NUM_KSPLIT must be > 1 for split-reduce optimization"
     
     # Split-K path: use split and reduce kernels
     splitk_block_size = triton.cdiv(K, num_ksplit)
@@ -846,7 +850,7 @@ def mhc_lite(
         acc_post_partial,
         acc_res_partial,
         acc_sq_partial,
-        perm_mats,
+        perm_mats_flat,  # Flattened (n!, n²) for tl.dot
         alpha_pre,
         alpha_post,
         alpha_res,
@@ -860,7 +864,6 @@ def mhc_lite(
         N=N,
         n=n,
         N_FACTORIAL=n_factorial,
-        N_FACTORIAL_POW2=n_factorial_pow2,
         eps=eps,
         # Intermediate buffer strides
         stride_acc_pre_k=acc_pre_partial.stride(0),
@@ -874,10 +877,9 @@ def mhc_lite(
         stride_acc_res_n=acc_res_partial.stride(2),  # n! dimension
         stride_acc_sq_k=acc_sq_partial.stride(0),
         stride_acc_sq_m=acc_sq_partial.stride(1),
-        # Permutation matrix strides
-        stride_perm_idx=perm_mats.stride(0),
-        stride_perm_row=perm_mats.stride(1),
-        stride_perm_col=perm_mats.stride(2),
+        # Permutation matrix strides (2D: n_factorial x n_squared)
+        stride_perm_k=perm_mats_flat.stride(0),
+        stride_perm_ij=perm_mats_flat.stride(1),
         # Output strides
         stride_pre_m=out_pre.stride(0),
         stride_pre_n=out_pre.stride(1),

@@ -741,14 +741,66 @@ def _mhc_lite_fused_split_kernel(
 
 
 @triton.jit
+def _compute_hres_mhc_lite(
+    out,           # (BLOCK_M, n_factorial) logits - padded to BLOCK_N for Triton
+    perm_ptr,      # (n_factorial, n_squared) permutation matrices
+    stride_perm_k,
+    stride_perm_ij,
+    n_squared: tl.constexpr,    # n*n: output dimension
+    n_factorial: tl.constexpr,  # n!: number of permutation matrices / input weights
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Compute exact doubly stochastic H_res via Birkhoff-von Neumann theorem.
+    
+    Computes H_res = softmax(logits) @ P where:
+    - logits: (BLOCK_M, n_factorial) raw weights for each permutation matrix  
+    - P: (n_factorial, n_squared) stacked permutation matrices
+    - Result: (BLOCK_M, n_squared) convex combination = exact doubly stochastic
+    
+    """
+    LOG2_E: tl.constexpr = 1.4426950408889634  # 1/ln(2)
+    LN_2: tl.constexpr = 0.6931471805599453    # ln(2)
+    
+    col_idx = tl.arange(0, BLOCK_N)
+    n_factorial_mask = col_idx[None, :] < n_factorial
+    out_masked = tl.where(n_factorial_mask, out, float('-inf'))
+    
+    # Log-domain softmax: logsumexp then subtract
+    out_max = tl.max(out_masked, axis=1, keep_dims=True)
+    out_shifted = out_masked - out_max
+    exp_shifted = tl.exp2(out_shifted * LOG2_E)
+    sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
+    log_sum_exp = out_max + tl.log2(sum_exp) * LN_2
+    
+    log_alpha = out_masked - log_sum_exp
+    alpha = tl.exp2(log_alpha * LOG2_E)  # (BLOCK_M, n_factorial) convex coefficients, padding ~0
+    
+    # Load permutation matrices P: (n_factorial, n_squared) padded to (BLOCK_N, BLOCK_N)
+    row_idx = tl.arange(0, BLOCK_N)[:, None]
+    col_idx_2d = tl.arange(0, BLOCK_N)[None, :]
+    perm_mask = (row_idx < n_factorial) & (col_idx_2d < n_squared)
+    P = tl.load(
+        perm_ptr + row_idx * stride_perm_k + col_idx_2d * stride_perm_ij,
+        mask=perm_mask,
+        other=0.0
+    ).to(tl.float32)  # Convert to fp32 to match alpha dtype
+    
+    H_res = tl.dot(alpha, P)
+    
+    return H_res
+
+
+@triton.jit
 def _mhc_lite_fused_reduce_kernel(
     # Intermediate buffers
     acc_pre_ptr,      # (NUM_KSPLIT, M, n)
     acc_post_ptr,     # (NUM_KSPLIT, M, n)
     acc_res_ptr,      # (NUM_KSPLIT, M, n!) - logits
     acc_sq_ptr,       # (NUM_KSPLIT, M)
-    # Permutation matrices
-    perm_mats_ptr,    # (n!, n, n)
+    # Permutation matrices (flattened)
+    perm_ptr,         # (n!, n²) flattened permutation matrices
     # Parameters
     alpha_pre,
     alpha_post,
@@ -764,7 +816,6 @@ def _mhc_lite_fused_reduce_kernel(
     N: tl.constexpr,
     n: tl.constexpr,
     N_FACTORIAL: tl.constexpr,
-    N_FACTORIAL_POW2: tl.constexpr,
     eps: tl.constexpr,
     # Intermediate buffer strides
     stride_acc_pre_k,
@@ -778,10 +829,9 @@ def _mhc_lite_fused_reduce_kernel(
     stride_acc_res_n,
     stride_acc_sq_k,
     stride_acc_sq_m,
-    # Permutation matrix strides
-    stride_perm_idx,
-    stride_perm_row,
-    stride_perm_col,
+    # Permutation matrix strides (2D: n_factorial x n_squared)
+    stride_perm_k,
+    stride_perm_ij,
     # Output strides
     stride_pre_m,
     stride_pre_n,
@@ -799,9 +849,10 @@ def _mhc_lite_fused_reduce_kernel(
     Reduce kernel for mHC-Lite - reduces partial results and applies Sinkhorn-Knopp fusion.
     
     For pre/post streams: standard reduce + RMS + bias + activation
-    For res stream: reduce → softmax over n! → weighted permutation sum → doubly stochastic
+    For res stream: reduce → softmax over n! → tl.dot with permutation matrices → doubly stochastic
     
-    This implements the core mHC-Lite innovation: H^res = Σ softmax(logits)_k * P_k
+    This implements the core mHC-Lite innovation: H^res = softmax(logits) @ P
+    where P is the (n!, n²) stacked permutation matrices.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -811,7 +862,10 @@ def _mhc_lite_fused_reduce_kernel(
     n_squared = n * n
     n_blocks_pre = tl.cdiv(n, BLOCK_N)
     n_blocks_post = n_blocks_pre
-    n_blocks_res = tl.cdiv(n_squared, BLOCK_N)
+    # For res stream, grid covers n_factorial (logits dimension)
+    # but output is n_squared; with BLOCK_N >= max(n_factorial, n_squared),
+    # there should be only 1 res block
+    n_blocks_res = tl.cdiv(N_FACTORIAL, BLOCK_N)
     
     # Stream determination using clearer logic
     threshold_post = n_blocks_pre + n_blocks_post
@@ -842,60 +896,36 @@ def _mhc_lite_fused_reduce_kernel(
     rsigma = 1.0 / rms
     
     if is_res_program:
-        # mHC-Lite path: reduce logits → softmax → weighted permutation sum
-        # STEP 1: Reduce logits across K-splits (M, n!)
-        # Allocate for n! logits per batch
-        logits = tl.zeros([BLOCK_M, N_FACTORIAL_POW2], dtype=tl.float32) + float('-inf')
+        # mHC-Lite path: reduce logits → apply RMS+alpha+bias → softmax+dot via helper
+        # Output dimension for res is n_factorial (will be converted to n² by helper)
+        n_out = N_FACTORIAL
         
-        # Reduce partial logits
-        for perm_idx in tl.static_range(N_FACTORIAL):
-            logit_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
-            for ks in range(ACTUAL_KSPLIT):
-                logit_partial = tl.load(
-                    acc_res_ptr + ks * stride_acc_res_k + rm * stride_acc_res_m + perm_idx * stride_acc_res_n,
-                    mask=rm < M,
-                    other=0.0,
-                )
-                logit_acc += logit_partial
-            
-            # Apply RMSNorm + alpha + bias
-            bias_val = tl.load(bias_ptr + (n + n + perm_idx)).to(tl.float32)
-            logit_normalized = rsigma * alpha_res * logit_acc + bias_val
-            
-            perm_indices = tl.arange(0, N_FACTORIAL_POW2)
-            logits = tl.where((perm_indices == perm_idx)[None, :], logit_normalized[:, None], logits)
+        # Reduce partial logits across K-splits
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for ks in range(ACTUAL_KSPLIT):
+            acc_partial = tl.load(
+                acc_res_ptr + ks * stride_acc_res_k + rm[:, None] * stride_acc_res_m + rn_local[None, :] * stride_acc_res_n,
+                mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+                other=0.0,
+            )
+            acc += acc_partial
         
-        # STEP 2: Softmax over n! dimension
-        LOG2_E: tl.constexpr = 1.4426950408889634
-        logits_max = tl.max(logits, axis=1, keep_dims=True)
-        exp_shifted = tl.exp2((logits - logits_max) * LOG2_E)
-        sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
-        weights = exp_shifted / sum_exp  # (BLOCK_M, N_FACTORIAL_POW2)
+        # Apply RMS + alpha + bias (Eq 16)
+        bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
+        out = rsigma[:, None] * alpha_res * acc + bias[None, :]
         
-        # STEP 3: Weighted sum of permutation matrices
-        # Compute which n² elements this program handles
-        elem_start = local_pid_n * BLOCK_N
-        elem_indices = elem_start + tl.arange(0, BLOCK_N)
-        elem_mask = elem_indices < n_squared
-        
-        row_coords = elem_indices // n
-        col_coords = elem_indices % n
-        
-        output = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        
-        for perm_idx in tl.static_range(N_FACTORIAL):
-            perm_ptrs = perm_mats_ptr + perm_idx * stride_perm_idx + row_coords * stride_perm_row + col_coords * stride_perm_col
-            perm_vals = tl.load(perm_ptrs, mask=elem_mask, other=0.0).to(tl.float32)
-            
-            perm_indices = tl.arange(0, N_FACTORIAL_POW2)
-            weight_mask = perm_indices == perm_idx
-            perm_weights = tl.sum(tl.where(weight_mask[None, :], weights, 0.0), axis=1)
-            
-            output = tl.fma(perm_weights[:, None], perm_vals[None, :], output)
+        # Call helper: softmax over n! + dot product with permutation matrices
+        # Returns (BLOCK_M, n_squared) doubly stochastic output
+        H_res = _compute_hres_mhc_lite(
+            out, perm_ptr, stride_perm_k, stride_perm_ij,
+            n_squared, N_FACTORIAL, BLOCK_M, BLOCK_N
+        )
         
         # Store H^res (already doubly stochastic)
-        out_ptrs = out_res_ptr + rm[:, None] * stride_res_m + elem_indices[None, :] * stride_res_n
-        tl.store(out_ptrs, output.to(out_res_ptr.dtype.element_ty), mask=(rm[:, None] < M) & elem_mask[None, :])
+        # Output indices are 0..n_squared (not rn_local which is for n_factorial)
+        out_cols = tl.arange(0, BLOCK_N)
+        out_ptrs = out_res_ptr + rm[:, None] * stride_res_m + out_cols[None, :] * stride_res_n
+        tl.store(out_ptrs, H_res.to(out_res_ptr.dtype.element_ty), mask=(rm[:, None] < M) & (out_cols[None, :] < n_squared))
         
     else:
         # Standard path for pre/post streams
