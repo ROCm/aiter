@@ -35,13 +35,10 @@ jobs:
     needs: check-signal
     steps:
       - name: Check whether it's a fork PR
+        if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
-          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
-            echo "It's a fork PR"
-            exit 0
-          else
-            echo "It's not a fork PR"
-          fi
+          echo "It's a fork PR, skipping this step (will not fail)."
+          exit 0
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -108,7 +105,6 @@ jobs:
   standard:
     name: Standard Tests (1 GPU)
     needs: build_aiter_image 
-    if: ${{ needs.build_aiter_image.result == 'success' || needs.build_aiter_image.result == 'skipped' }}
     strategy:
       fail-fast: false
       matrix:
@@ -206,7 +202,6 @@ jobs:
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
     needs: build_aiter_image 
-    if: ${{ github.ref == 'refs/heads/main' && needs.build_aiter_image.result == 'success' || needs.build_aiter_image.result == 'skipped' }}
     strategy:
       fail-fast: false
       matrix:
