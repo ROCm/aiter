@@ -1288,10 +1288,12 @@ def fused_moe_2stages(
                 (token_num, topk, 1), dtype=dtypes.fp32, device=device
             )
             topk_ids_sq2 = topk_ids
-            if expert_mask is not None and smooth_a2.shape[0] != expert_mask.numel():
-                if local_expert_hash is None:
-                    local_expert_hash = _get_local_expert_hash(expert_mask)
-                topk_ids_sq2 = local_expert_hash[topk_ids_sq2]
+            if (
+                local_expert_hash is None
+                and expert_mask is not None
+                and smooth_a2.shape[0] != expert_mask.numel()
+            ):
+                local_expert_hash = _get_local_expert_hash(expert_mask)
 
             aiter.smooth_per_token_scaled_quant(
                 a2_out,
@@ -1299,6 +1301,7 @@ def fused_moe_2stages(
                 a2_scale,
                 smooth_a2.contiguous(),
                 topk_ids_sq2.contiguous(),
+                smooth_scale_map_hash=local_expert_hash,  # Optional EP hash for global->local mapping
                 num_rows=num_local_tokens,
                 num_rows_factor=topk,
             )
