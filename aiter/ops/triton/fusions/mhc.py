@@ -257,6 +257,9 @@ def fused_mhc(
     n_blocks_res = 1 if hres_lite_mode else triton.cdiv(n_squared, BLOCK_N)
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
 
+    # Pop HRES_OP from config before kernel calls (only used in reduce/fused kernels, not split)
+    hres_op = config.pop("HRES_OP", 0)
+
     if num_ksplit > 1:
         # Split-K path: use split and reduce kernels
         splitk_block_size = triton.cdiv(K, num_ksplit)
@@ -368,6 +371,7 @@ def fused_mhc(
             BLOCK_N=BLOCK_N,
             ACTUAL_KSPLIT=actual_ksplit,
             HRES_LITE_MODE=hres_lite_mode,
+            HRES_OP=hres_op,  # Use the value popped earlier from config
             **config,
         )
     else:
@@ -417,6 +421,7 @@ def fused_mhc(
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
             HRES_LITE_MODE=hres_lite_mode,
+            HRES_OP=hres_op,  # Use the value popped earlier from config
             **config,
         )
 

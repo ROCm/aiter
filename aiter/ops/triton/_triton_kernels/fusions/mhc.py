@@ -31,6 +31,7 @@ def _compute_hres_mhc_lite(
     n_factorial: tl.constexpr,  # n!: number of permutation matrices / input weights
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HRES_OP: tl.constexpr,      # 0=fma loop, 1=dot product
 ):
     """
     Compute exact doubly stochastic H_res via Birkhoff-von Neumann theorem.
@@ -47,32 +48,58 @@ def _compute_hres_mhc_lite(
     n_factorial_mask = col_idx[None, :] < n_factorial
     out_masked = tl.where(n_factorial_mask, out, float('-inf'))
     
-    # Optimized softmax: direct exp-normalize (faster than log-domain for small n_factorial)
-    out_max = tl.max(out_masked, axis=1, keep_dims=True)
-    exp_shifted = tl.exp2((out_masked - out_max) * LOG2_E)
-    sum_exp = tl.sum(tl.where(n_factorial_mask, exp_shifted, 0.0), axis=1, keep_dims=True)
-    alpha = exp_shifted / sum_exp  # (BLOCK_M, n_factorial) convex coefficients
-    
     # Initialize output accumulator
     H_res = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     
-    # Loop over permutations and use tl.fma (fused multiply-add) for accumulation
-    for perm_idx in tl.static_range(n_factorial):
-        # Load permutation matrix P[perm_idx] - a vector of n_squared elements
-        elem_idx = tl.arange(0, BLOCK_N)
-        elem_mask = elem_idx < n_squared
-        perm_vals = tl.load(
-            perm_ptr + perm_idx * stride_perm_k + elem_idx * stride_perm_ij,
-            mask=elem_mask,
+    if HRES_OP == 0:
+        # FMA loop: explicit iteration with optimized softmax (good for small n_factorial)
+        # Optimized softmax: direct exp-normalize (faster than log-domain for small n_factorial)
+        out_max = tl.max(out_masked, axis=1, keep_dims=True)
+        exp_shifted = tl.exp2((out_masked - out_max) * LOG2_E)
+        sum_exp = tl.sum(tl.where(n_factorial_mask, exp_shifted, 0.0), axis=1, keep_dims=True)
+        alpha = exp_shifted / sum_exp  # (BLOCK_M, n_factorial) convex coefficients
+        
+        for perm_idx in tl.static_range(n_factorial):
+            # Load permutation matrix P[perm_idx] - a vector of n_squared elements
+            elem_idx = tl.arange(0, BLOCK_N)
+            elem_mask = elem_idx < n_squared
+            perm_vals = tl.load(
+                perm_ptr + perm_idx * stride_perm_k + elem_idx * stride_perm_ij,
+                mask=elem_mask,
+                other=0.0
+            ).to(tl.float32)
+            
+            # Extract weight for this permutation (alpha[:, perm_idx]). Use masking to extract the column
+            weight_mask = (col_idx == perm_idx)
+            weight_val = tl.sum(tl.where(weight_mask[None, :], alpha, 0.0), axis=1)
+            
+            # Fused multiply-add: H_res += weight_val * perm_vals
+            H_res = tl.fma(weight_val[:, None], perm_vals[None, :], H_res)
+    else:
+        # Dot product: load entire permutation matrix and use tl.dot (may be better for larger problems)
+        LN_2: tl.constexpr = 0.6931471805599453    # ln(2)
+        
+        # Log-domain softmax: logsumexp then subtract
+        out_max = tl.max(out_masked, axis=1, keep_dims=True)
+        out_shifted = out_masked - out_max
+        exp_shifted = tl.exp2(out_shifted * LOG2_E)
+        sum_exp = tl.sum(exp_shifted, axis=1, keep_dims=True)
+        log_sum_exp = out_max + tl.log2(sum_exp) * LN_2
+        
+        log_alpha = out_masked - log_sum_exp
+        alpha = tl.exp2(log_alpha * LOG2_E)  # (BLOCK_M, n_factorial) convex coefficients, padding ~0
+        
+        # Load permutation matrices P: (n_factorial, n_squared) padded to (BLOCK_N, BLOCK_N)
+        row_idx = tl.arange(0, BLOCK_N)[:, None]
+        col_idx_2d = tl.arange(0, BLOCK_N)[None, :]
+        perm_mask = (row_idx < n_factorial) & (col_idx_2d < n_squared)
+        P = tl.load(
+            perm_ptr + row_idx * stride_perm_k + col_idx_2d * stride_perm_ij,
+            mask=perm_mask,
             other=0.0
-        ).to(tl.float32)
+        )
         
-        # Extract weight for this permutation (alpha[:, perm_idx]). Use masking to extract the column
-        weight_mask = (col_idx == perm_idx)
-        weight_val = tl.sum(tl.where(weight_mask[None, :], alpha, 0.0), axis=1)
-        
-        # Fused multiply-add: H_res += weight_val * perm_vals
-        H_res = tl.fma(weight_val[:, None], perm_vals[None, :], H_res)
+        H_res = tl.dot(alpha, P)
     
     return H_res
 
@@ -119,6 +146,7 @@ def _mhc_fused_kernel(
     BLOCK_K: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     HRES_LITE_MODE: tl.constexpr,  # 0=sinkhorn (identity), 1=lite (softmax+perm)
+    HRES_OP: tl.constexpr,         # 0=fma loop, 1=dot product (only used if HRES_LITE_MODE=1)
 ):
     """
     Fused kernel for equations 14-18 with stream-aware grid.
@@ -229,7 +257,7 @@ def _mhc_fused_kernel(
     if HRES_LITE_MODE:
         out_res = _compute_hres_mhc_lite(
             out, perm_ptr, stride_perm_k, stride_perm_ij,
-            n_squared, n_factorial, BLOCK_M, BLOCK_N
+            n_squared, n_factorial, BLOCK_M, BLOCK_N, HRES_OP
         )
         # Output dimension for store: n for pre/post, n² for res
         n_out = n + (n_squared - n) * is_res_i32
@@ -471,6 +499,7 @@ def _mhc_fused_reduce_kernel(
     NUM_KSPLIT: tl.constexpr,
     ACTUAL_KSPLIT: tl.constexpr,
     HRES_LITE_MODE: tl.constexpr,  # 0=sinkhorn, 1=lite
+    HRES_OP: tl.constexpr,         # 0=fma loop, 1=dot product (only used if HRES_LITE_MODE=1)
 ):
     """
     Reduce kernel for mHC - combines partial results and applies post-processing.
@@ -570,7 +599,7 @@ def _mhc_fused_reduce_kernel(
     if HRES_LITE_MODE:
         out_res = _compute_hres_mhc_lite(
             out, perm_ptr, stride_perm_k, stride_perm_ij,
-            n_squared, n_factorial, BLOCK_M, BLOCK_N
+            n_squared, n_factorial, BLOCK_M, BLOCK_N, HRES_OP
         )
         # Output dimension for store: n for pre/post, n² for res
         n_out = n + (n_squared - n) * is_res_i32

@@ -93,13 +93,16 @@ def run_benchmark(args):
         line_vals = [metric_map.get(args.metric, "throughput(TFLOPS)")]
     
     benchmark_name = get_caller_name_no_ext()
-    benchmark_name += f"_{hres_mode}"
+    if hres_mode == "lite":
+        benchmark_name += f"_{hres_mode}"
+    else:
+        benchmark_name += f"_{hres_mode}{sinkhorn_iters}iters"
     if mode == "full":
-        benchmark_name += f"_full_sinkhorn{sinkhorn_iters}"
+        benchmark_name += f"_full"
     elif mode == "fused":
         benchmark_name += "_fused_only"
     elif mode == "sinkhorn":
-        benchmark_name += f"_sinkhorn_only_{sinkhorn_iters}iters"
+        benchmark_name += f"_sinkhorn_only"
     
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
