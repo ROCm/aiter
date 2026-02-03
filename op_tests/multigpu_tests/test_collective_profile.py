@@ -91,7 +91,6 @@ def run_worker(local_rank, world_size):
             torch.cuda.synchronize()
 
             # 2. Fused AllReduce + RMSNorm
-            # 直接使用 out1 作为输入
             residual = torch.randn(shape, dtype=torch.float16, device=device)
             weight = torch.randn(hidden_size, dtype=torch.float16, device=device)
             eps = 1e-5
@@ -101,12 +100,10 @@ def run_worker(local_rank, world_size):
             torch.cuda.synchronize()
 
             # 3. Reduce-Scatter
-            # 直接使用 out2 作为输入
             out3 = tensor_model_parallel_reduce_scatter(out2, use_custom=True)
             torch.cuda.synchronize()
 
             # 4. All-Gather
-            # 直接使用 out3 作为输入
             out4 = tensor_model_parallel_all_gather(out3, use_custom=True)
             torch.cuda.synchronize()
 
