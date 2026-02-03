@@ -114,9 +114,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Clean up Rocm processes
-        run: ./.github/scripts/clean_up_rocm.sh
-      
       - name: Setup Aiter for fork PR
         if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
