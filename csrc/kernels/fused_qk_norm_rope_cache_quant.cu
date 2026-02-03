@@ -20,6 +20,7 @@
 #include "hip_compat.h"
 #include "hip_reduce.h"
 #include "quant_utils.cuh"
+#include "quant_common.cuh"
 #include "rope/rope_common.h"
 #include "vec_convert.h"
 #include <torch/cuda.h>
@@ -381,7 +382,33 @@
          }
      }
  }
- 
+
+ template<typename scalar_t,  typename F, int WarpSize = 64>
+ __device__ __forceinline__ scalar_t warp_reduce(scalar_t val, F op) {
+     #pragma unroll
+     for (int offset = WarpSize / 2; offset > 0; offset >>= 1) {
+         val = op(val, __shfl_xor(val, offset, WarpSize));
+     }
+     return val;
+ }
+
+template<typename scalar_t, typename F, uint32_t NUM_WARPS>
+__inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t identity_element, scalar_t *smem)
+{
+    uint32_t warp_id = threadIdx.x / WARP_SIZE;
+    uint32_t lane_id = threadIdx.x % WARP_SIZE;
+    value = warp_reduce<scalar_t, F, WARP_SIZE>(value, op);
+    //__syncthreads();
+    if(lane_id == 0) {
+        smem[warp_id] = value;
+    }
+    __syncthreads();
+    value = (threadIdx.x < NUM_WARPS) ? smem[lane_id] : identity_element;
+    if(warp_id == 0) {
+        value = warp_reduce<scalar_t, F, WARP_SIZE>(value, op);
+    }
+    return value;
+}
  // Perform per-head QK Norm,  RoPE in a single kernel, and group quantize the kv cache with fp8 group [blk_size, head_dim].
  // scalar_t: data type of QKV and RMSNorm weights
  // kv_cache_scalar_t: data type of kv cache
@@ -470,7 +497,7 @@
       {
          // Compute norm squares
          float sumOfSquares = 0.0f;
- #pragma unroll
+        #pragma unroll
          for(int i = 0; i < numElemsPerThread; i++)
          {
              sumOfSquares += static_cast<float>(elements[i]) * static_cast<float>(elements[i]);
@@ -480,7 +507,7 @@
          float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
  
          // Normalize elements
- #pragma unroll
+         #pragma unroll
          for(int i = 0; i < numElemsPerThread; i++)
          {
              int dim      = i;//laneId * numElemsPerThread + 
@@ -560,8 +587,15 @@
          return;
      }
  
+     // ============================================================================
+     // TOKEN GROUPING FOR KV CACHE: Ensure all active threads process the same KV cache block
+     // Similar to cache_kernels.cu (lines 531-558)
+     // This is critical for correct block-level quantization scale calculation
+     // ============================================================================
+     
      // cache the kv into kv cache and quant if required
-     int64_t slot_id = slot_mapping[tokenIdx];
+     int64_t first_token_idx = tokenBlockIdx * blockDim.x;
+     int64_t slot_id = slot_mapping[first_token_idx];
      if(slot_id < 0)
      {
          // invalid slot, skip
@@ -569,94 +603,144 @@
      }
      int64_t block_idx    = slot_id / page_size;
      int64_t block_offset = slot_id % page_size;
-
-     __shared__ float shared_max[num_kv_heads];
+     // CHECK all tokens in the block have the same block_idx and block_offset
+     // fix first_token_idx to real block first_token_idx
+     
+     if(blockIdx.x > 0 && block_offset > 0)
+     {
+        __shared__ int64_t idx_smem[2];
+         if(threadIdx.x < page_size)
+         {
+             int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
+             int64_t block_idx1 = slot_mapping[token_idx] / page_size;
+             int64_t slot_idx2  = slot_mapping[token_idx + 1];
+             int64_t block_idx2 = slot_idx2 / page_size;
+             if(block_idx1 != block_idx2 && block_idx2 == block_idx)
+             {
+                 idx_smem[0] = token_idx + 1;
+                 idx_smem[1] = slot_idx2;
+             }
+         }
+      
+         __syncthreads();
+         first_token_idx = idx_smem[0];
+         slot_id        = idx_smem[1];
+     }
+     block_offset = slot_id % page_size; // for the new block block offset set all 0 to process
+     
+     // Each token should compute its own slot_id and block_offset
+     int64_t actual_slot_id = -1;
+     int64_t actual_block_offset = 0;
+     int64_t actual_block_idx = -1;
+     
+     //  add cal the num_tokens that are in the same block
+     int tokens_in_block = 0;
+     if(first_token_idx + threadIdx.x < num_tokens)
+     {
+         actual_slot_id = slot_mapping[first_token_idx + threadIdx.x];
+         actual_block_idx = actual_slot_id / page_size;
+         actual_block_offset = actual_slot_id % page_size;
+         tokens_in_block = (actual_block_idx == block_idx) ? 1 : 0;
+     }
+     auto sum               = [](float a, float b) { return a + b; };
+     //int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
+     __shared__ float smem[wg_size / WARP_SIZE];
+     int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
      float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
-     block_max  = elements[0];
- 
+     
+     // Check if current token belongs to the current block_idx
+     bool is_token_in_block = (tokens_in_block == 1);
+     block_max  = 0;//abs(elements[0]);  // Initialize with first element's abs value
+  
      // If quantization is required, compute the max abs value across the head_dim * num_heads
+     // IMPORTANT: Only compute max for tokens that belong to the same page/block
      if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
      {
         auto f_absmax_f32 = [](float v_0_, float v_1_) {
             return __builtin_fmaxf(abs(v_0_), abs(v_1_));
         };
         auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
-
-        //if (tokenIdx < num_tokens)
-        //{
-            #pragma unroll
-            for(int i = 1; i < numElemsPerThread ; i++)
-            {
-                block_max = f_absmax_f32(block_max, elements[i]);
-            }
-            //warp_max = warpReduceSum(f_absmax_f32, warp_max);
-        //} else {
-        //    block_max = 0;
-        //}
-        block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
+ 
+         // Only compute max for tokens in the current block
+         if(is_token_in_block)
+         {
+             #pragma unroll
+             for(int i = 0; i < numElemsPerThread ; i++)
+             {
+                 block_max = f_absmax_f32(block_max, elements[i]);
+             }
+         }
+         //warp_max = warpReduceSum(f_absmax_f32, warp_max);
+ 
+         //block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
+         __shared__ float smem_max[wg_size / WARP_SIZE];
+         block_max = block_reduce<float, decltype(f_max_f32), wg_size / WARP_SIZE>(block_max, f_max_f32, 0.0f, smem_max);
      }
-     if(threadIdx.x == 0)
-        printf("tokenIdx: %d,  threadIdx.x: %d , blockIdx.x: %d, blockIdx.y: %d, block_max: %f\n", tokenIdx, threadIdx.x, blockIdx.x, blockIdx.y, block_max);
-    if(isK)qsef
-    {
-        float k_scale_val = 1.0f;
-        if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
-        {
-            k_scale_val = block_max / dtype_max;
-            // Fix: correct scale index calculation [num_blocks, num_kv_heads]
-            int64_t scale_offset = block_idx * num_kv_heads + headIdx;
-            
-            // Handle incremental updates: check for scale conflicts
-            if(block_offset > 0)
-            {
-                float k_scale_global = k_scale[scale_offset];
-                
-                if(k_scale_global < k_scale_val)
-                {
-                    // New data has larger dynamic range, need to requantize old data
-                    int64_t cache_base = block_idx * page_size * num_heads_k * head_dim +
-                                        headIdx * head_dim * page_size;
-                    
+    
+     if(isK)
+     {
+         float k_scale_val = 1.0f;
+         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+         {
+             k_scale_val = block_max / dtype_max;
+             // Fix: correct scale index calculation [num_blocks, num_kv_heads]
+             int64_t scale_offset = block_idx * num_kv_heads + headIdx;
+             
+             // Handle incremental updates: check for scale conflicts
+             if(block_offset > 0)
+             {
+                 float k_scale_global = k_scale[scale_offset];
+                 
+                 if(k_scale_global < k_scale_val)
+                 {
+                     // New data has larger dynamic range, need to requantize old data
+                     int64_t cache_base = block_idx * page_size * num_heads_k * head_dim +
+                                         headIdx * head_dim * page_size;
+                     
                     // Requantize existing data [0, block_offset)
+                    // Flatten the loop: all threads cooperatively process block_offset * head_dim elements
                     // [num_blocks, num_kv_heads, head_size // x, block_size, x]
-                    #pragma unroll
-                    for(int old_offset = 0; old_offset < block_offset; old_offset++)
+                    int total_elements = block_offset * head_dim;
+                    for(int idx = threadIdx.x; idx < total_elements; idx += blockDim.x)
                     {
-                        for(int d = 0; d < head_dim; d++)
-                        {
-                            int d_idx = d / x;
-                            int x_idx = d % x;
-                            // [num_blocks, num_kv_heads, head_size // x, block_size, x]
-                            int64_t cache_idx = cache_base + d_idx * page_size * x + 
-                                              old_offset * x + x_idx;
-                            
-                            float tmp = ck_tile::type_convert<float>(k_cache[cache_idx]);
-                            tmp = tmp * k_scale_global / k_scale_val;
-                            k_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
-                        }
+                        int old_offset = idx / head_dim;
+                        int d = idx % head_dim;
+                        int d_idx = d / x;
+                        int x_idx = d % x;
+                        // [num_blocks, num_kv_heads, head_size // x, block_size, x]
+                        int64_t cache_idx = cache_base + d_idx * page_size * x + 
+                                          old_offset * x + x_idx;
+                        
+                        float tmp = ck_tile::type_convert<float>(k_cache[cache_idx]);
+                        tmp = tmp * k_scale_global / k_scale_val;
+                        k_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
                     }
-                    k_scale[scale_offset] = k_scale_val;
-                }
-                else
-                {
-                    // Old scale is sufficient, use it for new data
-                    k_scale_val = k_scale_global;
-                }
-            }
-            else
-            {
-                // New block, directly write scale
-                k_scale[scale_offset] = k_scale_val;
-            }
-        }
+                     k_scale[scale_offset] = k_scale_val;
+                 }
+                 else
+                 {
+                     // Old scale is sufficient, use it for new data
+                     k_scale_val = k_scale_global;
+                 }
+
+             }
+             else
+             {
+                 // New block, directly write scale
+                 k_scale[scale_offset] = k_scale_val;
+             }
+         }
+        //vllm::atomicMaxFloat(&k_scale[scale_offset], k_scale_val);
+        //            __threadfence();
         int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
-                               headIdx * head_dim * page_size;// + block_offset * x
+                               headIdx * head_dim * page_size;// + actual_block_offset * x
+        // Only write if current token belongs to this block
 
         #pragma unroll
         for(int i = 0; i < numElemsPerThread; i++)
         {
             // [num_blocks, num_kv_heads, head_size // x, block_size, x]
-            int64_t offset = cache_offset + i / x * page_size * x + block_offset * x + i % x;
+            int64_t offset = cache_offset + i / x * page_size * x + actual_block_offset * x + i % x;
             if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
             {
                 k_cache[offset] = elements[i];
@@ -667,79 +751,83 @@
                     ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
             }
         }
-    }
-    else
-    {
-        float v_scale_val = 1.0f;
-        if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
-        {
-            v_scale_val = block_max / dtype_max;
-            // Fix: correct scale index calculation [num_blocks, num_kv_heads]
-            int64_t scale_offset = block_idx * num_kv_heads + headIdx;
-            
-            // Handle incremental updates: check for scale conflicts
-            if(block_offset > 0)
-            {
-                float v_scale_global = v_scale[scale_offset];
-                
-                if(v_scale_global < v_scale_val)
-                {
-                    // New data has larger dynamic range, need to requantize old data
-                    int64_t cache_base = block_idx * page_size * num_heads_v * head_dim +
-                                        headIdx * head_dim * page_size;
-                    
+
+     }
+     else
+     {
+         float v_scale_val = 1.0f;
+         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+         {
+             v_scale_val = block_max / dtype_max;
+             // Fix: correct scale index calculation [num_blocks, num_kv_heads]
+             int64_t scale_offset = block_idx * num_kv_heads + headIdx;
+             
+             // Handle incremental updates: check for scale conflicts
+             if(block_offset > 0)
+             {
+                 float v_scale_global = v_scale[scale_offset];
+                 
+                 if(v_scale_global < v_scale_val)
+                 {
+                     // New data has larger dynamic range, need to requantize old data
+                     int64_t cache_base = block_idx * page_size * num_heads_v * head_dim +
+                                         headIdx * head_dim * page_size;
+                     
                     // Requantize existing data [0, block_offset)
-                    #pragma unroll
-                    for(int old_offset = 0; old_offset < block_offset; old_offset++)
+                    // Flatten the loop: all threads cooperatively process block_offset * head_dim elements
+                    int total_elements = block_offset * head_dim;
+                    for(int idx = threadIdx.x; idx < total_elements; idx += blockDim.x)
                     {
-                        for(int d = 0; d < head_dim; d++)
-                        {
-                            int old_offset_divX = old_offset / x;
-                            int old_offset_modX = old_offset % x;
-                            // [num_blocks, num_kv_heads, block_size // x, head_size, x]
-                            int64_t cache_idx = cache_base + old_offset_divX * head_dim * x + 
-                                              d * x + old_offset_modX;
-                            
-                            float tmp = ck_tile::type_convert<float>(v_cache[cache_idx]);
-                            tmp = tmp * v_scale_global / v_scale_val;
-                            v_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
-                        }
+                        int old_offset = idx / head_dim;
+                        int d = idx % head_dim;
+                        int old_offset_divX = old_offset / x;
+                        int old_offset_modX = old_offset % x;
+                        // [num_blocks, num_kv_heads, block_size // x, head_size, x]
+                        int64_t cache_idx = cache_base + old_offset_divX * head_dim * x + 
+                                          d * x + old_offset_modX;
+                        
+                        float tmp = ck_tile::type_convert<float>(v_cache[cache_idx]);
+                        tmp = tmp * v_scale_global / v_scale_val;
+                        v_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
                     }
-                    v_scale[scale_offset] = v_scale_val;
+                     v_scale[scale_offset] = v_scale_val;
+                 }
+                 else
+                 {
+                     // Old scale is sufficient, use it for new data
+                     v_scale_val = v_scale_global;
+                 }
+
+             }
+             else
+             {
+                 // New block, directly write scale
+                 v_scale[scale_offset] = v_scale_val;
+             }
+         }
+        int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
+                               headIdx * head_dim * page_size + actual_block_offset / x * head_dim * x; 
+                               
+
+         // no vectorized store for v cache since its not contiguous on head_dim
+        if (threadIdx.x < numtokens_in_block) {
+            #pragma unroll
+            for(int i = 0; i < numElemsPerThread; i++)
+            {
+                // Value cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
+                int64_t offset = cache_offset + i * x + actual_block_offset % x;
+                if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    v_cache[offset] = elements[i];
                 }
                 else
                 {
-                    // Old scale is sufficient, use it for new data
-                    v_scale_val = v_scale_global;
+                    v_cache[offset] =
+                        ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
                 }
             }
-            else
-            {
-                // New block, directly write scale
-                v_scale[scale_offset] = v_scale_val;
-            }
         }
-        int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
-                               headIdx * head_dim * page_size + block_offset / x * head_dim * x; 
-                               
-
-        // no vectorized store for v cache since its not contiguous on head_dim
-        #pragma unroll
-        for(int i = 0; i < numElemsPerThread; i++)
-        {
-            // Value cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
-            int64_t offset = cache_offset + i * x + block_offset % x;
-            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
-            {
-                v_cache[offset] = elements[i];
-            }
-            else
-            {
-                v_cache[offset] =
-                    ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
-            }
-        }
-    }
+     }
  }
  
  #define DISPATCH_KV_HEAD(num_kv_heads, ...)                             \
@@ -930,7 +1018,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             hipStream_t stream)
 {
     // Fixed blockSize to reduce template instantiations
-    constexpr int blockSize = 256;
+    constexpr int blockSize = 64;
     int const gridSize = (num_tokens + blockSize - 1) / blockSize;
 
     dim3 gridDim(gridSize, num_heads_q + num_heads_k + num_heads_v);
@@ -1184,7 +1272,7 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
          "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
  
      int64_t num_tokens = qkv.size(0);
-     int64_t page_size  = v_cache.size(-1);
+     int64_t page_size  = k_cache.size(-2);
      int64_t x          = k_cache.size(-1);
      TORCH_CHECK(position_ids.size(0) == num_tokens,
                  "Number of tokens in position_ids must match QKV");
