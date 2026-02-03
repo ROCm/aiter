@@ -269,6 +269,42 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
     return algoIndex;
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
+/*
+    Return data type size
+*/
+inline std::size_t realDataTypeSize(hipDataType dtype)
+{
+    // These types were not defined in older versions of ROCm, so need to be handled specially here.
+    auto const dtype_int = static_cast<int>(dtype);
+    if(dtype_int == HIP_R_4F_E2M1_EXT || dtype_int == HIP_R_6F_E2M3_EXT
+       || dtype_int == HIP_R_6F_E3M2_EXT)
+    {
+        return 1;
+    }
+
+    static const std::map<hipDataType, std::size_t> dtypeMap{
+        {HIP_R_32F, 4},
+        {HIP_R_64F, 8},
+        {HIP_R_16F, 2},
+        {HIP_R_8I, 1},
+        {HIP_R_8U, 1},
+        {HIP_R_32I, 4},
+        {HIP_R_32U, 4},
+        {HIP_R_16BF, 2},
+        {HIP_R_4I, 1},
+        {HIP_R_4U, 1},
+        {HIP_R_16I, 2},
+        {HIP_R_16U, 2},
+        {HIP_R_64I, 8},
+        {HIP_R_64U, 8},
+        {HIP_R_8F_E4M3_FNUZ, 1},
+        {HIP_R_8F_E5M2_FNUZ, 1},
+        {HIP_R_8F_E4M3, 1},
+        {HIP_R_8F_E5M2, 1},
+    };
+    return dtypeMap.at(dtype);
+}
+
 /**
  * GPU time measurement
  */
@@ -548,7 +584,9 @@ hipblasStatus_t hipblasLt_online_tuning(
     hipblasLtMatmulDesc_t matmulDesc, hipblasLtMatrixLayout_t ADesc, hipblasLtMatrixLayout_t BDesc, hipblasLtMatrixLayout_t CDesc,
     const void* A, const void* B, void* C,
     void* workspace, size_t workspaceSize, const void* alpha, const void* beta,
-    std::vector<hipblasLtMatmulHeuristicResult_t>& tunedResults, hipStream_t steam)
+    std::vector<hipblasLtMatmulHeuristicResult_t>& tunedResults,
+    size_t size_dA, size_t size_dB, size_t size_dC, int64_t totalRotatingSizeNeeded, hipDataType intype, hipDataType outtype,
+    hipStream_t steam)
 {
   double      gpu_time_used = 0;
   hipEvent_t  event_gpu_time_start, event_gpu_time_end;
@@ -562,9 +600,6 @@ hipblasStatus_t hipblasLt_online_tuning(
   size_t best_sol       = -1;
   double best_gpu_time  = std::numeric_limits<double>::max();
   double best_warm_time = std::numeric_limits<double>::max();
-
-  int    flush_iter      = 100000;
-  double flush_time_used = 0;
 
   const int requested_solutions = 32;
   int returnedAlgoCount = 0;
@@ -593,15 +628,44 @@ hipblasStatus_t hipblasLt_online_tuning(
       iters = 10;
   }
 
+  // rotating buffer
+  int64_t rotating = 128 * 1024 * 1024;
+  int32_t block_count = max(1, min(max(warmup_iters, iters), ceil((float)rotating / totalRotatingSizeNeeded)));
+  void* A_rotate;
+  void* B_rotate;
+  void* C_rotate;
+  CHECK_HIP_ERROR(hipMalloc(&A_rotate, size_dA * block_count * realDataTypeSize(intype)));
+  CHECK_HIP_ERROR(hipMalloc(&B_rotate, size_dB * block_count * realDataTypeSize(intype)));
+  CHECK_HIP_ERROR(hipMalloc(&C_rotate, size_dC * block_count * realDataTypeSize(outtype)));
+
   float skip_slow_solution_ratio = 0.8;
 
   for (int sol = 0; sol < heuristicResult.size(); sol++) {
     // warm-up
     pre_gpu_time(event_gpu_time_start, gpu_time_used, stream);
     for (int i = 0; i < warmup_iters; i++) {
-      status = hipblasLtMatmul(
+        /*
+        status = hipblasLtMatmul(
         hipblaslt_handle, matmulDesc, alpha, A, ADesc, B, BDesc, beta, C, CDesc, C, CDesc,
         &heuristicResult[sol].algo, workspace, workspaceSize, stream);
+        */
+        status = hipblasLtMatmul(
+                    hipblaslt_handle, 
+                    matmulDesc, 
+                    alpha, 
+                    reinterpret_cast<char*>(A_rotate) + (i % block_count) * size_dA * realDataTypeSize(intype), 
+                    ADesc, 
+                    reinterpret_cast<char*>(B_rotate) + (i % block_count) * size_dB * realDataTypeSize(intype), 
+                    BDesc, 
+                    beta, 
+                    reinterpret_cast<char*>(C_rotate) + (i % block_count) * size_dC * realDataTypeSize(outtype), 
+                    CDesc, 
+                    reinterpret_cast<char*>(C_rotate) + (i % block_count) * size_dC * realDataTypeSize(outtype), 
+                    CDesc,
+                    &heuristicResult[sol].algo, 
+                    workspace, 
+                    workspaceSize, 
+                    stream);
     }
     post_gpu_time(event_gpu_time_start, event_gpu_time_end, gpu_time_used, stream);
     best_warm_time = best_warm_time < gpu_time_used ? best_warm_time : gpu_time_used;
@@ -613,9 +677,28 @@ hipblasStatus_t hipblasLt_online_tuning(
     // iters
     pre_gpu_time(event_gpu_time_start, gpu_time_used, stream);
     for (int i = 0; i < iters; i++) {
-      status = hipblasLtMatmul(
+        /*
+        status = hipblasLtMatmul(
         hipblaslt_handle, matmulDesc, alpha, A, ADesc, B, BDesc, beta, C, CDesc, C, CDesc,
         &heuristicResult[sol].algo, workspace, workspaceSize, stream);
+        */
+        status = hipblasLtMatmul(
+                    hipblaslt_handle, 
+                    matmulDesc, 
+                    alpha, 
+                    reinterpret_cast<char*>(A_rotate) + (i % block_count) * size_dA * realDataTypeSize(intype), 
+                    ADesc, 
+                    reinterpret_cast<char*>(B_rotate) + (i % block_count) * size_dB * realDataTypeSize(intype), 
+                    BDesc, 
+                    beta, 
+                    reinterpret_cast<char*>(C_rotate) + (i % block_count) * size_dC * realDataTypeSize(outtype), 
+                    CDesc, 
+                    reinterpret_cast<char*>(C_rotate) + (i % block_count) * size_dC * realDataTypeSize(outtype), 
+                    CDesc,
+                    &heuristicResult[sol].algo, 
+                    workspace, 
+                    workspaceSize, 
+                    stream);
     }
     post_gpu_time(event_gpu_time_start, event_gpu_time_end, gpu_time_used, stream);
 
@@ -630,6 +713,10 @@ hipblasStatus_t hipblasLt_online_tuning(
   hipStreamDestroy(stream);
   hipEventDestroy(event_gpu_time_start);
   hipEventDestroy(event_gpu_time_end);
+
+  CHECK_HIP_ERROR(hipFree(A_rotate));
+  CHECK_HIP_ERROR(hipFree(B_rotate));
+  CHECK_HIP_ERROR(hipFree(C_rotate));
 
   tunedResults.clear();
   tunedResults.push_back(heuristicResult[best_sol]);
@@ -796,12 +883,26 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
       // if enable hipblaslt online tuning, check the cache file and tune the gemm
       if (online_tuning && n <= decode_max_n) {
         std::cout << "Tuning hip GEMM (" << m << ", " << n << ", " << k << ")\n";
+        
+        // calculate for rotating buffer
+        size_t size_dA, size_dB, size_dC;
+        if (bpreshuffle) {
+            size_dA = scaleA != nullptr ? ((m + 15) / 16) * 16 * ((k + 31) / 32) * 32 : ((m + 15) / 16) * 16 * ((k + 63) / 64) * 64;
+        } else {
+            size_dA = op_A == HIPBLAS_OP_N ? lda * k : lda * m;
+        }
+        size_dB = op_A == HIPBLAS_OP_N ? ldb * n : ldb * k;
+        size_dC = ldc * n;
+        int64_t totalRotatingSizeNeeded = (size_dA + size_dB) * realDataTypeSize(intype) + (2 * size_dC + 2 * m + n) * realDataTypeSize(outtype);
+
         hipblasLt_online_tuning(      
 	        handle, m, n, k,
             matmul, matA, matB, matC,
             a, b, c,
             d_workspace, workspace_size, alpha, beta,
-            heuristicResult, stream);
+            heuristicResult, 
+            size_dA, size_dB, size_dC, totalRotatingSizeNeeded, intype, outtype,
+            stream);
       
         append_hip_tuning_csv(
             heuristicResult[0].algo, "./hip_online_tuning_res.csv",
@@ -1343,5 +1444,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("bpreshuffle") = false);
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }
+
 
 
