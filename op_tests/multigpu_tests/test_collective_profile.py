@@ -104,7 +104,7 @@ def run_worker(local_rank, world_size):
             torch.cuda.synchronize()
 
             # 4. All-Gather
-            out4 = tensor_model_parallel_all_gather(out3, use_custom=True)
+            tensor_model_parallel_all_gather(out3, use_custom=True)
             torch.cuda.synchronize()
 
     # Export chrome trace
