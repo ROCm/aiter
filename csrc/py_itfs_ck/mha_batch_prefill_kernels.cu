@@ -384,14 +384,17 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                     "kv_block_descale second dim must match num_kv_heads");
         TORCH_CHECK(kv_block_descale_tensor.size(2) == 2,
                     "kv_block_descale third dim must be 2 (k_scale, v_scale)");
-        TORCH_CHECK(kv_block_descale_tensor.stride(-1) == 1,
-                    "kv_block_descale must have contiguous last dimension");
 
-        args.kv_block_descale_ptr           = kv_block_descale_tensor.data_ptr();
-        // Strides: [num_block, num_kv_head, 2]
-        args.nblock_stride_kv_block_descale = kv_block_descale_tensor.stride(0);
-        args.nhead_stride_kv_block_descale  = kv_block_descale_tensor.stride(1);
-        args.kv_stride_kv_block_descale     = kv_block_descale_tensor.stride(2);
+        // Split into separate K and V descale pointers
+        // k_descale: [num_block, num_kv_head] at kv_block_descale[..., 0]
+        // v_descale: [num_block, num_kv_head] at kv_block_descale[..., 1]
+        auto k_descale_view = kv_block_descale_tensor.select(-1, 0);
+        auto v_descale_view = kv_block_descale_tensor.select(-1, 1);
+
+        args.k_descale_ptr                  = k_descale_view.data_ptr();
+        args.v_descale_ptr                  = v_descale_view.data_ptr();
+        args.nblock_stride_kv_block_descale = k_descale_view.stride(0);
+        args.nhead_stride_kv_block_descale  = k_descale_view.stride(1);
     }
 
     return args;
