@@ -175,21 +175,85 @@ class QManagerV2
     private:
     using q_t = typename T::q_t;
 
-    uint32_t src_lane_0;
-    uint32_t src_lane_1;
-    uint64_t use_src1_s;
+    uint32_t m_src_lane_0;
+    uint32_t m_src_lane_1;
+    uint64_t m_use_src1_s;
+    uint4 m_data_rope;
+
+    template <uint32_t GPR_START>
+    __device__ __forceinline__ void shuffle_data(const uint4& data)
+    {
+        uint32_t src_lane_0_reg_0;
+        uint32_t src_lane_0_reg_1;
+        uint32_t src_lane_0_reg_2;
+        uint32_t src_lane_0_reg_3;
+        uint32_t src_lane_1_reg_0;
+        uint32_t src_lane_1_reg_1;
+        uint32_t src_lane_1_reg_2;
+        uint32_t src_lane_1_reg_3;
+
+        asm volatile("ds_bpermute_b32 %0, %4, %5\n\t"
+                     "ds_bpermute_b32 %2, %4, %7\n\t"
+                     "ds_bpermute_b32 %1, %4, %6\n\t"
+                     "ds_bpermute_b32 %3, %4, %8"
+                     : "=v"(src_lane_0_reg_0),
+                       "=v"(src_lane_0_reg_1),
+                       "=v"(src_lane_0_reg_2),
+                       "=v"(src_lane_0_reg_3)
+                     : "v"(m_src_lane_0), "v"(data[0]), "v"(data[1]), "v"(data[2]), "v"(data[3]));
+
+        // Workaround for quality issue under 8 waves mode. The results of wave 4-7 may be
+        // incorrect if there are more than 4 ds_bpermute_b32 launched in short term.
+        if constexpr(T::kNumWarps > 4)
+        {
+            __builtin_amdgcn_s_barrier();
+        }
+
+        asm volatile("ds_bpermute_b32 %0, %4, %5\n\t"
+                     "ds_bpermute_b32 %2, %4, %7\n\t"
+                     "ds_bpermute_b32 %1, %4, %6\n\t"
+                     "ds_bpermute_b32 %3, %4, %8"
+                     : "=v"(src_lane_1_reg_0),
+                       "=v"(src_lane_1_reg_1),
+                       "=v"(src_lane_1_reg_2),
+                       "=v"(src_lane_1_reg_3)
+                     : "v"(m_src_lane_1), "v"(data[0]), "v"(data[1]), "v"(data[2]), "v"(data[3]));
+
+        asm volatile("s_waitcnt lgkmcnt(6)\n\t"
+                     "v_cndmask_b32 v[%0], %4, %8, %12\n\t"
+                     "s_waitcnt lgkmcnt(4)\n\t"
+                     "v_cndmask_b32 v[%1], %5, %9, %12\n\t"
+                     "s_waitcnt lgkmcnt(2)\n\t"
+                     "v_cndmask_b32 v[%2], %6, %10, %12\n\t"
+                     "s_waitcnt lgkmcnt(0)\n\t"
+                     "v_cndmask_b32 v[%3], %7, %11, %12"
+                     :
+                     : "i"(GPR_START),
+                       "i"(GPR_START + 1),
+                       "i"(GPR_START + 2),
+                       "i"(GPR_START + 3),
+                       "v"(src_lane_0_reg_0),
+                       "v"(src_lane_0_reg_1),
+                       "v"(src_lane_1_reg_0),
+                       "v"(src_lane_1_reg_1),
+                       "v"(src_lane_0_reg_2),
+                       "v"(src_lane_0_reg_3),
+                       "v"(src_lane_1_reg_2),
+                       "v"(src_lane_1_reg_3),
+                       "s"(m_use_src1_s));
+    }
 
     public:
     __device__ QManagerV2()
     {
         const uint32_t lane_idx = ckt::get_lane_id();
-        src_lane_0              = (lane_idx % 16) * 4 + (lane_idx / 32);
-        src_lane_1              = src_lane_0 + 2;
-        src_lane_0 *= 4; // the address passed in ds_bpermute_b32 is tid * 4
-        src_lane_1 *= 4;
+        m_src_lane_0            = (lane_idx % 16) * 4 + (lane_idx / 32);
+        m_src_lane_1            = m_src_lane_0 + 2;
+        m_src_lane_0 *= 4; // the address passed in ds_bpermute_b32 is tid * 4
+        m_src_lane_1 *= 4;
 
         const uint32_t use_src1_v = (lane_idx / 16) % 2;
-        asm volatile("v_cmp_ne_u32 %0, %1, %2" : "=s"(use_src1_s) : "v"(use_src1_v), "v"(0));
+        asm volatile("v_cmp_ne_u32 %0, %1, %2" : "=s"(m_use_src1_s) : "v"(use_src1_v), "v"(0));
     }
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
@@ -210,127 +274,52 @@ class QManagerV2
         constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / ckt::get_warp_size(); // 1024/64=16
         constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;      // 64/16=4
 
-        auto buffer_load_dwordx4 = [](const __amdgpu_buffer_rsrc_t& srsrc,
-                                      const uint32_t v_offset,
-                                      const uint32_t s_offset,
-                                      const uint32_t i_offset) {
-            v4ui result;
-
-            asm volatile("buffer_load_dwordx4 %0, %1, %2, %3 offen offset:%4"
-                         : "=v"(result)
-                         : "v"(v_offset), "s"(srsrc), "s"(s_offset), "i"(i_offset)
-                         : "memory");
-
-            return result;
-        };
-
-        auto shuffle_data = [&]<uint32_t GPR_START>(const v4ui& data) {
-            uint32_t src_lane_0_reg_0;
-            uint32_t src_lane_0_reg_1;
-            uint32_t src_lane_0_reg_2;
-            uint32_t src_lane_0_reg_3;
-            uint32_t src_lane_1_reg_0;
-            uint32_t src_lane_1_reg_1;
-            uint32_t src_lane_1_reg_2;
-            uint32_t src_lane_1_reg_3;
-
-            asm volatile("ds_bpermute_b32 %0, %4, %5\n\t"
-                         "ds_bpermute_b32 %2, %4, %7\n\t"
-                         "ds_bpermute_b32 %1, %4, %6\n\t"
-                         "ds_bpermute_b32 %3, %4, %8"
-                         : "=v"(src_lane_0_reg_0),
-                           "=v"(src_lane_0_reg_1),
-                           "=v"(src_lane_0_reg_2),
-                           "=v"(src_lane_0_reg_3)
-                         : "v"(src_lane_0), "v"(data[0]), "v"(data[1]), "v"(data[2]), "v"(data[3]));
-
-            // Workaround for quality issue under 8 waves mode. The results of wave 4-7 may be
-            // incorrect if there are more than 4 ds_bpermute_b32 launched in short term.
-            if constexpr(T::kNumWarps > 4)
-            {
-                __builtin_amdgcn_s_barrier();
-            }
-
-            asm volatile("ds_bpermute_b32 %0, %4, %5\n\t"
-                         "ds_bpermute_b32 %2, %4, %7\n\t"
-                         "ds_bpermute_b32 %1, %4, %6\n\t"
-                         "ds_bpermute_b32 %3, %4, %8"
-                         : "=v"(src_lane_1_reg_0),
-                           "=v"(src_lane_1_reg_1),
-                           "=v"(src_lane_1_reg_2),
-                           "=v"(src_lane_1_reg_3)
-                         : "v"(src_lane_1), "v"(data[0]), "v"(data[1]), "v"(data[2]), "v"(data[3]));
-
-            asm volatile("s_waitcnt lgkmcnt(6)\n\t"
-                         "v_cndmask_b32 v[%0], %4, %8, %12\n\t"
-                         "s_waitcnt lgkmcnt(4)\n\t"
-                         "v_cndmask_b32 v[%1], %5, %9, %12\n\t"
-                         "s_waitcnt lgkmcnt(2)\n\t"
-                         "v_cndmask_b32 v[%2], %6, %10, %12\n\t"
-                         "s_waitcnt lgkmcnt(0)\n\t"
-                         "v_cndmask_b32 v[%3], %7, %11, %12"
-                         :
-                         : "i"(GPR_START),
-                           "i"(GPR_START + 1),
-                           "i"(GPR_START + 2),
-                           "i"(GPR_START + 3),
-                           "v"(src_lane_0_reg_0),
-                           "v"(src_lane_0_reg_1),
-                           "v"(src_lane_1_reg_0),
-                           "v"(src_lane_1_reg_1),
-                           "v"(src_lane_0_reg_2),
-                           "v"(src_lane_0_reg_3),
-                           "v"(src_lane_1_reg_2),
-                           "v"(src_lane_1_reg_3),
-                           "s"(use_src1_s));
-        };
-
         const uint32_t lane_idx = ckt::get_lane_id();
 
-        q_t* p_q_buffer = &q_buffer[{q_start, 0, 0, 0}];
-        const __amdgpu_buffer_rsrc_t srsrc =
-            __builtin_amdgcn_make_buffer_rsrc(p_q_buffer, 0, 0xffffffff, 0x00020000);
+        uint64_t as_u64 =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&q_buffer[{q_start, 0, 0, 0}]));
+        const hk::buffer_resource br = hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
 
         const uint32_t s_offset = warp_idx * kNumRowsPerWarp * T::kQkHeadDim * sizeof(q_t);
         const uint32_t row      = lane_idx / kNumLanesPerRow;
         const uint32_t col      = (lane_idx % kNumLanesPerRow) * kNumElemPerLane;
         const uint32_t v_offset = (row * T::kQkHeadDim + col) * sizeof(q_t);
 
-        v4ui data_0 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 0 * kNumColsPerWarp);
-        v4ui data_1 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 1 * kNumColsPerWarp);
+        uint4 data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 0 * kNumColsPerWarp);
+        uint4 data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 1 * kNumColsPerWarp);
         asm volatile("s_waitcnt vmcnt(1)");
-        v4ui data_2 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 2 * kNumColsPerWarp);
+        uint4 data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 2 * kNumColsPerWarp);
         __builtin_amdgcn_s_setprio(7);
-        shuffle_data.template operator()<GPR_NOPE_START + 0>(data_0);
+        shuffle_data<GPR_NOPE_START + 0>(data_0);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(6);
-        data_0 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 3 * kNumColsPerWarp);
-        shuffle_data.template operator()<GPR_NOPE_START + 4>(data_1);
+        data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 3 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 4>(data_1);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(5);
-        data_1 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 4 * kNumColsPerWarp);
-        shuffle_data.template operator()<GPR_NOPE_START + 8>(data_2);
+        data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 4 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 8>(data_2);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(4);
-        data_2 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 5 * kNumColsPerWarp);
-        shuffle_data.template operator()<GPR_NOPE_START + 12>(data_0);
+        data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 5 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 12>(data_0);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(3);
-        data_0 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 6 * kNumColsPerWarp);
-        shuffle_data.template operator()<GPR_NOPE_START + 16>(data_1);
+        data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 6 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 16>(data_1);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(2);
-        data_1 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 7 * kNumColsPerWarp);
-        shuffle_data.template operator()<GPR_NOPE_START + 20>(data_2);
+        data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 7 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 20>(data_2);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(1);
-        data_2 = buffer_load_dwordx4(srsrc, v_offset, s_offset, 8 * kNumColsPerWarp);
-        shuffle_data.template operator()<GPR_NOPE_START + 24>(data_0);
+        m_data_rope = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 8 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 24>(data_0);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(0);
-        shuffle_data.template operator()<GPR_NOPE_START + 28>(data_1);
+        shuffle_data<GPR_NOPE_START + 28>(data_1);
         asm volatile("s_waitcnt vmcnt(0)");
-        shuffle_data.template operator()<GPR_ROPE_START>(data_2);
+        shuffle_data<GPR_ROPE_START>(m_data_rope);
     }
 };
 
@@ -1363,12 +1352,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     const uint32_t kv_ld_row_base_idx = kv_manager.get_kv_ld_row_base_idx(warp_idx);
     const uint32_t kv_ld_col_base     = kv_manager.get_kv_ld_col_base(warp_idx);
 
-    std::uintptr_t out_as_int       = reinterpret_cast<std::uintptr_t>(params.final_output.raw_ptr);
-    std::uint64_t out_as_u64        = static_cast<std::uint64_t>(out_as_int);
-    hk::buffer_resource out_br      = hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
-    std::uintptr_t split_out_as_int = reinterpret_cast<std::uintptr_t>(params.split_output.raw_ptr);
-    std::uint64_t split_out_as_u64  = static_cast<std::uint64_t>(split_out_as_int);
-    hk::buffer_resource split_out_br =
+    const uintptr_t out_as_int       = reinterpret_cast<uintptr_t>(params.final_output.raw_ptr);
+    const uint64_t out_as_u64        = static_cast<uint64_t>(out_as_int);
+    const hk::buffer_resource out_br = hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+    const uintptr_t split_out_as_int = reinterpret_cast<uintptr_t>(params.split_output.raw_ptr);
+    const uint64_t split_out_as_u64  = static_cast<uint64_t>(split_out_as_int);
+    const hk::buffer_resource split_out_br =
         hk::make_buffer_resource(split_out_as_u64, 0xFFFFFFFF, 0x00020000);
 
     // LDS tiles
