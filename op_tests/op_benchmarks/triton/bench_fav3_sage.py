@@ -128,6 +128,7 @@ def run_aiter_fp8_flash_attn(
     v: torch.Tensor,
     has_descale: bool = False,
     scale: Optional[torch.Tensor] = None,
+    causal: bool = False,
 ):
     scale = scale
     q, k, v, q_descale, k_descale, v_descale = fp8_quantize(q, k, v, scale=scale)
@@ -144,6 +145,7 @@ def run_aiter_fp8_flash_attn(
             q,
             k,
             v,
+            causal=causal,
             **attn_kwargs,
         )
 
@@ -153,7 +155,7 @@ def run_aiter_fp8_flash_attn(
 
 
 def run_aiter_flash_attn(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, has_round_mode: bool = False
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, has_round_mode: bool = False, causal: bool = False
 ):
     # Note this will JIT compile on first invocation
     # [aiter] start build [module_fmha_v3_fwd] under /opt/aiter/aiter/jit/build/module_fmha_v3_fwd
@@ -169,7 +171,7 @@ def run_aiter_flash_attn(
                 k,
                 v,
                 dropout_p=0.0,
-                causal=False,
+                causal=causal,
                 return_attn_probs=False,
                 how_v3_bf16_cvt=2,
             )
@@ -178,7 +180,7 @@ def run_aiter_flash_attn(
 
         def fn():
             return aiter.ops.mha.flash_attn_func(
-                q, k, v, dropout_p=0.0, causal=False, return_attn_probs=False
+                q, k, v, dropout_p=0.0, causal=causal, return_attn_probs=False
             )
 
     return fn
@@ -312,7 +314,7 @@ def fav3_sage_forward_func(
         k,
         v,
         softmax_scale,
-        causal=False,
+        causal=causal,
         inference_mode=True,
         layout=layout,
     )
@@ -439,22 +441,22 @@ def primary_output(result):
     return result
 
 
-def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
+def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, causal=False):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
             k,
             v,
-            causal=False,
+            causal=causal,
             inference_mode=True,
             layout=layout,
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
         if func_name == "aiter_bf16":
-            fn = run_aiter_flash_attn(q, k, v)
+            fn = run_aiter_flash_attn(q, k, v, causal=causal)
         elif func_name == "aiter_fp8":
-            fn = run_aiter_fp8_flash_attn(q, k, v, has_descale=True)
+            fn = run_aiter_fp8_flash_attn(q, k, v, has_descale=True, causal=causal)
         elif func_name == "fav2":  # fav2 (no quantization)
             fn = fav2_forward_func(
                 q,
@@ -462,7 +464,7 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
                 v,
                 dropout_p=0.0,
                 softmax_scale=softmax_scale,
-                causal=False,
+                causal=causal,
                 return_lse=False,
                 return_attn_probs=False,
             )
@@ -472,17 +474,16 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
                 k,
                 v,
                 softmax_scale=softmax_scale,
-                causal=False,
+                causal=causal,
                 window_size=(-1, -1),
                 attention_chunk=0,
                 softcap=0.0,
                 sm_margin=0,
             )
         else:
-
             def fn():
                 return attention_ref(
-                    q, k, v, dropout_p=0.0, dropout_mask=None, causal=False
+                    q, k, v, dropout_p=0.0, dropout_mask=None, causal=causal
                 )
 
     return fn
@@ -503,6 +504,8 @@ def bench_kernel(q, k, v, args, provider):
     # FLOPS calculation variables
     total_flops = 0.0
     total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+    if args.causal:
+        total_flops /= 2.0  # causal attention does half the work
     bench_func_name = ""
     if args.fav3_fp8:
         bench_func_name = "fav3_fp8"
@@ -521,6 +524,7 @@ def bench_kernel(q, k, v, args, provider):
         softmax_scale=softmax_scale,
         k_smooth=k_smooth,
         layout=args.layout,
+        causal=args.causal,
         dtype=arg_to_torch_dtype[args.dtype],
     )
     ms = triton.testing.do_bench(fn)
@@ -545,6 +549,7 @@ def bench_kernel(q, k, v, args, provider):
                 k_smooth=k_smooth,
                 layout=args.layout,
                 dtype=arg_to_torch_dtype[args.dtype],
+                causal=args.causal,
             )()
         )
 
@@ -703,6 +708,7 @@ def parse_args():
         default=0,
         help="Q and K head size, if -dv is absent then -d specifies V head size too",
     )
+    parser.add_argument("-causal", action="store_true", default=False)
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument(
         "-fav3_fp8",

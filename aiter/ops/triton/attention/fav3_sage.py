@@ -25,6 +25,7 @@ def get_sage_fwd_configs():
             "num_stages": 5,
             "num_warps": 8,
         }
+        
     elif arch == "gfx942":
         return {
             "BLOCK_M": 256,
@@ -399,7 +400,7 @@ def fav3_sage_func(
 
     # --- 7. Kernel Launch ---
     def grid(META):
-        return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
+        return (triton.cdiv(seqlen_q, META["BLOCK_M"]) * nheads_q * batch, )
 
     sage_fwd[grid](
         q,
@@ -458,6 +459,7 @@ def fav3_sage_func(
         philox_seed=None,
         philox_offset_base=None,
         RETURN_LSE=return_lse,
+        BATCH=batch,
         HQ=nheads_q,
         HK=nheads_k,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,

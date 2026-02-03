@@ -5,6 +5,8 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     compute_alibi_block,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+
 
 
 def map_dims(shape, indices):
@@ -908,6 +910,7 @@ def sage_fwd(
     dropout_p,
     philox_seed,
     philox_offset_base,
+    BATCH,
     RETURN_LSE: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -937,9 +940,22 @@ def sage_fwd(
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
 
     # compute offsets
-    start_m = tl.program_id(0)
-    off_h_q = tl.program_id(1)
-    off_z = tl.program_id(2)
+    NUM_BLOCKS = (MAX_SEQLENS_Q + BLOCK_M - 1) // BLOCK_M
+    # calculate offsets
+    wid = tl.program_id(
+        0
+    )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
+    # num blocks along seqlen
+
+    off_h_q = wid % HQ
+    off_h_q = remap_xcd(off_h_q, HQ, 8)
+    start_m = (wid // HQ) % NUM_BLOCKS
+    off_z = (wid // (NUM_BLOCKS * HQ)) % BATCH
+
+
+    # start_m = tl.program_id(0)
+    # off_h_q = tl.program_id(1)
+    # off_z = tl.program_id(2)
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
     if GROUP_SIZE != 1:
