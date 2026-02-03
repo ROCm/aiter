@@ -2,7 +2,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
-#include "sinkhorn_knopp.cuh"
+#include "../include/mhc_layer.cuh"
 
 namespace cg = cooperative_groups;
 
