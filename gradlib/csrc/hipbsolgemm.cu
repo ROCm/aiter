@@ -586,16 +586,14 @@ hipblasStatus_t hipblasLt_online_tuning(
     void* workspace, size_t workspaceSize, const void* alpha, const void* beta,
     std::vector<hipblasLtMatmulHeuristicResult_t>& tunedResults,
     size_t size_dA, size_t size_dB, size_t size_dC, int64_t totalRotatingSizeNeeded, hipDataType intype, hipDataType outtype,
-    hipStream_t steam)
+    hipStream_t stream)
 {
   double      gpu_time_used = 0;
   hipEvent_t  event_gpu_time_start, event_gpu_time_end;
-  hipStream_t stream;
   hipblasStatus_t status;
 
   hipEventCreate(&event_gpu_time_start);
   hipEventCreate(&event_gpu_time_end);
-  hipStreamCreate(&stream);
 
   size_t best_sol       = -1;
   double best_gpu_time  = std::numeric_limits<double>::max();
@@ -709,8 +707,9 @@ hipblasStatus_t hipblasLt_online_tuning(
 
     int* ptr_algo = (int*)(&heuristicResult[sol].algo.data);
   }
+  
+  hipStreamSynchronize(stream);
 
-  hipStreamDestroy(stream);
   hipEventDestroy(event_gpu_time_start);
   hipEventDestroy(event_gpu_time_end);
 
@@ -867,6 +866,16 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     // load tuning cache file and check if the gemm has been already tuned
     const char* env = std::getenv("HIP_ONLINE_TUNING");
     bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
+    // check if there is enough memory left for online tuning
+    if (online_tuning) {
+        size_t freeMem, totalMem;
+        hipMemGetInfo(&freeMem, &totalMem);
+        if (freeMem <= 128*1024*1024) {
+            std::cout << "No space left for hipBLASLt online tuning." << std::endl;
+            online_tuning = false;
+        }
+    }
+
     if (online_tuning && n <= decode_max_n) { 
       solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
                                                   bpreshuffle, use_rowwise,

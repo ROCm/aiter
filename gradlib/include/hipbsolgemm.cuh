@@ -83,6 +83,6 @@ hipblasStatus_t hipblasLt_online_tuning(
     void* workspace, size_t workspaceSize, const void* alpha, const void* beta,
     std::vector<hipblasLtMatmulHeuristicResult_t>& tunedResults,
     size_t size_dA, size_t size_dB, size_t size_dC, int64_t totalRotatingSizeNeeded, hipDataType intype, hipDataType outtype,
-    hipStream_t steam);
+    hipStream_t stream);
 
 
