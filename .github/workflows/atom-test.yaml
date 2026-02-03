@@ -44,12 +44,12 @@ jobs:
             env_vars: ""
             runner: aiter-8gpu-runner
           - model_name: "gpt-oss-120b"
-            label: MI325 (1 GPU)
+            label: MI355 (1 GPU)
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
-            runner: aiter-1gpu-runner
+            runner: aiter-mi355-1gpu
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
