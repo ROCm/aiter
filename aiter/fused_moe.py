@@ -678,7 +678,10 @@ def get_2stage_cfgs(
             dtypes.fp8,
             QuantType.per_1x128,
         )
-        return problem_type != bypass_type
+        if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
+            aiter.logger.info("bypass tuned results for fp8 blockscale")
+            return False
+        return True
 
     # cfg = cfg_2stages.get(keys, None)
     cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
@@ -707,7 +710,7 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = False
+                run_1stage = token > 32 and (inter_dim % 256 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -1640,11 +1643,13 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    if (
-        get_gfx() == "gfx942"
-        and (expert, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
-        and gating_output.dtype == dtypes.fp32
-    ):
+    if (expert, topk) in [
+        (128, 4),
+        (128, 6),
+        (128, 8),
+        (256, 6),
+        (256, 8),
+    ] and gating_output.dtype in [dtypes.bf16, dtypes.fp32]:
         if topk_weights is None:
             topk_weights = torch.empty(
                 (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device

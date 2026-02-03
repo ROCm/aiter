@@ -116,6 +116,20 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_ps_metadata": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/ps_metadata_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_comm.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_2_host.cuh'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla.cu'",
@@ -126,7 +140,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla --output_dir {{}}'"
     },
     "module_cache": {
         "srcs": [
@@ -429,7 +443,8 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
-            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
         ]
     },
     "module_moe_ck2stages": {
@@ -548,6 +563,21 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
+    },
+    "module_rmsnorm_quant": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/rmsnorm_quant_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/rmsnorm_quant_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": ["'-ffast-math'"],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'",
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     },
     "module_smoothquant": {
         "srcs": [
@@ -803,7 +833,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_fwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_fwd_asm_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
         ],
         "flags_extra_cc": [
             "'-DFAV3_ON=1'"
@@ -826,7 +856,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_fwd_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_fwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
         ],
         "flags_extra_cc": [
             "'-DFAV2_ON=1'"
@@ -850,8 +880,8 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_fwd_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cpp'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cu'"
         ],
         "flags_extra_cc": [
             "'-DFAV2_ON=1'"
@@ -877,7 +907,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_batch_prefill_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_batch_prefill_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cpp'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -899,7 +929,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_bwd.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
@@ -921,7 +951,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_bwd.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
@@ -944,7 +974,7 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_fwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_asm_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
         ],
         "flags_extra_cc": [
             "'-DFAV3_ON=1'"
@@ -965,7 +995,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -988,7 +1018,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -1009,9 +1039,9 @@
     },
     "libmha_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cpp'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cpp'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -1035,7 +1065,7 @@
     },
     "libmha_bwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cpp'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

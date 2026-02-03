@@ -172,11 +172,11 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, total_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({num_heads, 1, total_q, head_size_q}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = head_size_q <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
-        dq_accum = torch::zeros({nsplits, total_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
@@ -271,11 +271,11 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
             ck_tile::index_t stride_dv = dv_expanded.stride(0);
             ck_tile::index_t nhead_stride_dv = dv_expanded.stride(1);
 
-            // dq_acc: (split, total_q, nheads, hdim_v)
-            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(0);
-            ck_tile::index_t batch_stride_dq_acc = 0;
-            ck_tile::index_t stride_dq_acc = dq_accum.stride(1);
-            ck_tile::index_t nhead_stride_dq_acc = dq_accum.stride(2);
+            // dq_acc: (nheads, split, total_q, hdim_v)
+            ck_tile::long_index_t batch_stride_dq_acc = 0;
+            ck_tile::long_index_t nhead_stride_dq_acc = dq_accum.stride(0);
+            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(1);
+            ck_tile::index_t stride_dq_acc = dq_accum.stride(2);
 
             float p_undrop = 1.0 - p_dropout;
 
