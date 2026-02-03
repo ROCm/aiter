@@ -349,9 +349,6 @@ void fused_mrope_rms(
 static constexpr int WARP_SIZE = 32;
 
 struct alignas(1) fp8e4m3fn {
-    enum {
-        max_value = 240,
-    };
     struct from_bits_t {
     };
     __host__ __device__ static constexpr from_bits_t from_bits() {
@@ -380,9 +377,6 @@ struct alignas(1) fp8e4m3fn {
 };
 
 struct alignas(1) fp8e4m3fnuz {
-    enum {
-        max_value = 120,
-    };
     struct from_bits_t {
     };
     __host__ __device__ static constexpr from_bits_t from_bits() {
@@ -1301,47 +1295,7 @@ struct KernelElementType<c10::BFloat16> {
     using type = hip_bfloat16;
 };
 
-void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Tensor &positions,
-                    int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
-                    bool is_neox_style, std::vector<int64_t> mrope_section_, bool is_interleaved, double eps) {
-    TORCH_CHECK(mrope_section_.size() == 3);
-    TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() && cos_sin.is_contiguous());
-    std::array<int64_t, 3> mrope_section;
-    mrope_section[0] = mrope_section_[0];
-    mrope_section[1] = mrope_section_[1];
-    mrope_section[2] = mrope_section_[2];
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(qkv));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    auto pos_strides = positions.strides();
-    TORCH_CHECK(pos_strides.size() == 2);
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        kBFloat16,
-        kHalf,
-        qkv.scalar_type(),
-        "fused_mrope_3d_rms", [&] {
-            using T = KernelElementType<scalar_t>::type;
-            rope_rms::fused_mrope_rms<T, 3>(
-                (T*)qkv.data_ptr<scalar_t>(),
-                (T*)qw.data_ptr<scalar_t>(),
-                (T*)kw.data_ptr<scalar_t>(),
-                (T*)cos_sin.data_ptr<scalar_t>(),
-                positions.data_ptr<int64_t>(),
-                pos_strides[0],
-                pos_strides[1],
-                num_tokens,
-                num_heads_q,
-                num_heads_k,
-                num_heads_v,
-                head_size,
-                is_neox_style,
-                eps,
-                mrope_section,
-                is_interleaved,
-                stream);
-        });
-}
-
-void fused_mrope_3d_rms_set_kv(Tensor& qkv,
+void fused_qk_norm_mrope_3d_cache_quant_shuffle(Tensor& qkv,
                                Tensor& qw,
                                Tensor& kw,
                                Tensor& cos_sin,
@@ -1492,198 +1446,6 @@ void fused_mrope_3d_rms_set_kv(Tensor& qkv,
                     eps,
                     mrope_section,
                     is_interleaved,
-                    (T*)q.data_ptr<scalar_t>(),
-                    (rope_rms::fp8e4m3fn*)k_cache.data_ptr(),
-                    (rope_rms::fp8e4m3fn*)v_cache.data_ptr(),
-                    kv_loc.data_ptr<int64_t>(),
-                    k_scale.item<float>(),
-                    v_scale.item<float>(),
-                    stream,
-                    k_out_fp8_ptr,
-                    v_out_fp8_ptr,
-                    return_kv,
-                    use_shuffle_layout,
-                    block_size,
-                    x);
-            }
-            else
-            {
-                TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
-            }
-        }
-    });
-}
-
-void fused_rope_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Tensor &positions,
-                    int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
-                    bool is_neox_style, double eps) {
-    TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() && cos_sin.is_contiguous());
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(qkv));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    auto pos_strides = positions.strides();
-    TORCH_CHECK(pos_strides.size() == 1);
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        kBFloat16,
-        kHalf,
-        qkv.scalar_type(),
-        "fused_rope_rms", [&] {
-            using T = KernelElementType<scalar_t>::type;
-            rope_rms::fused_rope_rms<T>(
-                (T*)qkv.data_ptr<scalar_t>(),
-                (T*)qw.data_ptr<scalar_t>(),
-                (T*)kw.data_ptr<scalar_t>(),
-                (T*)cos_sin.data_ptr<scalar_t>(),
-                positions.data_ptr<int64_t>(),
-                0,
-                pos_strides[0],
-                num_tokens,
-                num_heads_q,
-                num_heads_k,
-                num_heads_v,
-                head_size,
-                is_neox_style,
-                eps,
-                stream);
-        });
-}
-
-void fused_rope_rms_set_kv(Tensor& qkv,
-                           Tensor& qw,
-                           Tensor& kw,
-                           Tensor& cos_sin,
-                           Tensor& positions,
-                           int64_t num_tokens,
-                           int64_t num_heads_q,
-                           int64_t num_heads_k,
-                           int64_t num_heads_v,
-                           int64_t head_size,
-                           bool is_neox_style,
-                           double eps,
-                           Tensor& q,
-                           Tensor& k_cache,
-                           Tensor& v_cache,
-                           Tensor& kv_loc,
-                           Tensor& k_scale,
-                           Tensor& v_scale,
-                           std::optional<Tensor> k_out,
-                           std::optional<Tensor> v_out,
-                           bool return_kv,
-                           bool use_shuffle_layout,
-                           int64_t block_size,
-                           int64_t x)
-{
-    TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
-                cos_sin.is_contiguous());
-    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && kv_loc.is_contiguous());
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(qkv));
-    auto stream         = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    auto pos_strides    = positions.strides();
-    auto kv_cache_dtype = k_cache.scalar_type();
-    auto qkv_dtype      = qkv.scalar_type();
-    TORCH_CHECK(pos_strides.size() == 1);
-    AT_DISPATCH_FLOATING_TYPES_AND2(kBFloat16, kHalf, qkv_dtype, "fused_rope_rms_set_kv", [&] {
-        using T = KernelElementType<scalar_t>::type;
-        if(kv_cache_dtype == qkv_dtype)
-        {
-            T* k_out_ptr =
-                (return_kv && k_out.has_value()) ? (T*)k_out.value().data_ptr<scalar_t>() : nullptr;
-            T* v_out_ptr =
-                (return_kv && v_out.has_value()) ? (T*)v_out.value().data_ptr<scalar_t>() : nullptr;
-            rope_rms::fused_rope_rms_set_kv<T, T>((T*)qkv.data_ptr<scalar_t>(),
-                                                  (T*)qw.data_ptr<scalar_t>(),
-                                                  (T*)kw.data_ptr<scalar_t>(),
-                                                  (T*)cos_sin.data_ptr<scalar_t>(),
-                                                  positions.data_ptr<int64_t>(),
-                                                  0,
-                                                  pos_strides[0],
-                                                  num_tokens,
-                                                  num_heads_q,
-                                                  num_heads_k,
-                                                  num_heads_v,
-                                                  head_size,
-                                                  is_neox_style,
-                                                  eps,
-                                                  (T*)q.data_ptr<scalar_t>(),
-                                                  (T*)k_cache.data_ptr<scalar_t>(),
-                                                  (T*)v_cache.data_ptr<scalar_t>(),
-                                                  kv_loc.data_ptr<int64_t>(),
-                                                  k_scale.item<float>(),
-                                                  v_scale.item<float>(),
-                                                  stream,
-                                                  k_out_ptr,
-                                                  v_out_ptr,
-                                                  return_kv,
-                                                  use_shuffle_layout,
-                                                  block_size,
-                                                  x);
-        }
-        else
-        {
-            // Check if kv_cache_dtype is fp8e4m3fnuz or fp8e4m3fn
-            if(kv_cache_dtype == at::ScalarType::Float8_e4m3fnuz)
-            {
-                rope_rms::fp8e4m3fnuz* k_out_fp8_ptr =
-                    (return_kv && k_out.has_value())
-                        ? (rope_rms::fp8e4m3fnuz*)k_out.value().data_ptr()
-                        : nullptr;
-                rope_rms::fp8e4m3fnuz* v_out_fp8_ptr =
-                    (return_kv && v_out.has_value())
-                        ? (rope_rms::fp8e4m3fnuz*)v_out.value().data_ptr()
-                        : nullptr;
-                rope_rms::fused_rope_rms_set_kv<T, rope_rms::fp8e4m3fnuz>(
-                    (T*)qkv.data_ptr<scalar_t>(),
-                    (T*)qw.data_ptr<scalar_t>(),
-                    (T*)kw.data_ptr<scalar_t>(),
-                    (T*)cos_sin.data_ptr<scalar_t>(),
-                    positions.data_ptr<int64_t>(),
-                    0,
-                    pos_strides[0],
-                    num_tokens,
-                    num_heads_q,
-                    num_heads_k,
-                    num_heads_v,
-                    head_size,
-                    is_neox_style,
-                    eps,
-                    (T*)q.data_ptr<scalar_t>(),
-                    (rope_rms::fp8e4m3fnuz*)k_cache.data_ptr(),
-                    (rope_rms::fp8e4m3fnuz*)v_cache.data_ptr(),
-                    kv_loc.data_ptr<int64_t>(),
-                    k_scale.item<float>(),
-                    v_scale.item<float>(),
-                    stream,
-                    k_out_fp8_ptr,
-                    v_out_fp8_ptr,
-                    return_kv,
-                    use_shuffle_layout,
-                    block_size,
-                    x);
-            }
-            else if(kv_cache_dtype == at::ScalarType::Float8_e4m3fn)
-            {
-                rope_rms::fp8e4m3fn* k_out_fp8_ptr =
-                    (return_kv && k_out.has_value())
-                        ? (rope_rms::fp8e4m3fn*)k_out.value().data_ptr()
-                        : nullptr;
-                rope_rms::fp8e4m3fn* v_out_fp8_ptr =
-                    (return_kv && v_out.has_value())
-                        ? (rope_rms::fp8e4m3fn*)v_out.value().data_ptr()
-                        : nullptr;
-                rope_rms::fused_rope_rms_set_kv<T, rope_rms::fp8e4m3fn>(
-                    (T*)qkv.data_ptr<scalar_t>(),
-                    (T*)qw.data_ptr<scalar_t>(),
-                    (T*)kw.data_ptr<scalar_t>(),
-                    (T*)cos_sin.data_ptr<scalar_t>(),
-                    positions.data_ptr<int64_t>(),
-                    0,
-                    pos_strides[0],
-                    num_tokens,
-                    num_heads_q,
-                    num_heads_k,
-                    num_heads_v,
-                    head_size,
-                    is_neox_style,
-                    eps,
                     (T*)q.data_ptr<scalar_t>(),
                     (rope_rms::fp8e4m3fn*)k_cache.data_ptr(),
                     (rope_rms::fp8e4m3fn*)v_cache.data_ptr(),

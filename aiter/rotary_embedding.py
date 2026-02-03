@@ -31,10 +31,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from aiter import (
     dtypes,
-    fused_mrope_3d_rms,
-    fused_mrope_3d_rms_set_kv,
-    fused_rope_rms,
-    fused_rope_rms_set_kv,
+    fused_qk_norm_mrope_3d_cache_quant_shuffle,
 )
 
 # from custom_op import CustomOp
@@ -1264,51 +1261,53 @@ class RotaryEmbeddingFusedQKNorm(nn.Module):
                 if return_kv
                 else None
             )
-            fused_rope_rms_set_kv(
-                qkv,
-                q_weight,
-                k_weight,
-                self.cos_sin_cache,
-                positions,
-                num_tokens,
-                num_heads_q,
-                num_heads_k,
-                num_heads_v,
-                self.head_size,
-                self.is_neox_style,
-                eps,
-                q_out,
-                fused_set_kv_buffer_arg.kv_cache[0],
-                fused_set_kv_buffer_arg.kv_cache[1],
-                fused_set_kv_buffer_arg.cache_loc,
-                fused_set_kv_buffer_arg.k_scale,
-                fused_set_kv_buffer_arg.v_scale,
-                k_out,
-                v_out,
-                return_kv,
-                fused_set_kv_buffer_arg.use_shuffle_layout,
-                fused_set_kv_buffer_arg.block_size,
-                fused_set_kv_buffer_arg.x,
-            )
+            raise NotImplementedError("fused_rope_rms_set_kv not supported yet")
+            # fused_rope_rms_set_kv(
+            #     qkv,
+            #     q_weight,
+            #     k_weight,
+            #     self.cos_sin_cache,
+            #     positions,
+            #     num_tokens,
+            #     num_heads_q,
+            #     num_heads_k,
+            #     num_heads_v,
+            #     self.head_size,
+            #     self.is_neox_style,
+            #     eps,
+            #     q_out,
+            #     fused_set_kv_buffer_arg.kv_cache[0],
+            #     fused_set_kv_buffer_arg.kv_cache[1],
+            #     fused_set_kv_buffer_arg.cache_loc,
+            #     fused_set_kv_buffer_arg.k_scale,
+            #     fused_set_kv_buffer_arg.v_scale,
+            #     k_out,
+            #     v_out,
+            #     return_kv,
+            #     fused_set_kv_buffer_arg.use_shuffle_layout,
+            #     fused_set_kv_buffer_arg.block_size,
+            #     fused_set_kv_buffer_arg.x,
+            # )
             if return_kv:
                 return q_out, k_out, v_out
             else:
                 return q_out, None, None
         else:
-            fused_rope_rms(
-                qkv,
-                q_weight,
-                k_weight,
-                self.cos_sin_cache,
-                positions,
-                num_tokens,
-                num_heads_q,
-                num_heads_k,
-                num_heads_v,
-                self.head_size,
-                self.is_neox_style,
-                eps,
-            )
+            raise NotImplementedError("fused_rope_rms not supported yet")
+            # fused_rope_rms(
+            #     qkv,
+            #     q_weight,
+            #     k_weight,
+            #     self.cos_sin_cache,
+            #     positions,
+            #     num_tokens,
+            #     num_heads_q,
+            #     num_heads_k,
+            #     num_heads_v,
+            #     self.head_size,
+            #     self.is_neox_style,
+            #     eps,
+            # )
             q_size = num_heads_q * self.head_size
             k_size = num_heads_k * self.head_size
             v_size = num_heads_v * self.head_size
@@ -1424,7 +1423,7 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
                 if return_kv
                 else None
             )
-            fused_mrope_3d_rms_set_kv(
+            fused_qk_norm_mrope_3d_cache_quant_shuffle(
                 qkv,
                 q_weight,
                 k_weight,
@@ -1457,22 +1456,23 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
             else:
                 return q_out, None, None
         else:
-            fused_mrope_3d_rms(
-                qkv,
-                q_weight,
-                k_weight,
-                self.cos_sin_cache,
-                positions,
-                num_tokens,
-                num_heads_q,
-                num_heads_k,
-                num_heads_v,
-                self.head_size,
-                self.is_neox_style,
-                self.mrope_section,
-                is_interleaved,
-                eps,
-            )
+            raise NotImplementedError("fused_mrope_3d_rms not supported yet")
+            # fused_mrope_3d_rms(
+            #     qkv,
+            #     q_weight,
+            #     k_weight,
+            #     self.cos_sin_cache,
+            #     positions,
+            #     num_tokens,
+            #     num_heads_q,
+            #     num_heads_k,
+            #     num_heads_v,
+            #     self.head_size,
+            #     self.is_neox_style,
+            #     self.mrope_section,
+            #     is_interleaved,
+            #     eps,
+            # )
             q_size = num_heads_q * self.head_size
             k_size = num_heads_k * self.head_size
             v_size = num_heads_v * self.head_size

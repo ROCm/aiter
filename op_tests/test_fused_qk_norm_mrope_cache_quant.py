@@ -68,208 +68,6 @@ def apply_rotary_emb_dispatch(
 
 
 @perftest()
-def run_torch_mrope_3d_rms(
-    qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
-    qw: Tensor,  #  contiguous (head_size)
-    kw: Tensor,  #  contiguous (head_size)
-    cos_sin: Tensor,  # contiguous (max_positions * head_size)
-    positions: Tensor,  # contiguous (3 * num_tokens) or (num_tokens)
-    num_tokens: int,
-    num_heads_q: int,
-    num_heads_k: int,
-    num_heads_v: int,
-    head_size: int,
-    is_neox_style: bool,
-    mrope_section: List[int],
-    is_interleaved: bool,
-    eps: float,
-    is_mrope: bool,
-):
-    q_size = num_heads_q * head_size
-    k_size = num_heads_k * head_size
-    v_size = num_heads_v * head_size
-    qkv = qkv.view(num_tokens, q_size + k_size + v_size)
-    q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
-
-    q_by_head = q.view(num_tokens, num_heads_q, head_size)
-    q_by_head = rms_norm_forward(q_by_head, qw, eps)
-    q = q_by_head.view(q.shape)
-
-    k_by_head = k.view(num_tokens, num_heads_k, head_size)
-    k_by_head = rms_norm_forward(k_by_head, kw, eps)
-    k = k_by_head.view(k.shape)
-
-    cos_sin = cos_sin.view(-1, head_size)
-    if is_mrope:
-        positions = positions.view(3, num_tokens)
-    cos_sin = cos_sin[positions]
-    cos, sin = cos_sin.chunk(2, dim=-1)
-
-    if is_mrope:
-        if is_interleaved:
-            cos = apply_interleaved_rope(cos, mrope_section)
-            sin = apply_interleaved_rope(sin, mrope_section)
-        else:
-            cos = torch.cat(
-                [m[i] for i, m in enumerate(cos.split(mrope_section, dim=-1))],
-                dim=-1,
-            )
-            sin = torch.cat(
-                [m[i] for i, m in enumerate(sin.split(mrope_section, dim=-1))],
-                dim=-1,
-            )
-
-    q_shape = q.shape
-    q = q.view(num_tokens, -1, head_size)
-    q = apply_rotary_emb_dispatch(q, cos, sin, is_neox_style)
-    q = q.reshape(q_shape)
-
-    k_shape = k.shape
-    k = k.view(num_tokens, -1, head_size)
-    k = apply_rotary_emb_dispatch(k, cos, sin, is_neox_style)
-    k = k.reshape(k_shape)
-
-    return q, k, v
-
-
-@perftest()
-def run_aiter_mrope_3d_rms(
-    qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
-    qw: Tensor,  #  contiguous (head_size)
-    kw: Tensor,  #  contiguous (head_size)
-    cos_sin: Tensor,  # contiguous (max_positions * head_size)
-    positions: Tensor,  # contiguous (3 * num_tokens)
-    num_tokens: int,
-    num_heads_q: int,
-    num_heads_k: int,
-    num_heads_v: int,
-    head_size: int,
-    is_neox_style: bool,
-    mrope_section: List[int],
-    is_interleaved: bool,
-    eps: float,
-    is_mrope: bool,
-):
-    qkv = qkv.clone()  # inplace op
-
-    if is_mrope:
-        aiter.fused_mrope_3d_rms(
-            qkv,
-            qw,
-            kw,
-            cos_sin,
-            positions,
-            num_tokens,
-            num_heads_q,
-            num_heads_k,
-            num_heads_v,
-            head_size,
-            is_neox_style,
-            mrope_section,
-            is_interleaved,
-            eps,
-        )
-    else:
-        aiter.fused_rope_rms(
-            qkv,
-            qw,
-            kw,
-            cos_sin,
-            positions,
-            num_tokens,
-            num_heads_q,
-            num_heads_k,
-            num_heads_v,
-            head_size,
-            is_neox_style,
-            eps,
-        )
-
-    q_size = num_heads_q * head_size
-    k_size = num_heads_k * head_size
-    v_size = num_heads_v * head_size
-
-    qkv = qkv.view(num_tokens, q_size + k_size + v_size)
-    q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
-    return q, k, v
-
-
-@benchmark()
-def test_mrope_3d_rms(
-    dtype,
-    num_tokens,
-    num_heads_q,
-    num_heads_k,
-    num_heads_v,
-    head_size,
-    is_neox_style,
-    mrope_section,
-    is_interleaved,
-    eps,
-    is_mrope,
-    max_positions,
-):
-    qkv = torch.randn(
-        (num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size),
-        dtype=dtype,
-        device="cuda",
-    )
-    qw = torch.randn(head_size, dtype=dtype, device="cuda")
-    kw = torch.randn(head_size, dtype=dtype, device="cuda")
-    cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
-    if is_mrope:
-        pos_shape = (3, num_tokens)
-    else:
-        pos_shape = (num_tokens,)
-    positions = torch.randint(
-        0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
-    )
-
-    (q_ref, k_ref, v_ref), avg_torch = run_torch_mrope_3d_rms(
-        qkv,
-        qw,
-        kw,
-        cos_sin,
-        positions,
-        num_tokens,
-        num_heads_q,
-        num_heads_k,
-        num_heads_v,
-        head_size,
-        is_neox_style,
-        mrope_section,
-        is_interleaved,
-        eps,
-        is_mrope,
-    )
-    (q, k, v), avg_cu = run_aiter_mrope_3d_rms(
-        qkv,
-        qw,
-        kw,
-        cos_sin,
-        positions,
-        num_tokens,
-        num_heads_q,
-        num_heads_k,
-        num_heads_v,
-        head_size,
-        is_neox_style,
-        mrope_section,
-        is_interleaved,
-        eps,
-        is_mrope,
-    )
-
-    info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
-    if is_mrope:
-        info += f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
-    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
-    checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
-    checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
-    checkAllclose(v_ref, v, msg=msg, rtol=1e-2, atol=0.05)
-
-
-@perftest()
 def run_torch_mrope_3d_rms_set_kv(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)
@@ -367,9 +165,8 @@ def run_fused_mrope_3d_rms_set_kv(
     v_scale: float,
     is_mrope: bool,
 ):
-    qkv = qkv.clone()  # inplace op
     if is_mrope:
-        aiter.fused_mrope_3d_rms_set_kv(
+        aiter.fused_qk_norm_mrope_3d_cache_quant_shuffle(
             qkv,
             qw,
             kw,
@@ -398,32 +195,7 @@ def run_fused_mrope_3d_rms_set_kv(
             0,
         )
     else:
-        aiter.fused_rope_rms_set_kv(
-            qkv,
-            qw,
-            kw,
-            cos_sin,
-            positions,
-            num_tokens,
-            num_heads_q,
-            num_heads_k,
-            num_heads_v,
-            head_size,
-            is_neox_style,
-            eps,
-            q_out,
-            k_cache,
-            v_cache,
-            kv_loc,
-            torch.tensor(k_scale),
-            torch.tensor(v_scale),
-            None,
-            None,
-            False,
-            False,
-            0,
-            0,
-        )
+        raise NotImplementedError("not implemented")
     return None
 
 
@@ -811,7 +583,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     use_shuffle_layout: bool = False,  # Whether to use shuffle layout
     page_size: int = 0,  # Page size (block_size) for shuffle layout
 ):
-    qkv = qkv.clone()  # inplace op
+    # qkv = qkv.clone()  # inplace op
     # Calculate x for shuffle layout: x = 16 // k_cache.element_size()
     x = 0
     block_size = page_size
@@ -819,7 +591,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
         x = 16 // k_cache.element_size()
 
     if is_mrope:
-        aiter.fused_mrope_3d_rms_set_kv(
+        aiter.fused_qk_norm_mrope_3d_cache_quant_shuffle(
             qkv,
             qw,
             kw,
@@ -848,33 +620,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
             x,
         )
     else:
-        # For non-mrope case, use fused_rope_rms_set_kv (now supports k_out/v_out)
-        aiter.fused_rope_rms_set_kv(
-            qkv,
-            qw,
-            kw,
-            cos_sin,
-            positions,
-            num_tokens,
-            num_heads_q,
-            num_heads_k,
-            num_heads_v,
-            head_size,
-            is_neox_style,
-            eps,
-            q_out,
-            k_cache,
-            v_cache,
-            kv_loc,
-            torch.tensor(k_scale),
-            torch.tensor(v_scale),
-            k_out,
-            v_out,
-            return_kv,
-            use_shuffle_layout,
-            block_size,
-            x,
-        )
+        raise NotImplementedError("not implemented")
     return None
 
 
@@ -1049,9 +795,10 @@ def test_mrope_3d_rms_set_kv_shuffle(
         info += f", return_kv:{test_return_kv}"
     if use_shuffle_layout:
         info += f", use_shuffle_layout:{use_shuffle_layout}, page_size:{page_size}"
-    # msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
+    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
 
     checkAllclose(q_out_ref, q_out, msg="q_out", rtol=1e-2, atol=0.05)
+    print(msg, flush=True)
     # For shuffle layout, we need to reshape cache for comparison
     if use_shuffle_layout:
         # Reshape shuffle cache back to flat format for comparison
@@ -1173,105 +920,11 @@ parser.add_argument(
     e.g.: -i true   # for interleaved MRoPE
           or -i false # for non-interleaved MRoPE""",
 )
-parser.add_argument(
-    "-ms",
-    "--mrope_sections",
-    type=dtypes.str2tuple,
-    nargs="*",
-    default=[[12, 10, 10], [24, 20, 20], [48, 40, 40]],
-    help="""Mrope section.
-    e.g.: -m 12,10,10""",
-)
 
+mrope_sections_dict = {64: [12, 10, 10], 128: [24, 20, 20], 256: [48, 40, 40]}
 
 if __name__ == "__main__":
     args = parser.parse_args()
-
-    print("\n\n================== test_rope_rms ==================\n\n")
-    for is_neox_style in args.neox_style:
-        for num_token in args.token:
-            for num_head in args.head:
-                for i, head_size in enumerate(args.head_sizes):
-                    test_mrope_3d_rms(
-                        args.dtype,
-                        num_token,
-                        num_head,
-                        num_head,
-                        num_head,
-                        head_size,
-                        is_neox_style,
-                        None,
-                        None,
-                        eps=1e-6,
-                        is_mrope=False,
-                        max_positions=args.max_positions,
-                    )
-
-    print("\n\n================== test_mrope_3d_rms ==================\n\n")
-    for is_neox_style in args.neox_style:
-        for num_token in args.token:
-            for num_head in args.head:
-                for i, head_size in enumerate(args.head_sizes):
-                    ms = args.mrope_sections[i]
-                    for is_interleaved in args.is_interleaved:
-                        test_mrope_3d_rms(
-                            args.dtype,
-                            num_token,
-                            num_head,
-                            num_head,
-                            num_head,
-                            head_size,
-                            is_neox_style,
-                            ms,
-                            is_interleaved,
-                            eps=1e-6,
-                            is_mrope=True,
-                            max_positions=args.max_positions,
-                        )
-
-    print("\n\n================== test_rope_rms_set_kv ==================\n\n")
-    for is_neox_style in args.neox_style:
-        for num_token in args.token:
-            for num_head in args.head:
-                for i, head_size in enumerate(args.head_sizes):
-                    test_mrope_3d_rms_set_kv(
-                        args.dtype,
-                        num_token,
-                        num_head,
-                        num_head,
-                        num_head,
-                        head_size,
-                        is_neox_style,
-                        None,
-                        None,
-                        eps=1e-6,
-                        is_mrope=False,
-                        max_positions=args.max_positions,
-                    )
-
-    print("\n\n================== test_mrope_3d_rms_set_kv ==================\n\n")
-    for is_neox_style in args.neox_style:
-        for num_token in args.token:
-            for num_head in args.head:
-                for i, head_size in enumerate(args.head_sizes):
-                    ms = args.mrope_sections[i]
-                    for is_interleaved in args.is_interleaved:
-                        test_mrope_3d_rms_set_kv(
-                            args.dtype,
-                            num_token,
-                            num_head,
-                            num_head,
-                            num_head,
-                            head_size,
-                            is_neox_style,
-                            ms,
-                            is_interleaved,
-                            eps=1e-6,
-                            is_mrope=True,
-                            max_positions=args.max_positions,
-                        )
-
-    print("\n\n================== test_rope_rms_set_kv_shuffle ==================\n\n")
     kv_cache_dtypes = [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz]
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
@@ -1286,39 +939,6 @@ if __name__ == "__main__":
                         for num_token in args.token:
                             for num_head in args.head:
                                 for i, head_size in enumerate(args.head_sizes):
-                                    test_mrope_3d_rms_set_kv_shuffle(
-                                        args.dtype,
-                                        num_token,
-                                        num_head,
-                                        num_head,
-                                        num_head,
-                                        head_size,
-                                        is_neox_style,
-                                        None,
-                                        None,
-                                        eps=1e-6,
-                                        is_mrope=False,
-                                        kv_cache_dtype=kv_cache_dtype,
-                                        test_return_kv=test_return_kv,
-                                        use_shuffle_layout=use_shuffle_layout,
-                                        page_size=page_size,
-                                        max_positions=args.max_positions,
-                                    )
-
-    print(
-        "\n\n================== test_mrope_3d_rms_set_kv_shuffle ==================\n\n"
-    )
-    for kv_cache_dtype in kv_cache_dtypes:
-        for test_return_kv in test_return_kv_flags:
-            for use_shuffle_layout in use_shuffle_layouts:
-                # For shuffle layout, test both page sizes; for normal layout, skip page_size
-                page_size_list = page_sizes if use_shuffle_layout else [0]
-                for page_size in page_size_list:
-                    for is_neox_style in args.neox_style:
-                        for num_token in args.token:
-                            for num_head in args.head:
-                                for i, head_size in enumerate(args.head_sizes):
-                                    ms = args.mrope_sections[i]
                                     for is_interleaved in args.is_interleaved:
                                         test_mrope_3d_rms_set_kv_shuffle(
                                             args.dtype,
@@ -1328,7 +948,7 @@ if __name__ == "__main__":
                                             1,
                                             head_size,
                                             is_neox_style,
-                                            ms,
+                                            mrope_sections_dict[head_size],
                                             is_interleaved,
                                             eps=1e-6,
                                             is_mrope=True,
@@ -1338,5 +958,3 @@ if __name__ == "__main__":
                                             page_size=page_size,
                                             max_positions=args.max_positions,
                                         )
-
-    print("done")
