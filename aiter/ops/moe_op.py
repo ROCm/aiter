@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
@@ -224,6 +224,7 @@ def cmdGenFunc_ck_moe_stage(
     quant_type: int = 0,
     activation: int = 0,
     splitk: int = 1,
+    use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
 ):
 
@@ -262,6 +263,9 @@ def cmdGenFunc_ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    splitk: int = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: Optional[str] = None,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -298,6 +302,7 @@ def ck_moe_stage1(
     quant_type: int = 0,
     activation: int = 0,
     splitk: Optional[int] = 1,
+    use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
 ) -> None: ...
 
@@ -319,6 +324,9 @@ def ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    splitk: int = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: Optional[str] = None,
 ) -> None: ...
 
 
@@ -337,7 +345,9 @@ def moe_cktile2stages_gemm1_ck(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
+    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    split_k: Optional[int] = 1,
 ) -> Tensor: ...
 
 
@@ -355,7 +365,9 @@ def moe_cktile2stages_gemm1(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
+    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    split_k: Optional[int] = 1,
 ):
     return moe_cktile2stages_gemm1_ck(
         XQ,
@@ -371,7 +383,9 @@ def moe_cktile2stages_gemm1(
         x_scale,
         w_scale,
         exp_bias,
+        activation,
         block_m,
+        split_k,
     )
 
 
@@ -390,7 +404,9 @@ def moe_cktile2stages_gemm2_ck(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
+    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    split_k: Optional[int] = 1,
 ) -> Tensor: ...
 
 
@@ -408,7 +424,9 @@ def moe_cktile2stages_gemm2(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
     exp_bias: Optional[Tensor] = None,
+    activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
+    split_k: Optional[int] = 1,
 ):
     return moe_cktile2stages_gemm2_ck(
         XQ,
@@ -424,7 +442,9 @@ def moe_cktile2stages_gemm2(
         x_scale,
         w_scale,
         exp_bias,
+        activation,
         block_m,
+        split_k,
     )
 
 
@@ -512,6 +532,7 @@ def ck_moe_stage1_fwd(
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
     splitk: Optional[int] = 1,
+    use_non_temporal_load: Optional[bool] = False,
     dst_type: Optional[torch.dtype] = None,
 ):
     ck_moe_stage1(
@@ -531,7 +552,8 @@ def ck_moe_stage1_fwd(
         quant_type.value,
         activation.value,
         int(splitk) if splitk is not None else splitk,
-        dtype2str_dict[dst_type],
+        use_non_temporal_load,
+        None if dst_type is None else dtype2str_dict[dst_type],
     )
     return out
 
@@ -552,8 +574,8 @@ def ck_moe_stage2_fwd(
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
+    use_non_temporal_load: Optional[bool] = False,
 ):
-
     ck_moe_stage2(
         inter_states,
         w1,
@@ -570,5 +592,6 @@ def ck_moe_stage2_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
+        use_non_temporal_load=use_non_temporal_load,
     )
     return out

@@ -33,31 +33,36 @@ void all_reduce(fptr_t _fa,
                 torch::Tensor& out,
                 bool use_new,
                 bool open_fp8_quant,
-                std::optional<torch::Tensor> reg_buffer);
+                std::optional<torch::Tensor> reg_input_buffer,
+                std::optional<torch::Tensor> reg_output_buffer);
 void reduce_scatter(fptr_t _fa,
-                torch::Tensor& inp,
-                torch::Tensor& out,
-                std::optional<torch::Tensor> reg_buffer);
+                    torch::Tensor& inp,
+                    torch::Tensor& out,
+                    std::optional<torch::Tensor> reg_buffer);
 void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
 void all_gather_unreg(fptr_t _fa,
                       torch::Tensor& inp,
                       torch::Tensor& reg_buffer,
                       torch::Tensor& out);
 void fused_allreduce_rmsnorm(fptr_t _fa,
-                torch::Tensor& inp,
-                torch::Tensor& res_inp,
-                torch::Tensor& res_out,
-                torch::Tensor& out,
-                torch::Tensor& w,
-                float eps,
-                std::optional<torch::Tensor> reg_buffer);
+                             torch::Tensor& inp,
+                             torch::Tensor& res_inp,
+                             torch::Tensor& res_out,
+                             torch::Tensor& out,
+                             torch::Tensor& w,
+                             float eps,
+                             std::optional<torch::Tensor> reg_buffer);
 
 void dispose(fptr_t _fa);
 int64_t meta_size();
-void register_buffer(fptr_t _fa,
+void register_input_buffer(fptr_t _fa,
                      torch::Tensor& t,
                      const std::vector<torch::Tensor>& handles,
                      const std::vector<int64_t>& offsets);
+void register_output_buffer(fptr_t _fa,
+                            torch::Tensor& t,
+                            const std::vector<torch::Tensor>& handles,
+                            const std::vector<int64_t>& offsets);
 std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa);
 void register_graph_buffers(fptr_t _fa,
                             const std::vector<torch::Tensor>& handles,

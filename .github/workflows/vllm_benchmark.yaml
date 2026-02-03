@@ -32,6 +32,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_vllm_image:
+    name: Build vLLM Image
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
     runs-on: aiter-k8s-build
@@ -72,7 +73,9 @@ jobs:
               git submodule sync && git submodule update --init --recursive && \\
               python3 setup.py develop
 
-          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+
+          ENTRYPOINT [""]
           EOF
 
       - name: Show Dockerfile
@@ -93,9 +96,10 @@ jobs:
           echo "Successfully prepared image: rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}"
 
   vllm_benchmark:
+    name: vLLM Benchmark (8 GPU)
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-8gpu-runner
     needs: build_vllm_image
+    runs-on: aiter-8gpu-runner
     strategy:
       fail-fast: false
       matrix:

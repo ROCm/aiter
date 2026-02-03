@@ -7,7 +7,6 @@ import triton
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
-
 # Standard bounds for M_LEQ_x keys (tuple for hashability with LRU cache)
 STANDARD_M_BOUNDS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
@@ -73,7 +72,8 @@ def get_gemm_config(
         specialized_filename: Custom specialized filename suffix (optional)
 
     Returns:
-        Dictionary with the config params
+        Dictionary with the config params,
+        bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     # Input validation
     assert M >= 0, "M must be positive."

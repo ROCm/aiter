@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import torch
@@ -69,6 +69,7 @@ def asm_moe_test(
     fc2_smooth_scale=None,  # [expert, 1, inter_dim]
     a16=False,
     expert_mask=None,
+    local_expert_hash=None,
 ):
     # Switch backend by env var:
     # - AITER_USE_FLYDSL_MOE=0 -> asm_moe (original)
@@ -102,6 +103,7 @@ def asm_moe_test(
         fc2_smooth_scale,
         a16,
         expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
     )
 
 
@@ -290,6 +292,11 @@ def test_fmoe_ep(
         # b implement
         w1b = shuffle_weight(w1)
         w2b = shuffle_weight(w2)
+        local_expert_hash = None
+        if expert_mask is not None and use_smooth:
+            local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+            local_expert_hash[local_expert_hash > 0] -= 1
+            local_expert_hash[expert_mask == 0] = -1
         out_b, avg_b = asm_moe_test(
             input,
             w1b,
@@ -301,6 +308,7 @@ def test_fmoe_ep(
             fc1_smooth_scale,
             fc2_smooth_scale,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
         )
 
         def calculateTensorsSize(*args):
@@ -614,7 +622,7 @@ for test in l_test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8smoothquant":
