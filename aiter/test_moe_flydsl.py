@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import torch
@@ -256,7 +256,13 @@ def test_fmoe(
 
     # Keep git-head behavior by default; allow disabling the swap to measure CK baseline:
     #   AITER_USE_FLIR_MOE=0 python3 op_tests/test_moe_2stage.py -q 2 ...
-    if os.environ.get("AITER_USE_FLIR_MOE", "1") not in ("1", "true", "True", "YES", "yes"):
+    if os.environ.get("AITER_USE_FLIR_MOE", "1") not in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    ):
         use_flir = False
     if use_flir:
         import sys
@@ -318,7 +324,6 @@ def test_fmoe(
         # before stage2 quantization.
         out1_flir = torch.empty((token, topk, inter_dim), device="cuda", dtype=dtype)
         exe1 = compile_moe_gemm1(
-            tokens=token,
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=E,
@@ -326,18 +331,14 @@ def test_fmoe(
             tile_m=tile_m,
             tile_n=tile_n1,
             tile_k=tile_k1,
-            sorted_size=sorted_size,
-            size_expert_ids=size_expert_ids_total,
             doweight_stage1=bool(doweight_stage1),
             in_dtype="fp8",
             out_dtype="bf16" if dtype == torch.bfloat16 else "f16",
-            dynamic_blocks=True,
             use_cshuffle_epilog=False,
         )
 
         # Stage2 compile once (compile inside perftest can be unstable + distorts perf).
         exe2 = compile_moe_gemm2(
-            tokens=token,
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=E,
@@ -345,14 +346,11 @@ def test_fmoe(
             tile_m=tile_m,
             tile_n=tile_n2,
             tile_k=tile_k2,
-            sorted_size=sorted_size,
-            size_expert_ids=size_expert_ids_total,
             doweight_stage2=bool(not doweight_stage1),
             in_dtype="fp8",
             # For bf16 test configs, fp16 atomic accumulation can overflow to +/-inf.
             # Use fp32 atomics for correctness; cast to `dtype` for comparison below.
             out_dtype="f32" if dtype == torch.bfloat16 else "f16",
-            dynamic_blocks=True,
         )
         w2_flat = w2_shuf.contiguous().view(E * model_dim, inter_dim).contiguous()
         w2_scale_1d = w2_scale.view(-1).contiguous()
@@ -385,7 +383,9 @@ def test_fmoe(
         _, us1 = run_perftest(launch_stage1, num_iters=num_iters, num_warmup=num_warmup)
 
         # Quantize stage1->stage2 input exactly like git-head reference (outside timing).
-        a2_qt_flir, a2_scale_flir = torch_quant(out1_flir.to(dtype), quant_dtype=AQDType)
+        a2_qt_flir, a2_scale_flir = torch_quant(
+            out1_flir.to(dtype), quant_dtype=AQDType
+        )
         a2_qt_flir = a2_qt_flir.view(token, topk, -1).contiguous()
 
         a2_qt_flat = a2_qt_flir.contiguous().view(-1)
@@ -410,9 +410,13 @@ def test_fmoe(
             )
             return out2
 
-        out2_ck, us2 = run_perftest(launch_stage2, num_iters=num_iters, num_warmup=num_warmup)
+        out2_ck, us2 = run_perftest(
+            launch_stage2, num_iters=num_iters, num_warmup=num_warmup
+        )
         us2 = us1 + us2
-        print(f"[aiter] flir_moe_gemm1: {us1:8.2f} us, flir_moe_gemm2: {us2 - us1:8.2f} us")
+        print(
+            f"[aiter] flir_moe_gemm1: {us1:8.2f} us, flir_moe_gemm2: {us2 - us1:8.2f} us"
+        )
         # Keep git-head test behavior: compare in the original `dtype` (often bf16).
         out2_ck = out2_ck.to(dtype)
     else:
@@ -466,7 +470,9 @@ def test_fmoe(
                 )
                 return out1_ck
 
-            _, us1 = run_perftest(launch_ck_stage1, num_iters=num_iters, num_warmup=num_warmup)
+            _, us1 = run_perftest(
+                launch_ck_stage1, num_iters=num_iters, num_warmup=num_warmup
+            )
 
             # Prepare stage2 inputs from the same reference stage1 output as git-head path,
             # so stage2 correctness is comparable and independent of stage1 behavior.
@@ -497,9 +503,13 @@ def test_fmoe(
                 )
                 return out2_ck
 
-            _, us2 = run_perftest(launch_ck_stage2, num_iters=num_iters, num_warmup=num_warmup)
+            _, us2 = run_perftest(
+                launch_ck_stage2, num_iters=num_iters, num_warmup=num_warmup
+            )
             us2 = us1 + us2
-            print(f"[aiter] ck_moe_gemm1: {us1:8.2f} us, ck_moe_gemm2: {us2 - us1:8.2f} us")
+            print(
+                f"[aiter] ck_moe_gemm1: {us1:8.2f} us, ck_moe_gemm2: {us2 - us1:8.2f} us"
+            )
         else:
             out2_ck, us2 = run_perftest(
                 fused_moe,
