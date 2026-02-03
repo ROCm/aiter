@@ -16,7 +16,6 @@ env:
   GPU_ARCH_LIST: "gfx942;gfx950"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
-  IS_FORK: ${{ github.event.pull_request.head.repo.fork && github.event_name == 'pull_request' }} # True if the PR is from a fork
 
 jobs:
   check-signal:
@@ -32,7 +31,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_image:
-    if: ${{ !env.IS_FORK }}
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     runs-on: aiter-k8s-build
     needs: check-signal
     steps:
@@ -100,7 +99,7 @@ jobs:
       
   standard:
     name: Standard Tests (1 GPU)
-    needs: ${{ !env.IS_FORK && 'build_aiter_image' || 'check-signal' }}
+    needs: build_aiter_image
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +116,16 @@ jobs:
       
       - name: Clean up Rocm processes
         run: ./.github/scripts/clean_up_rocm.sh
+      
+      - name: Setup Aiter for fork PR
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          set -ex
+          echo "Setting up Aiter for fork PR..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Run the container
         run: |
@@ -129,6 +138,12 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            IMAGE_TAG=${{ env.DOCKER_IMAGE }}
+          else
+            IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          fi
+
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
@@ -138,7 +153,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
-          $([ "${{ env.IS_FORK }}" = "true" ] && echo "${{ env.DOCKER_IMAGE }}" || echo "rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}")
+          $IMAGE_TAG
 
       - name: Show Aiter version
         run: |
@@ -151,18 +166,16 @@ jobs:
       - name: Tests
         run: |
           set -ex
-          if [ "${{ env.IS_FORK }}" = "true" ]; then
-            echo "Forked PR: Using JIT build to run aiter_test.sh"
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "pip uninstall -y aiter || true && pip install -r requirements.txt && python setup.py develop && ./.github/scripts/aiter_test.sh"
+            bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
           else
-            echo "Main branch or not a fork PR: Using prebuilt image to run aiter_test.sh"
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "./.github/scripts/aiter_test.sh"
+            bash -c "./.github/scripts/aiter_test.sh" 
           fi
 
       - name: Collect test logs
@@ -183,16 +196,11 @@ jobs:
         if: always()
         run: |
           docker rm -f aiter_test || true
-  
-      - name: Clean up Rocm processes
-        if: always()
-        run: |
-          ./.github/scripts/clean_up_rocm.sh
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
     if: github.ref == 'refs/heads/main'
-    needs: ${{ !env.IS_FORK && 'build_aiter_image' || 'check-signal' }}
+    needs: build_aiter_image
     strategy:
       fail-fast: false
       matrix:
@@ -208,6 +216,16 @@ jobs:
       - name: Clean up Rocm processes
         run: ./.github/scripts/clean_up_rocm.sh
 
+      - name: Setup Aiter for fork PR
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          set -ex
+          echo "Setting up Aiter for fork PR..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+
       - name: Run the container
         run: |
           set -ex
@@ -219,6 +237,12 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            IMAGE_TAG=${{ env.DOCKER_IMAGE }}
+          else
+            IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          fi
+
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
@@ -228,7 +252,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
-          $([ "${{ env.IS_FORK }}" = "true" ] && echo "${{ env.DOCKER_IMAGE }}" || echo "rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}")
+          $IMAGE_TAG
       
       - name: Show Aiter version
         run: |
@@ -241,21 +265,11 @@ jobs:
       - name: Tests
         run: |
           set -ex
-          if [ "${{ env.IS_FORK }}" = "true" ]; then
-            echo "Forked PR: Using JIT build to run aiter_test.sh"
-            docker exec \
-            -e MULTIGPU=TRUE \
-            -w /workspace \
-            aiter_test \
-            bash -c "pip uninstall -y aiter || true && pip install -r requirements.txt && python setup.py develop && ./.github/scripts/aiter_test.sh"
-          else
-            echo "Main branch or not a fork PR: Using prebuilt image to run aiter_test.sh"
-            docker exec \
-            -e MULTIGPU=TRUE \
-            -w /workspace \
-            aiter_test \
-            bash -c "./.github/scripts/aiter_test.sh"
-          fi
+          docker exec \
+          -e MULTIGPU=TRUE \
+          -w /workspace \
+          aiter_test \
+          bash -c "./.github/scripts/aiter_test.sh"
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
