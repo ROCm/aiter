@@ -437,16 +437,7 @@ void moe_stage2_g1u1(
 
     int inter_dim = inter_states.size(-1); // inter_states: [..., inter_dim]
 
-    int sub_X_cnt;
-    if(num_valid_ids.numel() > 0)
-    {
-        int valid_token_cnt = num_valid_ids[0].item<int>();
-        sub_X_cnt           = (valid_token_cnt + block_m - 1) / block_m;
-    }
-    else
-    {
-        sub_X_cnt = sorted_expert_ids.size(0);
-    }
+    int sub_X_cnt       = sorted_expert_ids.size(0);
     std::string arch_id = get_gpu_arch();
     kernelName          = !kernelName.empty() ? arch_id + kernelName : "";
     if(kernelName.empty())
