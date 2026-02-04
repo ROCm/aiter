@@ -323,9 +323,9 @@ def moe_stage2_g1u1(
     w2_scale: Optional[Tensor] = None,
     a2_scale: Optional[Tensor] = None,
     sorted_weights: Optional[Tensor] = None,
-    quant_type: Optional[Enum] = QuantType.No.value,
-    activation: Optional[Enum] = ActivationType.Silu.value,
-    splitk: Optional[int] = 1,
+    quant_type: Enum = QuantType.No.value,
+    activation: Enum = ActivationType.Silu.value,
+    splitk: int = 0,
 ) -> None: ...
 
 @compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage2)

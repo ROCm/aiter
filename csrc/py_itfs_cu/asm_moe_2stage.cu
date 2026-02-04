@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_fmoe_2stages_configs.hpp"
 #include "moe_op.h"
@@ -169,7 +169,7 @@ static CFG* get_cfg_stage2(torch::Tensor& inter_states,
 {
     if(inter_states.scalar_type() == at::ScalarType::Char &&
        w2.scalar_type() == at::ScalarType::Char && out.scalar_type() == at::ScalarType::BFloat16 &&
-       quant_type == QuantType::per_Token && !do_weight)
+       quant_type == QuantType::per_Token && do_weight)
     {
         return &cfg_fmoe_stage2_bf16_pertokenInt8_g1u1;
     }
@@ -262,17 +262,9 @@ void moe_stage1_g1u1(
     int model_dim  = input.size(-1);
     int hidden_dim = inter_dim;
 
-    int token_cnt;
     // Handle [TOPK, BATCH, DIM] vs [BATCH, TOPK, DIM]
     // token_cnt should be BATCH count based on Host Code implication
-    if(input.dim() == 3 && input.size(0) == out.size(1) && input.size(1) == out.size(0))
-    {
-        token_cnt = input.size(1);
-    }
-    else
-    {
-        token_cnt = input.size(0);
-    }
+    int token_cnt = input.size(-2);
     int topk = out.size(1);
     int eprt = w1.size(0);
 
@@ -323,15 +315,15 @@ void moe_stage1_g1u1(
                 " need block_m == ",
                 cfg.tile_m);
 
-    int stride_X;
-    if(input.dim() == 3 && input.size(0) == out.size(1) && input.size(1) == out.size(0))
-    {
-        stride_X = input.stride(1) * input.element_size();
-    }
-    else
-    {
-        stride_X = input.stride(0) * input.element_size();
-    }
+    int stride_X = input.stride(-2);
+    // if(input.dim() == 3 && input.size(0) == out.size(1) && input.size(1) == out.size(0))
+    // {
+    //     stride_X = input.stride(1) * input.element_size();
+    // }
+    // else
+    // {
+    //     stride_X = input.stride(0) * input.element_size();
+    // }
     int stride_GU = model_dim * w1.element_size();
 
     int stride_expert_GU    = stride_GU * inter_dim;
@@ -434,7 +426,7 @@ void moe_stage2_g1u1(
         std::nullopt, // [max_num_tokens_padded], do_weight==true need
     QuantType quant_type      = QuantType::No,
     ActivationType activation = ActivationType::Silu,
-    int splitk                = 1)
+    int splitk                = 0)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inter_states));
     const hipStream_t stream = at::hip::getCurrentHIPStream();

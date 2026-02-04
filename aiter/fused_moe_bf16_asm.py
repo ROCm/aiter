@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -134,7 +134,7 @@ def asm_moe(
     lastdim_mul = 8 if w1.dtype in {dtypes.i32, torch.uint32} else 1
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
         moe_sorting_ck(
-            topk_ids, topk_weight, global_E, model_dim, dtype, BLOCK_SIZE_M, expert_mask
+            topk_ids, topk_weight, global_E, model_dim, dtype, 64, expert_mask
         )
     )
     if fc1_scale is None:
@@ -281,7 +281,7 @@ def asm_moe(
             else:
                 logger.warning("FMOE fall into pure torch quant...")
                 a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
-        
+
         # Check for 2-stage execution
         is_smoothquant = fc1_smooth_scale is not None
         run_2stage = False
@@ -303,12 +303,13 @@ def asm_moe(
             # Stage 1: ASM Kernel
             # Allocate intermediate buffer [M, topk, inter_dim + pad_len] (Int8)
             # Pad length calculation: 4 bytes (float32) scale per 128 int8 elements
-            pad_len = (inter_dim + 32) // 32
-            pad_len = (pad_len + 3) // 4 * 4
-            inter_states = torch.empty(
-                (M, topk, inter_dim + pad_len), dtype=dtypes.i8, device=device
+            ratio = a8_scale.element_size() // a8.element_size()
+            inter_states = torch.zeros(
+                (M + (M * ratio + 127) // 128, topk, inter_dim),
+                dtype=dtypes.i8,
+                device=device,
             )
-            doweight_stage1 = True
+            doweight_stage1 = False
 
             aiter.moe_stage1_g1u1(
                 a8,
@@ -317,7 +318,7 @@ def asm_moe(
                 sorted_ids,
                 sorted_expert_ids,
                 num_valid_ids,
-                inter_states[..., :inter_dim],
+                inter_states,
                 inter_dim,
                 kernelName1,
                 block_m_2s,
@@ -331,16 +332,27 @@ def asm_moe(
                 sorted_weights if doweight_stage1 else None,
             )
 
-            # Stage 2: ASM Kernel 
+            # Stage 2: ASM Kernel
             # inter_states is already Int8, no explicit pertoken_quant needed
             # Extract scale from padded region for Stage2
             # Note: inter_states[..., inter_dim:] must be viewable as float32 (pad_len % 4 == 0)
-            a2_scale = inter_states[..., inter_dim:].view(torch.float32)
+            inter_states_v = inter_states[:M, :, :]
+            inter_states_scale = (
+                inter_states[M:, ...]
+                .view(-1)[: M * topk * inter_dim * ratio // 128]
+                .view(dtypes.fp32)
+                .view(M, -1)
+            )
+            inter_states = inter_states_v
+            print(f"{inter_states.view(M, -1, 128)[ ...,:10]=}")
+            print(f"{inter_states_scale=}")
+            # inter_states_scale[2: ] = 1
 
+            moe_buf[:] = 1
             # Slicing inter_states[..., :inter_dim] creates a strided tensor.
             # Ensure Stage 2 kernel supports stride != width.
             asm_moe_stage2(
-                inter_states[..., :inter_dim],
+                inter_states,
                 w1,
                 w2,
                 sorted_ids,
@@ -350,16 +362,17 @@ def asm_moe(
                 topk,
                 kernelName2,
                 fc2_scale,
-                a2_scale,
+                inter_states_scale.contiguous(),
                 block_m_2s,
                 sorted_weights if not doweight_stage1 else None,
                 QuantType.per_Token.value,
                 activation.value,
-                1,  # splitk
+                0,  # splitk
             )
+            # print(f"{moe_buf.view(M, -1, 128)[ ...,:2]=}")
             return moe_buf
-                
-        
+
+
         if w2.shape[2] * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_int8_g1u0(
                 moe_buf,
