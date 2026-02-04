@@ -1811,17 +1811,8 @@ _LOCAL_EXPERT_HASH_CACHE = {}
 
 def _get_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
     """Cache global->local expert id map for EP."""
-    key = (
-        int(expert_mask.device.index),
-        int(expert_mask.numel()),
-        int(expert_mask.data_ptr()),
-    )
-    cached = _LOCAL_EXPERT_HASH_CACHE.get(key)
-    if cached is not None and cached.device == expert_mask.device:
-        return cached
     local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
     local_expert_hash[local_expert_hash > 0] -= 1
-    _LOCAL_EXPERT_HASH_CACHE[key] = local_expert_hash
     return local_expert_hash
 
 
