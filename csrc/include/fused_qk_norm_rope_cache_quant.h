@@ -5,6 +5,7 @@
 using namespace at;
 
 namespace aiter {
+
 void fused_qk_norm_rope_cache_quant_shuffle(
     at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
                                        // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
@@ -25,4 +26,30 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
     std::optional<at::Tensor> v_scale  // v scale tensor for quantized v cache
 );
-}
+
+void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
+                                                at::Tensor& qw,
+                                                at::Tensor& kw,
+                                                at::Tensor& cos_sin,
+                                                at::Tensor& positions,
+                                                int64_t num_tokens,
+                                                int64_t num_heads_q,
+                                                int64_t num_heads_k,
+                                                int64_t num_heads_v,
+                                                int64_t head_size,
+                                                bool is_neox_style,
+                                                double eps,
+                                                at::Tensor& q_out,
+                                                at::Tensor& k_cache,
+                                                at::Tensor& v_cache,
+                                                at::Tensor& slot_mapping,
+                                                at::Tensor& per_tensor_k_scale,
+                                                at::Tensor& per_tensor_v_scale,
+                                                std::optional<at::Tensor> k_out,
+                                                std::optional<at::Tensor> v_out,
+                                                bool return_kv,
+                                                bool use_shuffle_layout,
+                                                int64_t block_size,
+                                                int64_t x);
+
+} // namespace aiter
