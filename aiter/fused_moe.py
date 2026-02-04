@@ -887,7 +887,12 @@ def get_2stage_cfgs(
             and activation == ActivationType.Silu
         )
         use_flydsl_stage1 = use_flydsl_stage2
-        flydsl_block_m = min(int(block_m) if block_m is not None else 64, 64)
+        flydsl_block_m = int(os.environ.get("AITER_FLYDSL_MOE_TILE_M", "0"))
+        if flydsl_block_m == 0:
+            max_flydsl_block_m = 64
+            flydsl_block_m = min(
+                int(block_m) if block_m is not None else 64, max_flydsl_block_m
+            )
         stage1_func = (
             functools.partial(flydsl_moe_stage1)
             if use_flydsl_stage1
@@ -915,14 +920,11 @@ def get_2stage_cfgs(
             )
         )
         if os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1":
-            logger.info("use_flydsl_stage2=%s", use_flydsl_stage2)
-            logger.info("use_flydsl_stage1=%s", use_flydsl_stage1)
-            logger.info("flydsl_block_m=%s", flydsl_block_m)
-            logger.info("stage1_func=%s", stage1_func)
-            logger.info("stage2_func=%s", stage2_func)
-            logger.info("block_m=%s", block_m)
-            logger.info("ksplit=%s", ksplit)
-            logger.info("run_1stage=%s", run_1stage)
+            logger.info(
+                f"use_flydsl_stage2={use_flydsl_stage2}, use_flydsl_stage1={use_flydsl_stage1}, \
+                flydsl_block_m={flydsl_block_m}, stage1_func={stage1_func}, stage2_func={stage2_func}, \
+                block_m={block_m}, ksplit={ksplit}, run_1stage={run_1stage}"
+            )
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -1862,13 +1864,7 @@ def flydsl_moe_stage1(
     E, _, model_dim = w1.shape
     inter_dim = w2.shape[2]
 
-    # IMPORTANT: stage1/stage2 tile_m must match the sorting `block_m` used to build `sorted_*`.
-    # Allow env override only when it matches `block_m`.
     tile_m = block_m if block_m is not None else 64
-    tile_m_env = int(os.environ.get("AITER_FLYDSL_MOE_TILE_M1", "0"))
-    if tile_m_env > 0 and tile_m_env % 16 == 0:
-        tile_m = tile_m_env
-        tile_m = 64
     tile_n = int(os.environ.get("AITER_FLYDSL_MOE_TILE_N1", "128"))
     tile_k = int(os.environ.get("AITER_FLYDSL_MOE_TILE_K1", "128"))
     stage1_cshuffle = os.environ.get("AITER_FLYDSL_STAGE1_CSHUFFLE", "0") in (
@@ -2071,9 +2067,6 @@ def flydsl_moe_stage2(
     E = w2.shape[0]
 
     tile_m = block_m if block_m is not None else 64
-    tile_m_env = int(os.environ.get("AITER_FLYDSL_MOE_TILE_M2", "0"))
-    if tile_m_env > 0 and tile_m_env % 16 == 0:
-        tile_m = tile_m_env
     tile_n = int(os.environ.get("AITER_FLYDSL_MOE_TILE_N2", "256"))
     tile_k = int(os.environ.get("AITER_FLYDSL_MOE_TILE_K2", "128"))
     stage2_cshuffle = os.environ.get("AITER_FLYDSL_STAGE2_CSHUFFLE", "1") in (
