@@ -132,6 +132,9 @@ def test_mla(
     varlen,
     decode_qlen,
     split_per_batch=None,
+    decode_only=False,
+    force_decode=False,
+    asm_only=False,
 ):
     ret = {}
 
@@ -216,11 +219,12 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
-    if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16
-    ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
-        us_aiter = test_normal_prefill()
-        ret["prefill:ck_192"] = us_aiter
+    if not decode_only:
+        if (
+            dtype == torch.bfloat16 and kvtype == torch.bfloat16
+        ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+            us_aiter = test_normal_prefill()
+            ret["prefill:ck_192"] = us_aiter
 
     torch.cuda.empty_cache()
     # absorb init
@@ -304,11 +308,12 @@ def test_mla(
         return us_asm
 
     us_asm = None
-    if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128]
-    ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
-        us_asm = test_absorb_prefill()
-        ret["prefill:asm_576"] = us_asm
+    if not decode_only:
+        if (
+            dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128]
+        ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
+            us_asm = test_absorb_prefill()
+            ret["prefill:asm_576"] = us_asm
 
     torch.cuda.empty_cache()
 
@@ -323,19 +328,35 @@ def test_mla(
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
-    # troch implementation
-    out_ref = torch_mla_extend(
-        q,
-        kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        is_causal=True,
-        dtype=out_dtype,
-    )
+    out_ref = None
+    us_torch_decode = None
+    if not asm_only:
+        # torch implementation
+        out_ref = torch_mla_extend(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            is_causal=True,
+            dtype=out_dtype,
+        )
+        out_ref_torch, us_torch_decode = run_perftest(
+            torch_mla_extend,
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            out_dtype,
+            True,
+        )
 
     # Triton implementation
     # if decode_qlen == 1:
@@ -386,6 +407,7 @@ def test_mla(
             max_seqlen_qo,
             sm_scale,
             num_kv_splits=split_per_batch,
+            force_decode=force_decode,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -394,11 +416,13 @@ def test_mla(
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse,
         #               msg=f'attn_lse    [golden vs aiter_asm]')
-        err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
+        err = None
+        if out_ref is not None:
+            err = checkAllclose(
+                out_ref,
+                out_asm,
+                msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
@@ -433,6 +457,7 @@ def test_mla(
             q_scale=q_scale,
             kv_scale=kv_scale,
             num_kv_splits=split_per_batch,
+            force_decode=force_decode,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -440,29 +465,30 @@ def test_mla(
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
-        err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-
-        cal_diff(out_ref, out_asm, "out", True)
+        err = None
+        if out_ref is not None:
+            err = checkAllclose(
+                out_ref,
+                out_asm,
+                msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
+            cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
-        16,
-        32,
-        64,
-        128,
-    ]:
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
+        nhead in [16, 32, 64, 128] or force_decode
+    ):
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
+    ret["decode:torch"] = us_torch_decode
+    if us_torch_decode is not None and us_torch_decode > 0:
+        ret["decode:speedup"] = us_torch_decode / us_asm_decode
 
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
@@ -567,10 +593,10 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    choices=[(8, 1), (8, 2), (16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    default=[(8, 1), (16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
     help="""Number of nhead and decode_qlen.
     e.g.: -n 16,1""",
 )
@@ -588,6 +614,27 @@ parser.add_argument(
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
+)
+parser.add_argument(
+    "--decode-only",
+    action="store_true",
+    help="Only run decode path (skip prefill).",
+)
+parser.add_argument(
+    "--force-decode",
+    action="store_true",
+    help="Force decode path even for unsupported nhead.",
+)
+parser.add_argument(
+    "--out-csv",
+    type=str,
+    default="mla_results.csv",
+    help="Write results to this CSV file (default: mla_results.csv).",
+)
+parser.add_argument(
+    "--asm-only",
+    action="store_true",
+    help="Only run ASM decode without golden torch reference.",
 )
 
 
@@ -613,9 +660,12 @@ for nhead, decode_qlen in args.nhead:
                 varlen=args.varlen,
                 decode_qlen=decode_qlen,
                 split_per_batch=split_per_batch,
+                decode_only=args.decode_only,
+                force_decode=args.force_decode,
+                asm_only=args.asm_only,
             )
             df.append(ret)
     df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
+    df.to_csv(args.out_csv, index=False)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("mla summary (markdown):\n%s", df_md)

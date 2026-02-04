@@ -165,6 +165,7 @@ def mla_decode_fwd(
     intra_batch_mode=False,
     return_logits=False,
     return_lse=False,
+    force_decode=True,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -180,6 +181,22 @@ def mla_decode_fwd(
     persistent_mode = work_meta_data is not None
 
     io_transformed = False
+    forced_head_pad = False
+    o_out = o
+
+    if force_decode and nhead == 8 and not persistent_mode:
+        forced_head_pad = True
+        padded_nhead = 16
+        q_padded = torch.zeros(
+            (total_s, padded_nhead, qk_head_dim), dtype=q.dtype, device=device
+        )
+        q_padded[:, :nhead, :] = q
+        o_padded = torch.empty(
+            (total_s, padded_nhead, v_head_dim), dtype=o.dtype, device=device
+        )
+        q = q_padded
+        o = o_padded
+        nhead = padded_nhead
 
     if not persistent_mode:
         if num_kv_splits is None or num_kv_splits_indptr is None:
@@ -244,6 +261,11 @@ def mla_decode_fwd(
                 and nhead in [32, 64]
             )
         ):
+            if forced_head_pad:
+                o_out.copy_(o[:, :ori_nhead, :])
+                logits = logits[:, :, :ori_nhead, :]
+                attn_lse = attn_lse[:, :, :ori_nhead, :]
+                return logits.view(total_s, ori_nhead, v_head_dim), attn_lse
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
@@ -338,12 +360,20 @@ def mla_decode_fwd(
             final_lse,
         )
 
+    if forced_head_pad:
+        o_out.copy_(o[:, :ori_nhead, :])
+
     if io_transformed:
         if return_logits:
             logits = logits.view(-1, 1, ori_nhead, v_head_dim)
 
         q = q.view(ori_total_s, ori_nhead, -1)
         o = o.view(ori_total_s, ori_nhead, -1)
+
+    if forced_head_pad:
+        logits = logits[..., :ori_nhead, :]
+        if final_lse is not None:
+            final_lse = final_lse[:, :ori_nhead]
 
     return logits, final_lse
 
