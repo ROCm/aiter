@@ -199,7 +199,7 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
     )
-
+    # import pdb; pdb.set_trace()
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_128x128:
         a2_qt, a2_scale = aiter.pertoken_quant(
@@ -230,6 +230,7 @@ def test_fmoe(
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
     )
+    # import pdb; pdb.set_trace()
 
     # ######################## stage 2 end ###########
     use_flydsl = (
@@ -292,6 +293,192 @@ def test_fmoe(
         )
 
     return {"us": us2, "err": err}
+
+
+# =============================================================================
+# FlyDSL Extended Tests: stage2_ex (atomic vs reduce) and reduction kernel
+# =============================================================================
+
+
+def test_flydsl_reduction(
+    tokens: int = 128,
+    topk: int = 8,
+    model_dim: int = 7168,
+    dtype=torch.float16,
+):
+    """Test FlyDSL reduce kernel correctness vs torch.sum."""
+    from aiter.fused_moe import flydsl_moe_reduction
+
+    dtype_str = {torch.float16: "f16", torch.bfloat16: "bf16", torch.float32: "f32"}[
+        dtype
+    ]
+
+    # Create test data
+    X = torch.randn(tokens, topk, model_dim, device="cuda", dtype=dtype)
+    Y_flydsl = torch.empty(tokens, model_dim, device="cuda", dtype=dtype)
+    Y_ref = torch.empty(tokens, model_dim, device="cuda", dtype=dtype)
+
+    # Run FlyDSL reduce kernel
+    flydsl_moe_reduction(X, Y_flydsl, tokens, topk, model_dim, dtype_str)
+
+    # Run torch reference
+    torch.sum(X, dim=1, out=Y_ref)
+    torch.cuda.synchronize()
+
+    # Check correctness
+    err = checkAllclose(
+        Y_flydsl.float(), Y_ref.float(), rtol=1e-2, atol=1e-2, msg="[flydsl_reduction]"
+    )
+    print(
+        f"[test_flydsl_reduction] tokens={tokens}, topk={topk}, model_dim={model_dim}, err={err}"
+    )
+    return err
+
+
+def test_flydsl_stage2_ex(
+    dtype,
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    actType,
+    qType,
+    AQDType,
+    WQDType,
+    use_g1u1=False,
+    doweight_stage1=False,
+    mode="auto",  # "auto", "atomic", "reduce"
+):
+    """Test FlyDSL stage2_ex with mode selection (atomic vs reduce)."""
+    from aiter.fused_moe import (
+        flydsl_moe_stage2_ex,
+        torch_moe_stage1,
+        torch_moe_stage2,
+        moe_sorting,
+        fused_topk,
+    )
+
+    if qType != aiter.QuantType.per_Token or AQDType != dtypes.fp8:
+        print(
+            f"[test_flydsl_stage2_ex] Skipping: only per_Token fp8 supported, got qType={qType}, AQDType={AQDType}"
+        )
+        return None
+
+    torch_quant = aiter.get_torch_quant(qType)
+
+    # Use smaller init scale to avoid overflow (matching FlyDSL test)
+    init_scale = 0.2
+    input = torch.randn((token, model_dim), dtype=dtype) * init_scale
+    if use_g1u1:
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * (
+            init_scale / (model_dim**0.5)
+        )
+    else:
+        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype) * (
+            init_scale / (model_dim**0.5)
+        )
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) * (
+        init_scale / (inter_dim**0.5)
+    )
+    score = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+
+    # Quantize weights - per-row (FlyDSL expects [E*model_dim] for w2_scale)
+    # w1: [E, inter_dim*2, model_dim] -> flatten to [E * inter_dim*2, model_dim] for per-row quant
+    w1_qt, w1_scale = torch_quant(w1.view(E * w1.shape[1], -1), quant_dtype=WQDType)
+    w1_qt = w1_qt.view(w1.shape)
+    w1_scale = w1_scale.view(E, w1.shape[1], 1)  # Reshape back for torch reference
+
+    # w2: [E, model_dim, inter_dim] -> flatten to [E * model_dim, inter_dim] for per-row quant
+    w2_qt, w2_scale_flat = torch_quant(
+        w2.view(E * model_dim, inter_dim), quant_dtype=WQDType
+    )
+    w2_qt = w2_qt.view(w2.shape)
+    # w2_scale_flat: [E * model_dim, 1] - keep for FlyDSL
+
+    # Also create per-expert scale for torch reference
+    w2_scale_torch = w2_scale_flat.view(E, model_dim, 1).mean(
+        dim=1
+    )  # [E, 1] approximate
+
+    # Quantize input
+    a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
+
+    # Torch reference stage1
+    out1_ref = torch_moe_stage1(
+        a1_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        activation=actType,
+        quant_type=qType,
+        a1_scale=a1_scale,
+        w1_scale=w1_scale,
+        doweight=doweight_stage1,
+    )
+
+    # Quantize stage1 output for stage2 - per-token
+    a2_qt, a2_scale = torch_quant(out1_ref.view(token * topk, -1), quant_dtype=AQDType)
+    a2_qt = a2_qt.view(token, topk, -1)
+    a2_scale = a2_scale.view(token, topk, 1)
+
+    # Torch reference stage2 (approximate, since per-row vs per-expert scale differs)
+    out2_ref = torch_moe_stage2(
+        a2_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        quant_type=qType,
+        w2_scale=w2_scale_torch,
+        a2_scale=a2_scale,
+        doweight=not doweight_stage1,
+    )
+
+    # FlyDSL stage2_ex
+    block_m = 64
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _moe_buf = (
+        moe_sorting(
+            topk_ids.to(torch.int32),
+            topk_weights.to(torch.float32),
+            E,
+            model_dim,
+            dtype,
+            block_m,
+        )
+    )
+
+    out2_flydsl = torch.zeros_like(out2_ref)
+    flydsl_moe_stage2_ex(
+        a2_qt.contiguous(),
+        w1_qt,
+        w2_qt,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out2_flydsl,
+        topk,
+        w2_scale_flat,  # Use per-row scale [E * model_dim, 1]
+        a2_scale,
+        block_m,
+        kernelName="",
+        sorted_weights=sorted_weights if not doweight_stage1 else None,
+        mode=mode,
+    )
+
+    err = checkAllclose(
+        out2_ref,
+        out2_flydsl,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"[flydsl_stage2_ex mode={mode}]",
+    )
+    print(f"[test_flydsl_stage2_ex] token={token}, mode={mode}, err={err}")
+    return {"mode": mode, "err": err}
 
 
 l_dtype = ["bf16", "fp16"][:1]
@@ -433,6 +620,29 @@ parser.add_argument(
     -p t    # True.""",
 )
 
+parser.add_argument(
+    "--test_flydsl",
+    type=str,
+    choices=["none", "reduction", "stage2_ex", "all"],
+    default="none",
+    help="""Run FlyDSL extended tests:
+    none       # Skip FlyDSL tests (default)
+    reduction  # Test reduce kernel only
+    stage2_ex  # Test stage2_ex (atomic vs reduce)
+    all        # Run all FlyDSL tests""",
+)
+
+parser.add_argument(
+    "--flydsl_mode",
+    type=str,
+    choices=["auto", "atomic", "reduce"],
+    default="reduce",
+    help="""FlyDSL stage2_ex mode selection:
+    auto    # Auto select based on shape rules
+    atomic  # Force atomic accumulation
+    reduce  # Force reduce mode (default)""",
+)
+
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -556,3 +766,57 @@ for (
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+
+# =============================================================================
+# FlyDSL Extended Tests
+# =============================================================================
+if args.test_flydsl != "none":
+    print("\n" + "=" * 60)
+    print("FlyDSL Extended Tests")
+    print("=" * 60)
+
+    # Test reduce kernel
+    if args.test_flydsl in ["reduction", "all"]:
+        print("\n[FlyDSL] Testing reduce kernel...")
+        for tokens in [128, 1024, 16384]:
+            for topk in [2, 8]:
+                try:
+                    test_flydsl_reduction(
+                        tokens=tokens,
+                        topk=topk,
+                        model_dim=7168,
+                        dtype=torch.float16,
+                    )
+                except Exception as e:
+                    print(
+                        f"[FlyDSL] reduce test failed: tokens={tokens}, topk={topk}, error={e}"
+                    )
+
+    # Test stage2_ex with mode selection
+    if args.test_flydsl in ["stage2_ex", "all"]:
+        print(f"\n[FlyDSL] Testing stage2_ex with mode={args.flydsl_mode}...")
+        for token in l_tokenNum[:3]:  # Test first 3 token sizes
+            try:
+                test_flydsl_stage2_ex(
+                    dtype=torch.bfloat16,
+                    token=token,
+                    model_dim=7168,
+                    inter_dim=256,
+                    E=args.expert,
+                    topk=args.topk,
+                    actType=aiter.ActivationType.Silu,
+                    qType=aiter.QuantType.per_Token,
+                    AQDType=dtypes.fp8,
+                    WQDType=dtypes.fp8,
+                    use_g1u1=True,
+                    doweight_stage1=False,
+                    mode=args.flydsl_mode,
+                )
+            except Exception as e:
+                print(
+                    f"[FlyDSL] stage2_ex test failed: token={token}, mode={args.flydsl_mode}, error={e}"
+                )
+
+    print("\n" + "=" * 60)
+    print("FlyDSL Tests Completed")
+    print("=" * 60)
