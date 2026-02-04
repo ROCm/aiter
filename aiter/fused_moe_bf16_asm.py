@@ -107,6 +107,8 @@ def get_2stage_config_simple(
         if inter_dim % 384 == 0:
             # The available kernel uses 64x384 tile, so block_m must be 64
             return True, 64, 0, "", ""
+        elif inter_dim % 128 == 0:
+            return True, 80, 0, "", ""
     return False, 32, 0, "", ""
 
 

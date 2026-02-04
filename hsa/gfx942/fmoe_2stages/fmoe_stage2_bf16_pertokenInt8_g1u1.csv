@@ -1,2 +1,3 @@
 tile_m,tile_n,knl_name,co_name,smf
 64,128,_ZN5aiter44fmoe_stage2_bf16_pertokenInt8_64x128_2tg_pf2E,fmoe_stage2_bf16_pertokenInt8_64x128_2tg_pf2.co,0
+80,128,_ZN5aiter44fmoe_stage2_bf16_pertokenInt8_80x128_2tg_pf2E,fmoe_stage2_bf16_pertokenInt8_80x128_2tg_pf2.co,0
