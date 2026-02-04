@@ -1322,13 +1322,17 @@ def fused_moe_2stages(
         a2 = a2.view(token_num, topk, inter_dim)
 
     # Build valid_mask for EP mode, comment it out for hotfix
-    # valid_mask = None
-    # if topk_ids is not None and expert_mask is not None:
-    #     valid_mask = get_topk_valid_mask(topk_ids, expert_mask)
+    extra_stage2_args = {}
+    is_flydsl_stage2 = getattr(metadata.stage2, "func", None) is flydsl_moe_stage2
+    if is_flydsl_stage2:
+        aiter.logger.info(f"is_flydsl_stage2: {is_flydsl_stage2}")
+        valid_mask = None
+        if topk_ids is not None and expert_mask is not None:
+            valid_mask = get_topk_valid_mask(topk_ids, expert_mask)
 
-    # # Add valid_mask to extra_stage2_args if available
-    # if valid_mask is not None:
-    #     extra_stage2_args["valid_mask"] = valid_mask
+        # Add valid_mask to extra_stage2_args if available
+        if valid_mask is not None:
+            extra_stage2_args["valid_mask"] = valid_mask
 
     metadata.stage2(
         a2,
@@ -1345,8 +1349,7 @@ def fused_moe_2stages(
         a2_scale=a2_scale,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
-        # hotfix
-        # **extra_stage2_args,
+        **extra_stage2_args,
     )
 
     return moe_out
