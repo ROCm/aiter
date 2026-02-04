@@ -844,7 +844,9 @@ REGISTER_DTYPE(bf8 , unsigned _BitInt(8))
 REGISTER_DTYPE(i32 , int32_t)
 REGISTER_DTYPE(u32 , uint32_t)
 REGISTER_DTYPE(i16 , int16_t)
+#if __clang_major__ >= 20
 REGISTER_DTYPE(u16 , uint16_t)
+#endif
 REGISTER_DTYPE(i8  , int8_t)
 REGISTER_DTYPE(u8  , uint8_t)
 
@@ -1170,6 +1172,12 @@ OPUS_D constexpr auto buffer_default_config() {
 OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, uint32_t size = 0xffffffff, uint32_t config = buffer_default_config()) {
     return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(static_cast<const void*>(ptr)), 0, size, config); // void *p, short stride, int num, int flags
 }
+#if __clang_major__ < 20
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, __attribute__((address_space(3))) uint32_t* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+#pragma clang diagnostic pop
+#endif
 template<typename T_>
 struct gmem {
     using T = remove_cvref_t<T_>;
@@ -1199,6 +1207,16 @@ struct gmem {
 #if  defined(__gfx950__)
         else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, 0, aux); }
+#endif
+#else
+        i32x4_t cached_rsrc_;
+        __builtin_memcpy(&cached_rsrc_, &cached_rsrc, sizeof(i32x4_t));   // builtin memcpy, __builtin_bit_cast() can not use here due to __amdgpu_buffer_rsrc_t is non copyable
+        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)),  1, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)),  2, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)),  4, v_os, s_os, 0, aux); }
+#if  defined(__gfx950__)
+        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)), 12, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)), 16, v_os, s_os, 0, aux); }
 #endif
 #endif
     }

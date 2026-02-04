@@ -12,8 +12,10 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  # TODO: Revert to rocm/pytorch:latest once CK adds ROCm 7.2 support
   DOCKER_IMAGE: "rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208"
+  GPU_ARCH_LIST: "gfx942;gfx950"
+  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
 jobs:
   check-signal:
@@ -28,43 +30,81 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  # define-runners:
-  #   runs-on: ubuntu-latest
-  #   needs: [check-signal]
-  #   outputs:
-  #     standard_runners: ${{ steps.machines.outputs.standard_runners }}
-  #     multigpu_runners: ${{ steps.machines.outputs.multigpu_runners }}
+  build_aiter_image:
+    runs-on: aiter-1gpu-runner
+    needs: check-signal
+    steps:
+      - name: Checkout code
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        uses: actions/checkout@v4
 
-  #   steps:
-  #     - name: Define whether runs on MI35X
-  #       env:
-  #         PR_TITLE: ${{ github.event.pull_request.title }}
-  #       id: machines
-  #       run: |
-  #         set -euo pipefail
-  #         if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-  #           echo "It's main branch, running tests on MI325 and MI35X..."
-  #           echo 'standard_runners=["aiter-mi355-1gpu", "aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
-  #           echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
-  #         #elif echo "${PR_TITLE}" | grep -qi "mi325"; then
-  #         #  echo "PR title contains 'MI325', running tests on MI325 and MI35X..."
-  #         #  echo 'standard_runners=["aiter-mi355-1gpu", "aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
-  #         #  echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
-  #         else
-  #           # echo "Not main branch and PR title does not contain mi325, only running on MI35X..."
-  #           echo 'standard_runners=["aiter-mi355-1gpu", "aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
-  #           echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
-  #         fi
-  #         echo "$GITHUB_OUTPUT"
-  #   
-  #     - name: Show output variable
-  #       run: |
-  #         echo "Standard: ${{ steps.machines.outputs.standard_runners }}"
-  #         echo "Multigpu: ${{ steps.machines.outputs.multigpu_runners }}"
+      # - name: Prepare docker config
+      #   run: |
+      #     export DOCKER_CONFIG="$HOME/.docker"
+      #     mkdir -p "$DOCKER_CONFIG" || true
+      #     cp /docker-config/config.json "$DOCKER_CONFIG/config.json"
+      #     echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+      
+      - name: Generate Dockerfile
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.DOCKER_IMAGE }}
 
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade pandas zmq einops numpy==1.26.2
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip install --upgrade "ninja>=1.11.1"
+          RUN pip install tabulate
+          RUN pip list
+
+          RUN rm -rf aiter \
+           && git clone ${{ env.GITHUB_REPO_URL }} aiter \
+           && cd aiter \
+           && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
+           && if [ "${GITHUB_REF:-}" = "refs/heads/main" ]; then \
+                echo "It's main branch, syncing latest CK..."; \
+                git submodule sync && \
+                git submodule update --init --recursive --remote --depth 1 --jobs 4; \
+              else \
+                echo "It's a PR branch, syncing specific CK..."; \
+                git submodule sync && \
+                git submodule update --init --recursive --depth 1 --jobs 4; \
+              fi \
+           && pip install -r requirements.txt \
+           && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py develop \
+           && echo "Prebuilding kernels completed"
+
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+          EOF
+
+      - name: Show Dockerfile
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: cat Dockerfile.mod
+
+      - name: Build Docker image
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
+
+      - name: Push Docker image
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+          docker push $IMAGE_TAG
+
+      - name: Success message
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
+      
   standard:
     name: Standard Tests (1 GPU)
-    needs: check-signal
+    needs: build_aiter_image 
     strategy:
       fail-fast: false
       matrix:
@@ -78,23 +118,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
-      - name: Sync submodules
-        run: |
-          set -euo pipefail
-          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
-            echo "It's main branch, syncing latest CK..."
-            git submodule sync
-            git submodule update --init --recursive --remote --depth 1 --jobs 4
-          else
-            echo "It's a PR branch, syncing specific CK..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
-          fi
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
-
+      
       - name: Run the container
         run: |
           set -ex
@@ -106,6 +135,12 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            IMAGE_TAG=${{ env.DOCKER_IMAGE }}
+          else
+            IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          fi
+
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
@@ -115,29 +150,41 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
-          ${{ env.DOCKER_IMAGE }}
+          $IMAGE_TAG
 
-      - name: Setup pip config
-        run: |
-          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
-
-      - name: Setup Aiter
+      - name: Setup Aiter for fork PR
+        if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           set -ex
-          echo "Setting up Aiter..."
+          git submodule sync && git submodule update --init --recursive --depth 1 --jobs 4
+          echo "Setting up Aiter for fork PR..."
           docker exec \
           -w /workspace \
           aiter_test \
           bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
-      
-      - name: Tests
+
+      - name: Show Aiter version
         run: |
           set -ex
           docker exec \
           -w /workspace \
           aiter_test \
-          bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
+          bash -c "pip show amd-aiter || true"
+      
+      - name: Tests
+        run: |
+          set -ex
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            docker exec \
+            -w /workspace \
+            aiter_test \
+            bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
+          else
+            docker exec \
+            -w /workspace \
+            aiter_test \
+            bash -c "./.github/scripts/aiter_test.sh" 
+          fi
 
       - name: Collect test logs
         if: always()
@@ -160,9 +207,8 @@ jobs:
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
-    needs: check-signal
-    # only run multi-gpu tests on main branch due to limited multi-gpu resources
-    if: github.ref == 'refs/heads/main' 
+    if: github.ref == 'refs/heads/main'
+    needs: build_aiter_image 
     strategy:
       fail-fast: false
       matrix:
@@ -175,21 +221,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Sync submodules
-        run: |
-          set -euo pipefail
-          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
-            echo "It's main branch, syncing latest CK..."
-            git submodule sync
-            git submodule update --init --recursive --remote --depth 1 --jobs 4
-          else
-            echo "It's a PR branch, syncing specific CK..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
-          fi
-
-      - name: Clean up Rocm processes
-        run: ./.github/scripts/clean_up_rocm.sh
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
 
       - name: Run the container
         run: |
@@ -202,6 +235,12 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            IMAGE_TAG=${{ env.DOCKER_IMAGE }}
+          else
+            IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          fi
+
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
@@ -211,21 +250,25 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
-          ${{ env.DOCKER_IMAGE }}
-
-      - name: Setup pip config
-        run: |
-          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
-
-      - name: Setup-Aiter
+          $IMAGE_TAG
+      
+      - name: Setup Aiter for fork PR
+        if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           set -ex
-          echo "Setting up Aiter..."
+          echo "Setting up Aiter for fork PR..."
           docker exec \
           -w /workspace \
           aiter_test \
           bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+
+      - name: Show Aiter version
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "pip show amd-aiter || true"
 
       - name: Tests
         run: |
@@ -234,7 +277,7 @@ jobs:
           -e MULTIGPU=TRUE \
           -w /workspace \
           aiter_test \
-          bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh"
+          bash -c "./.github/scripts/aiter_test.sh"
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
