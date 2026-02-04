@@ -402,6 +402,8 @@ def get_gemm1_kernels_list(
                 tag = "a4w4"
             else:
                 tag = "a4w4_bns"
+        else:
+            tag = "empty_list"
 
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
