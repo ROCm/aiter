@@ -3,8 +3,11 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include "../include/mhc_layer.cuh"
+#include "../include/opus/opus.hpp"
 
 namespace cg = cooperative_groups;
+
+constexpr int WARP_SIZE = opus::get_warp_size();
 
 namespace mhc {
 
@@ -14,7 +17,7 @@ __global__ void rmsnorm_kernel(__hip_bfloat16* __restrict__ out, float* __restri
                                const __hip_bfloat16* __restrict__ weight, int N, int C,
                                float eps) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
 
     int idx = blockIdx.x;
     if (idx >= N)
@@ -34,9 +37,9 @@ __global__ void rmsnorm_kernel(__hip_bfloat16* __restrict__ out, float* __restri
 
     float warp_sum = cg::reduce(warp, thread_sum_sq, cg::plus<float>());
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int num_warps = BLOCK_SIZE / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
 
     if (lane_id == 0) {
         s_sum_sq[warp_id] = warp_sum;
@@ -74,7 +77,7 @@ __global__ void rmsnorm_kernel_vectorized(__hip_bfloat16* __restrict__ out,
                                           const __hip_bfloat16* __restrict__ weight, int N, int C,
                                           float eps) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
 
     int idx = blockIdx.x;
     if (idx >= N)
@@ -113,9 +116,9 @@ __global__ void rmsnorm_kernel_vectorized(__hip_bfloat16* __restrict__ out,
 
     float warp_sum = cg::reduce(warp, thread_sum_sq, cg::plus<float>());
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int num_warps = BLOCK_SIZE / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
 
     if (lane_id == 0) {
         s_sum_sq[warp_id] = warp_sum;
@@ -176,7 +179,7 @@ inline void rmsnorm_forward(__hip_bfloat16* out, const __hip_bfloat16* inp,
                             const __hip_bfloat16* weight, int N, int C, float eps,
                             hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
-    int num_warps = BLOCK_SIZE / 32;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
     size_t shared_mem = num_warps * sizeof(float);
 
     dim3 grid(N);
@@ -196,7 +199,7 @@ inline void rmsnorm_forward_with_rms(__hip_bfloat16* out, float* rms_out,
                                      const __hip_bfloat16* weight, int N, int C, float eps,
                                      hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
-    int num_warps = BLOCK_SIZE / 32;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
     size_t shared_mem = num_warps * sizeof(float);
 
     dim3 grid(N);
@@ -218,7 +221,7 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
                                         const __hip_bfloat16* __restrict__ weight,
                                         const float* __restrict__ rms, int N, int C) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
 
     int idx = blockIdx.x;
     if (idx >= N)
@@ -243,9 +246,9 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
 
     float warp_dot = cg::reduce(warp, thread_dot, cg::plus<float>());
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int num_warps = BLOCK_SIZE / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
 
     if (lane_id == 0) {
         s_reduce[warp_id] = warp_dot;
@@ -279,7 +282,7 @@ inline void rmsnorm_backward(float* d_inp, float* d_weight, const float* grad,
                              const __hip_bfloat16* inp, const __hip_bfloat16* weight,
                              const float* rms, int N, int C, hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
-    int num_warps = BLOCK_SIZE / 32;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
     size_t shared_mem = num_warps * sizeof(float);
 
     rmsnorm_backward_kernel<BLOCK_SIZE>
@@ -291,7 +294,7 @@ template<int BLOCK_SIZE>
 __global__ void compute_rms_kernel(float* __restrict__ rms_out, const __hip_bfloat16* __restrict__ inp,
                                    int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
 
     int idx = blockIdx.x;
     if (idx >= N)
@@ -309,9 +312,9 @@ __global__ void compute_rms_kernel(float* __restrict__ rms_out, const __hip_bflo
 
     float warp_sum = cg::reduce(warp, thread_sum_sq, cg::plus<float>());
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int num_warps = BLOCK_SIZE / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
 
     if (lane_id == 0) {
         shared[warp_id] = warp_sum;
@@ -334,7 +337,7 @@ __global__ void compute_rms_kernel_vectorized(float* __restrict__ rms_out,
                                               const __hip_bfloat16* __restrict__ inp, int N, int C,
                                               float eps) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
 
     int idx = blockIdx.x;
     if (idx >= N)
@@ -371,9 +374,9 @@ __global__ void compute_rms_kernel_vectorized(float* __restrict__ rms_out,
 
     float warp_sum = cg::reduce(warp, thread_sum_sq, cg::plus<float>());
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int num_warps = BLOCK_SIZE / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
 
     if (lane_id == 0) {
         shared[warp_id] = warp_sum;
@@ -394,7 +397,7 @@ __global__ void compute_rms_kernel_vectorized(float* __restrict__ rms_out,
 inline void compute_rms(float* rms_out, const __hip_bfloat16* inp, int N, int C, float eps,
                         hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
-    int num_warps = BLOCK_SIZE / 32;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
     size_t shared_mem = num_warps * sizeof(float);
 
     if (C % 8 == 0 && C >= 64) {
@@ -578,7 +581,7 @@ template<int BLOCK_SIZE>
 __global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const __hip_bfloat16* __restrict__ inp,
                                        int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
 
     int idx = blockIdx.x;
     if (idx >= N)
@@ -596,9 +599,9 @@ __global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const __hip_
 
     float warp_sum = cg::reduce(warp, thread_sum_sq, cg::plus<float>());
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int num_warps = BLOCK_SIZE / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
 
     if (lane_id == 0) {
         shared[warp_id] = warp_sum;
@@ -619,7 +622,7 @@ __global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const __hip_
 inline void compute_rms_pdl(float* rms_out, const __hip_bfloat16* inp, int N, int C, float eps,
                             hipStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
-    int num_warps = BLOCK_SIZE / 32;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
     size_t shared_mem = num_warps * sizeof(float);
 
     compute_rms_pdl_kernel<BLOCK_SIZE>
@@ -692,7 +695,7 @@ __global__ void rms_correction_kernel(float* __restrict__ dx, const float* __res
                                       const __hip_bfloat16* __restrict__ x, const float* __restrict__ rms,
                                       int M, int K_dim) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
 
     int row = blockIdx.x;
     if (row >= M)
@@ -705,9 +708,9 @@ __global__ void rms_correction_kernel(float* __restrict__ dx, const float* __res
     float* dx_row = dx + row * K_dim;
     float r = rms[row];
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    int num_warps = BLOCK_SIZE / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
 
     float thread_dot = 0.0f;
     for (int i = threadIdx.x; i < K_dim; i += BLOCK_SIZE) {
@@ -893,7 +896,7 @@ struct FusedRMSNormMatmulBackward {
                                     dx_out_desc, K_buffer, dx_out_desc, &dx_heuristic.algo,
                                     workspace, workspace_size, stream) == HIPBLAS_STATUS_SUCCESS);
 
-        int num_warps = BLOCK_SIZE / 32;
+        int num_warps = BLOCK_SIZE / WARP_SIZE;
         size_t shared_mem = num_warps * sizeof(float);
         rms_correction_kernel<BLOCK_SIZE>
             <<<M, BLOCK_SIZE, shared_mem, stream>>>(dx_out, K_buffer, x, rms, M, K);
@@ -1454,8 +1457,8 @@ __global__ void stream_aggregate_backward_dH_partial_kernel(float* __restrict__ 
                                                             const float* __restrict__ inp, int B,
                                                             int n, int C) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    __shared__ float s_warp_sums[MAX_N][BLOCK_SIZE / 32];
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
+    __shared__ float s_warp_sums[MAX_N][BLOCK_SIZE / WARP_SIZE];
 
     float local_sum[MAX_N] = {0.0f};
     for (int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x; idx < B * C;
@@ -1469,7 +1472,7 @@ __global__ void stream_aggregate_backward_dH_partial_kernel(float* __restrict__ 
         }
     }
 
-    int warp_id = threadIdx.x / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
 #pragma unroll
     for (int i = 0; i < MAX_N; i++) {
         if (i < n) {
@@ -1482,7 +1485,7 @@ __global__ void stream_aggregate_backward_dH_partial_kernel(float* __restrict__ 
 
     if (threadIdx.x < n) {
         float block_sum = 0.0f;
-        for (int w = 0; w < BLOCK_SIZE / 32; w++)
+        for (int w = 0; w < BLOCK_SIZE / WARP_SIZE; w++)
             block_sum += s_warp_sums[threadIdx.x][w];
         partials[blockIdx.x * n + threadIdx.x] = block_sum;
     }
@@ -1492,7 +1495,7 @@ template<int MAX_N>
 __global__ void reduce_partials_kernel(float* __restrict__ out, const float* __restrict__ partials,
                                        int n, int num_partials) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
     int i = blockIdx.x;
     if (i >= n)
         return;
@@ -1504,12 +1507,12 @@ __global__ void reduce_partials_kernel(float* __restrict__ out, const float* __r
 
     __shared__ float s_warp_sums[8];
     if (warp.thread_rank() == 0)
-        s_warp_sums[threadIdx.x / 32] = sum;
+        s_warp_sums[threadIdx.x / WARP_SIZE] = sum;
     block.sync();
 
     if (threadIdx.x == 0) {
         float total = 0.0f;
-        for (int w = 0; w < (blockDim.x + 31) / 32; w++)
+        for (int w = 0; w < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE; w++)
             total += s_warp_sums[w];
         out[i] = total;
     }
@@ -1640,8 +1643,8 @@ __global__ void stream_distribute_mix_backward_partials_kernel(
     float* __restrict__ partials_M, float* __restrict__ partials_H, const float* __restrict__ grad,
     const float* __restrict__ x, const float* __restrict__ y_norm, int B, int n, int C) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
+    constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
     __shared__ float s_warp_M[MAX_N][MAX_N][NUM_WARPS];
     __shared__ float s_warp_H[MAX_N][NUM_WARPS];
 
@@ -1673,7 +1676,7 @@ __global__ void stream_distribute_mix_backward_partials_kernel(
         }
     }
 
-    int warp_id = threadIdx.x / 32;
+    int warp_id = threadIdx.x / WARP_SIZE;
 #pragma unroll
     for (int i = 0; i < MAX_N; i++) {
         if (i < n) {
@@ -1717,7 +1720,7 @@ __global__ void reduce_partials_matrix_kernel(float* __restrict__ out,
                                               const float* __restrict__ partials, int n,
                                               int num_partials) {
     cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<WARP_SIZE> warp = cg::tiled_partition<WARP_SIZE>(block);
     int k = blockIdx.x;
     if (k >= n * n)
         return;
@@ -1729,12 +1732,12 @@ __global__ void reduce_partials_matrix_kernel(float* __restrict__ out,
 
     __shared__ float s_warp_sums[8];
     if (warp.thread_rank() == 0)
-        s_warp_sums[threadIdx.x / 32] = sum;
+        s_warp_sums[threadIdx.x / WARP_SIZE] = sum;
     block.sync();
 
     if (threadIdx.x == 0) {
         float total = 0.0f;
-        for (int w = 0; w < (blockDim.x + 31) / 32; w++)
+        for (int w = 0; w < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE; w++)
             total += s_warp_sums[w];
         out[k] = total;
     }
