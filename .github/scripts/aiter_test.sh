@@ -35,7 +35,7 @@ for idx in "${!files[@]}"; do
     fi
 done
 
-echo "Running ${#sharded_files[@]} tests in shard $SHARD_IDX of $SHARD_TOTAL."
+echo "Running ${sharded_files[@]} in shard $SHARD_IDX of $SHARD_TOTAL."
 
 for file in "${sharded_files[@]}"; do
     # Print a clear separator and test file name for readability
