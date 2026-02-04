@@ -2181,7 +2181,7 @@ def flydsl_moe_stage2(
     if DSL2_ROOT not in sys.path:
         sys.path.insert(0, DSL2_ROOT)
 
-    from kernels.moe_gemm_2stage import compile_moe_gemm2  # type: ignore
+    from kernels.moe_gemm_2stage import compile_moe_gemm2_ex, MoeGemm2Mode   # type: ignore
 
     if out.dtype == dtypes.bf16:
         out_dtype = "bf16"
@@ -2220,7 +2220,16 @@ def flydsl_moe_stage2(
     _do_cmp = _cmp and _cmp_s2 and int(token_num) <= int(_cmp_max_tokens)
     out_base = out.clone() if _do_cmp else None
 
-    exe2 = compile_moe_gemm2(
+    moe_mode = MoeGemm2Mode.REDUCE
+    try:
+        _moe_mode_env = os.environ.get("AITER_FLYDSL_MOE_GEMM2_MODE", "reduce").lower()
+        if _moe_mode_env == "atomic":
+            moe_mode = MoeGemm2Mode.ATOMIC
+    except Exception:
+        pass
+    logger.info("[flydsl] moe stage2 using mode=%s", str(moe_mode))
+
+    exe2 = compile_moe_gemm2_ex(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -2231,6 +2240,7 @@ def flydsl_moe_stage2(
         doweight_stage2=bool(sorted_weights is not None),
         in_dtype="fp8",
         out_dtype=out_dtype,
+        mode=moe_mode,
     )
     exe2(
         out,
