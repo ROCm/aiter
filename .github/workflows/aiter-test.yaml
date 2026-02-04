@@ -31,7 +31,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_image:
-    runs-on: aiter-k8s-build
+    runs-on: aiter-1gpu-runner
     needs: check-signal
     steps:
       - name: Checkout code
