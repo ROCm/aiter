@@ -1573,13 +1573,6 @@ __global__ void compute_rms_pdl_kernel(float* __restrict__ rms_out, const __hip_
             rms_out[idx] = rms;
         }
     }
-
-#if __CUDA_ARCH__ >= 900
-    __syncthreads();
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
 }
 
 inline void compute_rms_pdl(float* rms_out, const __hip_bfloat16* inp, int N, int C, float eps,
