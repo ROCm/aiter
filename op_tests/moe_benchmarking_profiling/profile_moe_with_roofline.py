@@ -31,6 +31,14 @@ import pandas as pd
 import argparse
 import shutil
 
+# Check for required dependencies
+try:
+    import plotly
+except ImportError:
+    print("Error: plotly is required for rooflineExtractor but not installed.")
+    print("Install with: pip install plotly")
+    sys.exit(1)
+
 # Add paths for tuner imports
 current_dir = Path(__file__).parent
 aiter_root = current_dir.parent.parent
