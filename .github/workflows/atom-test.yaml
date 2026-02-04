@@ -155,7 +155,7 @@ jobs:
           echo ""
           echo "========== Running test =========="
   
-          if [ -d "/run" ]; then
+          if [ -d "/run" && ${{ matrix.model_name == 'DeepSeek-R1-0528' }}]; then
             model_path="/run/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
@@ -181,7 +181,7 @@ jobs:
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          if [ -d "/run" ]; then
+          if [ -d "/run" && ${{ matrix.model_name == 'DeepSeek-R1-0528' }}]; then
             model_path="/run/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
