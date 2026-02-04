@@ -597,7 +597,7 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
 
     else if(input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte) // int8
     {
-        if(fc2_smooth_scale.has_value())
+        if(fc2_smooth_scale.has_value() && out.dtype() != at::ScalarType::Float)
             smf = 2;
         if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_silu;
@@ -607,6 +607,8 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_silu;
         else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
+        else if(out.dtype() == at::ScalarType::Float && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp32_pertokenInt8_g1u1_silu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
