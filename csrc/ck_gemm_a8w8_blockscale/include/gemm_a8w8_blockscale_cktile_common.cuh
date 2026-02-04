@@ -35,11 +35,12 @@ using BDataType       = TILE_FP8;
 using AccDataType     = TILE_FP32;
 using ComputeDataType = ADataType;
 
-using ALayout  = ck_tile::tensor_layout::gemm::RowMajor;
-using AQLayout = ck_tile::tensor_layout::gemm::RowMajor;
-using BLayout  = ck_tile::tensor_layout::gemm::ColumnMajor;
-using BQLayout = ck_tile::tensor_layout::gemm::ColumnMajor;
-using CLayout  = ck_tile::tensor_layout::gemm::RowMajor;
+using ALayout         = ck_tile::tensor_layout::gemm::RowMajor;
+using AQLayout        = ck_tile::tensor_layout::gemm::RowMajor;
+using AQLayout_8Warps = ck_tile::tensor_layout::gemm::ColumnMajor;
+using BLayout         = ck_tile::tensor_layout::gemm::ColumnMajor;
+using BQLayout        = ck_tile::tensor_layout::gemm::ColumnMajor;
+using CLayout         = ck_tile::tensor_layout::gemm::RowMajor;
 
 using CDEElementWise = ck_tile::element_wise::PassThrough;
 
@@ -118,7 +119,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 {
 
     static constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::ABQuantGrouped;
-    static constexpr bool transpose_c = BQuantGroupSize::kN == 128;
+    static constexpr bool transpose_c             = BQuantGroupSize::kN == 128;
     static constexpr bool eight_warps =
         BQuantGroupSize::kN == 128 &&
         (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8) &&
@@ -133,20 +134,21 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
-    using GemmTraits = ck_tile::TileGemmQuantTraits<false, // PadM
-                                                PadN,
-                                                PadK,
-                                                false, // PreshuffleQuant for A, not supported yet
-                                                false, // PreshuffleQuant for B, not supported yet (distinct from PreshuffleB below)
-                                                PreshuffleB, // PreshuffleB (weight/B matrix preshuffle), supported
-                                                ALayout,
-                                                BLayout,
-                                                CLayout,
-                                                QuantMode,
-                                                AQLayout,
-                                                BQLayout,
-                                                transpose_c,
-                                                UseDoubleSmemBuffer>;
+    using GemmTraits =
+        ck_tile::TileGemmQuantTraits<false, // PadM
+                                     PadN,
+                                     PadK,
+                                     false, // PreshuffleQuant for A, not supported yet
+                                     false, // PreshuffleQuant for B, not supported yet (distinct from PreshuffleB below)
+                                     PreshuffleB, // PreshuffleB (weight/B matrix preshuffle), supported
+                                     ALayout,
+                                     BLayout,
+                                     CLayout,
+                                     QuantMode,
+                                     std::conditional_t<eight_warps, AQLayout_8Warps, AQLayout>,
+                                     BQLayout,
+                                     transpose_c,
+                                     UseDoubleSmemBuffer>;
 
     using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
                                                                  BDataType,
@@ -188,12 +190,12 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                     has_hot_loop_v,
                                                                     tail_number_v>;
 
-        using GemmPipeline =
-            std::conditional_t<eight_warps,
-                               ck_tile::ABQuantGemmPipelineAgBgCrAsync<PipelineProblem>,
-                               std::conditional_t<UseDoubleSmemBuffer && PreshuffleB,
-                                                  ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
-                                                  ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>>;
+        using GemmPipeline = std::conditional_t<
+            eight_warps,
+            ck_tile::ABQuantGemmPipelineAgBgCrAsync<PipelineProblem>,
+            std::conditional_t<UseDoubleSmemBuffer && PreshuffleB,
+                               ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
+                               ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>>;
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ADataType,
                                              BDataType,
@@ -216,10 +218,8 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                              1,
                                              GemmConfig::TiledMMAPermuteN_v>>;
 
-        using Kernel = ck_tile::QuantGemmKernel<TilePartitioner,
-                                                GemmPipeline,
-                                                GemmEpilogue,
-                                                QuantMode>;
+        using Kernel =
+            ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
 
         auto kargs = Kernel::MakeKernelArgs(args);
 
@@ -303,11 +303,14 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int BQK = ck_tile::integer_divide_ceil(K, BQuantGroupSize::kK);
     const int BQN = ck_tile::integer_divide_ceil(N, BQuantGroupSize::kN);
 
-    const int stride_A  = K;
-    const int stride_B  = K;
-    const int stride_C  = N;
-    const int stride_AQ = AQK;
-    const int stride_BQ = BQK;
+    const int stride_A = K;
+    const int stride_B = K;
+    const int stride_C = N;
+    // const int stride_AQ = AQK;
+    const int stride_AQ = (GemmInstance::M_Warp_v * GemmInstance::N_Warp_v * GemmInstance::K_Warp_v == 8)
+                              ? M    // Col-Major
+                              : AQK; // Row-Major
+    const int stride_BQ = BQN;
 
     args.QK_A      = AQK;
     args.QK_B      = BQK;
