@@ -11,6 +11,7 @@ from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
+from aiter.jit.utils.chip_info import get_gfx
 # ck
 import sys
 from pathlib import Path
@@ -196,6 +197,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         tasks_cktile = []
         for i in range(kernels_num):
             kernel = kernel_list[i]
+            if not get_gfx().startswith("gfx95") and (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp) == 8:
+                continue
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -208,6 +211,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 if useSplitK
                 else 0
             )
+            #print("======================= gemm_a8w8_idx = ", i, kernel.M_Tile,kernel.N_Tile, kernel.K_Tile, kernel.M_Warp, kernel.N_Warp, kernel.K_Warp)
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "cktile", preshuffleB)
                 tasks_cktile.append(
