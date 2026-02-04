@@ -1754,8 +1754,7 @@ def flydsl_moe_stage1(
     except ImportError:
         # If kernels is not in path, try to add FlyDSL root to path
         import sys
-        import flydsl
-        flydsl_path = os.path.dirname(os.path.dirname(flydsl.__file__))
+        flydsl_path = os.environ.get("DSL2_ROOT", "/data/FlyDSL")
         if flydsl_path not in sys.path:
             sys.path.insert(0, flydsl_path)
         if not is_wfp4_pipeline:
@@ -1769,7 +1768,7 @@ def flydsl_moe_stage1(
     if is_wfp4_pipeline:
         extra_w4_stage1_args["a_dtype"] = "fp8"
         extra_w4_stage1_args["b_dtype"] = "fp4"
-        extra_w4_stage1_args["enable_bias"] = bias1 is not None,
+        extra_w4_stage1_args["enable_bias"] = (bias1 is not None)
     else:
         extra_w4_stage1_args["in_dtype"] = "fp8"
 
@@ -1787,6 +1786,7 @@ def flydsl_moe_stage1(
         **extra_w4_stage1_args,
     )
 
+    stream_ptr = torch.cuda.current_stream().cuda_stream
     exe1(
         out,
         x_q,
@@ -1802,6 +1802,7 @@ def flydsl_moe_stage1(
         inter_dim,
         model_dim,
         blocks,
+        stream_ptr,
     )
     return out
 
@@ -1905,14 +1906,13 @@ def flydsl_moe_stage2(
     except ImportError:
         # If kernels is not in path, try to add FlyDSL root to path
         import sys
-        import flydsl
-        flydsl_path = os.path.dirname(os.path.dirname(flydsl.__file__))
+        flydsl_path = os.environ.get("DSL2_ROOT", "/data/FlyDSL")
         if flydsl_path not in sys.path:
             sys.path.insert(0, flydsl_path)
         if not is_wfp4_pipeline:
             from kernels.moe_gemm_2stage import compile_moe_gemm2
         else:
-            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm2
+            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2 as compile_moe_gemm2
 
     if out.dtype == dtypes.bf16:
         out_dtype = "bf16"
@@ -1928,7 +1928,7 @@ def flydsl_moe_stage2(
     if is_wfp4_pipeline:
         extra_w4_stage2_args["a_dtype"] = "fp8"
         extra_w4_stage2_args["b_dtype"] = "fp4"
-        extra_w4_stage2_args["enable_bias"] = bias2 is not None,
+        extra_w4_stage2_args["enable_bias"] = (bias2 is not None)
     else:
         extra_w4_stage2_args["in_dtype"] = "fp8"
 
@@ -1945,6 +1945,7 @@ def flydsl_moe_stage2(
         **extra_w4_stage2_args,
     )
 
+    stream_ptr = torch.cuda.current_stream().cuda_stream
     exe2(
         out,
         a2,
@@ -1960,6 +1961,7 @@ def flydsl_moe_stage2(
         model_dim,
         inter_dim,
         blocks,
+        stream_ptr,
     )
     return out
 
