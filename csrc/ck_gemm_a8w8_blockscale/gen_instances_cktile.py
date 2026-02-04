@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from aiter.jit.utils.chip_info import get_gfx
 
 from gemm_a8w8_blockscale_cktile_instance import (
     default_kernels_cktile_dict,
@@ -235,6 +236,8 @@ torch::Tensor
 
         # generate instances code
         for _, k in kernels_dict.items():
+            if not get_gfx().startswith("gfx95") and (k.M_Warp * k.N_Warp * k.K_Warp) == 8:
+                continue
             self.gen_tile_instance(k)
 
         # generate lookup dict for kernel instances
