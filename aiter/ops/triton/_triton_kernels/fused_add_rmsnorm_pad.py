@@ -2,6 +2,15 @@ import triton
 import triton.language as tl
 
 
+CONFIGS = [
+    triton.Config({"BLOCK_SIZE_N": 64}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_SIZE_N": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_SIZE_N": 256}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_SIZE_N": 512}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_SIZE_N": 1024}, num_warps=8, num_stages=4),
+    triton.Config({"BLOCK_SIZE_N": 2048}, num_warps=8, num_stages=4),
+]
+
 @triton.jit
 def _rmsmorm_op(row, weight, n_cols, epsilon):
     row_norm = row * row
@@ -11,6 +20,10 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     rms_norm = row * norm_factor * weight
     return rms_norm
 
+@triton.autotune(
+    configs=CONFIGS,
+    key=["N", "N_OUT"],
+)
 
 @triton.jit
 def _fused_add_rmsnorm_pad(
