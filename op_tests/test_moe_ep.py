@@ -74,12 +74,16 @@ def asm_moe_test(
     # Switch backend by env var:
     # - AITER_USE_FLYDSL_MOE=0 -> asm_moe (original)
     # - AITER_USE_FLYDSL_MOE=1 -> fused_moe(... use_flydsl=True) (FlyDSL 2-stage)
-    if os.environ.get("AITER_USE_FLYDSL_MOE", "0") in (
-        "1",
-        "true",
-        "True",
-        "YES",
-        "yes",
+    if (
+        os.environ.get("AITER_USE_FLYDSL_MOE", "0")
+        in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        )
+        and not a16
     ):
         return fused_moe(
             hidden_states,
@@ -88,6 +92,7 @@ def asm_moe_test(
             topk_weight,
             topk_ids,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
             activation=ActivationType.Silu,
             quant_type=QuantType.per_Token if fc1_scale is not None else QuantType.No,
             doweight_stage1=False,
