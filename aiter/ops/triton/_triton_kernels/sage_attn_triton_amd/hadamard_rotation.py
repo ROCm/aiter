@@ -45,7 +45,7 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     # Normalize to make it orthogonal: H @ H.T = I
     # The unnormalized matrix satisfies H_unnorm @ H_unnorm.T = block_size * I
     # So divide by sqrt(block_size) to get orthogonal matrix
-    H = H / (2.0 ** 0.5)  # Divide by sqrt(2) since we doubled the size
+    # H = H / (2.0 ** 0.5)  # Divide by sqrt(2) since we doubled the size
     
     return H
 
@@ -162,7 +162,7 @@ def apply_hadamard_rotation_qk(q, k, BLKM=128, BLKN=64, block_size=32):
     k = k.view(-1, k_shape[-1])
 
     r = create_hadamard_matrix(block_size, q.device, q.dtype)
-    #r = create_random_rotation(block_size, q.device, q.dtype)
+    r /= (block_size ** 0.5)
     
     q_rotated = apply_hadamard_rotation(q, r, BLKM, block_size=block_size)
     k_rotated = apply_hadamard_rotation(k, r, BLKN, block_size=block_size)

@@ -1662,9 +1662,7 @@ def sage_quant_v2(
         raise ValueError(f"Unknown tensor layout: {layout}")
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
-    # Apply K tensor smoothing following SageAttention approach
-    if smooth_k:
-        k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+
 
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
@@ -1695,7 +1693,11 @@ def sage_quant_v2(
         num_warps=8
     )
 
-    #q, k = apply_hadamard_rotation_qk(q, k, BLKQ, BLKK) 
+    q, k = apply_hadamard_rotation_qk(q, k, BLKQ, BLKK) 
+
+    # Apply K tensor smoothing following SageAttention approach
+    if smooth_k:
+        k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     # q_fp4, q_scale = downcast_to_mxfp(q, aiter.dtypes.fp8, axis=-1)
