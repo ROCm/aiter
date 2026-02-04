@@ -1841,6 +1841,7 @@ def flydsl_moe_stage1(
         raise ValueError(
             f"FlyDSL stage1 only supports out dtype in (fp16, bf16), got {out.dtype}"
         )
+    stream_ptr = torch.cuda.current_stream().cuda_stream
     exe1 = compile_moe_gemm1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1868,6 +1869,7 @@ def flydsl_moe_stage1(
         inter_dim,
         model_dim,
         int(blocks),
+        stream_ptr
     )
 
     # Debug hook: run CK in parallel and diff (small tokens only).
@@ -2229,6 +2231,7 @@ def flydsl_moe_stage2(
         pass
     logger.info("[flydsl] moe stage2 using mode=%s", str(moe_mode))
 
+    stream_ptr = torch.cuda.current_stream().cuda_stream
     exe2 = compile_moe_gemm2_ex(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -2256,6 +2259,7 @@ def flydsl_moe_stage2(
         model_dim,
         inter_dim,
         int(blocks),
+        stream_ptr
     )
     if _do_cmp:
         out_ck = out_base.clone()  # type: ignore[union-attr]
