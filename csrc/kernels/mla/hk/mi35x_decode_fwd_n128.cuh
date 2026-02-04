@@ -133,25 +133,11 @@ struct HkMlaDecodeFwdParams
     void* p_dbg;
 };
 
-template <typename T, uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
+template <typename T>
 class QManagerV1
 {
     private:
     using q_t = typename T::q_t;
-
-    using q_nope_ranges = hkdart::split_many_t<
-        hkdart::type_list<hkdart::range<GPR_NOPE_START, GPR_NOPE_START + 32 - 1>>,
-        2>; // 32 vgprs
-    using q_rope_ranges = hkdart::split_many_t<
-        hkdart::type_list<hkdart::range<GPR_ROPE_START, GPR_ROPE_START + 4 - 1>>,
-        2>; // 4 vgprs
-
-    __device__ static hk::
-        art<q_t, T::kTileM, T::kQkNopeHeadDim, hk::row_l, hk::rt_16x32_s, q_nope_ranges>
-            q_nope_;
-    __device__ static hk::
-        art<q_t, T::kTileM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_s, q_rope_ranges>
-            q_rope_;
 
     public:
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
@@ -159,17 +145,30 @@ class QManagerV1
         return 0; // Not used
     }
 
+    template <uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
     __device__ __forceinline__ static void load_q_to_gpr(const typename T::gl_q& q_buffer,
                                                          const int32_t warp_idx,
                                                          const int32_t q_start,
-                                                         const uintptr_t p_lds_q)
+                                                         const uintptr_t p_lds)
     {
-        hk::load<2, 0>(q_nope_, q_buffer, {q_start, 0, 0, 0}, {0, warp_idx, 0, 0});
-        hk::load<2, T::kQkNopeHeadDim>(q_rope_, q_buffer, {q_start, 0, 0, 0}, {0, warp_idx, 0, 0});
+        using q_nope_ranges = hkdart::split_many_t<
+            hkdart::type_list<hkdart::range<GPR_NOPE_START, GPR_NOPE_START + 32 - 1>>,
+            2>; // 32 vgprs
+        using q_rope_ranges = hkdart::split_many_t<
+            hkdart::type_list<hkdart::range<GPR_ROPE_START, GPR_ROPE_START + 4 - 1>>,
+            2>; // 4 vgprs
+
+        static hk::art<q_t, T::kTileM, T::kQkNopeHeadDim, hk::row_l, hk::rt_16x32_s, q_nope_ranges>
+            q_nope;
+        static hk::art<q_t, T::kTileM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_s, q_rope_ranges>
+            q_rope;
+
+        hk::load<2, 0>(q_nope, q_buffer, {q_start, 0, 0, 0}, {0, warp_idx, 0, 0});
+        hk::load<2, T::kQkNopeHeadDim>(q_rope, q_buffer, {q_start, 0, 0, 0}, {0, warp_idx, 0, 0});
     }
 };
 
-template <typename T, uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
+template <typename T>
 class QManagerV2
 {
     private:
@@ -178,10 +177,9 @@ class QManagerV2
     uint32_t m_src_lane_0;
     uint32_t m_src_lane_1;
     uint64_t m_use_src1_s;
-    uint4 m_data_rope;
 
     template <uint32_t GPR_START>
-    __device__ __forceinline__ void shuffle_data(const uint4& data)
+    __device__ __forceinline__ void shuffle_data(const v4ui& data)
     {
         uint32_t src_lane_0_reg_0;
         uint32_t src_lane_0_reg_1;
@@ -261,10 +259,11 @@ class QManagerV2
         return 0; // Not used
     }
 
+    template <uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
     __device__ __forceinline__ void load_q_to_gpr(const typename T::gl_q& q_buffer,
                                                   const int32_t warp_idx,
                                                   const int32_t q_start,
-                                                  const uintptr_t p_lds_q)
+                                                  const uintptr_t p_lds)
     {
         // Each warp loads 16x64 each time. Each lane handles 1x16 elements.
         // Since dtype should be fp8, a buffer_load_dwordx4 is used to load all 1x16 elements.
@@ -285,10 +284,10 @@ class QManagerV2
         const uint32_t col      = (lane_idx % kNumLanesPerRow) * kNumElemPerLane;
         const uint32_t v_offset = (row * T::kQkHeadDim + col) * sizeof(q_t);
 
-        uint4 data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 0 * kNumColsPerWarp);
-        uint4 data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 1 * kNumColsPerWarp);
+        v4ui data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 0 * kNumColsPerWarp);
+        v4ui data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 1 * kNumColsPerWarp);
         asm volatile("s_waitcnt vmcnt(1)");
-        uint4 data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 2 * kNumColsPerWarp);
+        v4ui data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 2 * kNumColsPerWarp);
         __builtin_amdgcn_s_setprio(7);
         shuffle_data<GPR_NOPE_START + 0>(data_0);
         asm volatile("s_waitcnt vmcnt(1)");
@@ -313,13 +312,140 @@ class QManagerV2
         shuffle_data<GPR_NOPE_START + 20>(data_2);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(1);
-        m_data_rope = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 8 * kNumColsPerWarp);
+        data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 8 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 24>(data_0);
         asm volatile("s_waitcnt vmcnt(1)");
         __builtin_amdgcn_s_setprio(0);
         shuffle_data<GPR_NOPE_START + 28>(data_1);
         asm volatile("s_waitcnt vmcnt(0)");
-        shuffle_data<GPR_ROPE_START>(m_data_rope);
+        shuffle_data<GPR_ROPE_START>(data_2);
+    }
+};
+
+template <typename T>
+class QManagerV3
+{
+    private:
+    using q_t = typename T::q_t;
+
+    // Stores 16x64 elements per warp in LDS.
+    // Pad 2DW per 2 rows.
+    static constexpr uint32_t kNumElemPerRow         = 64;
+    static constexpr uint32_t kNumElemPerCol         = 16;
+    static constexpr uint32_t kNumPaddingBytesPerRow = 2 * sizeof(uint32_t); // 2*4=8
+    static constexpr uint32_t kNumBytesPer2Rows =
+        kNumElemPerRow * 2 * sizeof(q_t) + kNumPaddingBytesPerRow; // 64*2*1+8=128+8=136
+
+    // All come from mfma_f32_16x16x32_fp8_fp8.
+    static constexpr uint32_t kMfmaRows = 16;
+    static constexpr uint32_t kMfmaCols = 32;
+    static constexpr uint32_t kMfmaElemPerLane =
+        kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*32/64=8
+
+    template <uint32_t GPR_START>
+    __device__ __forceinline__ void shuffle_data(const v4ui& data, const uintptr_t p_lds)
+    {
+        constexpr uint32_t kNumLanePerRow = ckt::get_warp_size() / kNumElemPerCol; // 64/16=4
+
+        const uint32_t lane_idx = ckt::get_lane_id();
+
+        auto get_v_offset = [&](const uint32_t row, const uint32_t col) -> uint32_t {
+            return (row / 2) * kNumBytesPer2Rows + ((row % 2) * kNumElemPerRow + col) * sizeof(q_t);
+        };
+
+        const uint32_t row_st = lane_idx / kNumLanePerRow;
+        const uint32_t col_st = (lane_idx % kNumLanePerRow) * (kNumElemPerRow / kNumLanePerRow);
+        const uint32_t v_offset_st = get_v_offset(row_st, col_st);
+
+        const uint32_t row_ld      = lane_idx % kMfmaRows;
+        const uint32_t col_ld      = (lane_idx / kMfmaRows) * kMfmaElemPerLane;
+        const uint32_t v_offset_ld = get_v_offset(row_ld, col_ld);
+
+        v4ui data_v = {data.x, data.y, data.z, data.w};
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        hkm::ds_write_b128(p_lds + v_offset_st, 0, data_v);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        hkm::ds_read_b64<GPR_START + 0>(p_lds + v_offset_ld, 0);
+        hkm::ds_read_b64<GPR_START + 2>(p_lds + v_offset_ld, kMfmaCols * sizeof(q_t));
+    }
+
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_per_warp_in_byte()
+    {
+        // 16/2 * 136 = 1088
+        return kNumElemPerCol / 2 * kNumBytesPer2Rows;
+    }
+
+    public:
+    __device__ QManagerV3() {}
+
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
+    {
+        return T::kNumWarps * get_lds_size_per_warp_in_byte();
+    }
+
+    template <uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
+    __device__ __forceinline__ void load_q_to_gpr(const typename T::gl_q& q_buffer,
+                                                  const int32_t warp_idx,
+                                                  const int32_t q_start,
+                                                  const uintptr_t p_lds)
+    {
+        // Each warp loads 16x64 each time. Each lane handles 1x16 elements.
+        // Since dtype should be fp8, a buffer_load_dwordx4 is used to load all 1x16 elements.
+        constexpr uint32_t kNumRowsPerWarp = 16;
+        constexpr uint32_t kNumColsPerWarp = 64;
+        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;      // 16*64=1024
+        constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / ckt::get_warp_size(); // 1024/64=16
+        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;      // 64/16=4
+
+        const uint32_t lane_idx = ckt::get_lane_id();
+
+        const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_warp_in_byte();
+
+        uint64_t as_u64 =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&q_buffer[{q_start, 0, 0, 0}]));
+        const hk::buffer_resource br = hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
+
+        const uint32_t s_offset = warp_idx * kNumRowsPerWarp * T::kQkHeadDim * sizeof(q_t);
+        const uint32_t row      = lane_idx / kNumLanesPerRow;
+        const uint32_t col      = (lane_idx % kNumLanesPerRow) * kNumElemPerLane;
+        const uint32_t v_offset = (row * T::kQkHeadDim + col) * sizeof(q_t);
+
+        v4ui data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 0 * kNumColsPerWarp);
+        v4ui data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 1 * kNumColsPerWarp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        v4ui data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 2 * kNumColsPerWarp);
+        __builtin_amdgcn_s_setprio(7);
+        shuffle_data<GPR_NOPE_START + 0>(data_0, p_lds_warp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(6);
+        data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 3 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 4>(data_1, p_lds_warp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(5);
+        data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 4 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 8>(data_2, p_lds_warp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(4);
+        data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 5 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 12>(data_0, p_lds_warp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(3);
+        data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 6 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 16>(data_1, p_lds_warp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(2);
+        data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 7 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 20>(data_2, p_lds_warp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(1);
+        data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 8 * kNumColsPerWarp);
+        shuffle_data<GPR_NOPE_START + 24>(data_0, p_lds_warp);
+        asm volatile("s_waitcnt vmcnt(1)");
+        __builtin_amdgcn_s_setprio(0);
+        shuffle_data<GPR_NOPE_START + 28>(data_1, p_lds_warp);
+        asm volatile("s_waitcnt vmcnt(0)");
+        shuffle_data<GPR_ROPE_START>(data_2, p_lds_warp);
     }
 };
 
@@ -538,8 +664,8 @@ class KvManagerV1
             p_lds_v + row * 8 * sizeof(kv_t) +
             col / kNumColsPerWarp * kWarpOffset /*+ col % kNumColsPerWarp * sizeof(kv_t)*/;
 
-        const uint4 pass_0 = hkm::ds_read_b128(p_lds_v_lane, 0);
-        const uint4 pass_1 = hkm::ds_read_b128(p_lds_v_lane, 4 * sizeof(uint32_t));
+        const v4ui pass_0 = hkm::ds_read_b128(p_lds_v_lane, 0);
+        const v4ui pass_1 = hkm::ds_read_b128(p_lds_v_lane, 4 * sizeof(uint32_t));
 
         *p_result = {
             pass_0.x, pass_0.y, pass_0.z, pass_0.w, pass_1.x, pass_1.y, pass_1.z, pass_1.w};
@@ -846,7 +972,7 @@ __device__ __forceinline__ void store_transposed_v_to_lds(const uintptr_t p_lds_
     const uintptr_t p_lds_vt_lane = p_lds_vt + block_offset;
 
     hkm::ds_write_b128(p_lds_vt_lane, 0, v_transposed.lo);
-    hkm::ds_write_b128(p_lds_vt_lane, sizeof(uint4), v_transposed.hi);
+    hkm::ds_write_b128(p_lds_vt_lane, sizeof(v4ui), v_transposed.hi);
 }
 
 // load 32x32 block for each warp. Each threads takes 4x4 elements.
@@ -1325,7 +1451,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hkdart::clobber<p_mfma_ranges>();
     hkdart::clobber<o_ranges>();
 
-    QManagerV2<T, k_q_nope_begin, k_q_rope_begin> q_manager;
+    QManagerV3<T> q_manager;
     KvManagerV2<T> kv_manager;
 
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
@@ -1389,7 +1515,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         }
 
         // Load Q from VRAM to GPRs
-        q_manager.load_q_to_gpr(params.query, warp_idx, qo_start, p_lds_q);
+        q_manager.template load_q_to_gpr<k_q_nope_begin, k_q_rope_begin>(
+            params.query, warp_idx, qo_start, p_lds_q);
         __builtin_amdgcn_sched_barrier(0);
 
         if(kv_len < T::kBlockN)
