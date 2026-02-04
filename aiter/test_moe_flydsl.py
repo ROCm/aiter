@@ -17,6 +17,7 @@ import logging
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
+    moe_sorting,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -50,26 +51,37 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=False,
 ):
+    num_iters = int(os.environ.get("AITER_MOE_NUM_ITERS", "5"))
+    num_warmup = int(os.environ.get("AITER_MOE_NUM_WARMUP", "2"))
+    # NOTE: For fp16 configs, the random init range can easily cause overflow (+/-inf) in
+    # fp16 accumulation paths (both CK and FLIR), which then makes checkAllclose meaningless.
+    # Allow scaling the random init down to keep values finite for correctness checks.
+    # - Default: 1.0 for bf16, 0.1 for fp16 (can override via env).
+    _scale_env = os.environ.get("AITER_MOE_INIT_SCALE", "").strip()
+    if _scale_env:
+        init_scale = float(_scale_env)
+    else:
+        init_scale = 0.1 if dtype == torch.float16 else 1.0
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
-    input = torch.randn((token, model_dim), dtype=dtype)
+    input = torch.randn((token, model_dim), dtype=dtype) * init_scale
     if use_g1u1:
-        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * init_scale
         if hidden_pad != 0 and intermediate_pad != 0:
             w1[:, :, -hidden_pad:] = 0
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
-        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype) * init_scale
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) * init_scale
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
-    score = torch.randn((token, E), dtype=dtype)
+    score = torch.randn((token, E), dtype=dtype) * init_scale
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
@@ -232,47 +244,293 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    use_flydsl = (
-        qType == aiter.QuantType.per_Token
-        and AQDType == dtypes.fp8
-        and WQDType == dtypes.fp8
+    # Only swap CK->FlyDSL for FP8 per-token case (as requested).
+    # NOTE: current FlyDSL MoE 2-stage kernels implement the g1u1 (SwiGLU) path, i.e.
+    # W1 shape must be [E, 2*inter_dim, model_dim]. We only enable the swap when `use_g1u1=True`.
+    use_flir = (
+        (qType == aiter.QuantType.per_Token)
+        and (AQDType == dtypes.fp8)
+        and (WQDType == dtypes.fp8)
         and bool(use_g1u1)
-        and actType == aiter.ActivationType.Silu
     )
-    if os.environ.get("AITER_USE_FLYDSL_MOE", "1") not in (
+
+    # Keep git-head behavior by default; allow disabling the swap to measure CK baseline:
+    #   AITER_USE_FLIR_MOE=0 python3 op_tests/test_moe_2stage.py -q 2 ...
+    if os.environ.get("AITER_USE_FLIR_MOE", "1") not in (
         "1",
         "true",
         "True",
         "YES",
         "yes",
     ):
-        use_flydsl = False
+        use_flir = False
+    if use_flir:
+        import sys
 
-    # FlyDSL expects pre-shuffled weights/scales (same as CK path).
-    w1_call = w1_qt_aiter
-    w2_call = w2_qt_aiter
-    w1_scale_call = w1_scale_aiter
-    w2_scale_call = w2_scale_aiter
-    out2_ck, us2 = run_perftest(
-        fused_moe,
-        input,
-        w1_call,
-        w2_call,
-        topk_weights,
-        topk_ids,
-        w1_scale=w1_scale_call,
-        w2_scale=w2_scale_call,
-        quant_type=qType,
-        activation=actType,
-        doweight_stage1=doweight_stage1,
-        intermediate_pad=intermediate_pad,
-        hidden_pad=hidden_pad,
-        bias1=exp_bias1_aiter,
-        bias2=exp_bias2_aiter,
-        use_flydsl=use_flydsl,
-        num_iters=5,
-        num_warmup=2,
-    )
+        DSL2_ROOT = os.environ.get("DSL2_ROOT", "/data/felix/dsl2")
+        if DSL2_ROOT not in sys.path:
+            sys.path.insert(0, DSL2_ROOT)
+
+        from kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2  # type: ignore
+        from tests.utils import shuffle_weight as dsl2_shuffle_weight  # type: ignore
+
+        # FlyDSL tiling defaults: keep consistent with dsl2/tests/kernels/test_moe_gemm.py.
+        tile_m = 64
+        tile_n1 = 128
+        tile_k1 = 128
+        tile_n2 = 256
+        tile_k2 = 128
+
+        # Routing buffers (Aiter moe_sorting, then trim+pad like dsl2 test).
+        topk_ids_i32 = topk_ids.to(torch.int32)
+        topk_w_f32 = topk_weights.to(torch.float32)
+        sorted_ids, sorted_w, sorted_eids, num_valid_ids, _moe_buf = moe_sorting(
+            topk_ids_i32,
+            topk_w_f32,
+            E,
+            model_dim,
+            torch.float16,
+            tile_m,
+        )
+        size_expert_ids_total = int(sorted_eids.numel())
+        # Align with CK launch rules: keep routing buffers as produced by `moe_sorting` (no host trim/pad),
+        # and launch full expert-block range. Per-block early-exit is controlled by `num_valid_ids`.
+        blocks = int(size_expert_ids_total)
+        sorted_ids = sorted_ids.contiguous()
+        sorted_w = sorted_w.contiguous()
+        sorted_eids = sorted_eids.contiguous()
+        sorted_size = int(sorted_ids.numel())
+        # Flatten/reshape inputs to match FlyDSL kernel ABI.
+        # - X: fp8, scale_x: [token]
+        x_q = a1_qt
+        scale_x_1d = a1_scale.view(-1).contiguous() if a1_scale is not None else None
+        if scale_x_1d is None:
+            raise RuntimeError("FP8 per-token swap requires a1_scale (got None)")
+        # Keep X as-is (no extra padding).
+        x_q = x_q.contiguous().view(token, model_dim)
+
+        # - W1/W2: use dsl2 preshuffle (layout must match FlyDSL kernel expectation)
+        w1_shuf = dsl2_shuffle_weight(w1_qt)
+        w2_shuf = dsl2_shuffle_weight(w2_qt)
+        w1_flat = w1_shuf.contiguous().view(E * (2 * inter_dim), model_dim)
+        # FlyDSL expects scales in logical row order (unshuffled), like dsl2 tests.
+        w1_scale_1d = w1_scale.view(-1).contiguous()
+        w1_flat = w1_flat.contiguous()
+
+        # - sorted_weights: [sorted_size] f32
+        sorted_w_1d = sorted_w.view(-1).contiguous()
+
+        # Stage1 out: bf16 is supported in FlyDSL now; prefer bf16 to avoid fp16 overflow
+        # before stage2 quantization.
+        out1_flir = torch.empty((token, topk, inter_dim), device="cuda", dtype=dtype)
+        exe1 = compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n1,
+            tile_k=tile_k1,
+            doweight_stage1=bool(doweight_stage1),
+            in_dtype="fp8",
+            out_dtype="bf16" if dtype == torch.bfloat16 else "f16",
+            use_cshuffle_epilog=False,
+        )
+
+        # Stage2 compile once (compile inside perftest can be unstable + distorts perf).
+        exe2 = compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n2,
+            tile_k=tile_k2,
+            doweight_stage2=bool(not doweight_stage1),
+            in_dtype="fp8",
+            # For bf16 test configs, fp16 atomic accumulation can overflow to +/-inf.
+            # Use fp32 atomics for correctness; cast to `dtype` for comparison below.
+            out_dtype="f32" if dtype == torch.bfloat16 else "f16",
+        )
+        w2_flat = w2_shuf.contiguous().view(E * model_dim, inter_dim).contiguous()
+        w2_scale_1d = w2_scale.view(-1).contiguous()
+        # FlyDSL stage2 output dtype follows `out_dtype` above.
+        out2 = torch.empty(
+            (token, model_dim),
+            device="cuda",
+            dtype=(torch.float32 if dtype == torch.bfloat16 else torch.float16),
+        )
+
+        # Precompute stage2 inputs once; timing should include only GEMM kernels.
+        def launch_stage1():
+            exe1(
+                out1_flir,
+                x_q,
+                w1_flat,
+                scale_x_1d,
+                w1_scale_1d,
+                sorted_ids,
+                sorted_eids,
+                sorted_w_1d,
+                num_valid_ids,
+                token,
+                inter_dim,
+                model_dim,
+                int(blocks),
+            )
+            return out1_flir
+
+        _, us1 = run_perftest(launch_stage1, num_iters=num_iters, num_warmup=num_warmup)
+
+        # Quantize stage1->stage2 input exactly like git-head reference (outside timing).
+        a2_qt_flir, a2_scale_flir = torch_quant(
+            out1_flir.to(dtype), quant_dtype=AQDType
+        )
+        a2_qt_flir = a2_qt_flir.view(token, topk, -1).contiguous()
+
+        a2_qt_flat = a2_qt_flir.contiguous().view(-1)
+        a2_scale_1d = a2_scale_flir.view(-1).contiguous()
+
+        def launch_stage2():
+            out2.zero_()
+            exe2(
+                out2,
+                a2_qt_flat,
+                w2_flat.view(-1),
+                a2_scale_1d,
+                w2_scale_1d,
+                sorted_ids,
+                sorted_eids,
+                sorted_w_1d,
+                num_valid_ids,
+                token,
+                model_dim,
+                inter_dim,
+                int(blocks),
+            )
+            return out2
+
+        out2_ck, us2 = run_perftest(
+            launch_stage2, num_iters=num_iters, num_warmup=num_warmup
+        )
+        us2 = us1 + us2
+        print(
+            f"[aiter] flir_moe_gemm1: {us1:8.2f} us, flir_moe_gemm2: {us2 - us1:8.2f} us"
+        )
+        # Keep git-head test behavior: compare in the original `dtype` (often bf16).
+        out2_ck = out2_ck.to(dtype)
+    else:
+        # Optional CK kernel-only timing for FP8 per-token g1u1.
+        _ck_kernel_only = (
+            (qType == aiter.QuantType.per_Token)
+            and (AQDType == dtypes.fp8)
+            and (WQDType == dtypes.fp8)
+            and bool(use_g1u1)
+        )
+        if _ck_kernel_only:
+            # Use the same routing buffers as the FLIR path for fair per-kernel timing.
+            block_m = 64
+            topk_ids_i32 = topk_ids.to(torch.int32)
+            topk_w_f32 = topk_weights.to(torch.float32)
+            sorted_ids, sorted_w, sorted_eids, num_valid_ids, _moe_buf = moe_sorting(
+                topk_ids_i32,
+                topk_w_f32,
+                E,
+                model_dim,
+                torch.float16,
+                block_m,
+            )
+            # Keep routing buffers as-is (no host trim/pad). Launch full expert-block range.
+            blocks = int(sorted_eids.numel())
+            sorted_ids = sorted_ids.contiguous()
+            sorted_w = sorted_w.contiguous()
+            sorted_eids = sorted_eids.contiguous()
+
+            out1_ck = torch.empty((token, topk, inter_dim), device="cuda", dtype=dtype)
+
+            def launch_ck_stage1():
+                aiter.ck_moe_stage1_fwd(
+                    a1_qt,
+                    w1_qt_aiter,
+                    w2_qt_aiter,
+                    sorted_ids,
+                    sorted_eids,
+                    num_valid_ids,
+                    out1_ck,
+                    topk,
+                    "",
+                    w1_scale_aiter,
+                    a1_scale,
+                    block_m,
+                    sorted_w,
+                    qType,
+                    actType,
+                    1,
+                    dtype,
+                )
+                return out1_ck
+
+            _, us1 = run_perftest(
+                launch_ck_stage1, num_iters=num_iters, num_warmup=num_warmup
+            )
+
+            # Prepare stage2 inputs from the same reference stage1 output as git-head path,
+            # so stage2 correctness is comparable and independent of stage1 behavior.
+            a2_qt_ck, a2_scale_ck = torch_quant(out1_ref.to(dtype), quant_dtype=AQDType)
+            a2_qt_ck = a2_qt_ck.view(token, topk, -1).contiguous()
+
+            # Stage2 accumulates into `out`, so ensure we start from zero for correctness.
+            out2_ck = torch.zeros((token, model_dim), device="cuda", dtype=dtype)
+
+            def launch_ck_stage2():
+                out2_ck.zero_()
+                aiter.ck_moe_stage2_fwd(
+                    a2_qt_ck,
+                    w1_qt_aiter,
+                    w2_qt_aiter,
+                    sorted_ids,
+                    sorted_eids,
+                    num_valid_ids,
+                    out2_ck,
+                    topk,
+                    "",
+                    w2_scale_aiter,
+                    a2_scale_ck,
+                    block_m,
+                    sorted_w,
+                    qType,
+                    actType,
+                )
+                return out2_ck
+
+            _, us2 = run_perftest(
+                launch_ck_stage2, num_iters=num_iters, num_warmup=num_warmup
+            )
+            us2 = us1 + us2
+            print(
+                f"[aiter] ck_moe_gemm1: {us1:8.2f} us, ck_moe_gemm2: {us2 - us1:8.2f} us"
+            )
+        else:
+            out2_ck, us2 = run_perftest(
+                fused_moe,
+                input,
+                w1_qt_aiter,
+                w2_qt_aiter,
+                topk_weights,
+                topk_ids,
+                w1_scale=w1_scale_aiter,
+                w2_scale=w2_scale_aiter,
+                quant_type=qType,
+                activation=actType,
+                doweight_stage1=doweight_stage1,
+                intermediate_pad=intermediate_pad,
+                hidden_pad=hidden_pad,
+                bias1=exp_bias1_aiter,
+                bias2=exp_bias2_aiter,
+                num_iters=num_iters,
+                num_warmup=num_warmup,
+            )
+
     err = checkAllclose(
         out2_ref,
         out2_ck,
@@ -285,6 +543,8 @@ def test_fmoe(
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
 
+    # Optional stage1 localization logs removed (debug-only).
+
     logits_diff = calc_diff(out2_ref, out2_ck)
     if logits_diff > 1e-3:
         logging.warning(
@@ -294,7 +554,8 @@ def test_fmoe(
     return {"us": us2, "err": err}
 
 
-l_dtype = ["bf16", "fp16"][:1]
+# Keep both bf16/fp16 available via CLI so we can run FLIR swap (which expects fp16 outputs).
+l_dtype = ["bf16", "fp16"]
 # l_dim = [(6144, 4096)]
 l_dim = [(7168, 256)]
 # l_dim = [(3072, 3072)]
@@ -533,8 +794,6 @@ for (
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
                         preshuffle=preshuffle,
-                        hidden_pad=0,
-                        intermediate_pad=0,
                     )
                     df.append(ret)
     else:
@@ -556,5 +815,9 @@ for (
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+try:
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+except ImportError:
+    # `tabulate` is optional for pandas markdown output; keep the test runnable without it.
+    aiter.logger.info("moe_2stage summary:\n%s", df.to_string(index=False))
