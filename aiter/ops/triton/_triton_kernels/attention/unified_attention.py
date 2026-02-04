@@ -896,7 +896,7 @@ def kernel_unified_attention_3d_gluon(
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
-    # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+    # Q_load : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
     Q_load = ttgl.amd.cdna4.buffer_load(
         ptr=query_ptr,
         offsets=query_offset.to(ttgl.int32),
@@ -904,10 +904,12 @@ def kernel_unified_attention_3d_gluon(
         other=0.0,
     )
     smem_Q.store(Q_load)
+    # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
     block_table_offset = seq_idx * block_table_stride
 
+    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
     if USE_SINKS:
         if segm_idx == 0:
             # Prescale with RCP_LN2, needed for exp2
@@ -935,9 +937,11 @@ def kernel_unified_attention_3d_gluon(
             layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT),
         )
 
+    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
     L = ttgl.full(
         [BLOCK_M], 1.0, dtype=tl.float32, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
     )
+    # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
     acc = ttgl.zeros(
         [BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32, layout=PV_WMMA_LAYOUT
     )
@@ -981,6 +985,8 @@ def kernel_unified_attention_3d_gluon(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
+        # seq_k_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
+        # seq_v_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
         seq_k_offset = j * TILE_SIZE + offs_k_t
         seq_v_offset = j * TILE_SIZE + offs_v_t
 
@@ -1007,7 +1013,7 @@ def kernel_unified_attention_3d_gluon(
         #     offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(ttgl.int32),
         # ).to(tl.int64)
         #
-        # # 2. convert_layout from physical_block_idx_k to ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT) layout (see below):
+        # # 2. convert_layout from physical_block_idx_k, i.e., ttgl.SliceLayout(0, K_BLOCKED_LAYOUT) -> ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT) (see below):
         physical_block_idx_v = ttgl.convert_layout(
             physical_block_idx_k, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
         )
@@ -1026,7 +1032,7 @@ def kernel_unified_attention_3d_gluon(
             + (seq_k_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
+        # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_BLOCKED_LAYOUT
         K_load = ttgl.amd.cdna4.buffer_load(
             ptr=key_cache_ptr,
             offsets=k_offset.to(ttgl.int32),
@@ -1043,9 +1049,10 @@ def kernel_unified_attention_3d_gluon(
         else:
             K_cast = K_load
         smem_K.store(K_cast)
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
         K = smem_K.load(layout=K_DOT_LAYOUT)
 
-        # V : (TILE_SIZE, HEAD_SIZE)
+        # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
         V_load = ttgl.amd.cdna4.buffer_load(
             ptr=value_cache_ptr,
             offsets=v_offset.to(ttgl.int32),
@@ -1062,6 +1069,7 @@ def kernel_unified_attention_3d_gluon(
         else:
             V_cast = V_load
         smem_V.store(V_cast)
+        # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
         V = smem_V.load(layout=V_DOT_LAYOUT)
 
         seq_offset = ttgl.convert_layout(
@@ -1069,10 +1077,11 @@ def kernel_unified_attention_3d_gluon(
         )
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        # S : (BLOCK_M, TILE_SIZE)
-        # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
+        # S : shape = (BLOCK_M, TILE_SIZE), layout = QK_WMMA_LAYOUT
         S = ttgl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=QK_WMMA_LAYOUT)
+        # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
         S = qk_scale * ttgl.amd.gfx1250.wmma(Q, K, S)
+        # S : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
         S = ttgl.convert_layout(S, layout=Q_BLOCKED_LAYOUT)
 
         if USE_SOFTCAP:
@@ -1109,34 +1118,40 @@ def kernel_unified_attention_3d_gluon(
             S += qq_bias * RCP_LN2
 
         # compute running maximum
-        # m_j : (BLOCK_M,)
+        # m_j : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
         m_j = ttgl.maximum(M, ttgl.max(S, axis=1))
 
         # For sliding window there's a chance the max is -inf due to masking of
         # the entire row. In this case we need to set m_j 0 to avoid NaN
         m_j = ttgl.where(m_j > float("-inf"), m_j, 0.0)
 
-        # P : (BLOCK_M, TILE_SIZE,)
+        # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
         P = ttgl.exp2(S - m_j[:, None])
 
-        # l_j : (BLOCK_M,)
+        # l_j : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
         l_j = ttgl.sum(P, axis=1)
 
-        # alpha : (BLOCK_M, )
+        # alpha : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
         alpha = ttgl.exp2(M - m_j)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = acc * ttgl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
 
         # update constants
+        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
         L = L * alpha + l_j
         M = m_j
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)x
         P = P.to(V.dtype)
         P = ttgl.convert_layout(P, layout=P_DOT_LAYOUT)
+        # P : shape = (BLOCK_M, TILE_SIZE), layout = P_DOT_LAYOUT
+        # V : shape = (TILE_SIZE, HEAD_SIZE), layout = V_DOT_LAYOUT
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = ttgl.amd.gfx1250.wmma(P, V, acc)
 
+    # store segm_output
+    # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
     acc = ttgl.convert_layout(acc, layout=Q_BLOCKED_LAYOUT)
     segm_output_offset = (
         query_offset_0[:, None]
@@ -1151,6 +1166,10 @@ def kernel_unified_attention_3d_gluon(
         offsets=segm_output_offset,
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
+
+    # store segm_max and segm_expsum
+    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
     segm_offset = (
         query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1 * NUM_SEGMENTS_PER_SEQ
