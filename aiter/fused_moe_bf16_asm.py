@@ -344,11 +344,11 @@ def asm_moe(
                 .view(M, -1)
             )
             inter_states = inter_states_v
-            print(f"{inter_states.view(M, -1, 128)[ ...,:10]=}")
-            print(f"{inter_states_scale=}")
+            # print(f"{inter_states.view(M, -1, 128)[ ...,:10]=}")
+            # print(f"{inter_states_scale=}")
             # inter_states_scale[2: ] = 1
 
-            moe_buf[:] = 1
+            # moe_buf[:] = 1
             # Slicing inter_states[..., :inter_dim] creates a strided tensor.
             # Ensure Stage 2 kernel supports stride != width.
             asm_moe_stage2(
