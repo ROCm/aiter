@@ -1204,7 +1204,6 @@ def sage_fwd_v2(
             + offs_d_qk_s[None, :]
         )
 
-
         if SMOOTH_Q:
             delta_s_ptr = Delta_S + delta_s_offset + n_front_skip_blocks * stride_dsk
         else:
@@ -1679,7 +1678,7 @@ def sage_quant(
     
     if smooth_q:
         q_smooth = torch.empty_like(q)
-        q_mean = torch.empty((b, h_qo, Q_NUM_BLKS, head_dim), device=q.device, dtype=q.dtype)
+        q_mean = torch.empty((b, h_qo, Q_NUM_BLKS, head_dim), device=q.device, dtype=q.dtype)    
         stride_qmz, stride_qmh, stride_qmblk, _ = q_mean.stride()
         grid = (b, h_qo, Q_NUM_BLKS)
         smooth_q_kernel[grid](
@@ -1712,7 +1711,7 @@ def sage_quant(
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
 
-    v_fp8 = v / v_scale[:, :, None]
+    v_fp8 = v / v_scale.unsqueeze(1 if layout == "bshd" else 2)
     v_fp8 = v_fp8.to(FP8_TYPE)
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s

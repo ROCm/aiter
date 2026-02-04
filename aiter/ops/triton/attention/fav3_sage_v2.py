@@ -120,8 +120,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
         num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-        expected_q_ds = (batch, num_q_heads, num_q_blocks)
-        expected_k_ds = (batch, num_kv_heads, num_k_blocks)
+        expected_q_ds = (batch, seqlen_q, num_q_heads, head_dim//32)
+        expected_k_ds = (batch, seqlen_k, num_q_heads, head_dim//32)
 
         assert (
             q_descale.shape == expected_q_ds
@@ -139,6 +139,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             k_descale,
             v_descale,
             delta_s,
+            fp8_max,
             softmax_scale,
             causal,
             window_size,
@@ -153,7 +154,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         # 6. Context Saving for Backward
         if return_lse:
             ctx.save_for_backward(
-                q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
+                q, k, v, out, softmax_lse, q_descale, k_descale
             )
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -340,7 +341,7 @@ def fav3_sage_func(
             "Feature (chunking/softcap/sm_margin) not supported in this API."
         )
 
-    assert q.dtype == torch.int8 and k.dtype == torch.int8, "Q and K must be int8"
+    # assert q.dtype == torch.int8 and k.dtype == torch.int8, "Q and K must be int8"
     assert seqlen_k == seqlen_v, f"K/V seqlen mismatch: {seqlen_k} vs {seqlen_v}"
     assert nheads_k == nheads_v, f"K/V head mismatch: {nheads_k} vs {nheads_v}"
     assert (
@@ -351,12 +352,15 @@ def fav3_sage_func(
     if config is None:
         config = get_sage_fwd_configs()
 
-    BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
-    num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
-    num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
+    expected_q_ds = (batch, seqlen_q, nheads_q, 4)
+    expected_k_ds = (batch, seqlen_k, nheads_q, 4)
 
-    assert q_descale.shape == (batch, nheads_q, num_q_blocks)
-    assert k_descale.shape == (batch, nheads_k, num_k_blocks)
+    assert (
+        q_descale.shape == expected_q_ds
+    ), f"q_descale shape {q_descale.shape} != {expected_q_ds}"
+    assert (
+        k_descale.shape == expected_k_ds
+    ), f"k_descale shape {k_descale.shape} != {expected_k_ds}"
 
     # --- 4. Output Allocation ---
     out_dtype = torch.bfloat16
@@ -399,7 +403,7 @@ def fav3_sage_func(
 
     q_smoothed = delta_s is not None
     if q_smoothed:
-        stride_dsz, stride_dsh, stride_dsq, stride_dsk, _ = delta_s.stride()
+        stride_dsz, stride_dsh, stride_dsq, stride_dsk = delta_s.stride()
     else:
         stride_dsz, stride_dsh, stride_dsq, stride_dsk = 0, 0, 0, 0
 
@@ -413,6 +417,46 @@ def fav3_sage_func(
     # --- 7. Kernel Launch ---
     def grid(META):
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
+
+    print("q.shape:", q.shape)
+    print("k.shape:", k.shape)
+    print("v.shape:", v.shape)
+    print("q_descale.shape:", q_descale.shape)
+    print("k_descale.shape:", k_descale.shape)
+    print("v_descale.shape:", v_descale.shape)
+    print("delta_s.shape:", delta_s.shape if delta_s is not None else None)
+    print("strides")
+    print("qsz:", stride_qsz)
+    print("qsh:", stride_qsh)
+    print("qsm:", stride_qsm)
+    print("ksz:", stride_ksz)
+    print("ksh:", stride_ksh)
+    print("ksn:", stride_ksn)
+    print("vsz:", stride_vsz)
+    print("vsh:", stride_vsh)
+    print("dsz:", stride_dsz)
+    print("dsh:", stride_dsh)
+    print("dsq:", stride_dsq)
+    print("dsk:", stride_dsk)
+
+    print("stride_qb:", stride_qb)
+    print("stride_qh:", stride_qh)
+    print("stride_qm:", stride_qm)
+    print("stride_qd:", stride_qd)
+    print("stride_kb:", stride_kb)
+    print("stride_kh:", stride_kh)
+    print("stride_kn:", stride_kn)
+    print("stride_kd:", stride_kd)
+    print("stride_vb:", stride_vb)
+    print("stride_vh:", stride_vh)
+    print("stride_vn:", stride_vn)
+    print("stride_vd:", stride_vd)
+    print("stride_ob:", stride_ob)
+    print("stride_oh:", stride_oh)
+    print("stride_om:", stride_om)
+    print("stride_od:", stride_od)
+
+
 
     sage_fwd_v2[grid](
         q,
@@ -473,8 +517,8 @@ def fav3_sage_func(
         None,
         None,
         None,  # Pass seqused tensors
-        Q_DTYPE_STR="e2m1" if is_q_fp4 else "e4m3",
-        K_DTYPE_STR="e2m1" if is_k_fp4 else "e4m3",
+        Q_DTYPE_STR="e2m1" if q.dtype == torch.uint8 else "e4m3",
+        K_DTYPE_STR="e2m1" if k.dtype == torch.uint8 else "e4m3",
         dropout_p=0.0,
         philox_seed=None,
         philox_offset_base=None,
@@ -499,7 +543,7 @@ def fav3_sage_func(
         USE_EXP2=True,
         RETURN_SCORES=False,
         USE_SEQUSED=False,
-        SMOOTH_Q= q_smoothed,
+        SMOOTH_Q=q_smoothed,
         **config,
     )
     if return_lse:
