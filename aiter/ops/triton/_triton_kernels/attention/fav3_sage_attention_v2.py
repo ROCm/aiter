@@ -69,7 +69,6 @@ def _sage_fwd_no_mask_v2(
     SMOOTH_Q: tl.constexpr,
 ):
     k_descale_ptr = k_descale_base_ptr
-
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
@@ -89,10 +88,7 @@ def _sage_fwd_no_mask_v2(
             k_descale_ptr, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
         )
         k_descale_ptr += stride_ksn * BLOCK_N
-        if SMOOTH_Q:
-            delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
-            delta_s = tl.load(delta_s_ptrs)
-            delta_s_ptr += stride_dsk
+        
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -105,11 +101,14 @@ def _sage_fwd_no_mask_v2(
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
         
+        if SMOOTH_Q:
+            delta_s_ptrs = delta_s_ptr + start_n
+            delta_s = tl.load(delta_s_ptrs, mask=kv_offs_n[None, :] < seqlen_k, other=0.0)
+            qk += delta_s
+
         # -- compute qk ----
         qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True)
 
-        if SMOOTH_Q:
-            qk += delta_s[None, :]
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -305,16 +304,17 @@ def _sage_fwd_mask_v2(
         )
         k_descale_ptr += stride_ksn * BLOCK_N
 
-        if SMOOTH_Q:
-            delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
-            delta_s = tl.load(delta_s_ptrs)
-            delta_s_ptr += stride_dsk
-
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+
+        if SMOOTH_Q:
+            delta_s_ptrs = delta_s_ptr + start_n
+            delta_s = tl.load(delta_s_ptrs, mask=k_mask, other=0.0)
+            qk += delta_s
+
 
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -332,11 +332,6 @@ def _sage_fwd_mask_v2(
 
         # -- compute qk ----
         qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True)
-        
-        
-        
-        if SMOOTH_Q:
-            qk += delta_s[None, :]
 
         
         if USE_ALIBI:
@@ -1063,24 +1058,24 @@ def sage_fwd_v2(
         + offs_d_qk_s[None, :]
     )
 
+    # tl.device_print("stride_qsz:", stride_qsz)
+    # tl.device_print("stride_qsh:", stride_qsh)
+    # tl.device_print("stride_qsm:", stride_qsm)
+    tl.static_print("offs_d_qk_s", offs_d_qk_s)
     q_descale = tl.load(
         q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0
     )  # MHA: use q head index
+
+    tl.debug_barrier()
+    tl.device_print("getting here")
 
 
     k_descale_offset = off_z * stride_ksz + off_h_k * stride_ksh
 
 
-    delta_s_offset = off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
+    
 
-    v_descale = tl.load(
-        V_Descale
-        + off_z * stride_vsz
-        + off_h_k * stride_vsh
-        + offs_d_v,
-        mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
-        other=0.0,
-    )
+    
 
     # figure out masking pattern
     (
@@ -1191,6 +1186,15 @@ def sage_fwd_v2(
         q_ptrs_mask = q_ptrs_mask & (offs_d_q[None, :] < ACTUAL_BLOCK_DMODEL_QK // Q_HEAD_DIM_DIVISOR)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
+    if SMOOTH_Q:
+        delta_s_offset = off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
+        delta_s_ptr = Delta_S + delta_s_offset + offs_n[None, :] * stride_dsk
+    else:
+        delta_s_ptr = None
+
+
+
+
     # ========== Process MASKED K Blocks in the front ==========
     # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
     if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
@@ -1203,11 +1207,6 @@ def sage_fwd_v2(
             + (block_min + offs_n[:, None]) * stride_ksn
             + offs_d_qk_s[None, :]
         )
-
-        if SMOOTH_Q:
-            delta_s_ptr = Delta_S + delta_s_offset + n_front_skip_blocks * stride_dsk
-        else:
-            delta_s_ptr = None
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
@@ -1283,11 +1282,6 @@ def sage_fwd_v2(
             + offs_d_qk_s[None, :]
         )
 
-        if SMOOTH_Q:
-            delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks) * stride_dsk
-        else:
-            delta_s_ptr = None
-
         acc, l_i, m_i = _sage_fwd_no_mask_v2(
             acc,
             l_i,
@@ -1343,6 +1337,8 @@ def sage_fwd_v2(
             SMOOTH_Q=SMOOTH_Q,
         )
 
+    
+    
     # ========== Process MASKED K Blocks in the back ==========
     if n_back_masked_blocks > 0:
         block_min = (
@@ -1361,12 +1357,6 @@ def sage_fwd_v2(
             + (block_min + offs_n[:, None]) * stride_ksn
             + offs_d_qk_s[None, :]
         )
-
-
-        if SMOOTH_Q:
-            delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * stride_dsk
-        else:
-            delta_s_ptr = None
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
@@ -1444,6 +1434,15 @@ def sage_fwd_v2(
         invalid_mask = None
         l_recip = 1 / l_i[:, None]
 
+    v_descale = tl.load(
+        V_Descale
+        + off_z * stride_vsz
+        + off_h_k * stride_vsh
+        + offs_d_v,
+        mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
+        other=0.0,
+    )
+    
     acc = acc * l_recip * v_descale
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)

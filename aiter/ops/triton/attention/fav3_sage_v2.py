@@ -80,6 +80,11 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd_map)
         _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd_map)
 
+
+        if q.dtype == torch.uint8:
+            head_dim *= 2
+        
+        
         if config is None:
             config = get_sage_fwd_configs()
 
@@ -335,6 +340,11 @@ def fav3_sage_func(
     _, seqlen_k, nheads_k, _ = map_dims(k.shape, bshd_map)
     _, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd_map)
 
+    # two e2m1 are packed into one uint8
+    if q.dtype == torch.uint8:
+        head_size_qk *= 2
+    
+    
     # --- 2. Feature & Input Validation ---
     if attention_chunk not in (0, 1) or softcap != 0.0 or sm_margin != 0:
         raise NotImplementedError(
@@ -418,44 +428,48 @@ def fav3_sage_func(
     def grid(META):
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
 
-    print("q.shape:", q.shape)
-    print("k.shape:", k.shape)
-    print("v.shape:", v.shape)
+    # print("q.shape:", q.shape)
+    # print("k.shape:", k.shape)
+    # print("v.shape:", v.shape)
+    # print("q_descale.shape:", q_descale.shape)
+    # print("k_descale.shape:", k_descale.shape)
+    # print("v_descale.shape:", v_descale.shape)
+    # print("delta_s.shape:", delta_s.shape if delta_s is not None else None)
+    # print("strides")
+    # print("q_descale", q_descale)
     print("q_descale.shape:", q_descale.shape)
-    print("k_descale.shape:", k_descale.shape)
-    print("v_descale.shape:", v_descale.shape)
-    print("delta_s.shape:", delta_s.shape if delta_s is not None else None)
-    print("strides")
+    print("q_descale.stride():", q_descale.stride())
     print("qsz:", stride_qsz)
     print("qsh:", stride_qsh)
     print("qsm:", stride_qsm)
-    print("ksz:", stride_ksz)
-    print("ksh:", stride_ksh)
-    print("ksn:", stride_ksn)
-    print("vsz:", stride_vsz)
-    print("vsh:", stride_vsh)
+    # print("ksz:", stride_ksz)
+    # print("ksh:", stride_ksh)
+    # print("ksn:", stride_ksn)
+    # print("vsz:", stride_vsz)
+    # print("vsh:", stride_vsh)
+    print("delta_s.shape:", delta_s.shape if delta_s is not None else None)
     print("dsz:", stride_dsz)
     print("dsh:", stride_dsh)
     print("dsq:", stride_dsq)
     print("dsk:", stride_dsk)
 
-    print("stride_qb:", stride_qb)
-    print("stride_qh:", stride_qh)
-    print("stride_qm:", stride_qm)
-    print("stride_qd:", stride_qd)
-    print("stride_kb:", stride_kb)
-    print("stride_kh:", stride_kh)
-    print("stride_kn:", stride_kn)
-    print("stride_kd:", stride_kd)
-    print("stride_vb:", stride_vb)
-    print("stride_vh:", stride_vh)
-    print("stride_vn:", stride_vn)
-    print("stride_vd:", stride_vd)
-    print("stride_ob:", stride_ob)
-    print("stride_oh:", stride_oh)
-    print("stride_om:", stride_om)
-    print("stride_od:", stride_od)
-
+    # print("stride_qb:", stride_qb)
+    # print("stride_qh:", stride_qh)
+    # print("stride_qm:", stride_qm)
+    # print("stride_qd:", stride_qd)
+    # print("stride_kb:", stride_kb)
+    # print("stride_kh:", stride_kh)
+    # print("stride_kn:", stride_kn)
+    # print("stride_kd:", stride_kd)
+    # print("stride_vb:", stride_vb)
+    # print("stride_vh:", stride_vh)
+    # print("stride_vn:", stride_vn)
+    # print("stride_vd:", stride_vd)
+    # print("stride_ob:", stride_ob)
+    # print("stride_oh:", stride_oh)
+    # print("stride_om:", stride_om)
+    # print("stride_od:", stride_od)
+    print("PADDED_DMODEL_QK:", padded_d_model_qk)
 
 
     sage_fwd_v2[grid](
