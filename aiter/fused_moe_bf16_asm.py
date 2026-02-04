@@ -52,6 +52,64 @@ def moe_sorting_ck(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
+def asm_moe_stage2(
+    inter_states,
+    w1,
+    w2,
+    sorted_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName,
+    w2_scale,
+    a2_scale,
+    block_m,
+    sorted_weights,
+    quant_type,
+    activation,
+    splitk,
+):
+    return aiter.moe_stage2_g1u1(
+        inter_states,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out,
+        topk,
+        kernelName,
+        block_m,
+        w2_scale,
+        a2_scale,
+        sorted_weights,
+        quant_type,
+        activation,
+        splitk,
+    )
+
+
+def get_2stage_config_simple(
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    quant_type,
+    dtype,
+    is_smoothquant,
+):
+    if is_smoothquant and (
+        dtype == dtypes.i8 or dtype == torch.int8 or str(dtype) == "torch.int8"
+    ):
+        # Check if inter_dim is supported by the 2-stage Int8 kernel (currently requires multiple of 384)
+        if inter_dim % 384 == 0:
+            # The available kernel uses 64x384 tile, so block_m must be 64
+            return True, 64, 0, "", ""
+    return False, 32, 0, "", ""
+
+
 def asm_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -78,11 +136,40 @@ def asm_moe(
     dtype = hidden_states.dtype
     device = topk_ids.device
     lastdim_mul = 8 if w1.dtype in {dtypes.i32, torch.uint32} else 1
+
+    # Check for 2-stage execution
+    is_smoothquant = fc1_smooth_scale is not None
+    run_2stage = False
+    if is_smoothquant:
+        run_2stage, block_m_2s, ksplit_2s, kernelName1, kernelName2 = (
+            get_2stage_config_simple(
+                M,
+                model_dim,
+                inter_dim,
+                global_E,
+                topk,
+                QuantType.per_Token,
+                w1.dtype,
+                is_smoothquant,
+            )
+        )
+
+    block_m_sorting = BLOCK_SIZE_M
+    if run_2stage and not a16:
+        block_m_sorting = block_m_2s
+
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
         moe_sorting_ck(
-            topk_ids, topk_weight, global_E, model_dim, dtype, BLOCK_SIZE_M, expert_mask
+            topk_ids,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_m_sorting,
+            expert_mask,
         )
     )
+
     if fc1_scale is None:
         # pure bf16
         aiter.fmoe(
@@ -206,7 +293,7 @@ def asm_moe(
                 smooth_scale_map_hash=local_expert_hash,
                 enable_ps=True,
             )
-            a8 = a8.view(-1, model_dim)
+            a8 = a8.view(-1, model_dim).view(topk, M, model_dim)
         else:
             if (
                 w1.dtype == dtypes.fp8
@@ -232,6 +319,74 @@ def asm_moe(
             else:
                 logger.warning("FMOE fall into pure torch quant...")
                 a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
+
+        if run_2stage:
+
+            total_tokens = M * topk
+            data_size = total_tokens * inter_dim
+            scale_size = data_size // 32  # 4 bytes scale per 128 bytes data
+
+            # Allocate flat buffer for Data + Scale
+            flat_buffer = torch.empty(
+                data_size + scale_size, dtype=dtypes.i8, device=device
+            )
+
+            # View for Data: [M, topk, inter_dim]
+            inter_states = flat_buffer[:data_size].view(M, topk, inter_dim)
+
+            # View for Scale: [M, topk, inter_dim/32/4] -> float32
+            # inter_dim=384 -> 12 bytes scale -> 3 floats
+            scale_view = flat_buffer[data_size:].view(torch.float32)
+            # scale_view.fill_(1.0) # Init to 1.0 for debugging
+            doweight_stage1 = False
+
+            aiter.moe_stage1_g1u1(
+                a8,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                inter_states,
+                inter_dim,
+                kernelName1,
+                block_m_2s,
+                ksplit_2s,
+                activation,
+                QuantType.per_Token,  # Input is A8
+                a8_scale,
+                fc1_scale,
+                fc2_smooth_scale,
+                fc2_scale,
+                sorted_weights if doweight_stage1 else None,
+            )
+
+            num_scales = inter_dim // 128
+            a2_scale = scale_view.view(M, topk, num_scales)
+
+            # Stage 2: ASM Kernel
+            # moe_buf is initialized as [M, model_dim] in moe_sorting_ck
+            asm_moe_stage2(
+                inter_states,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                topk,
+                kernelName2,
+                fc2_scale,
+                a2_scale,
+                block_m_2s,
+                sorted_weights if not doweight_stage1 else None,
+                QuantType.per_Token.value,
+                activation.value,
+                0,  # splitk
+            )
+
+            return moe_buf
+
         if w2.shape[2] * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_int8_g1u0(
                 moe_buf,

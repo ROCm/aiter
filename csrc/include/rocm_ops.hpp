@@ -413,8 +413,8 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
-          py::arg("reg_input_buffer") = std::nullopt,                                               \
-          py::arg("reg_output_buffer") = std::nullopt);                                               \
+          py::arg("reg_input_buffer")  = std::nullopt,                                         \
+          py::arg("reg_output_buffer") = std::nullopt);                                        \
     m.def("fused_allreduce_rmsnorm",                                                           \
           &aiter::fused_allreduce_rmsnorm,                                                     \
           py::arg("_fa"),                                                                      \
@@ -430,9 +430,9 @@ namespace py = pybind11;
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
-    m.def("register_input_buffer",                                                                   \
-          &aiter::register_input_buffer,                                                             \
-          "register_input_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",             \
+    m.def("register_input_buffer",                                                             \
+          &aiter::register_input_buffer,                                                       \
+          "register_input_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",       \
           py::arg("_fa"),                                                                      \
           py::arg("t"),                                                                        \
           py::arg("handles"),                                                                  \
@@ -1260,12 +1260,32 @@ namespace py = pybind11;
           py::arg("inter_dim"),                                                \
           py::arg("kernelName"),                                               \
           py::arg("block_m"),                                                  \
-          py::arg("ksplit")         = 0,                                       \
-          py::arg("activation")     = ActivationType::Silu,                    \
+          py::arg("ksplit")           = 0,                                     \
+          py::arg("activation")       = ActivationType::Silu,                  \
+          py::arg("quant_type")       = QuantType::No,                         \
+          py::arg("a1_scale")         = std::nullopt,                          \
+          py::arg("w1_scale")         = std::nullopt,                          \
+          py::arg("fc2_smooth_scale") = std::nullopt,                          \
+          py::arg("fc2_scale")        = std::nullopt,                          \
+          py::arg("sorted_weights")   = std::nullopt);                           \
+    m.def("moe_stage2_g1u1",                                                   \
+          &moe_stage2_g1u1,                                                    \
+          py::arg("inter_states"),                                             \
+          py::arg("w1"),                                                       \
+          py::arg("w2"),                                                       \
+          py::arg("sorted_token_ids"),                                         \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("out"),                                                      \
+          py::arg("topk"),                                                     \
+          py::arg("kernelName"),                                               \
+          py::arg("block_m"),                                                  \
+          py::arg("w2_scale")       = std::nullopt,                            \
+          py::arg("a2_scale")       = std::nullopt,                            \
+          py::arg("sorted_weights") = std::nullopt,                            \
           py::arg("quant_type")     = QuantType::No,                           \
-          py::arg("a1_scale")       = std::nullopt,                            \
-          py::arg("w1_scale")       = std::nullopt,                            \
-          py::arg("sorted_weights") = std::nullopt);                           \
+          py::arg("activation")     = ActivationType::Silu,                    \
+          py::arg("splitk")         = 0);                                              \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND             \
