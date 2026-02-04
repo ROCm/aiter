@@ -476,10 +476,12 @@ def fav3_sage_func(
 
     if delta_s is not None:
         assert delta_s.shape == (
+            batch,
+            num_kv_heads,
             num_q_blocks,
             num_k_blocks,
             BLKK,
-        ), f"delta_s shape {delta_s.shape} != expected {(num_q_blocks, num_k_blocks, BLKK)}"
+        ), f"delta_s shape {delta_s.shape} != expected {(batch, num_kv_heads, num_q_blocks, num_k_blocks, BLKK)}"
 
 
     # Validate unsupported features
