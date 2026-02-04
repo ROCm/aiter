@@ -87,9 +87,6 @@ def static_compute_mx_quant_and_scale(
     )
     evens, odds = tl.split(e2m1_value)
     out_tensor = evens | (odds << 4)
-
-    
-
     return out_tensor, dequant_scale_tensor
 
 
@@ -174,39 +171,30 @@ def _sage_fwd_no_mask_v3(
                 v = tl.load(v_ptrs)
                 v_descale = tl.load(v_descale_ptr)
             v_descale_ptr += stride_vsn * BLOCK_N//2
-
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-
         # -- compute qk ----
         qk += tl.dot(q, k) * (q_descale * k_descale)
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
-
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
         q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+            m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
         )
-
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
             # p = tl.math.exp2(q_shifted * RCP_LN2)
             p = tl.math.exp2(q_shifted)
         else:
             p = tl.math.exp(q_shifted)
-
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
-
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
         m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         if USE_EXP2:
-            # alpha = tl.math.exp2(m_diff * RCP_LN2)
             alpha = tl.math.exp2(m_diff)
         else:
             alpha = tl.math.exp(m_diff)
@@ -221,12 +209,10 @@ def _sage_fwd_no_mask_v3(
                 v = tl.load(v_ptrs)
                 v_descale = tl.load(v_descale_ptr)
             v_descale_ptr += stride_vsn * BLOCK_N//2
-
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-
-        p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        # p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         # p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
         # fake quantization in order to estimate how fast it could be
         # e2m1_value = tl.reshape(
@@ -304,7 +290,6 @@ def _sage_fwd_mask_v3(
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n//2 * stride_vk
-
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -314,13 +299,10 @@ def _sage_fwd_mask_v3(
         if PADDED_HEAD_QK:
             k_mask = k_mask & (offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK)
             v_descale_mask = None
-      
         # load k and if preload_v then v
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         k_descale = tl.load(k_descale_ptr)
         k_descale_ptr += stride_ksblk
-        
-
         if PRE_LOAD_V:
             if PADDED_HEAD_V:
                 v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
@@ -334,7 +316,6 @@ def _sage_fwd_mask_v3(
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
@@ -348,27 +329,19 @@ def _sage_fwd_mask_v3(
             size_n = start_n + offs_n[None, :]
             mask = size_n < boundary_m[:, None]
             qk = tl.where(mask, qk, float("-inf"))
-
         # -- compute qk ----
         qk += tl.dot(q, k) * (q_descale * k_descale)
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
-
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-
-        q_shifted = qk_scaled - m_ij[:, None]
-
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        q_shifted = qk - m_ij[:, None]
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
             # p = tl.math.exp2(q_shifted * RCP_LN2)
             p = tl.math.exp2(q_shifted)
         else:
             p = tl.math.exp(q_shifted)
-
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
-       
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
@@ -379,7 +352,6 @@ def _sage_fwd_mask_v3(
         else:
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
-        
         if not PRE_LOAD_V:
             if PADDED_HEAD_V:
                 v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
@@ -390,12 +362,10 @@ def _sage_fwd_mask_v3(
                 v = tl.load(v_ptrs)
                 v_descale = tl.load(v_descale_ptr)
             v_descale_ptr += stride_vsn * BLOCK_N//2
-
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-
-        p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        # p_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         # p, p_descale = _compute_mx_quant_and_scale(p, p_mask, tl.uint8)
         # fake quantization in order to estimate how fast it could be
         # e2m1_value = tl.reshape(
