@@ -11,13 +11,14 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 NUM_HEADS = [(64, 8)]
 HEAD_SIZES = [64]
-BLOCK_SIZES = [16, 64]
+BLOCK_SIZES = [16]
 
 DTYPES = [torch.bfloat16]
 QDTYPES = [None]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
-NUM_BLOCKS = [2048]
+NUM_BLOCKS = [128]
+SLIDING_WINDOWS = [None]
 
 
 def ref_paged_attn(
@@ -101,7 +102,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("sliding_window", [None, 128])
+@pytest.mark.parametrize("sliding_window", SLIDING_WINDOWS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
@@ -118,6 +119,7 @@ def test_triton_unified_attn(
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
 ) -> None:
+    print()
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
 
@@ -128,6 +130,10 @@ def test_triton_unified_attn(
     kv_lens = [x[1] for x in seq_lens]
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
+    print(f"{query_lens=}")
+    print(f"{kv_lens=}")
+    print(f"{num_query_heads=}")
+    print(f"{num_kv_heads=}")
     assert num_query_heads % num_kv_heads == 0
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)

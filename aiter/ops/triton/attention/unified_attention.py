@@ -328,7 +328,7 @@ def unified_attention(
         )
         print(tmp_output.shape)
         print(f"{tmp_output=}")
-        print(f"{tmp_output[0][:][3]}")
+        # print(f"{tmp_output[0][:][3]}")
 
         kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,

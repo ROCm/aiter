@@ -692,6 +692,28 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
 
 @gluon.jit
+def find_seq_idx_gluon(
+    query_start_len_ptr,
+    target_idx,
+    num_seqs,
+    BLOCK_Q: ttgl.constexpr,
+    use_q_block_mode: ttgl.constexpr,
+):
+    left: ttgl.int32 = 0
+    right = num_seqs
+    while left < right:
+        mid = (left + right) // 2
+        val = ttgl.load(query_start_len_ptr + mid)
+        mid_val = val // BLOCK_Q + mid if use_q_block_mode else val
+
+        if mid_val <= target_idx:
+            left = mid + 1
+        else:
+            right = mid
+
+    return left - 1
+
+@gluon.jit
 def kernel_unified_attention_3d_gluon(
     tmp_output_ptr,
     tmp_stride_0,
@@ -751,7 +773,7 @@ def kernel_unified_attention_3d_gluon(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    seq_idx = find_seq_idx(
+    seq_idx = find_seq_idx_gluon(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
     )
 
@@ -777,32 +799,111 @@ def kernel_unified_attention_3d_gluon(
     if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
         return
 
-    offs_m = ttgl.arange(0, BLOCK_M)
-    offs_d = ttgl.arange(0, HEAD_SIZE_PADDED)
-    offs_t = ttgl.arange(0, TILE_SIZE)
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    Q_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+        size_per_thread=[1, 8], 
+        threads_per_warp=[4, 8],
+        warps_per_cta=[2, 1],
+        order=[1, 0]
+    )
+    K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+        size_per_thread=[8, 1], 
+        threads_per_warp=[8, 4],
+        warps_per_cta=[1, 2],
+        order=[0, 1]
+    )
+
+    
+    Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        vec=8,
+        per_phase=1,
+        max_phase=8,
+        order=[1, 0]
+    )
+    K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        vec=8,
+        per_phase=1,
+        max_phase=8,
+        order=[0, 1]
+    )
+    V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        vec=1,
+        per_phase=1,
+        max_phase=1,
+        order=[1, 0]
+    )
+
+    QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+        version=3, 
+        transposed=True, 
+        warp_bases=[[1, 0]], 
+        reg_bases=[], 
+        instr_shape=[16, 16, 32]
+    )
+    Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=0, parent=QK_WMMA_LAYOUT, k_width=16
+    )
+    K_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=1, parent=QK_WMMA_LAYOUT, k_width=16
+    )
+
+    PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+        version=3, 
+        transposed=True, 
+        warp_bases=[[0, 1]], 
+        reg_bases=[], 
+        instr_shape=[16, 16, 32]
+    )
+    P_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=0, parent=PV_WMMA_LAYOUT, k_width=16
+    )
+    V_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=1, parent=PV_WMMA_LAYOUT, k_width=16
+    )
+
+    smem_Q = ttgl.allocate_shared_memory(
+        query_ptr.type.element_ty, [BLOCK_M, HEAD_SIZE_PADDED], layout=Q_SHARED_LAYOUT
+    )
+    smem_K = ttgl.allocate_shared_memory(
+        key_cache_ptr.type.element_ty, [HEAD_SIZE_PADDED, TILE_SIZE], layout=K_SHARED_LAYOUT
+    )
+    smem_V = ttgl.allocate_shared_memory(
+        value_cache_ptr.type.element_ty, [TILE_SIZE, HEAD_SIZE_PADDED], layout=V_SHARED_LAYOUT
+    )
+
+    offs_q_m = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    offs_q_d = ttgl.arange(0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT))
+
+    offs_k_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, K_BLOCKED_LAYOUT))
+    offs_k_d = ttgl.arange(0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(1, K_BLOCKED_LAYOUT))
+
+    offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    offs_v_d = ttgl.arange(0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT))
+
+    query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
     
     query_offset_0 = cur_batch_in_all_start_index + query_pos
-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_q_m % num_queries_per_kv
     query_offset = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
-        + offs_d[None, :]
+        + offs_q_d[None, :]
     )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
-        dim_mask = offs_d < HEAD_SIZE
+        dim_mask = offs_q_d < HEAD_SIZE
     else:
         dim_mask = ttgl.full((1,), 1, dtype=tl.int1)
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-    Q = ttgl.load(
+    Q_load = ttgl.load(
         query_ptr + query_offset,
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+    smem_Q.store(Q_load)
+    Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
     ttgl.store(
         tmp_output_ptr + q_block_global_idx * tmp_stride_0 + kv_head_idx * tmp_stride_1 + segm_idx * tmp_stride_2,
@@ -822,193 +923,209 @@ def kernel_unified_attention_3d_gluon(
                 * RCP_LN2
             )
         else:
-            M = ttgl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+            M = ttgl.full([BLOCK_M], float("-inf"), dtype=tl.float32, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
     else:
-        M = ttgl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+        M = ttgl.full([BLOCK_M], float("-inf"), dtype=tl.float32, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
 
     L = ttgl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = ttgl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
 
-    # # context length for this particular sequences
-    # context_len = seq_len - cur_batch_query_len
+    # context length for this particular sequences
+    context_len = seq_len - cur_batch_query_len
 
-    # # alibi slope for this head
-    # if USE_ALIBI_SLOPES:
-    #     alibi_slope = tl.load(
-    #         alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
-    #     )
+    # alibi slope for this head
+    if USE_ALIBI_SLOPES:
+        alibi_slope = tl.load(
+            alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
+        )
 
-    # # query-query attention bias
-    # if USE_QQ_BIAS:
-    #     qq_bias_row_ptrs = (
-    #         qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
-    #     )  # shape: [BLOCK_M]
+    # query-query attention bias
+    if USE_QQ_BIAS:
+        qq_bias_row_ptrs = (
+            qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+        )  # shape: [BLOCK_M]
 
-    # # compute the length of the longest sequence prefix spanned by any
-    # # query token in the current q_block (q_block_local_idx)
-    # max_seq_prefix_len = (
-    #     context_len
-    #     + q_block_local_idx * BLOCK_Q
-    #     + (BLOCK_M - 1) // num_queries_per_kv
-    #     + 1
-    # )
+    # compute the length of the longest sequence prefix spanned by any
+    # query token in the current q_block (q_block_local_idx)
+    max_seq_prefix_len = (
+        context_len
+        + q_block_local_idx * BLOCK_Q
+        + (BLOCK_M - 1) // num_queries_per_kv
+        + 1
+    )
 
-    # # adjust for potential padding in the last q_block by considering the
-    # # actual sequence length
-    # max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    # adjust for potential padding in the last q_block by considering the
+    # actual sequence length
+    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
 
-    # # calculate the number of tiles that need to be processed to
-    # # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # # this prefix can be skipped)
-    # num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
+    # calculate the number of tiles that need to be processed to
+    # cover the longest sequence prefix (due to causal masking, tiles beyond
+    # this prefix can be skipped)
+    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    # KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    # # iterate through tiles within current segment
-    # for j in range(
-    #     segm_idx * tiles_per_segment,
-    #     min((segm_idx + 1) * tiles_per_segment, num_tiles),
-    # ):
-    #     seq_offset = j * TILE_SIZE + offs_t
-    #     if TILE_SIZE == BLOCK_SIZE:
-    #         tile_mask = tl.full((1,), 1, dtype=tl.int1)
-    #     else:
-    #         tile_mask = seq_offset < max_seq_prefix_len
+    KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+    # iterate through tiles within current segment
+    for j in range(
+        segm_idx * tiles_per_segment,
+        min((segm_idx + 1) * tiles_per_segment, num_tiles),
+    ):
+        seq_k_offset = j * TILE_SIZE + offs_k_t
+        seq_v_offset = j * TILE_SIZE + offs_v_t
+        if TILE_SIZE == BLOCK_SIZE:
+            tile_k_mask = ttgl.full((1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(0, K_BLOCKED_LAYOUT))
+            tile_v_mask = ttgl.full((1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+        else:
+            tile_k_mask = seq_k_offset < max_seq_prefix_len
+            tile_v_mask = seq_v_offset < max_seq_prefix_len
 
-    #     physical_block_idx = tl.load(
-    #         block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-    #     ).to(tl.int64)
+        physical_block_idx = ttgl.load(
+            block_tables_ptr + block_table_offset + seq_k_offset // BLOCK_SIZE
+        ).to(tl.int64)
 
-    #     v_offset = (
-    #         physical_block_idx[:, None] * stride_v_cache_0
-    #         + kv_head_idx * stride_v_cache_2
-    #         + offs_d[None, :] * stride_v_cache_3
-    #         + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-    #     )
+        physical_block_idx_v = ttgl.convert_layout(physical_block_idx, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
 
-    #     k_offset = (
-    #         physical_block_idx[None, :] * stride_k_cache_0
-    #         + kv_head_idx * stride_k_cache_2
-    #         + offs_d[:, None] * stride_k_cache_3
-    #         + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-    #     )
+        v_offset = (
+            physical_block_idx_v[:, None] * stride_v_cache_0
+            + kv_head_idx * stride_v_cache_2
+            + offs_v_d[None, :] * stride_v_cache_3
+            + (seq_v_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+        )
 
-    #     # K : (HEAD_SIZE, TILE_SIZE)
-    #     K_load = tl.load(
-    #         key_cache_ptr + k_offset,
-    #         mask=dim_mask[:, None] & tile_mask[None, :],
-    #         other=0.0,
-    #         cache_modifier=KV_cache_modifier,
-    #     )
+        k_offset = (
+            physical_block_idx[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + offs_k_d[:, None] * stride_k_cache_3
+            + (seq_k_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+        )
 
-    #     if K_load.dtype.is_fp8():
-    #         if Q.dtype.is_fp8():
-    #             K = K_load
-    #         else:
-    #             K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-    #     else:
-    #         K = K_load
+        # K : (HEAD_SIZE, TILE_SIZE)
+        K_load = ttgl.load(
+            key_cache_ptr + k_offset,
+            mask=dim_mask[:, None] & tile_k_mask[None, :],
+            other=0.0,
+            cache_modifier=KV_cache_modifier,
+        )
 
-    #     # V : (TILE_SIZE, HEAD_SIZE)
-    #     V_load = tl.load(
-    #         value_cache_ptr + v_offset,
-    #         mask=dim_mask[None, :] & tile_mask[:, None],
-    #         other=0.0,
-    #         cache_modifier=KV_cache_modifier,
-    #     )
+        if K_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
+                K_cast = K_load
+            else:
+                K_cast = (K_load.to(ttgl.float32) * ttgl.load(k_scale)).to(Q.dtype)
+        else:
+            K_cast = K_load
+        smem_K.store(K_cast)
+        K = smem_K.load(layout=K_DOT_LAYOUT)
 
-    #     if V_load.dtype.is_fp8():
-    #         if Q.dtype.is_fp8():
-    #             V = V_load
-    #         else:
-    #             V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-    #     else:
-    #         V = V_load
+        # V : (TILE_SIZE, HEAD_SIZE)
+        V_load = ttgl.load(
+            value_cache_ptr + v_offset,
+            mask=dim_mask[None, :] & tile_v_mask[:, None],
+            other=0.0,
+            cache_modifier=KV_cache_modifier,
+        )
 
-    #     seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        if V_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
+                V_cast = V_load
+            else:
+                V_cast = (V_load.to(ttgl.float32) * ttgl.load(v_scale)).to(Q.dtype)
+        else:
+            V_cast = V_load
+        smem_V.store(V_cast)
+        V = smem_V.load(layout=V_DOT_LAYOUT)
+        
+        seq_offset = ttgl.convert_layout(seq_v_offset, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT))
+        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-    #     # S : (BLOCK_M, TILE_SIZE)
-    #     # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-    #     S = qk_scale * tl.dot(Q, K)
+        # S : (BLOCK_M, TILE_SIZE)
+        # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
+        S = ttgl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=QK_WMMA_LAYOUT)
+        S = qk_scale * ttgl.amd.gfx1250.wmma(Q, K, S)
+        # S = qk_scale * ttgl.dot(Q, K)
 
-    #     if USE_SOFTCAP:
-    #         # softcap here uses exp2 and consumes RCP_LN2 conversion.
-    #         # multiply by RCP_LN2 again to be used in later exp2
-    #         S = apply_softcap(S, softcap) * RCP_LN2
+        if USE_SOFTCAP:
+            # softcap here uses exp2 and consumes RCP_LN2 conversion.
+            # multiply by RCP_LN2 again to be used in later exp2
+            S = apply_softcap(S, softcap) * RCP_LN2
 
-    #     S = tl.where(
-    #         query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-    #     )
+        S_where_mask = query_mask_1[:, None] & query_mask_0[:, None] & seq_mask
+        S_where_mask = ttgl.convert_layout(S_where_mask, layout=QK_WMMA_LAYOUT)
+        S = ttgl.where(
+            S_where_mask, S, float("-inf")
+        )
 
-    #     if SLIDING_WINDOW > 0:
-    #         S = tl.where(
-    #             (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
-    #             S,
-    #             float("-inf"),
-    #         )
+        if SLIDING_WINDOW > 0:
+            S = ttgl.where(
+                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                S,
+                float("-inf"),
+            )
 
-    #     if USE_ALIBI_SLOPES:
-    #         # prescale w. RCP_LN2 for later exp2
-    #         S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
+        if USE_ALIBI_SLOPES:
+            # prescale w. RCP_LN2 for later exp2
+            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
 
-    #     if USE_QQ_BIAS:
-    #         # compute key positions relative to query section
-    #         key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-    #         # load bias only for keys that correspond to queries
-    #         is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-    #         qq_bias = tl.load(
-    #             qq_bias_row_ptrs + key_rel_pos[None, :],
-    #             mask=is_query_key[None, :],  # avoid OOB for context keys
-    #             other=0.0,
-    #         )
-    #         # prescale w. RCP_LN2 for later exp2
-    #         S += qq_bias * RCP_LN2
+        if USE_QQ_BIAS:
+            # compute key positions relative to query section
+            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
+            # load bias only for keys that correspond to queries
+            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+            qq_bias = ttgl.load(
+                qq_bias_row_ptrs + key_rel_pos[None, :],
+                mask=is_query_key[None, :],  # avoid OOB for context keys
+                other=0.0,
+            )
+            # prescale w. RCP_LN2 for later exp2
+            S += qq_bias * RCP_LN2
 
-    #     # compute running maximum
-    #     # m_j : (BLOCK_M,)
-    #     m_j = tl.maximum(M, tl.max(S, axis=1))
+        # compute running maximum
+        # m_j : (BLOCK_M,)
+        m_j = ttgl.maximum(M, ttgl.max(S, axis=1))
 
-    #     # For sliding window there's a chance the max is -inf due to masking of
-    #     # the entire row. In this case we need to set m_j 0 to avoid NaN
-    #     m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        # For sliding window there's a chance the max is -inf due to masking of
+        # the entire row. In this case we need to set m_j 0 to avoid NaN
+        m_j = ttgl.where(m_j > float("-inf"), m_j, 0.0)
 
-    #     # P : (BLOCK_M, TILE_SIZE,)
-    #     P = tl.math.exp2(S - m_j[:, None])
+        # P : (BLOCK_M, TILE_SIZE,)
+        P = ttgl.math.exp2(S - m_j[:, None])
 
-    #     # l_j : (BLOCK_M,)
-    #     l_j = tl.sum(P, axis=1)
+        # l_j : (BLOCK_M,)
+        l_j = ttgl.sum(P, axis=1)
 
-    #     # alpha : (BLOCK_M, )
-    #     alpha = tl.math.exp2(M - m_j)
+        # alpha : (BLOCK_M, )
+        alpha = ttgl.math.exp2(M - m_j)
 
-    #     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-    #     acc = acc * alpha[:, None]
+        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        acc = acc * alpha[:, None]
 
-    #     # update constants
-    #     L = L * alpha + l_j
-    #     M = m_j
+        # update constants
+        L = L * alpha + l_j
+        M = m_j
 
-    #     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-    #     acc += tl.dot(P.to(V.dtype), V)
+        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        acc = ttgl.amd.gfx1250.wmma(P.to(V.dtype), V, acc)
+        # acc += ttgl.dot(P.to(V.dtype), V)
 
-    # segm_output_offset = (
-    #     query_offset_0[:, None].to(tl.int64)
-    #     * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-    #     + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-    #     + segm_idx * HEAD_SIZE_PADDED
-    #     + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
-    # )
-    # tl.store(
-    #     segm_output_ptr + segm_output_offset,
-    #     acc,
-    #     mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-    # )
-    # segm_offset = (
-    #     query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-    #     + query_offset_1 * NUM_SEGMENTS_PER_SEQ
-    #     + segm_idx
-    # )
-    # tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
-    # tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
+    segm_output_offset = (
+        query_offset_0[:, None].to(ttgl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + segm_idx * HEAD_SIZE_PADDED
+        + ttgl.arange(0, HEAD_SIZE_PADDED)[None, :]
+    )
+    ttgl.store(
+        segm_output_ptr + segm_output_offset,
+        acc,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    )
+    segm_offset = (
+        query_offset_0.to(ttgl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+        + segm_idx
+    )
+    ttgl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
+    ttgl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 @triton.jit
 def reduce_segments(
