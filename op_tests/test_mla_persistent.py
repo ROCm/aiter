@@ -16,11 +16,14 @@ torch.set_printoptions(sci_mode=False)
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
+# qdtype fp8, kdtype fp8: nhead32, max_seqlen_qo=4
 # qdtype fp8, kdtype bf16: nhead16
 
 
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    if dtype == dtypes.bf16 and kv_dtype == dtypes.bf16 and nhead == 32:
         return False
     return True
 
