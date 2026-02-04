@@ -69,6 +69,7 @@ def _sage_fwd_no_mask_v2(
     ACCUMULATOR_TYPE,
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
+    SMOOTH_Q: tl.constexpr,
 ):
     k_descale_ptr = k_descale_base_ptr
     k_descale_pre_ptr = k_descale_pre_base_ptr
@@ -95,9 +96,10 @@ def _sage_fwd_no_mask_v2(
         k_descale_pre = tl.load(k_descale_pre_ptr)
         k_descale_pre_ptr += 1
 
-        delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
-        delta_s = tl.load(delta_s_ptrs)
-        delta_s_ptr += stride_dsk
+        if SMOOTH_Q:
+            delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
+            delta_s = tl.load(delta_s_ptrs)
+            delta_s_ptr += stride_dsk
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -109,7 +111,8 @@ def _sage_fwd_no_mask_v2(
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-        qk += delta_s[None, :]
+        if SMOOTH_Q:
+            qk += delta_s[None, :]
 
         # -- compute qk ----
         qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * (q_descale_pre * k_descale_pre)
@@ -280,6 +283,7 @@ def _sage_fwd_mask_v2(
     ACCUMULATOR_TYPE,
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
+    SMOOTH_Q: tl.constexpr,
 ):
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
@@ -312,16 +316,18 @@ def _sage_fwd_mask_v2(
         k_descale_pre = tl.load(k_descale_pre_ptr)
         k_descale_pre_ptr += 1
 
-        delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
-        delta_s = tl.load(delta_s_ptrs)
-        delta_s_ptr += stride_dsk
+        if SMOOTH_Q:
+            delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
+            delta_s = tl.load(delta_s_ptrs)
+            delta_s_ptr += stride_dsk
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-        qk += delta_s[None, :]
+        if SMOOTH_Q:
+            qk += delta_s[None, :]
 
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -984,6 +990,7 @@ def sage_fwd_v2(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
+    SMOOTH_Q: tl.constexpr,
 ):
     Q_HEAD_DIM_DIVISOR: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
     K_HEAD_DIM_DIVISOR: tl.constexpr = 2 if K_DTYPE_STR == "e2m1" else 1
@@ -1225,7 +1232,10 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks
 
-        delta_s_ptr = Delta_S + delta_s_offset + n_front_skip_blocks * stride_dsk
+        if SMOOTH_Q:
+            delta_s_ptr = Delta_S + delta_s_offset + n_front_skip_blocks * stride_dsk
+        else:
+            delta_s_ptr = None
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
@@ -1286,6 +1296,7 @@ def sage_fwd_v2(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            SMOOTH_Q=SMOOTH_Q,
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1304,7 +1315,10 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks
 
-        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks) * stride_dsk
+        if SMOOTH_Q:
+            delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks) * stride_dsk
+        else:
+            delta_s_ptr = None
 
         acc, l_i, m_i = _sage_fwd_no_mask_v2(
             acc,
@@ -1360,6 +1374,7 @@ def sage_fwd_v2(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            SMOOTH_Q=SMOOTH_Q,
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1383,7 +1398,10 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
 
-        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * stride_dsk
+        if SMOOTH_Q:
+            delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * stride_dsk
+        else:
+            delta_s_ptr = None
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
@@ -1444,6 +1462,7 @@ def sage_fwd_v2(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            SMOOTH_Q=SMOOTH_Q,
         )
 
     # ============================================================
@@ -1916,6 +1935,7 @@ def fav3_sage_triton_impl_v2(
     if sm_scale == None:
         sm_scale = head_size_qk**(-0.5)
     sm_scale *= 1.4426950408889634
+    smooth_q = True if delta_s is not None else False
     sage_fwd_v2[grid](
         q,
         k,
@@ -2007,6 +2027,7 @@ def fav3_sage_triton_impl_v2(
         USE_EXP2=use_exp2,
         RETURN_SCORES=return_scores,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
+        SMOOTH_Q=smooth_q,
         **config,
     )
 
@@ -2284,67 +2305,6 @@ def sage_v2_pre_quant_kernel(
             K_MAX,
             offs_kn[:, None] < SEQLEN_K,
         )
-
-@triton.jit
-def q_smooth_kernel(
-    Q,
-    K,
-    Delta_S,
-    seqlen_q,
-    seqlen_k,
-    stride_qz,
-    stride_qh,
-    stride_qm,
-    stride_kz,
-    stride_kh,
-    stride_kn,
-    stride_dsm,
-    stride_dsn,
-    Q_NUM_BLKS: tl.constexpr,
-    K_NUM_BLKS: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-
-    off_z = tl.program_id(0)
-    off_h = tl.program_id(1)
-    start_m = tl.program_id(2)
-
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, D)
-
-    q_offset = (
-        Q + off_z * stride_qz + off_h * stride_qh
-    )
-    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d[None, :]
-    q_ptrs_mask = offs_m[:, None] < seqlen_q
-    q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
-
-    #q = calculate mean of q
-    solid_M = tl.minimum(BLOCK_M, seqlen_q - (start_m * BLOCK_M))
-    q = tl.sum(q, 0, keep_dims=True) / solid_M # 1 x D vector
-
-    delta_s_offset = Delta_S + start_m * stride_dsm
-
-    k_offset = (
-        K + off_z * stride_kz + off_h * stride_kh
-    )
-
-    for start_n in range(K_NUM_BLKS):
-        k_ptrs = k_offset + offs_d[:, None] + offs_n[None, :] * stride_kn
-        k_ptrs_mask = offs_n[None, :] < seqlen_k
-        k_offset += BLOCK_N * stride_kn
-        k = tl.load(k_ptrs, mask=k_ptrs_mask, other=0.0)
-
-        delta_s = tl.dot(q.to(Q.type.element_ty), k) # 1 x BLOCK_N
-        delta_s = tl.reshape(delta_s, [BLOCK_N])
-
-        delta_s_ptrs = delta_s_offset + offs_n
-        delta_s_offset += stride_dsn
-
-        tl.store(delta_s_ptrs, delta_s.to(Delta_S.type.element_ty))
 
 @triton.jit
 def sage_quant_v_kernel(
