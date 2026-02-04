@@ -597,7 +597,7 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
 
     else if(input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte) // int8
     {
-        if(fc2_smooth_scale.has_value())
+        if(fc2_smooth_scale.has_value() && out.dtype() != at::ScalarType::Float)
             smf = 2;
         if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_silu;
@@ -607,6 +607,8 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_silu;
         else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
+        else if(out.dtype() == at::ScalarType::Float && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp32_pertokenInt8_g1u1_silu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
@@ -771,6 +773,8 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_silu;
         else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
+        else if(out.dtype() == at::ScalarType::Float && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp32_pertokenInt8_g1u1_silu;
         else
             TORCH_CHECK(
                 false, __func__, "Unsupported output dtype or activation type for fmoe_g1u1_a16");
@@ -793,20 +797,36 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
         TORCH_CHECK(false, __func__, "Unsupported gate dtype for fmoe_g1u1_a16");
 
     impl_ptr = get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 1);
-    impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
-                                                     input,
-                                                     gate,
-                                                     down,
-                                                     sorted_token_ids,
-                                                     sorted_weights,
-                                                     sorted_expert_ids,
-                                                     num_valid_ids,
-                                                     topk,
-                                                     // quant args
-                                                     fc1_smooth_scale,
-                                                     fc1_scale,
-                                                     fc2_scale,
-                                                     fc2_smooth_scale);
+    if(out.dtype() == at::ScalarType::Float)
+        impl_ptr->launch_kernel<uint8_t, float, true>(out,
+                                                      input,
+                                                      gate,
+                                                      down,
+                                                      sorted_token_ids,
+                                                      sorted_weights,
+                                                      sorted_expert_ids,
+                                                      num_valid_ids,
+                                                      topk,
+                                                      // quant args
+                                                      fc1_smooth_scale,
+                                                      fc1_scale,
+                                                      fc2_scale,
+                                                      fc2_smooth_scale);
+    else
+        impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
+                                                         input,
+                                                         gate,
+                                                         down,
+                                                         sorted_token_ids,
+                                                         sorted_weights,
+                                                         sorted_expert_ids,
+                                                         num_valid_ids,
+                                                         topk,
+                                                         // quant args
+                                                         fc1_smooth_scale,
+                                                         fc1_scale,
+                                                         fc2_scale,
+                                                         fc2_smooth_scale);
 }
 
 void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, dim]
