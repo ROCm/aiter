@@ -52,4 +52,25 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                 int64_t block_size,
                                                 int64_t x);
 
+void fused_qk_norm_rope_2way(at::Tensor& q0,
+                             at::Tensor& k0,
+                             at::Tensor& q1,
+                             at::Tensor& k1,
+                             at::Tensor& w_q0,
+                             at::Tensor& w_k0,
+                             at::Tensor& w_q1,
+                             at::Tensor& w_k1,
+                             at::Tensor& cos_sin0,
+                             at::Tensor& cos_sin1,
+                             int64_t batch_size,
+                             int64_t num_tokens0,
+                             int64_t num_tokens1,
+                             int64_t num_heads_q,
+                             int64_t num_heads_k,
+                             int64_t head_size,
+                             bool is_interleaved,
+                             double eps,
+                             at::Tensor& out_q01,
+                             at::Tensor& out_k01);
+
 } // namespace aiter
