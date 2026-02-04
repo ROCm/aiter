@@ -23,7 +23,7 @@ torch.set_printoptions(sci_mode=False)
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if dtype == dtypes.bf16 and kv_dtype == dtypes.bf16 and nhead == 32:
+    if dtype == dtypes.bf16 and nhead == 32:
         return False
     return True
 
