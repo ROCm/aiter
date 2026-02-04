@@ -160,16 +160,15 @@ def asm_moe(
     # FIX: Flattened sorting is ONLY for 2-stage Int8 SmoothQuant (expanded input).
     # a16 path uses hidden_states (shared input) so it needs standard sorting.
     if is_smoothquant and run_2stage and not a16:
-        local_E = E
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
             moe_sorting_ck(
                 topk_ids,
                 topk_weight,
-                local_E,
+                global_E,
                 model_dim,
                 dtype,
                 block_m_sorting,
-                expert_mask=None,
+                expert_mask,
             )
         )
     else:
