@@ -1175,7 +1175,7 @@ OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, uint32_t size = 
 #if __clang_major__ < 20
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundefined-inline"
-OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, __attribute__((address_space(3))) uint32_t* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR uint32_t* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
 #pragma clang diagnostic pop
 #endif
 template<typename T_>
@@ -1211,12 +1211,12 @@ struct gmem {
 #else
         i32x4_t cached_rsrc_;
         __builtin_memcpy(&cached_rsrc_, &cached_rsrc, sizeof(i32x4_t));   // builtin memcpy, __builtin_bit_cast() can not use here due to __amdgpu_buffer_rsrc_t is non copyable
-        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)),  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)),  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)),  4, v_os, s_os, 0, aux); }
+        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)),  1, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)),  2, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)),  4, v_os, s_os, 0, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)), 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<__attribute__((address_space(3))) u32_t*>(reinterpret_cast<unsigned long int>(dst)), 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)), 12, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)), 16, v_os, s_os, 0, aux); }
 #endif
 #endif
     }
@@ -1236,16 +1236,6 @@ struct gmem {
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
     OPUS_D void async_load(__shared__ void* dst, int v_os, int s_os = 0, number<aux> = {}) { _async_load<vec>(dst, v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
-
-    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
-    OPUS_D void async_load(__shared__ void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
-        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        scalar_type* smem_ptr = reinterpret_cast<scalar_type*>(smem_base);
-        static_ford(issue_space_vec, [&](auto... ids) {
-            async_load<vec>(smem_ptr + u_smem(ids...), u_gmem(ids...), s_os, number<aux>{});
-        });
-    }
 
     template<index_t vec = 1, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>   // os in unit of T and cast to vector with vec
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
@@ -1302,6 +1292,17 @@ struct gmem {
             store<vec>(v_, u(ids...), s_os, number<aux>{});
         });
     }
+
+    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load(__shared__ void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
+        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<uintptr_t>(smem_base));
+        static_ford(issue_space_vec, [&](auto... ids) {
+            async_load<vec>(smem_ptr + u_smem(ids...), u_gmem(ids...), s_os, number<aux>{});
+        });
+    }
+
     __amdgpu_buffer_rsrc_t cached_rsrc;
 };
 
