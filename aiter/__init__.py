@@ -85,7 +85,7 @@ from .ops.mha import *  # noqa: F403,E402
 from .ops.gradlib import *  # noqa: F403,E402
 from .ops.trans_ragged_layout import *  # noqa: F403,E402
 from .ops.sample import *  # noqa: F403,E402
-from .ops.fused_mrope_rms import *  # noqa: F403,E402
+from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
 from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
 from .ops.groupnorm import *  # noqa: F403,E402
 from . import mla  # noqa: F403,F401,E402
