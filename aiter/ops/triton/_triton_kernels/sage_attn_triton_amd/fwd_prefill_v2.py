@@ -38,6 +38,7 @@ def _sage_fwd_no_mask_v2(
     sd_mask,
     stride_sz,
     stride_sh,
+    stride_ds_k,
     off_z,
     off_h_q,
     offs_m,
@@ -2075,32 +2076,6 @@ def sage_quant_v2(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
-    delta_s = None
-    if smooth_q:
-        delta_s = torch.empty((Q_NUM_BLKS, K_NUM_BLKS, BLKK), device=q.device, dtype=q.dtype)
-        grid = (b, h_qo, Q_NUM_BLKS)
-        q_smooth_kernel[grid](
-            q,
-            k,
-            delta_s,
-            qo_len, 
-            kv_len,
-            stride_bz_q,
-            stride_h_q,
-            stride_seq_q,
-            stride_bz_k,
-            stride_h_k,
-            stride_seq_k,
-            delta_s.stride(0),
-            delta_s.stride(1),
-            Q_NUM_BLKS=Q_NUM_BLKS,
-            K_NUM_BLKS=K_NUM_BLKS,
-            D=head_dim,
-            BLOCK_M=BLKQ,
-            BLOCK_N=BLKK,
-        )
-
-
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
     # call sage_quant_kernel
@@ -2132,11 +2107,90 @@ def sage_quant_v2(
     q_scale_pre = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale_pre = torch.empty((b, h_kv, K_NUM_BLKS), device=k.device, dtype=torch.float32)
 
+    # smooth Q + prescale Q
+    delta_s = None
+    q_mean = None
+    stride_qmz, stride_qmh, stride_qmblk = (0, 0, 0)
+    if smooth_q:
+        q_mean = torch.empty((b, h_qo, Q_NUM_BLKS, head_dim), device=q.device, dtype=q.dtype)
+        stride_qmz, stride_qmh, stride_qmblk, _ = q_mean.stride()
+        delta_s = torch.empty((b, h_kv, Q_NUM_BLKS, K_NUM_BLKS, BLKK), device=q.device, dtype=q.dtype)
+        #grid = (b, h_qo, Q_NUM_BLKS)
+        #q_smooth_kernel[grid](
+        #    q,
+        #    k,
+        #    delta_s,
+        #    qo_len, 
+        #    kv_len,
+        #    stride_bz_q,
+        #    stride_h_q,
+        #    stride_seq_q,
+        #    stride_bz_k,
+        #    stride_h_k,
+        #    stride_seq_k,
+        #    delta_s.stride(0),
+        #    delta_s.stride(1),
+        #    Q_NUM_BLKS=Q_NUM_BLKS,
+        #    K_NUM_BLKS=K_NUM_BLKS,
+        #    D=head_dim,
+        #    BLOCK_M=BLKQ,
+        #    BLOCK_N=BLKK,
+        #)
+
+    Q_MAX = FP4_MAX if is_q_fp4 else FP8_MAX
+    grid = (b, h_qo, Q_NUM_BLKS)
+
+    smooth_prescale_q_kernel[grid](
+        q,
+        q_bf16,
+        q_scale_pre,
+        smooth_q,
+        q_mean,
+        stride_bz_q,
+        stride_h_q,
+        stride_seq_q,
+        q_scale_pre.stride(0),
+        q_scale_pre.stride(1),
+        stride_qmz,
+        stride_qmh,
+        stride_qmblk,
+        (sm_scale * 1.4426950408889634),
+        b,
+        h_qo,
+        Q_NUM_BLKS,
+        qo_len,
+        Q_MAX=Q_MAX,
+        D=head_dim,
+        BLK_Q=BLKQ,
+    )
+
+    ## calculate delta_s if smooth_q and prescale K
+    K_MAX = FP4_MAX if is_k_fp4 else FP8_MAX
+    grid = (b, h_kv, K_NUM_BLKS)
+
+    prescale_k_kernel[grid](
+        k,
+        k_bf16,
+        k_scale_pre,
+        smooth_q,
+        q_mean,
+        stride_bz_k,
+        stride_h_k,
+        stride_seq_k,
+        k_scale_pre.stride(0),
+        k_scale_pre.stride(1),
+        stride_qmz,
+        stride_qmh,
+        stride_qmblk,
+        b,
+        h_kv, # should be equal to h_qo in this implementation
+        
+    )
+
+
     q_task_count = b * h_qo * Q_NUM_BLKS
     k_task_count = b * h_kv * K_NUM_BLKS
 
-    Q_MAX = FP4_MAX if is_q_fp4 else FP8_MAX
-    K_MAX = FP4_MAX if is_k_fp4 else FP8_MAX
 
     grid = (q_task_count + k_task_count,)
 
@@ -2144,6 +2198,8 @@ def sage_quant_v2(
         q,
         q_bf16,
         q_scale_pre,
+        smooth_q,
+        q_mean,
         k,
         k_bf16,
         k_scale_pre,
@@ -2383,3 +2439,67 @@ def sage_quant_v_kernel(
     v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
     tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
+@triton.jit
+def smooth_prescale_q_kernel(
+    Q_Input,
+    Q_Output,
+    Q_Scale,
+    SMOOTH_Q: tl.constexpr,
+    Q_Mean,
+    stride_qz,
+    stride_qh,
+    stride_qn,
+    stride_qsz,
+    stride_qsh,
+    stride_qmz,
+    stride_qmh,
+    stride_qmblk,
+    sm_scale,
+    BATCH,
+    Q_HEAD,
+    Q_NUM_BLKS,
+    SEQLEN_Q,
+    Q_MAX: tl.constexpr,
+    D: tl.constexpr,
+    BLK_Q: tl.constexpr,
+):
+    off_b = tl.program_id(0)
+    off_h = tl.program_id(1)
+    off_blk = tl.program_id(2)
+
+    offs_blk_q = tl.arange(0, BLK_Q)
+    offs_d = tl.arange(0, D)
+
+    offs_qn = off_blk * BLK_Q + offs_blk_q
+
+    q_offs = (
+        off_b * stride_qz
+        + off_h * stride_qh
+        + offs_qn[:, None] * stride_qn
+        + offs_d[None, :]
+    )
+
+    q_input_ptrs = Q_Input + q_offs
+    q_output_ptrs = Q_Output + q_offs
+    mask = offs_qn[:, None] < SEQLEN_Q
+
+    q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
+
+    x = tl.load(q_input_ptrs, mask=mask, other=0.0)
+    x = x.to(tl.float32)
+    if sm_scale is not None:
+        x *= sm_scale
+    if SMOOTH_Q:
+        q_mean_ptrs = Q_Mean + off_b * stride_qmz + off_h * stride_qmh + off_blk * stride_qmblk + offs_d
+        actual_num = tl.minimum(BLK_Q, SEQLEN_Q - (off_blk * BLK_Q))
+        x_mean = tl.sum(x, 0) / actual_num # [BLK_Q]
+        x = x - x_mean[None, :]
+    scale = tl.max(tl.abs(x)) / Q_MAX
+    x_quant = x / scale
+    if q_output_ptrs.dtype.element_ty == tl.int8:
+        x_quant += 0.5 * tl.where(x_quant >= 0, 1, -1)
+    x_quant = x_quant.to(q_output_ptrs.dtype.element_ty)
+    tl.store(q_output_ptrs, x_quant, mask=mask)
+    tl.store(q_scale_ptrs, scale)
+    if SMOOTH_Q:
+        tl.store(q_mean_ptrs, x_mean.to(q_mean_ptrs.dtype.element_ty))
