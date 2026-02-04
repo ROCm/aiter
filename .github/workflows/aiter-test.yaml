@@ -234,7 +234,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: standard-test-log-${{ matrix.runner }}
+          name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
           path: latest_test.log
 
       - name: Cleanup container
