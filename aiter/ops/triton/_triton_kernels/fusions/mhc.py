@@ -177,9 +177,11 @@ def _mhc_fused_kernel(
     is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
     is_res_program = ~is_pre_program & ~is_post_program
     
-    is_pre_f32 = is_pre_program.to(tl.float32)
+    # Only convert types that are actually needed:
+    # - is_post_f32: needed for activation scaling (2*sigmoid for post)
+    # - is_post_i32, is_res_i32: needed for index arithmetic
+    # Note: is_pre_f32 and is_res_f32 removed - use tl.where for alpha selection instead
     is_post_f32 = is_post_program.to(tl.float32)
-    is_res_f32 = is_res_program.to(tl.float32)
     is_post_i32 = is_post_program.to(tl.int32)
     is_res_i32 = is_res_program.to(tl.int32)
     
@@ -243,17 +245,15 @@ def _mhc_fused_kernel(
     
     # BIAS + ALPHA SCALING (Eq 16)
     bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
-    # Use arithmetic blending for alpha selection
-    alpha_val = is_pre_f32 * alpha_pre + is_post_f32 * alpha_post + is_res_f32 * alpha_res
+    # Use tl.where for alpha selection (more efficient than arithmetic blending)
+    alpha_val = tl.where(is_pre_program, alpha_pre,
+                         tl.where(is_post_program, alpha_post, alpha_res))
     
     # Apply Eq 16: H = (1/r) * α * H̃ + b
     out = rsigma[:, None] * alpha_val * acc + bias[None, :]
     
     # Apply stream-specific activation
-    sigmoid_out = tl.sigmoid(out)
-    # Pre/post activation: sigmoid (pre) or 2*sigmoid (post) - computed once for both modes
-    out_activated_prepost = sigmoid_out * (1.0 + is_post_f32)
-    
+    # Compute res output first (before sigmoid to avoid unnecessary computation)
     if HRES_LITE_MODE:
         out_res = _compute_hres_mhc_lite(
             out, perm_ptr, stride_perm_k, stride_perm_ij,
@@ -264,8 +264,13 @@ def _mhc_fused_kernel(
     else:
         out_res = out
 
-    # Blend: select out_res for res stream, out_activated_prepost for pre/post
-    out_activated = is_res_f32 * out_res + (1.0 - is_res_f32) * out_activated_prepost
+    # Only compute sigmoid for pre/post programs, use out_res for res
+    # Pre: sigmoid(out), Post: 2*sigmoid(out), Res: out_res (identity or lite)
+    out_activated = tl.where(
+        is_pre_program | is_post_program,
+        tl.sigmoid(out) * (1.0 + is_post_f32),
+        out_res
+    )
 
     # Select output pointer and strides based on stream type
     out_ptr = tl.where(is_pre_program, out_pre_ptr,
@@ -381,6 +386,10 @@ def _mhc_fused_split_kernel(
     
     # Initialize accumulators
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    
+    # Only compute acc_sq for pre-stream programs (first N-block)
+    # to avoid redundant computation since acc_sq depends only on x.
+    compute_acc_sq = is_pre_program & (local_pid_n == 0)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     # Select phi pointers and strides based on stream type
@@ -414,8 +423,11 @@ def _mhc_fused_split_kernel(
         )
         
         acc += tl.dot(x_tile, phi_tile)
-        x_tile_f32 = x_tile.to(tl.float32)
-        acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
+        
+        # Only compute acc_sq for programs that need it (saves computation for post/res streams)
+        if compute_acc_sq:
+            x_tile_f32 = x_tile.to(tl.float32)
+            acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
     
     # Store partial results to intermediate buffers
     # Select output buffer based on stream type
@@ -435,16 +447,13 @@ def _mhc_fused_split_kernel(
         mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
     )
     
-    # Store partial acc_sq only from pre-stream programs (to avoid redundant writes)
-    # All streams compute the same acc_sq value, so we only need to store once
-    if is_pre_program:
-        # Only the first N-block of pre-stream stores acc_sq
-        if local_pid_n == 0:
-            tl.store(
-                acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
-                acc_sq,
-                mask=rm < M,
-            )
+    # Store partial acc_sq only from the programs that computed it
+    if compute_acc_sq:
+        tl.store(
+            acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
+            acc_sq,
+            mask=rm < M,
+        )
 
 
 @triton.jit
@@ -527,10 +536,11 @@ def _mhc_fused_reduce_kernel(
     is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
     is_res_program = ~is_pre_program & ~is_post_program
     
-    # Precompute type conversions
-    is_pre_f32 = is_pre_program.to(tl.float32)
+    # Only convert types that are actually needed:
+    # - is_post_f32: needed for activation scaling (2*sigmoid for post)
+    # - is_post_i32, is_res_i32: needed for index arithmetic
+    # Note: is_pre_f32 and is_res_f32 removed - use tl.where for alpha selection instead
     is_post_f32 = is_post_program.to(tl.float32)
-    is_res_f32 = is_res_program.to(tl.float32)
     is_post_i32 = is_post_program.to(tl.int32)
     is_res_i32 = is_res_program.to(tl.int32)
     
@@ -560,19 +570,19 @@ def _mhc_fused_reduce_kernel(
     stride_acc_n = tl.where(is_pre_program, stride_acc_pre_n,
                        tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n))
     
-    # Sum partial dot products across K-splits
+    # Sum partial results across K-splits (fused loop for better cache utilization)
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
     for ks in range(ACTUAL_KSPLIT):
+        # Load and accumulate partial dot products
         acc_partial = tl.load(
             acc_ptr + ks * stride_acc_k + rm[:, None] * stride_acc_m + rn_local[None, :] * stride_acc_n,
             mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
             other=0.0,
         )
         acc += acc_partial
-    
-    # Sum partial acc_sq across K-splits
-    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-    for ks in range(ACTUAL_KSPLIT):
+        
+        # Load and accumulate partial acc_sq
         acc_sq_partial = tl.load(
             acc_sq_ptr + ks * stride_acc_sq_k + rm * stride_acc_sq_m,
             mask=rm < M,
@@ -586,16 +596,15 @@ def _mhc_fused_reduce_kernel(
     
     # BIAS + ALPHA SCALING (Eq 16)
     bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
-    alpha_val = is_pre_f32 * alpha_pre + is_post_f32 * alpha_post + is_res_f32 * alpha_res
+    # Use tl.where for alpha selection (more efficient than arithmetic blending)
+    alpha_val = tl.where(is_pre_program, alpha_pre,
+                         tl.where(is_post_program, alpha_post, alpha_res))
     
     # Apply Eq 16: H = (1/r) * α * H̃ + b
     out = rsigma[:, None] * alpha_val * acc + bias[None, :]
     
     # Apply stream-specific activation
-    sigmoid_out = tl.sigmoid(out)
-    # Pre/post activation: sigmoid (pre) or 2*sigmoid (post) - computed once for both modes
-    out_activated_prepost = sigmoid_out * (1.0 + is_post_f32)
-    
+    # Compute res output first (before sigmoid to avoid unnecessary computation)
     if HRES_LITE_MODE:
         out_res = _compute_hres_mhc_lite(
             out, perm_ptr, stride_perm_k, stride_perm_ij,
@@ -606,7 +615,13 @@ def _mhc_fused_reduce_kernel(
     else:
         out_res = out
 
-    out_activated = is_res_f32 * out_res + (1.0 - is_res_f32) * out_activated_prepost
+    # Only compute sigmoid for pre/post programs, use out_res for res
+    # Pre: sigmoid(out), Post: 2*sigmoid(out), Res: out_res (identity or lite)
+    out_activated = tl.where(
+        is_pre_program | is_post_program,
+        tl.sigmoid(out) * (1.0 + is_post_f32),
+        out_res
+    )
 
     out_ptr = tl.where(is_pre_program, out_pre_ptr,
                        tl.where(is_post_program, out_post_ptr, out_res_ptr))
