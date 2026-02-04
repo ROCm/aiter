@@ -114,19 +114,19 @@ jobs:
             label: MI355
             shard_total: 5
             shard_idx: 0
-          - runner: aiter-mi355-1gpu
+          - runner: aiter-mi355-1gpu.cpx
             label: MI355
             shard_total: 5
             shard_idx: 1
-          - runner: aiter-mi355-1gpu
+          - runner: aiter-mi355-1gpu.cpx
             label: MI355
             shard_total: 5
             shard_idx: 2
-          - runner: aiter-mi355-1gpu
+          - runner: aiter-mi355-1gpu.cpx
             label: MI355
             shard_total: 5
             shard_idx: 3
-          - runner: aiter-mi355-1gpu
+          - runner: aiter-mi355-1gpu.cpx
             label: MI355
             shard_total: 5
             shard_idx: 4
