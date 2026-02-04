@@ -123,6 +123,7 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    use_gluon=False,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -244,6 +245,10 @@ def unified_attention(
             num_2d_prgms,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
+        if use_gluon:
+            impl = kernel_unified_attention_3d_gluon
+        else:
+            impl = kernel_unified_attention_3d
         segm_output = torch.empty(
             q.shape[0],
             num_query_heads,
@@ -266,71 +271,7 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
-        tmp_output = torch.zeros(
-            total_num_q_blocks,
-            num_kv_heads,
-            NUM_SEGMENTS,
-            dtype=torch.int32,
-            device=q.device,
-
-        )
-        print(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
-        kernel_unified_attention_3d_gluon[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
-
-            tmp_output_ptr=tmp_output,
-            tmp_stride_0=tmp_output.stride(0),
-            tmp_stride_1=tmp_output.stride(1),
-            tmp_stride_2=tmp_output.stride(2),
-            
-            segm_output_ptr=segm_output,
-            segm_max_ptr=segm_max,
-            segm_expsum_ptr=segm_expsum,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
-            ALL_DECODE=ALL_DECODE,
-            **attn_config,
-        )
-        print(tmp_output.shape)
-        print(f"{tmp_output=}")
-        # print(f"{tmp_output[0][:][3]}")
-
-        kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+        impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,

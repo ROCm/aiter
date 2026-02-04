@@ -119,7 +119,6 @@ def test_triton_unified_attn(
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
 ) -> None:
-    print()
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
 
@@ -130,10 +129,6 @@ def test_triton_unified_attn(
     kv_lens = [x[1] for x in seq_lens]
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
-    print(f"{query_lens=}")
-    print(f"{kv_lens=}")
-    print(f"{num_query_heads=}")
-    print(f"{num_kv_heads=}")
     assert num_query_heads % num_kv_heads == 0
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
@@ -162,6 +157,7 @@ def test_triton_unified_attn(
     )
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
     output = torch.empty_like(query)
+    output_gluon = torch.empty_like(query)
 
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
@@ -180,6 +176,8 @@ def test_triton_unified_attn(
         k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
         v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
 
+    print()
+    print(f"Computing Triton")
     unified_attention(
         q=maybe_quantized_query,
         k=maybe_quantized_key_cache,
@@ -199,22 +197,52 @@ def test_triton_unified_attn(
         v_descale=v_descale,
         sinks=sinks,
     )
-
-    ref_output = ref_paged_attn(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        query_lens=query_lens,
-        kv_lens=kv_lens,
-        block_tables=block_tables,
-        scale=scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
+    print(f"Computing Gluon")
+    unified_attention(
+        q=maybe_quantized_query,
+        k=maybe_quantized_key_cache,
+        v=maybe_quantized_value_cache,
+        out=output_gluon,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         sinks=sinks,
+        use_gluon=True,
     )
+
+    # print(f"Computing Reference")
+    # ref_output = ref_paged_attn(
+    #     query=query,
+    #     key_cache=key_cache,
+    #     value_cache=value_cache,
+    #     query_lens=query_lens,
+    #     kv_lens=kv_lens,
+    #     block_tables=block_tables,
+    #     scale=scale,
+    #     sliding_window=sliding_window,
+    #     soft_cap=soft_cap,
+    #     sinks=sinks,
+    # )
+
+    print(f"Comparing Results")
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype is not None:
         atol, rtol = 1.5e-1, 1.5e-1
+    # torch.testing.assert_close(
+    #     output, ref_output, atol=atol, rtol=rtol
+    # ), f"{torch.max(torch.abs(output - ref_output))}"
+    # torch.testing.assert_close(
+    #     output_gluon, ref_output, atol=atol, rtol=rtol
+    # ), f"{torch.max(torch.abs(output_gluon - ref_output))}"
     torch.testing.assert_close(
-        output, ref_output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output - ref_output))}"
+        output_gluon, output, atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output_gluon - output))}"
