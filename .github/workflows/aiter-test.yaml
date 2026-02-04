@@ -112,8 +112,44 @@ jobs:
         include:
           - runner: linux-aiter-mi355-1
             label: MI355
+            shard_total: 5
+            shard_idx: 0
+          - runner: aiter-mi355-1gpu
+            label: MI355
+            shard_total: 5
+            shard_idx: 1
+          - runner: aiter-mi355-1gpu
+            label: MI355
+            shard_total: 5
+            shard_idx: 2
+          - runner: aiter-mi355-1gpu
+            label: MI355
+            shard_total: 5
+            shard_idx: 3
+          - runner: aiter-mi355-1gpu
+            label: MI355
+            shard_total: 5
+            shard_idx: 4
           - runner: aiter-1gpu-runner
             label: MI325
+            shard_total: 5
+            shard_idx: 0
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 1
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 2
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 3
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 4
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -179,12 +215,12 @@ jobs:
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
+            bash -c "MAX_JOBS=20 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh" 
           else
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "./.github/scripts/aiter_test.sh" 
+            bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh" 
           fi
 
       - name: Collect test logs
