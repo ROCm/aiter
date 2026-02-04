@@ -1386,10 +1386,12 @@ namespace py = pybind11;
           py::arg("input"),                                              \
           py::arg("scales"),                                             \
           py::arg("smooth_scale"),                                       \
-          py::arg("smooth_scale_map") = std::nullopt,                    \
-          py::arg("shuffle_scale")    = false,                           \
-          py::arg("num_rows")         = std::nullopt,                    \
-          py::arg("num_rows_factor")  = 1);                               \
+          py::arg("smooth_scale_map")      = std::nullopt,               \
+          py::arg("shuffle_scale")         = false,                      \
+          py::arg("num_rows")              = std::nullopt,               \
+          py::arg("num_rows_factor")       = 1,                          \
+          py::arg("smooth_scale_map_hash") = std::nullopt,               \
+          py::arg("enable_ps")             = true);                                  \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
