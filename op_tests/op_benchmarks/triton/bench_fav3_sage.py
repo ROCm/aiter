@@ -26,9 +26,17 @@ from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outpu
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
-from aiter.ops.triton.attention.fav3_sage import (
-    fav3_sage_wrapper_func,
-)
+
+SAGE_VERSION=2
+
+if SAGE_VERSION == 2:
+    from aiter.ops.triton.attention.fav3_sage_v2 import (
+        fav3_sage_wrapper_func,
+    )
+else:
+    from aiter.ops.triton.attention.fav3_sage import (
+        fav3_sage_wrapper_func,
+    )
 from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
 CAUSAL = False
