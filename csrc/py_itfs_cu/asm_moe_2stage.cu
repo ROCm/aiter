@@ -373,19 +373,30 @@ void moe_stage1_g1u1(
     int gdy = sz_stp; // sub_X_cnt;
     int gdz = k_num;
 
-    // printf("#### stage1 arg start ############\n");
-    // std::cout << "dim:" << args.dim << std::endl;
-    // std::cout << "hidden:" << args.hidden_dim << std::endl;
-    // std::cout << "token:" << args.token_cnt << std::endl;
-    // std::cout << "eprt:" << args.eprt_cnt << std::endl;
-    // std::cout << "Xs:" << args.Xs << std::endl;
-    // std::cout << "GUs:" << args.GUs << std::endl;
-    // std::cout << "Os:" << args.Os << std::endl;
-    // std::cout << "eGUs:" << args.eGUs << std::endl;
-    // std::cout << "GUQs:" << args.eGUQs << std::endl;
-    // std::cout << "SMQs:" << args.eSMQs << std::endl;
-    // std::cout << "topk:" << args.topk << std::endl;
-    // std::cout << "splitk:" << args.splitk << std::endl;
+    // printf("####stage1 arg start############ \n");
+    // std::cout << " args.ptr_O       = " << args.ptr_O << std::endl;
+    // std::cout << " args.ptr_X       = " << args.ptr_X << std::endl;
+    // std::cout << " args.ptr_GU      = " << args.ptr_GU << std::endl;
+    // std::cout << " args.ptr_XC      = " << args.ptr_XC << std::endl;
+    // std::cout << " args.ptr_XQ      = " << args.ptr_XQ << std::endl;
+    // std::cout << " args.ptr_GUQ     = " << args.ptr_GUQ << std::endl;
+    // std::cout << " args.ptr_SMQ     = " << args.ptr_SMQ << std::endl;
+    // std::cout << " args.ptr_STP     = " << args.ptr_STP << std::endl;
+    // std::cout << " args.ptr_SEP     = " << args.ptr_SEP << std::endl;
+    // std::cout << " args.dim         = " << args.dim << std::endl;
+    // std::cout << " args.hidden_dim  = " << args.hidden_dim << std::endl;
+    // std::cout << " args.token_cnt   = " << args.token_cnt << std::endl;
+    // std::cout << " args.eprt_cnt    = " << args.eprt_cnt << std::endl;
+    // std::cout << " args.Xs          = " << args.Xs << std::endl;
+    // std::cout << " args.GUs         = " << args.GUs << std::endl;
+    // std::cout << " args.Os          = " << args.Os << std::endl;
+    // std::cout << " args.eGUs        = " << args.eGUs << std::endl;
+    // std::cout << " args.eGUQs       = " << args.eGUQs << std::endl;
+    // std::cout << " args.eSMQs       = " << args.eSMQs << std::endl;
+    // std::cout << " args.topk        = " << args.topk << std::endl;
+    // std::cout << " args.splitk      = " << args.splitk << std::endl;
+    // std::cout << " args.activation  = " << args.activation << std::endl;
+    // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
     // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
 
     impl_ptr->launch_kernel({&args,

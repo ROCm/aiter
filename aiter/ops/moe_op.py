@@ -308,6 +308,7 @@ def ck_moe_stage1(
     dst_type: Optional[str] = None,
 ) -> None: ...
 
+
 @compile_ops("module_moe_asm")
 def moe_stage2_g1u1(
     inter_states: Tensor,
@@ -327,6 +328,7 @@ def moe_stage2_g1u1(
     activation: Optional[Enum] = ActivationType.Silu.value,
     splitk: Optional[int] = 0,
 ) -> None: ...
+
 
 @compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage2)
 def ck_moe_stage2(

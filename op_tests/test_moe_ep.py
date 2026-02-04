@@ -167,7 +167,9 @@ def test_fmoe_ep(
         s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
         for i in range(ep_id, MAX_TOKENS, ep):
             s_topk_ids_list[i] = shared_expert_ids
-        s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device=input.device)
+        s_topk_ids[:] = torch.tensor(
+            s_topk_ids_list, dtype=dtypes.i32, device=input.device
+        )
 
         # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
         total_topk_weights = torch.empty(
@@ -460,7 +462,6 @@ for test in l_test:
         #                 for ep in [4, 8]:
         #                     test_fmoe_ep(
         #                         dtype, m, dim, hdim, 128, 6, quant="No", shared_E=shared_E, ep=ep
-                            
 
     elif test == "g1u1_no_quant":
         for dtype in (
