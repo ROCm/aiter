@@ -483,99 +483,6 @@ void append_hip_tuning_csv(
   hipDataType C_data_type, int32_t ldc, int64_t stride_c,
   hipblasComputeType_t compute_type, int32_t batch_count, bool write_header_if_missing) {
     
-  /*
-  std::ifstream infile(filename, std::ios::ate);
-  std::ofstream file(filename, std::ios::app);
-  
-  if (!file.is_open()) {
-    return;
-  }
-  
-  bool file_exists    = infile.good();
-  bool file_empty     = (infile.tellg() == 0);
-
-  // If the file is new or empty, write header first
-  if (write_header_if_missing && (!file_exists || file_empty)) {
-    file << "preshuffle, use_rowwise, trans_a, trans_b, m, n, k, A_data_type, lda, stride_a, B_data_type, ldb, stride_b, C_data_type, ldc, stride_c, compute_type, batch_count, algo_index, kernel_name" << "\n";
-  }
-    
-  int algo_index = -1;
-  algo_index         = hipblaslt_ext::getIndexFromAlgo(algo);
-  std::string kernel_name = "NA";
-  kernel_name = std::string(hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, algo));
-
-  auto boolToString = [](bool val) -> const char* {
-    switch (val) {
-        case true:
-          return "true";
-        case false:
-          return "false";
-	default:
-          return "<?>";
-    }
-  };
-
-  auto opToString = [](hipblasOperation_t op) -> const char* {
-    switch (op) {
-      case HIPBLAS_OP_T:
-        return "T";
-      case HIPBLAS_OP_N:
-        return "N";
-      default:
-        return "<?>";
-    }
-  };
-
-  auto dataTypeToString = [](hipDataType t) -> const char* {
-    switch (t) {
-      case HIP_R_32F:
-        return "f32_r";
-      case HIP_R_16F:
-        return "f16_r";
-      case HIP_R_16BF:
-        return "bf16_r";
-      case HIP_R_8F_E4M3_FNUZ:
-        return "f8_e4m3_fnuz_r";
-      default:
-        return "<?>";
-    }
-  };
-
-  auto computeTypeToString = [](hipblasComputeType_t t) -> const char* {
-    switch (t) {
-      case HIPBLAS_COMPUTE_32F:
-        return "f32_r";
-      default:
-        return "<?>";
-    }
-  };
-
-  std::ostringstream oss;
-  oss << boolToString(bpreshuffle) << ","
-      << boolToString(use_rowwise) << "," 
-      << opToString(trans_a) << ","
-      << opToString(trans_b) << ","
-      << m << ","
-      << n << ","
-      << k << ","
-      << dataTypeToString(A_data_type) << ","
-      << lda << ","
-      << static_cast<long long>(stride_a) << ","
-      << dataTypeToString(B_data_type) << ","
-      << ldb << ","
-      << static_cast<long long>(stride_b) << ","
-      << dataTypeToString(C_data_type) << ","
-      << ldc << ","
-      << static_cast<long long>(stride_c) << ","
-      << computeTypeToString(compute_type) << ","
-      << batch_count << ","
-      << algo_index << ","
-      << kernel_name << "\n";
-
-  file << oss.str();
-
-  file.close();
-  */
     int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return;
 
@@ -710,11 +617,6 @@ hipblasStatus_t hipblasLt_online_tuning(
     // warm-up
     pre_gpu_time(event_gpu_time_start, gpu_time_used, stream);
     for (int i = 0; i < warmup_iters; i++) {
-        /*
-        status = hipblasLtMatmul(
-        hipblaslt_handle, matmulDesc, alpha, A, ADesc, B, BDesc, beta, C, CDesc, C, CDesc,
-        &heuristicResult[sol].algo, workspace, workspaceSize, stream);
-        */
         status = hipblasLtMatmul(
                     hipblaslt_handle, 
                     matmulDesc, 
@@ -743,11 +645,6 @@ hipblasStatus_t hipblasLt_online_tuning(
     // iters
     pre_gpu_time(event_gpu_time_start, gpu_time_used, stream);
     for (int i = 0; i < iters; i++) {
-        /*
-        status = hipblasLtMatmul(
-        hipblaslt_handle, matmulDesc, alpha, A, ADesc, B, BDesc, beta, C, CDesc, C, CDesc,
-        &heuristicResult[sol].algo, workspace, workspaceSize, stream);
-        */
         status = hipblasLtMatmul(
                     hipblaslt_handle, 
                     matmulDesc, 
