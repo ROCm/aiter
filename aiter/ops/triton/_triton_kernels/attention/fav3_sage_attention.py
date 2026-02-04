@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     compute_alibi_block,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
