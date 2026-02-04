@@ -170,7 +170,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         if libType == "ck":
             kernel_list = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
         elif libType == "cktile":
-            kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
+            #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
+            kernel_list = candidate_kernels_cktile_dict
         else:
             return None
 
@@ -187,9 +188,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
     ):
         cu_num, M, N, K = info_keys
-        kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
+        #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
+        kernel_list = candidate_kernels_cktile_dict
         kernels_num = len(kernel_list)
-        gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
+        #gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 3]
         tasks_cktile = []
         for i in range(kernels_num):
@@ -215,7 +217,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         (M, N, K, seed),
                         run_gemm_a8w8_blockscale_cktile,
                         (
-                            gemm_a8w8_idx,
+                            [0, 5 if preshuffleB else 1, 6 if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp) == 8 else 2, 3, 4],
                             i,
                             splitK,
                             preshuffleB,
@@ -344,7 +346,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
-        print(ret)
+        #print(ret)
         return ret
 
     def result_to_df(self, results):
