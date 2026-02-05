@@ -730,38 +730,41 @@ def get_2stage_cfgs(
             return False
         return True
 
-    # cfg = cfg_2stages.get(keys, None)
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
-    if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
-        lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
-        mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
-        cfg_2stages = get_cfg_2stages(tune_file)
-        # cfg = cfg_2stages.get(keys, None)
-        cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
-        if cfg is None:
-            logger.warning(f"Fmoe tuning not support for {keys}")
+    cfg = None
+    if not int(os.environ.get("AITER_ENFORCE_DSL", "1")):
+        cfg = cfg_2stages.get(keys, None)
+        cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
+        if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
+            lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
+            mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
+            cfg_2stages = get_cfg_2stages(tune_file)
+            # cfg = cfg_2stages.get(keys, None)
+            cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+            if cfg is None:
+                logger.warning(f"Fmoe tuning not support for {keys}")
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
-        if (
-            activation,
-            q_type,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            use_g1u1,
-            doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
-            if q_type == QuantType.per_1x128:
-                run_1stage = token > 32 and (inter_dim % 256 == 0)
-            elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
-                run_1stage = token > 32
-            elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
-                run_1stage = token > 16
-            elif q_type != QuantType.per_1x32:
-                run_1stage = token < 256
+        if not int(os.environ.get("AITER_ENFORCE_DSL", "1")):
+            if (
+                activation,
+                q_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                use_g1u1,
+                doweight_stage1,
+            ) in fused_moe_1stage_dict[get_gfx()]:
+                if q_type == QuantType.per_1x128:
+                    run_1stage = token > 32 and (inter_dim % 256 == 0)
+                elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
+                    run_1stage = token > 32
+                elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
+                    run_1stage = token > 16
+                elif q_type != QuantType.per_1x32:
+                    run_1stage = token < 256
 
         block_m = (
             BLOCK_SIZE_M
@@ -910,6 +913,15 @@ def get_2stage_cfgs(
         )
         if flydsl_block_m <= 0:
             flydsl_block_m = default_flydsl_block_m
+
+        def get_dsl_block_m():
+            if token > 128:
+                return 32
+            else:
+                return 16
+
+        flydsl_block_m = get_dsl_block_m()
+
         stage1_func = (
             functools.partial(
                 flydsl_moe_stage1,
@@ -1722,7 +1734,7 @@ def flydsl_moe_stage1(
 
     tile_m = int(block_m) if block_m is not None else 64
     tile_n = 64 # 128
-    tile_k = 128
+    tile_k = 256
     # Decode/small-token fix (NO kernel changes):
     # FlyDSL stage1 kernel expects CK-style preshuffled W1 layout, but model weights are not
     # preshuffled. For small tokens, only a handful of experts are actually touched.
@@ -1842,6 +1854,8 @@ def flydsl_moe_stage1(
             f"FlyDSL stage1 only supports out dtype in (fp16, bf16), got {out.dtype}"
         )
     stream_ptr = torch.cuda.current_stream().cuda_stream
+
+    thread_size = 256 if token_num > 128 else 128
     exe1 = compile_moe_gemm1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1854,6 +1868,7 @@ def flydsl_moe_stage1(
         in_dtype="fp8",
         out_dtype=out_dtype,
         use_cshuffle_epilog=False,
+        total_thread_size=thread_size,
     )
     exe1(
         out,
@@ -2232,6 +2247,7 @@ def flydsl_moe_stage2(
     logger.info("[flydsl] moe stage2 using mode=%s", str(moe_mode))
 
     stream_ptr = torch.cuda.current_stream().cuda_stream
+    thread_size = 256  # if token_num > 128 else 64
     exe2 = compile_moe_gemm2_ex(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -2244,6 +2260,7 @@ def flydsl_moe_stage2(
         in_dtype="fp8",
         out_dtype=out_dtype,
         mode=moe_mode,
+        total_thread_size=thread_size,
     )
     exe2(
         out,
