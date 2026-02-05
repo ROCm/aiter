@@ -70,8 +70,8 @@ def init_3buffer_kv_cache(
     )
 
     # Generate random scale factors
-    # scale_values = [1.0, 2.0, 4.0, 8.0]
-    scale_values = [1.0, 1.0, 1.0, 1.0]
+    scale_values = [1.0, 2.0, 4.0, 8.0]
+    # scale_values = [1.0, 1.0, 1.0, 1.0]
     scale_indices = torch.randint(
         0, len(scale_values), size=(num_page, page_size, 1, scale_dim)
     )
