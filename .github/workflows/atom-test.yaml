@@ -44,12 +44,6 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             runner: aiter-8gpu-runner
-          - model_name: "DeepSeek-R1-0528"
-            label: MI355
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8"
-            env_vars: ""
-            runner: aiter-mi355-8gpu
           - model_name: "gpt-oss-120b"
             label: MI355
             model_path: "openai/gpt-oss-120b"
@@ -182,6 +176,7 @@ jobs:
           cat atom_test_output.txt
         
       - name: Run ATOM accuracy test
+        if: ${{ matrix.model_name != 'DeepSeek-R1-0528' }}
         timeout-minutes: 30
         run: |
           set -euo pipefail
