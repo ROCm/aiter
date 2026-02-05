@@ -6,6 +6,7 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 import math
 from aiter.ops.triton._triton_kernels.attention.unified_attention_gluon import (
     gluon_kernel_unified_attention_3d,
+    gluon_kernel_unified_attention_3d_pipelined,
     gluon_kernel_unified_attention_3d_tdm_pipelined,
     gluon_reduce_segments,
 )
@@ -162,8 +163,11 @@ def unified_attention(
             device=q.device,
         )
 
-        impl = gluon_kernel_unified_attention_3d
+        # impl = gluon_kernel_unified_attention_3d
+        impl = gluon_kernel_unified_attention_3d_pipelined
         # impl = gluon_kernel_unified_attention_3d_tdm_pipelined
+        attn_config["num_stages"] = 2
+        print(attn_config)
 
         impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
