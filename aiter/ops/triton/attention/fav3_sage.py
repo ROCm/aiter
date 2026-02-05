@@ -371,9 +371,6 @@ def fav3_sage_func(
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
     """
-    
-    
-    
     if USE_MXFP4_SAGE:
         assert delta_s != None, "Delta_S is needed for mxfp sage attention"
 
