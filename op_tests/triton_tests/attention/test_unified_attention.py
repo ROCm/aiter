@@ -7,6 +7,9 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention_3d_gluon import (
+    unified_attention as gluon_unified_attention,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 NUM_HEADS = [(64, 8)]
@@ -180,72 +183,57 @@ def test_triton_unified_attn(
         v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
 
     print()
-    print(f"Computing Triton")
-    unified_attention(
-        q=maybe_quantized_query,
-        k=maybe_quantized_key_cache,
-        v=maybe_quantized_value_cache,
-        out=output,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=block_tables,
-        softcap=soft_cap if soft_cap is not None else 0,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        sinks=sinks,
-    )
-    print(f"Computing Gluon")
-    unified_attention(
-        q=maybe_quantized_query,
-        k=maybe_quantized_key_cache,
-        v=maybe_quantized_value_cache,
-        out=output_gluon,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=block_tables,
-        softcap=soft_cap if soft_cap is not None else 0,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        sinks=sinks,
-        use_gluon=True,
-    )
 
-    # print(f"Computing Reference")
-    # ref_output = ref_paged_attn(
-    #     query=query,
-    #     key_cache=key_cache,
-    #     value_cache=value_cache,
-    #     query_lens=query_lens,
-    #     kv_lens=kv_lens,
-    #     block_tables=block_tables,
-    #     scale=scale,
-    #     sliding_window=sliding_window,
-    #     soft_cap=soft_cap,
-    #     sinks=sinks,
-    # )
+    def unified_attention_impl(impl, output_impl):
+        impl(
+            q=maybe_quantized_query,
+            k=maybe_quantized_key_cache,
+            v=maybe_quantized_value_cache,
+            out=output_impl,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=soft_cap if soft_cap is not None else 0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+        )
+
+    print(f"Computing Triton")
+    unified_attention_impl(unified_attention, output)
+    print(f"Computing Gluon")
+    unified_attention_impl(gluon_unified_attention, output_gluon)
+
+    print(f"Computing Reference")
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        sinks=sinks,
+    )
 
     print(f"Comparing Results")
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype is not None:
         atol, rtol = 1.5e-1, 1.5e-1
-    # torch.testing.assert_close(
-    #     output, ref_output, atol=atol, rtol=rtol
-    # ), f"{torch.max(torch.abs(output - ref_output))}"
-    # torch.testing.assert_close(
-    #     output_gluon, ref_output, atol=atol, rtol=rtol
-    # ), f"{torch.max(torch.abs(output_gluon - ref_output))}"
     torch.testing.assert_close(
-        output_gluon, output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output_gluon - output))}"
+        output_gluon, ref_output, atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output_gluon - ref_output))}"
+    torch.testing.assert_close(
+        output, ref_output, atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output - ref_output))}"
+    # torch.testing.assert_close(
+    #     output_gluon, output, atol=atol, rtol=rtol
+    # ), f"{torch.max(torch.abs(output_gluon - output))}"

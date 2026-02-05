@@ -4,53 +4,11 @@ import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
-from aiter.ops.triton._triton_kernels.attention.unified_attention import (
-    kernel_unified_attention_2d,
-    kernel_unified_attention_3d,
-    reduce_segments,
+from aiter.ops.triton._triton_kernels.attention.unified_attention_gluon import (
+    gluon_kernel_unified_attention_3d,
+    gluon_kernel_unified_attention_3d_tdm_pipelined,
+    gluon_reduce_segments,
 )
-
-
-def select_2d_config(
-    block_size,
-    head_size,
-    sliding_window,
-    all_decode,
-    max_seqlen_q,
-    max_seqlen_k,
-    num_queries_per_kv,
-    num_2d_prgms,
-):
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
-    TILE_SIZE = 64
-    # in case head_size is large
-    max_num_stages_2d = 4
-    if head_size > 128:
-        max_num_stages_2d = 2
-    if all_decode == False:
-        num_stages_2d = 1
-        num_warps = 2
-    else:
-        num_stages_2d = 3
-        num_warps = 2
-        TILE_SIZE = block_size
-
-    if max_seqlen_q >= 256:
-        BLOCK_M = 128
-        num_stages_2d = 1
-        num_warps = 4
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-    num_stages_2d = min(max_num_stages_2d, num_stages_2d)
-    return {
-        "BLOCK_M": BLOCK_M,
-        "BLOCK_Q": BLOCK_Q,
-        "TILE_SIZE": TILE_SIZE,
-        "num_warps": num_warps,
-        "num_stages": num_stages_2d,
-        "waves_per_eu": 2,
-    }
 
 
 def select_3d_config(
@@ -133,6 +91,7 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
+    num_blocks = v.shape[0]
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
@@ -169,70 +128,7 @@ def unified_attention(
         target_num_prgms,
         num_2d_prgms,
     ):
-        config = select_2d_config(
-            block_size,
-            head_size,
-            SLIDING_WINDOW,
-            ALL_DECODE,
-            max_seqlen_q,
-            max_seqlen_k,
-            num_queries_per_kv,
-            num_2d_prgms,
-        )
-        assert config["BLOCK_Q"] >= 1
-        total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
-
-        kernel_unified_attention_2d[
-            (
-                num_kv_heads,
-                total_num_q_blocks,
-            )
-        ](
-            output_ptr=out,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            out_scale=1 / output_scale if output_scale is not None else 1.0,
-            softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            num_seqs=num_seqs,
-            USE_FP8=output_scale is not None,
-            ALL_DECODE=ALL_DECODE,
-            **config,
-        )
-
+        raise NotImplementedError("2D Gluon Unified Attention is not yet implemented.")
     else:
         attn_config, reduce_config = select_3d_config(
             head_size,
@@ -265,7 +161,11 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
-        kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+
+        impl = gluon_kernel_unified_attention_3d
+        # impl = gluon_kernel_unified_attention_3d_tdm_pipelined
+
+        impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
@@ -287,6 +187,7 @@ def unified_attention(
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+            NUM_BLOCKS=num_blocks,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
@@ -310,7 +211,8 @@ def unified_attention(
             ALL_DECODE=ALL_DECODE,
             **attn_config,
         )
-        reduce_segments[(q.shape[0], num_query_heads)](
+
+        gluon_reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,

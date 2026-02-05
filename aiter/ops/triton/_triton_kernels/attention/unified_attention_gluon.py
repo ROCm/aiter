@@ -86,6 +86,29 @@ def create_kv_tdm_tensor_descriptors(
     return k_desc, v_desc
 
 
+# @gluon.jit
+# def issue_loads(
+#     producer,
+#     k_desc,
+#     # v_desc,
+#     off_k_t,
+#     off_k_d,
+#     k_buffer,
+#     # v_buffer,
+#     BLOCK_K: ttgl.constexpr,
+#     NUM_BUFFERS: ttgl.constexpr,
+#     pred=1
+# ):
+#     # pred is a hardware predicate passed to async_load for conditional execution without branch divergence
+#     # Convert boolean pred to i32 for hardware predicate (i1 -> i32)
+#     pred_i32 = pred.to(ttgl.int32) if hasattr(pred, 'to') else pred
+#     ttgl.amd.gfx1250.tdm.async_load(
+#         k_desc, [off_k_d, producer * BLOCK_K], b_buffer.index(producer % NUM_BUFFERS),
+#                                     pred=pred_i32)
+#     producer += 1
+#     return producer
+
+
 @gluon.jit
 def gluon_kernel_unified_attention_3d_tdm_pipelined(
     segm_output_ptr,
@@ -133,11 +156,16 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     num_seqs: ttgl.int32,
     BLOCK_M: ttgl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: ttgl.constexpr,  # int
+    num_warps: ttgl.constexpr,  # int
+    num_stages: ttgl.constexpr,  # int
     ALL_DECODE: ttgl.constexpr = False,  # bool
 ):
     q_block_global_idx = ttgl.program_id(0)
     kv_head_idx = ttgl.program_id(1)
     segm_idx = ttgl.program_id(2)
+    num_ctas: ttgl.constexpr = ttgl.num_ctas()
+    pred = 1
+    pred_i32 = pred.to(ttgl.int32) if hasattr(pred, "to") else pred
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
@@ -172,13 +200,13 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     Q_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[4, 8],
-        warps_per_cta=[2, 1],
+        warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
     K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
         size_per_thread=[8, 1],
         threads_per_warp=[8, 4],
-        warps_per_cta=[1, 2],
+        warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
 
@@ -358,14 +386,23 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
 
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    max_seq_prefix_len = ttgl.minimum(max_seq_prefix_len, seq_len)
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+    KV_cache_modifier: ttgl.constexpr = ".cg" if ALL_DECODE else ""
+
+    # stride_k_cache_0 = HEAD_SIZE * num_kv_heads * BLOCK_SIZE
+    # stride_k_cache_1 = HEAD_SIZE * num_kv_heads
+    # stride_k_cache_2 = HEAD_SIZE
+    # therefore,
+    # stride_k_cache_0_over_2 should be num_kv_heads * BLOCK_SIZE
+    # stride_k_cache_1_over_2 should be num_kv_heads
+    stride_k_cache_0_over_2: ttgl.constexpr = stride_k_cache_0 // stride_k_cache_2
+    stride_k_cache_1_over_2: ttgl.constexpr = stride_k_cache_1 // stride_k_cache_2
     # iterate through tiles within current segment
     for j in range(
         segm_idx * tiles_per_segment,
@@ -377,14 +414,14 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         seq_v_offset = j * TILE_SIZE + offs_v_t
 
         if TILE_SIZE == BLOCK_SIZE:
-            tile_k_mask = ttgl.full(
-                (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
-            )
+            # tile_k_mask = ttgl.full(
+            #     (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
+            # )
             tile_v_mask = ttgl.full(
                 (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
             )
         else:
-            tile_k_mask = seq_k_offset < max_seq_prefix_len
+            # tile_k_mask = seq_k_offset < max_seq_prefix_len
             tile_v_mask = seq_v_offset < max_seq_prefix_len
 
         physical_block_idx_k = ttgl.amd.cdna4.buffer_load(
@@ -392,17 +429,10 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
             offsets=(block_table_offset + seq_k_offset // BLOCK_SIZE).to(ttgl.int32),
         ).to(tl.int64)
 
-        # # At ASM level, the following two options of getting physical_block_idx_v are identical even though they are different at IR level:
-        # # 1. buffer_load directly with ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT) layout (see below):
-        # physical_block_idx_v = ttgl.amd.cdna4.buffer_load(
-        #     ptr=block_tables_ptr,
-        #     offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(ttgl.int32),
-        # ).to(tl.int64)
-        #
-        # # 2. convert_layout from physical_block_idx_k, i.e., ttgl.SliceLayout(0, K_BLOCKED_LAYOUT) -> ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT) (see below):
-        physical_block_idx_v = ttgl.convert_layout(
-            physical_block_idx_k, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-        )
+        physical_block_idx_v = ttgl.amd.cdna4.buffer_load(
+            ptr=block_tables_ptr,
+            offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(ttgl.int32),
+        ).to(tl.int64)
 
         v_offset = (
             physical_block_idx_v[:, None] * stride_v_cache_0
@@ -411,32 +441,40 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
             + (seq_v_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
-        k_offset = (
-            physical_block_idx_k[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_k_d[:, None] * stride_k_cache_3
-            + (seq_k_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+        # k_offset = (
+        #     physical_block_idx_k[None, :] * stride_k_cache_0
+        #     + kv_head_idx * stride_k_cache_2
+        #     + offs_k_d[:, None] * stride_k_cache_3
+        #     + (seq_k_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+        # )
 
         # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_BLOCKED_LAYOUT
-        K_load = ttgl.amd.cdna4.buffer_load(
-            ptr=key_cache_ptr,
-            offsets=k_offset.to(ttgl.int32),
-            mask=dim_mask[:, None] & tile_k_mask[None, :],
-            other=0.0,
-            cache=KV_cache_modifier,
+        # K_load = ttgl.amd.cdna4.buffer_load(
+        #     ptr=key_cache_ptr,
+        #     offsets=k_offset.to(ttgl.int32),
+        #     mask=dim_mask[:, None] & tile_k_mask[None, :],
+        #     other=0.0,
+        #     cache=KV_cache_modifier,
+        # )
+        physical_offs_k_t = (
+            physical_block_idx_k * stride_k_cache_0_over_2
+            + (seq_k_offset % BLOCK_SIZE) * stride_k_cache_1_over_2
+            + kv_head_idx
         )
-
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K_cast = K_load
-            else:
-                K_cast = (K_load.to(ttgl.float32) * ttgl.load(k_scale)).to(Q.dtype)
-        else:
-            K_cast = K_load
-        smem_K.store(K_cast)
+        ttgl.amd.gfx1250.tdm.async_load(
+            src=k_desc,
+            offsets=[offs_k_d, physical_offs_k_t],
+            dest=smem_K,  # .index(producer % NUM_BUFFERS),
+            pred=pred_i32,
+        )
+        if num_ctas > 1:
+            ttgl.amd.gfx1250.cluster.arrive()
+        ttgl.amd.gfx1250.tdm.async_wait(0)
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
         K = smem_K.load(layout=K_DOT_LAYOUT)
+
+        if K.dtype.is_fp8() and not Q.dtype.is_fp8():
+            K = (K.to(ttgl.float32) * ttgl.load(k_scale)).to(Q.dtype)
 
         # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
         V_load = ttgl.amd.cdna4.buffer_load(
@@ -599,6 +637,7 @@ def gluon_kernel_unified_attention_3d(
     query_stride_0: ttgl.int64,  # int
     query_stride_1: ttgl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: ttgl.int64,  # int
+    NUM_BLOCKS: ttgl.constexpr,  # int
     BLOCK_SIZE: ttgl.constexpr,  # int
     TILE_SIZE: ttgl.constexpr,  # int, must be power of 2
     HEAD_SIZE: ttgl.constexpr,  # int
@@ -621,6 +660,8 @@ def gluon_kernel_unified_attention_3d(
     num_seqs: ttgl.int32,
     BLOCK_M: ttgl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: ttgl.constexpr,  # int
+    num_warps: ttgl.constexpr,  # int
+    num_stages: ttgl.constexpr,  # int
     ALL_DECODE: ttgl.constexpr = False,  # bool
 ):
     q_block_global_idx = ttgl.program_id(0)
@@ -660,13 +701,13 @@ def gluon_kernel_unified_attention_3d(
     Q_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[4, 8],
-        warps_per_cta=[2, 1],
+        warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
     K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
         size_per_thread=[8, 1],
         threads_per_warp=[8, 4],
-        warps_per_cta=[1, 2],
+        warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
 
