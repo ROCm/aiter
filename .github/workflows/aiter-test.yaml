@@ -112,24 +112,44 @@ jobs:
         include:
           - runner: linux-aiter-mi355-1
             label: MI355
-            shard_total: 5
+            shard_total: 10
             shard_idx: 0
           - runner: aiter-mi355-1gpu.cpx
             label: MI355
-            shard_total: 5
+            shard_total: 10
             shard_idx: 1
           - runner: aiter-mi355-1gpu.cpx
             label: MI355
-            shard_total: 5
+            shard_total: 10
             shard_idx: 2
           - runner: aiter-mi355-1gpu.cpx
             label: MI355
-            shard_total: 5
+            shard_total: 10
             shard_idx: 3
           - runner: aiter-mi355-1gpu.cpx
             label: MI355
-            shard_total: 5
+            shard_total: 10
             shard_idx: 4
+          - runner: aiter-mi355-1gpu.cpx
+            label: MI355
+            shard_total: 10
+            shard_idx: 5
+          - runner: aiter-mi355-1gpu.cpx
+            label: MI355
+            shard_total: 10
+            shard_idx: 6
+          - runner: aiter-mi355-1gpu.cpx
+            label: MI355
+            shard_total: 10
+            shard_idx: 7
+          - runner: aiter-mi355-1gpu.cpx
+            label: MI355
+            shard_total: 10
+            shard_idx: 8
+          - runner: aiter-mi355-1gpu.cpx
+            label: MI355
+            shard_total: 10
+            shard_idx: 9
           - runner: aiter-1gpu-runner
             label: MI325
             shard_total: 5
