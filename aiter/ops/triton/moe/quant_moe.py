@@ -5,6 +5,8 @@ from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _downcast_to_static_fp8,
     _downcast_to_mxfp,
     _upcast_from_mxfp,
+    _smoothquant_fuse_quant_kernel,
+    _smoothquant_fuse_quant_kernel_single_pass,
 )
 
 
@@ -226,3 +228,140 @@ def dequant_w_blockscale(w, w_scales, group_shape):
     w = w * scales
     w = w.view(E, K_pad, N_pad)[:, :K, :N]
     return w
+
+
+def smoothquant_quantize(
+    x: torch.Tensor,
+    smooth_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply smoothquant quantization to convert bf16/fp16 tensor to int8.
+
+    Args:
+        x: Input tensor in bf16/fp16 [M, K]
+        smooth_scale: Per-column smooth scale in fp32 [K]
+
+    Returns:
+        x_int8: Quantized int8 tensor [M, K]
+        x_scale: Per-row quantization scale in fp32 [M]
+
+    The operation performs:
+    1. x_smooth = x * smooth_scale (per column)
+    2. row_scale = max(abs(x_smooth), dim=1) / 127
+    3. x_int8 = round(x_smooth / row_scale)
+    """
+    assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
+    assert smooth_scale.ndim == 1, f"Expected 1D smooth_scale, got {smooth_scale.ndim}D"
+    assert (
+        x.shape[1] == smooth_scale.shape[0]
+    ), f"Dimension mismatch: x.shape[1]={x.shape[1]}, smooth_scale.shape[0]={smooth_scale.shape[0]}"
+
+    M, K = x.shape
+    device = x.device
+
+    # Allocate outputs
+    x_int8 = torch.empty((M, K), dtype=torch.int8, device=device)
+    x_scale = torch.empty((M,), dtype=torch.float32, device=device)
+
+    # Ensure smooth_scale is fp32 and contiguous
+    smooth_scale = smooth_scale.to(torch.float32).contiguous()
+
+    # Choose kernel based on K size
+    # Use single-pass for K <= 1024, otherwise use multi-pass (iterates over K)
+    # Key insight: BLOCK_K should be small enough to fit in registers
+    MAX_SINGLE_PASS_K = 1024  # Maximum K for single-pass kernel
+
+    BLOCK_M = min(triton.next_power_of_2(M), 32)
+
+    if K <= MAX_SINGLE_PASS_K:
+        # Single pass: load entire row at once
+        BLOCK_K = triton.next_power_of_2(K)
+        grid = (triton.cdiv(M, BLOCK_M),)
+
+        _smoothquant_fuse_quant_kernel_single_pass[grid](
+            x,
+            x.stride(0),
+            x.stride(1),
+            smooth_scale,
+            x_int8,
+            x_int8.stride(0),
+            x_int8.stride(1),
+            x_scale,
+            1,
+            M,
+            K,
+            BLOCK_M,
+            BLOCK_K,
+            num_warps=4,
+        )
+    else:
+        # Multi-pass: iterate over K dimension with smaller blocks
+        # Use BLOCK_K that balances parallelism and register pressure
+        BLOCK_K = 256  # Good for most GPUs
+        grid = (triton.cdiv(M, BLOCK_M),)
+
+        _smoothquant_fuse_quant_kernel[grid](
+            x,
+            x.stride(0),
+            x.stride(1),
+            smooth_scale,
+            x_int8,
+            x_int8.stride(0),
+            x_int8.stride(1),
+            x_scale,
+            1,
+            M,
+            K,
+            BLOCK_M,
+            BLOCK_K,
+            num_warps=4,
+        )
+
+    return x_int8, x_scale
+
+
+def quantize_weights_int8(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize weights to int8 with per-output-channel scaling.
+
+    Args:
+        w: Weight tensor in bf16/fp16/fp32 [E, K, N] or [K, N]
+
+    Returns:
+        w_int8: Quantized int8 weights (contiguous)
+        w_scale: Per-output-channel scale [E, N] or [N] (contiguous)
+    """
+    if w.ndim == 2:
+        # [K, N] -> add expert dimension
+        w = w.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+
+    E, K, N = w.shape
+    device = w.device
+
+    # Compute per-channel max (along K dimension)
+    w_fp32 = w.to(torch.float32)
+    w_abs_max = w_fp32.abs().max(dim=1).values  # [E, N]
+
+    # Compute scale
+    INT8_MAX = 127.0
+    w_scale = w_abs_max / INT8_MAX + 1e-12  # [E, N]
+
+    # Quantize
+    w_scaled = w_fp32 / w_scale[:, None, :]
+    w_int8 = w_scaled.round().clamp(-127, 127).to(torch.int8)
+
+    # Ensure contiguous memory layout for efficient access
+    # Layout [E, K, N] with N contiguous is optimal for the GEMM kernel
+    w_int8 = w_int8.contiguous()
+    w_scale = w_scale.contiguous()
+
+    if squeeze_output:
+        w_int8 = w_int8.squeeze(0)
+        w_scale = w_scale.squeeze(0)
+
+    return w_int8, w_scale
