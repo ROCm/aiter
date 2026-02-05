@@ -127,6 +127,9 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
     args.ptr_kseq         = nullptr;
     args.ptr_qseq_padding = nullptr;
     args.ptr_kseq_padding = nullptr;
+    args.ptr_q_descale    = nullptr;
+    args.ptr_k_descale    = nullptr;
+    args.ptr_v_descale    = nullptr;
     // batch mode does not support padded
     if(a.is_group_mode)
     {
@@ -148,6 +151,21 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
         {
             args.ptr_qseq = a.seqstart_q_ptr;
         }
+    }
+    if(a.data_type == "fp8bf16")
+    {
+        // args.ptr_q_descale = a.q_descale_ptr;
+        // args.ptr_k_descale = a.k_descale_ptr;
+        // args.ptr_v_descale = a.v_descale_ptr;
+        args.ptr_q_descale = a.q_ptr;
+        args.ptr_k_descale = a.k_ptr;
+        args.ptr_v_descale = a.v_ptr;
+        args.s_descale_q_Bs = a.batch_stride_q_descale;
+        args.s_descale_q_Hs = a.nhead_stride_q_descale;
+        args.s_descale_k_Bs = a.batch_stride_k_descale;
+        args.s_descale_k_Hs = a.nhead_stride_k_descale;
+        args.s_descale_v_Bs = a.batch_stride_v_descale;
+        args.s_descale_v_Hs = a.nhead_stride_v_descale;
     }
 }
 
@@ -186,10 +204,11 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     std::string arch_id = get_gpu_arch();
 
     if((!a.use_asm_v3) || (a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
-       (a.data_type != "bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
+       (a.data_type != "bf16" && a.data_type != "fp8bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
         std::cout << "[Warning]unsupported condition in fwd_v3!!!" << std::endl;
+        std::cout << "data type" << a.data_type <<std::endl;
         return -1;
     }
 

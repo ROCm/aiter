@@ -23,7 +23,7 @@ bf16,192,128,0,1,2,128,32,_ZN5aiter33fmha_fwd_hd192x128_bf16_rtz_groupE,fwd_hd19
 bf16,192,128,2,1,0,128,32,_ZN5aiter41fmha_fwd_hd192x128_bf16_causal_rtne_groupE,fwd_hd192x128_bf16_causal_rtne_group.co
 bf16,192,128,2,1,1,128,32,_ZN5aiter41fmha_fwd_hd192x128_bf16_causal_rtna_groupE,fwd_hd192x128_bf16_causal_rtna_group.co
 bf16,192,128,2,1,2,128,32,_ZN5aiter40fmha_fwd_hd192x128_bf16_causal_rtz_groupE,fwd_hd192x128_bf16_causal_rtz_group.co
-fp8,128,128,0,0,1,256,64,_ZN5aiter18fmha_fwd_hd128_fp8E,fwd_hd128_fp8.co
-fp8,128,128,2,0,1,256,64,_ZN5aiter25fmha_fwd_hd128_fp8_causalE,fwd_hd128_fp8_causal.co
-fp8,128,128,0,1,1,256,64,_ZN5aiter24fmha_fwd_hd128_fp8_groupE,fwd_hd128_fp8_group.co
-fp8,128,128,2,1,1,256,64,_ZN5aiter31fmha_fwd_hd128_fp8_causal_groupE,fwd_hd128_fp8_causal_group.co
+fp8bf16,128,128,0,0,1,256,64,_ZN5aiter18fmha_fwd_hd128_fp8E,fwd_hd128_fp8.co
+fp8bf16,128,128,2,0,1,256,64,_ZN5aiter25fmha_fwd_hd128_fp8_causalE,fwd_hd128_fp8_causal.co
+fp8bf16,128,128,0,1,1,256,64,_ZN5aiter24fmha_fwd_hd128_fp8_groupE,fwd_hd128_fp8_group.co
+fp8bf16,128,128,2,1,1,256,64,_ZN5aiter31fmha_fwd_hd128_fp8_causal_groupE,fwd_hd128_fp8_causal_group.co
