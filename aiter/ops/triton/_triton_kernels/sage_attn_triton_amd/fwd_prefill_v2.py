@@ -1088,25 +1088,11 @@ def sage_fwd_v2(
 
     q_descale_pre = tl.load(q_descale_pre_ptr)
 
-    k_descale_offset = off_z * stride_ksz + off_h_k * stride_ksh
+    # Defer computing offsets until needed to reduce register pressure
+    # These will be recomputed cheaply in each block section
 
-    k_descale_pre_offset = (
-        K_Descale_Pre
-        + off_z * stride_kspz
-        + off_h_k * stride_ksph
-        + cu_seqlens_k_start
-    )
-
-    delta_s_offset = off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
-
-    v_descale = tl.load(
-        V_Descale
-        + off_z * stride_vsz
-        + off_h_k * stride_vsh
-        + offs_d_v,
-        mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
-        other=0.0,
-    )
+    # Defer computing offsets until needed to reduce register pressure
+    # These will be recomputed cheaply in each block section
 
     # figure out masking pattern
     (
@@ -1217,12 +1203,18 @@ def sage_fwd_v2(
         q_ptrs_mask = q_ptrs_mask & (offs_d_q[None, :] < ACTUAL_BLOCK_DMODEL_QK // Q_HEAD_DIM_DIVISOR)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
+    # Compute offsets here - closer to usage to minimize live range
+    k_descale_offset = off_z * stride_ksz + off_h_k * stride_ksh
+    k_descale_pre_offset = K_Descale_Pre + off_z * stride_kspz + off_h_k * stride_ksph + cu_seqlens_k_start
+    delta_s_offset = off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
+
     # ========== Process MASKED K Blocks in the front ==========
     # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
     if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
         block_min = n_front_skip_blocks * BLOCK_N
         block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
 
+        # Recompute pointers instead of storing - cheaper than register spill
         k_descale_ptr = (
             K_Descale
             + k_descale_offset
@@ -1232,10 +1224,7 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks
 
-        if SMOOTH_Q:
-            delta_s_ptr = Delta_S + delta_s_offset + n_front_skip_blocks * stride_dsk
-        else:
-            delta_s_ptr = None
+        delta_s_ptr = Delta_S + delta_s_offset + n_front_skip_blocks * stride_dsk if SMOOTH_Q else None
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
@@ -1315,10 +1304,7 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks
 
-        if SMOOTH_Q:
-            delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks) * stride_dsk
-        else:
-            delta_s_ptr = None
+        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks) * stride_dsk if SMOOTH_Q else None
 
         acc, l_i, m_i = _sage_fwd_no_mask_v2(
             acc,
@@ -1398,10 +1384,7 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
 
-        if SMOOTH_Q:
-            delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * stride_dsk
-        else:
-            delta_s_ptr = None
+        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * stride_dsk if SMOOTH_Q else None
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
@@ -1471,6 +1454,17 @@ def sage_fwd_v2(
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     # Instead of directly computing 1/l_i which can be inf,
     # we check for the invalid case first
+    
+    # Load v_descale here, right before epilogue where it's used
+    v_descale = tl.load(
+        V_Descale
+        + off_z * stride_vsz
+        + off_h_k * stride_vsh
+        + offs_d_v,
+        mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
+        other=0.0,
+    )
+    
     if USE_SLIDING_WINDOW:
         # For rows where m_i is still -inf, no keys were valid
         # Set l_i to 1.0 to avoid division by zero (acc is already 0)
