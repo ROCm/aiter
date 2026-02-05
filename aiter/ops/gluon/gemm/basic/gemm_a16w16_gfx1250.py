@@ -72,14 +72,12 @@ def _gemm_a16w16_gfx1250_kernel(
     USE_ACTIVATION: ttgl.constexpr,   
     ADD_BIAS: ttgl.constexpr,         
 ):
-    # Map linear ID to 2D tile coordinates using column-major ordering
-    # This means we process tiles column by column (good for some access patterns)
     pid = ttgl.program_id(axis=0) 
     num_pid_m = ttgl.cdiv(M, BLOCK_M) 
     pid_m = pid % num_pid_m            
     pid_n = pid // num_pid_m           
     
-    # Create Tensor Descriptors to tell the TDM hardware how to load the tensors
+    # Tensor descriptors to tell the TDM hardware how to load the tensors
     if PHYSICAL_MK:
         a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=a_ptr,
@@ -149,10 +147,9 @@ def _gemm_a16w16_gfx1250_kernel(
     producer = 0
     consumer = 0
     
-    # Initialize accumulator registers
     accumulator = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
     
-    # Pipeline prologue - Fill the pipeline
+    # Fill the pipeline
     for _ in ttgl.static_range(NUM_BUFFERS - 1):
         # Load A tile
         if PHYSICAL_MK:
@@ -220,7 +217,6 @@ def _gemm_a16w16_gfx1250_kernel(
         # We want (NUM_BUFFERS - 1) * 2 to ensure the consumer's tile is ready while allowing next loads to proceed
         ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
         
-        # Load from LDS into registers
         if PHYSICAL_MK:
             cur_a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)
         else:
@@ -233,12 +229,11 @@ def _gemm_a16w16_gfx1250_kernel(
         else:
             cur_b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
         
-        # Execute WMMA instruction
         accumulator = ttgl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
         
         consumer += 1
     
-    # Pipeline epilogue - No more loads
+    # No more loads
     for i in ttgl.static_range(NUM_BUFFERS - 1):
         ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
         
@@ -256,27 +251,24 @@ def _gemm_a16w16_gfx1250_kernel(
         accumulator = ttgl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
         consumer += 1
     
-    # Add bias vector to the accumulated result
+    #Bias
     if ADD_BIAS:
         offs_bias = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
         bias_vals = ttgl.load(bias_ptr + offs_bias)
         accumulator = accumulator + bias_vals[None, :]
     
-    # Apply activation function to the accumulated result before storing
+    #Activation
     if USE_ACTIVATION:
         accumulator = activation(accumulator)
     
-    # Store results to global memory
     offs_cm = pid_m * BLOCK_M + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
     offs_cn = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
     
-    # Compute 2D offset array
     offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     
-    # Boundary mask
     mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     
-    # Convert from float32 accumulator to output dtype and store
+    #Store
     ttgl.amd.gfx1250.buffer_store(
         accumulator.to(c_ptr.type.element_ty),
         c_ptr,
@@ -371,13 +363,11 @@ def gemm_a16w16_gfx1250(
     NUM_BUFFERS = effective_config["NUM_BUFFERS"]
     num_warps = effective_config["num_warps"]
         
-    #Dynamically calculate the warp bases
     warp_bases = [(0, 1)]
     for i in range(int(math.log2(num_warps // 2))):
         warp_bases.append((1 << i, 0))
     warp_bases = tuple(warp_bases)
     
-    # Define the WMMA layout
     wmma_layout = ttgl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
@@ -392,12 +382,10 @@ def gemm_a16w16_gfx1250(
     shared_layouts = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, physical_mk, physical_nk)
     shared_a, shared_b = shared_layouts[0], shared_layouts[1]
     
-    # Calculate the grid size
     num_tiles_m = triton.cdiv(M, BLOCK_M)
     num_tiles_n = triton.cdiv(N, BLOCK_N)
     grid = (num_tiles_m * num_tiles_n, 1)
     
-    # Calculate the strides
     if preshuffled:
         stride_bk, stride_bn = w.stride(1), w.stride(0)
     else:
