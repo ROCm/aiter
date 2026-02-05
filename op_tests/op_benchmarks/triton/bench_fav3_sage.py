@@ -303,6 +303,7 @@ def fav3_sage_forward_func(
     causal: bool,
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
+    use_mxfp4_sage: bool = False,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
@@ -315,6 +316,7 @@ def fav3_sage_forward_func(
         causal=False,
         inference_mode=True,
         layout=layout,
+        USE_MXFP4_SAGE=use_mxfp4_sage
     )
 
 
@@ -439,7 +441,7 @@ def primary_output(result):
     return result
 
 
-def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
+def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, use_mxfp4_sage=False):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
@@ -448,6 +450,7 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
             causal=False,
             inference_mode=True,
             layout=layout,
+            use_mxfp4_sage=use_mxfp4_sage
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -513,6 +516,8 @@ def bench_kernel(q, k, v, args, provider):
     else:
         bench_func_name = "fav3_sage"
 
+    use_mxfp4_sage=args.mxfp4_sage
+
     fn = attn_forward_func(
         q,
         k,
@@ -522,6 +527,7 @@ def bench_kernel(q, k, v, args, provider):
         k_smooth=k_smooth,
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
+        use_mxfp4_sage=use_mxfp4_sage
     )
     ms = triton.testing.do_bench(fn)
 
@@ -705,6 +711,12 @@ def parse_args():
     )
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument(
+        "-mxfp4_sage",
+        action="store_true",
+        default=False,
+        help="Use mxfp4 sage kernel with mixed precision quantization",
+    )
+    parser.add_argument(
         "-fav3_fp8",
         action="store_true",
         default=False,
@@ -722,12 +734,6 @@ def parse_args():
         default=False,
         help="Use asm fav3 bf16 kernel (instead of default fav3_sage)",
     )
-    # parser.add_argument(
-    #     "-fav3_sage",
-    #     action="store_true",
-    #     default=False,
-    #     help="fav3 fp8 sagev1 hybrid kernel: per block quantization for Q/K, per tensor quantization for V, QK in int8, PV in fp8, accumulation in fp32.",
-    # )
     parser.add_argument("-k_smooth", action="store_true", default=True)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)

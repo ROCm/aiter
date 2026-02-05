@@ -12,10 +12,24 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     map_dims,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
+    sage_fwd_mxfp4,
+    sage_quant_mxfp4,
+)
 
 
-def get_sage_fwd_configs():
+def get_sage_fwd_configs(USE_MXFP4_SAGE=False):
     arch = arch_info.get_arch()
+    if USE_MXFP4_SAGE:
+        assert arch == "gfx950", f"MXFP is not supported on {arch}"
+        return {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "waves_per_eu": 2,
+            "PRE_LOAD_V": False,
+            "num_stages": 5,
+            "num_warps": 8,
+        }
     if arch == "gfx950":
         return {
             "BLOCK_M": 256,
@@ -73,15 +87,17 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         sm_margin: int,
         return_lse: bool = True,
         layout: str = "bshd",
+        USE_MXFP4_SAGE: bool = False,
         config: Optional[dict] = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+        bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
         batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd_map)
         _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd_map)
 
         if config is None:
-            config = get_sage_fwd_configs()
+            config = get_sage_fwd_configs(USE_MXFP4_SAGE)
 
         BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
 
@@ -104,40 +120,68 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         fp8_dtype = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_dtype).max
 
-        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
-            q,
-            k,
-            v,
-            fp8_dtype,
-            fp8_max,
-            sm_scale=softmax_scale,
-            BLKQ=BLKQ,
-            BLKK=BLKK,
-            layout=layout,
-        )
+        delta_s = None
+        if USE_MXFP4_SAGE:
+            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale, delta_s = (
+                sage_quant_mxfp4(
+                    q,
+                    k,
+                    v,
+                    fp8_dtype,
+                    fp8_max,
+                    BLKQ=BLKQ,
+                    BLKK=BLKK,
+                    sm_scale=softmax_scale,
+                    layout=layout,
+                )
+            )
+        else:
+            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant(
+                q,
+                k,
+                v,
+                fp8_dtype,
+                fp8_max,
+                sm_scale=softmax_scale,
+                BLKQ=BLKQ,
+                BLKK=BLKK,
+                layout=layout,
+            )
 
         # 4. Verify Descale Shapes (Grouped scaling for GQA/MQA)
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
         num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-        expected_q_ds = (batch, num_q_heads, num_q_blocks)
-        expected_k_ds = (batch, num_kv_heads, num_k_blocks)
+        qd_shape = q_descale.shape
+        kd_shape = k_descale.shape
 
+        if USE_MXFP4_SAGE:
+            qd_shape = map_dims(qd_shape, bhsd_map)
+            kd_shape = map_dims(kd_shape, bhsd_map)
+            expected_q_ds = (batch, num_q_heads, seqlen_q, head_dim // 32)
+            expected_k_ds = (batch, num_kv_heads, seqlen_k, head_dim // 32)
+        else:
+            expected_q_ds = (batch, num_q_heads, num_q_blocks)
+            expected_k_ds = (batch, num_kv_heads, num_k_blocks)
+
+        qd_shape = tuple(qd_shape)
+        kd_shape = tuple(kd_shape)
         assert (
-            q_descale.shape == expected_q_ds
-        ), f"q_descale shape {q_descale.shape} != {expected_q_ds}"
+            qd_shape == expected_q_ds
+        ), f"q_descale shape {qd_shape} != {expected_q_ds}"
         assert (
-            k_descale.shape == expected_k_ds
-        ), f"k_descale shape {k_descale.shape} != {expected_k_ds}"
+            kd_shape == expected_k_ds
+        ), f"k_descale shape {kd_shape} != {expected_k_ds}"
 
         # 5. Execution
         out, softmax_lse = fav3_sage_func(
-            q_int8,
-            k_int8,
-            v_fp8,
+            q_quantized,
+            k_quantized,
+            v_quantized,
             q_descale,
             k_descale,
             v_descale,
+            delta_s,
             softmax_scale,
             causal,
             window_size,
@@ -146,13 +190,14 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             sm_margin,
             return_lse,
             layout,
+            USE_MXFP4_SAGE,
             config,
         )
 
         # 6. Context Saving for Backward
         if return_lse:
             ctx.save_for_backward(
-                q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
+                q, k, v, out, softmax_lse
             )
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -197,6 +242,7 @@ def fav3_sage_wrapper_func(
     sm_margin: int = 0,
     inference_mode: bool = True,
     layout: str = "bshd",
+    USE_MXFP4_SAGE: bool = False,
     config: Optional[dict] = None,
 ):
     """
@@ -227,6 +273,7 @@ def fav3_sage_wrapper_func(
         sm_margin: SM margin parameter (not yet supported)
         inference_mode: do not return softmax_lse
         layout: bshd or bhsd layout for the inputs
+        USE_MXFP4_SAGE: Whether to use MXFP4 variant of Sage attention
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
 
@@ -275,6 +322,7 @@ def fav3_sage_wrapper_func(
         sm_margin,
         return_lse,
         layout,
+        USE_MXFP4_SAGE,
         config,
     )
 
@@ -286,6 +334,7 @@ def fav3_sage_func(
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
+    delta_s: torch.Tensor = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
@@ -294,6 +343,7 @@ def fav3_sage_func(
     sm_margin: int = 0,
     return_lse: bool = False,
     layout: str = "bshd",
+    USE_MXFP4_SAGE: bool = False,
     config: Optional[dict] = None,
 ):
     """
@@ -322,12 +372,16 @@ def fav3_sage_func(
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
     """
+    if USE_MXFP4_SAGE:
+        assert delta_s != None, "Delta_S is needed for mxfp sage attention"
 
     # --- 1. Layout & Dimension Mapping ---
     # bshd: [0,1,2,3], bhsd: [0,2,1,3]
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
     batch, seqlen_q, nheads_q, head_size_qk = map_dims(q.shape, bshd_map)
+    if USE_MXFP4_SAGE:
+        head_size_qk *= 2
     _, seqlen_k, nheads_k, _ = map_dims(k.shape, bshd_map)
     _, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd_map)
 
@@ -337,7 +391,11 @@ def fav3_sage_func(
             "Feature (chunking/softcap/sm_margin) not supported in this API."
         )
 
-    assert q.dtype == torch.int8 and k.dtype == torch.int8, "Q and K must be int8"
+    if USE_MXFP4_SAGE:
+        assert q.dtype == torch.uint8 and k.dtype == torch.uint8, "Q and K must be uint8"
+        assert q_descale.dtype == torch.uint8 and k_descale.dtype == torch.uint8, "Q and K descales must be uint8"
+    else:
+        assert q.dtype == torch.int8 and k.dtype == torch.int8, "Q and K must be int8"
     assert seqlen_k == seqlen_v, f"K/V seqlen mismatch: {seqlen_k} vs {seqlen_v}"
     assert nheads_k == nheads_v, f"K/V head mismatch: {nheads_k} vs {nheads_v}"
     assert (
@@ -346,14 +404,7 @@ def fav3_sage_func(
 
     # --- 3. Configuration & Descale Setup ---
     if config is None:
-        config = get_sage_fwd_configs()
-
-    BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
-    num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
-    num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
-
-    assert q_descale.shape == (batch, nheads_q, num_q_blocks)
-    assert k_descale.shape == (batch, nheads_k, num_k_blocks)
+        config = get_sage_fwd_configs(USE_MXFP4_SAGE)
 
     # --- 4. Output Allocation ---
     out_dtype = torch.bfloat16
@@ -386,8 +437,13 @@ def fav3_sage_func(
     stride_lse_z, stride_lse_h, stride_lse_m = (
         softmax_lse.stride() if return_lse else (0, 0, 0)
     )
-    stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
-    stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
+
+    if USE_MXFP4_SAGE:
+        stride_qsz, stride_qsn, stride_qsh, _ = map_dims(q_descale.stride(), bshd_map)
+        stride_ksz, stride_ksn, stride_ksh, _ = map_dims(k_descale.stride(), bshd_map)
+    else:
+        stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
+        stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
     stride_vsz, stride_vsh, _ = v_descale.stride()
 
     # --- 6. Padding & Metadata ---
@@ -401,85 +457,174 @@ def fav3_sage_func(
     def grid(META):
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
 
-    sage_fwd[grid](
-        q,
-        k,
-        v,
-        None,
-        q_descale,
-        k_descale,
-        v_descale,
-        stride_qsz,
-        stride_qsh,
-        stride_qsblk,
-        stride_ksz,
-        stride_ksh,
-        stride_ksblk,
-        stride_vsz,
-        stride_vsh,
-        softmax_lse,
-        out,
-        None,
-        None,
-        stride_qb,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_kd,
-        stride_vb,
-        stride_vh,
-        stride_vn,
-        stride_vd,
-        stride_ob,
-        stride_oh,
-        stride_om,
-        stride_od,
-        0,
-        0,
-        0,
-        0,  # stride_bz, stride_bh, stride_bm, stride_bn
-        0,
-        0,  # stride_az, stride_ah
-        0,
-        0,
-        0,
-        0,  # stride_sz, stride_sh, stride_sm, stride_sn
-        stride_lse_z,
-        stride_lse_h,
-        stride_lse_m,
-        None,
-        None,
-        None,
-        None,
-        dropout_p=0.0,
-        philox_seed=None,
-        philox_offset_base=None,
-        RETURN_LSE=return_lse,
-        HQ=nheads_q,
-        HK=nheads_k,
-        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
-        ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        MAX_SEQLENS_Q=seqlen_q,
-        MAX_SEQLENS_K=seqlen_k,
-        SM_SCALE=softmax_scale,
-        IS_CAUSAL=causal,
-        USE_SLIDING_WINDOW=use_sliding_window,
-        WINDOW_SIZE_LEFT=window_size_left,
-        WINDOW_SIZE_RIGHT=window_size_right,
-        IS_VARLEN=False,
-        BLOCK_DMODEL_QK=padded_d_model_qk,
-        BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=False,
-        USE_ALIBI=False,
-        ENABLE_DROPOUT=False,
-        USE_EXP2=True,
-        RETURN_SCORES=False,
-        USE_SEQUSED=False,
-        **config,
-    )
+    if USE_MXFP4_SAGE:
+        stride_dsz, stride_dsh, stride_dsq, _ = delta_s.stride()
+
+        sage_fwd_mxfp4[grid](
+            q,
+            k,
+            v,
+            delta_s,  # Delta smoothing tensor for MXFP4 variant
+            None,  # bias (not used)
+            q_descale,
+            k_descale,
+            v_descale,
+            stride_qsz,
+            stride_qsh,
+            stride_qsn,
+            stride_ksz,
+            stride_ksh,
+            stride_ksn,
+            stride_vsz,
+            stride_vsh,
+            stride_dsz,
+            stride_dsh,
+            stride_dsq,
+            softmax_lse,
+            out,
+            None,  # SD_MASK (not used)
+            None,  # ALIBI_SLOPES (not used)
+            stride_qb,
+            stride_qh,
+            stride_qm,
+            stride_qd,
+            stride_kb,
+            stride_kh,
+            stride_kn,
+            stride_kd,
+            stride_vb,
+            stride_vh,
+            stride_vn,
+            stride_vd,
+            stride_ob,
+            stride_oh,
+            stride_om,
+            stride_od,
+            0,  # stride_bz (bias - not used)
+            0,  # stride_bh (bias - not used)
+            0,  # stride_bm (bias - not used)
+            0,  # stride_bn (bias - not used)
+            0,  # stride_az (alibi - not used)
+            0,  # stride_ah (alibi - not used)
+            0,  # stride_sz (scores mask - not used)
+            0,  # stride_sh (scores mask - not used)
+            0,  # stride_sm (scores mask - not used)
+            0,  # stride_sn (scores mask - not used)
+            stride_lse_z,
+            stride_lse_h,
+            stride_lse_m,
+            None,  # cu_seqlens_q (varlen - not used)
+            None,  # cu_seqlens_k (varlen - not used)
+            None,  # seqused_q (not used)
+            None,  # seqused_k (not used)
+            dropout_p=0.0,
+            philox_seed=None,
+            philox_offset_base=None,
+            Q_DTYPE_STR="e2m1",  # MXFP4 for now
+            K_DTYPE_STR="e2m1",  # MXFP4 for now
+            RETURN_LSE=return_lse,
+            HQ=nheads_q,
+            HK=nheads_k,
+            ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+            ACTUAL_BLOCK_DMODEL_V=head_size_v,
+            MAX_SEQLENS_Q=seqlen_q,
+            MAX_SEQLENS_K=seqlen_k,
+            IS_VARLEN=False,
+            SM_SCALE=softmax_scale,
+            IS_CAUSAL=causal,
+            USE_SLIDING_WINDOW=use_sliding_window,
+            WINDOW_SIZE_LEFT=window_size_left,
+            WINDOW_SIZE_RIGHT=window_size_right,
+            BLOCK_DMODEL_QK=padded_d_model_qk,
+            BLOCK_DMODEL_V=padded_d_model_v,
+            USE_BIAS=False,
+            ENABLE_DROPOUT=False,
+            RETURN_SCORES=False,
+            USE_ALIBI=False,
+            USE_EXP2=True,
+            USE_SEQUSED=False,
+            **config,
+        )
+    else:
+        sage_fwd[grid](
+            q,
+            k,
+            v,
+            None,  # bias (not used)
+            q_descale,
+            k_descale,
+            v_descale,
+            stride_qsz,
+            stride_qsh,
+            stride_qsblk,
+            stride_ksz,
+            stride_ksh,
+            stride_ksblk,
+            stride_vsz,
+            stride_vsh,
+            softmax_lse,
+            out,
+            None,  # SD_MASK (not used)
+            None,  # ALIBI_SLOPES (not used)
+            stride_qb,
+            stride_qh,
+            stride_qm,
+            stride_qd,
+            stride_kb,
+            stride_kh,
+            stride_kn,
+            stride_kd,
+            stride_vb,
+            stride_vh,
+            stride_vn,
+            stride_vd,
+            stride_ob,
+            stride_oh,
+            stride_om,
+            stride_od,
+            0,  # stride_bz (bias - not used)
+            0,  # stride_bh (bias - not used)
+            0,  # stride_bm (bias - not used)
+            0,  # stride_bn (bias - not used)
+            0,  # stride_az (alibi - not used)
+            0,  # stride_ah (alibi - not used)
+            0,  # stride_sz (scores mask - not used)
+            0,  # stride_sh (scores mask - not used)
+            0,  # stride_sm (scores mask - not used)
+            0,  # stride_sn (scores mask - not used)
+            stride_lse_z,
+            stride_lse_h,
+            stride_lse_m,
+            None,  # cu_seqlens_q (varlen - not used)
+            None,  # cu_seqlens_k (varlen - not used)
+            None,  # seqused_q (not used)
+            None,  # seqused_k (not used)
+            dropout_p=0.0,
+            philox_seed=None,
+            philox_offset_base=None,
+            RETURN_LSE=return_lse,
+            HQ=nheads_q,
+            HK=nheads_k,
+            ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+            ACTUAL_BLOCK_DMODEL_V=head_size_v,
+            MAX_SEQLENS_Q=seqlen_q,
+            MAX_SEQLENS_K=seqlen_k,
+            SM_SCALE=softmax_scale,
+            IS_CAUSAL=causal,
+            USE_SLIDING_WINDOW=use_sliding_window,
+            WINDOW_SIZE_LEFT=window_size_left,
+            WINDOW_SIZE_RIGHT=window_size_right,
+            IS_VARLEN=False,
+            BLOCK_DMODEL_QK=padded_d_model_qk,
+            BLOCK_DMODEL_V=padded_d_model_v,
+            USE_BIAS=False,
+            USE_ALIBI=False,
+            ENABLE_DROPOUT=False,
+            USE_EXP2=True,
+            RETURN_SCORES=False,
+            USE_SEQUSED=False,
+            **config,
+        )
 
     if return_lse:
         return out, softmax_lse

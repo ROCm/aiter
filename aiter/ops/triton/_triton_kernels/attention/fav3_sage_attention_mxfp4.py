@@ -5,20 +5,23 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     compute_alibi_block,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
-
-
-def map_dims(shape, indices):
-    return [shape[i] for i in indices]
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
+    compute_block_masking,
+    compute_alibi_block,
+    map_dims,
+)
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 
 @triton.jit
-def _sage_fwd_no_mask(
+def _sage_fwd_no_mask_mxfp4(
     acc,
     l_i,
     m_i,
     q,
     k_base_ptrs,
     v_base_ptrs,
+    delta_s_base_ptrs,
     bias_base_ptrs,
     stride_kn,
     stride_vk,
@@ -37,14 +40,15 @@ def _sage_fwd_no_mask(
     off_z,
     off_h_q,
     offs_m,
-    offs_d_qk,
+    offs_d_k,
     offs_d_v,
     block_min,
     block_max,
     alibi_slope,
     q_descale,
-    k_descale_base_ptr,
-    stride_ksblk,
+    k_descale_base_ptrs,
+    stride_ksn,
+    SM_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
@@ -56,26 +60,27 @@ def _sage_fwd_no_mask(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
-    ACCUMULATOR_TYPE,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
 ):
-    k_descale_ptr = k_descale_base_ptr
-
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
+        k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
+        delta_s_ptrs = delta_s_base_ptrs + start_n
 
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
         # Load K
         if PADDED_HEAD_QK:
-            k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
+            k_mask = offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_QK
             k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         else:
             k = tl.load(k_ptrs)
 
-        k_descale = tl.load(k_descale_ptr)
-        k_descale_ptr += stride_ksblk
+        k_descale = tl.load(k_descale_ptrs)
+        delta_s = tl.load(delta_s_ptrs)
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -86,10 +91,23 @@ def _sage_fwd_no_mask(
                 v = tl.load(v_ptrs)
 
         # setup qk accumlator
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+        qk = delta_s[None, :].broadcast_to((BLOCK_M, BLOCK_N))
 
+        # TODO SM_SCALE
         # -- compute qk ----
-        qk += tl.dot(q, k) * (q_descale * k_descale)
+        qk = (
+            tl.dot_scaled(
+                q,
+                q_descale,
+                Q_DTYPE_STR,
+                k,
+                k_descale,
+                K_DTYPE_STR,
+                fast_math=True,
+                acc=qk,
+            )
+            * SM_SCALE
+        )
         # qk_scaled = qk * SM_SCALE
         qk_scaled = qk
         if USE_ALIBI:
@@ -199,13 +217,14 @@ def _sage_fwd_no_mask(
 
 
 @triton.jit
-def _sage_fwd_mask(
+def _sage_fwd_mask_mxfp4(
     acc,
     l_i,
     m_i,
     q,
     k_base_ptrs,
     v_base_ptrs,
+    delta_s_base_ptrs,
     bias_base_ptrs,
     stride_kn,
     stride_vk,
@@ -225,15 +244,16 @@ def _sage_fwd_mask(
     off_h_q,
     offs_m,
     offs_n,
-    offs_d_qk,
+    offs_d_k,
     offs_d_v,
     block_min,
     block_max,
     n_extra_tokens,
     alibi_slope,
     q_descale,
-    k_descale_base_ptr,
-    stride_ksblk,
+    k_descale_base_ptrs,
+    stride_ksn,
+    SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -249,18 +269,18 @@ def _sage_fwd_mask(
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
-    ACCUMULATOR_TYPE,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
 ):
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
-
-    k_descale_ptr = k_descale_base_ptr
-
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
+        k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
+        delta_s_ptrs = delta_s_base_ptrs + start_n
 
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
@@ -268,20 +288,22 @@ def _sage_fwd_mask(
         k_mask = kv_offs_n[None, :] < seqlen_k
         v_mask = kv_offs_n[:, None] < seqlen_k
         if PADDED_HEAD_QK:
-            k_mask = k_mask & (offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK)
+            k_mask = k_mask & (offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_QK)
         if PADDED_HEAD_V:
             v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
 
         # load k and if preload_v then v
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
-        k_descale = tl.load(k_descale_ptr)
-        k_descale_ptr += stride_ksblk
+        k_descale = tl.load(
+            k_descale_ptrs, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
+        )
+        delta_s = tl.load(delta_s_ptrs, kv_offs_n < seqlen_k, other=0.0)
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # setup qk accumlator
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+        qk = delta_s[None, :].broadcast_to((BLOCK_M, BLOCK_N))
 
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -298,7 +320,19 @@ def _sage_fwd_mask(
             qk = tl.where(mask, qk, float("-inf"))
 
         # -- compute qk ----
-        qk += tl.dot(q, k) * (q_descale * k_descale)
+        qk = (
+            tl.dot_scaled(
+                q,
+                q_descale,
+                Q_DTYPE_STR,
+                k,
+                k_descale,
+                K_DTYPE_STR,
+                fast_math=True,
+                acc=qk,
+            )
+            * SM_SCALE
+        )
         # qk_scaled = qk * SM_SCALE
         qk_scaled = qk
 
@@ -562,312 +596,26 @@ def _sage_fwd_mask(
 
 
 @triton.jit
-def compute_window_bounds(
-    q_start,
-    q_end,
-    diag,
-    seqlen_k,
-    WINDOW_SIZE_LEFT: tl.constexpr,
-    WINDOW_SIZE_RIGHT: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-):
-    """Calculate the window boundaries for a query block."""
-    # Left boundary
-    if WINDOW_SIZE_LEFT < 0:
-        left_min = 0
-        left_max = 0
-    else:
-        left_min = tl.maximum(0, q_start + diag - WINDOW_SIZE_LEFT)
-        left_max = tl.maximum(0, q_end + diag - WINDOW_SIZE_LEFT)
-
-    # Right boundary
-    if IS_CAUSAL:
-        # Causal cap: col ≤ row + diag
-        right_min = tl.minimum(seqlen_k - 1, q_start + diag)
-        right_max = tl.minimum(seqlen_k - 1, q_end + diag)
-    else:
-        if WINDOW_SIZE_RIGHT < 0:
-            right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
-            right_max = tl.minimum(seqlen_k - 1, q_end + diag + WINDOW_SIZE_RIGHT)
-        else:
-            # Non-causal doesn't have the diagonal constraint
-            right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
-            right_max = tl.minimum(seqlen_k - 1, q_end + diag + WINDOW_SIZE_RIGHT)
-
-    return left_min, left_max, right_min, right_max
-
-
-@triton.jit
-def classify_window_blocks(
-    left_min, left_max, right_min, right_max, BLOCK_N: tl.constexpr
-):
-    """Classify blocks based on window boundaries."""
-    # First and last blocks that have ANY overlap with window
-    first_block = left_min // BLOCK_N
-    last_block = right_max // BLOCK_N
-
-    # First block that is FULLY visible for all rows in Q block
-    full_left_block = left_max // BLOCK_N + (left_max % BLOCK_N != 0)
-    clipped_left = tl.minimum(full_left_block, last_block + 1)
-
-    # Last block that is FULLY visible for all rows in Q block
-    last_full_block_candidate = right_min // BLOCK_N
-    if (last_full_block_candidate + 1) * BLOCK_N - 1 > right_min:
-        last_full_block_candidate -= 1
-    full_right_block = tl.maximum(last_full_block_candidate, clipped_left - 1)
-
-    # Calculate counts
-    n_front_skip_blocks = first_block
-    n_front_masked_blocks = tl.maximum(0, clipped_left - first_block)
-    n_full_blocks = tl.maximum(0, full_right_block - clipped_left + 1)
-    n_back_masked_blocks = tl.maximum(0, last_block - full_right_block)
-
-    return (
-        n_front_skip_blocks,
-        n_front_masked_blocks,
-        n_full_blocks,
-        n_back_masked_blocks,
-        clipped_left,
-    )  # Return clipped_left for padded block handling
-
-
-@triton.jit
-def handle_padded_last_block(
-    n_extra_tokens,
-    last_block,
-    total_k_blocks,
-    clipped_left,
-    n_front_masked_blocks,
-    n_full_blocks,
-    n_back_masked_blocks,
-):
-    """Ensure a padded last K-block is never classified as 'full'.
-
-    We move the padded last block (if visible) into the back-masked bucket.
-    If it's already back-masked, we do nothing.  If it was counted in the
-    front-masked range, we decrement front-masked; if it was counted as full,
-    we decrement full.  Then we increment back-masked.
-    """
-    padded_last_k = (n_extra_tokens != 0) & (last_block == total_k_blocks - 1)
-
-    if padded_last_k:
-        # current 'full' range right edge
-        full_right_block = clipped_left + n_full_blocks - 1
-
-        # If last_block is already beyond full_right_block, it's already in back-masked → nothing to do
-        last_already_back_masked = last_block > full_right_block
-        if not last_already_back_masked:
-            # If the window starts past last_block, it was counted in front-masked
-            if clipped_left > last_block:
-                n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
-            else:
-                # Otherwise it was counted 'full' → move it out of full
-                n_full_blocks = tl.maximum(0, n_full_blocks - 1)
-            # In both cases we need one more back-masked block
-            n_back_masked_blocks = n_back_masked_blocks + 1
-
-    return n_front_masked_blocks, n_full_blocks, n_back_masked_blocks
-
-
-@triton.jit
-def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
-    """Calculate padding information for the last K block."""
-    # check if we will need to do masking due either BLOCK_N being bigger than seqlen_k or seqlen_k not being a factor of BLOCK_N
-    # n_extra_tokens = 10 % 4 = 2
-    # This means the last K block has 2 valid tokens and 2 padding positions
-    # K blocks visualization:
-    #         Block 0         Block 1         Block 2 (last)
-    #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
-    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
-    #         full block     full block      valid  pad
-    if seqlen_k < BLOCK_N:
-        n_extra_tokens = BLOCK_N - seqlen_k
-    elif seqlen_k % BLOCK_N:
-        n_extra_tokens = seqlen_k % BLOCK_N
-    else:
-        n_extra_tokens = 0
-    return n_extra_tokens
-
-
-@triton.jit
-def compute_block_masking(
-    seqlen_k,
-    seqlen_q,
-    start_m,
-    IS_CAUSAL: tl.constexpr,
-    USE_SLIDING_WINDOW: tl.constexpr,
-    WINDOW_SIZE_LEFT: tl.constexpr,
-    WINDOW_SIZE_RIGHT: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """
-    Classify K blocks for attention computation with sliding window support.
-
-    Returns:
-        - n_front_skip_blocks: Blocks completely before the window
-        - n_front_masked_blocks: Blocks partially overlapping window front
-        - n_full_blocks: Blocks completely inside the window
-        - n_back_masked_blocks: Blocks partially overlapping window back
-        - n_extra_tokens: Padding tokens in last K block
-    """
-
-    # common
-    q_start = start_m * BLOCK_M
-    q_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
-    diag = seqlen_k - seqlen_q
-    total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
-    n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
-
-    if USE_SLIDING_WINDOW:
-        # get window bounds
-        left_min, left_max, right_min, right_max = compute_window_bounds(
-            q_start,
-            q_end,
-            diag,
-            seqlen_k,
-            WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT,
-            IS_CAUSAL,
-        )
-
-        # window vanishes → early exit
-        if right_max < left_min:
-            return 0, 0, 0, 0, n_extra_tokens
-
-        # classify blocks
-        (
-            n_front_skip_blocks,
-            n_front_masked_blocks,
-            n_full_blocks,
-            n_back_masked_blocks,
-            clipped_left,
-        ) = classify_window_blocks(left_min, left_max, right_min, right_max, BLOCK_N)
-
-        # handle padded last block if needed
-        if n_extra_tokens != 0:
-            last_block = right_max // BLOCK_N
-            n_front_masked_blocks, n_full_blocks, n_back_masked_blocks = (
-                handle_padded_last_block(
-                    n_extra_tokens,
-                    last_block,
-                    total_k_blocks,
-                    clipped_left,
-                    n_front_masked_blocks,
-                    n_full_blocks,
-                    n_back_masked_blocks,
-                )
-            )
-        return (
-            n_front_skip_blocks,
-            n_front_masked_blocks,
-            n_full_blocks,
-            n_back_masked_blocks,
-            n_extra_tokens,
-        )
-    else:
-        if IS_CAUSAL:
-            # ========== CAUSAL MODE: Classify K Blocks ==========
-            # Calculate causal boundary for this Q block
-            #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
-            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
-            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
-            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
-            #                            ↑ can see up to K5
-            #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
-
-            # ------------------------------------------------------------
-            # 1. figure out, in tokens, the right-most K position
-            #    this Q-block may attend to
-            # ------------------------------------------------------------
-            k_max_token = q_end + diag  # last visible K index
-
-            # this Q-block is entirely above the diagonal ⇒ nothing to do
-            if k_max_token < 0:
-                return 0, 0, 0, 0, n_extra_tokens
-
-            k_max_token = tl.minimum(k_max_token, seqlen_k - 1)
-
-            # ------------------------------------------------------------
-            # 2. translate token indices into K-block indices
-            # ------------------------------------------------------------
-            last_visible_k_block = k_max_token // BLOCK_N
-            n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
-
-            # ------------------------------------------------------------
-            # 3. classify those visible blocks
-            #    – we *never* skip or mask blocks in front, because causal
-            #      attention always starts at K0
-            #    – the back side can require several masked blocks:
-            #         • intersection of the causal diagonal with K-grid
-            #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-            #         • plus one extra block if this Q-block stops in the
-            #           middle of a K-block or the last K-block is padded
-            # ------------------------------------------------------------
-            padded_last_k = n_extra_tokens != 0
-            is_modulo_mn = (not padded_last_k) & (seqlen_q % BLOCK_M == 0)
-
-            n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
-            n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
-
-            n_front_skip_blocks = 0  # causal never skips the left side
-            n_front_masked_blocks = 0  # ditto
-            n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
-        else:
-            # ========== NON-CAUSAL MODE ==========
-            # Without causal mask, all positions can attend to all positions
-            # Only need to handle the padding in the last block
-            #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-
-            n_front_skip_blocks = 0  # never skips the left side
-            n_front_masked_blocks = 0  # ditto
-            if n_extra_tokens != 0:
-                n_back_masked_blocks = 1  # Last block needs padding mask
-                n_full_blocks = total_k_blocks - 1
-            else:
-                n_back_masked_blocks = 0  # All blocks are aligned
-                n_full_blocks = total_k_blocks
-
-        return (
-            n_front_skip_blocks,
-            n_front_masked_blocks,
-            n_full_blocks,
-            n_back_masked_blocks,
-            n_extra_tokens,
-        )
-
-
-@triton.jit
-def sage_fwd(
+def sage_fwd_mxfp4(
     Q,
     K,
     V,
+    Delta_S,  # [b, h, seq_q_blk, seq_k]
     bias,
     Q_Descale,
     K_Descale,
     V_Descale,
     stride_qsz,
     stride_qsh,
-    stride_qsblk,
+    stride_qsm,
     stride_ksz,
     stride_ksh,
-    stride_ksblk,
+    stride_ksn,
     stride_vsz,
     stride_vsh,
+    stride_dsz,
+    stride_dsh,
+    stride_dsq,
     LSE,
     Out,
     SD_MASK,
@@ -908,6 +656,8 @@ def sage_fwd(
     dropout_p,
     philox_seed,
     philox_offset_base,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
     RETURN_LSE: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -934,7 +684,14 @@ def sage_fwd(
     USE_SEQUSED: tl.constexpr,
 ):
     # set params
-    ACCUMULATOR_TYPE = tl.float32  # for q*k product
+    Q_HEAD_DIM_DIVISOR: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
+    K_HEAD_DIM_DIVISOR: tl.constexpr = 2 if K_DTYPE_STR == "e2m1" else 1
+    SCALE_GROUP_SIZE: tl.constexpr = 32
+    ACCUMULATOR_TYPE: tl.constexpr = tl.float32  # for q*k product
+
+    BLOCK_DMODEL_Q: tl.constexpr = BLOCK_DMODEL_QK // Q_HEAD_DIM_DIVISOR
+    BLOCK_DMODEL_K: tl.constexpr = BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR
+    BLOCK_DMODEL_QK_S: tl.constexpr = BLOCK_DMODEL_QK // SCALE_GROUP_SIZE
 
     # compute offsets
     start_m = tl.program_id(0)
@@ -952,7 +709,9 @@ def sage_fwd(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
+    offs_d_q = tl.arange(0, BLOCK_DMODEL_Q)  # we fit 2 fp4 elements per int8
+    offs_d_k = tl.arange(0, BLOCK_DMODEL_K)  # we fit 2 fp4 elements per int8
+    offs_d_qk_s = tl.arange(0, BLOCK_DMODEL_QK_S)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
     tl.multiple_of(offs_m, BLOCK_M),
     # N dimension
@@ -960,8 +719,11 @@ def sage_fwd(
     tl.multiple_of(offs_n, BLOCK_N),
 
     # D dimensions (MOST IMPORTANT)
-    offs_d_qk = tl.max_contiguous(
-        tl.multiple_of(offs_d_qk, BLOCK_DMODEL_QK), BLOCK_DMODEL_QK
+    offs_d_q = tl.max_contiguous(
+        tl.multiple_of(offs_d_q, BLOCK_DMODEL_Q), BLOCK_DMODEL_Q
+    )
+    offs_d_k = tl.max_contiguous(
+        tl.multiple_of(offs_d_q, BLOCK_DMODEL_K), BLOCK_DMODEL_K
     )
     offs_d_v = tl.max_contiguous(
         tl.multiple_of(offs_d_v, BLOCK_DMODEL_V), BLOCK_DMODEL_V
@@ -1080,31 +842,40 @@ def sage_fwd(
     q_offset = (
         Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
     )
-    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[None, :] * stride_qk
+    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_q[None, :] * stride_qk
     k_offset = (
         K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
     )
-    k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[None, :] * stride_kn
+    k_ptrs = k_offset + offs_d_k[:, None] * stride_kk + offs_n[None, :] * stride_kn
     v_offset = (
         V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     )
     v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
-    q_descale_ptr = (
+    q_descale_offset = (
         Q_Descale
         + off_z * stride_qsz
         + off_h_q * stride_qsh
-        + (start_m + cu_seqlens_q_start) * stride_qsblk
+        + (start_m + cu_seqlens_q_start) * stride_qsm
+    )
+    q_descale_ptrs = (
+        q_descale_offset + offs_m[:, None] * stride_qsm + offs_d_qk_s[None, :]
     )
     k_descale_offset = (
         K_Descale
         + off_z * stride_ksz
         + off_h_k * stride_ksh
-        + cu_seqlens_k_start * stride_ksblk
+        + cu_seqlens_k_start * stride_ksn
+    )
+    k_descale_ptrs = (
+        k_descale_offset + offs_n[:, None] * stride_ksn + offs_d_qk_s[None, :]
     )
     v_descale_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
+    delta_s_offset = Delta_S + off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
+    delta_s_ptrs = delta_s_offset + offs_n
 
-    q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
-
+    q_descale = tl.load(
+        q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0
+    )  # MHA: use q head index
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
         bias_offset = off_h_q * stride_bh
@@ -1131,7 +902,9 @@ def sage_fwd(
     # Q is loaded once at the beginning and shared by all N blocks.
     q_ptrs_mask = offs_m[:, None] < seqlen_q
     if PADDED_HEAD_QK:
-        q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :] < ACTUAL_BLOCK_DMODEL_QK)
+        q_ptrs_mask = q_ptrs_mask & (
+            offs_d_q[None, :] < ACTUAL_BLOCK_DMODEL_QK // Q_HEAD_DIM_DIVISOR
+        )
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
     # ========== Process MASKED K Blocks in the front ==========
@@ -1139,16 +912,14 @@ def sage_fwd(
     if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
         block_min = n_front_skip_blocks * BLOCK_N
         block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
-
-        k_descale_ptr = k_descale_offset + n_front_skip_blocks * stride_ksblk
-
-        acc, l_i, m_i = _sage_fwd_mask(
+        acc, l_i, m_i = _sage_fwd_mask_mxfp4(
             acc,
             l_i,
             m_i,
             q,
             k_ptrs,
             v_ptrs,
+            delta_s_ptrs,
             bias_ptrs,
             stride_kn,
             stride_vk,
@@ -1168,15 +939,16 @@ def sage_fwd(
             off_h_q,
             offs_m,
             offs_n,
-            offs_d_qk,
+            offs_d_k,
             offs_d_v,
             block_min,  # Start of front masked blocks
             block_max,  # End of front masked blocks
             0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
             alibi_slope,
             q_descale,
-            k_descale_ptr,
-            stride_ksblk,
+            k_descale_ptrs,
+            stride_ksn,
+            SM_SCALE,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_N,
@@ -1192,7 +964,8 @@ def sage_fwd(
             USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            Q_DTYPE_STR=Q_DTYPE_STR,
+            K_DTYPE_STR=K_DTYPE_STR,
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1202,18 +975,14 @@ def sage_fwd(
             n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
         ) * BLOCK_N
 
-        k_descale_ptr = (
-            k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks) * stride_ksblk
-        )
-
-        acc, l_i, m_i = _sage_fwd_no_mask(
+        acc, l_i, m_i = _sage_fwd_no_mask_mxfp4(
             acc,
             l_i,
             m_i,
             q,
             k_ptrs,
             v_ptrs,
+            delta_s_ptrs,
             bias_ptrs,
             stride_kn,
             stride_vk,
@@ -1232,14 +1001,15 @@ def sage_fwd(
             off_z,
             off_h_q,
             offs_m,
-            offs_d_qk,
+            offs_d_k,
             offs_d_v,
             block_min,  # Start of range: 0
             block_max,  # End of range: n_full_blocks * BLOCK_N
             alibi_slope,
             q_descale,
-            k_descale_ptr,
-            stride_ksblk,
+            k_descale_ptrs,
+            stride_ksn,
+            SM_SCALE,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -1251,7 +1021,8 @@ def sage_fwd(
             USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            Q_DTYPE_STR=Q_DTYPE_STR,
+            K_DTYPE_STR=K_DTYPE_STR,
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1266,19 +1037,14 @@ def sage_fwd(
             + n_back_masked_blocks
         ) * BLOCK_N
 
-        k_descale_ptr = (
-            k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
-            * stride_ksblk
-        )
-
-        acc, l_i, m_i = _sage_fwd_mask(
+        acc, l_i, m_i = _sage_fwd_mask_mxfp4(
             acc,
             l_i,
             m_i,
             q,
             k_ptrs,
             v_ptrs,
+            delta_s_ptrs,
             bias_ptrs,
             stride_kn,
             stride_vk,
@@ -1298,15 +1064,16 @@ def sage_fwd(
             off_h_q,
             offs_m,
             offs_n,
-            offs_d_qk,
+            offs_d_k,
             offs_d_v,
             block_min,  # Start of range: n_full_blocks * BLOCK_N
             block_max,  # End of range: n_visible_k_blocks * BLOCK_N
             n_extra_tokens,  # Padding tokens in last block
             alibi_slope,
             q_descale,
-            k_descale_ptr,
-            stride_ksblk,
+            k_descale_ptrs,
+            stride_ksn,
+            SM_SCALE,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_N,
@@ -1322,7 +1089,8 @@ def sage_fwd(
             USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            Q_DTYPE_STR=Q_DTYPE_STR,
+            K_DTYPE_STR=K_DTYPE_STR,
         )
 
     # ============================================================
@@ -1458,7 +1226,7 @@ def sage_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
-def sage_quant(
+def sage_quant_mxfp4(
     q,
     k,
     v,
@@ -1470,42 +1238,18 @@ def sage_quant(
     layout="bshd",
     smooth_k=True,
 ):
-    """
-    Quantize Q and K tensors to INT8 with per-block scaling.
-
-    Args:
-        q: Query tensor
-        k: Key tensor
-        km: Optional pre-computed K smoothing factors (if None and smooth_k=True, will be computed)
-        BLKQ: Block size for Q quantization
-        BLKK: Block size for K quantization
-        sm_scale: Softmax scale factor (defaults to head_dim^-0.5)
-        layout: Either "bshd" or "bhsd"
-        smooth_k: Whether to apply SageAttention-style smoothing to K tensor (default: True)
-
-    Returns:
-        q_int8: Quantized Q tensor
-        q_scale: Per-block scales for Q
-        k_int8: Quantized K tensor
-        k_scale: Per-block scales for K
-        k_smooth: K smoothing factors applied (or None if smooth_k=False)
-    """
-    q_int8 = torch.empty_like(q, dtype=torch.int8, device=q.device)
-    k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = k.shape
 
-        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
 
     elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = k.shape
 
-        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
@@ -1513,207 +1257,416 @@ def sage_quant(
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
     # Apply K tensor smoothing following SageAttention approach
-    if smooth_k:
-        k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
-
-    q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
-    k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
-
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
-
-    q_task_count = b * h_qo * Q_NUM_BLKS
-    k_task_count = b * h_kv * K_NUM_BLKS
     v_task_count = b * h_kv * K_NUM_BLKS
-
-    grid = (q_task_count + k_task_count + v_task_count,)
-
-    # call sage_quant_kernel
-    sage_quant_kernel[grid](
-        q,
-        q_int8,
-        q_scale,
-        k,
-        k_int8,
-        k_scale,
+    grid = (v_task_count,)
+    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, layout=layout)
+    sage_quant_v_kernel[grid](
         v,
         v_fp8,
         v_scale,
-        stride_bz_q,
-        stride_h_q,
-        stride_seq_q,
         stride_bz_k,
         stride_h_k,
         stride_seq_k,
-        q_scale.stride(0),
-        q_scale.stride(1),
-        k_scale.stride(0),
-        k_scale.stride(1),
         v_scale.stride(0),
         v_scale.stride(1),
-        (sm_scale * 1.4426950408889634),
-        q_task_count,
-        k_task_count,
         b,
-        h_qo,
         h_kv,
-        Q_NUM_BLKS,
         K_NUM_BLKS,
-        qo_len,
         kv_len,
-        triton.next_power_of_2(kv_len),
-        FP8_MAX=FP8_MAX,
-        INT8_MAX=torch.iinfo(q_int8.dtype).max,
         D=head_dim,
-        BLK_Q=BLKQ,
         BLK_K=BLKK,
         num_stages=3,
         num_warps=8,
     )
 
-    return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
+    q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
+    k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
 
 @triton.jit
-def sage_quant_kernel(
-    Q_Input,
-    Q_Output,
-    Q_Scale,
-    K_Input,
-    K_Output,
-    K_Scale,
+def sage_quant_v_kernel(
     V_Input,
     V_Output,
     V_Scale,
-    stride_qz,
-    stride_qh,
-    stride_qn,
     stride_kz,
     stride_kh,
     stride_kn,
-    stride_qsz,
-    stride_qsh,
-    stride_ksz,
-    stride_ksh,
     stride_vsz,
     stride_vsh,
-    sm_scale,
-    q_task_count,
-    k_task_count,
     BATCH,
-    Q_HEAD,
     K_HEAD,
-    Q_NUM_BLKS,
     K_NUM_BLKS,
-    SEQLEN_Q,
     SEQLEN_K,
-    SEQLEN_K_PADDED: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    INT8_MAX: tl.constexpr,
     D: tl.constexpr,
-    BLK_Q: tl.constexpr,
     BLK_K: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    offs_blk_q = tl.arange(0, BLK_Q)
     offs_blk_k = tl.arange(0, BLK_K)
     offs_d = tl.arange(0, D)
 
-    if pid < q_task_count:
-        # here we do Q
-        off_blk, off_h, off_b = pid_grid_3d(pid, Q_NUM_BLKS, Q_HEAD, BATCH)
-        offs_qn = off_blk * BLK_Q + offs_blk_q
+    # V
+    off_blk, off_h, off_b = pid_grid_3d(pid, K_NUM_BLKS, K_HEAD, BATCH)
+    offs_kn = off_blk * BLK_K + offs_blk_k
 
-        q_offs = (
-            off_b * stride_qz
-            + off_h * stride_qh
-            + offs_qn[:, None] * stride_qn
-            + offs_d[None, :]
-        )
+    v_offs = (
+        off_b * stride_kz
+        + off_h * stride_kh
+        + offs_kn[:, None] * stride_kn
+        + offs_d[None, :]
+    )
 
-        q_input_ptrs = Q_Input + q_offs
-        q_output_ptrs = Q_Output + q_offs
-        q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
+    v_input_ptrs = V_Input + v_offs
+    v_output_ptrs = V_Output + v_offs
 
-        _general_quant_kernel(
-            q_input_ptrs,
-            q_output_ptrs,
-            q_scale_ptrs,
-            INT8_MAX,
-            offs_qn[:, None] < SEQLEN_Q,
-            sm_scale=sm_scale,
-        )
-    elif pid >= q_task_count and pid < q_task_count + k_task_count:
-        # here we do K
-        _pid = pid - q_task_count
-        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-
-        offs_kn = off_blk * BLK_K + offs_blk_k
-
-        k_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
-        )
-
-        k_input_ptrs = K_Input + k_offs
-        k_output_ptrs = K_Output + k_offs
-        k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
-
-        _general_quant_kernel(
-            k_input_ptrs,
-            k_output_ptrs,
-            k_scale_ptrs,
-            INT8_MAX,
-            offs_kn[:, None] < SEQLEN_K,
-        )
-    else:
-        # V
-        _pid = pid - (q_task_count + k_task_count)
-        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-        offs_kn = off_blk * BLK_K + offs_blk_k
-
-        v_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
-        )
-
-        v_input_ptrs = V_Input + v_offs
-        v_output_ptrs = V_Output + v_offs
-
-        # just apply the per channel v_scales that have been computed outside
-        v_scale_ptrs = (
-            V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
-        )
-        v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
-        v = v.to(tl.float32)
-        v_scales = tl.load(v_scale_ptrs)
-        v_quant = v / v_scales
-        v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
-        tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
+    # just apply the per channel v_scales that have been computed outside
+    v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
+    v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
+    v = v.to(tl.float32)
+    v_scales = tl.load(v_scale_ptrs)
+    v_quant = v / v_scales
+    v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+    tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
 @triton.jit
-def _general_quant_kernel(
-    input_ptrs, output_ptrs, scale_ptrs, DTYPE_MAX, mask, sm_scale=None
+def _rot_q_kernel(
+    Q,
+    Q_rot,
+    Q_mean,
+    R,  # Hadamard matrix
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    stride_md,
+    n_heads,
+    seq_len,
+    d_model,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,  # BLOCK_D is 32
 ):
-    if mask is not None:
-        x = tl.load(input_ptrs, mask=mask, other=0.0)
-    else:
-        x = tl.load(input_ptrs)
-    x = x.to(tl.float32)
-    if sm_scale is not None:
-        x *= sm_scale
-    scale = tl.max(tl.abs(x)) / DTYPE_MAX
-    x_quant = x / scale
-    if output_ptrs.dtype.element_ty == tl.int8:
-        x_quant += 0.5 * tl.where(x_quant >= 0, 1, -1)
-    x_quant = x_quant.to(output_ptrs.dtype.element_ty)
-    tl.store(output_ptrs, x_quant, mask=mask)
-    tl.store(scale_ptrs, scale)
+    # Grid: (batch * n_heads, seq_len // BLOCK_M, d_model // BLOCK_D)
+    pid_bh = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_d = tl.program_id(2)
+
+    pid_h = pid_bh % n_heads
+    pid_b = pid_bh // n_heads
+
+    # Offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    # Load Q block and R (Hadamard)
+    # Q block shape: [BLOCK_M, BLOCK_D]
+    q_ptr = (
+        Q
+        + pid_b * stride_qb
+        + pid_h * stride_qh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+    r_ptr = (
+        R + tl.arange(0, BLOCK_D)[:, None] * BLOCK_D + tl.arange(0, BLOCK_D)[None, :]
+    )
+    q_tile = tl.load(
+        q_ptr, mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model), other=0.0
+    )
+    r_mat = tl.load(r_ptr)  # 32x32
+
+    # Rotate: Q_rot = Q @ R
+    q_rot_tile = tl.dot(q_tile, r_mat)
+
+    # Store rotated Q
+    rot_ptr = (
+        Q_rot
+        + pid_b * stride_qb
+        + pid_h * stride_qh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+    tl.store(
+        rot_ptr,
+        q_rot_tile,
+        mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model),
+    )
+
+    # Calculate mean for the block (reduction over d within the BLOCK_M)
+    # q_mean shape: [B, H, Q_NUM_BLKS, D]
+    m_row_sum = tl.sum(q_rot_tile, axis=0)  # Sum over BLOCK_M -> shape [BLOCK_D]
+
+    # Store mean (Atomic add or structured store)
+    # For simplicity in this layout, we store the block-sum
+    # and divide by BLOCK_M in the host or final step
+    mean_ptr = Q_mean + pid_b * stride_mb + pid_h * stride_mh + pid_m * stride_mm + offs_d * stride_md
+    tl.store(mean_ptr, m_row_sum / BLOCK_M)
+
+
+@triton.jit
+def _rot_k_only_kernel(
+    K,
+    K_rot,
+    R,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    n_heads,
+    seq_k,
+    d_model,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_d = tl.program_id(2)
+
+    pid_h = pid_bh % n_heads
+    pid_b = pid_bh // n_heads
+
+    offs_n = pid_n * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    # Load K block and R
+    k_ptr = (
+        K
+        + pid_b * stride_kb
+        + pid_h * stride_kh
+        + offs_n[:, None] * stride_kn
+        + offs_d[None, :] * stride_kd
+    )
+    r_ptr = (
+        R + tl.arange(0, BLOCK_D)[:, None] * BLOCK_D + tl.arange(0, BLOCK_D)[None, :]
+    )
+
+    k_tile = tl.load(
+        k_ptr, mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < d_model), other=0.0
+    )
+    r_mat = tl.load(r_ptr)
+
+    # Rotate K
+    k_rot_tile = tl.dot(k_tile, r_mat)
+
+    # Store
+    rot_ptr = (
+        K_rot
+        + pid_b * stride_kb
+        + pid_h * stride_kh
+        + offs_n[:, None] * stride_kn
+        + offs_d[None, :] * stride_kd
+    )
+    tl.store(
+        rot_ptr,
+        k_rot_tile,
+        mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < d_model),
+    )
+
+
+@triton.jit
+def _compute_delta_s_kernel(
+    Q_mean,
+    K_rot,
+    Delta_S,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    stride_md,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_sb,
+    stride_sh,
+    stride_sm,
+    stride_sn,
+    n_heads,
+    seq_k,
+    d_model,
+    BLOCK_N: tl.constexpr,  # Number of K-tokens to process
+):
+    pid_bh = tl.program_id(0)
+    pid_m_q = tl.program_id(1)  # The Q-block index
+    pid_n_k = tl.program_id(2)  # The K-block index
+
+    pid_h = pid_bh % n_heads
+    pid_b = pid_bh // n_heads
+
+    offs_n = pid_n_k * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Accumulate dot product across the whole d_model
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    # Loop over d_model in steps of 32 (our block_size)
+    for d_offset in range(0, d_model, 32):
+        offs_d = d_offset + tl.arange(0, 32)
+
+        # Load Q_mean segment: [32]
+        qm_ptr = Q_mean + pid_b * stride_mb + pid_h * stride_mh + pid_m_q * stride_mm + offs_d * stride_md
+        qm_val = tl.load(qm_ptr)
+
+        # Load K_rot segment: [BLOCK_N, 32]
+        kn_ptr = (
+            K_rot
+            + pid_b * stride_kb
+            + pid_h * stride_kh
+            + offs_n[:, None] * stride_kn
+            + offs_d[None, :] * stride_kd
+        )
+        kn_val = tl.load(kn_ptr, mask=offs_n[:, None] < seq_k, other=0.0)
+
+        # Compute dot product for this d-segment
+        acc += tl.sum(qm_val[None, :] * kn_val, axis=1)
+
+    # Store to Delta_S [B, H, Q_BLKS, seq_k]
+    s_ptr = Delta_S + pid_b * stride_sb + pid_h * stride_sh + pid_m_q * stride_sm + offs_n * stride_sn
+    tl.store(s_ptr, acc, mask=offs_n < seq_k)
+
+
+def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
+    """
+    Create an orthogonal Hadamard matrix of size block_size x block_size.
+    Uses Sylvester's recursive construction and normalizes to be orthogonal.
+
+    Args:
+        block_size: Size of the matrix (must be a power of 2)
+
+    Returns:
+        Orthogonal Hadamard matrix of shape (block_size, block_size)
+        Satisfies: H @ H.T = I (identity matrix)
+
+    Example:
+        H_2 = [[1,  1],
+               [1, -1]] / sqrt(2)
+
+        H_4 = [[1,  1,  1,  1],
+               [1, -1,  1, -1],
+               [1,  1, -1, -1],
+               [1, -1, -1,  1]] / 2
+    """
+    assert (block_size & (block_size - 1)) == 0, "block_size must be power of 2"
+    assert block_size > 0, "block_size must be positive"
+
+    # Base case: H_1 = [1]
+    if block_size == 1:
+        return torch.ones(1, 1, device=device, dtype=dtype)
+
+    # Recursive construction: H_{2n} = [H_n   H_n  ]
+    #                                   [H_n  -H_n ]
+    H_half = create_hadamard_matrix(block_size // 2, device=device, dtype=dtype)
+
+    # Build the full matrix (unnormalized)
+    H = torch.zeros(block_size, block_size, device=device, dtype=dtype)
+    half = block_size // 2
+    H[:half, :half] = H_half
+    H[:half, half:] = H_half
+    H[half:, :half] = H_half
+    H[half:, half:] = -H_half
+
+    # Normalize to make it orthogonal: H @ H.T = I
+    # The unnormalized matrix satisfies H_unnorm @ H_unnorm.T = block_size * I
+    # So divide by sqrt(block_size) to get orthogonal matrix
+    # H = H / (2.0 ** 0.5)  # Divide by sqrt(2) since we doubled the size
+
+    return H
+
+
+def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, layout="bhsd"):
+    # Generate Hadamard Matrix R (Rank 32)
+    R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
+    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+
+    # shapes
+    b, s_q, h_q, d = map_dims(q.shape, bshd)
+    _, s_k, h_k, _ = map_dims(k.shape, bshd)
+
+    Q_rot = torch.empty_like(q)
+    K_rot = torch.empty_like(k)
+
+    Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+
+    # TODO check the dtypes for scales
+    q_mean = torch.empty((b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device)
+    delta_s = torch.empty(
+        (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
+    )
+
+    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+
+    # Launch Q Kernel
+    grid_q = (b * h_q, Q_NUM_BLKS, d // block_size)
+    _rot_q_kernel[grid_q](
+        q,
+        Q_rot,
+        q_mean,
+        R,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        q_mean.stride(0),
+        q_mean.stride(1),
+        q_mean.stride(2),
+        q_mean.stride(3),
+        h_q,
+        s_q,
+        d,
+        BLOCK_M=BLOCK_SIZE_M,
+        BLOCK_D=block_size,
+    )
+
+    # 2. Rotate K (Only once!)
+    grid_k = (b * h_k, K_NUM_BLKS, d // block_size)
+    _rot_k_only_kernel[grid_k](
+        k,
+        K_rot,
+        R,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        h_k,
+        s_k,
+        d,
+        BLOCK_M=BLOCK_SIZE_M,
+        BLOCK_D=block_size,
+    )
+
+    # smooth k after rotation
+    k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+
+    # 3. Compute Smoothing Delta S
+    # Grid: Each Q-block x Each K-block
+    grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
+    _compute_delta_s_kernel[grid_delta](
+        q_mean,
+        K_rot,
+        delta_s,
+        q_mean.stride(0),
+        q_mean.stride(1),
+        q_mean.stride(2),
+        q_mean.stride(3),
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        delta_s.stride(0),
+        delta_s.stride(1),
+        delta_s.stride(2),
+        delta_s.stride(3),
+        h_k,
+        s_k,
+        d,
+        BLOCK_N=BLOCK_SIZE_M,
+    )
+
+    return Q_rot, K_rot, delta_s
