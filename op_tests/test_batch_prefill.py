@@ -1821,7 +1821,6 @@ def run_batch_prefill_kv_blockscale(
     kv_indptr = kv_cache["kv_indptr_cpu"]
     kv_indices = kv_cache["kv_indices_cpu"]
     kv_last_page_len_cpu = kv_cache["kv_last_page_len_cpu"]
-    total_num_pages = kv_cache["total_num_pages"]
 
     # Split K/V from paged format
     k_paged_ref, v_paged_ref = split_kv_pages(kv_data)  # BF16 for BF16 kernel
