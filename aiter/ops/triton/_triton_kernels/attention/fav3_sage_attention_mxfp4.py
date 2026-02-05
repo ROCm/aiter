@@ -1232,9 +1232,7 @@ def sage_quant_mxfp4(
     FP8_MAX,
     BLKQ=128,
     BLKK=64,
-    sm_scale=None,
     layout="bshd",
-    smooth_k=True,
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
@@ -1251,7 +1249,6 @@ def sage_quant_mxfp4(
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
-    Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
     # Apply K tensor smoothing following SageAttention approach

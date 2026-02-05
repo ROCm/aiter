@@ -314,7 +314,7 @@ def fav3_sage_forward_func(
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
     use_mxfp4_sage: bool = False,
-    include_quantization_overhead: bool = False,
+    include_quantization_overhead: bool = True,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
