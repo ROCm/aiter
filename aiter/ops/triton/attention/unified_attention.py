@@ -265,7 +265,7 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
-        
+
         kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
