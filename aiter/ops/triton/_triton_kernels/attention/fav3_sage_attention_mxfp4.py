@@ -1393,21 +1393,24 @@ def _rot_q_kernel(
         + offs_m[:, None] * stride_qm
         + offs_d[None, :] * stride_qd
     )
+
+    # Calculate mean for the block (reduction over d within the BLOCK_M)
+    # q_mean shape: [B, H, Q_NUM_BLKS, D]
+    m_row_mean = tl.sum(q_rot_tile, axis=0) / BLOCK_M  # Sum over BLOCK_M -> shape [BLOCK_D]
+
+    q_rot_tile -= m_row_mean[None, :]
+
     tl.store(
         rot_ptr,
         q_rot_tile,
         mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model),
     )
 
-    # Calculate mean for the block (reduction over d within the BLOCK_M)
-    # q_mean shape: [B, H, Q_NUM_BLKS, D]
-    m_row_sum = tl.sum(q_rot_tile, axis=0)  # Sum over BLOCK_M -> shape [BLOCK_D]
-
     # Store mean (Atomic add or structured store)
     # For simplicity in this layout, we store the block-sum
     # and divide by BLOCK_M in the host or final step
     mean_ptr = Q_mean + pid_b * stride_mb + pid_h * stride_mh + pid_m * stride_mm + offs_d * stride_md
-    tl.store(mean_ptr, m_row_sum / BLOCK_M)
+    tl.store(mean_ptr, m_row_mean)
 
 
 @triton.jit
