@@ -93,7 +93,6 @@ def _sage_fwd_no_mask_mxfp4(
         # setup qk accumlator
         qk = delta_s[None, :].broadcast_to((BLOCK_M, BLOCK_N))
 
-        # TODO SM_SCALE
         # -- compute qk ----
         qk = (
             tl.dot_scaled(
@@ -108,15 +107,14 @@ def _sage_fwd_no_mask_mxfp4(
             )
             * SM_SCALE
         )
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
+
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            qk_scaled += alibi_block
+            qk += alibi_block
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -125,14 +123,14 @@ def _sage_fwd_no_mask_mxfp4(
         if bias_base_ptrs is not None:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+            qk += bias
 
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
         q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+            m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
         )
 
         # Compute scaled QK and softmax probabilities
@@ -333,8 +331,6 @@ def _sage_fwd_mask_mxfp4(
             )
             * SM_SCALE
         )
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -342,7 +338,7 @@ def _sage_fwd_mask_mxfp4(
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            qk_scaled += alibi_block
+            qk += alibi_block
 
         if USE_SLIDING_WINDOW:
             if IS_CAUSAL:
@@ -384,7 +380,7 @@ def _sage_fwd_mask_mxfp4(
                 mask = causal_mask | window_mask
 
                 # Apply mask
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
+                qk = tl.where(mask, float("-inf"), qk)
             else:
                 # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
                 # Exactly matching reference construct_local_mask:
@@ -431,12 +427,12 @@ def _sage_fwd_mask_mxfp4(
                     )
 
                 # Apply mask (set to -inf where mask is True)
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
+                qk = tl.where(mask, float("-inf"), qk)
         else:
             if IS_CAUSAL:
                 causal_boundary = start_n + offs_n - seqlen_delta_qk
                 causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-                qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+                qk = tl.where(causal_mask, qk, float("-inf"))
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -445,23 +441,23 @@ def _sage_fwd_mask_mxfp4(
         if bias_base_ptrs is not None:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+            qk += bias
 
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
         # IMPORTANT: Handle the case where all values are -inf
-        # When m_ij = -inf and qk_scaled = -inf, subtraction gives NaN
+        # When m_ij = -inf and qk = -inf, subtraction gives NaN
         # We need to handle this explicitly
         if USE_SLIDING_WINDOW:
             # Check if this block has any valid values (m_ij != -inf)
             # For rows where everything is -inf, set q_shifted to -inf (not NaN)
             q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
             )
         else:
-            q_shifted = qk_scaled - m_ij[:, None]
+            q_shifted = qk - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -870,7 +866,9 @@ def sage_fwd_mxfp4(
         k_descale_offset + offs_n[:, None] * stride_ksn + offs_d_qk_s[None, :]
     )
     v_descale_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
-    delta_s_offset = Delta_S + off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
+    delta_s_offset = (
+        Delta_S + off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
+    )
     delta_s_ptrs = delta_s_offset + offs_n
 
     q_descale = tl.load(
@@ -1396,7 +1394,9 @@ def _rot_q_kernel(
 
     # Calculate mean for the block (reduction over d within the BLOCK_M)
     # q_mean shape: [B, H, Q_NUM_BLKS, D]
-    m_row_mean = tl.sum(q_rot_tile, axis=0) / BLOCK_M  # Sum over BLOCK_M -> shape [BLOCK_D]
+    m_row_mean = (
+        tl.sum(q_rot_tile, axis=0) / BLOCK_M
+    )  # Sum over BLOCK_M -> shape [BLOCK_D]
 
     q_rot_tile -= m_row_mean[None, :]
 
@@ -1409,7 +1409,13 @@ def _rot_q_kernel(
     # Store mean (Atomic add or structured store)
     # For simplicity in this layout, we store the block-sum
     # and divide by BLOCK_M in the host or final step
-    mean_ptr = Q_mean + pid_b * stride_mb + pid_h * stride_mh + pid_m * stride_mm + offs_d * stride_md
+    mean_ptr = (
+        Q_mean
+        + pid_b * stride_mb
+        + pid_h * stride_mh
+        + pid_m * stride_mm
+        + offs_d * stride_md
+    )
     tl.store(mean_ptr, m_row_mean)
 
 
@@ -1512,7 +1518,13 @@ def _compute_delta_s_kernel(
         offs_d = d_offset + tl.arange(0, 32)
 
         # Load Q_mean segment: [32]
-        qm_ptr = Q_mean + pid_b * stride_mb + pid_h * stride_mh + pid_m_q * stride_mm + offs_d * stride_md
+        qm_ptr = (
+            Q_mean
+            + pid_b * stride_mb
+            + pid_h * stride_mh
+            + pid_m_q * stride_mm
+            + offs_d * stride_md
+        )
         qm_val = tl.load(qm_ptr)
 
         # Load K_rot segment: [BLOCK_N, 32]
@@ -1529,7 +1541,13 @@ def _compute_delta_s_kernel(
         acc += tl.sum(qm_val[None, :] * kn_val, axis=1)
 
     # Store to Delta_S [B, H, Q_BLKS, seq_k]
-    s_ptr = Delta_S + pid_b * stride_sb + pid_h * stride_sh + pid_m_q * stride_sm + offs_n * stride_sn
+    s_ptr = (
+        Delta_S
+        + pid_b * stride_sb
+        + pid_h * stride_sh
+        + pid_m_q * stride_sm
+        + offs_n * stride_sn
+    )
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
 

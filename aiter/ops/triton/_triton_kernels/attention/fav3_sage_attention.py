@@ -90,15 +90,14 @@ def _sage_fwd_no_mask(
 
         # -- compute qk ----
         qk += tl.dot(q, k) * (q_descale * k_descale)
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
+
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            qk_scaled += alibi_block
+            qk += alibi_block
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -107,14 +106,14 @@ def _sage_fwd_no_mask(
         if bias_base_ptrs is not None:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+            qk += bias
 
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
         q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+            m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
         )
 
         # Compute scaled QK and softmax probabilities
@@ -299,8 +298,6 @@ def _sage_fwd_mask(
 
         # -- compute qk ----
         qk += tl.dot(q, k) * (q_descale * k_descale)
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -308,7 +305,7 @@ def _sage_fwd_mask(
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            qk_scaled += alibi_block
+            qk += alibi_block
 
         if USE_SLIDING_WINDOW:
             if IS_CAUSAL:
@@ -350,7 +347,7 @@ def _sage_fwd_mask(
                 mask = causal_mask | window_mask
 
                 # Apply mask
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
+                qk = tl.where(mask, float("-inf"), qk)
             else:
                 # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
                 # Exactly matching reference construct_local_mask:
@@ -397,12 +394,12 @@ def _sage_fwd_mask(
                     )
 
                 # Apply mask (set to -inf where mask is True)
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
+                qk = tl.where(mask, float("-inf"), qk)
         else:
             if IS_CAUSAL:
                 causal_boundary = start_n + offs_n - seqlen_delta_qk
                 causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-                qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+                qk = tl.where(causal_mask, qk, float("-inf"))
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -411,23 +408,23 @@ def _sage_fwd_mask(
         if bias_base_ptrs is not None:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+            qk += bias
 
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
         # IMPORTANT: Handle the case where all values are -inf
-        # When m_ij = -inf and qk_scaled = -inf, subtraction gives NaN
+        # When m_ij = -inf and qk = -inf, subtraction gives NaN
         # We need to handle this explicitly
         if USE_SLIDING_WINDOW:
             # Check if this block has any valid values (m_ij != -inf)
             # For rows where everything is -inf, set q_shifted to -inf (not NaN)
             q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
             )
         else:
-            q_shifted = qk_scaled - m_ij[:, None]
+            q_shifted = qk - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
