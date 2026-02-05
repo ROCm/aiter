@@ -124,7 +124,8 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
     using GemmTraits      = ck_tile::TileGemmQuantTraits<false, // kPadM_v,
                                                          PadN,
                                                          PadK,
-                                                         false, // PreshuffleQuant, not support yet
+                                                         false, // PreshuffleQuantA, not support yet
+                                                         false, // PreshuffleQuantB, not support yet
                                                          false, // PreshuffleB, not support yet
                                                          ALayout,
                                                          BLayout,

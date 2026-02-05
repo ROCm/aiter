@@ -593,10 +593,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
     {
         tmps[warp_id][rank * part + idx - start] = input_ptr[idx];
     }
-    start_sync<ngpus>(sg, self_sg, rank);
+    end_sync<ngpus>(sg, self_sg, rank);
  
     // stage 2: reduce scatter & write result to remote rank
-    for(int idx = tid; idx < part; idx += stride)
+    end = rank != ngpus - 1 ? part : size - part * (ngpus-1);
+    for(int idx = tid; idx < end; idx += stride)
     {
         *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = tmp_out[warp_id * part + idx];
         __syncthreads();
@@ -644,11 +645,13 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
             tmps[warp_id][rank * part + idx + stage3_offset] = *(reinterpret_cast<P*>(&res_smem[0]) + lane_id);
         }
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    end_sync<ngpus>(sg, self_sg, rank);
+
     if (!is_broadcast_reg_outptr)
     {
         // stage 3: get the output from tmp_buffer
-        for(int idx = threadIdx.x + blockIdx.x * blockDim.x; idx < size; idx += gridDim.x * blockDim.x)
+        end = warp_id == ngpus - 1 ? size : start + part;
+        for(int idx = start + tid; idx < end; idx += stride)
         {
             ((P*)result)[idx] = tmp_out[idx + stage3_offset];
         }
