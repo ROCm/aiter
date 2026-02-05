@@ -819,6 +819,9 @@ class ck_moe_2stage_gemm_codegen:
                                 self.mul_routed_weight_stage == kernel.stage
                             ).lower(),
                         )
+                        if "FP4" in self.b_dtype:
+                            stage_instance = "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
+
                         f_ins.write(stage_instance)
 
                 ## generate lookUpTable

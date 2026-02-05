@@ -213,8 +213,6 @@ a4w4_bns_gemm1_kernels_list= {
      2: kernelInstanceGEMM1(       256,      128,          64,       128,     2,       2,        3,),
 }
 
-empty_list= {}
-
 gemm1_kernels_dict = {
     "a16w16_gfx950": a16w16_gemm1_kernels_list_gfx950,
     "a16w16": a16w16_gemm1_kernels_list,
@@ -224,7 +222,6 @@ gemm1_kernels_dict = {
     "a8w4": a8w4_gemm1_kernels_list,
     "a4w4": a4w4_gemm1_kernels_list,
     "a4w4_bns": a4w4_bns_gemm1_kernels_list,
-    "empty_list": empty_list,
 }
 
 
@@ -351,7 +348,6 @@ gemm2_kernels_dict = {
     "a8w4": a8w4_gemm2_kernels_list,
     "a4w4": a4w4_gemm2_kernels_list,
     "a4w4_bns": a4w4_bns_gemm2_kernels_list,
-    "empty_list": empty_list,
 }
 
 
@@ -397,13 +393,10 @@ def get_gemm1_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        if arch == "gfx950":
-            if preshuffle:
-                tag = "a4w4"
-            else:
-                tag = "a4w4_bns"
+        if preshuffle:
+            tag = "a4w4"
         else:
-            tag = "empty_list"
+            tag = "a4w4_bns"
 
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
@@ -471,13 +464,10 @@ def get_gemm2_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        if arch == "gfx950":
-            if preshuffle:
-                tag = "a4w4"
-            else:
-                tag = "a4w4_bns"
+        if preshuffle:
+            tag = "a4w4"
         else:
-            tag = "empty_list"
+            tag = "a4w4_bns"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm2_kernels_dict[tag]
