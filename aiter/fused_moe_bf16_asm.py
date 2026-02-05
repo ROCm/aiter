@@ -104,12 +104,14 @@ def get_2stage_config_simple(
         dtype == dtypes.i8 or dtype == torch.int8 or str(dtype) == "torch.int8"
     ):
         # Check if inter_dim is supported by the 2-stage Int8 kernel (currently requires multiple of 384)
-        if inter_dim % 384 == 0:
+        if inter_dim % 384 == 0 or inter_dim % 128 == 0:
             # The available kernel uses 64x384 tile, so block_m must be 64
-            return True, 64, 0, "", ""
-        elif inter_dim % 128 == 0:
-            return True, 80, 0, "", ""
-    return False, 32, 0, "", ""
+            return True, 64, 0, "", "", False
+            # return True, 64, 0, "", "", True
+        # elif inter_dim % 128 == 0:
+        #     return True, 64, 0, "", "", False
+            # return True, 80, 0, "", "", True
+    return False, 32, 0, "", "", False
 
 
 def asm_moe(
@@ -143,7 +145,7 @@ def asm_moe(
     is_smoothquant = fc1_smooth_scale is not None
     run_2stage = False
     if is_smoothquant:
-        run_2stage, block_m_2s, ksplit_2s, kernelName1, kernelName2 = (
+        run_2stage, block_m_2s, ksplit_2s, kernelName1, kernelName2, stage1_fused_quant = (
             get_2stage_config_simple(
                 M,
                 model_dim,
@@ -323,24 +325,30 @@ def asm_moe(
                 a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
 
         if run_2stage:
-
+            doweight_stage1 = False
             total_tokens = M * topk
             data_size = total_tokens * inter_dim
-            scale_size = data_size // 32  # 4 bytes scale per 128 bytes data
+            if stage1_fused_quant:
+                scale_size = data_size // 32  # 4 bytes scale per 128 bytes data
 
-            # Allocate flat buffer for Data + Scale
-            flat_buffer = torch.empty(
-                data_size + scale_size, dtype=dtypes.i8, device=device
-            )
+                # Allocate flat buffer for Data + Scale
+                flat_buffer = torch.empty(
+                    data_size + scale_size, dtype=dtypes.i8, device=device
+                )
 
-            # View for Data: [M, topk, inter_dim]
-            inter_states = flat_buffer[:data_size].view(M, topk, inter_dim)
+                # View for Data: [M, topk, inter_dim]
+                inter_states = flat_buffer[:data_size].view(M, topk, inter_dim)
 
-            # View for Scale: [M, topk, inter_dim/32/4] -> float32
-            # inter_dim=384 -> 12 bytes scale -> 3 floats
-            scale_view = flat_buffer[data_size:].view(torch.float32)
-            # scale_view.fill_(1.0) # Init to 1.0 for debugging
-            doweight_stage1 = False
+                # View for Scale: [M, topk, inter_dim/32/4] -> float32
+                # inter_dim=384 -> 12 bytes scale -> 3 floats
+                scale_view = flat_buffer[data_size:].view(torch.float32)
+                # scale_view.fill_(1.0) # Init to 1.0 for debugging
+                num_scales = inter_dim // 128
+                a2_scale = scale_view.view(M, topk, num_scales)
+            else:
+                inter_states = torch.empty((M, topk, inter_dim), dtype=dtype, device=device)
+                a2 = torch.empty((M, topk, inter_dim), dtype=dtypes.i8, device=device)
+                a2_scale = torch.empty((M, topk), dtype=dtypes.fp32, device=device)
 
             aiter.moe_stage1_g1u1(
                 a8,
@@ -363,13 +371,24 @@ def asm_moe(
                 sorted_weights if doweight_stage1 else None,
             )
 
-            num_scales = inter_dim // 128
-            a2_scale = scale_view.view(M, topk, num_scales)
+            if stage1_fused_quant:
+                a2 = inter_states
+            else:
+                aiter.smooth_per_token_scaled_quant(
+                    a2,
+                    inter_states.view(M, topk, inter_dim),
+                    a2_scale,
+                    fc2_smooth_scale,
+                    topk_ids,
+                    smooth_scale_map_hash=local_expert_hash,
+                    enable_ps=True,
+                )
+
 
             # Stage 2: ASM Kernel
             # moe_buf is initialized as [M, model_dim] in moe_sorting_ck
             asm_moe_stage2(
-                inter_states,
+                a2,
                 w1,
                 w2,
                 sorted_ids,

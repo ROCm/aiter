@@ -115,6 +115,7 @@ static CFG* get_cfg(torch::Tensor& inp,
 {
     int E    = w1.size(0);
     int dim1 = w1.size(1);
+    bool is_MultiX = (inp.numel() / inp.size(-1)) == (out.numel() / out.size(-1));
 
     if((inp.scalar_type() == torch_fp8) && (w1.scalar_type() == torch_fp8) &&
        out.scalar_type() == at::ScalarType::BFloat16 && quant_type == QuantType::per_Token &&
@@ -132,7 +133,14 @@ static CFG* get_cfg(torch::Tensor& inp,
             out.scalar_type() == at::ScalarType::BFloat16 && quant_type == QuantType::per_Token &&
             !do_weight)
     {
-        return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1;
+        if(is_MultiX)
+        {
+            return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1_multix;
+        }
+        else
+        {
+            return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1;
+        }
     }
     else if((inp.scalar_type() == torch_fp8) && (w1.scalar_type() == torch_fp8) &&
             (out.scalar_type() == torch_fp8) && quant_type == QuantType::per_1x128 && !do_weight)
@@ -262,7 +270,7 @@ void moe_stage1_g1u1(
     int model_dim  = input.size(-1);
     int hidden_dim = inter_dim;
 
-    int token_cnt = input.size(-2);
+    int token_cnt = out.size(0);
     int topk      = out.size(1);
     int eprt      = w1.size(0);
 
