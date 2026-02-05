@@ -11,7 +11,7 @@ torch::Tensor gemm_a8w8_blockscale_cktile(
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-	bool preshuffleB);
+    bool preshuffleB);
 
     
 torch::Tensor gemm_a8w8_blockscale_cktile_tune(
@@ -22,6 +22,6 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(
     torch::Tensor &Y,
     int kernelId,
     int splitK,
-	bool preshuffleB);
+    bool preshuffleB);
 
 
