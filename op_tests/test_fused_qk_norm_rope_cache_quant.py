@@ -671,22 +671,6 @@ if __name__ == "__main__":
                         )
                         df.append(ret)
     df = pd.DataFrame(df)
-    df = df[
-        [
-            "dtype",
-            "num_tokens",
-            "num_heads_q",
-            "num_heads_k",
-            "num_heads_v",
-            "num_heads_k",
-            "head_size",
-            "is_neox_style",
-            "kv_cache_dtype",
-            "avg_torch",
-            "avg_cu",
-            "speedup",
-        ]
-    ]
     df_md = df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_cache_quant summary (markdown):\n%s", df_md)
 
@@ -712,20 +696,5 @@ if __name__ == "__main__":
                 )
                 df.append(ret)
     df = pd.DataFrame(df)
-    df = df[
-        [
-            "dtype",
-            "batch_size",
-            "num_tokens0",
-            "num_tokens1",
-            "num_heads_q",
-            "num_heads_k",
-            "head_size",
-            "is_interleaved",
-            "avg_torch",
-            "avg_cu",
-            "speedup",
-        ]
-    ]
     df_md = df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
