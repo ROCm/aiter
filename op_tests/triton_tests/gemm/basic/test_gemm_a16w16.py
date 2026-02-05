@@ -4,13 +4,12 @@
 """
 Unit tests for A16W16 GEMM kernels.
 
-Backend Selection via -k filter:
-    pytest ... -k "gluon"       # only gluon backend tests
-    pytest ... -k "triton"      # only triton backend tests (note: also matches "not gluon")
-    pytest ... -k "not gluon"   # skip gluon tests
-    pytest ... -k "not atomic"  # skip atomic tests (triton-only)
+-k filter:
+    pytest ... -k "gluon"       # only gluon tests
+    pytest ... -k "triton"      # only triton tests (note: also matches "not gluon")
+    pytest ... -k "gluon and not atomic"   # Do gluon tests that are not atomic
     
-Default (no -k): runs both backends where available.
+Default (no -k): runs both tests where available.
 Gluon tests are automatically skipped if gluon is not available or not supported on the architecture.
 """
 
