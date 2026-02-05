@@ -70,6 +70,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         fp8_dtype = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(fp8_dtype).max
 
+        delta_s = None
         if sage_version == fav3_sage.Sage_version.V1:
             q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant(
                 q,
@@ -85,7 +86,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             q_descale_pre = None
             k_descale_pre = None
         elif sage_version == fav3_sage.Sage_version.V2:
-            q_quantized, q_descale, q_descale_pre, k_quantized, k_descale, k_descale_pre, v_quantized, v_descale = sage_quant_v2(
+            q_quantized, q_descale, q_descale_pre, k_quantized, k_descale, k_descale_pre, v_quantized, v_descale, delta_s = sage_quant_v2(
                 q,
                 k,
                 v,
@@ -198,6 +199,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             sage_version=sage_version,
             q_descale_pre=q_descale_pre,
             k_descale_pre=k_descale_pre,
+            delta_s=delta_s,
         )
 
         if not return_lse:
