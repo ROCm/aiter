@@ -506,7 +506,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=[513, 1257, 127, 778, 1024, 3, 1],
+    default=[3, 127, 513, 778, 1024, 1257],
     help="""Number of tokens.
     e.g.: -t 513""",
 )
@@ -640,17 +640,14 @@ if __name__ == "__main__":
                             v_scale,
                         )
 
-    is_interleaveds = [True, False]
-    batch_sizes = [1, 2]
-    num_tokens0 = 678
+    dtype = torch.bfloat16
+    batch_size = 2
     num_tokens1 = 3608
     num_heads_q = 24
     num_heads_k = 25
-    head_sizes = [64, 128]
-    dtype = torch.bfloat16
-    for is_interleaved in is_interleaveds:
-        for batch_size in batch_sizes:
-            for head_size in head_sizes:
+    for head_size in args.head_sizes:
+        for num_tokens0 in args.token:
+            for is_neox_styles in args.is_neox_styles:
                 test_qk_norm_rope_2way(
                     dtype,
                     batch_size,
@@ -659,7 +656,7 @@ if __name__ == "__main__":
                     num_heads_q,
                     num_heads_k,
                     head_size,
-                    is_interleaved,
+                    not is_neox_styles,
                     eps=1e-6,
                 )
     print("done")
