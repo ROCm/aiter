@@ -101,6 +101,13 @@ def asm_moe(
             expert_mask,
         )
     )
+    # print(topk_ids)
+    # print(topk_weight)
+    # print(global_E) #3
+    # print(model_dim)#5120
+    # print(topk_ids)#0 1
+    # print(BLOCK_SIZE_M)#32
+    # print(expert_mask) #[1, 1, 0]
 
     if fc1_scale is None:
         # pure bf16
@@ -203,14 +210,20 @@ def asm_moe(
             else dtypes.fp8
         )
         if fc1_smooth_scale is not None:
-            a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
-            a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
-
+            # a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
+            # a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
+            if enable_fp32 and a8_type == dtypes.i8:
+                a8 = torch.empty((topk, M, model_dim), dtype=a8_type, device=device)
+                a8_scale = torch.empty((topk, M, 1), dtype=dtypes.fp32, device=device)
+            else:
+                a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
+                a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
             # moe_smoothquant_fwd need topk_ids which contains local_expert_id
             if expert_mask is not None:
                 local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
                 local_expert_hash[local_expert_hash > 0] -= 1
                 topk_ids = local_expert_hash[topk_ids]
+                # topk_ids = topk_ids.clamp(min=0)
 
             aiter.moe_smoothquant_fwd(
                 a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale

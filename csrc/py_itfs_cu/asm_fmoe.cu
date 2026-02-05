@@ -123,7 +123,7 @@ class FMoeKernel
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
 
-        int stride_X  = input.stride(0) * input.element_size();
+        int stride_X  = input.stride(-2) * input.element_size();
         int stride_GU = dim * I_elemSize;
         int stride_D  = inter_dim * I_elemSize;
         if(is_int4)
@@ -138,7 +138,9 @@ class FMoeKernel
         int stride_expert_DDQN =
             w2_dqn.has_value() ? w2_dqn.value().stride(0) * w2_dqn.value().element_size() : 0;
         int stride_expert_SMTDQN = inter_dim * sizeof(float);
-        int stride_O             = dim * O_elemSize;
+        // int stride_O             = dim * O_elemSize;
+        int dbl_o    = 1;
+        int stride_O = dim * out.element_size() * dbl_o;
         if(inter_dim * 2 == w1.size(1))
         {
             stride_expert_GU *= 2;
@@ -211,25 +213,39 @@ class FMoeKernel
             gdy = sub_X_cnt;
             gdz = 1;
         }
-        // std::cout << "sub_GU: " << sub_GU << std::endl;
+
+        // std::cout << "args.ptr_O: " << args.ptr_O << std::endl;
+        // std::cout << "args.ptr_X: " << args.ptr_X << std::endl;
+        // std::cout << "args.ptr_GU: " << args.ptr_GU << std::endl;
+        // std::cout << "args.ptr_XC: " << args.ptr_XC << std::endl;
+        // std::cout << "args.ptr_D: " << args.ptr_D << std::endl;
+        // std::cout << "args.ptr_XQ: " << args.ptr_XQ << std::endl;
+        // std::cout << "args.ptr_GUQ: " << args.ptr_GUQ << std::endl;
+        // std::cout << "args.ptr_DQ: " << args.ptr_DQ << std::endl;
+        // std::cout << "args.ptr_SMQ: " << args.ptr_SMQ << std::endl;
+        // std::cout << "args.ptr_STP: " << args.ptr_STP << std::endl;
+        // std::cout << "args.ptr_SW: " << args.ptr_SW << std::endl;
+        // std::cout << "args.ptr_SEP: " << args.ptr_SEP << std::endl;
         // std::cout << "args.dim: " << args.dim << std::endl;
         // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
         // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
         // std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
-        // std::cout << "args.stride_X: " << args.Xs << std::endl;
-        // std::cout << "args.stride_GU: " << args.GUs << std::endl;
-        // std::cout << "args.stride_D: " << args.Ds << std::endl;
-        // std::cout << "args.stride_O: " << args.Os << std::endl;
-        // std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
-        // std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
-        // std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
-        // std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
-        // std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
+        // std::cout << "args.Xs: " << args.Xs << std::endl;
+        // std::cout << "args.GUs: " << args.GUs << std::endl;
+        // std::cout << "args.Ds: " << args.Ds << std::endl;
+        // std::cout << "args.Os: " << args.Os << std::endl;
+        // std::cout << "args.eGUs: " << args.eGUs << std::endl;
+        // std::cout << "args.eDs: " << args.eDs << std::endl;
+        // std::cout << "args.eGUQs: " << args.eGUQs << std::endl;
+        // std::cout << "args.eDQs: " << args.eDQs << std::endl;
+        // std::cout << "args.eSMQs: " << args.eSMQs << std::endl;
         // std::cout << "args.topk: " << args.topk << std::endl;
+        // std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
         // std::cout << "args.ps_deno: " << args.ps_deno << std::endl;
         // std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
         // std::cout << "gdx: " << gdx << std::endl;
         // std::cout << "gdy: " << gdy << std::endl;
+        // std::cout << "gdz: " << gdz << std::endl;
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
