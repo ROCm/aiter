@@ -55,7 +55,7 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}",
         ]
     blob_gen_cmd.extend(BWD_CODEGEN_CMD)
-    flags_extra_cc = ["-DONLY_FAV3"] if ck_exclude else []
+    flags_extra_cc = ["-DFAV3_ON=1"] if ck_exclude else ["-DFAV3_ON=1", "-DFAV2_ON=1"]
     return {
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
