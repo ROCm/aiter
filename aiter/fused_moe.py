@@ -1822,6 +1822,7 @@ def _get_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
     """Cache global->local expert id map for EP."""
     local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
     local_expert_hash[local_expert_hash > 0] -= 1
+    local_expert_hash[expert_mask == 0] = -1
     return local_expert_hash
 
 
