@@ -207,7 +207,12 @@ jobs:
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
-    if: github.ref == 'refs/heads/main'
+    if: |
+      github.ref == 'refs/heads/main' ||
+      (
+        github.event_name == 'pull_request' &&
+        contains(join(github.event.pull_request.labels.*.name, ' '), 'multigpu')
+      )
     needs: build_aiter_image 
     strategy:
       fail-fast: false
