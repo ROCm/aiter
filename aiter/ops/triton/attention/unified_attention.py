@@ -7,8 +7,11 @@ import math
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
-    kernel_unified_attention_3d_gluon,
     reduce_segments,
+)
+from aiter.ops.triton._triton_kernels.attention.unified_attention_gluon import (
+    gluon_kernel_unified_attention_3d,
+    gluon_reduce_segments,
 )
 
 
@@ -246,9 +249,11 @@ def unified_attention(
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if use_gluon:
-            impl = kernel_unified_attention_3d_gluon
+            impl = gluon_kernel_unified_attention_3d
+            reduce_impl = gluon_reduce_segments
         else:
             impl = kernel_unified_attention_3d
+            reduce_impl = reduce_segments
         segm_output = torch.empty(
             q.shape[0],
             num_query_heads,
@@ -316,7 +321,7 @@ def unified_attention(
             ALL_DECODE=ALL_DECODE,
             **attn_config,
         )
-        reduce_segments[(q.shape[0], num_query_heads)](
+        reduce_impl[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
