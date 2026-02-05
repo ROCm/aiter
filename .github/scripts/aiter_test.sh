@@ -5,9 +5,6 @@ MULTIGPU=${MULTIGPU:-FALSE}
 SHARD_TOTAL=5
 SHARD_IDX=${SHARD_IDX:-0}
 
-# Suggestion: configure HIP allocator to reduce fragmentation
-export PYTORCH_HIP_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256,garbage_collect_threshold:0. 0"
-
 files=()
 failedFiles=()
 
