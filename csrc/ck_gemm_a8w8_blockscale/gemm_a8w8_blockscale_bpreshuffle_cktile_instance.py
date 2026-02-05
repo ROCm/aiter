@@ -20,7 +20,7 @@ class TileKernelInstance:
     TiledMMAPermuteN: bool
     TransposeC: bool
     UsePersistentKernel: bool
-
+    PreshuffleQuantB: bool
     BlockPerCu: int  # 1,2
 
     @property
@@ -57,6 +57,7 @@ class TileKernelInstance:
                         [
                             self.TiledMMAPermuteN,
                             self.TransposeC,
+                            self.PreshuffleQuantB,
                             self.UsePersistentKernel,
                         ],
                     )
@@ -70,12 +71,13 @@ class TileKernelInstance:
 # Candidate and default kernel instances for tile gemm a8w8 blockscale
 # These instances are used for generating the kernel code and tuning.
 candidate_kernels_bpreshuffle_cktile_dict = {
-    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
+    #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC     | PreshuffleQuantB | UsePersistentKernel | BlockPerCu |
     # K_Tile = 128, M_Warp x N_Warp = 1 x 4, WarpTile = 16 x 16 x 32
-    0:   TileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
-    1:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
-    2:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
-    3:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
+    0:   TileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,          False,           False,             2      ),
+    1:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,          False,           False,             1      ),
+    2:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,          False,           False,             1      ),
+    3:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,          False,           False,             2      ),
+    4:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,            False,           True,           False,             1      ),
     ## K_Tile = 128, M_Warp x N_Warp = 2 x 2, WarpTile = 16 x 16 x 32
     #4:   TileKernelInstance(   32,     128,      128,     2,        2,       1,        16,            16,           32,      "Intrawave",        False,             False,          False,             1      ),
     #5:   TileKernelInstance(   64,     128,      128,     2,        2,       1,        16,            16,           32,      "Intrawave",        False,             False,          False,             1      ),
@@ -107,7 +109,7 @@ candidate_kernels_bpreshuffle_cktile_dict = {
 
 
 default_kernels_bpreshuffle_cktile_dict = {
-   #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
-    -1:  TileKernelInstance(  128,     128,      128,     1,        4,       1,        16,            16,          128,       "Intrawave",        False,            False,          False,             1      ), 
+   #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | PreshuufleQuantB | UsePersistentKernel | BlockPerCu |
+    -1:  TileKernelInstance(  128,     128,      128,     1,        4,       1,        16,            16,          128,       "Intrawave",        False,            False,         False,                False,             1      ), 
 }
 # fmt: on
