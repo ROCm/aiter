@@ -496,7 +496,7 @@ def get_moe_stage_module(
     quant_type = (
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
-    act = str(activation).split(".")[-1].lower()
+    str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()
 
     md_name = "module_moe_ck2stages"
