@@ -867,7 +867,7 @@ def sage_fwd_mxfp4(
     )
     v_descale_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
     delta_s_offset = (
-        Delta_S + off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
+        Delta_S + off_z * stride_dsz + off_h_q * stride_dsh + start_m * stride_dsq
     )
     delta_s_ptrs = delta_s_offset + offs_n
 
@@ -1260,6 +1260,7 @@ def sage_quant_mxfp4(
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
     q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, layout=layout)
+
     sage_quant_v_kernel[grid](
         v,
         v_fp8,
