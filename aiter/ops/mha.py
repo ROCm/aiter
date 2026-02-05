@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Any, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
 
 from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
+
+# Environment variables to control v3 kernel usage
+# Set AITER_DISABLE_V3_FWD=1 to disable v3 forward kernel
+# Set AITER_DISABLE_V3_BWD=1 to disable v3 backward kernel
+AITER_DISABLE_V3_FWD = os.environ.get("AITER_DISABLE_V3_FWD", "0") == "1"
+AITER_DISABLE_V3_BWD = os.environ.get("AITER_DISABLE_V3_BWD", "0") == "1"
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
@@ -1276,7 +1283,7 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
-    if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
+    if can_impl_fmha_v3_fwd() and seqlen_q > 128 and not AITER_DISABLE_V3_FWD:  # Prefer CK for decode cases
         out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
@@ -1622,7 +1629,7 @@ def _flash_attn_backward(
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
 
     if (
-        can_impl_fmha_v3_bwd_ and seqlen_q > 16
+        can_impl_fmha_v3_bwd_ and seqlen_q > 16 and not AITER_DISABLE_V3_BWD
     ):  # ck fmha bwd has optimization for seqlen_q <= 16
         if dq is not None:
             dq.zero_()
@@ -1860,6 +1867,7 @@ def flash_attn_func(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,  # True=A32 kernel, False=A16 kernel
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1926,7 +1934,7 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
-        True,  # is_v3_atomic_fp32
+        is_v3_atomic_fp32,  # True=A32 kernel, False=A16 kernel
         how_v3_bf16_cvt,
         cu_seqlens_q,
         cu_seqlens_kv,
@@ -2000,7 +2008,7 @@ def _flash_attn_varlen_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_v3_fwd():
+    if can_impl_fmha_v3_fwd() and not AITER_DISABLE_V3_FWD:
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,
@@ -2202,7 +2210,7 @@ def _flash_attn_varlen_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
 
-    if can_impl_fmha_v3_bwd_:
+    if can_impl_fmha_v3_bwd_ and not AITER_DISABLE_V3_BWD:
         (
             dq,
             dk,
@@ -2502,6 +2510,7 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,  # True=A32 kernel, False=A16 kernel
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -2590,7 +2599,7 @@ def flash_attn_varlen_func(
         torch.is_grad_enabled(),
         cu_seqlens_q_padded,
         cu_seqlens_k_padded,
-        True,
+        is_v3_atomic_fp32,  # True=A32 kernel, False=A16 kernel
         how_v3_bf16_cvt,
         sink_ptr,
     )
