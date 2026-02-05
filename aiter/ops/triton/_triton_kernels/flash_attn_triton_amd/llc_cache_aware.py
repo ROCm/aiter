@@ -222,7 +222,7 @@ def print_head_grouping_info(
         nheads, seqlen_k, head_dim, dtype, device_index
     )
     
-    print(f"\n=== Infinity Cache (LLC) Aware Head Grouping ===")
+    print("\n=== Infinity Cache (LLC) Aware Head Grouping ===")
     print(f"GPU: {arch.name}")
     print(f"Infinity Cache (LLC): {llc_size / (1024*1024):.1f} MB")
     print(f"Heads: {nheads}, SeqLen: {seqlen_k}, HeadDim: {head_dim}")
