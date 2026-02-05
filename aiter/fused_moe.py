@@ -1324,8 +1324,12 @@ def fused_moe_2stages(
     # Build valid_mask for EP mode, comment it out for hotfix
     extra_stage2_args = {}
     is_flydsl_stage2 = getattr(metadata.stage2, "func", None) is flydsl_moe_stage2
-    if is_flydsl_stage2:
-        aiter.logger.info(f"is_flydsl_stage2: {is_flydsl_stage2}")
+    use_reduce = os.environ.get(
+        "AITER_FLYDSL_GEMM2_MODE", "ATOMIC"
+    ).upper().strip() in ("REDUCE")
+    use_valid_mask = int(os.environ.get("AITER_FLYDSL_GEMM2_VALID_MASK", "0"))
+    if is_flydsl_stage2 and use_reduce and use_valid_mask:
+        # aiter.logger.info(f"use_reduce: {use_reduce}, use_valid_mask: {use_valid_mask}")
         valid_mask = None
         if topk_ids is not None and expert_mask is not None:
             valid_mask = get_topk_valid_mask(topk_ids, expert_mask)
@@ -2108,7 +2112,7 @@ def flydsl_moe_stage2(
         "YES",
         "yes",
     )
-    # New env var: use compile_moe_gemm2_ex with mode selection (AUTO/ATOMIC/REDUCE).
+    # New env var: use compile_moe_gemm2_ex with mode selection (ATOMIC/REDUCE).
     use_gemm2_ex = os.environ.get("AITER_FLYDSL_USE_GEMM2_EX", "0") in (
         "1",
         "true",
@@ -2116,7 +2120,7 @@ def flydsl_moe_stage2(
         "YES",
         "yes",
     )
-    gemm2_mode = os.environ.get("AITER_FLYDSL_GEMM2_MODE", "AUTO").upper().strip()
+    gemm2_mode = os.environ.get("AITER_FLYDSL_GEMM2_MODE", "ATOMIC").upper().strip()
 
     a2_qt_flat = a2.contiguous().view(-1)
     a2_scale_1d = a2_scale.view(-1).contiguous()
@@ -2183,7 +2187,8 @@ def flydsl_moe_stage2(
         elif gemm2_mode == "REDUCE":
             mode_val = MoeGemm2Mode.REDUCE
         else:
-            mode_val = MoeGemm2Mode.AUTO
+            # Default to ATOMIC mode if not specified
+            mode_val = MoeGemm2Mode.ATOMIC
 
         key2_ex = (
             "gemm2_ex",
@@ -2203,6 +2208,7 @@ def flydsl_moe_stage2(
         )
         exe2 = _FLYDSL_MOE_GEMM2_CACHE.get(key2_ex)
         if exe2 is None:
+            aiter.logger.info("compile_moe_gemm2_ex")
             exe2 = compile_moe_gemm2_ex(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
@@ -2216,120 +2222,64 @@ def flydsl_moe_stage2(
                 out_dtype=out_dtype_kernel,
                 use_cshuffle_epilog=bool(stage2_cshuffle),
                 mode=mode_val,
-                tokens_hint=token_num,
                 valid_mask=valid_mask,
             )
+            aiter.logger.info(exe2)
             _FLYDSL_MOE_GEMM2_CACHE[key2_ex] = exe2
 
         # Launch kernel (wrapper handles atomic vs reduce internally).
-        exe2(
-            out_kernel if not use_fp16_out else out_kernel,
-            a2_qt_flat,
-            w2_flat.view(-1),
-            a2_scale_1d,
-            w2_scale_1d,
-            sorted_ids,
-            sorted_eids,
-            sorted_w.view(-1).contiguous(),
-            num_valid_ids,
-            token_num,
-            model_dim,
-            inter_dim,
-            int(blocks),
-        )
-        if use_fp16_out:
-            out.copy_(out_kernel.to(dtypes.bf16))
-        return out
+        # Check if exe2 is a wrapper (REDUCE mode) or raw kernel (ATOMIC mode)
+        # The wrapper expects valid_mask, but raw kernel does not
+        # aiter.logger.info(f"valid_mask: {valid_mask}")
+        if mode_val == MoeGemm2Mode.REDUCE:
+            # aiter.logger.info(f"use Reduce MODE")
+            exe2(
+                out_kernel,  # Output buffer (may be fp16 scratch or final out)
+                a2_qt_flat,  # A2 input flattened to 1D
+                w2_flat,  # W2 weights flattened to 2D [E*model_dim, inter_dim]
+                a2_scale_1d,  # A2 scale flattened to 1D
+                w2_scale_1d,  # W2 scale flattened to 1D
+                sorted_ids,  # Sorted token IDs (contiguous)
+                sorted_eids,  # Sorted expert IDs (contiguous)
+                sorted_w,  # Sorted routing weights (or zeros if None)
+                num_valid_ids,  # Valid ID count tensor
+                token_num,  # Number of tokens
+                model_dim,  # Model dimension
+                inter_dim,  # Intermediate dimension
+                blocks,  # Number of expert blocks
+                valid_mask,  # Valid mask for EP mode (or None)
+            )
+        else:
+            # ATOMIC mode: exe2 is raw compiled kernel
+            # aiter.logger.info(f"use Atomics MODE")
+            exe2(
+                out_kernel,  # Output buffer (may be fp16 scratch or final out)
+                a2_qt_flat,  # A2 input flattened to 1D
+                w2_flat,  # W2 weights flattened to 2D [E*model_dim, inter_dim]
+                a2_scale_1d,  # A2 scale flattened to 1D
+                w2_scale_1d,  # W2 scale flattened to 1D
+                sorted_ids,  # Sorted token IDs (contiguous)
+                sorted_eids,  # Sorted expert IDs (contiguous)
+                sorted_w,  # Sorted routing weights (or zeros if None)
+                num_valid_ids,  # Valid ID count tensor
+                token_num,  # Number of tokens
+                model_dim,  # Model dimension
+                inter_dim,  # Intermediate dimension
+                blocks,  # Number of expert blocks
+            )
 
-    # Legacy path: use compile_moe_gemm2 with accumulate flag.
-    key2 = (
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        tile_m,
-        tile_n,
-        tile_k,
-        bool(sorted_weights is not None),
-        in_dtype,
-        out_dtype_kernel,
-        bool(not no_atomics),
-        bool(stage2_cshuffle),
-    )
-    exe2 = _FLYDSL_MOE_GEMM2_CACHE.get(key2)
-    if exe2 is None:
-        exe2 = compile_moe_gemm2(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=E,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage2=bool(sorted_weights is not None),
-            in_dtype=in_dtype,
-            out_dtype=out_dtype_kernel,
-            accumulate=not no_atomics,
-            use_cshuffle_epilog=bool(stage2_cshuffle),
-        )
-        _FLYDSL_MOE_GEMM2_CACHE[key2] = exe2
-    if not no_atomics:
-        exe2(
-            out_kernel,
-            a2_qt_flat,
-            w2_flat.view(-1),
-            a2_scale_1d,
-            w2_scale_1d,
-            sorted_ids,
-            sorted_eids,
-            sorted_w.view(-1).contiguous(),
-            num_valid_ids,
-            token_num,
-            model_dim,
-            inter_dim,
-            int(blocks),
-        )
-        if use_fp16_out:
+        # Handle optional fp16->bf16 conversion if scratch buffer was used
+        if out_kernel is not out:
             out.copy_(out_kernel.to(dtypes.bf16))
-        return out
 
-    # Scatter per-(token,slot) output then reduce over topk on the host side (legacy torch.sum path).
-    # IMPORTANT: scatter mode does not use atomics and may not write every element
-    # (e.g. masked/fake expert rows). Zero-init to keep unwritten entries deterministic.
-    key_s = (
-        "stage2_scatter_slots",
-        int(out.device.index),
-        tuple((token_num, topk, model_dim)),
-        str(out.dtype),
-    )
-    out_slots = _FLYDSL_SCRATCH_CACHE.get(key_s)
-    if (
-        out_slots is None
-        or out_slots.device != out.device
-        or out_slots.dtype != out.dtype
-    ):
-        out_slots = torch.empty(
-            (token_num, topk, model_dim), device=out.device, dtype=out.dtype
+        return out
+    else:
+        # Fallback: use_gemm2_ex is False
+        # This path requires implementing the legacy compile_moe_gemm2 call
+        raise NotImplementedError(
+            "FlyDSL stage2 without AITER_FLYDSL_USE_GEMM2_EX=1 is not implemented. "
+            "Please set AITER_FLYDSL_USE_GEMM2_EX=1 to use the _MoeGemm2ReduceWrapper path."
         )
-        _FLYDSL_SCRATCH_CACHE[key_s] = out_slots
-    out_slots.zero_()
-    exe2(
-        out_slots.view(-1),
-        a2_qt_flat,
-        w2_flat.view(-1),
-        a2_scale_1d,
-        w2_scale_1d,
-        sorted_ids,
-        sorted_eids,
-        sorted_w.view(-1).contiguous(),
-        num_valid_ids,
-        token_num,
-        model_dim,
-        inter_dim,
-        int(blocks),
-    )
-    out.copy_(out_slots.sum(dim=1, dtype=torch.float32).to(out.dtype))
-    return out
 
 
 def fused_topk(

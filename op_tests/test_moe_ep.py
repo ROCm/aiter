@@ -319,7 +319,7 @@ def test_fmoe_ep(
             fc1_smooth_scale,
             fc2_smooth_scale,
             expert_mask=expert_mask,
-            local_expert_hash=None,
+            local_expert_hash=local_expert_hash,
         )
 
         def calculateTensorsSize(*args):
