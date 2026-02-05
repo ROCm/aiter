@@ -52,8 +52,8 @@ def _compute_hres_mhc_lite(
     H_res = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     
     if HRES_OP == 0:
-        # FMA loop: explicit iteration with optimized softmax (good for small n_factorial)
-        # Optimized softmax: direct exp-normalize (faster than log-domain for small n_factorial)
+        # FMA loop: explicit iteration with optimized softmax
+        # Direct exp-normalize. TODO: benchmark with log-domain softmax.
         out_max = tl.max(out_masked, axis=1, keep_dims=True)
         exp_shifted = tl.exp2((out_masked - out_max) * LOG2_E)
         sum_exp = tl.sum(tl.where(n_factorial_mask, exp_shifted, 0.0), axis=1, keep_dims=True)
@@ -76,7 +76,7 @@ def _compute_hres_mhc_lite(
             # Fused multiply-add: H_res += weight_val * perm_vals
             H_res = tl.fma(weight_val[:, None], perm_vals[None, :], H_res)
     else:
-        # Dot product: load entire permutation matrix and use tl.dot (may be better for larger problems)
+        # Dot product: load entire permutation matrix and use tl.dot
         LN_2: tl.constexpr = 0.6931471805599453    # ln(2)
         
         # Log-domain softmax: logsumexp then subtract
@@ -176,11 +176,6 @@ def _mhc_fused_kernel(
     is_pre_program = pid_n < n_blocks_pre
     is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
     is_res_program = ~is_pre_program & ~is_post_program
-    
-    # Only convert types that are actually needed:
-    # - is_post_f32: needed for activation scaling (2*sigmoid for post)
-    # - is_post_i32, is_res_i32: needed for index arithmetic
-    # Note: is_pre_f32 and is_res_f32 removed - use tl.where for alpha selection instead
     is_post_f32 = is_post_program.to(tl.float32)
     is_post_i32 = is_post_program.to(tl.int32)
     is_res_i32 = is_res_program.to(tl.int32)
@@ -193,8 +188,8 @@ def _mhc_fused_kernel(
     rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     
     # Output dimension for res stream
-    # - Sinkhorn mode: n² (raw logits for SK projection)
-    # - Lite mode: n! (weights for permutation combination)
+    # - Sinkhorn mode: n²
+    # - Lite mode: n!
     n_out_res = n_squared + (n_factorial - n_squared) * is_res_i32
     
     # Output dimension for this stream
@@ -253,7 +248,6 @@ def _mhc_fused_kernel(
     out = rsigma[:, None] * alpha_val * acc + bias[None, :]
     
     # Apply stream-specific activation
-    # Compute res output first (before sigmoid to avoid unnecessary computation)
     if HRES_LITE_MODE:
         out_res = _compute_hres_mhc_lite(
             out, perm_ptr, stride_perm_k, stride_perm_ij,
@@ -264,7 +258,6 @@ def _mhc_fused_kernel(
     else:
         out_res = out
 
-    # Only compute sigmoid for pre/post programs, use out_res for res
     # Pre: sigmoid(out), Post: 2*sigmoid(out), Res: out_res (identity or lite)
     out_activated = tl.where(
         is_pre_program | is_post_program,
@@ -535,11 +528,6 @@ def _mhc_fused_reduce_kernel(
     is_pre_program = pid_n < n_blocks_pre
     is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
     is_res_program = ~is_pre_program & ~is_post_program
-    
-    # Only convert types that are actually needed:
-    # - is_post_f32: needed for activation scaling (2*sigmoid for post)
-    # - is_post_i32, is_res_i32: needed for index arithmetic
-    # Note: is_pre_f32 and is_res_f32 removed - use tl.where for alpha selection instead
     is_post_f32 = is_post_program.to(tl.float32)
     is_post_i32 = is_post_program.to(tl.int32)
     is_res_i32 = is_res_program.to(tl.int32)
@@ -604,7 +592,6 @@ def _mhc_fused_reduce_kernel(
     out = rsigma[:, None] * alpha_val * acc + bias[None, :]
     
     # Apply stream-specific activation
-    # Compute res output first (before sigmoid to avoid unnecessary computation)
     if HRES_LITE_MODE:
         out_res = _compute_hres_mhc_lite(
             out, perm_ptr, stride_perm_k, stride_perm_ij,
@@ -615,7 +602,6 @@ def _mhc_fused_reduce_kernel(
     else:
         out_res = out
 
-    # Only compute sigmoid for pre/post programs, use out_res for res
     # Pre: sigmoid(out), Post: 2*sigmoid(out), Res: out_res (identity or lite)
     out_activated = tl.where(
         is_pre_program | is_post_program,
@@ -742,4 +728,3 @@ def _sinkhorn_knopp_log_domain_kernel(
             P = tl.exp2(log_P * LOG2_E)
 
             tl.store(out_ptr + batch_offset + flat_idx, P.to(out_ptr.dtype.element_ty))
-
