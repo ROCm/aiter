@@ -8,6 +8,7 @@ from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter.utility.dtypes import get_dtype_fp8
 from aiter.utility import dtypes
 import argparse
+import pandas as pd
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -279,6 +280,20 @@ def test_qk_norm_rope_cache_quant(
     checkAllclose(k_scale_ref, k_scale, msg="k_scale", rtol=1e-2, atol=0.05)
     checkAllclose(v_scale_ref, v_scale, msg="v_scale", rtol=1e-2, atol=0.05)
 
+    ret = {}
+    ret["dtype"] = dtype
+    ret["num_tokens"] = num_tokens
+    ret["num_heads_q"] = num_heads_q
+    ret["num_heads_k"] = num_heads_k
+    ret["num_heads_v"] = num_heads_v
+    ret["head_size"] = head_size
+    ret["is_neox_style"] = "1" if is_neox_style else "0"
+    ret["kv_cache_dtype"] = k_cache.dtype
+    ret["avg_torch"] = avg_torch
+    ret["avg_cu"] = avg_cu
+    ret["speedup"] = avg_torch / avg_cu
+    return ret
+
 
 @perftest()
 def run_torch_qk_norm_rope_2way(
@@ -485,6 +500,20 @@ def test_qk_norm_rope_2way(
     checkAllclose(k01_ref, k01, msg="k01", rtol=1e-2, atol=0.05)
     print(msg, flush=True)
 
+    ret = {}
+    ret["dtype"] = dtype
+    ret["batch_size"] = batch_size
+    ret["num_tokens0"] = num_tokens0
+    ret["num_tokens1"] = num_tokens1
+    ret["num_heads_q"] = num_heads_q
+    ret["num_heads_k"] = num_heads_k
+    ret["head_size"] = head_size
+    ret["is_interleaved"] = "1" if is_interleaved else "0"
+    ret["avg_torch"] = avg_torch
+    ret["avg_cu"] = avg_cu
+    ret["speedup"] = avg_torch / avg_cu
+    return ret
+
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -575,6 +604,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     max_positions = args.max_positions
     # rope
+    df = []
     for is_neox_style in args.is_neox_styles:
         for num_token in args.token:
             for num_head, num_kv_head in args.head:
@@ -623,7 +653,7 @@ if __name__ == "__main__":
                         )
                         v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
 
-                        test_qk_norm_rope_cache_quant(
+                        ret = test_qk_norm_rope_cache_quant(
                             args.dtype,
                             num_token,
                             num_head,
@@ -639,16 +669,37 @@ if __name__ == "__main__":
                             k_scale,
                             v_scale,
                         )
+                        df.append(ret)
+    df = pd.DataFrame(df)
+    df = df[
+        [
+            "dtype",
+            "num_tokens",
+            "num_heads_q",
+            "num_heads_k",
+            "num_heads_v",
+            "num_heads_k",
+            "head_size",
+            "is_neox_style",
+            "kv_cache_dtype",
+            "avg_torch",
+            "avg_cu",
+            "speedup",
+        ]
+    ]
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("qk_norm_rope_cache_quant summary (markdown):\n%s", df_md)
 
     dtype = torch.bfloat16
     batch_size = 2
     num_tokens1 = 3608
     num_heads_q = 24
     num_heads_k = 25
+    df = []
     for head_size in args.head_sizes:
         for num_tokens0 in args.token:
             for is_neox_styles in args.is_neox_styles:
-                test_qk_norm_rope_2way(
+                ret = test_qk_norm_rope_2way(
                     dtype,
                     batch_size,
                     num_tokens0,
@@ -659,4 +710,22 @@ if __name__ == "__main__":
                     not is_neox_styles,
                     eps=1e-6,
                 )
-    print("done")
+                df.append(ret)
+    df = pd.DataFrame(df)
+    df = df[
+        [
+            "dtype",
+            "batch_size",
+            "num_tokens0",
+            "num_tokens1",
+            "num_heads_q",
+            "num_heads_k",
+            "head_size",
+            "is_interleaved",
+            "avg_torch",
+            "avg_cu",
+            "speedup",
+        ]
+    ]
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
