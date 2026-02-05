@@ -36,7 +36,7 @@ def get_sage_fwd_configs(USE_MXFP4_SAGE=False):
             "BLOCK_N": 128,
             "waves_per_eu": 2,
             "PRE_LOAD_V": False,
-            "num_stages": 5,
+            "num_stages": 3,
             "num_warps": 8,
         }
     elif arch == "gfx942":
@@ -131,7 +131,6 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                     fp8_max,
                     BLKQ=BLKQ,
                     BLKK=BLKK,
-                    sm_scale=softmax_scale,
                     layout=layout,
                 )
             )
@@ -372,6 +371,9 @@ def fav3_sage_func(
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
     """
+    
+    
+    
     if USE_MXFP4_SAGE:
         assert delta_s != None, "Delta_S is needed for mxfp sage attention"
 
@@ -459,7 +461,8 @@ def fav3_sage_func(
 
     if USE_MXFP4_SAGE:
         stride_dsz, stride_dsh, stride_dsq, _ = delta_s.stride()
-
+        softmax_scale = softmax_scale or (head_size_qk**-0.5)
+        softmax_scale *= 1.4426950408889634
         sage_fwd_mxfp4[grid](
             q,
             k,
@@ -609,7 +612,6 @@ def fav3_sage_func(
             ACTUAL_BLOCK_DMODEL_V=head_size_v,
             MAX_SEQLENS_Q=seqlen_q,
             MAX_SEQLENS_K=seqlen_k,
-            SM_SCALE=softmax_scale,
             IS_CAUSAL=causal,
             USE_SLIDING_WINDOW=use_sliding_window,
             WINDOW_SIZE_LEFT=window_size_left,

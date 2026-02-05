@@ -10,6 +10,14 @@ import aiter
 import triton
 import logging
 
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
+    sage_quant_mxfp4,
+)
+
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
+    sage_quant,
+)
+
 from aiter.ops.triton.mha import (
     flash_attn_func,
 )
@@ -28,6 +36,8 @@ from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
+    fav3_sage_func,
+    get_sage_fwd_configs
 )
 from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
@@ -304,20 +314,72 @@ def fav3_sage_forward_func(
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
     use_mxfp4_sage: bool = False,
+    include_quantization_overhead: bool = False,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
+    if include_quantization_overhead:
+        return lambda: fav3_sage_wrapper_func(
+            q,
+            k,
+            v,
+            softmax_scale,
+            causal=False,
+            inference_mode=True,
+            layout=layout,
+            USE_MXFP4_SAGE=use_mxfp4_sage
+        )
+    else: # exclude quantization overhead
+        config = get_sage_fwd_configs(use_mxfp4_sage)
+        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+        
+        
+        # Note: softmax_scale is integrated into quantization descaling
+        fp8_dtype = aiter.dtypes.fp8
+        fp8_max = torch.finfo(fp8_dtype).max
+        if use_mxfp4_sage:
+            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale, delta_s = (
+                sage_quant_mxfp4(
+                    q,
+                    k,
+                    v,
+                    fp8_dtype,
+                    fp8_max,
+                    BLKQ=BLKQ,
+                    BLKK=BLKK,
+                    layout=layout,
+                )
+            )
+        else:
+            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant(
+                q,
+                k,
+                v,
+                fp8_dtype,
+                fp8_max,
+                sm_scale=softmax_scale,
+                BLKQ=BLKQ,
+                BLKK=BLKK,
+                layout=layout,
+            )
+            delta_s = None
 
-    return lambda: fav3_sage_wrapper_func(
-        q,
-        k,
-        v,
-        softmax_scale,
-        causal=False,
-        inference_mode=True,
-        layout=layout,
-        USE_MXFP4_SAGE=use_mxfp4_sage
-    )
+        
+        return lambda: fav3_sage_func(
+            q_quantized,
+            k_quantized,
+            v_quantized,
+            q_descale,
+            k_descale,
+            v_descale,
+            delta_s,
+            softmax_scale,
+            causal,
+            layout=layout,
+            USE_MXFP4_SAGE=use_mxfp4_sage,
+            config=config,
+        )
+
 
 
 def create_benchmark_configs(args):
