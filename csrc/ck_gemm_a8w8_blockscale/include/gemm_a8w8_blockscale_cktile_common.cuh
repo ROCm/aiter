@@ -310,7 +310,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int stride_AQ = (GemmInstance::M_Warp_v * GemmInstance::N_Warp_v * GemmInstance::K_Warp_v == 8)
                               ? M    // Col-Major
                               : AQK; // Row-Major
-    const int stride_BQ = BQN;
+    const int stride_BQ = BQK;
 
     args.QK_A      = AQK;
     args.QK_B      = BQK;

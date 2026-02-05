@@ -572,7 +572,11 @@ def gemm_a8w8_blockscale(
             if libtype == "ck":
                 return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
             elif libtype == "cktile":
-                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, False)
+                x_scale_input = x_scale
+                m_warp, n_warp, k_warp = map(int, config["kernelName"].split('_')[4].split('x'))
+                if (m_warp * n_warp * k_warp == 8):
+                    x_scale_input = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale_input, w_scale, Y, False)
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
@@ -617,21 +621,27 @@ def gemm_a8w8_blockscale_bpreshuffle(
         dtypes.bf16,
         dtypes.fp16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     config = get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
     )
     if config is not None:
         libtype = config["libtype"]
         if libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "cktile":
-            return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, True)
+            x_scale_input = x_scale
+            m_warp, n_warp, k_warp = map(int, config["kernelName"].split('_')[4].split('x'))
+            if (m_warp * n_warp * k_warp == 8):
+                x_scale_input = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+            return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale_input, w_scale, Y, True)
         else:
             assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+
     return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
