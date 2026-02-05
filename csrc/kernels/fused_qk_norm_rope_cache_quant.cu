@@ -421,7 +421,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
            int head_dim,
            bool interleave,
            int num_kv_heads,
-           int wg_size=256,
+           int wg_size=64,
            vllm::Fp8KVCacheDataType kv_dt>
  __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
      scalar_t* qkv_void,            // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)， head_dim]
@@ -447,19 +447,63 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
  {
      // per block deal with blockSize tokens
      // blockDim.x = page_size
-     int const warpsPerBlock = blockDim.x / WARP_SIZE;
-     int const warpId        = threadIdx.x / WARP_SIZE;
-     int const laneId        = threadIdx.x % WARP_SIZE;
- 
-     int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
- 
-     int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
-     int const tokenBlockIdx     = blockIdx.x;// / num_heads
-     int const tokenIdx = tokenBlockIdx * blockDim.x + threadIdx.x;
-     int const localHeadIdx = blockIdx.y;// % num_heads;
-     float block_max  = 0.0f;
-     if(tokenIdx >= num_tokens)
-         return;
+    int const warpsPerBlock = blockDim.x / WARP_SIZE;
+    int const warpId        = threadIdx.x / WARP_SIZE;
+    int const laneId        = threadIdx.x % WARP_SIZE;
+    int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+
+    int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
+    int const tokenBlockIdx     = blockIdx.x;// / num_heads
+    int tokenIdx = tokenBlockIdx * blockDim.x + threadIdx.x;
+    int const localHeadIdx = blockIdx.y;// % num_heads;
+    float block_max  = 0.0f;
+    
+    // Declare first_token_idx and slot_id - will be set based on boundary conditions
+    int64_t first_token_idx;
+    int64_t slot_id;
+    
+    // ============================================================================
+    // BOUNDARY HANDLING: Similar to cache_kernels.cu lines 504-521
+    // Handle case where GPU block extends beyond num_tokens
+    // ============================================================================
+    if(blockIdx.x * blockDim.x >= num_tokens)
+    {
+        // This GPU block starts beyond the input tokens
+        // Check if we need to process remaining tokens from a different page
+        
+        // Get the block_idx (page) of the previous GPU block's first token
+        int64_t prev_first_token_idx = blockIdx.x * blockDim.x - blockDim.x;
+        if(prev_first_token_idx < 0)
+        {
+            return;  // Invalid, just return
+        }
+        
+        int64_t prev_slot_id = slot_mapping[prev_first_token_idx];
+        int64_t prev_block_idx = prev_slot_id / page_size;
+        
+        // Get the last token's block_idx (page)
+        first_token_idx = num_tokens - 1;
+        slot_id = slot_mapping[first_token_idx];
+        int64_t last_block_idx = slot_id / page_size;
+        
+        // If they are in the same page, the previous GPU block already handled it
+        if(prev_block_idx == last_block_idx)
+        {
+            return;  // Already processed by previous GPU block
+        }
+        
+        // Otherwise, this block should process the remaining tokens
+        // first_token_idx and slot_id are already set to the last token
+        tokenIdx = first_token_idx;  // All threads in this block will work on the last token's page
+    } else
+    {
+        // Normal case: GPU block starts within the valid token range
+        first_token_idx = tokenBlockIdx * blockDim.x;
+        slot_id = slot_mapping[first_token_idx];
+    }
+    
+    if(tokenIdx >= num_tokens)
+        return;
      int active_tokens = num_tokens - tokenBlockIdx * blockDim.x < blockDim.x ? num_tokens - tokenBlockIdx * blockDim.x : blockDim.x;
 
      bool const isQ                  = localHeadIdx < num_heads_q;
@@ -594,8 +638,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      // ============================================================================
      
      // cache the kv into kv cache and quant if required
-     int64_t first_token_idx = tokenBlockIdx * blockDim.x;
-     int64_t slot_id = slot_mapping[first_token_idx];
+
      if(slot_id < 0)
      {
          // invalid slot, skip
@@ -645,10 +688,12 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      auto sum               = [](float a, float b) { return a + b; };
      //int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
      __shared__ float smem[wg_size / WARP_SIZE];
-     int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
-     float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
-     
-     // Check if current token belongs to the current block_idx
+    int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
+    float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
+    
+    // Debug print: only print first few threads to avoid spam
+    
+    // Check if current token belongs to the current block_idx
      bool is_token_in_block = (tokens_in_block == 1);
      block_max  = 0;//abs(elements[0]);  // Initialize with first element's abs value
   
@@ -829,6 +874,8 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
         }
      }
  }
+
+ 
  
  #define DISPATCH_KV_HEAD(num_kv_heads, ...)                             \
      if(num_kv_heads == 1)                                               \
@@ -1019,7 +1066,9 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
 {
     // Fixed blockSize to reduce template instantiations
     constexpr int blockSize = 64;
-    int const gridSize = (num_tokens + blockSize - 1) / blockSize;
+    // todo if decode  one token per block
+    // int const gridSize = num_tokens;
+    int const gridSize = (num_tokens + blockSize - 1) / blockSize + 1;
 
     dim3 gridDim(gridSize, num_heads_q + num_heads_k + num_heads_v);
     dim3 blockDim(blockSize);
@@ -1054,34 +1103,34 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                                    x);
         });
         break;
-    //case 128:
-    //    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-    //        fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,
-    //                                               kv_cache_scalar_t,
-    //                                               128,
-    //                                               INTERLEAVE,
-    //                                               NUM_KV_HEADS,
-    //                                               blockSize,
-    //                                               kv_dt>
-    //            <<<gridDim, blockDim, 0, stream>>>(qkv,
-    //                                               num_heads_q,
-    //                                               num_heads_k,
-    //                                               num_heads_v,
-    //                                               eps,
-    //                                               q_weight,
-    //                                               k_weight,
-    //                                               cos_sin_cache,
-    //                                               position_ids,
-    //                                               k_cache,
-    //                                               v_cache,
-    //                                               slot_mapping,
-    //                                               k_scale,
-    //                                               v_scale,
-    //                                               num_tokens,
-    //                                               page_size,
-    //                                               x);
-    //    });
-    //    break;
+    case 128:
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+            fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,
+                                                   kv_cache_scalar_t,
+                                                   128,
+                                                   INTERLEAVE,
+                                                   NUM_KV_HEADS,
+                                                   blockSize,
+                                                   kv_dt>
+                <<<gridDim, blockDim, 0, stream>>>(qkv,
+                                                   num_heads_q,
+                                                   num_heads_k,
+                                                   num_heads_v,
+                                                   eps,
+                                                   q_weight,
+                                                   k_weight,
+                                                   cos_sin_cache,
+                                                   position_ids,
+                                                   k_cache,
+                                                   v_cache,
+                                                   slot_mapping,
+                                                   k_scale,
+                                                   v_scale,
+                                                   num_tokens,
+                                                   page_size,
+                                                   x);
+        });
+        break;
     //case 256:
     //    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     //        fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,
@@ -1282,7 +1331,7 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
                  "QKV tensor size must match total number of heads and head dimension");
  
      auto stream = at::hip::getCurrentHIPStream(qkv.get_device());
- 
+     printf("[DEBUG] num_tokens=%ld, page_size=%ld, x=%ld\n", num_tokens, page_size, x);
      DISPATCH_BY_KV_CACHE_DTYPE(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
  }
  
