@@ -851,7 +851,7 @@ def sage_fwd_mxfp4(
         Q_Descale
         + off_z * stride_qsz
         + off_h_q * stride_qsh
-        + (start_m + cu_seqlens_q_start) * stride_qsm
+        + cu_seqlens_q_start * stride_qsm
     )
     q_descale_ptrs = (
         q_descale_offset + offs_m[:, None] * stride_qsm + offs_d_qk_s[None, :]

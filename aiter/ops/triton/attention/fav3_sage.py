@@ -439,7 +439,7 @@ def fav3_sage_func(
     )
 
     if USE_MXFP4_SAGE:
-        stride_qsz, stride_qsn, stride_qsh, _ = map_dims(q_descale.stride(), bshd_map)
+        stride_qsz, stride_qsm, stride_qsh, _ = map_dims(q_descale.stride(), bshd_map)
         stride_ksz, stride_ksn, stride_ksh, _ = map_dims(k_descale.stride(), bshd_map)
     else:
         stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
@@ -471,7 +471,7 @@ def fav3_sage_func(
             v_descale,
             stride_qsz,
             stride_qsh,
-            stride_qsn,
+            stride_qsm,
             stride_ksz,
             stride_ksh,
             stride_ksn,
