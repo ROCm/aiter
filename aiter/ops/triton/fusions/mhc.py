@@ -176,15 +176,16 @@ def fused_mhc(
         config = dict(config)  # Copy to avoid mutation
     
     num_ksplit = config.get("NUM_KSPLIT", 1)
-
-    # Pop block sizes from config, or compute defaults
+    hres_op = config.pop("HRES_OP", 0)
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     # BLOCK_N: Column tile size (must be power of 2 for Triton arange)
-    if hres_lite_mode:
-        BLOCK_N = config.pop("BLOCK_N", 32)
+    if hres_lite_mode:        
+        min_block_n = n_factorial if hres_op == 1 else n_squared
+        config_block_n = config.pop("BLOCK_N", min_block_n)
+        BLOCK_N = triton.next_power_of_2(max(config_block_n, min_block_n))
     else:
-        # For sinkhorn mode, fit the n² output matrix (ignore config)
-        BLOCK_N = triton.next_power_of_2(n_squared)
+        BLOCK_N = triton.next_power_of_2(config.pop("BLOCK_N", n_squared))
+    
     BLOCK_K = config.pop("BLOCK_K", 64)
     # Ensure BLOCK_K doesn't exceed K dimension
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
@@ -255,9 +256,6 @@ def fused_mhc(
     # For lite mode, res stream needs to fit in one block for softmax
     n_blocks_res = 1 if hres_lite_mode else triton.cdiv(n_squared, BLOCK_N)
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
-
-    # Pop HRES_OP from config before kernel calls (only used in reduce/fused kernels, not split)
-    hres_op = config.pop("HRES_OP", 0)
 
     if num_ksplit > 1:
         # Split-K path: use split and reduce kernels
