@@ -164,8 +164,8 @@ def unified_attention(
         )
 
         # impl = gluon_kernel_unified_attention_3d
-        impl = gluon_kernel_unified_attention_3d_pipelined
-        # impl = gluon_kernel_unified_attention_3d_tdm_pipelined
+        # impl = gluon_kernel_unified_attention_3d_pipelined
+        impl = gluon_kernel_unified_attention_3d_tdm_pipelined
         attn_config["num_stages"] = 2
         print(attn_config)
 

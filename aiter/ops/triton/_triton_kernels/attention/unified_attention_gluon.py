@@ -435,6 +435,14 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         offs_k_t_starts = (
             physical_block_idx * stride_k_cache_0 + kv_head_idx * stride_k_cache_2
         ).to(tl.int32)
+        # ttgl.amd.gfx1250.tdm.prefetch(
+        #     src=k_desc,
+        #     offsets=[
+        #         0,
+        #         offs_k_t_starts,
+        #     ],
+        #     pred=pred.to(ttgl.int1)
+        # )
         ttgl.amd.gfx1250.tdm.async_load(
             src=k_desc,
             offsets=[
@@ -447,6 +455,8 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         if num_ctas > 1:
             ttgl.amd.gfx1250.cluster.arrive()
         ttgl.amd.gfx1250.tdm.async_wait(0)
+        if num_ctas > 1:
+            ttgl.amd.gfx1250.cluster.wait()
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
         K = smem_K.load(layout=K_DOT_LAYOUT)
 
