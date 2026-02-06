@@ -1970,7 +1970,7 @@ class CustomAllreduce
                               (size / world_size_ + (threads / world_size_) - 1) /
                                   (threads / world_size_));
             if (world_size_ == 8 && bytes > 512 * 4096 * 2 && arch.find("gfx942") != std::string::npos) {
-                use_write_mode = true;
+                use_write_mode = false;
             }
         }
 
