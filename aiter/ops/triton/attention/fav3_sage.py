@@ -122,30 +122,38 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         delta_s = None
         if USE_MXFP4_SAGE:
-            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale, delta_s = (
-                sage_quant_mxfp4(
-                    q,
-                    k,
-                    v,
-                    fp8_dtype,
-                    fp8_max,
-                    BLKQ=BLKQ,
-                    BLKK=BLKK,
-                    q_smoothing=q_smooth,
-                    layout=layout,
-                )
-            )
-        else:
-            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant(
+            (
+                q_quantized,
+                q_descale,
+                k_quantized,
+                k_descale,
+                v_quantized,
+                v_descale,
+                delta_s,
+            ) = sage_quant_mxfp4(
                 q,
                 k,
                 v,
                 fp8_dtype,
                 fp8_max,
-                sm_scale=softmax_scale,
                 BLKQ=BLKQ,
                 BLKK=BLKK,
+                q_smoothing=q_smooth,
                 layout=layout,
+            )
+        else:
+            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = (
+                sage_quant(
+                    q,
+                    k,
+                    v,
+                    fp8_dtype,
+                    fp8_max,
+                    sm_scale=softmax_scale,
+                    BLKQ=BLKQ,
+                    BLKK=BLKK,
+                    layout=layout,
+                )
             )
 
         # 4. Verify Descale Shapes (Grouped scaling for GQA/MQA)
@@ -195,9 +203,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         # 6. Context Saving for Backward
         if return_lse:
-            ctx.save_for_backward(
-                q, k, v, out, softmax_lse
-            )
+            ctx.save_for_backward(q, k, v, out, softmax_lse)
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
             ctx.window_size = window_size
@@ -387,8 +393,12 @@ def fav3_sage_func(
         )
 
     if USE_MXFP4_SAGE:
-        assert q.dtype == torch.uint8 and k.dtype == torch.uint8, "Q and K must be uint8"
-        assert q_descale.dtype == torch.uint8 and k_descale.dtype == torch.uint8, "Q and K descales must be uint8"
+        assert (
+            q.dtype == torch.uint8 and k.dtype == torch.uint8
+        ), "Q and K must be uint8"
+        assert (
+            q_descale.dtype == torch.uint8 and k_descale.dtype == torch.uint8
+        ), "Q and K descales must be uint8"
     else:
         assert q.dtype == torch.int8 and k.dtype == torch.int8, "Q and K must be int8"
     assert seqlen_k == seqlen_v, f"K/V seqlen mismatch: {seqlen_k} vs {seqlen_v}"

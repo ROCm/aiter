@@ -37,7 +37,7 @@ from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     fav3_sage_func,
-    get_sage_fwd_configs
+    get_sage_fwd_configs,
 )
 from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
@@ -327,32 +327,25 @@ def fav3_sage_forward_func(
             causal=False,
             inference_mode=True,
             layout=layout,
-            USE_MXFP4_SAGE=use_mxfp4_sage
+            USE_MXFP4_SAGE=use_mxfp4_sage,
         )
-    else: # exclude quantization overhead
+    else:  # exclude quantization overhead
         config = get_sage_fwd_configs(use_mxfp4_sage)
-        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]    
-        
+        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+
         # Note: softmax_scale is integrated into quantization descaling
         fp8_dtype = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_dtype).max
         if use_mxfp4_sage:
-            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale, delta_s = (
-                sage_quant_mxfp4(
-                    q,
-                    k,
-                    v,
-                    fp8_dtype,
-                    fp8_max,
-                    sm_scale=softmax_scale,
-                    BLKQ=BLKQ,
-                    BLKK=BLKK,
-                    q_smoothing=q_smooth,
-                    layout=layout,
-                )
-            )
-        else:
-            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = sage_quant(
+            (
+                q_quantized,
+                q_descale,
+                k_quantized,
+                k_descale,
+                v_quantized,
+                v_descale,
+                delta_s,
+            ) = sage_quant_mxfp4(
                 q,
                 k,
                 v,
@@ -361,11 +354,25 @@ def fav3_sage_forward_func(
                 sm_scale=softmax_scale,
                 BLKQ=BLKQ,
                 BLKK=BLKK,
+                q_smoothing=q_smooth,
                 layout=layout,
+            )
+        else:
+            q_quantized, q_descale, k_quantized, k_descale, v_quantized, v_descale = (
+                sage_quant(
+                    q,
+                    k,
+                    v,
+                    fp8_dtype,
+                    fp8_max,
+                    sm_scale=softmax_scale,
+                    BLKQ=BLKQ,
+                    BLKK=BLKK,
+                    layout=layout,
+                )
             )
             delta_s = None
 
-        
         return lambda: fav3_sage_func(
             q_quantized,
             k_quantized,
@@ -379,7 +386,6 @@ def fav3_sage_forward_func(
             USE_MXFP4_SAGE=use_mxfp4_sage,
             config=config,
         )
-
 
 
 def create_benchmark_configs(args):
@@ -503,7 +509,9 @@ def primary_output(result):
     return result
 
 
-def attn_forward_func(q, k, v, func_name, softmax_scale, q_smooth, layout, dtype, use_mxfp4_sage=False):
+def attn_forward_func(
+    q, k, v, func_name, softmax_scale, q_smooth, layout, dtype, use_mxfp4_sage=False
+):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
@@ -513,7 +521,7 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, q_smooth, layout, dtype
             inference_mode=True,
             layout=layout,
             q_smooth=q_smooth,
-            use_mxfp4_sage=use_mxfp4_sage
+            use_mxfp4_sage=use_mxfp4_sage,
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -579,7 +587,7 @@ def bench_kernel(q, k, v, args, provider):
     else:
         bench_func_name = "fav3_sage"
 
-    use_mxfp4_sage=args.mxfp4_sage
+    use_mxfp4_sage = args.mxfp4_sage
 
     fn = attn_forward_func(
         q,
@@ -590,7 +598,7 @@ def bench_kernel(q, k, v, args, provider):
         q_smooth=q_smooth,
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
-        use_mxfp4_sage=use_mxfp4_sage
+        use_mxfp4_sage=use_mxfp4_sage,
     )
     ms = triton.testing.do_bench(fn)
 
