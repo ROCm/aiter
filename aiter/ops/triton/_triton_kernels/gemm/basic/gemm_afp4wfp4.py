@@ -141,9 +141,27 @@ def _gemm_afp4wfp4_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+        # Total number of scale groups: K (tensor shape) * 2 (FP4 per uint8) / SCALE_GROUP_SIZE
+        num_scale_groups = K * 2 // SCALE_GROUP_SIZE
+        # Local offset for scale mask calculation
+        offs_ks_local = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            a_scales = tl.load(a_scale_ptrs)
-            b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
+            # Load the next block of A and B scales, with mask when K is not aligned.
+            if EVEN_K:
+                a_scales = tl.load(a_scale_ptrs)
+                b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
+            else:
+                # Calculate scale mask: check if scale group index is within bounds
+                current_scale_offset = k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                scale_k_mask = offs_ks_local < (num_scale_groups - current_scale_offset)
+                a_scales = tl.load(a_scale_ptrs, mask=scale_k_mask[None, :], other=0)
+                b_scales = tl.load(
+                    b_scale_ptrs,
+                    mask=scale_k_mask[None, :],
+                    other=0,
+                    cache_modifier=cache_modifier,
+                )
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
