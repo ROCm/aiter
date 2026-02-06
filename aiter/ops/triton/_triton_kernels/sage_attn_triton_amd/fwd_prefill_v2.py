@@ -2064,7 +2064,7 @@ def sage_quant_v2(
     )
 
     ## rotate q and k
-    q, k = apply_hadamard_rotation_qk(q, k)
+    q, k = apply_hadamard_rotation_qk(q, k, block_size=128)
 
     ## quantize q and k
     q_bf16 = torch.empty_like(q, dtype=torch.bfloat16, device=q.device)
