@@ -890,7 +890,7 @@ def paged_attention_decode_sliding_window(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
-    if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
+    if COMPUTE_TYPE.is_fp8():
         MFMA_INSTR_K: gl.constexpr = 32
     else:
         MFMA_INSTR_K: gl.constexpr = 16
@@ -3106,7 +3106,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
             CDNA_VERSION=CDNA_VERSION,
             ONE_SHOT=(num_splits <= 1),
-            waves_per_eu=waves_per_eu,
             num_stages=1,
         )
         return
