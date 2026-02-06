@@ -621,7 +621,7 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
                 v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_dv[None, :] * stride_vn
                 # Compute pointers for all the scale tensors used in this kernel.
                 q_descale_offset = Q_descale + off_z * stride_qsz + off_h_q * stride_qsh + cu_seqlens_q_start * stride_qsm
-                q_descale_ptrs = q_descale_offset + offs_m[:, None] * stride_qsm + offs_d[None, :] * stride_qsk
+                q_descale_ptrs = q_descale_offset + offs_m[:, None] * stride_qsm + offs_ds[None, :] * stride_qsk
                 
                 k_descale_offset = K_descale + off_z * stride_ksz + off_h_k * stride_ksh + cu_seqlens_k_start * stride_ksn
                 k_descale_ptrs = k_descale_offset + offs_ds[None, :] * stride_ksk + offs_n[:, None] * stride_ksn # Do not transpose for dot scaled!
@@ -1385,41 +1385,6 @@ def quantize_input(
     return q_fp4, k_fp4, v_fp8
 
 
-def quantize_input_old(q, k, v, input_metadata: MetaData, quantize_p=False, int8_kv=False):
-    assert not (quantize_p and int8_kv)
-    if input_metadata.layout == 'bhsd':
-        qunatization_dim = 1
-    elif input_metadata.layout == 'bshd':
-        qunatization_dim = 2
-    else:
-        assert False, 'Got unsupported tensor layout'
-    assert not (quantize_p and int8_kv)
-
-    q_descale = None
-    if not int8_kv:
-        q, _, q_descale = quantize_int8(q, dim=qunatization_dim)
-    k, _, k_descale = quantize_int8(k, dim=qunatization_dim)
-    v, _, v_descale = quantize_int8(v, dim=qunatization_dim)
-
-    # In real world use case, the p scale would be a parameter trained by the model.
-    p_scale = p_descale = None
-    # The p shape is always bhqk
-    if quantize_p:
-        _, nheads_q, _, _ = get_shape_from_layout(q, k, input_metadata)
-        p_scale = torch.full((1, nheads_q, 1, 1), 127, dtype=torch.float32, device="cuda")
-        p_descale = 1 / p_scale
-
-    # We are not multiplying the scales togather to get qk_desale / o_descale e.g.
-    # qk_desale = q_descale * k_descale
-    # o_desale = p_descale * v_descale
-    # it results in very small fp e.g. 0,0002, losing precision. They are applied on the run.
-    input_metadata.set_int8_params(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
-                                   # By default p_scaling is not enabled
-                                   p_scale=p_scale, p_descale=p_descale)
-
-    return q, k, v
-
-
 def input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, requires_grad=True):
     torch.manual_seed(20)
 
@@ -1511,6 +1476,8 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torc
     q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
 
     triton_out, _, best_configs = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+
+    # print("Triton out", triton_out)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
