@@ -52,10 +52,10 @@ def init_3buffer_kv_cache(
         kv_lora_rank % scale_dim == 0
     ), f"kv_lora_rank ({kv_lora_rank}) must be divisible by scale_dim ({scale_dim})"
 
-    kv_nope_buffer_fp32 = torch.ones(
+    kv_nope_buffer_fp32 = torch.randn(
         (num_page, page_size, 1, kv_lora_rank), dtype=torch.float32
     )
-    kv_rope_buffer_bf16 = torch.ones(
+    kv_rope_buffer_bf16 = torch.randn(
         (num_page, page_size, 1, qk_rope_head_dim),
         dtype=torch.bfloat16,
     )
@@ -270,7 +270,6 @@ def torch_mla_extend(
 
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
-    # print(f"kvc[1,:,:] is {kvc[1,:,:]}")
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
     bs = qo_indptr.shape[0] - 1
 
@@ -424,10 +423,10 @@ def gather_sparse_kv_buffer(
     fill_value: float = 0.0,
 ):
     """
-    Gather sparse KV buffer ??? valid_mask
+    Gather sparse KV pages for the given token indices and compute the corresponding validity mask.
 
     Returns:
-        gathered_kv: [num_tokens, num_topk, nhead_kv, dim]
+        gathered_kv: [page_nums, page_size, nhead_kv, dim]
         valid_mask: [num_tokens, num_topk] - bool tensor
     """
     page_num, page_size, nhead_kv, head_dim = kv_buffer.shape
@@ -443,7 +442,6 @@ def gather_sparse_kv_buffer(
         gathered_kv,
         torch.full_like(gathered_kv, fill_value),
     )
-    print(f"valid_mask.shape is {valid_mask.shape}")
     return gathered_kv.reshape(-1, page_size, nhead_kv, head_dim), valid_mask
 
 
@@ -455,13 +453,14 @@ def get_dense_kv_indptr_and_indices(
     num_tokens, topk = converted_indices.shape
     new_kv_indptr = [0]
     new_kv_last_page_lens = []
-    total_kv_page_nums = 0
+    total_kv_padded_page_nums = 0
     for i in range(num_tokens):
-        kv_num_pages = (topk + page_size - 1) // page_size
-        total_kv_page_nums = total_kv_page_nums + kv_num_pages
-        new_kv_indptr.append(kv_num_pages + new_kv_indptr[i])
         kv_len = new_kv_len_indptr[i + 1] - new_kv_len_indptr[i]
         kv_len = min(kv_len, topk)
+        kv_padded_num_pages = (topk + page_size - 1) // page_size
+        total_kv_padded_page_nums = total_kv_padded_page_nums + kv_padded_num_pages
+        new_kv_indptr.append(kv_padded_num_pages + new_kv_indptr[i])
+
         if kv_len % page_size == 0:
             new_kv_last_page_lens.append(page_size)
         else:
@@ -470,7 +469,7 @@ def get_dense_kv_indptr_and_indices(
     return (
         torch.tensor(new_kv_indptr, dtype=torch.int32),
         torch.tensor(new_kv_last_page_lens, dtype=torch.int32),
-        torch.arange(0, total_kv_page_nums, dtype=torch.int32),
+        torch.arange(0, total_kv_padded_page_nums, dtype=torch.int32),
     )
 
 
@@ -663,9 +662,9 @@ def test_mla(
 
     kv_len_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
-    print(
-        f"seq_lens_kv is {seq_lens_kv}, kv_len_indptr is {kv_len_indptr}, kv_block_nums is {kv_block_nums}, kv_indptr is {kv_indptr}"
-    )
+    # print(
+    #     f"seq_lens_kv is {seq_lens_kv}, kv_len_indptr is {kv_len_indptr}, kv_block_nums is {kv_block_nums}, kv_indptr is {kv_indptr}"
+    # )
     num_page = kv_indptr[-1].item()
     kv_indices = torch.randperm(num_page, dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -789,14 +788,14 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
-    num_works = work_indptr[-1].item()
-    for i in range(num_works):
-        print(
-            f"work_info_set[{i}, 0]: {work_info_set[i, 0]}, [{i}, 1]: {work_info_set[i, 1]}, [{i}, 2]: {work_info_set[i, 2]}, [{i}, 3]: {work_info_set[i, 3]}, [{i}, 4]: {work_info_set[i, 4]}, [{i}, 5]: {work_info_set[i, 5]}, [{i}, 6]: {work_info_set[i, 6]}"
-        )
+    # num_works = work_indptr[-1].item()
+    # for i in range(num_works):
+    #     print(
+    #         f"work_info_set[{i}, 0]: {work_info_set[i, 0]}, [{i}, 1]: {work_info_set[i, 1]}, [{i}, 2]: {work_info_set[i, 2]}, [{i}, 3]: {work_info_set[i, 3]}, [{i}, 4]: {work_info_set[i, 4]}, [{i}, 5]: {work_info_set[i, 5]}, [{i}, 6]: {work_info_set[i, 6]}"
+    #     )
     # generate kv topk per token & convert indices into per token
     token_indices = generate_topk_kv(kv_len_indptr, decode_qlen, topk)
-    # ??????????
+
     converted_indices = triton_convert_req_index_to_global_index(
         kv_indptr,
         kv_indices,
@@ -819,12 +818,12 @@ def test_mla(
         )
     )
     total_kv = new_kv_indptr[-1].item()  # change into pertoken total_kv
-    print(
-        f"new_qo_indptr shape is {new_qo_indptr.shape}, new_qo_indptr is {new_qo_indptr}, "
-        f"new_kv_indptr shape is {new_kv_indptr.shape}, new_kv_indptr is {new_kv_indptr}, "
-        f"new_kv_last_page_lens shape is {new_kv_last_page_lens.shape}, new_kv_last_page_lens is {new_kv_last_page_lens}, "
-        f"new_indices shape is {new_indices.shape}, new_indices is {new_indices}"
-    )
+    # print(
+    #     f"new_qo_indptr shape is {new_qo_indptr.shape}, new_qo_indptr is {new_qo_indptr}, "
+    #     f"new_kv_indptr shape is {new_kv_indptr.shape}, new_kv_indptr is {new_kv_indptr}, "
+    #     f"new_kv_last_page_lens shape is {new_kv_last_page_lens.shape}, new_kv_last_page_lens is {new_kv_last_page_lens}, "
+    #     f"new_indices shape is {new_indices.shape}, new_indices is {new_indices}"
+    # )
 
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -966,7 +965,6 @@ def test_mla(
             kv_nope_scale_factors_fp32,
             converted_indices,
         )
-        # print(f"new_kv_nope_buffer_fp8[17,:,:] is {new_kv_nope_buffer_fp8[17,:,:]}")
         # convert to bytes
         nope_bytes = new_kv_nope_buffer_fp8.view(torch.uint8)
         scale_bytes = new_kv_scale_factors_fp32.view(torch.uint8)
@@ -984,7 +982,8 @@ def test_mla(
                 page_size,
             )
         )
-        print(f"dense_kv_last_page_lens is {dense_kv_last_page_lens}")
+
+        # print(f"dense_kv_last_page_lens is {dense_kv_last_page_lens}, dense_kv_indptr is {dense_kv_indptr}, dense_kv_indices is {dense_kv_indices}")
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend_3buffer(
             q,
             kv_buffer_bytes,
@@ -1077,8 +1076,8 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 2), (48, 1), (128, 2)]
-# list_nhead = [(16, 1), (16, 2), (16, 4), (16, 3)]
+# list_nhead = [(16, 2), (48, 1), (128, 2)]
+list_nhead = [(16, 1), (16, 2), (16, 4), (16, 3)]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1148,7 +1147,8 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[21, 64, 256, 512, 1200, 2048, 3200, 5200, 8192],
+    # default=[21, 64, 256, 512, 1200, 2048, 3200, 5200, 8192],
+    default=[21, 64, 256, 512, 1200, 2048, 3200, 5200],
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -1157,7 +1157,8 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[1, 3, 5, 16, 32, 64, 128, 256],
+    # default=[1, 3, 5, 16, 32, 64, 128, 256],
+    default=[1, 3, 5, 16, 32, 64, 128],
     help="""Batch size.
     e.g.: -b 16""",
 )
