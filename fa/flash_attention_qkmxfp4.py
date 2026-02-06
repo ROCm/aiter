@@ -278,6 +278,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
                     RETURN_ENCODED_SOFTMAX: tl.constexpr, PADDED_HEAD: tl.constexpr, ACTUAL_BLOCK_DMODEL: tl.constexpr,
                     QK_SCALE: tl.constexpr,
                     ENABLE_PIPELINING: tl.constexpr):
+    k_descale_ptrs = k_descale_base_ptrs
+    
     # loop over k, v, and update accumulator
     num_stages: tl.constexpr = None if ENABLE_PIPELINING else 1  # Set num_stages==1 if we want to disable pipelining
     for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=num_stages):
@@ -290,9 +292,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
         k_offs_k = None if not PADDED_HEAD else tl.arange(0, BLOCK_DMODEL)
         k = load_fn(k_ptrs, k_offs_k, k_offs_n, ACTUAL_BLOCK_DMODEL, actual_seqlen_k)
         # load k_descale
-        k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
+        # k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
         k_descale = tl.load(k_descale_ptrs)
-        
+        k_descale_ptrs += BLOCK_N * stride_ksn
 
         if PRE_LOAD_V:
             # We can use the same offsets as k, just with dims transposed.
@@ -721,6 +723,10 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
                         bias_ptrs += n_full_blocks * BLOCK_N * stride_bn
                     if RETURN_ENCODED_SOFTMAX:
                         encoded_sm_ptrs += n_full_blocks * BLOCK_N
+                    
+                    k_descale_ptrs += n_full_blocks * BLOCK_N * stride_ksn
+                    
+                    
                     acc, l_i, m_i = _attn_fwd_inner(
                         acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, start_m, seqlen_k,
                         seqlen_q, dropout_p, philox_seed, batch_philox_offset, encoded_sm_ptrs, block_min, block_max,
@@ -1538,7 +1544,7 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torc
     check_attention_outputs(
         triton_out,
         torch_out,
-        fp8=True,
+        fp8=False,
         atol=ATOL_fp8,
         rtol=RTOL_fp8,
         max_diff_percentage=0.5,
