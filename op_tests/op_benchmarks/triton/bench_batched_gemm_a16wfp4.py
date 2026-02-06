@@ -2,6 +2,9 @@ import sys
 import torch
 import triton
 import math
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
+    generate_batched_gemm_a16wfp4_inputs,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,
@@ -29,7 +32,7 @@ def bench_gemm_fn(
     layout: str,
 ):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
+    x, w, x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
         batch, M, N, K, c_dtype, layout=layout, output=True
     )
     # flops
