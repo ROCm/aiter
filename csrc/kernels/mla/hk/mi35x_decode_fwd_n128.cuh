@@ -2345,6 +2345,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             ckt::static_for<0, kNumIter, 1>{}([&](auto idx) {
                 constexpr uint32_t gpr_offset = k_o_begin + idx.value * 8;
                 constexpr uint32_t col_offset = idx.value * 32;
+                __builtin_amdgcn_s_setprio(kNumIter - 1 - idx.value);
                 o_manager.template output_to_vram<gpr_offset, col_offset>(
                     params.final_output.raw_ptr, warp_idx, qo_start, p_lds_o);
             });
@@ -2356,6 +2357,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             ckt::static_for<0, kNumIter, 1>{}([&](auto idx) {
                 constexpr uint32_t gpr_offset = k_o_begin + idx.value * 8;
                 constexpr uint32_t col_offset = idx.value * 32;
+                __builtin_amdgcn_s_setprio(kNumIter - 1 - idx.value);
                 split_o_manager.template output_to_vram<gpr_offset, col_offset>(
                     params.split_output.raw_ptr, warp_idx, partial_qo_loc, p_lds_o);
             });
