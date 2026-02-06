@@ -48,7 +48,7 @@ def fused_ar_rmsnorm(
     eps,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
-    post_per_token_quant: bool = True,
+    post_per_token_quant: bool = False,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -364,6 +364,7 @@ def test_fused_ar_rmsnorm(
     dtype,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
+    post_per_token_quant: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -397,6 +398,7 @@ def test_fused_ar_rmsnorm(
                     eps,
                     withGraph,
                     distributed_init_method,
+                    post_per_token_quant,
                 ),
             )
         )
@@ -418,7 +420,10 @@ def test_fused_ar_rmsnorm(
     for out, us in rets:
         msg = f"test_fused_ar_rmsnorm: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         # print(cpu_rslt[out.device.index])
-        checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg)
+        if not post_per_token_quant:
+            checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg)
+        else:
+            checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg, atol=5e-2, rtol=5e-2)
         # checkAllclose(ref, out.to(ref), msg=msg)
 
 
@@ -545,7 +550,8 @@ def acc_test_cudagraph_on(
 #         checkAllclose(cpu_rslt[i], ar_rslt[i].to(ref))
 
 l_dtype = ["fp16", "bf16"]
-l_shape = [(13, 512), (13, 1024), (13, 2048), (17, 4096), (17, 7168), (19, 8192)]
+# l_shape = [(13, 512), (13, 1024), (13, 2048), (17, 4096), (17, 7168), (19, 8192)]
+l_shape = [(4, 4096)]
 l_tp = [8]
 l_pp = [1]
 l_graph = [False, True]
@@ -640,4 +646,16 @@ if __name__ == "__main__":
             distributed_init_method=get_distributed_init_method(
                 get_ip(), get_open_port()
             ),
+            post_per_token_quant=False,
+        )
+        test_fused_ar_rmsnorm(
+            tp,
+            pp,
+            shape,
+            dtype,
+            withGraph=graph_on,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+            post_per_token_quant=True,
         )

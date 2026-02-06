@@ -417,8 +417,7 @@ class CustomAllreduce:
             return out, res_out
         else:
             if out is None:
-                # out = torch.empty(inp.shape, device=inp.device, dtype=aiter.dtypes.fp8)
-                out = torch.empty_like(inp).to(fp8)
+                out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
             if scale_out is None:
                 scale_out = torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device)
             ops.fused_allreduce_rmsnorm_quant(
@@ -426,8 +425,8 @@ class CustomAllreduce:
                 inp,
                 res_inp,
                 res_out,
-                scale_out,
                 out,
+                scale_out,
                 w,
                 eps,
                 None if registered else self.input_buffer,

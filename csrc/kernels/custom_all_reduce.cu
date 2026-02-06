@@ -384,7 +384,7 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
             use_1stage);                                         \
     }
 
-    switch(out.scalar_type())
+    switch(residual_inp.scalar_type())
     {
     case at::ScalarType::Float: {
         DISPATCH_AR_FUSION(float)
@@ -471,7 +471,6 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());
-    TORCH_CHECK_EQ(inp.numel(), out.numel());
     TORCH_CHECK_EQ(inp.numel(), res_inp.numel());
     int n = w.numel();
     int m = inp.numel() / n;

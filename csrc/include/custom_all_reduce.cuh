@@ -1407,7 +1407,7 @@ __device__ __forceinline__ void ar_fusion_epilogue(
         *reinterpret_cast<P *>(output + idx) = out;
     } else {
         float FP8_UPBOUND = ck_tile::type_convert<float>(ck_tile::numeric<ck_tile::fp8_t>::max());
-        using OP = array_t<hip_fp8, PACK_SIZE>;
+        using OP = array_t<OutT, PACK_SIZE>;
         OP out_quant;
         A out;
         ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE, BLOCK_SIZE>(out, in, weight, eps, hidden_dim);
@@ -1416,7 +1416,7 @@ __device__ __forceinline__ void ar_fusion_epilogue(
 #pragma unroll
         for (int i = 0; i < PACK_SIZE; ++i) {
             float out_scaled = ck_tile::type_convert<float>(out.data[i]) / scale;
-            out_quant.data[i] = ck_tile::type_convert<hip_fp8>(out_scaled);
+            out_quant.data[i] = ck_tile::type_convert<OutT>(out_scaled);
         }
         *reinterpret_cast<OP *>(output + idx) = out_quant;
         scale_out[tidx] = scale;
