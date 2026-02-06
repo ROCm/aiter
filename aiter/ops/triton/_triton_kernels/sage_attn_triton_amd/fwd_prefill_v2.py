@@ -23,53 +23,31 @@ def _sage_fwd_no_mask_v2(
     k_base_ptrs,
     v_base_ptrs,
     delta_s_ptr,
-    bias_base_ptrs,
     stride_kn,
     stride_vk,
-    stride_bn,
-    stride_sn,
-    stride_sm,
-    start_m,
+    stride_dsk,
     seqlen_k,
     seqlen_q,
-    dropout_p,
-    philox_seed,
-    philox_offset_base,
-    sd_mask,
-    stride_sz,
-    stride_sh,
-    stride_dsk,
-    off_z,
-    off_h_q,
     offs_m,
     offs_n,
     offs_d_k,
     offs_d_v,
     block_min,
     block_max,
-    alibi_slope,
     q_descale,
     q_descale_pre,
     k_descale_base_ptr,
     k_descale_pre_base_ptr,
-    SM_SCALE: tl.constexpr,
-    FP8_MAX,
     stride_ksn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
-    ENABLE_DROPOUT: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr,
     PADDED_HEAD_V: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_K: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
-    RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
-    Q_DTYPE_STR: tl.constexpr,
-    K_DTYPE_STR: tl.constexpr,
-    SMOOTH_Q: tl.constexpr,
 ):
     k_descale_ptr = k_descale_base_ptr
     k_descale_pre_ptr = k_descale_pre_base_ptr
@@ -96,10 +74,10 @@ def _sage_fwd_no_mask_v2(
         k_descale_pre = tl.load(k_descale_pre_ptr)
         k_descale_pre_ptr += 1
 
-        if SMOOTH_Q:
-            delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
-            delta_s = tl.load(delta_s_ptrs)
-            delta_s_ptr += stride_dsk
+        # SMOOTH_Q is always True - always load delta_s
+        delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
+        delta_s = tl.load(delta_s_ptrs)
+        delta_s_ptr += stride_dsk
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -111,28 +89,12 @@ def _sage_fwd_no_mask_v2(
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-        if SMOOTH_Q:
-            qk += delta_s[None, :]
+        # SMOOTH_Q is always True
+        qk += delta_s[None, :]
 
         # -- compute qk ----
-        qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * (q_descale_pre * k_descale_pre)
-
-        if USE_ALIBI:
-            # compute the global position of each token within the sequence
-            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-            )
-            qk += alibi_block
-
-        # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
-        # compute bias
-        if bias_base_ptrs is not None:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk += bias
+        # Hardcoded for e2m1 dtype
+        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1", fast_math=True) * (q_descale_pre * k_descale_pre)
 
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -144,58 +106,11 @@ def _sage_fwd_no_mask_v2(
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
-            # p = tl.math.exp2(q_shifted * RCP_LN2)
             p = tl.math.exp2(q_shifted)
         else:
             p = tl.math.exp(q_shifted)
 
-        # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
-        if ENABLE_DROPOUT:
-            # Compute pointers for this block
-            philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-            philox_ptrs = (
-                philox_base
-                + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
-            )
-
-            # compute dropout mask
-            rng_output = tl.rand(philox_seed, philox_ptrs)
-            dropout_mask = rng_output > dropout_p
-
-            # return scores with negative values for dropped vals (only if RETURN_SCORES is True)
-            if RETURN_SCORES:
-                sd_mask_value = tl.where(dropout_mask, p, -p)
-                sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = (
-                    sd_mask_base
-                    + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
-                )
-
-                # Compute mask for sd_mask storage
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                    kv_offs_n[None, :] < seqlen_k
-                )
-                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
-
-            # apply dropout mask in place
-            p = tl.where(dropout_mask, p, 0.0)
-        elif RETURN_SCORES:
-            # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-            sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-            sd_mask_ptrs = (
-                sd_mask_base
-                + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
-            )
-
-            # Compute mask for sd_mask storage
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                kv_offs_n[None, :] < seqlen_k
-            )
-            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
@@ -232,24 +147,12 @@ def _sage_fwd_mask_v2(
     k_base_ptrs,
     v_base_ptrs,
     delta_s_ptr,
-    bias_base_ptrs,
     stride_kn,
     stride_vk,
-    stride_bn,
-    stride_sn,
-    stride_sm,
+    stride_dsk,
     start_m,
     seqlen_k,
     seqlen_q,
-    dropout_p,
-    philox_seed,
-    philox_offset_base,
-    sd_mask,
-    stride_sz,
-    stride_sh,
-    stride_dsk,
-    off_z,
-    off_h_q,
     offs_m,
     offs_n,
     offs_d_k,
@@ -257,40 +160,25 @@ def _sage_fwd_mask_v2(
     block_min,
     block_max,
     n_extra_tokens,
-    alibi_slope,
     q_descale,
     q_descale_pre,
     k_descale_base_ptr,
     k_descale_pre_base_ptr,
-    SM_SCALE: tl.constexpr,
-    FP8_MAX,
     stride_ksn,
-    IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
-    ENABLE_DROPOUT: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr,
     PADDED_HEAD_V: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_K: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
-    RETURN_SCORES: tl.constexpr,
-    USE_SLIDING_WINDOW: tl.constexpr,
-    WINDOW_SIZE_LEFT: tl.constexpr,
-    WINDOW_SIZE_RIGHT: tl.constexpr,
     ACCUMULATOR_TYPE,
-    Q_DTYPE_STR: tl.constexpr,
-    K_DTYPE_STR: tl.constexpr,
-    SMOOTH_Q: tl.constexpr,
 ):
-    # seqlen diff
-    seqlen_delta_qk = seqlen_k - seqlen_q
-
+    # Initialize pointers for this masked block range
     k_descale_ptr = k_descale_base_ptr
     k_descale_pre_ptr = k_descale_pre_base_ptr
-
+    
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
@@ -316,272 +204,46 @@ def _sage_fwd_mask_v2(
         k_descale_pre = tl.load(k_descale_pre_ptr)
         k_descale_pre_ptr += 1
 
-        if SMOOTH_Q:
-            delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
-            delta_s = tl.load(delta_s_ptrs)
-            delta_s_ptr += stride_dsk
+        # SMOOTH_Q is always True - always load delta_s
+        delta_s_ptrs = delta_s_ptr + tl.arange(0, BLOCK_N)
+        delta_s = tl.load(delta_s_ptrs)
+        delta_s_ptr += stride_dsk
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-        if SMOOTH_Q:
-            qk += delta_s[None, :]
+        # SMOOTH_Q is always True
+        qk += delta_s[None, :]
+
+        # -- compute qk ----
+        # Hardcoded for e2m1 dtype
+        qk += tl.dot_scaled(q, q_descale, "e2m1", k, k_descale, "e2m1", fast_math=True) * (q_descale_pre * k_descale_pre)
 
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
-        # TODO: This can be optimized to only be true for the padded block.
         # If this is the last block / iteration, we want to
         # mask if the sequence length is not a multiple of block size
-        # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
-        # last step might get wasted but that is okay. check if this masking works For
-        # that case.
         if (n_extra_tokens != 0) and (start_n + BLOCK_N == block_max):
             boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
             size_n = start_n + offs_n[None, :]
             mask = size_n < boundary_m[:, None]
             qk = tl.where(mask, qk, float("-inf"))
 
-        # -- compute qk ----
-        qk += tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True) * (q_descale_pre * k_descale_pre)
-        if USE_ALIBI:
-            # compute the global position of each token within the sequence
-            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-            )
-            qk += alibi_block
-
-        if USE_SLIDING_WINDOW:
-            if IS_CAUSAL:
-                # ========== CAUSAL SLIDING WINDOW MASKING ==========
-                # For causal sliding window, we need to apply both constraints:
-                # 1. Causal: col_idx <= row_idx + (seqlen_k - seqlen_q)
-                # 2. Sliding window: row_idx - window_left <= col_idx <= row_idx + window_right
-
-                # Get positions
-                row_idx = offs_m  # Query positions
-                col_idx = kv_offs_n  # Key positions
-
-                # Expand for broadcasting
-                row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
-                col_idx_expanded = col_idx[None, :]  # [1, BLOCK_N]
-
-                # Apply causal constraint: can only attend to positions before or at the diagonal
-                causal_offset = seqlen_k - seqlen_q
-                causal_mask = col_idx_expanded > (row_idx_expanded + causal_offset)
-
-                # Apply sliding window constraint
-                if WINDOW_SIZE_LEFT < 0:
-                    # Only right window constraint
-                    window_mask = col_idx_expanded > (
-                        row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
-                    )
-                else:
-                    # Both left and right window constraints
-                    # Adjust window bounds by causal offset
-                    left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
-                    right_bound = row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
-
-                    # Can't attend to positions outside the window
-                    window_mask = (col_idx_expanded < left_bound) | (
-                        col_idx_expanded > right_bound
-                    )
-
-                # Final mask is the union of both constraints (True = cannot attend)
-                mask = causal_mask | window_mask
-
-                # Apply mask
-                qk = tl.where(mask, float("-inf"), qk)
-            else:
-                # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
-                # Exactly matching reference construct_local_mask:
-                # row_idx = query positions, col_idx = key positions
-                # sk = seqlen_k, sq = seqlen_q
-
-                # Get positions
-                row_idx = offs_m  # Query positions
-                col_idx = kv_offs_n  # Key positions
-
-                # sk and sq from reference (no padding masks in this test)
-                sk = seqlen_k
-                sq = seqlen_q
-
-                # Expand for broadcasting
-                row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
-                col_idx_expanded = col_idx[None, :]  # [1, BLOCK_N]
-
-                # Reference logic for mask computation
-                if WINDOW_SIZE_LEFT < 0:
-                    # Reference: return col_idx > row_idx + sk - sq + window_size[1]
-                    mask = col_idx_expanded > (
-                        row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
-                    )
-                else:
-                    # Reference:
-                    # sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
-                    # return torch.logical_or(
-                    #     col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
-                    #     col_idx < row_idx + sk - sq - window_size[0],
-                    # )
-                    # Create sk tensor with proper shape for broadcasting
-                    # sk represents the key sequence length, which should be compared per column
-                    sk_full = tl.full((1, BLOCK_N), sk, dtype=tl.int32)
-
-                    # Compute boundaries
-                    right_bound_val = row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
-                    right_bound = tl.minimum(right_bound_val, sk_full)
-                    left_bound = row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
-
-                    # Mask where True = cannot attend (matching reference)
-                    mask = (col_idx_expanded > right_bound) | (
-                        col_idx_expanded < left_bound
-                    )
-
-                # Apply mask (set to -inf where mask is True)
-                qk = tl.where(mask, float("-inf"), qk)
-        else:
-            if IS_CAUSAL:
-                causal_boundary = start_n + offs_n - seqlen_delta_qk
-                causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-                qk = tl.where(causal_mask, qk, float("-inf"))
-
-        # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
-        # compute bias
-        if bias_base_ptrs is not None:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk += bias
-
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
-        # IMPORTANT: Handle the case where all values are -inf
-        # When m_ij = -inf and qk = -inf, subtraction gives NaN
-        # We need to handle this explicitly
-        if USE_SLIDING_WINDOW:
-            # Check if this block has any valid values (m_ij != -inf)
-            # For rows where everything is -inf, set q_shifted to -inf (not NaN)
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
-            )
-        else:
-            q_shifted = qk - m_ij[:, None]
+        q_shifted = qk - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
-            # p = tl.math.exp2(q_shifted * RCP_LN2)
             p = tl.math.exp2(q_shifted)
         else:
             p = tl.math.exp(q_shifted)
 
-        # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
-        if ENABLE_DROPOUT:
-            # Compute pointers for this block
-            philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-            philox_ptrs = (
-                philox_base
-                + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
-            )
-
-            # compute dropout mask
-            rng_output = tl.rand(philox_seed, philox_ptrs)
-            dropout_mask = rng_output > dropout_p
-
-            # return scores with negative values for dropped vals (only if RETURN_SCORES is True)
-            if RETURN_SCORES:
-                sd_mask_value = tl.where(dropout_mask, p, -p)
-                sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = (
-                    sd_mask_base
-                    + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
-                )
-
-                # Compute mask for sd_mask storage - include bounds check
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                    kv_offs_n[None, :] < seqlen_k
-                )
-
-                # Add causal mask if applicable to prevent writing to invalid positions
-                if IS_CAUSAL:
-                    seqlen_delta_qk = seqlen_k - seqlen_q
-                    causal_constraint = kv_offs_n[None, :] <= (
-                        offs_m[:, None] + seqlen_delta_qk
-                    )
-                    sd_store_mask = sd_store_mask & causal_constraint
-
-                # Add sliding window mask if applicable
-                if USE_SLIDING_WINDOW:
-                    seqlen_delta_qk = seqlen_k - seqlen_q
-                    if WINDOW_SIZE_LEFT < 0:
-                        # Only right window constraint
-                        window_constraint = kv_offs_n[None, :] <= (
-                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        )
-                    else:
-                        # Both left and right window constraints
-                        left_bound = (
-                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        )
-                        right_bound = (
-                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        )
-                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                            kv_offs_n[None, :] <= right_bound
-                        )
-                    sd_store_mask = sd_store_mask & window_constraint
-
-                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
-
-            # apply dropout mask in place
-            p = tl.where(dropout_mask, p, 0.0)
-        elif RETURN_SCORES:
-            # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-            sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-            sd_mask_ptrs = (
-                sd_mask_base
-                + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
-            )
-
-            # Compute mask for sd_mask storage - include bounds check
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                kv_offs_n[None, :] < seqlen_k
-            )
-
-            # Add causal mask if applicable
-            if IS_CAUSAL:
-                seqlen_delta_qk = seqlen_k - seqlen_q
-                causal_constraint = kv_offs_n[None, :] <= (
-                    offs_m[:, None] + seqlen_delta_qk
-                )
-                sd_store_mask = sd_store_mask & causal_constraint
-
-            # Add sliding window mask if applicable
-            if USE_SLIDING_WINDOW:
-                seqlen_delta_qk = seqlen_k - seqlen_q
-                if WINDOW_SIZE_LEFT < 0:
-                    # Only right window constraint
-                    window_constraint = kv_offs_n[None, :] <= (
-                        offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    )
-                else:
-                    # Both left and right window constraints
-                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                    right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                        kv_offs_n[None, :] <= right_bound
-                    )
-                sd_store_mask = sd_store_mask & window_constraint
-
-            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
@@ -738,161 +400,42 @@ def compute_block_masking(
     seqlen_k,
     seqlen_q,
     start_m,
-    IS_CAUSAL: tl.constexpr,
-    USE_SLIDING_WINDOW: tl.constexpr,
-    WINDOW_SIZE_LEFT: tl.constexpr,
-    WINDOW_SIZE_RIGHT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """
-    Classify K blocks for attention computation with sliding window support.
+    Simplified block masking for attention computation without causal or sliding window.
+    Only handles padding in the last K block.
 
     Returns:
-        - n_front_skip_blocks: Blocks completely before the window
-        - n_front_masked_blocks: Blocks partially overlapping window front
-        - n_full_blocks: Blocks completely inside the window
-        - n_back_masked_blocks: Blocks partially overlapping window back
+        - n_front_skip_blocks: Always 0 (no skipping)
+        - n_front_masked_blocks: Always 0 (no front masking)
+        - n_full_blocks: All blocks except possibly the last
+        - n_back_masked_blocks: 1 if last block is padded, 0 otherwise
         - n_extra_tokens: Padding tokens in last K block
     """
-
-    # common
-    q_start = start_m * BLOCK_M
-    q_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
-    diag = seqlen_k - seqlen_q
     total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
     n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
-
-    if USE_SLIDING_WINDOW:
-        # get window bounds
-        left_min, left_max, right_min, right_max = compute_window_bounds(
-            q_start,
-            q_end,
-            diag,
-            seqlen_k,
-            WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT,
-            IS_CAUSAL,
-        )
-
-        # window vanishes → early exit
-        if right_max < left_min:
-            return 0, 0, 0, 0, n_extra_tokens
-
-        # classify blocks
-        (
-            n_front_skip_blocks,
-            n_front_masked_blocks,
-            n_full_blocks,
-            n_back_masked_blocks,
-            clipped_left,
-        ) = classify_window_blocks(left_min, left_max, right_min, right_max, BLOCK_N)
-
-        # handle padded last block if needed
-        if n_extra_tokens != 0:
-            last_block = right_max // BLOCK_N
-            n_front_masked_blocks, n_full_blocks, n_back_masked_blocks = (
-                handle_padded_last_block(
-                    n_extra_tokens,
-                    last_block,
-                    total_k_blocks,
-                    clipped_left,
-                    n_front_masked_blocks,
-                    n_full_blocks,
-                    n_back_masked_blocks,
-                )
-            )
-        return (
-            n_front_skip_blocks,
-            n_front_masked_blocks,
-            n_full_blocks,
-            n_back_masked_blocks,
-            n_extra_tokens,
-        )
+    
+    # No causal or sliding window - all positions can attend to all positions
+    # Only need to handle padding in the last block
+    n_front_skip_blocks = 0
+    n_front_masked_blocks = 0
+    
+    if n_extra_tokens != 0:
+        n_back_masked_blocks = 1  # Last block needs padding mask
+        n_full_blocks = total_k_blocks - 1
     else:
-        if IS_CAUSAL:
-            # ========== CAUSAL MODE: Classify K Blocks ==========
-            # Calculate causal boundary for this Q block
-            #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
-            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
-            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
-            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
-            #                            ↑ can see up to K5
-            #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
-
-            # ------------------------------------------------------------
-            # 1. figure out, in tokens, the right-most K position
-            #    this Q-block may attend to
-            # ------------------------------------------------------------
-            k_max_token = q_end + diag  # last visible K index
-
-            # this Q-block is entirely above the diagonal ⇒ nothing to do
-            if k_max_token < 0:
-                return 0, 0, 0, 0, n_extra_tokens
-
-            k_max_token = tl.minimum(k_max_token, seqlen_k - 1)
-
-            # ------------------------------------------------------------
-            # 2. translate token indices into K-block indices
-            # ------------------------------------------------------------
-            last_visible_k_block = k_max_token // BLOCK_N
-            n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
-
-            # ------------------------------------------------------------
-            # 3. classify those visible blocks
-            #    – we *never* skip or mask blocks in front, because causal
-            #      attention always starts at K0
-            #    – the back side can require several masked blocks:
-            #         • intersection of the causal diagonal with K-grid
-            #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-            #         • plus one extra block if this Q-block stops in the
-            #           middle of a K-block or the last K-block is padded
-            # ------------------------------------------------------------
-            padded_last_k = n_extra_tokens != 0
-            is_modulo_mn = (not padded_last_k) & (seqlen_q % BLOCK_M == 0)
-
-            n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
-            n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
-
-            n_front_skip_blocks = 0  # causal never skips the left side
-            n_front_masked_blocks = 0  # ditto
-            n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
-        else:
-            # ========== NON-CAUSAL MODE ==========
-            # Without causal mask, all positions can attend to all positions
-            # Only need to handle the padding in the last block
-            #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-
-            n_front_skip_blocks = 0  # never skips the left side
-            n_front_masked_blocks = 0  # ditto
-            if n_extra_tokens != 0:
-                n_back_masked_blocks = 1  # Last block needs padding mask
-                n_full_blocks = total_k_blocks - 1
-            else:
-                n_back_masked_blocks = 0  # All blocks are aligned
-                n_full_blocks = total_k_blocks
-
-        return (
-            n_front_skip_blocks,
-            n_front_masked_blocks,
-            n_full_blocks,
-            n_back_masked_blocks,
-            n_extra_tokens,
-        )
+        n_back_masked_blocks = 0  # All blocks are aligned
+        n_full_blocks = total_k_blocks
+    
+    return (
+        n_front_skip_blocks,
+        n_front_masked_blocks,
+        n_full_blocks,
+        n_back_masked_blocks,
+        n_extra_tokens,
+    )
 
 
 @triton.jit
@@ -900,14 +443,12 @@ def sage_fwd_v2(
     Q,
     K,
     V,
-    bias,
     Q_Descale,
     Q_Descale_Pre,
     K_Descale,
     K_Descale_Pre,
     Delta_S,
     V_Descale,
-    FP8_MAX,
     stride_qsz,
     stride_qsh,
     stride_qsm,
@@ -924,10 +465,7 @@ def sage_fwd_v2(
     stride_dsk,
     stride_vsz,
     stride_vsh,
-    LSE,
     Out,
-    SD_MASK,
-    ALIBI_SLOPES,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -944,56 +482,23 @@ def sage_fwd_v2(
     stride_oh,
     stride_om,
     stride_on,
-    stride_bz,
-    stride_bh,
-    stride_bm,
-    stride_bn,
-    stride_az,
-    stride_ah,
-    stride_sz,
-    stride_sh,
-    stride_sm,
-    stride_sn,
-    stride_lse_z,
-    stride_lse_h,
-    stride_lse_m,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    seqused_q,
-    seqused_k,  # Add seqused parameters
-    dropout_p,
-    philox_seed,
-    philox_offset_base,
-    Q_DTYPE_STR: tl.constexpr,
-    K_DTYPE_STR: tl.constexpr,
-    RETURN_LSE: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     MAX_SEQLENS_Q: tl.constexpr,
     MAX_SEQLENS_K: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    SM_SCALE: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    USE_SLIDING_WINDOW: tl.constexpr,
-    WINDOW_SIZE_LEFT: tl.constexpr,
-    WINDOW_SIZE_RIGHT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL_QK: tl.constexpr,
     BLOCK_DMODEL_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
-    USE_BIAS: tl.constexpr,
-    ENABLE_DROPOUT: tl.constexpr,
-    RETURN_SCORES: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
-    USE_SEQUSED: tl.constexpr,
-    SMOOTH_Q: tl.constexpr,
 ):
-    Q_HEAD_DIM_DIVISOR: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
-    K_HEAD_DIM_DIVISOR: tl.constexpr = 2 if K_DTYPE_STR == "e2m1" else 1
+    # Hardcoded for e2m1 dtype - 2 elements per int8
+    Q_HEAD_DIM_DIVISOR: tl.constexpr = 2
+    K_HEAD_DIM_DIVISOR: tl.constexpr = 2
+    # SMOOTH_Q is always True
     # set params
     ACCUMULATOR_TYPE: tl.constexpr = tl.float32  # for q*k product
     SCALE_GROUP_SIZE: tl.constexpr = 32
@@ -1020,47 +525,9 @@ def sage_fwd_v2(
     offs_d_qk_s = tl.arange(0, BLOCK_DMODEL_QK // SCALE_GROUP_SIZE)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
 
-    # handle seqlen
-    if IS_VARLEN:
-        cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
-        cu_seqlens_q_end = tl.load(cu_seqlens_q + off_z + 1)
-
-        # If seqused is provided, use it to limit the actual sequence length
-        if USE_SEQUSED:
-            actual_seqlen_q = (
-                tl.load(seqused_q + off_z)
-                if seqused_q is not None
-                else cu_seqlens_q_end - cu_seqlens_q_start
-            )
-            seqlen_q = tl.minimum(
-                actual_seqlen_q, cu_seqlens_q_end - cu_seqlens_q_start
-            )
-        else:
-            seqlen_q = cu_seqlens_q_end - cu_seqlens_q_start
-
-        # we have a one-size-fits-all grid in id(0). Some seqlens might be too small for all start_m so for those we return early.
-        if start_m * BLOCK_M > seqlen_q:
-            return
-        cu_seqlens_k_start = tl.load(cu_seqlens_k + off_z)
-        cu_seqlens_k_end = tl.load(cu_seqlens_k + off_z + 1)
-
-        # If seqused is provided, use it to limit the actual sequence length for keys
-        if USE_SEQUSED:
-            actual_seqlen_k = (
-                tl.load(seqused_k + off_z)
-                if seqused_k is not None
-                else cu_seqlens_k_end - cu_seqlens_k_start
-            )
-            seqlen_k = tl.minimum(
-                actual_seqlen_k, cu_seqlens_k_end - cu_seqlens_k_start
-            )
-        else:
-            seqlen_k = cu_seqlens_k_end - cu_seqlens_k_start
-    else:
-        cu_seqlens_q_start = 0
-        cu_seqlens_k_start = 0
-        seqlen_q = MAX_SEQLENS_Q
-        seqlen_k = MAX_SEQLENS_K
+    # Simplified seqlen handling - no varlen support
+    seqlen_q = MAX_SEQLENS_Q
+    seqlen_k = MAX_SEQLENS_K
 
     # Load scale factors
     # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (off_h_k)
@@ -1083,7 +550,7 @@ def sage_fwd_v2(
         Q_Descale_Pre
         + off_z * stride_qspz
         + off_h_q * stride_qsph
-        + start_m + cu_seqlens_q_start
+        + start_m
     )
 
     q_descale_pre = tl.load(q_descale_pre_ptr)
@@ -1105,10 +572,6 @@ def sage_fwd_v2(
         seqlen_k,
         seqlen_q,
         start_m,
-        IS_CAUSAL,
-        USE_SLIDING_WINDOW,
-        WINDOW_SIZE_LEFT,
-        WINDOW_SIZE_RIGHT,
         BLOCK_M,
         BLOCK_N,
     )
@@ -1122,12 +585,7 @@ def sage_fwd_v2(
         No K blocks visible - write zeros and exit.
         """
         # Write zeros to output
-        o_offset = (
-            Out
-            + off_z * stride_oz
-            + off_h_q * stride_oh
-            + cu_seqlens_q_start * stride_om
-        )
+        o_offset = Out + off_z * stride_oz + off_h_q * stride_oh
         o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
         o_mask = offs_m[:, None] < seqlen_q
         if PADDED_HEAD_V:
@@ -1137,19 +595,6 @@ def sage_fwd_v2(
             tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=Out.type.element_ty),
             mask=o_mask,
         )
-
-        # Write zeros to LSE
-        if RETURN_LSE:
-            l_ptrs = (
-                LSE
-                + off_z * stride_lse_z
-                + off_h_q * stride_lse_h
-                + cu_seqlens_q_start * stride_lse_m
-                + offs_m * stride_lse_m
-            )
-            tl.store(
-                l_ptrs, tl.zeros([BLOCK_M], dtype=tl.float32), mask=offs_m < seqlen_q
-            )
         return
 
     # ============================================================
@@ -1162,35 +607,12 @@ def sage_fwd_v2(
 
     # Initialize for processing
     # Compute pointers for all the tensors used in this kernel.
-    q_offset = (
-        Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
-    )
+    q_offset = Q + off_z * stride_qz + off_h_q * stride_qh
     q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_q[None, :] * stride_qk
-    k_offset = (
-        K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
-    )
+    k_offset = K + off_z * stride_kz + off_h_k * stride_kh
     k_ptrs = k_offset + offs_d_k[:, None] * stride_kk + offs_n[None, :] * stride_kn
-    v_offset = (
-        V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
-    )
+    v_offset = V + off_z * stride_vz + off_h_k * stride_vh
     v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
-    if USE_BIAS:
-        # Note: this might get large enough to overflow on some configs
-        bias_offset = off_h_q * stride_bh
-        bias_ptrs = (
-            bias
-            + bias_offset
-            + offs_m[:, None] * stride_bm
-            + offs_n[None, :] * stride_bn
-        )
-    else:
-        bias_ptrs = None
-
-    if USE_ALIBI:
-        a_offset = off_z * stride_az + off_h_q * stride_ah
-        alibi_slope = tl.load(ALIBI_SLOPES + a_offset)
-    else:
-        alibi_slope = None
 
     # initialize pointer to m and l
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=ACCUMULATOR_TYPE)
@@ -1205,89 +627,13 @@ def sage_fwd_v2(
 
     # Compute offsets here - closer to usage to minimize live range
     k_descale_offset = off_z * stride_ksz + off_h_k * stride_ksh
-    k_descale_pre_offset = K_Descale_Pre + off_z * stride_kspz + off_h_k * stride_ksph + cu_seqlens_k_start
+    k_descale_pre_offset = K_Descale_Pre + off_z * stride_kspz + off_h_k * stride_ksph
     delta_s_offset = off_z * stride_dsz + off_h_k * stride_dsh + start_m * stride_dsq
 
     # ========== Process MASKED K Blocks in the front ==========
-    # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
-    if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
-        block_min = n_front_skip_blocks * BLOCK_N
-        block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
-
-        # Recompute pointers instead of storing - cheaper than register spill
-        k_descale_ptr = (
-            K_Descale
-            + k_descale_offset
-            + (block_min + offs_n[:, None]) * stride_ksn
-            + offs_d_qk_s[None, :]
-        )
-
-        k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks
-
-        delta_s_ptr = Delta_S + delta_s_offset + n_front_skip_blocks * stride_dsk if SMOOTH_Q else None
-
-        acc, l_i, m_i = _sage_fwd_mask_v2(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            delta_s_ptr,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            stride_dsk,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_n,
-            offs_d_k,
-            offs_d_v,
-            block_min,  # Start of front masked blocks
-            block_max,  # End of front masked blocks
-            0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
-            alibi_slope,
-            q_descale,
-            q_descale_pre,
-            k_descale_ptr,
-            k_descale_pre_ptr,
-            SM_SCALE,
-            FP8_MAX,
-            stride_ksn,
-            IS_CAUSAL,
-            BLOCK_M,
-            BLOCK_N,
-            PRE_LOAD_V,
-            ENABLE_DROPOUT,
-            PADDED_HEAD_QK,
-            PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR,
-            ACTUAL_BLOCK_DMODEL_V,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            RETURN_SCORES=RETURN_SCORES,
-            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
-            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            Q_DTYPE_STR=Q_DTYPE_STR,
-            K_DTYPE_STR=K_DTYPE_STR,
-            SMOOTH_Q=SMOOTH_Q,
-        )
-
+    # Front masking no longer needed without sliding window
+    # This section can be removed entirely as n_front_masked_blocks will always be 0
+    
     # ========== Process FULL K Blocks (Fast Path) ==========
     if n_full_blocks > 0:
         block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
@@ -1304,7 +650,8 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks
 
-        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks) * stride_dsk if SMOOTH_Q else None
+        # SMOOTH_Q is always True
+        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks) * stride_dsk
 
         acc, l_i, m_i = _sage_fwd_no_mask_v2(
             acc,
@@ -1314,53 +661,31 @@ def sage_fwd_v2(
             k_ptrs,
             v_ptrs,
             delta_s_ptr,
-            bias_ptrs,
             stride_kn,
             stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
+            stride_dsk,
             seqlen_k,
             seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            stride_dsk,
-            off_z,
-            off_h_q,
             offs_m,
             offs_n,
             offs_d_k,
             offs_d_v,
-            block_min,  # Start of range: 0
-            block_max,  # End of range: n_full_blocks * BLOCK_N
-            alibi_slope,
+            block_min,
+            block_max,
             q_descale,
             q_descale_pre,
             k_descale_ptr,
             k_descale_pre_ptr,
-            SM_SCALE,
-            FP8_MAX,
             stride_ksn,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
-            ENABLE_DROPOUT,
             PADDED_HEAD_QK,
             PADDED_HEAD_V,
             ACTUAL_BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR,
             ACTUAL_BLOCK_DMODEL_V,
-            USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
-            RETURN_SCORES=RETURN_SCORES,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            Q_DTYPE_STR=Q_DTYPE_STR,
-            K_DTYPE_STR=K_DTYPE_STR,
-            SMOOTH_Q=SMOOTH_Q,
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1384,7 +709,8 @@ def sage_fwd_v2(
 
         k_descale_pre_ptr = k_descale_pre_offset + n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
 
-        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * stride_dsk if SMOOTH_Q else None
+        # SMOOTH_Q is always True
+        delta_s_ptr = Delta_S + delta_s_offset + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * stride_dsk
 
         acc, l_i, m_i = _sage_fwd_mask_v2(
             acc,
@@ -1394,67 +720,38 @@ def sage_fwd_v2(
             k_ptrs,
             v_ptrs,
             delta_s_ptr,
-            bias_ptrs,
             stride_kn,
             stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
+            stride_dsk,
             start_m,
             seqlen_k,
             seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            stride_dsk,
-            off_z,
-            off_h_q,
             offs_m,
             offs_n,
             offs_d_k,
             offs_d_v,
-            block_min,  # Start of range: n_full_blocks * BLOCK_N
-            block_max,  # End of range: n_visible_k_blocks * BLOCK_N
-            n_extra_tokens,  # Padding tokens in last block
-            alibi_slope,
+            block_min,
+            block_max,
+            n_extra_tokens,
             q_descale,
             q_descale_pre,
             k_descale_ptr,
             k_descale_pre_ptr,
-            SM_SCALE,
-            FP8_MAX,
             stride_ksn,
-            IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
-            ENABLE_DROPOUT,
             PADDED_HEAD_QK,
             PADDED_HEAD_V,
             ACTUAL_BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR,
             ACTUAL_BLOCK_DMODEL_V,
-            USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
-            RETURN_SCORES=RETURN_SCORES,
-            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
-            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            Q_DTYPE_STR=Q_DTYPE_STR,
-            K_DTYPE_STR=K_DTYPE_STR,
-            SMOOTH_Q=SMOOTH_Q,
         )
 
     # ============================================================
     #                        EPILOGUE
     # ============================================================
-    # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
-    # Instead of directly computing 1/l_i which can be inf,
-    # we check for the invalid case first
-    
     # Load v_descale here, right before epilogue where it's used
     v_descale = tl.load(
         V_Descale
@@ -1465,125 +762,18 @@ def sage_fwd_v2(
         other=0.0,
     )
     
-    if USE_SLIDING_WINDOW:
-        # For rows where m_i is still -inf, no keys were valid
-        # Set l_i to 1.0 to avoid division by zero (acc is already 0)
-        invalid_mask = m_i == float("-inf")
-        l_i_safe = tl.where(invalid_mask, 1.0, l_i)
-        l_recip = 1 / l_i_safe[:, None]
-    else:
-        invalid_mask = None
-        l_recip = 1 / l_i[:, None]
-
+    l_recip = 1 / l_i[:, None]
     acc = acc * l_recip * v_descale
-    if ENABLE_DROPOUT:
-        dropout_scale = 1 / (1 - dropout_p)
-        acc = acc * dropout_scale
 
-    # compute log-sum-exp
-    if RETURN_LSE:
-        if USE_EXP2:
-            # RCP_LN2: tl.constexpr = 1.4426950408889634
-            LN2: tl.constexpr = 0.6931471824645996
-            # compute log-sum-exp in base 2 units
-            # mi_base2 = m_i * RCP_LN2
-            mi_base2 = m_i
-            # For invalid rows, log(l_i) would be -inf, but we want LSE to be -inf
-            # So we handle this case explicitly
-            if USE_SLIDING_WINDOW:
-                log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i))
-                softmax_lse = mi_base2 + log_l_i
-                # Ensure invalid rows have LSE = -inf
-                softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
-            else:
-                softmax_lse = mi_base2 + tl.math.log2(l_i)
-            # convert back to natural units
-            softmax_lse *= LN2
-        else:
-            if USE_SLIDING_WINDOW:
-                log_l_i = tl.where(invalid_mask, 0.0, tl.math.log(l_i))
-                softmax_lse = m_i + log_l_i
-                softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
-            else:
-                softmax_lse = m_i + tl.math.log(l_i)
-
-    # handle masking edge cases
-    if USE_SLIDING_WINDOW:
-        if IS_CAUSAL:
-            pass
-        else:
-            pass
-    else:
-        if IS_CAUSAL:
-            # When seqlen_q > seqlen_k, some rows are completely above the causal diagonal
-            # These rows have all -inf attention scores, resulting in NaN after softmax
-            # e.g.
-            # Q length: 6, K length: 4
-            # Causal mask (X = can attend, . = cannot):
-            #    K0 K1 K2 K3
-            # Q0   .  .  .  .  <- All masked, would give NaN
-            # Q1   .  .  .  .  <- All masked, would give NaN
-            # Q2   X  .  .  .  <- First valid row
-            # Q3   X  X  .  .
-            # Q4   X  X  X  .
-            # Q5   X  X  X  X
-            causal_start_idx = seqlen_q - seqlen_k
-            start_m_idx = start_m * BLOCK_M
-
-            # Create mask for rows that need zeroing
-            row_indices = start_m_idx + tl.arange(0, BLOCK_M)
-            causal_mask = row_indices < causal_start_idx
-
-            # Zero out both acc and LSE for these rows
-            if causal_start_idx > start_m_idx:
-                end_m_idx = (start_m + 1) * BLOCK_M
-                if causal_start_idx < end_m_idx:
-                    # This block contains the boundary - need to mask acc
-                    out_mask_boundary = tl.full(
-                        (BLOCK_DMODEL_V,), causal_start_idx, dtype=tl.int32
-                    )
-                    out_ptrs_mask = row_indices[:, None] >= out_mask_boundary[None, :]
-                    z = 0.0
-                    acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
-
-            # Zero out LSE for rows above diagonal
-            if RETURN_LSE:
-                softmax_lse = tl.where(causal_mask, 0.0, softmax_lse)
-
-    # write back LSE(Log Sum Exponents), the log of the normalization constant
-    if RETURN_LSE:
-        l_offset = (
-            LSE
-            + off_z * stride_lse_z
-            + off_h_q * stride_lse_h
-            + cu_seqlens_q_start * stride_lse_m
-        )
-        l_ptrs = l_offset + offs_m * stride_lse_m
-
-    # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
-    # This is only true for the last Q block. For others, overflow_size will be -ve
-    end_m_idx = (start_m + 1) * BLOCK_M
-    overflow_size = end_m_idx - seqlen_q
-    if RETURN_LSE:
-        if overflow_size > 0:
-            boundary = tl.full((BLOCK_M,), BLOCK_M - overflow_size, dtype=tl.int32)
-            l_ptrs_mask = tl.arange(0, BLOCK_M) < boundary
-            tl.store(l_ptrs, softmax_lse, mask=l_ptrs_mask)
-        else:
-            tl.store(l_ptrs, softmax_lse)
-
-    # write back O
-    o_offset = (
-        Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
-    )
+    # ============================================================
+    #                       FINAL STORE
+    # ============================================================
+    o_offset = Out + off_z * stride_oz + off_h_q * stride_oh
     o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
-    o_ptrs_mask = tl.full([BLOCK_M, BLOCK_DMODEL_V], 1, dtype=tl.int1)
-    if overflow_size > 0:
-        o_ptrs_mask = o_ptrs_mask & (offs_m[:, None] < seqlen_q)
+    o_mask = offs_m[:, None] < seqlen_q
     if PADDED_HEAD_V:
-        o_ptrs_mask = o_ptrs_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
-
-    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
+        o_mask = o_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
+    tl.store(o_ptrs, acc, mask=o_mask)
 
 
 def fav3_sage_triton_impl_v2(
@@ -1591,62 +781,50 @@ def fav3_sage_triton_impl_v2(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
-    softmax_lse: Optional[torch.Tensor],
-    sd_mask: Optional[torch.Tensor],
-    sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[torch.Tensor],
-    layout: Literal["bshd", "bhsd", "thd"],
-    # varlen
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    softmax_lse: torch.Tensor,  # not used
+    sd_mask: torch.Tensor,  # not used
+    softmax_scale: float,  # not used
+    alibi_slopes: torch.Tensor,  # not used
+    causal: bool,  # not used
+    window_size_left: int,  # not used
+    window_size_right: int,  # not used
+    bias: torch.Tensor,  # not used
+    layout: Literal["bshd", "bhsd"],
+    cu_seqlens_q: torch.Tensor,  # not used
+    cu_seqlens_k: torch.Tensor,  # not used
     max_seqlens_q: int,
     max_seqlens_k: int,
-    # dropout
-    dropout_p: float,
-    philox_seed: Optional[int],
-    philox_offset: Optional[int],
-    # misc
-    return_scores: bool,
+    dropout_p: float,  # not used
+    philox_seed: int,  # not used
+    philox_offset: int,  # not used
+    return_softmax: bool,  # not used
     use_exp2: bool,
-    # fp8
-    q_descale: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    v_descale: Optional[torch.Tensor],
-    FP8_MAX: float,
-    # seqused for FA v3
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    # rotary (optional)
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    rotary_interleaved: bool = False,
-    seqlens_rotary: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    q_descale_pre: Optional[torch.Tensor] = None,
-    k_descale_pre: Optional[torch.Tensor] = None,
-    delta_s: Optional[torch.Tensor] = None,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    FP8_MAX: float,  # not used
+    seqused_q: torch.Tensor,  # not used
+    seqused_k: torch.Tensor,  # not used
+    rotary_cos: torch.Tensor,  # not used
+    rotary_sin: torch.Tensor,  # not used
+    rotary_interleaved: bool,  # not used
+    seqlens_rotary: torch.Tensor,  # not used
+    config: Optional[dict],
+    q_descale_pre: torch.Tensor,
+    k_descale_pre: torch.Tensor,
+    delta_s: torch.Tensor,
 ):
-    # get params, strides and shape
-    IS_VARLEN = layout == "thd"
-
     # common assertions
-    assert (
-        0.0 <= dropout_p <= 1.0
-    ), f"dropout_p must be between 0 and 1, got {dropout_p}"
     assert (
         q.device == k.device == v.device == o.device
     ), f"All tensors must be on the same device. Got: q={q.device}, k={k.device}, v={v.device}, o={o.device}"
-    # assert (
-    #     q.dtype == k.dtype == torch.uint8
-    # ), f"q, k must have the dtype torch.int8. Got {q.dtype} for q and {k.dtype} for k"
+    
     current_device = torch.cuda.current_device()
     assert (
         q.is_cuda and q.device.index == current_device
     ), f"Device mismatch: Kernel will launch on cuda:{current_device}, but tensors are on {q.device}"
+
+    assert layout in ["bshd", "bhsd"], f"layout must be 'bshd' or 'bhsd', got {layout}"
 
     head_size_q = q.shape[-1]
     head_size_k = k.shape[-1]
@@ -1658,191 +836,57 @@ def fav3_sage_triton_impl_v2(
         head_size_k *= 2
 
     # get shapes and strides
-    if IS_VARLEN:
-        # shape
-        total_seqlen_q, nheads_q, _ = q.shape
-        total_seqlen_k, nheads_k, _ = k.shape
-        total_seqlen_v, nheads_v, head_size_v = v.shape
+    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    # shapes
+    batch_q, seqlen_q, nheads_q, _ = map_dims(q.shape, bshd)
+    batch_k, seqlen_k, nheads_k, _ = map_dims(k.shape, bshd)
+    batch_v, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd)
 
-        # assert shapes
-        assert (
-            cu_seqlens_q is not None
-        ), "cu_seqlens_q must be provided for varlen layout"
-        assert (
-            cu_seqlens_k is not None
-        ), "cu_seqlens_k must be provided for varlen layout"
-        assert (
-            max_seqlens_q is not None and max_seqlens_q > 0
-        ), "max_seqlens_q must be provided and positive for varlen layout"
-        assert (
-            max_seqlens_k is not None and max_seqlens_k > 0
-        ), "max_seqlens_k must be provided and positive for varlen layout"
+    # assert batch dimensions
+    assert (
+        batch_q == batch_k == batch_v
+    ), f"batch sizes must match: q={batch_q}, k={batch_k}, v={batch_v}"
 
-        # assert head dimensions
-        assert (
-            head_size_q == head_size_k
-        ), f"head sizes must match: q={head_size_q}, k={head_size_k}"
-        assert (
-            nheads_k == nheads_v
-        ), f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
-        assert (
-            nheads_q % nheads_k == 0
-        ), f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
+    # assert head dimensions
+    assert (
+        head_size_q == head_size_k
+    ), f"head sizes must match: q={head_size_q}, k={head_size_k}"
+    assert (
+        nheads_k == nheads_v
+    ), f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
+    assert (
+        nheads_q % nheads_k == 0
+    ), f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
 
-        # assert output shapes
-        assert o.shape == (
-            total_seqlen_q,
-            nheads_q,
-            head_size_v,
-        ), f"o shape {o.shape} != expected {(total_seqlen_q, nheads_q, head_size_v)}"
+    # assert sequence lengths
+    assert (
+        seqlen_k == seqlen_v
+    ), f"k and v sequence lengths must match: k={seqlen_k}, v={seqlen_v}"
 
-        # assert cu_seqlens
-        assert (
-            cu_seqlens_q.dtype == torch.int32
-        ), f"cu_seqlens_q must be int32, got {cu_seqlens_q.dtype}"
-        assert (
-            cu_seqlens_k.dtype == torch.int32
-        ), f"cu_seqlens_k must be int32, got {cu_seqlens_k.dtype}"
-        assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
-        assert cu_seqlens_k[0] == 0, "cu_seqlens_k must start with 0"
-        assert (
-            cu_seqlens_q[-1] == total_seqlen_q
-        ), f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} != total_seqlen_q {total_seqlen_q}"
-        assert (
-            cu_seqlens_k[-1] == total_seqlen_k
-        ), f"cu_seqlens_k[-1] {cu_seqlens_k[-1]} != total_seqlen_k {total_seqlen_k}"
+    # assert output shapes
+    assert o.shape == (
+        q.shape[0],
+        q.shape[1],
+        q.shape[2],
+        v.shape[-1],
+    ), f"o shape {o.shape} != expected {(batch_q, seqlen_q, nheads_q, head_size_v)}"
 
-        # set vars
-        batch = len(cu_seqlens_q) - 1
-        head_size_qk = head_size_q
+    batch = batch_q
+    head_size_qk = head_size_q
+    max_seqlens_q = seqlen_q
+    max_seqlens_k = seqlen_k
 
-        # Assert softmax_lse tensor is large enough
-        if softmax_lse is not None:
-            assert (
-                softmax_lse.shape[0] >= nheads_q
-            ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= nheads_q={nheads_q}"
-            assert (
-                softmax_lse.shape[1] >= total_seqlen_q
-            ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= total_seqlen_q={total_seqlen_q}"
-            assert (
-                softmax_lse.dtype == torch.float32
-            ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
-            assert (
-                softmax_lse.device == q.device
-            ), f"softmax_lse must be on same device as q"
+    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+    stride_vb, stride_vn, stride_vh, stride_vd = map_dims(v.stride(), bshd)
+    stride_ob, stride_om, stride_oh, stride_od = map_dims(o.stride(), bshd)
 
-        # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = (
-            0,
-            q.stride(1),
-            q.stride(0),
-            q.stride(2),
-        )
-        stride_kb, stride_kh, stride_kn, stride_kd = (
-            0,
-            k.stride(1),
-            k.stride(0),
-            k.stride(2),
-        )
-        stride_vb, stride_vh, stride_vn, stride_vd = (
-            0,
-            v.stride(1),
-            v.stride(0),
-            v.stride(2),
-        )
-        stride_ob, stride_oh, stride_om, stride_od = (
-            0,
-            o.stride(1),
-            o.stride(0),
-            o.stride(2),
-        )
-        stride_lse_z, stride_lse_h, stride_lse_m = (
-            (
-                0,
-                softmax_lse.stride(0),
-                softmax_lse.stride(1),
-            )
-            if softmax_lse is not None
-            else (0, 0, 0)
-        )
-    else:
-        bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-        # shapes
-        batch_q, seqlen_q, nheads_q, _ = map_dims(q.shape, bshd)
-        batch_k, seqlen_k, nheads_k, _ = map_dims(k.shape, bshd)
-        batch_v, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd)
-
-        # assert batch dimensions
-        assert (
-            batch_q == batch_k == batch_v
-        ), f"batch sizes must match: q={batch_q}, k={batch_k}, v={batch_v}"
-
-        # assert head dimensions
-        assert (
-            head_size_q == head_size_k
-        ), f"head sizes must match: q={head_size_q}, k={head_size_k}"
-        assert (
-            nheads_k == nheads_v
-        ), f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
-        assert (
-            nheads_q % nheads_k == 0
-        ), f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
-
-        # assert sequence lengths
-        assert (
-            seqlen_k == seqlen_v
-        ), f"k and v sequence lengths must match: k={seqlen_k}, v={seqlen_v}"
-
-        # assert output shapes
-        assert o.shape == (
-            q.shape[0],
-            q.shape[1],
-            q.shape[2],
-            v.shape[-1],
-        ), f"o shape {o.shape} != expected {(batch_q, seqlen_q, nheads_q, head_size_v)}"
-
-        # set vars
-        batch = batch_q
-        head_size_qk = head_size_q
-        max_seqlens_q = seqlen_q
-        max_seqlens_k = seqlen_k
-
-        # Assert softmax_lse tensor is large enough
-        if softmax_lse is not None:
-            assert (
-                softmax_lse.shape[0] >= batch
-            ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= batch={batch}"
-            assert (
-                softmax_lse.shape[1] >= nheads_q
-            ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= nheads_q={nheads_q}"
-            assert (
-                softmax_lse.shape[2] >= seqlen_q
-            ), f"softmax_lse.shape[2]={softmax_lse.shape[2]} must be >= seqlen_q={seqlen_q}"
-            assert (
-                softmax_lse.dtype == torch.float32
-            ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
-            assert (
-                softmax_lse.device == q.device
-            ), f"softmax_lse must be on same device as q"
-
-        # strides
-        stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
-        stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
-        stride_vb, stride_vn, stride_vh, stride_vd = map_dims(v.stride(), bshd)
-        stride_ob, stride_om, stride_oh, stride_od = map_dims(o.stride(), bshd)
-        stride_lse_z, stride_lse_h, stride_lse_m = (
-            softmax_lse.stride() if softmax_lse is not None else (0, 0, 0)
-        )
-
-    # apply rotary embeddings
-    if rotary_cos is not None and rotary_sin is not None:
-        raise NotImplementedError("Rotary embeddings prefill are not implemented yet.")
-    else:
-        assert o.dtype in [
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
+    # No rotary embeddings support
+    assert o.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
 
     stride_qsz, stride_qsm, stride_qsh, _ = map_dims(
         q_descale.stride(), bshd
@@ -1861,16 +905,6 @@ def fav3_sage_triton_impl_v2(
     else:
         stride_dsz, stride_dsh, stride_dsq, stride_dsk = (0, 0, 0, 0)
 
-    # check features
-    use_sliding_window = window_size_left != -1 or window_size_right != -1
-
-    use_alibi, (stride_az, stride_ah) = (
-        (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
-    )
-    # NOTE: a large bias tensor leads to overflow during pointer arithmetic
-    if bias is not None:
-        assert bias.numel() < 2**31
-
     # Get closest power of 2 over or equal to 32 for both QK and V dimensions
     padded_d_model_qk = 1 << (head_size_qk - 1).bit_length()
     padded_d_model_v = 1 << (head_size_v - 1).bit_length()
@@ -1879,69 +913,21 @@ def fav3_sage_triton_impl_v2(
     padded_d_model_qk = max(padded_d_model_qk, 16)
     padded_d_model_v = max(padded_d_model_v, 16)
 
-    # sd_mask assertions and strides
-    if sd_mask is not None:
-        assert dropout_p > 0.0 or return_scores, "sd_mask provided but not used"
-        assert (
-            sd_mask is not None
-        ), "sd_mask must be provided when return_scores=True or dropout_p > 0"
-        # Assert sd_mask tensor is large enough
-        assert (
-            sd_mask.shape[0] >= batch
-        ), f"sd_mask.shape[0]={sd_mask.shape[0]} must be >= batch={batch}"
-        assert (
-            sd_mask.shape[1] >= nheads_q
-        ), f"sd_mask.shape[1]={sd_mask.shape[1]} must be >= nheads_q={nheads_q}"
-        assert (
-            sd_mask.shape[2] >= max_seqlens_q
-        ), f"sd_mask.shape[2]={sd_mask.shape[2]} must be >= max_seqlens_q={max_seqlens_q}"
-        assert (
-            sd_mask.shape[3] >= max_seqlens_k
-        ), f"sd_mask.shape[3]={sd_mask.shape[3]} must be >= max_seqlens_k={max_seqlens_k}"
-        assert sd_mask.device == q.device, "sd_mask must be on same device as q"
-
-        stride_sz, stride_sh, stride_sm, stride_sn = (
-            sd_mask.stride(0),
-            sd_mask.stride(1),
-            sd_mask.stride(2),
-            sd_mask.stride(3),
-        )
-    else:
-        stride_sz, stride_sh, stride_sm, stride_sn = (0, 0, 0, 0)
-
-    if bias is not None:
-        stride_bz, stride_bh, stride_bm, stride_bn = (
-            bias.stride(0),
-            bias.stride(1),
-            bias.stride(2),
-            bias.stride(3),
-        )
-    else:
-        stride_bz, stride_bh, stride_bm, stride_bn = (0, 0, 0, 0)
-
-    return_lse = True if softmax_lse is not None else False
-
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
     if config is None:
         config = get_sage_fwd_configs(False, seqlen_k=max_seqlens_k)
 
-    if sm_scale == None:
-        sm_scale = head_size_qk**(-0.5)
-    sm_scale *= 1.4426950408889634
-    smooth_q = True if delta_s is not None else False
     sage_fwd_v2[grid](
         q,
         k,
         v,
-        bias,
         q_descale,
         q_descale_pre,
         k_descale,
         k_descale_pre,
         delta_s, 
         v_descale,
-        FP8_MAX,
         stride_qsz,
         stride_qsh,
         stride_qsm,
@@ -1958,10 +944,7 @@ def fav3_sage_triton_impl_v2(
         stride_dsk,
         stride_vsz,
         stride_vsh,
-        softmax_lse,
         o,
-        sd_mask,
-        alibi_slopes,
         stride_qb,
         stride_qh,
         stride_qm,
@@ -1978,50 +961,15 @@ def fav3_sage_triton_impl_v2(
         stride_oh,
         stride_om,
         stride_od,
-        stride_bz,
-        stride_bh,
-        stride_bm,
-        stride_bn,
-        stride_az,
-        stride_ah,
-        stride_sz,
-        stride_sh,
-        stride_sm,
-        stride_sn,
-        stride_lse_z,
-        stride_lse_h,
-        stride_lse_m,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,  # Pass seqused tensors
-        Q_DTYPE_STR="e2m1" if is_q_fp4 else "e4m3",
-        K_DTYPE_STR="e2m1" if is_k_fp4 else "e4m3",
-        dropout_p=dropout_p,
-        philox_seed=philox_seed,
-        philox_offset_base=philox_offset,
-        RETURN_LSE=return_lse,
         HQ=nheads_q,
         HK=nheads_k,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
         MAX_SEQLENS_Q=max_seqlens_q,
         MAX_SEQLENS_K=max_seqlens_k,
-        SM_SCALE=sm_scale,
-        IS_CAUSAL=causal,
-        USE_SLIDING_WINDOW=use_sliding_window,
-        WINDOW_SIZE_LEFT=window_size_left,
-        WINDOW_SIZE_RIGHT=window_size_right,
-        IS_VARLEN=IS_VARLEN,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=False if bias is None else True,
-        USE_ALIBI=use_alibi,
-        ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,
-        RETURN_SCORES=return_scores,
-        USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
-        SMOOTH_Q=smooth_q,
         **config,
     )
 
