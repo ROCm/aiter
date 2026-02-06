@@ -65,12 +65,10 @@ jobs:
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && if [ "${GITHUB_REF:-}" = "refs/heads/main" ]; then \
                 echo "It's main branch, syncing latest CK..."; \
-                git submodule set-branch --branch develop 3rdparty/composable_kernel; \
                 git submodule sync && \
                 git submodule update --init --recursive --remote --depth 1 --jobs 4; \
               else \
                 echo "It's a PR branch, syncing specific CK..."; \
-                git submodule set-branch --branch develop 3rdparty/composable_kernel; \
                 git submodule sync && \
                 git submodule update --init --recursive --depth 1 --jobs 4; \
               fi \
