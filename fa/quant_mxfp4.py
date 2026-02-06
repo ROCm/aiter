@@ -6,6 +6,8 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     map_dims,
 )
+from enum import Enum
+
 
 class DequantScaleRoundingMode(Enum):
     ROUND_UP = 0

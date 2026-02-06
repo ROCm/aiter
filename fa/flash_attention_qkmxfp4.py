@@ -30,6 +30,14 @@ import triton
 import triton.language as tl
 from utils.benchmark_utils import get_available_models, get_model_configs
 
+from quant_mxfp4 import (
+    sage_quant_v_kernel,
+    rotation_smooth_qk,
+    downcast_to_mxfp
+)
+import aiter
+
+
 @triton.jit
 def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     ## pid remapping on xcds
@@ -149,23 +157,13 @@ class MetaData():
             assert q.dim() == 4
             assert self.max_seqlens_q > 0 and self.max_seqlens_k > 0
             assert self.cu_seqlens_q is None and self.cu_seqlens_k is None
-        assert k.shape == v.shape
-        assert q.shape[-1] == k.shape[-1] and q.shape[-1] == v.shape[-1]
-        # TODO: Change assert if we support qkl f8 and v f16
-        if self.int8:
-            if self.int8_kv:
-                assert v.dtype == k.dtype and k.dtype == torch.int8
-                assert q.dtype != k.dtype
-                assert (self.v_descale is not None) and (self.k_descale is not None)
-            else:
-                assert q.dtype == k.dtype and q.dtype == v.dtype and q.dtype == torch.int8
-                assert (self.q_descale is not None) and (self.k_descale is not None) and (self.v_descale is not None)
-                if self.use_p_scale:
-                    assert (self.p_scale is not None) and (self.p_descale is not None)
-        else:
-            assert q.dtype == k.dtype and q.dtype == v.dtype
+    
+        
+        assert q.shape[-1] == k.shape[-1] and q.shape[-1] == v.shape[-1] // 2
+        # assert q.shape[:-1] == k.shape[:-1] and q.shape[:-1] == v.shape[:-1]
+        
+        assert q.dtype == k.dtype 
         assert head_size <= 256
-        assert o.shape == q.shape
         assert (nheads_q % nheads_k) == 0
         assert self.layout is not None
         assert self.layout == 'thd' or not self.varlen
@@ -500,6 +498,17 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
     tl.assume(stride_oh >= 0)
     tl.assume(stride_om >= 0)
     tl.assume(stride_on >= 0)
+    tl.assume(stride_qsz >= 0)
+    tl.assume(stride_qsh >= 0)
+    tl.assume(stride_qsm >= 0)
+    tl.assume(stride_qsk >= 0)
+    tl.assume(stride_ksz >= 0)
+    tl.assume(stride_ksh >= 0)
+    tl.assume(stride_ksn >= 0)
+    tl.assume(stride_ksk >= 0)
+    tl.assume(stride_vsz >= 0)
+    tl.assume(stride_vsh >= 0)
+    tl.assume(stride_vsn >= 0)
 
     if PERSISTENT:  # if persistent, kernel loops over multiple tiles
         NUM_WG = NUM_CU * GRID_CU_MULTIP  # number of workgroups launched
@@ -1096,6 +1105,21 @@ def get_strides_from_layout(q, k, v, o, metadata):
     return q_strides, k_strides, v_strides, o_strides
 
 
+def get_descale_strides_from_layout(q_descale, k_descale, v_descale, metadata):
+    if metadata.layout == 'bhsd':
+        q_descale_strides = (q_descale.stride(0), q_descale.stride(1), q_descale.stride(2), q_descale.stride(3))
+        k_descale_strides = (k_descale.stride(0), k_descale.stride(1), k_descale.stride(2), k_descale.stride(3))
+        v_descale_strides = (v_descale.stride(0), v_descale.stride(1), v_descale.stride(2))
+    elif metadata.layout == 'bshd':
+        q_descale_strides = (q_descale.stride(0), q_descale.stride(2), q_descale.stride(1), q_descale.stride(3))
+        k_descale_strides = (k_descale.stride(0), k_descale.stride(2), k_descale.stride(1), k_descale.stride(3))
+        v_descale_strides = (v_descale.stride(0), v_descale.stride(1), v_descale.stride(2))
+    else:
+        assert False, 'Got unsupported layout.'
+    return q_descale_strides, k_descale_strides, v_descale_strides
+
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
@@ -1118,7 +1142,7 @@ class _attention(torch.autograd.Function):
             head_size *= 2
         
         q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(q, k, v, o, metadata)
-
+        
         # Get closest power of 2 over or equal to 32.
         padded_d_model = 1 << (head_size - 1).bit_length()
         # Smallest head_dim supported is 16. If smaller, the tile in the
@@ -1152,12 +1176,8 @@ class _attention(torch.autograd.Function):
         else:
             alibi_strides = (0, 0)
 
-        if metadata.int8:
-            q_descale, k_descale, p_scale, p_descale, v_descale = metadata.q_descale, metadata.k_descale, metadata.p_scale, metadata.p_descale, metadata.v_descale
-        elif metadata.mxfp4:
-            q_descale, k_descale, v_descale = metadata.q_descale, metadata.k_descale, metadata.v_descale
-        else:
-            q_descale = k_descale = p_scale = p_descale = v_descale = None
+        q_descale, k_descale, v_descale = metadata.q_descale, metadata.k_descale, metadata.v_descale
+        q_descale_strides, k_descale_strides, v_descale_strides = get_descale_strides_from_layout(q_descale, k_descale, v_descale, metadata)
 
         # number of compute units available
         NUM_CU = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -1174,7 +1194,7 @@ class _attention(torch.autograd.Function):
         # test_op_fwd(Z, x_vals_list[1], x_vals_list[2], N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alibi, layout, dtype=torch.float16):
 
         attn_fwd[grid](q, k, v, metadata.bias, metadata.sm_scale, M, o, *q_strides, *k_strides, *v_strides, *o_strides,
-                       *bias_strides, *alibi_strides, q_descale, k_descale, p_scale, p_descale, v_descale,
+                       *bias_strides, *alibi_strides, *q_descale_strides, *k_descale_strides, *v_descale_strides, q_descale, k_descale, v_descale,
                        metadata.cu_seqlens_q, metadata.cu_seqlens_k, dropout_p=metadata.dropout_p,
                        philox_seed=philox_seed, philox_offset_base=philox_offset, encoded_softmax=encoded_softmax,
                        alibi_slopes=metadata.alibi_slopes, HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size,
@@ -1182,8 +1202,7 @@ class _attention(torch.autograd.Function):
                        IS_CAUSAL=metadata.causal, VARLEN=metadata.varlen, BLOCK_DMODEL=padded_d_model,
                        USE_BIAS=False if metadata.bias is None else True,
                        USE_ALIBI=False if metadata.alibi_slopes is None else True, ENABLE_DROPOUT=metadata.dropout_p
-                       > 0.0, RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax, INT8=metadata.int8,
-                       USE_P_SCALE=metadata.int8 and metadata.use_p_scale, INT8_KV=metadata.int8 and metadata.int8_kv,
+                       > 0.0, RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax,
                        PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
                        NUM_CU=NUM_CU, atomic_counter=atomic_counter, B=batch)
 
@@ -1298,12 +1317,7 @@ def quantize_int8(tensor: torch.Tensor, dim) -> tuple[torch.Tensor, torch.Tensor
     return tensor_quantized, scale, 1 / scale
 
 
-from .quant_mxfp4 import (
-    sage_quant_v_kernel,
-    rotation_smooth_qk,
-    downcast_to_mxfp
-)
-import aiter
+
 
 def quantize_input(
     q,
@@ -1314,18 +1328,16 @@ def quantize_input(
     BLKK=64,
     sm_scale=None,
     q_smoothing=False,
-    layout="bshd",
 ):
     FP8_TYPE = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+    layout = input_metadata.layout
 
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = k.shape
-
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
-
     elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = k.shape
@@ -1469,158 +1481,6 @@ def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, equal_seqlen
     return q, k, v, input_metadata
 
 
-@pytest.mark.parametrize('Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD', [
-    (4, 48, 24, 1024, 1024, 64),
-    (1, 24, 6, 8192, 8192, 64),
-    (1, 4, 2, 16384, 16384, 128),
-    (2, 16, 4, 1020, 987, 128),
-    (2, 16, 4, 15498, 2, 128),
-    (2, 16, 2, 7, 16219, 64),
-    (4, 48, 12, 1, 1, 64),
-    (4, 48, 48, 1, 1, 128),
-    (4, 48, 24, 3, 3, 128),
-    (4, 48, 48, 1001, 990, 64),
-    (1, 8, 8, 8081, 7099, 64),
-    (1, 4, 4, 16330, 15989, 128),
-    (4, 4, 1, 1024, 1024, 33),
-    (4, 4, 2, 65, 1018, 65),
-    (4, 4, 4, 128, 128, 65),
-    (4, 4, 4, 113, 123, 1),
-])
-@pytest.mark.parametrize('causal', [True, False])
-@pytest.mark.parametrize('use_alibi', [True, False])
-@pytest.mark.parametrize('layout', ['bshd', 'bhsd'])
-def test_op_fwd(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alibi, layout, dtype=torch.float16):
-    torch.manual_seed(20)
-    q, k, v, input_metadata = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout)
-    if causal:
-        input_metadata.need_causal()
-
-    if use_alibi:
-        # for n heads the set of slopes is the geometric sequence that starts 2^(-8/n)
-        alibi_slopes = torch.tensor([2**(-8 / HQ * i) for i in range(1, HQ + 1)], dtype=torch.float32,
-                                    device="cuda").repeat(Z, 1)
-        input_metadata.need_alibi(alibi_slopes, Z, HQ)
-    else:
-        alibi_slopes = None
-
-    o = torch.empty_like(q)
-
-    # triton implementation
-    tri_out, _, _ = attention(q, k, v, o, input_metadata)
-
-    # Transpose here if layout is bshd so we have same reference code for all layouts
-    if layout == 'bshd':
-        q = q.transpose(1, 2).clone()
-        k = k.transpose(1, 2).clone()
-        v = v.transpose(1, 2).clone()
-    # Replicate K and V if using MQA/GQA
-    if HQ != HK:
-        k = k.view(k.shape[0], k.shape[1], -1, k.shape[2],
-                   k.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(k.shape[0], -1, k.shape[2], k.shape[3])
-        v = v.view(v.shape[0], v.shape[1], -1, v.shape[2],
-                   v.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(v.shape[0], -1, v.shape[2], v.shape[3])
-
-    scores = torch.einsum('bhqd,bhkd->bhqk', q, k).float() * input_metadata.sm_scale
-    if causal:
-        mask = torch.tril(torch.ones(N_CTX_Q, N_CTX_K, device="cuda"), diagonal=N_CTX_K - N_CTX_Q)
-        scores[:, :, mask == 0] = float("-inf")
-    if use_alibi:
-        scores += compute_alibi_tensor(alibi_slopes, N_CTX_Q, N_CTX_K)
-
-    p = torch.softmax(scores, dim=-1)
-    if causal:
-        # If N_CTX_Q > N_CTX_K, there is at least one row of all -infs going into
-        # the softmax. This produces a row of NaNs as -inf - -inf == NaN. So we fix
-        # this by converting the NaNs to 0s, which is what they should be out of the softmax.
-        nan_mask = torch.isnan(p)
-        p[nan_mask == 1] = 0
-    ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v)
-    # compare
-    if layout == 'bshd':
-        ref_out = ref_out.transpose(1, 2).clone()
-    ref_out = ref_out
-    torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
-    print("✅ Triton and Torch match")
-
-
-@pytest.mark.parametrize('Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD', [
-    (4, 48, 24, 1024, 1024, 64),
-    (1, 24, 6, 8192, 8192, 64),
-    (1, 4, 2, 16384, 16384, 128),
-    (2, 16, 4, 1020, 987, 128),
-    (2, 16, 4, 15498, 2, 128),
-    (2, 16, 2, 7, 16219, 64),
-    (4, 48, 12, 1, 1, 64),
-    (4, 48, 48, 1, 1, 128),
-    (4, 48, 24, 3, 3, 128),
-    (4, 48, 48, 1001, 990, 64),
-    (1, 8, 8, 8081, 7099, 64),
-    (1, 4, 4, 16330, 15989, 128),
-    (4, 4, 1, 1024, 1024, 33),
-    (4, 4, 2, 65, 1018, 65),
-    (4, 4, 4, 128, 128, 65),
-    (4, 4, 4, 113, 123, 1),
-])
-@pytest.mark.parametrize('causal', [True, False])
-@pytest.mark.parametrize('use_alibi', [True, False])
-@pytest.mark.parametrize('layout', ['bshd', 'bhsd'])
-@pytest.mark.parametrize('persistent', ['fixed', 'dynamic'])
-def test_op_persistent_fwd(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alibi, layout, persistent,
-                           dtype=torch.float16):
-    torch.manual_seed(20)
-    q, k, v, input_metadata = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout)
-    if causal:
-        input_metadata.need_causal()
-
-    if use_alibi:
-        # for n heads the set of slopes is the geometric sequence that starts 2^(-8/n)
-        alibi_slopes = torch.tensor([2**(-8 / HQ * i) for i in range(1, HQ + 1)], dtype=torch.float32,
-                                    device="cuda").repeat(Z, 1)
-        input_metadata.need_alibi(alibi_slopes, Z, HQ)
-    else:
-        alibi_slopes = None
-
-    input_metadata.set_persistent(persistent)
-
-    o = torch.empty_like(q)
-
-    # triton implementation
-    tri_out, _, _ = attention(q, k, v, o, input_metadata)
-
-    # Transpose here if layout is bshd so we have same reference code for all layouts
-    if layout == 'bshd':
-        q = q.transpose(1, 2).clone()
-        k = k.transpose(1, 2).clone()
-        v = v.transpose(1, 2).clone()
-    # Replicate K and V if using MQA/GQA
-    if HQ != HK:
-        k = k.view(k.shape[0], k.shape[1], -1, k.shape[2],
-                   k.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(k.shape[0], -1, k.shape[2], k.shape[3])
-        v = v.view(v.shape[0], v.shape[1], -1, v.shape[2],
-                   v.shape[3]).expand(-1, -1, HQ // HK, -1, -1).reshape(v.shape[0], -1, v.shape[2], v.shape[3])
-
-    scores = torch.einsum('bhqd,bhkd->bhqk', q, k).float() * input_metadata.sm_scale
-    if causal:
-        mask = torch.tril(torch.ones(N_CTX_Q, N_CTX_K, device="cuda"), diagonal=N_CTX_K - N_CTX_Q)
-        scores[:, :, mask == 0] = float("-inf")
-    if use_alibi:
-        scores += compute_alibi_tensor(alibi_slopes, N_CTX_Q, N_CTX_K)
-
-    p = torch.softmax(scores, dim=-1)
-    if causal:
-        # If N_CTX_Q > N_CTX_K, there is at least one row of all -infs going into
-        # the softmax. This produces a row of NaNs as -inf - -inf == NaN. So we fix
-        # this by converting the NaNs to 0s, which is what they should be out of the softmax.
-        nan_mask = torch.isnan(p)
-        p[nan_mask == 1] = 0
-    ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v)
-    # compare
-    if layout == 'bshd':
-        ref_out = ref_out.transpose(1, 2).clone()
-    torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
-
-
 @pytest.mark.parametrize('Z, H, N_CTX_Q, N_CTX_K, D_HEAD', [
     (4, 48, 1024, 1024, 64),
     (4, 12, 8192, 8192, 64),
@@ -1639,9 +1499,8 @@ def test_op_persistent_fwd(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alib
     (4, 4, 113, 123, 1),
 ])
 @pytest.mark.parametrize('causal', [False])
-@pytest.mark.parametrize('quantize_p', [False])
 @pytest.mark.parametrize('layout', ['bhsd'])
-def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, quantize_p, layout, dtype=torch.float16):
+def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch.float16):
     torch.manual_seed(20)
 
     # Disable grad to save memeory it won't run into OOM on CI machine.
@@ -1653,396 +1512,37 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, quantize_p, layout
 
     q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
 
-    tri_out, _, best_configs = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+    triton_out, _, best_configs = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
 
-    # Compute scores
-    q_descale, k_descale, v_descale = input_metadata.q_descale, input_metadata.k_descale, input_metadata.v_descale
-    scores = (torch.einsum('bhqd,bhkd->bhqk', q_quantized.half(), k_quantized.half()) * q_descale *
-              k_descale) * input_metadata.sm_scale
+    if layout == "bhsd":
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
 
-    if causal:
-        mask = torch.tril(torch.ones(N_CTX_Q, N_CTX_K, device="cuda"), diagonal=N_CTX_K - N_CTX_Q)
-        scores[:, :, mask == 0] = float("-inf")
+    from aiter.test_mha_common import (
+        attention_ref,
+    )
+    
+    torch_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=False)
+    torch_out, attention_scores, _ = torch_out
 
-    # Quantization with tiling
-    if quantize_p:
-        tile_size = best_configs.kwargs["BLOCK_N"]  # We need the tiling to match Block_N to work
-        m_i = torch.full((Z, H, N_CTX_Q), float('-inf'), device='cuda', dtype=torch.float32)
-        acc = torch.zeros((Z, H, N_CTX_Q, D_HEAD), device='cuda', dtype=torch.float32)
-        l_i = torch.zeros_like(m_i)
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
 
-        for i in range(0, N_CTX_K, tile_size):
-            qk_tile = scores[:, :, :, i:i + tile_size]
-            v_tile = v_quantized[:, :, i:i + tile_size]
-            m_ij = torch.max(m_i, torch.max(qk_tile, dim=-1).values)
-            qk_tile -= m_ij.unsqueeze(-1)
-            p_tile = torch.exp(qk_tile)
-            l_ij = torch.sum(p_tile, dim=-1)
-            p_tile = (p_tile * input_metadata.p_scale).to(torch.int8)
+    assert torch_out.shape == triton_out.shape
 
-            alpha = torch.exp(m_i - m_ij)
-            # We need float here since both p and v are quantized. So they might overflow the fp16 range.
-            acc = acc * alpha.unsqueeze(-1) + torch.einsum('bhqk,bhkd->bhqd', p_tile.float(), v_tile.float())
-            m_i = m_ij
-            l_i = alpha * l_i + l_ij
+    from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outputs
+    ATOL_fp8 = 3.0e-1
+    RTOL_fp8 = 2.5e-1
 
-        l_recip = 1 / l_i.unsqueeze(-1)
-        acc = acc * input_metadata.p_descale * input_metadata.v_descale * l_recip
-        ref_out = acc.to(torch.float16)
-    else:
-        p = torch.softmax(scores, dim=-1)
-        ref_out = (torch.einsum('bhqk,bhkd->bhqd', p.float(), v_quantized.float()) * v_descale).to(torch.float16)
-
-    if causal:
-        nan_mask = torch.isnan(ref_out)
-        ref_out[nan_mask] = 0
-
-    torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
-
-
-
-
-
-@pytest.mark.parametrize('Z, H, N_CTX_Q, N_CTX_K, D_HEAD', [
-    (4, 48, 1024, 1024, 64),
-    (4, 12, 8192, 8192, 64),
-    (2, 4, 16384, 16384, 128),
-    (2, 16, 1020, 987, 128),
-    (2, 4, 7, 16219, 64),
-    (4, 48, 1, 1, 64),
-    (4, 48, 1, 1, 128),
-    (4, 48, 3, 3, 128),
-    (4, 48, 1001, 990, 64),
-    (1, 8, 8081, 7099, 64),
-    (1, 8, 16330, 15989, 128),
-    (4, 4, 1024, 1024, 33),
-    (4, 4, 65, 1019, 65),
-    (4, 4, 128, 128, 65),
-    (4, 4, 113, 123, 1),
-])
-@pytest.mark.parametrize('causal', [True, False])
-@pytest.mark.parametrize('quantize_p', [True, False])
-@pytest.mark.parametrize('layout', ['bhsd'])
-def test_op_fwd_int8(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, quantize_p, layout, dtype=torch.float16):
-    torch.manual_seed(20)
-
-    # Disable grad to save memeory it won't run into OOM on CI machine.
-    q, k, v, input_metadata = input_helper(Z, H, H, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, requires_grad=False)
-    if causal:
-        input_metadata.need_causal()
-
-    o = torch.empty_like(q)
-
-    q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata, quantize_p=quantize_p)
-
-    tri_out, _, best_configs = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
-
-    # Compute scores
-    q_descale, k_descale, v_descale = input_metadata.q_descale, input_metadata.k_descale, input_metadata.v_descale
-    scores = (torch.einsum('bhqd,bhkd->bhqk', q_quantized.half(), k_quantized.half()) * q_descale *
-              k_descale) * input_metadata.sm_scale
-
-    if causal:
-        mask = torch.tril(torch.ones(N_CTX_Q, N_CTX_K, device="cuda"), diagonal=N_CTX_K - N_CTX_Q)
-        scores[:, :, mask == 0] = float("-inf")
-
-    # Quantization with tiling
-    if quantize_p:
-        tile_size = best_configs.kwargs["BLOCK_N"]  # We need the tiling to match Block_N to work
-        m_i = torch.full((Z, H, N_CTX_Q), float('-inf'), device='cuda', dtype=torch.float32)
-        acc = torch.zeros((Z, H, N_CTX_Q, D_HEAD), device='cuda', dtype=torch.float32)
-        l_i = torch.zeros_like(m_i)
-
-        for i in range(0, N_CTX_K, tile_size):
-            qk_tile = scores[:, :, :, i:i + tile_size]
-            v_tile = v_quantized[:, :, i:i + tile_size]
-            m_ij = torch.max(m_i, torch.max(qk_tile, dim=-1).values)
-            qk_tile -= m_ij.unsqueeze(-1)
-            p_tile = torch.exp(qk_tile)
-            l_ij = torch.sum(p_tile, dim=-1)
-            p_tile = (p_tile * input_metadata.p_scale).to(torch.int8)
-
-            alpha = torch.exp(m_i - m_ij)
-            # We need float here since both p and v are quantized. So they might overflow the fp16 range.
-            acc = acc * alpha.unsqueeze(-1) + torch.einsum('bhqk,bhkd->bhqd', p_tile.float(), v_tile.float())
-            m_i = m_ij
-            l_i = alpha * l_i + l_ij
-
-        l_recip = 1 / l_i.unsqueeze(-1)
-        acc = acc * input_metadata.p_descale * input_metadata.v_descale * l_recip
-        ref_out = acc.to(torch.float16)
-    else:
-        p = torch.softmax(scores, dim=-1)
-        ref_out = (torch.einsum('bhqk,bhkd->bhqd', p.float(), v_quantized.float()) * v_descale).to(torch.float16)
-
-    if causal:
-        nan_mask = torch.isnan(ref_out)
-        ref_out[nan_mask] = 0
-
-    torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.parametrize('Z, H, N_CTX_Q, N_CTX_K, D_HEAD', [
-    (4, 48, 1024, 1024, 64),
-    (4, 12, 8192, 8192, 64),
-    (2, 4, 16384, 16384, 128),
-    (2, 16, 1020, 987, 128),
-    (2, 4, 7, 16219, 64),
-    (4, 48, 1, 1, 64),
-    (4, 48, 1, 1, 128),
-    (4, 48, 3, 3, 128),
-    (4, 48, 1001, 990, 64),
-    (1, 8, 8081, 7099, 64),
-    (1, 8, 16330, 15989, 128),
-    (4, 4, 1024, 1024, 33),
-    (4, 4, 65, 1019, 65),
-    (4, 4, 128, 128, 65),
-    (4, 4, 113, 123, 1),
-])
-@pytest.mark.parametrize('causal', [True, False])
-@pytest.mark.parametrize('layout', ['bhsd'])
-def test_op_fwd_int8_kv(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch.float16):
-    torch.manual_seed(20)
-
-    q, k, v, input_metadata = input_helper(Z, H, H, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout)
-    if causal:
-        input_metadata.need_causal()
-
-    o = torch.empty_like(q)
-
-    _, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata, int8_kv=True)
-    k_descale, v_descale = input_metadata.k_descale, input_metadata.v_descale
-    k_dequantized = (k_quantized * k_descale).half()
-    v_dequantized = (v_quantized * v_descale).half()
-
-    tri_out, _, _ = attention(q, k_quantized, v_quantized, o, input_metadata)
-
-    # Compute scores
-    scores = torch.einsum('bhqd,bhkd->bhqk', q, k_dequantized).float() * input_metadata.sm_scale
-
-    if causal:
-        mask = torch.tril(torch.ones(N_CTX_Q, N_CTX_K, device="cuda"), diagonal=N_CTX_K - N_CTX_Q)
-        scores[:, :, mask == 0] = float("-inf")
-
-    p = torch.softmax(scores, dim=-1)
-    ref_out = torch.einsum('bhqk,bhkd->bhqd', p.half(), v_dequantized).to(torch.float16)
-
-    if causal:
-        nan_mask = torch.isnan(ref_out)
-        ref_out[nan_mask] = 0
-
-    torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.parametrize('Z, H, N_CTX_Q, N_CTX_K, D_HEAD', [
-    (4, 48, 1024, 1024, 64),
-    (4, 12, 8192, 8192, 64),
-    (2, 4, 16384, 16384, 128),
-    (2, 16, 1020, 987, 128),
-    (2, 4, 7, 16219, 64),
-    (4, 48, 1, 1, 64),
-    (4, 48, 1, 1, 128),
-    (4, 48, 3, 3, 128),
-    (4, 48, 1001, 990, 64),
-    (1, 8, 8081, 7099, 64),
-    (1, 8, 16330, 15989, 128),
-    (4, 4, 1024, 1024, 33),
-    (4, 4, 65, 1019, 65),
-    (4, 4, 128, 128, 65),
-    # TODO: This config fails. Disabled until triaged and fixed.
-    # (4, 4, 113, 123, 1),
-    # (2, 16, 15498, 2, 128),
-])
-@pytest.mark.parametrize('causal', [True, False])
-@pytest.mark.parametrize('use_bias', [True])
-@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
-def test_op_fwd_bias(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, use_bias, dtype):
-    torch.manual_seed(20)
-    sm_scale = D_HEAD**-0.5
-    input_metadata = MetaData(sm_scale=sm_scale)
-    q, k, v, input_metadata = input_helper(Z, H, H, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout='bhsd')
-    if causal:
-        input_metadata.need_causal()
-    if use_bias:
-        bias = torch.randn((1, H, N_CTX_Q, N_CTX_K), dtype=dtype, device="cuda")
-        input_metadata.need_bias(bias, Z, H, N_CTX_Q, N_CTX_K)
-    else:
-        bias = None
-    o = torch.empty_like(q)
-
-    # triton implementation
-    tri_out, _, _ = attention(q, k, v, o, input_metadata)
-    # reference implementation:171
-
-    scores = torch.einsum('bhqd,bhkd->bhqk', q, k).float() * sm_scale
-    if causal:
-        mask = torch.tril(torch.ones(N_CTX_Q, N_CTX_K, device="cuda"), diagonal=N_CTX_K - N_CTX_Q)
-        scores[:, :, mask == 0] = float("-inf")
-    if use_bias:
-        scores += input_metadata.bias
-    p = torch.softmax(scores, dim=-1)
-    if causal:
-        # If N_CTX_Q > N_CTX_K, there is at least one row of all -infs going into
-        # the softmax. This produces a row of NaNs as -inf - -inf == NaN. So we fix
-        # this by converting the NaNs to 0s, which is what they should be out of the softmax.
-        nan_mask = torch.isnan(p)
-        p[nan_mask == 1] = 0
-
-    ref_out = torch.einsum('bhqk,bhkd->bhqd', p.to(dtype), v)
-    # compare
-    torch.testing.assert_close(ref_out, tri_out, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.parametrize('Z, H, N_CTX, D_HEAD', [(4, 48, 8192, 64), (4, 48, 256, 64), (4, 48, 512, 64),
-                                                 (4, 48, 1024, 64), (8, 48, 4096, 64), (4, 48, 8192, 64),
-                                                 (4, 48, 128, 128), (4, 48, 4096, 128), (4, 48, 16384, 128),
-                                                 (4, 16, 1024, 128), (4, 16, 8192, 128), (32, 48, 8192, 128)])
-@pytest.mark.parametrize('causal', [True, False])
-def test_op_varlen_fwd(Z, H, N_CTX, D_HEAD, causal, dtype=torch.float16):
-
-    q, k, v, input_metadata = varlen_input_helper(Z, H, H, N_CTX, N_CTX, D_HEAD, dtype)
-
-    tri_out = torch.empty_like(q)
-    ref_out = torch.empty_like(q)
-
-    for i in range(0, input_metadata.num_contexts):
-        start_q, start_k = input_metadata.cu_seqlens_q[i], input_metadata.cu_seqlens_k[i]
-        end_q, end_k = input_metadata.cu_seqlens_q[i + 1], input_metadata.cu_seqlens_k[i + 1]
-        scores = torch.einsum('qhd,khd->qhk', q[start_q:end_q], k[start_k:end_k]).float()
-        p = torch.softmax(scores * input_metadata.sm_scale, dim=-1).half()
-        ref_out[start_q:end_q] = torch.einsum('qhk,khd->qhd', p, v[start_k:end_k])
-    attention(q, k, v, tri_out, input_metadata)
-    torch.testing.assert_close(ref_out, tri_out, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize('Z, HQ, HK, N_CTX, D_HEAD', [(2, 48, 24, 128, 64), (4, 48, 12, 256, 64), (4, 48, 4, 512, 64),
-                                                      (4, 48, 2, 1024, 64), (8, 48, 6, 4096, 64), (4, 48, 8, 16384, 64),
-                                                      (4, 64, 16, 128, 128), (4, 64, 4, 4096, 128),
-                                                      (4, 64, 8, 16384, 128), (4, 16, 4, 1024, 128),
-                                                      (4, 16, 2, 8192, 128), (32, 128, 32, 8192, 128)])
-@pytest.mark.parametrize('causal', [False])
-def test_op_varlen_mqa_fwd(Z, HQ, HK, N_CTX, D_HEAD, causal, dtype=torch.float16):
-    q, k, v, input_metadata = varlen_input_helper(Z, HQ, HK, N_CTX, N_CTX, D_HEAD, dtype)
-    ref_out = torch.empty_like(q)
-    tri_out = torch.empty_like(q)
-    # Make KV look like HQ/HK "groups" of HK. Later, we will reshape so the
-    # size aligns with Q.
-    k_ref = k.view(k.shape[0], k.shape[1], 1, k.shape[2]).expand(-1, -1, HQ // HK, -1)
-    v_ref = v.view(v.shape[0], v.shape[1], 1, v.shape[2]).expand(-1, -1, HQ // HK, -1)
-    for i in range(0, input_metadata.num_contexts):
-        start_q, start_k = input_metadata.cu_seqlens_q[i], input_metadata.cu_seqlens_k[i]
-        end_q, end_k = input_metadata.cu_seqlens_q[i + 1], input_metadata.cu_seqlens_k[i + 1]
-        k_curr = k_ref[start_k:end_k]
-        k_curr = k_curr.reshape(k_curr.shape[0], -1, k_curr.shape[3])
-        v_curr = v_ref[start_k:end_k]
-        v_curr = v_curr.reshape(v_curr.shape[0], -1, v_curr.shape[3])
-        scores = torch.einsum('qhd,khd->qhk', q[start_q:end_q], k_curr).float()
-        p = torch.softmax(scores * input_metadata.sm_scale, dim=-1).half()
-        ref_out[start_q:end_q] = torch.einsum('qhk,khd->qhd', p, v_curr)
-    attention(q, k, v, tri_out, input_metadata)
-    torch.testing.assert_close(ref_out, tri_out, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize('Z, H, N_CTX, D_HEAD', [
-    (4, 48, 1024, 64),
-    (4, 48, 2048, 64),
-    (2, 48, 4096, 64),
-    (1, 16, 1024, 64),
-    (1, 16, 1024, 128),
-    #(1, 16, 8192, 63),
-    #(1, 16, 1022, 64),
-])
-@pytest.mark.parametrize('qseqlen_not_equal_kseqlen', [None])
-@pytest.mark.parametrize('torch_sdpa_test', [False, True])
-@pytest.mark.parametrize('causal', [True])
-@pytest.mark.parametrize('use_alibi', [False, True])
-def test_op_bwd(Z, H, N_CTX, D_HEAD, qseqlen_not_equal_kseqlen, causal, torch_sdpa_test, use_alibi,
-                dtype=torch.float16):
-    pytest.skip()
-    torch.manual_seed(20)
-    if qseqlen_not_equal_kseqlen is not None:
-        seqlen_q = qseqlen_not_equal_kseqlen
-    else:
-        seqlen_q = N_CTX
-    seqlen_k = N_CTX
-
-    if causal and ((N_CTX - 1) & N_CTX):
-        pytest.skip()
-    if causal and seqlen_q != seqlen_k:
-        pytest.skip()
-
-    sm_scale = D_HEAD**-0.5
-    input_metadata = MetaData(sm_scale=sm_scale)
-    input_metadata.max_seqlens_q = seqlen_q
-    input_metadata.max_seqlens_k = seqlen_k
-
-    dropout_p = 0
-    q = (torch.empty((Z, H, seqlen_q, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, seqlen_k, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, seqlen_k, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
-    o = torch.empty_like(q)
-
-    if causal:
-        input_metadata.need_causal()
-
-    if use_alibi and not torch_sdpa_test:
-        # for n heads the set of slopes is the geometric sequence that starts 2^(-8/n)
-        alibi_slopes = torch.tensor([2**(-8 / H * i) for i in range(1, H + 1)], dtype=torch.float32,
-                                    device="cuda").repeat(Z, 1)
-        input_metadata.need_alibi(alibi_slopes, Z, H)
-    dout = torch.randn_like(q)
-    # reference implementation
-    if torch_sdpa_test:
-        ref_out, ref_softmax = torch.ops.aten._scaled_dot_product_attention_math(q, k, v, dropout_p=dropout_p,
-                                                                                 is_causal=causal, scale=sm_scale,
-                                                                                 dropout_mask=None)
-        ref_out.backward(dout.to(device=ref_out.device, dtype=ref_out.dtype))
-        ref_dv, v.grad = v.grad.clone(), None
-        ref_dk, k.grad = k.grad.clone(), None
-        ref_dq, q.grad = q.grad.clone(), None
-    else:
-        M = torch.tril(torch.ones((seqlen_q, seqlen_k), device="cuda"))
-        p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-        if use_alibi:
-            p += compute_alibi_tensor(alibi_slopes, N_CTX, N_CTX)
-        if causal:
-            p[:, :, M == 0] = float("-inf")
-
-        p = torch.softmax(p.float(), dim=-1).type(dtype=p.dtype)
-        ref_out = torch.matmul(p, v)
-        ref_out.backward(dout)
-        ref_dv, v.grad = v.grad.clone(), None
-        ref_dk, k.grad = k.grad.clone(), None
-        ref_dq, q.grad = q.grad.clone(), None
-
-    # # triton implementation
-    tri_out, _, _ = attention(q, k, v, o, input_metadata)
-    tri_out.backward(dout)
-    tri_dv, v.grad = v.grad.clone(), None
-    tri_dk, k.grad = k.grad.clone(), None
-    tri_dq, q.grad = q.grad.clone(), None
-    # test
-    #print("reference")
-    #print(ref_dv)
-    #print("tri")
-    #print(tri_dv)
-    # compare
-    torch.testing.assert_close(ref_out, tri_out, atol=1e-2, rtol=0)
-    # The current block size for gfx90a and gfx908 series is 64x64. This results in
-    # larger differences in float results due to rounding.
-
-    if dtype == torch.bfloat16:
-        ATOL = 1e-1 * max(1.0, (seqlen_q + D_HEAD) / 64.0)
-    if dtype == torch.float32:
-        ATOL = 1e-3 * max(1.0, (seqlen_q + D_HEAD) / 64.0)
-    else:
-        ATOL = 1e-1 * max(1.0, (seqlen_q + D_HEAD) / 64.0)
-
-    RTOL = 0
-
-    torch.testing.assert_close(ref_dv, tri_dv, atol=ATOL, rtol=RTOL)
-    torch.testing.assert_close(ref_dk, tri_dk, atol=ATOL, rtol=RTOL)
-    torch.testing.assert_close(ref_dq, tri_dq, atol=ATOL, rtol=RTOL)
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
 
 
 def nonvarlen_benchmark_configs():
@@ -2056,7 +1556,7 @@ def nonvarlen_benchmark_configs():
         # (2, 48, 48, 2048, 1024),
         # (2, 48, 48, 4096, 8192),
         # (2, 48, 48, 8192, 4096),
-        (2, 48, 48, 16384, 8192),
+        (1, 5, 5, 75600, 75600),
         # (8, 16, 16, 1989, 15344),
         # (4, 16, 16, 4097, 163),
         # (2, 16, 16, 8122, 2159),
@@ -2211,8 +1711,8 @@ def run_benchmark(custom, args):
 
         if "triton" in provider:
             o = torch.empty_like(q)
-            if int8:
-                q, k, v = quantize_input(q, k, v, input_metadata, quantize_p=quantize_p, int8_kv=int8_kv)
+
+            q, k, v = quantize_input(q, k, v, input_metadata)
             input_metadata.set_persistent(args.persistent)
             fn = lambda: attention(q, k, v, o, input_metadata)
             if mode == 'bwd':
@@ -2247,7 +1747,7 @@ def run_benchmark(custom, args):
         else:
             return total_flops / ms * 1e-9
 
-    bench_flash_attention.run(save_path="out/", print_data=True, show_plots=False)
+    bench_flash_attention.run(save_path=None, print_data=True)
 
 
 def supported_layouts():
@@ -2322,5 +1822,7 @@ def main():
 
 
 if __name__ == '__main__':
-    #test_op_fwd(2, 48, 48, 16384, 8192, 128, False, False, 'bshd', dtype=torch.float16)
+    test_op_fwd_mxfp4(1, 5, 4096, 4096, 128, False, 'bhsd', dtype=torch.float16)
+    
+    
     sys.exit(main())
