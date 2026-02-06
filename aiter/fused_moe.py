@@ -1701,6 +1701,15 @@ def cktile_moe_stage1(
     return out
 
 
+# ---- FlyDSL compile/import caches (avoid per-call overhead) ----
+_FLYDSL_COMPILE_MOE_GEMM1 = None
+_FLYDSL_COMPILE_MOE_GEMM2 = None
+_FLYDSL_MOE_GEMM1_CACHE = {}
+_FLYDSL_MOE_GEMM2_CACHE = {}
+_FLYDSL_SCRATCH_CACHE = {}
+_LOCAL_EXPERT_HASH_CACHE = {}
+
+
 def flydsl_moe_stage1(
     hidden_states,
     w1,
@@ -1856,20 +1865,38 @@ def flydsl_moe_stage1(
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     thread_size = 256 if token_num > 128 else 128
-    exe1 = compile_moe_gemm1(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage1=bool(doweight_stage1),
-        in_dtype="fp8",
-        out_dtype=out_dtype,
-        use_cshuffle_epilog=False,
-        total_thread_size=thread_size,
+    key1 = (
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        tile_m,
+        tile_n,
+        tile_k,
+        bool(doweight_stage1),
+        "fp8",
+        out_dtype,
+        # bool(stage1_cshuffle),  # use_cshuffle_epilog
+        False,
+        thread_size,
     )
+    exe1 = _FLYDSL_MOE_GEMM1_CACHE.get(key1)
+    if exe1 is None:
+        exe1 = compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=bool(doweight_stage1),
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=False,
+            total_thread_size=thread_size,
+        )
+        _FLYDSL_MOE_GEMM1_CACHE[key1] = exe1
     exe1(
         out,
         x_q,
@@ -2255,20 +2282,39 @@ def flydsl_moe_stage2(
 
     stream_ptr = torch.cuda.current_stream().cuda_stream
     thread_size = 256  # if token_num > 128 else 64
-    exe2 = compile_moe_gemm2_ex(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage2=bool(sorted_weights is not None),
-        in_dtype="fp8",
-        out_dtype=out_dtype,
-        mode=moe_mode,
-        total_thread_size=thread_size,
+
+    key2 = (
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        tile_m,
+        tile_n,
+        tile_k,
+        bool(sorted_weights is not None),
+        "fp8",
+        out_dtype,
+        moe_mode,
+        thread_size,
     )
+    exe2 = _FLYDSL_MOE_GEMM2_CACHE.get(key2)
+    if exe2 is None:
+        exe2 = compile_moe_gemm2_ex(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=bool(sorted_weights is not None),
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            mode=moe_mode,
+            total_thread_size=thread_size,
+        )
+        _FLYDSL_MOE_GEMM2_CACHE[key2] = exe2
+
     exe2(
         out,
         a2_qt_flat,
