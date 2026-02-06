@@ -1,0 +1,1529 @@
+// Design Author: Zhang,Niels Zhu,Wei
+// HostCode Author: Zheng,Huan Zhu,Wei
+// Kernel Author: Zhu,Wei
+
+/*******************************************************************************
+ * Kernel:           F8_FMHA_D192_VD128_1TG_8W_32mx8_128nx1
+ *
+ * Limitations:
+ *   1. Head size of Q and K should be 192
+ *   2. Head size of V should be 128
+ ******************************************************************************/
+
+/* -------------------------------------------------------------------------- */
+/*                            Parameter description                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * User input parameters
+ *
+ * belowing paramters are passed in a buffer that pointed by s0, s1
+ *  name             size  offset              comment                        sreg
+ * ----------------------------------------------------------------------------------
+ *   Q                 8    0x00        Q address                            _s_Q_buf
+ *   K                 8    0x10        K address                            _s_K_buf
+ *   V                 8    0x20        V address                            _s_V_buf
+ *   O                 8    0x30        O address                            _s_O_buf
+ *   Split Data        8    0x40        SplitData address                    _s_SplitData_buf
+ *   Split LSE         8    0x50        SplitLSE address                     _s_SplitLSE_buf
+ *   Work indices      8    0x60        Work indices address                 _s_WorkIdx_buf
+ *   Work info set     8    0x70        Work info set address                _s_WorkInfoSet_buf
+ *   QO indices        8    0x80        QO indices address                   _s_QOIdx_buf
+ *   KV indices        8    0x90        KV indices address                   _s_KVIdx_buf
+ *   KV page indices   8    0xA0        KV page indices address              _s_KVPageIdx_buf
+ *   Scale             4    0xB0        1/sqrt(head_size)                    _s_scale
+ *   Scale log2e       4    0xC0        1/sqrt(head_size)*log2e              _s_scale_log2e
+ *   total Q seqlen    4    0xD0        total seq length of all batches      _s_Q_seqlen
+ *   num heads of Q    4    0xE0        number of heads (Q = KV)             _s_num_Q_heads
+ *   num pages         4    0xF0        total number of pages                _s_num_pages
+ *   num pages used    4    0x100       number of pages that has been used   _s_num_pages_used
+ *   max split KV      4    0x110       max number of split KV               _s_max_split
+ */
+
+/**
+ * SPI input
+ *
+ * spi_set_reg       description         reg used by kernel
+ * -----------------------------------------------------------------------
+ *   s2             thread group idx        _s_tgid_x
+ *   s3             thread group idy         not used
+ *   s4             thread group idz         not used
+ *   v0             thread idx/y/z           v0,v1,v2 (threadidx, idy, idz)
+ * -----------------------------------------------------------------------
+ * Above SPI input vaule should be derived by following threadgroup grid in host opencl code
+ *   1. global_size_x = 256
+ *   2. global_size_y = 1
+ *   3. global_size_z = 1
+ *   4. local_size_x = 256
+ *   5. local_size_y = 1
+ *   6. local_size_z = 1
+ */
+
+/* -------------------------------------------------------------------------- */
+/*                              Global variables                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Tunable variables
+ */
+var CAUSAL_MASK     = 1
+var USE_EXP_OFFSET  = 1
+/* -------------------------------- Constants ------------------------------- */
+
+var kWaves        = 8
+var kTileQ        = 256
+var kTileKV       = 128
+var kHeadSizeQK   = 192
+var kHeadSizeV    = 128
+
+var kSubSizeQ    = kTileQ / kWaves    // 32
+var kSubSizeKV   = kTileKV            // 128
+
+var kMmaM    = 32
+var kMmaN    = 32
+var kMmaK    = 64
+
+var kSubM     = kSubSizeQ / kMmaM      // 1
+var kSubN0    = kSubSizeKV / kMmaN     // 4
+var kSubK0    = kHeadSizeQK / kMmaK    // 3
+var kSubN1    = kHeadSizeV / kMmaN     // 4
+var kSubK1    = kTileKV / kMmaK        // 2
+
+var kInstsMemLoadK  = 6
+var kInstsMemLoadV  = 4
+var kUnitsLdsReadK  = 12
+var kUnitsLdsReadV  = 8
+
+// LDS usage
+var kLdsSizeUnit  = 1040                 // Unit size: 64x16B, with padding of 16B
+var kLdsSizeQ     = kLdsSizeUnit * 48    // 48 units, 8 waves 6 insts
+var kLdsSizeK     = kLdsSizeUnit * 24    // 24 units, 4 waves 6 insts
+var kLdsSizeK2    = kLdsSizeK * 2        // double buffer
+var kLdsSizeV     = kLdsSizeUnit * 16    // 16 units, 4 waves 4 insts
+var kLdsSizeV2    = kLdsSizeV * 2        // double buffer
+
+var kLdsBaseQ      = 0
+var kLdsBaseK      = kLdsBaseQ + kLdsSizeQ
+var kLdsBaseV      = kLdsBaseK + kLdsSizeK2
+var kLdsTotalSize  = kLdsBaseV + kLdsSizeV2
+
+/**
+ * Others
+ */
+var kNegInfinity  = 0xff800000
+var kLog2e        = 0x3fb8aa3b
+var kMinimumF32   = 0xff7fffff    // -3.4028235e+38
+var kFP8MaxLog2   = 0x410CEAED    // 8.8073549220576, log2(448)
+var kFP8MaxLn     = 0x40C35A77    // 6.10479323241498, loge(448)
+
+var Vsrc63_48    = 0x00000000
+var Vsrc95_64    = 0x80000000
+var Vsrc127_96   = 0x00020000
+
+/* ---------------------------- SGPRs assignment ---------------------------- */
+
+var _s_Q_buf            = 4
+var _s_K_buf            = 8
+var _s_V_buf            = 12
+var _s_O_buf            = 16
+var _s_SplitData_buf    = 20
+var _s_SplitLSE_buf     = 24
+var _s_WorkIdx_buf      = 28
+var _s_WorkInfoSet_buf  = 32
+var _s_QOIdx_buf        = 36
+var _s_KVIdx_buf        = 40
+var _s_KVPageIdx_buf    = 44
+
+var _s_QScale_buf  = 48
+var _s_KScale_buf  = 50
+var _s_VScale_buf  = 52
+
+var iota               = 54
+var _s_scale_log2e     = s[iota++]
+var _s_scale_log2e_1   = s[iota++]         // used by pk instructions
+var _s_scale           = s[iota++]
+var _s_Q_seqlen        = s[iota++]
+var _s_num_Q_heads     = s[iota++]
+var _s_num_KV_heads    = _s_num_Q_heads
+var _s_num_pages       = s[iota++]
+var _s_num_pages_used  = s[iota++]
+
+if iota > 62
+    print "Error: index of iota a: ", iota
+end
+iota = 62
+var _s_wave_id   = s[iota++]
+var _s_tgid_x    = s[iota++]
+var _s_tmp0      = s[iota++]
+var _s_tmp1      = s[iota++]
+
+if iota > 66
+    print "Error: index of iota b: ", iota
+end
+iota = 66
+var _s_work_start      = s[iota++]
+var _s_work_end        = s[iota++]
+var _s_Q_batch_start   = s[iota++]
+var _s_Q_batch_end     = s[iota++]
+var _s_KV_batch_start  = s[iota++]
+var _s_KV_batch_end    = s[iota++]
+var _s_KV_cur          = s[iota++]
+var _s_KV_mask_start   = s[iota++]
+var _s_Q_stride        = s[iota++]
+var _s_O_stride        = s[iota++]
+var _s_K_stride        = s[iota++]
+var _s_V_stride        = s[iota++]
+var _s_q_scale         = s[iota++]
+var _s_k_scale         = s[iota++]
+var _s_v_scale         = s[iota++]
+
+if iota > 84
+    print "Error: index of iota c: ", iota
+end
+var _s_work_info  = 84                  // it will occupy 8 consecutive registers
+var _s_Q_lds_m0   = _s_work_info + 8
+var _s_K_lds_m0   = _s_Q_lds_m0 + 1
+var _s_V_lds_m0   = _s_K_lds_m0 + 1
+var _s_end        = _s_V_lds_m0 + 1
+
+// unpacking _s_work_info
+iota = _s_work_info
+var _s_batch_idx    = s[iota++]
+var _s_partial_idx  = s[iota++]
+var _s_Q_start      = s[iota++]
+var _s_Q_end        = s[iota++]
+var _s_KV_start     = s[iota++]
+var _s_KV_end       = s[iota++]
+var _s_pad          = s[iota++]    // not used in kernel
+var _s_head_start   = s[iota++]
+
+var _s_KV_local_end = _s_KV_end
+
+/* ---------------------------- VGPRs assignment ---------------------------- */
+
+// data, 192
+var _v_Q          = 4                  // 24, [kSubM, kSubK0, 8], idx:4
+var _v_K          = _v_Q + 24          // 32|96, [kSubN0, kSubK0, 8], idx:28
+var _v_V          = _v_K               // reuse K, 32|64, [kSubN1, kSubK1, 8], idx:28
+var _v_S          = _v_V + 32          // 64, [kSubM, kSubN0, 16], idx:60
+var _v_P          = _v_S               // reuse S, 16, [kSubM, kSubK1, 8]
+var _v_R          = _v_P + 64          // 64, [kSubM, kSubN1, 16], idx:124
+var _v_PageIdxK   = _v_R + 64          // 1
+var _v_PageIdxV   = _v_PageIdxK + 1    // 2
+var _v_SplitLSE   = _v_PageIdxV + 2    // 1
+
+// softmax, 14
+var _v_tmp              = _v_SplitLSE + 1           // 4
+var _v_delta_max_log2e  = _v_tmp + 4                // 2, [kSubM * 2]
+var _v_L                = _v_delta_max_log2e + 2    // 2, [kSubM * 2]
+var _v_FA_max           = _v_L + 2                  // 1, [kSubM]
+var _v_DYN_max          = _v_FA_max + kSubM         // 1, [kSubM]
+
+var _v_mask_border     = _v_DYN_max + 1           // 1
+var _v_mask_KV_offset  = _v_mask_border + 1       // 1
+var _v_mask_Q_offset   = _v_mask_KV_offset + 1    // 1
+var _v_NEG_INF         = _v_mask_Q_offset + 1     // 1
+
+// addresses
+var _v_mem_row_id      = _v_NEG_INF + 1           // 2
+var _v_lds_offset      = _v_mem_row_id + 2        // 1
+var _v_Q_base          = _v_lds_offset + 1        // 2
+var _v_Q_addr          = _v_Q_base + 2            // 2
+var _v_Q_lds_rd        = _v_Q_addr + 2            // 1
+var _v_PageIdxK_base   = _v_Q_lds_rd + 1          // 1
+var _v_PageIdxK_addr   = _v_PageIdxK_base + 1     // 1
+var _v_PageIdxV_base   = _v_PageIdxK_addr + 1     // 1
+var _v_PageIdxV_addr   = _v_PageIdxV_base + 1     // 1
+var _v_K_base          = _v_PageIdxV_addr + 1     // 1
+var _v_K_addr          = _v_K_base + 1            // 2
+var _v_V_base          = _v_K_addr + 2            // 1
+var _v_V_addr          = _v_V_base + 1            // 4
+var _v_K_lds_rd        = _v_V_addr + 4            // 1
+var _v_V_lds_rd        = _v_K_lds_rd + 1          // 1
+var _v_O_base          = _v_V_lds_rd + 1          // 1
+var _v_O_addr          = _v_O_base + 1            // 1
+var _v_SplitData_base  = _v_O_addr + 1            // 1
+var _v_SplitData_addr  = _v_SplitData_base + 1    // 1
+var _v_SplitLSE_base   = _v_SplitData_addr + 1    // 1
+var _v_SplitLSE_addr   = _v_SplitLSE_base + 1     // 1
+var _v_K_stride        = _v_SplitLSE_addr + 1     // 1
+var _v_V_stride        = _v_K_stride + 1          // 1
+var _v_end             = _v_V_stride + 1
+var _acc_end           = 0
+
+/* ----------------------------- Dispaly macros ----------------------------- */
+
+print "LDS used (<65536): ", kLdsTotalSize
+print "Total sgpr used (<100): ", _s_end
+print "Total vgpr used (<256): ", _v_end
+print "Total accvgpr used (<256): ", _acc_end
+
+/* ---------------------------------- Label --------------------------------- */
+
+label label_core_loop_with_mask[4]
+label label_core_loop_exit[2]
+label label_core_loop[2]
+
+/* -------------------------------------------------------------------------- */
+/*                               Macro functions                              */
+/* -------------------------------------------------------------------------- */
+
+function v_regs(base, offset)
+    var v_idx = base + offset
+    return v[v_idx]
+end
+
+function s_regs(base, offset)
+    var s_idx = base + offset
+    return s[s_idx]
+end
+
+function init_buffer_default(s_buf)
+    s_mov_b32       s_regs(s_buf, 2),  Vsrc95_64
+    s_mov_b32       s_regs(s_buf, 3),  Vsrc127_96
+    s_and_b32       s_regs(s_buf, 1),  s_regs(s_buf, 1),  0xffff
+    s_or_b32        s_regs(s_buf, 1),  s_regs(s_buf, 1),  Vsrc63_48
+end
+
+/* ----------------------- Initialize buffer addresses ---------------------- */
+
+function init_buffer_addresses
+    /**
+     *  _s_Q_buf, [num_seqs, num_q_heads, qk_head_size], fp8
+     */
+    init_buffer_default(_s_Q_buf)
+    s_mul_i32       s_regs(_s_Q_buf, 2),  _s_Q_stride,  _s_Q_seqlen
+
+    /**
+     *  _s_K_buf, [num_page, num_kv_heads, qk_head_size], fp8
+     */
+    init_buffer_default(_s_K_buf)
+    s_mul_i32       s_regs(_s_K_buf, 2),  _s_K_stride,  _s_num_pages
+
+    /**
+     *  _s_V_buf, [num_page, num_kv_heads, v_head_size], fp8
+     */
+    init_buffer_default(_s_V_buf)
+    s_mul_i32       s_regs(_s_V_buf, 2),  _s_V_stride,  _s_num_pages
+
+    /**
+     *  _s_O_buf,  [num_seqs, num_q_heads, v_head_size], bf16
+     */
+    init_buffer_default(_s_O_buf)
+
+    /**
+     *  _s_SplitData_buf,  [max_partition, num_q_heads, v_head_size], fp32
+     */
+    init_buffer_default(_s_SplitData_buf)
+
+    /**
+     *  _s_SplitLSE_buf,  [max_partition, num_q_heads], fp32
+     */
+    init_buffer_default(_s_SplitLSE_buf)
+
+    /**
+     * _s_WorkInfoSet_buf, _s_QOIdx_buf, _s_KVIdx_buf
+     */
+    s_and_b32       s_regs(_s_WorkInfoSet_buf, 1),  s_regs(_s_WorkInfoSet_buf, 1),  0xffff
+    s_and_b32       s_regs(_s_QOIdx_buf, 1),        s_regs(_s_QOIdx_buf, 1),        0xffff
+    s_and_b32       s_regs(_s_KVIdx_buf, 1),        s_regs(_s_KVIdx_buf, 1),        0xffff
+
+    /**
+     *  _s_KVPageIdx_buf, [num_pages_used], int
+     */
+    init_buffer_default(_s_KVPageIdx_buf)
+    s_lshl_b32      s_regs(_s_KVPageIdx_buf, 2),  _s_num_pages_used,  2
+end
+
+/* ------------------------------ Row Indicies ------------------------------ */
+
+function create_mem_row_id
+    /**
+     * _v_mem_row_id[0], row indicies for loading Q and K
+     *  threads: 16x4, each 16Bytes
+     *  row_id: [0, 1, 2, 3, 4, 5, 6, 7, 32, 33, 34, 35, 36, 37, 38, 39]
+     *  using row_offsets (0, 8, 16, 24) to load a 64x64 block
+     */
+
+    // id = (v0 % 32) / 4 + (v0 / 32) * 32
+    v_and_b32           v_regs(_v_tmp, 0),         0x1f,               v0
+    v_lshrrev_b32       v_regs(_v_tmp, 0),         2,                  v_regs(_v_tmp, 0)
+    v_lshrrev_b32       v_regs(_v_tmp, 1),         5,                  v0
+    v_lshlrev_b32       v_regs(_v_tmp, 1),         5,                  v_regs(_v_tmp, 1)
+    v_add_u32           v_regs(_v_mem_row_id, 0),  v_regs(_v_tmp, 0),  v_regs(_v_tmp, 1)
+
+    /**
+     * _v_mem_row_id[1], row indicies for loading V
+     *  threads: 8x8, each 16Bytes
+     *  row_id: [0, 1, 16, 17, 32, 33, 48, 49]
+     *  using row_offsets (0, 4, 2, 6, 8, 12, 10, 14) to load a 64x128 block
+     */
+
+    // id = (v0 / 16) * 16 + (v0 / 8) % 2
+    v_lshrrev_b32       v_regs(_v_tmp, 0),         4,                  v0
+    v_lshlrev_b32       v_regs(_v_tmp, 0),         4,                  v_regs(_v_tmp, 0)
+    v_lshrrev_b32       v_regs(_v_tmp, 1),         3,                  v0
+    v_and_b32           v_regs(_v_tmp, 1),         0x1,                v_regs(_v_tmp, 1)
+    v_add_u32           v_regs(_v_mem_row_id, 1),  v_regs(_v_tmp, 0),  v_regs(_v_tmp, 1)
+end
+
+function create_lds_offset
+    /**
+     * _v_lds_offset, offsets for reading a 32x32 LDS block
+     */
+
+    // (v0 / 32) * 16 + (v0 % 32) / 8 * kLdsSizeUnit + (v0 % 8) * 64
+    v_lshrrev_b32       v_regs(_v_tmp, 0),         5,                  v0
+    v_lshlrev_b32       v_regs(_v_tmp, 0),         4,                  v_regs(_v_tmp, 0)
+    v_and_b32           v_regs(_v_tmp, 1),         0x1f,               v0
+    v_lshrrev_b32       v_regs(_v_tmp, 1),         3,                  v_regs(_v_tmp, 1)
+    v_mul_i32_i24       v_regs(_v_tmp, 1),         kLdsSizeUnit,       v_regs(_v_tmp, 1)
+    v_and_b32           v_regs(_v_tmp, 2),         0x7,                v0
+    v_lshlrev_b32       v_regs(_v_tmp, 2),         6,                  v_regs(_v_tmp, 2)
+    v_add3_u32          v_regs(_v_lds_offset, 0),  v_regs(_v_tmp, 0),  v_regs(_v_tmp, 1),  v_regs(_v_tmp, 2)
+end
+
+/* -------------------------------- MemLoad Q ------------------------------- */
+
+function generate_Q_base_addr
+    /**
+     * _v_Q_base[2]
+     *   For Q, 8 waves will load 256x192 elements and 2 waves load 64x192 elements
+     * collaboratively. The 64x192 block is divided into 3 sub-block of 64x64.
+     */
+
+    // wave 0-7 offsets: [0, 16, 64, 80, 128, 144, 192, 208]
+    // row_id = (wave_id / 2) * 64 + (wave_id % 2) * 16 + _v_mem_row_id[0]
+    s_lshr_b32      _s_tmp0,            _s_wave_id,    1
+    s_lshl_b32      _s_tmp0,            _s_tmp0,       6
+    s_and_b32       _s_tmp1,            _s_wave_id,    0x1
+    s_lshl_b32      _s_tmp1,            _s_tmp1,       4
+    s_add_u32       _s_tmp0,            _s_tmp0,       _s_tmp1
+    v_add_u32       v_regs(_v_tmp, 0),  _s_tmp0,       v_regs(_v_mem_row_id, 0)
+
+    // col_offset = (v0 % 4) * 16
+    v_and_b32           v_regs(_v_tmp, 1),  0x3,    v0
+    v_lshlrev_b32       v_regs(_v_tmp, 1),  4,      v_regs(_v_tmp, 1)
+
+    // _v_Q_base[0] = row_id * StrideQ + col_offset
+    v_mul_i32_i24       v_regs(_v_Q_base, 0),  _s_Q_stride,           v_regs(_v_tmp, 0)
+    v_add_u32           v_regs(_v_Q_base, 0),  v_regs(_v_Q_base, 0),  v_regs(_v_tmp, 1)
+
+    // _v_Q_base[1] =  _v_Q_base[0] + 8 * StrideQ
+    s_lshl_b32      _s_tmp1,               _s_Q_stride,    3
+    v_add_u32       v_regs(_v_Q_base, 1),  _s_tmp1,        v_regs(_v_Q_base, 0)
+
+    /**
+     * _s_Q_lds_m0
+     * (wave_id / 2 * 6 + wave_id % 2) * kLdsSizeUnit * 2 + kLdsBaseQ
+     */
+    s_lshr_b32      _s_tmp0,                 _s_wave_id,    1
+    s_mul_i32       _s_tmp0,                 _s_tmp0,       6
+    s_and_b32       _s_tmp1,                 _s_wave_id,    0x1
+    s_add_u32       _s_tmp0,                 _s_tmp0,       _s_tmp1
+    s_mul_i32       s_regs(_s_Q_lds_m0, 0),  _s_tmp0,       kLdsSizeUnit * 2
+end
+
+function generate_Q_mem_addr
+    /**
+     * _v_Q_addr[2]
+     */
+    // offset = _s_Q_start * _s_Q_stride + _s_head_start * kHeadSizeQK
+    s_mul_i32       _s_tmp0,    _s_Q_start,     _s_Q_stride
+    s_mul_i32       _s_tmp1,    _s_head_start,  kHeadSizeQK
+    s_add_u32       _s_tmp0,    _s_tmp0,        _s_tmp1
+
+    // _v_Q_addr = _v_Q_base + offset
+    v_add_u32       v_regs(_v_Q_addr, 0),  _s_tmp0,    v_regs(_v_Q_base, 0)
+    v_add_u32       v_regs(_v_Q_addr, 1),  _s_tmp0,    v_regs(_v_Q_base, 1)
+end
+
+function mem_load_Q
+    for var k = 0; k < kSubK0; k++
+        for var i = 0; i < 2; i++
+            var offset = k * 64
+            var lds_offset = (k * 4 + i) * kLdsSizeUnit - offset
+            s_add_u32             m0,            s_regs(_s_Q_lds_m0, 0),  lds_offset
+            buffer_load_dwordx4   v_regs(0, 0),  v_regs(_v_Q_addr, i),    s_regs(_s_Q_buf, 0),  0  offen:1  lds:1  offset:offset
+        end
+    end
+end
+
+/* ------------------------------- LDS read Q ------------------------------- */
+
+function generate_Q_lds_addr
+    /**
+     * _v_Q_lds_rd
+     *   wave offset = wave_id / 2 * kLdsSizeUnit * 12 + (wave_id % 2) * 8 * 64
+     */
+    s_lshr_b32      _s_tmp0,                 _s_wave_id,    1
+    s_mul_i32       _s_tmp0,                 _s_tmp0,       kLdsSizeUnit * 12
+    s_add_u32       _s_tmp0,                 _s_tmp0,       kLdsBaseQ
+    s_and_b32       _s_tmp1,                 _s_wave_id,    0x1
+    s_lshl_b32      _s_tmp1,                 _s_tmp1,       9
+    s_add_u32       _s_tmp0,                 _s_tmp1,       _s_tmp0
+    v_add_u32       v_regs(_v_Q_lds_rd, 0),  _s_tmp0,       v_regs(_v_lds_offset, 0)
+end
+
+function lds_read_Q
+    for var k = 0; k < kSubK0; k++
+        for var i = 0; i < 2; i++
+            var lds_offset = k * kLdsSizeUnit * 4 + i * 32
+            ds_read_b128   v_regs(_v_Q, i * 4 + k * 8),  v_regs(_v_Q_lds_rd, 0)  offset:lds_offset
+        end
+    end
+end
+
+/* ----------------------------- Load KV PageIdx ---------------------------- */
+
+function generate_KV_PageIdx_base_addr
+    /**
+     * _v_PageIdxK_base[1]
+     *   The block of K has a row size of 128. The page id of each row is loaded
+     * according to _v_mem_row_id[0]. K is load by the first 4 waves, and each wave
+     * needs to load 32 rows. The address will load 64 rows, which can used to
+     * load 2 blocks of K.
+     */
+
+    // wave 0-3 offsets: [0, 16, 64, 80]
+    // (wave_id / 2) * 64 + (wave_id % 2) * 16 + _v_mem_row_id[0]
+    s_lshr_b32      _s_tmp0,            _s_wave_id,    1
+    s_lshl_b32      _s_tmp0,            _s_tmp0,       6
+    s_and_b32       _s_tmp1,            _s_wave_id,    0x1
+    s_lshl_b32      _s_tmp1,            _s_tmp1,       4
+    s_add_u32       _s_tmp0,            _s_tmp0,       _s_tmp1
+    v_add_u32       v_regs(_v_tmp, 0),  _s_tmp0,       v_regs(_v_mem_row_id, 0)
+
+    // quad offsets: [0, 8, 128, 136]
+    // (v0 % 2) * 8 + ((v0 % 4) / 2) * 128
+    v_and_b32           v_regs(_v_tmp, 1),  0x1,    v0
+    v_lshlrev_b32       v_regs(_v_tmp, 1),  3,      v_regs(_v_tmp, 1)
+
+    v_and_b32           v_regs(_v_tmp, 2),  0x3,    v0
+    v_lshrrev_b32       v_regs(_v_tmp, 2),  1,      v_regs(_v_tmp, 2)
+    v_lshlrev_b32       v_regs(_v_tmp, 2),  7,      v_regs(_v_tmp, 2)
+
+    v_add3_u32          v_regs(_v_PageIdxK_base, 0),  v_regs(_v_tmp, 0),  v_regs(_v_tmp, 1),           v_regs(_v_tmp, 2)
+    v_lshlrev_b32       v_regs(_v_PageIdxK_base, 0),  2,                  v_regs(_v_PageIdxK_base, 0)
+
+    /**
+     * _v_PageIdxV_base[1]
+     *   The block of V has a row size of 128. The page id of each row is loaded
+     * according to _v_mem_row_id[1]. V is load by the last 4 waves, and each wave
+     * needs to load 32 rows. 2 VGPRs are used to store 2 blocks indicies of V.
+     */
+
+    // wave 4-7 offsets: [0, 8, 64, 72]
+    // ((wave_id / 2) % 2) * 64 + (wave_id % 2) * 8 + _v_mem_row_id[1]
+    s_lshr_b32      _s_tmp0,            _s_wave_id,    1
+    s_and_b32       _s_tmp0,            _s_tmp0,       0x1
+    s_lshl_b32      _s_tmp0,            _s_tmp0,       6
+    s_and_b32       _s_tmp1,            _s_wave_id,    0x1
+    s_lshl_b32      _s_tmp1,            _s_tmp1,       3
+    s_add_u32       _s_tmp0,            _s_tmp0,       _s_tmp1
+    v_add_u32       v_regs(_v_tmp, 0),  _s_tmp0,       v_regs(_v_mem_row_id, 1)
+
+    // quad offsets: [0, 4, 2, 6]
+    // (v0 % 2) * 4 + ((v0 % 4) / 2) * 2
+    v_and_b32           v_regs(_v_tmp, 1),  0x1,    v0
+    v_lshlrev_b32       v_regs(_v_tmp, 1),  2,      v_regs(_v_tmp, 1)
+
+    v_and_b32           v_regs(_v_tmp, 2),  0x3,    v0
+    v_lshrrev_b32       v_regs(_v_tmp, 2),  1,      v_regs(_v_tmp, 2)
+    v_lshlrev_b32       v_regs(_v_tmp, 2),  1,      v_regs(_v_tmp, 2)
+
+    v_add3_u32          v_regs(_v_PageIdxV_base, 0),  v_regs(_v_tmp, 0),  v_regs(_v_tmp, 1),           v_regs(_v_tmp, 2)
+    v_lshlrev_b32       v_regs(_v_PageIdxV_base, 0),  2,                  v_regs(_v_PageIdxV_base, 0)
+end
+
+/**
+ * PageIdx K
+ */
+
+function generate_PageIdxK_mem_addr
+    /**
+     * _v_PageIdxK_addr = _s_KV_start * 4 + base
+     */
+    s_lshl_b32      _s_tmp0,                      _s_KV_start,    2
+    v_add_u32       v_regs(_v_PageIdxK_addr, 0),  _s_tmp0,        v_regs(_v_PageIdxK_base, 0)
+end
+
+function update_PageIdxK_mem_addr
+    v_add_u32       v_regs(_v_PageIdxK_addr, 0),  kTileKV * 8,  v_regs(_v_PageIdxK_addr, 0)
+end
+
+function mem_load_PageIdxK
+    buffer_load_dword   v_regs(_v_PageIdxK, 0),  v_regs(_v_PageIdxK_addr, 0),  s_regs(_s_KVPageIdx_buf, 0),  0  offen:1
+    return 1
+end
+
+/**
+ * PageIdx V
+ */
+
+function generate_PageIdxV_mem_addr
+    /**
+     * _v_PageIdxV_addr = _s_KV_start * 4 + base
+     */
+    s_lshl_b32      _s_tmp0,                      _s_KV_start,    2
+    v_add_u32       v_regs(_v_PageIdxV_addr, 0),  _s_tmp0,        v_regs(_v_PageIdxV_base, 0)
+end
+
+function update_PageIdxV_mem_addr
+    v_add_u32       v_regs(_v_PageIdxV_addr, 0),  kTileKV * 8,  v_regs(_v_PageIdxV_addr, 0)
+end
+
+function mem_load_PageIdxV(inst_idx)
+    if inst_idx == 0
+        buffer_load_dword   v_regs(_v_PageIdxV, 0),  v_regs(_v_PageIdxV_addr, 0),  s_regs(_s_KVPageIdx_buf, 0),  0  offen:1
+    elsif inst_idx == 1
+        buffer_load_dword   v_regs(_v_PageIdxV, 1),  v_regs(_v_PageIdxV_addr, 0),  s_regs(_s_KVPageIdx_buf, 0),  0  offen:1  offset:kTileKV * 4
+    end
+    return inst_idx + 1
+end
+
+/* ------------------------------ Load K and V ------------------------------ */
+
+function generate_KV_lds_m0
+    /**
+     * _s_K_lds_m0
+     *   wave 0-3
+     *   (wave_id / 2 * 6 + wave_id % 2) * kLdsSizeUnit * 2 + kLdsBaseK
+     */
+    s_lshr_b32      _s_tmp0,                 _s_wave_id,    1
+    s_mul_i32       _s_tmp0,                 _s_tmp0,       6
+    s_and_b32       _s_tmp1,                 _s_wave_id,    0x1
+    s_add_u32       _s_tmp0,                 _s_tmp0,       _s_tmp1
+    s_mul_i32       s_regs(_s_K_lds_m0, 0),  _s_tmp0,       kLdsSizeUnit * 2
+    s_add_u32       s_regs(_s_K_lds_m0, 0),  kLdsBaseK,     s_regs(_s_K_lds_m0, 0)
+
+    /**
+     * _s_V_lds_m0
+     *   wave 4-7
+     *  (wave_id % 4) * kLdsSizeUnit * 4 + kLdsBaseV
+     */
+    s_and_b32       _s_tmp1,                 _s_wave_id,    0x3
+    s_mul_i32       _s_tmp1,                 _s_tmp1,       kLdsSizeUnit * 4
+    s_add_u32       s_regs(_s_V_lds_m0, 0),  kLdsBaseV,     _s_tmp1
+end
+
+/**
+ * Memload K
+ */
+
+function generate_K_base_addr
+    /**
+     * _v_K_base = _s_head_start * kHeadSizeQK + (v0 % 4) * 16
+     */
+    s_mul_i32           _s_tmp0,               _s_head_start,  kHeadSizeQK
+    v_and_b32           v_regs(_v_tmp, 0),     0x3,            v0
+    v_lshlrev_b32       v_regs(_v_tmp, 0),     4,              v_regs(_v_tmp, 0)
+    v_add_u32           v_regs(_v_K_base, 0),  _s_tmp0,        v_regs(_v_tmp, 0)
+end
+
+function update_K_mem_addr(rep_idx)
+    var i = rep_idx * 2
+
+    v_mul_i32_i24       v_regs(_v_tmp, 0),     v_regs(_v_PageIdxK, 0),  v_regs(_v_K_stride, 0)  quad_perm:[i, i, i, i]
+    v_mul_i32_i24       v_regs(_v_tmp, 1),     v_regs(_v_PageIdxK, 0),  v_regs(_v_K_stride, 0)  quad_perm:[i + 1, i + 1, i + 1, i + 1]
+    v_add_u32           v_regs(_v_K_addr, 0),  v_regs(_v_K_base, 0),    v_regs(_v_tmp, 0)
+    v_add_u32           v_regs(_v_K_addr, 1),  v_regs(_v_K_base, 0),    v_regs(_v_tmp, 1)
+    return 0
+end
+
+function mem_load_K(rep_idx, inst_idx)
+    if inst_idx < kInstsMemLoadK
+        var k = inst_idx / 2
+        var i = inst_idx % 2
+
+        var offset = k * 64
+        var lds_offset = rep_idx * kLdsSizeK + (k * 4 + i) * kLdsSizeUnit - offset
+
+        s_add_u32             m0,             s_regs(_s_K_lds_m0, 0),  lds_offset
+        buffer_load_dwordx4   v_regs(0, 0),   v_regs(_v_K_addr, i),    s_regs(_s_K_buf, 0),  0    offen:1    lds:1    offset:offset
+    end
+    return inst_idx + 1
+end
+
+function mem_load_K_all(rep_idx)
+    for var inst_idx = 0; inst_idx < kInstsMemLoadK; inst_idx++
+        mem_load_K(rep_idx, inst_idx)
+    end
+end
+
+/**
+ * Memload V
+ */
+
+function generate_V_base_addr
+    /**
+     * _v_V_base = _s_head_start * kHeadSizeV + (v0 % 8) * 16
+     */
+    s_mul_i32           _s_tmp0,               _s_head_start,  kHeadSizeV
+    v_and_b32           v_regs(_v_tmp, 0),     0x7,            v0
+    v_lshlrev_b32       v_regs(_v_tmp, 0),     4,              v_regs(_v_tmp, 0)
+    v_add_u32           v_regs(_v_V_base, 0),  _s_tmp0,        v_regs(_v_tmp, 0)
+end
+
+function update_V_mem_addr(rep_idx)
+    for var i = 0; i < 4; i++
+        v_mul_i32_i24       v_regs(_v_tmp, i),  v_regs(_v_PageIdxV, rep_idx),  v_regs(_v_V_stride, 0)  quad_perm:[i, i, i, i]
+    end
+    for var i = 0; i < 4; i++
+        v_add_u32       v_regs(_v_V_addr, i),  v_regs(_v_V_base, 0),  v_regs(_v_tmp, i)
+    end
+    return 0
+end
+
+function mem_load_V(rep_idx, inst_idx)
+    if inst_idx < kInstsMemLoadV
+        var lds_offset = rep_idx * kLdsSizeV + inst_idx * kLdsSizeUnit
+
+        s_add_u32             m0,             s_regs(_s_V_lds_m0, 0),       lds_offset
+        buffer_load_dwordx4   v_regs(0, 0),   v_regs(_v_V_addr, inst_idx),  s_regs(_s_V_buf, 0),  0    offen:1    lds:1
+    end
+    return inst_idx + 1
+end
+
+function mem_load_V_all(rep_idx)
+    for var inst_idx = 0; inst_idx < kInstsMemLoadV; inst_idx++
+        mem_load_V(rep_idx, inst_idx)
+    end
+end
+
+/* ------------------------------- LDS read K ------------------------------- */
+
+function generate_K_lds_addr
+    /**
+     * _v_K_lds_rd
+     */
+    v_add_u32       v_regs(_v_K_lds_rd, 0),  kLdsBaseK,  v_regs(_v_lds_offset, 0)
+end
+
+function lds_read_K_unit(rep_idx, unit_idx)
+    if unit_idx < kUnitsLdsReadK
+        var k = unit_idx % 3
+        var m = unit_idx / 6
+        var n = (unit_idx / 3) % 2
+        var offset = rep_idx * kLdsSizeK + k * kLdsSizeUnit * 4 + m * kLdsSizeUnit * 12 + n * 512
+
+        for var inst_idx = 0; inst_idx < 2; inst_idx++
+            var lds_offset = offset + inst_idx * 32
+            var reg_offset = (unit_idx % 4) * 8 + inst_idx * 4
+            ds_read_b128   v_regs(_v_K, reg_offset),  v_regs(_v_K_lds_rd, 0)  offset:lds_offset
+        end
+    end
+    return unit_idx + 1
+end
+
+function lds_read_K_first3(rep_idx)
+    for var unit_idx = 0; unit_idx < 3; unit_idx++
+        lds_read_K_unit(rep_idx, unit_idx)
+    end
+end
+
+/* ------------------------------- LDS read V ------------------------------- */
+
+function generate_V_lds_addr
+    /**
+     * _v_V_lds_rd
+     */
+    v_lshrrev_b32       v_regs(_v_tmp, 0),  1,    v0
+    v_and_b32           v_regs(_v_tmp, 0),  7,    v_regs(_v_tmp, 0)  //g_id
+
+    v_and_b32           v_regs(_v_tmp, 1),  1,      v_regs(_v_tmp, 0)  //g_id&1
+    v_mul_i32_i24       v_regs(_v_tmp, 1),  128,    v_regs(_v_tmp, 1)  //(g_id&1)*128
+
+    v_lshrrev_b32       v_regs(_v_tmp, 0),       1,                  v_regs(_v_tmp, 0)  //g_id/2
+    v_mul_i32_i24       v_regs(_v_tmp, 0),       kLdsSizeUnit * 2,   v_regs(_v_tmp, 0)  //g_id/2*2*kLdsSizeUnit
+    v_add_u32           v_regs(_v_V_lds_rd, 0),  v_regs(_v_tmp, 1),  v_regs(_v_tmp, 0)
+
+    v_and_b32           v_regs(_v_tmp, 0),       1,                  v0                      //t_id&1
+    v_mul_i32_i24       v_regs(_v_tmp, 0),       8,                  v_regs(_v_tmp, 0)       //(t_id&1)*8
+    v_add_u32           v_regs(_v_V_lds_rd, 0),  v_regs(_v_tmp, 0),  v_regs(_v_V_lds_rd, 0)
+
+    v_lshrrev_b32       v_regs(_v_tmp, 0),       4,                  v0                      //row_id
+    v_and_b32           v_regs(_v_tmp, 1),       1,                  v_regs(_v_tmp, 0)       //row_id&1
+    v_mul_i32_i24       v_regs(_v_tmp, 1),       16,                 v_regs(_v_tmp, 1)       //row_id&1 *16
+    v_add_u32           v_regs(_v_V_lds_rd, 0),  v_regs(_v_tmp, 1),  v_regs(_v_V_lds_rd, 0)
+
+    v_lshrrev_b32       v_regs(_v_tmp, 1),       1,                  v_regs(_v_tmp, 0)       //row_id>>1
+    v_mul_i32_i24       v_regs(_v_tmp, 1),       kLdsSizeUnit,       v_regs(_v_tmp, 1)       //row_id>>1 * kLdsSizeUnit
+    v_add_u32           v_regs(_v_V_lds_rd, 0),  v_regs(_v_tmp, 1),  v_regs(_v_V_lds_rd, 0)
+
+    v_add_u32       v_regs(_v_V_lds_rd, 0),  kLdsBaseV,  v_regs(_v_V_lds_rd, 0)
+end
+
+function lds_read_V_unit(rep_idx, unit_idx)
+    if unit_idx < kUnitsLdsReadV
+        var k = unit_idx % 2
+        var n = unit_idx / 2
+        var offset = rep_idx * kLdsSizeV + n * 32 + k * kLdsSizeUnit * 8
+
+        for var inst_idx = 0; inst_idx < 4; inst_idx++
+            var lds_offset = offset + inst_idx * 256
+            var reg_offset = (unit_idx % 4) * 8 + inst_idx * 2
+            ds_read_b64_tr_b8   v_regs(_v_V, reg_offset),  v_regs(_v_V_lds_rd, 0)  offset:lds_offset
+        end
+    end
+    return unit_idx + 1
+end
+
+/* --------------------------------- Output --------------------------------- */
+
+function generate_out_base_addr
+    /**
+     * _v_O_base
+     */
+    // row(tmp0) = wave_id * 32 + v0 & 0x1f
+    s_lshl_b32      _s_tmp0,            _s_wave_id,         5
+    v_and_b32       v_regs(_v_tmp, 0),  0x1f,               v0
+    v_add_u32       v_regs(_v_tmp, 0),  v_regs(_v_tmp, 0),  _s_tmp0
+
+    // col(tmp1) = (v0 // 32) * 16
+    v_lshrrev_b32       v_regs(_v_tmp, 1),  5,     v0
+    v_mul_i32_i24       v_regs(_v_tmp, 1),  16,    v_regs(_v_tmp, 1)
+
+    // offset = row * _s_O_stride * 2 + col, output is bf16
+    s_lshl_b32          _s_tmp1,               _s_O_stride,        1
+    v_mul_i32_i24       v_regs(_v_tmp, 2),     _s_tmp1,            v_regs(_v_tmp, 0)
+    v_add_u32           v_regs(_v_O_base, 0),  v_regs(_v_tmp, 1),  v_regs(_v_tmp, 2)
+
+    /**
+     * _v_SplitData_base: [_s_max_split, num_q_heads, v_head_dim]
+     */
+    // offset = row * _s_O_stride * 4 + col, output is fp32
+    s_lshl_b32          _s_tmp1,                       _s_O_stride,        2
+    v_mul_i32_i24       v_regs(_v_tmp, 2),             _s_tmp1,            v_regs(_v_tmp, 0)
+    v_add_u32           v_regs(_v_SplitData_base, 0),  v_regs(_v_tmp, 1),  v_regs(_v_tmp, 2)
+
+    /**
+     * _v_SplitLSE_base: [_s_max_split, num_q_heads]
+     */
+    // offset = (wave_id * 32  + (v0 & 0x1f)) * num_q_heads * 4
+    s_lshl_b32          _s_tmp1,                      _s_num_Q_heads,     2
+    v_mul_i32_i24       v_regs(_v_SplitLSE_base, 0),  v_regs(_v_tmp, 0),  _s_tmp1
+end
+
+function generate_out_mem_addr
+    /**
+     * _v_O_addr =   _s_Q_start * _s_O_stride + _s_head_start * kHeadSizeV
+     */
+
+    s_mul_i32       _s_tmp0,    _s_Q_start,     _s_O_stride
+    s_mul_i32       _s_tmp1,    _s_head_start,  kHeadSizeV
+    s_add_u32       _s_tmp0,    _s_tmp0,        _s_tmp1
+
+    s_lshl_b32      _s_tmp0,               _s_tmp0,    1
+    v_add_u32       v_regs(_v_O_addr, 0),  _s_tmp0,    v_regs(_v_O_base, 0)
+    
+    s_mul_i32       _s_tmp0,              _s_Q_end,    _s_O_stride
+    s_lshl_b32      s_regs(_s_O_buf, 2),  _s_tmp0,     1
+
+    /**
+     * split_data_addr = (_s_head_start * kHeadSizeV + _s_partial_idx * _s_O_stride) * 4
+     */
+
+    s_mul_i32       _s_tmp0,    _s_head_start,   kHeadSizeV
+    s_mul_i32       _s_tmp1,    _s_partial_idx,  _s_O_stride
+    s_add_u32       _s_tmp1,    _s_tmp0,         _s_tmp1
+    s_lshl_b32      _s_tmp0,    _s_tmp1,         2
+
+    v_add_u32       v_regs(_v_SplitData_addr, 0),  _s_tmp0,  v_regs(_v_SplitData_base, 0)
+
+    /**
+     * split_data_addr = (_s_head_start  + _s_partial_idx * num_q_heads) * 4
+     */
+
+    s_mul_i32       _s_tmp1,    _s_partial_idx,  _s_num_Q_heads
+    s_add_i32       _s_tmp0,    _s_head_start,   _s_tmp1
+    s_lshl_b32      _s_tmp0,    _s_tmp0,         2
+
+    v_add_u32       v_regs(_v_SplitLSE_addr, 0),  _s_tmp0,  v_regs(_v_SplitLSE_base, 0)
+
+end
+
+function output_partial_results
+    // compute lse
+    // lse = (_v_FA_Max * _s_scale + loge(_v_L))
+    v_log_f32       v_regs(_v_tmp, 0),  v_regs(_v_L, 0)
+    v_rcp_f32       v_regs(_v_tmp, 1),  kLog2e
+    s_nop           0
+    v_mul_f32       v_regs(_v_tmp, 0),  v_regs(_v_tmp, 0),  v_regs(_v_tmp, 1)
+    
+    if USE_EXP_OFFSET
+        // lse = (_v_FA_Max * _s_scale - loge(448) + loge(_v_L))
+        v_mov_b32       v_regs(_v_tmp, 2),  kFP8MaxLn
+        v_add_f32       v_regs(_v_tmp, 0),  v_regs(_v_tmp, 0),  -v_regs(_v_tmp, 2)
+    end    
+    
+    v_fma_f32       v_regs(_v_SplitLSE, 0),  v_regs(_v_FA_max, 0),  _s_scale,  v_regs(_v_tmp, 0)
+
+    // write partial lse
+    buffer_store_dword   v_regs(_v_SplitLSE, 0),  v_regs(_v_SplitLSE_addr, 0),  s_regs(_s_SplitLSE_buf, 0),  0  offen:1
+    
+    v_rcp_f32           v_regs(_v_tmp, 2),  v_regs(_v_L, 0)
+    v_cmp_eq_u32        _s_tmp0,            0,                  v_regs(_v_L, 0)
+    s_nop               0
+    v_cndmask_b32       v_regs(_v_tmp, 2),  v_regs(_v_tmp, 2),  0,               _s_tmp0    
+    
+    v_mul_f32       v_regs(_v_tmp, 2),  _s_v_scale,        v_regs(_v_tmp, 2)
+    v_mov_b32       v_regs(_v_tmp, 3),  v_regs(_v_tmp, 2)    
+    
+    // write partial output
+    for var j = 0; j < kSubN1; j++
+        // vR = vR / L
+        for var i = 0; i < 16; i += 2
+            v_pk_mul_f32   v_regs(_v_R, j * 16 + i),  v_regs(_v_R, j * 16 + i),  v_regs(_v_tmp, 2)
+        end
+
+        // write back to global memory
+        for var i = 0; i < 4; i++
+            v_add_u32              v_regs(_v_tmp, 0),              (j * 32 + i * 8) * 4,  v_regs(_v_SplitData_addr, 0)
+            buffer_store_dwordx4   v_regs(_v_R, (j * 4 + i) * 4),  v_regs(_v_tmp, 0),     s_regs(_s_SplitData_buf, 0),  0  offen:1
+        end
+    end
+end
+
+function output_complete_results
+    v_rcp_f32           v_regs(_v_tmp, 2),  v_regs(_v_L, 0)
+    v_cmp_eq_u32        _s_tmp0,            0,                  v_regs(_v_L, 0)
+    s_nop               0
+    v_cndmask_b32       v_regs(_v_tmp, 2),  v_regs(_v_tmp, 2),  0,               _s_tmp0    
+    
+    v_mul_f32       v_regs(_v_tmp, 2),  _s_v_scale,        v_regs(_v_tmp, 2)
+    v_mov_b32       v_regs(_v_tmp, 3),  v_regs(_v_tmp, 2)
+
+    //    vR = vR / L
+    for var i = 0; i < kSubN1 * 16; i += 2
+        v_pk_mul_f32        v_regs(_v_R, i),  v_regs(_v_R, i),  v_regs(_v_tmp, 2)
+    end
+
+    for var j = 0; j < kSubN1; j++
+        // cvt fp32 to bf16
+        for var i = 0; i < 16; i += 2
+            var src_offset = j * 16 + i
+            var dst_offset = (j * 16 + i) / 2
+            v_cvt_pk_bf16_f32   v_regs(_v_R, dst_offset),  v_regs(_v_R, src_offset),  v_regs(_v_R, src_offset + 1)
+        end
+
+        v_permlane32_swap_b32   v_regs(_v_R, j * 8 + 0),  v_regs(_v_R, j * 8 + 2)
+        v_permlane32_swap_b32   v_regs(_v_R, j * 8 + 1),  v_regs(_v_R, j * 8 + 3)
+
+        v_permlane32_swap_b32   v_regs(_v_R, j * 8 + 4),  v_regs(_v_R, j * 8 + 6)
+        v_permlane32_swap_b32   v_regs(_v_R, j * 8 + 5),  v_regs(_v_R, j * 8 + 7)
+        // write back to global memory
+        for var i = 0; i < 2; i++
+            v_add_u32              v_regs(_v_tmp, 0),            (j * 32 + i * 16) * 2,  v_regs(_v_O_addr, 0)
+            buffer_store_dwordx4   v_regs(_v_R, j * 8 + i * 4),  v_regs(_v_tmp, 0),      s_regs(_s_O_buf, 0),  0  offen:1
+        end
+    end
+end
+
+function output_results
+    // compute_final_sum
+    v_mov_b32               v_regs(_v_tmp, 0),  v_regs(_v_L, 0)
+    s_nop                   1
+    v_permlane32_swap_b32   v_regs(_v_tmp, 0),  v_regs(_v_L, 0)
+    v_add_f32               v_regs(_v_L, 0),    v_regs(_v_L, 0),  v_regs(_v_tmp, 0)
+
+    s_cmp_eq_i32        _s_partial_idx,       -1
+    s_cbranch_scc0      label_output_partial
+
+    output_complete_results()
+    s_branch        label_output_exit
+
+ label_output_partial:
+    output_partial_results()
+
+ label_output_exit:
+end
+
+/* -------------------------- Causal and Tail Mask -------------------------- */
+
+function generate_mask_offset
+    /**
+     * _v_mask_KV_offset = (v0 / 32) * 4
+     */
+    v_lshrrev_b32       v_regs(_v_tmp, 0),             5,    v0
+    v_lshlrev_b32       v_regs(_v_mask_KV_offset, 0),  2,    v_regs(_v_tmp, 0)
+
+    /**
+     * _v_mask_Q_offset = wave_id * 32 + v0 % 32
+     */
+    s_mul_i32       _s_tmp0,                      _s_wave_id,    32
+    v_and_b32       v_regs(_v_mask_Q_offset, 0),  0x1f,          v0
+    v_add_u32       v_regs(_v_mask_Q_offset, 0),  _s_tmp0,       v_regs(_v_mask_Q_offset, 0)
+end
+
+function generate_mask_border
+    if CAUSAL_MASK
+        // Note: assume kv_len must be greater than or equal to q_len for each request
+        s_sub_i32       _s_tmp0,    _s_Q_batch_end,   _s_Q_batch_start
+        s_sub_i32       _s_tmp1,    _s_KV_batch_end,  _s_KV_batch_start
+        s_sub_i32       _s_tmp0,    _s_tmp1,          _s_tmp0
+        
+        s_sub_i32       _s_tmp1,    _s_Q_start,    _s_Q_batch_start
+        s_add_i32       _s_tmp0,    _s_tmp0,       _s_tmp1
+        s_add_i32       _s_tmp0,    _s_tmp0,       1
+
+        v_add_u32           v_regs(_v_mask_border, 0),  _s_tmp0,                    v_regs(_v_mask_Q_offset, 0)
+        v_cmp_lt_i32        vcc,                        v_regs(_v_mask_border, 0),  _s_KV_local_end
+        v_mov_b32           v_regs(_v_tmp, 0),          _s_KV_local_end
+        v_cndmask_b32       v_regs(_v_mask_border, 0),  v_regs(_v_tmp, 0),          v_regs(_v_mask_border, 0),   vcc     
+
+        s_cmp_lt_i32        _s_tmp0,           _s_KV_local_end
+        s_cselect_b32       _s_tmp0,           _s_tmp0,         _s_KV_local_end
+        s_and_b32           _s_KV_mask_start,  _s_tmp0,         0xffffff80
+    else
+        v_mov_b32       v_regs(_v_mask_border, 0),  _s_KV_local_end
+        s_and_b32       _s_KV_mask_start,           _s_KV_local_end,  0xffffff80
+    end
+end
+
+function apply_mask
+    v_add_u32       v_regs(_v_tmp, 0),  _s_KV_cur,  v_regs(_v_mask_KV_offset, 0)
+
+    for var n = 0; n < kSubN0; n++
+        for var j = 0; j < 4; j++
+            for var i = 0; i < 4; i++
+                var offset = n * 32 + j * 8 + i
+                var reg_offset = n * 16 + j * 4 + i
+                var vS = v_regs(_v_S, reg_offset)
+
+                v_add_u32       v_regs(_v_tmp, 1),  offset,                 v_regs(_v_tmp, 0)
+                v_cmp_lt_i32    vcc,                v_regs(_v_tmp, 1),      v_regs(_v_mask_border, 0)
+                s_nop           0
+                v_cndmask_b32   vS,                 v_regs(_v_NEG_INF, 0),  vS,                        vcc
+            end
+        end
+    end
+end
+
+/* --------------------------------- Softmax -------------------------------- */
+
+function fmha_softmax(is_wave47)
+    /**
+     * _v_DYN_max = max(_v_FA_max, rowmax(S))
+     */
+    v_mov_b32       v_regs(_v_DYN_max, 0),  v_regs(_v_FA_max, 0)
+
+    for var i = 0; i < kSubN0 * 16; i += 2  // 32
+        v_max3_f32      v_regs(_v_DYN_max, 0),  v_regs(_v_S, i),  v_regs(_v_S, i + 1),  v_regs(_v_DYN_max, 0)
+    end
+
+    v_mov_b32               v_regs(_v_tmp, 0),      v_regs(_v_DYN_max, 0)
+    s_nop                   1
+    s_nop                   0
+    v_permlane32_swap_b32   v_regs(_v_tmp, 0),      v_regs(_v_DYN_max, 0)
+    v_max_f32               v_regs(_v_DYN_max, 0),  v_regs(_v_DYN_max, 0),  v_regs(_v_tmp, 0)
+
+    /**
+     * P = exp2(S * scale_log2e - _v_DYN_max * scale_log2e)
+     */
+    v_mul_f32       v_regs(_v_tmp, 0),  -_s_scale_log2e,   v_regs(_v_DYN_max, 0)
+    
+    if USE_EXP_OFFSET
+        // P = exp2(S * scale_log2e - _v_DYN_max * scale_log2e + FP8MaxLog2)
+        v_mov_b32       v_regs(_v_tmp, 2),  kFP8MaxLog2
+        v_add_f32       v_regs(_v_tmp, 0),  v_regs(_v_tmp, 0),  v_regs(_v_tmp, 2)
+    end
+    
+    v_mov_b32       v_regs(_v_tmp, 1),  v_regs(_v_tmp, 0)
+
+    for var i = 0; i < kSubN0 * 16; i += 2  // 32
+        v_pk_fma_f32        v_regs(_v_S, i),  v_regs(_v_S, i),  _s_scale_log2e,  v_regs(_v_tmp, 0)
+    end
+
+    s_barrier       // wave03--4, wave47--7
+
+    for var i = 0; i < kSubN0 * 16; i++  // 64
+        v_exp_f32       v_regs(_v_P, i),  v_regs(_v_S, i)
+    end
+
+    /**
+     * delta_max_log2e = exp2((prev_max - cur_max) * scale_log2e)
+     */
+    v_sub_f32           v_regs(_v_delta_max_log2e, 0),  v_regs(_v_FA_max, 0),           v_regs(_v_DYN_max, 0)
+    v_cmp_eq_u32        _s_tmp0,                        v_regs(_v_NEG_INF, 0),          v_regs(_v_FA_max, 0)
+    s_nop               0
+    v_cndmask_b32       v_regs(_v_delta_max_log2e, 0),  v_regs(_v_delta_max_log2e, 0),  0,                     _s_tmp0
+
+    v_mov_b32       v_regs(_v_FA_max, 0),           v_regs(_v_DYN_max, 0)
+    v_mul_f32       v_regs(_v_delta_max_log2e, 0),  _s_scale_log2e,                v_regs(_v_delta_max_log2e, 0)
+    v_exp_f32       v_regs(_v_delta_max_log2e, 0),  v_regs(_v_delta_max_log2e, 0)
+
+    /**
+     * L = L * delta_max_log2e + sum(P)
+     */
+    s_nop           0                                                                  //data harzard
+    v_mul_f32       v_regs(_v_L, 0),  v_regs(_v_delta_max_log2e, 0),  v_regs(_v_L, 0)
+
+    for var i = 0; i < kSubN0 * 16; i++  // 64
+        v_add_f32       v_regs(_v_L, 0),  v_regs(_v_P, i),  v_regs(_v_L, 0)
+    end
+
+    /**
+     * R = R * delta_max_log2e + P * V
+     */
+
+    if is_wave47
+        var tuneForWaitcntV = 25
+
+        for var i = 0; i < tuneForWaitcntV; i++
+            v_mul_f32   v_regs(_v_R, i),  v_regs(_v_delta_max_log2e, 0),  v_regs(_v_R, i)
+        end
+
+        s_waitcnt       vmcnt(0)    // waiting for V and/or pageIdx
+        s_barrier                   // wave47--1
+
+        var tuneForSyncWithGemmQK03 = 64
+
+        for var i = tuneForWaitcntV; i < tuneForSyncWithGemmQK03; i++
+            v_mul_f32   v_regs(_v_R, i),  v_regs(_v_delta_max_log2e, 0),  v_regs(_v_R, i)
+        end
+
+        s_barrier       // wave47--2
+
+    else  // wave03
+        var tuneForSyncWithGemmQK47 = 64
+
+        for var i = 0; i < tuneForSyncWithGemmQK47; i++
+            v_mul_f32   v_regs(_v_R, i),  v_regs(_v_delta_max_log2e, 0),  v_regs(_v_R, i)
+        end
+        v_mov_b32       v_regs(_v_delta_max_log2e, 1),  v_regs(_v_delta_max_log2e, 0)
+
+        s_barrier       // wave03--5
+    end
+
+    /**
+     * Convert P to fp8
+     */
+    for var i = 0; i < kSubN0 * 16; i += 4  // 16
+        v_cvt_pk_fp8_f32   v_regs(_v_P, i / 4),  v_regs(_v_P, i + 0),  v_regs(_v_P, i + 1)  op_sel:[0, 0, 0]
+        v_cvt_pk_fp8_f32   v_regs(_v_P, i / 4),  v_regs(_v_P, i + 2),  v_regs(_v_P, i + 3)  op_sel:[0, 0, 1]
+    end
+end
+
+/* ---------------------------------- Gemm ---------------------------------- */
+
+function gemm_QK(is_wave47, rep_idx)
+    var idx = 0
+    var addr_not_updated = 1
+    var ld_K_cnt = 0
+    var ld_V_cnt = 0
+    var ld_PageIdxK_cnt = 0
+    var ld_PageIdxV_cnt = 0
+    var rd_K_cnt = 3
+    var rd_V_cnt = 0
+
+    var wait_cnt = 6    // 3 units of K by ds_read(2)
+
+    for var n = 0; n < kSubN0; n++
+        var vS = v_regs(_v_S, n * 16)
+
+        for var k = 0; k < kSubK0; k++
+            var vQ = v_regs(_v_Q, k * 8)
+            var vK = v_regs(_v_K, (idx % 4) * 8)
+
+            wait_cnt -= 2  // 1 unit of K must be ready
+            s_waitcnt   lgkmcnt(wait_cnt)
+
+            if k == 0
+                v_mfma_f32_32x32x64_f8f6f4   vS,  vK,  vQ,  0
+            else
+                v_mfma_f32_32x32x64_f8f6f4   vS,  vK,  vQ,  vS
+            end
+
+            if is_wave47
+                if addr_not_updated
+                    addr_not_updated = update_V_mem_addr(rep_idx ^ 1)  // 8
+                elsif ld_V_cnt < kInstsMemLoadV
+                    ld_V_cnt = mem_load_V(rep_idx ^ 1, ld_V_cnt)
+                elsif rep_idx == 0 && ld_PageIdxV_cnt < 2
+                    ld_PageIdxV_cnt = mem_load_PageIdxV(ld_PageIdxV_cnt)
+                    if ld_PageIdxV_cnt == 2
+                        update_PageIdxV_mem_addr()  // 1
+                    end
+                end
+            else  // wave03
+                if addr_not_updated
+                    addr_not_updated = update_K_mem_addr(rep_idx ^ 1)  // 4
+                elsif ld_K_cnt < kInstsMemLoadK
+                    ld_K_cnt = mem_load_K(rep_idx ^ 1, ld_K_cnt)
+                elsif rep_idx == 0 && ld_PageIdxK_cnt < 1
+                    ld_PageIdxK_cnt = mem_load_PageIdxK()
+                    update_PageIdxK_mem_addr()  // 1
+                end
+            end
+
+            if rd_K_cnt < kUnitsLdsReadK
+                rd_K_cnt = lds_read_K_unit(rep_idx, rd_K_cnt)  // 2
+                wait_cnt += 2
+            elsif rd_V_cnt < 3
+                if !is_wave47 && rd_V_cnt == 0
+                    // waiting for loading of V by wave47
+                    s_barrier   // wave03--1
+                end
+                rd_V_cnt = lds_read_V_unit(rep_idx, rd_V_cnt)  // 4
+                wait_cnt += 4
+            end
+
+            idx++
+        end
+    end
+    
+    if rep_idx == 1 && is_wave47
+        s_nop           0
+        s_nop           4
+    else
+        s_nop           5
+    end
+
+    s_barrier            // wave03--2, wave47--5
+    s_setprio       0
+    s_barrier            // wave03--3, wave47--6
+end
+
+function gemm_PV(is_wave47, rep_idx)
+    s_barrier       // wave03--6, wave47--3
+
+    if !is_wave47
+        s_waitcnt       vmcnt(0)  // waiting for K and/or pageIdx
+    end
+
+    var wait_cnt = 8
+    s_waitcnt       lgkmcnt(wait_cnt)
+    s_setprio       1
+    s_barrier                          // wave03--7, wave47--4
+
+    var idx = 0
+    var rd_K_cnt = 0
+    var rd_V_cnt = 3
+
+    for var n = 0; n < kSubN1; n++
+        var vR = v_regs(_v_R, n * 16)
+
+        for var k = 0; k < kSubK1; k++
+            var vP = v_regs(_v_P, k * 8)
+            var vV = v_regs(_v_V, (idx % 4) * 8)
+
+            if idx > 0
+                wait_cnt -= 4  // 1 unit of V must be ready
+                s_waitcnt   lgkmcnt(wait_cnt)
+            end
+
+            v_mfma_f32_32x32x64_f8f6f4   vR,  vV,  vP,  vR
+
+            if rd_V_cnt < kUnitsLdsReadV
+                rd_V_cnt = lds_read_V_unit(rep_idx, rd_V_cnt)
+                wait_cnt += 4
+            elsif rd_K_cnt < 3
+                rd_K_cnt = lds_read_K_unit(rep_idx ^ 1, rd_K_cnt)
+                wait_cnt += 2
+            end
+
+            idx++
+        end
+    end
+end
+
+/* -------------------------------- Core Loop ------------------------------- */
+
+function core_loop(is_wave47)
+ label_core_loop[is_wave47]:
+    for var rep_idx = 0; rep_idx < 2; rep_idx++
+        var label_idx = is_wave47 * 2 + rep_idx
+
+        s_cmp_lt_i32        _s_KV_cur,                            _s_KV_mask_start
+        s_cbranch_scc0      label_core_loop_with_mask[label_idx]
+
+        gemm_QK(is_wave47, rep_idx)
+        fmha_softmax(is_wave47)
+        gemm_PV(is_wave47, rep_idx)
+
+        s_addk_i32      _s_KV_cur,  kTileKV
+    end
+
+    s_branch        label_core_loop[is_wave47]
+end
+
+function core_loop_with_mask(is_wave47)
+    for var rep_idx = 0; rep_idx < 2; rep_idx++
+        var label_idx = is_wave47 * 2 + rep_idx
+
+ label_core_loop_with_mask[label_idx]:
+        s_cmp_lt_i32        _s_KV_cur,                       _s_KV_local_end
+        s_cbranch_scc0      label_core_loop_exit[is_wave47]
+
+        gemm_QK(is_wave47, rep_idx)
+        apply_mask()
+        fmha_softmax(is_wave47)
+        gemm_PV(is_wave47, rep_idx)
+
+        s_addk_i32      _s_KV_cur,  kTileKV
+    end
+
+    s_branch        label_core_loop_with_mask[is_wave47 * 2]
+end
+
+/* ----------------------------- Work Inner Loop ---------------------------- */
+
+function process_current_work
+    s_cmp_lt_i32        _s_wave_id,     4
+    s_cbranch_scc0      label_wave47
+
+    // wave03 start
+    s_setprio       1
+
+    // load K page idx
+    generate_PageIdxK_mem_addr()
+    mem_load_PageIdxK()  // 1
+    update_PageIdxK_mem_addr()
+
+    // preload Q and update oob
+    generate_Q_mem_addr()
+    mem_load_Q()  // 6
+
+    generate_mask_border()
+    generate_out_mem_addr()
+    generate_K_base_addr()
+
+    s_waitcnt       vmcnt(6)  // waiting for PageIdxK
+
+    update_K_mem_addr(0)
+    mem_load_K_all(0)  // 6
+
+    s_waitcnt       vmcnt(6)
+    s_barrier                   // waiting for Q, sync
+
+    lds_read_Q()
+
+    s_waitcnt       vmcnt(0)
+    s_barrier                   // waiting for K, sync
+
+    lds_read_K_first3(0)
+    core_loop(0)
+
+ label_wave47:
+    s_setprio       0
+
+    // load V page idx
+    generate_PageIdxV_mem_addr()
+    mem_load_PageIdxV(0)  // 1
+    mem_load_PageIdxV(1)  // 1
+    update_PageIdxV_mem_addr()
+
+    // preload Q and update oob
+    generate_Q_mem_addr()
+    mem_load_Q()  // 6
+
+    generate_mask_border()
+    generate_out_mem_addr()
+    generate_V_base_addr()
+
+    s_waitcnt       vmcnt(6)  // waiting for PageIdxV
+
+    update_V_mem_addr(0)
+    mem_load_V_all(0)  // 4
+
+    s_waitcnt       vmcnt(4)
+    s_barrier                   // waiting for Q, sync
+
+    lds_read_Q()
+
+    s_barrier       // waiting for K, sync
+
+    // waiting for loading of V
+    s_waitcnt       vmcnt(0)
+    s_barrier                   // sync 1
+    s_barrier                   // sync 2
+    s_barrier                   // sync 3
+    s_barrier                   // sync 4
+    s_setprio       1
+
+    lds_read_K_first3(0)
+    core_loop(1)
+
+    /**
+     * loop the last few tiles with mask
+     */
+
+    // wave03
+    core_loop_with_mask(0)
+
+    // wave47
+    core_loop_with_mask(1)
+
+    /**
+     * exit of loop, output results
+     */
+ label_core_loop_exit[0]:
+    s_barrier       // sync 1
+    s_barrier       // sync 2
+    s_barrier       // sync 3
+    s_barrier       // sync 4
+
+ label_core_loop_exit[1]:
+    output_results()
+
+end
+
+/* -------------------------------------------------------------------------- */
+/*                             Main shader program                            */
+/* -------------------------------------------------------------------------- */
+
+shader main
+    type(CS)
+
+    user_sgpr_count(2)
+    tgid_x_en(1)
+    tgid_y_en(1)
+    tgid_z_en(1)
+    tidig_comp_cnt(2)
+
+    /* --------------------- Parameters load and process -------------------- */
+
+    /**
+     * User parameters load
+     */
+
+    s_and_b32       s1,  s1,  0xffff
+
+    s_load_dwordx2      s_regs(_s_Q_buf, 0),            s[0:1],    0x00
+    s_load_dwordx2      s_regs(_s_K_buf, 0),            s[0:1],    0x10
+    s_load_dwordx2      s_regs(_s_V_buf, 0),            s[0:1],    0x20
+    s_load_dwordx2      s_regs(_s_O_buf, 0),            s[0:1],    0x30
+    s_load_dwordx2      s_regs(_s_SplitData_buf, 0),    s[0:1],    0x40
+    s_load_dwordx2      s_regs(_s_SplitLSE_buf, 0),     s[0:1],    0x50
+    s_load_dwordx2      s_regs(_s_WorkIdx_buf, 0),      s[0:1],    0x60
+    s_load_dwordx2      s_regs(_s_WorkInfoSet_buf, 0),  s[0:1],    0x70
+    s_load_dwordx2      s_regs(_s_QOIdx_buf, 0),        s[0:1],    0x80
+    s_load_dwordx2      s_regs(_s_KVIdx_buf, 0),        s[0:1],    0x90
+    s_load_dwordx2      s_regs(_s_KVPageIdx_buf, 0),    s[0:1],    0xA0
+    s_load_dwordx2      s_regs(_s_QScale_buf, 0),       s[0:1],    0xB0
+    s_load_dwordx2      s_regs(_s_KScale_buf, 0),       s[0:1],    0xC0
+    s_load_dwordx2      s_regs(_s_VScale_buf, 0),       s[0:1],    0xD0
+
+    s_load_dword        _s_scale,           s[0:1],    0xE0
+    s_load_dword        _s_Q_seqlen,        s[0:1],    0xF0     // num of tokens in this batch, =  _s_QOIdx_buf[batch_size]
+    s_load_dword        _s_num_Q_heads,     s[0:1],    0x100
+    s_load_dword        _s_num_pages,       s[0:1],    0x110
+    s_load_dword        _s_num_pages_used,  s[0:1],    0x120
+
+    /**
+     * SPI parameters process
+     */
+
+    // SPI in MI300 packed thread_idx/y/z into v0, unpack v0 and store in v0,v1,v2
+    v_lshrrev_b32       v1,    10,       v0
+    v_lshrrev_b32       v2,    10,       v1
+    v_and_b32           v2,    0x3ff,    v2
+    v_and_b32           v1,    0x3ff,    v1
+    v_and_b32           v0,    0x3ff,    v0
+    v_lshrrev_b32       v3,    6,        v0
+    v_and_b32           v0,    0x3f,     v0
+
+    // from now, use _s_tgid_x/y as the thread_groupx/y
+    s_mov_b32       _s_tgid_x,  s2
+
+    // in fact, v3 is the waveid in a thread group, move it into _s_wave_id,
+    // after that, v3 is not used any longer.
+    v_readfirstlane_b32   _s_wave_id,  v3  // index --0/1/2/3
+
+    /* ------------------------ Initialize Constants ------------------------ */
+
+    create_mem_row_id()
+    create_lds_offset()
+    generate_mask_offset()
+
+    generate_Q_lds_addr()
+    generate_K_lds_addr()
+    generate_V_lds_addr()
+    generate_KV_lds_m0()
+
+    v_mov_b32       v_regs(_v_NEG_INF, 0),  kNegInfinity
+
+    s_waitcnt       lgkmcnt(0)  // waiting for user parameters
+    
+    /* --------------------------- Load QScale/KScale/VScale -------------------------- */
+    s_and_b32           s_regs(_s_QScale_buf, 1),  s_regs(_s_QScale_buf, 1),  0xffff
+    s_load_dword        _s_q_scale,                s_regs(_s_QScale_buf, 0),  0x0
+    s_and_b32           s_regs(_s_KScale_buf, 1),  s_regs(_s_KScale_buf, 1),  0xffff
+    s_load_dword        _s_k_scale,                s_regs(_s_KScale_buf, 0),  0x0
+    s_and_b32           s_regs(_s_VScale_buf, 1),  s_regs(_s_VScale_buf, 1),  0xffff
+    s_load_dword        _s_v_scale,                s_regs(_s_VScale_buf, 0),  0x0
+    
+    s_mul_i32       _s_Q_stride,             _s_num_Q_heads,   kHeadSizeQK
+    s_mul_i32       _s_O_stride,             _s_num_Q_heads,   kHeadSizeV
+    s_mul_i32       _s_K_stride,             _s_num_KV_heads,  kHeadSizeQK
+    s_mul_i32       _s_V_stride,             _s_num_KV_heads,  kHeadSizeV
+    v_mov_b32       v_regs(_v_K_stride, 0),  _s_K_stride
+    v_mov_b32       v_regs(_v_V_stride, 0),  _s_V_stride    
+    
+    s_waitcnt       lgkmcnt(0)  // waiting for QScale/KScale/VScale
+    
+    /* --------------------------- Load Work Index -------------------------- */
+
+    s_lshl_b32          _s_tmp0,                    _s_tgid_x,                  2          // 4B per index
+    s_and_b32           s_regs(_s_WorkIdx_buf, 1),  s_regs(_s_WorkIdx_buf, 1),  0xffff
+    s_load_dwordx2      _s_work_start,              s_regs(_s_WorkIdx_buf, 0),  _s_tmp0
+
+    // initialize variables dependent on user parameters
+    // apply _s_q_scale/_s_k_scale to _s_scale
+    v_mov_b32             v_regs(_v_tmp, 0),  _s_scale
+    v_mul_f32             v_regs(_v_tmp, 0),  _s_q_scale,         v_regs(_v_tmp, 0)
+    v_mul_f32             v_regs(_v_tmp, 0),  v_regs(_v_tmp, 0),  _s_k_scale
+    v_mul_f32             v_regs(_v_tmp, 1),  kLog2e,             v_regs(_v_tmp, 0)
+    v_readfirstlane_b32   _s_scale,           v_regs(_v_tmp, 0)
+    v_readfirstlane_b32   _s_scale_log2e,     v_regs(_v_tmp, 1)
+
+    s_mov_b32       _s_scale_log2e_1,  _s_scale_log2e
+
+    init_buffer_addresses()
+    generate_Q_base_addr()
+    generate_KV_PageIdx_base_addr()
+    generate_out_base_addr()
+
+    s_waitcnt       lgkmcnt(0)  // waiting for _s_work_start and _s_work_end
+
+    /* ------------------------------ Work Loop ----------------------------- */
+
+ label_work_loop:
+    s_cmp_lt_i32        _s_work_start,   _s_work_end
+    s_cbranch_scc0      label_work_exit
+
+    // load work info
+    s_lshl_b32          _s_tmp0,                  _s_work_start,                  5          // 32B
+    s_load_dwordx8      s_regs(_s_work_info, 0),  s_regs(_s_WorkInfoSet_buf, 0),  _s_tmp0
+    s_waitcnt           lgkmcnt(0)
+    
+    // handle q head start, only use low 16 bit
+    s_and_b32       _s_head_start,  _s_head_start,  0xffff
+
+    // load batch indicies
+    s_lshl_b32          _s_tmp0,            _s_batch_idx,             2          // 4B
+    s_load_dwordx2      _s_Q_batch_start,   s_regs(_s_QOIdx_buf, 0),  _s_tmp0
+    s_load_dwordx2      _s_KV_batch_start,  s_regs(_s_KVIdx_buf, 0),  _s_tmp0
+
+    // initialize variables for current work
+    for var i = 0; i < 64; i += 2
+        v_mov_b64       v_regs(_v_R, i),  0
+    end
+    v_mov_b32       v_regs(_v_FA_max, 0),           kMinimumF32
+    v_mov_b64       v_regs(_v_delta_max_log2e, 0),  0
+    v_mov_b64       v_regs(_v_L, 0),                0
+    
+    s_waitcnt       lgkmcnt(0)  // waiting for batch start
+    
+    s_sub_i32       _s_KV_cur,        _s_KV_start,    _s_KV_batch_start
+    s_sub_i32       _s_KV_local_end,  _s_KV_end,      _s_KV_batch_start
+    process_current_work()
+
+    s_addk_i32      _s_work_start,   1
+    s_branch        label_work_loop
+
+ label_work_exit:
+    s_waitcnt       0
+    s_endpgm
+end
