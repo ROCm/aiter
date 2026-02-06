@@ -9,7 +9,13 @@ CONFIGS = [
     triton.Config({"BLOCK_SIZE_N": 512}, num_warps=8, num_stages=3),
     triton.Config({"BLOCK_SIZE_N": 1024}, num_warps=8, num_stages=4),
     triton.Config({"BLOCK_SIZE_N": 2048}, num_warps=8, num_stages=4),
+    triton.Config({"BLOCK_SIZE_N": 4096}, num_warps=8, num_stages=4),
 ]
+
+
+def _prune_configs(configs, named_args, **kwargs):
+    N_OUT = named_args["N_OUT"]
+    return [cfg for cfg in configs if cfg.kwargs["BLOCK_SIZE_N"] >= N_OUT]
 
 @triton.jit
 def _rmsmorm_op(row, weight, n_cols, epsilon):
@@ -23,6 +29,7 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
 @triton.autotune(
     configs=CONFIGS,
     key=["N", "N_OUT"],
+    prune_configs_by={"early_config_prune": _prune_configs},
 )
 
 @triton.jit
