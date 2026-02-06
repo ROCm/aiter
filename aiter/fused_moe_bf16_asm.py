@@ -106,7 +106,7 @@ def get_2stage_config_simple(
         # Check if inter_dim is supported by the 2-stage Int8 kernel (currently requires multiple of 384)
         if inter_dim % 384 == 0 or inter_dim % 128 == 0:
             # The available kernel uses 64x384 tile, so block_m must be 64
-            return True, 64, 0, "", "", False
+            return True, 32, 0, "", "", False
             # return True, 64, 0, "", "", True
         # elif inter_dim % 128 == 0:
         #     return True, 64, 0, "", "", False

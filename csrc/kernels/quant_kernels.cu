@@ -533,6 +533,8 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         auto buffer_hash = opus::make_gmem<int>(smooth_scale_map_hash, smooth_scale_map_hash_size * sizeof(int));
         buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x, threadIdx.x);
+        opus::s_waitcnt_vmcnt(opus::number<0>{});
+        __syncthreads();
     }
     for(; token_idx < rows; token_idx += num_tg)
     {
@@ -543,14 +545,12 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         int32_t smscale_map_idx = smooth_scale_map == nullptr ? 0 : smooth_scale_map[token_idx];
         if(smooth_scale_map != nullptr && smooth_scale_map_hash != nullptr)
         {
-            asm volatile("s_waitcnt vmcnt(%0)" : : "n"(0) : "memory");
-            __syncthreads();
             smscale_map_idx = smscale_map_idx < smooth_scale_map_hash_size ? smooth_scale_map_hash_shared[smscale_map_idx] : -1;
         }
         if (smscale_map_idx < 0)
         {
             continue;
-        }    
+        }
         auto res = smooth_data_to_per_row_scale<DTYPE_I, DTYPE_O, block_size, thread_data_size>(
             input, smooth_scale, smscale_map_idx, cols, real_token_idx);
         float row_scale = std::get<0>(res);
