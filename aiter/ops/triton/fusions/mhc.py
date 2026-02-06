@@ -179,6 +179,7 @@ def fused_mhc(
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     # BLOCK_N: Column tile size (must be power of 2 for Triton arange)
     if hres_lite_mode:        
+        # BLOCK_N must fit both the input logits (n_factorial) and the output (n_squared)
         min_block_n = max(n_factorial, n_squared)
         config_block_n = config.pop("BLOCK_N", min_block_n)
         BLOCK_N = triton.next_power_of_2(max(config_block_n, min_block_n))

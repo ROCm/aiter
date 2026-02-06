@@ -27,7 +27,7 @@
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 2,
-        "HRES_OP": 0
+        "HRES_OP": 1
     },
     "M_LEQ_8192": {
         "BLOCK_M": 64,
