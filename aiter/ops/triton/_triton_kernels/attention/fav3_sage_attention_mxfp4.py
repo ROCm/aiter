@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     map_dims,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton._triton_kernels.quant.downcast_to_mxfp_rne import downcast_to_mxfp_rne
 
 
 @triton.jit
@@ -1251,6 +1252,7 @@ def sage_quant_mxfp4(
     sm_scale=None,
     q_smoothing=False,
     layout="bshd",
+    USE_RNE=False,
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
@@ -1301,8 +1303,10 @@ def sage_quant_mxfp4(
         num_warps=8,
     )
 
-    q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
-    k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+    downcast_func = downcast_to_mxfp_rne if USE_RNE else downcast_to_mxfp
+
+    q_fp4, q_scale = downcast_func(q, torch.uint8, axis=-1)
+    k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
