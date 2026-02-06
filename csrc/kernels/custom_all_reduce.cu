@@ -20,6 +20,8 @@
 
 #include "custom_all_reduce.cuh"
 
+using fp8_type = ck_tile::fp8_t;
+
 // fake pointer type, must match fptr_t type in ops.h
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
@@ -334,63 +336,140 @@ void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
     _all_gather(_fa, reg_buffer, out, inp.numel(), stream);
 }
 
-void _fused_allreduce_rmsnorm(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual_inp, torch::Tensor& residual_out, torch::Tensor& out, torch::Tensor& w, int eps, int m, int n, bool use_1stage, hipStream_t stream)
+void _fused_allreduce_rmsnorm(fptr_t _fa,
+                              torch::Tensor& inp,
+                              torch::Tensor& residual_inp,
+                              torch::Tensor& residual_out,
+                              torch::Tensor& out,
+                              torch::Tensor& scale_out,
+                              torch::Tensor& w,
+                              int eps,
+                              int m,
+                              int n,
+                              bool use_1stage,
+                              hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
+    bool use_fp8_per_token_quant = scale_out.defined();
+
+#define DISPATCH_AR_FUSION(DTYPE)                                \
+    if(!use_fp8_per_token_quant)                                 \
+    {                                                            \
+        fa->dispatchFusedAllReduceRMSNorm<DTYPE>(                \
+            stream,                                              \
+            reinterpret_cast<DTYPE*>(inp.data_ptr()),            \
+            reinterpret_cast<DTYPE*>(residual_inp.data_ptr()),   \
+            reinterpret_cast<DTYPE*>(residual_out.data_ptr()),   \
+            reinterpret_cast<DTYPE*>(out.data_ptr()),            \
+            reinterpret_cast<DTYPE*>(w.data_ptr()),              \
+            eps,                                                 \
+            m,                                                   \
+            n,                                                   \
+            use_1stage);                                         \
+    }                                                            \
+    else                                                         \
+    {                                                            \
+        fa->dispatchFusedAllReduceRMSNormQuant<DTYPE, fp8_type>( \
+            stream,                                              \
+            reinterpret_cast<DTYPE*>(inp.data_ptr()),            \
+            reinterpret_cast<DTYPE*>(residual_inp.data_ptr()),   \
+            reinterpret_cast<DTYPE*>(residual_out.data_ptr()),   \
+            reinterpret_cast<fp8_type*>(out.data_ptr()),         \
+            reinterpret_cast<float*>(scale_out.data_ptr()),      \
+            reinterpret_cast<DTYPE*>(w.data_ptr()),              \
+            eps,                                                 \
+            m,                                                   \
+            n,                                                   \
+            use_1stage);                                         \
+    }
+
     switch(out.scalar_type())
     {
     case at::ScalarType::Float: {
-        fa->dispatchFusedAllReduceRMSNorm<float>(stream,
-                             reinterpret_cast<float*>(inp.data_ptr()),
-                             reinterpret_cast<float*>(residual_inp.data_ptr()),
-                             reinterpret_cast<float*>(residual_out.data_ptr()),
-                             reinterpret_cast<float*>(out.data_ptr()),
-                             reinterpret_cast<float*>(w.data_ptr()),
-                             eps, m, n, use_1stage);
+        DISPATCH_AR_FUSION(float)
         break;
     }
     case at::ScalarType::Half: {
-        fa->dispatchFusedAllReduceRMSNorm<half>(stream,
-                             reinterpret_cast<half*>(inp.data_ptr()),
-                             reinterpret_cast<half*>(residual_inp.data_ptr()),
-                             reinterpret_cast<half*>(residual_out.data_ptr()),
-                             reinterpret_cast<half*>(out.data_ptr()),
-                             reinterpret_cast<half*>(w.data_ptr()),
-                             eps, m, n, use_1stage);
+        DISPATCH_AR_FUSION(half)
         break;
     }
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
-        fa->dispatchFusedAllReduceRMSNorm<__hip_bfloat16>(stream,
-                             reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
-                             reinterpret_cast<__hip_bfloat16*>(residual_inp.data_ptr()),
-                             reinterpret_cast<__hip_bfloat16*>(residual_out.data_ptr()),
-                             reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
-                             reinterpret_cast<__hip_bfloat16*>(w.data_ptr()),
-                             eps, m, n, use_1stage);
+        DISPATCH_AR_FUSION(__hip_bfloat16)
         break;
     }
 #endif
     default:
         throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
     }
+
+#undef DISPATCH_AR_FUSION
 }
 
 void fused_allreduce_rmsnorm(fptr_t _fa,
-                torch::Tensor& inp,
-                torch::Tensor& res_inp,
-                torch::Tensor& res_out,
-                torch::Tensor& out,
-                torch::Tensor& w,
-                float eps,
-                std::optional<torch::Tensor> reg_buffer,
-                bool use_1stage)
+                             torch::Tensor& inp,
+                             torch::Tensor& res_inp,
+                             torch::Tensor& res_out,
+                             torch::Tensor& out,
+                             torch::Tensor& w,
+                             float eps,
+                             std::optional<torch::Tensor> reg_buffer,
+                             bool use_1stage)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+    TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());
+    TORCH_CHECK_EQ(inp.numel(), out.numel());
+    TORCH_CHECK_EQ(inp.numel(), res_inp.numel());
+    int n          = w.numel();
+    int m          = inp.numel() / n;
+    auto scale_out = torch::Tensor();
+
+    if(reg_buffer.has_value())
+    {
+        auto input_size = inp.numel() * inp.element_size();
+        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
+                    "registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
+                                inp.data_ptr(),
+                                input_size,
+                                hipMemcpyDeviceToDevice,
+                                stream));
+        _fused_allreduce_rmsnorm(_fa,
+                                 reg_buffer.value(),
+                                 res_inp,
+                                 res_out,
+                                 out,
+                                 scale_out,
+                                 w,
+                                 eps,
+                                 m,
+                                 n,
+                                 use_1stage,
+                                 stream);
+    }
+    else
+    {
+        _fused_allreduce_rmsnorm(
+            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, stream);
+    }
+}
+
+void fused_allreduce_rmsnorm_quant(fptr_t _fa,
+                                   torch::Tensor& inp,
+                                   torch::Tensor& res_inp,
+                                   torch::Tensor& res_out,
+                                   torch::Tensor& out,
+                                   torch::Tensor& scale_out,
+                                   torch::Tensor& w,
+                                   float eps,
+                                   std::optional<torch::Tensor> reg_buffer,
+                                   bool use_1stage)
+{
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());
     TORCH_CHECK_EQ(inp.numel(), out.numel());
     TORCH_CHECK_EQ(inp.numel(), res_inp.numel());
@@ -407,11 +486,23 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                                 input_size,
                                 hipMemcpyDeviceToDevice,
                                 stream));
-        _fused_allreduce_rmsnorm(_fa, reg_buffer.value(), res_inp, res_out, out, w, eps, m, n, use_1stage, stream);
+        _fused_allreduce_rmsnorm(_fa,
+                                 reg_buffer.value(),
+                                 res_inp,
+                                 res_out,
+                                 out,
+                                 scale_out,
+                                 w,
+                                 eps,
+                                 m,
+                                 n,
+                                 use_1stage,
+                                 stream);
     }
     else
     {
-      _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out, w, eps, m, n, use_1stage, stream);
+        _fused_allreduce_rmsnorm(
+            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, stream);
     }
 }
 

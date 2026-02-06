@@ -24,6 +24,7 @@ from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
 from aiter.test_common import (
     checkAllclose,
@@ -47,6 +48,7 @@ def fused_ar_rmsnorm(
     eps,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
+    post_per_token_quant: bool = True,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -72,9 +74,15 @@ def fused_ar_rmsnorm(
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x, x, weight, eps
-                )
+                if not post_per_token_quant:
+                    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                        x, x, weight, eps
+                    )
+                else:
+                    out, res_out, scale_out = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                        x, x, weight, eps
+                    )
+                    out = out.float() * scale_out
         out.fill_(0)
         res_out.fill_(0)
 
@@ -88,9 +96,15 @@ def fused_ar_rmsnorm(
 
         @perftest()
         def run_ca(x):
-            out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, x, weight, eps
-            )
+            if not post_per_token_quant:
+                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, x, weight, eps
+                )
+            else:
+                out, res_out, scale_out = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                    x, x, weight, eps
+                )
+                out = out.float() * scale_out
             return out
 
         out = run_ca(x)

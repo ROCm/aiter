@@ -2326,6 +2326,74 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     }
 }
 
+template <typename T, typename QT>
+void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
+                                   T* input,
+                                   T* residual_inp,
+                                   T* residual_out,
+                                   QT* output,
+                                   float* scale_out,
+                                   T* weight,
+                                   float eps,
+                                   int m,
+                                   int n,
+                                   bool use_1stage)
+{
+    auto d   = packed_t<T>::P::size;
+    int size = m * n;
+    if(size % d != 0)
+    {
+        throw std::runtime_error("custom allreduce currently requires input length to be multiple "
+                                 "of " +
+                                 std::to_string(d));
+    }
+    RankData* ptrs = get_buffer_RD(stream, input);
+
+    use_1stage = (use_1stage && (n == 4096 || n == 2048 || n == 1024 || n == 512));
+#define DISPATCH_1S_KERNEL(NGPUS, N)                                          \
+    case N: {                                                                 \
+        allreduce_fusion_kernel_1stage_launcher<T, QT, NGPUS, N>(ptrs,        \
+                                                                sg_,          \
+                                                                self_sg_,     \
+                                                                rank_,        \
+                                                                residual_inp, \
+                                                                residual_out, \
+                                                                output,       \
+                                                                weight,       \
+                                                                scale_out,    \
+                                                                size,         \
+                                                                eps,          \
+                                                                stream);      \
+        return;                                                               \
+    }
+#define MAYBE_DISPATCH_1S_KERNEL(NGPUS)                                  \
+    if(use_1stage)                                                       \
+    {                                                                    \
+        switch(n)                                                        \
+        {                                                                \
+            DISPATCH_1S_KERNEL(NGPUS, 4096)                              \
+            DISPATCH_1S_KERNEL(NGPUS, 2048)                              \
+            DISPATCH_1S_KERNEL(NGPUS, 1024)                              \
+            DISPATCH_1S_KERNEL(NGPUS, 512)                               \
+        default: printf("fused 1stage allreduce rmsnorm N-dim error\n"); \
+        }                                                                \
+    }
+
+    switch(world_size_)
+    {
+    case 8:
+        MAYBE_DISPATCH_1S_KERNEL(8);
+        break;
+    case 4:
+        MAYBE_DISPATCH_1S_KERNEL(4);
+        break;
+    case 2:
+        MAYBE_DISPATCH_1S_KERNEL(2);
+        break;
+    default: printf("fused allreduce rmsnorm world size error\n");
+    }
+}
+
 ~CustomAllreduce()
 {
     for(auto [_, ptr] : ipc_handles_)
