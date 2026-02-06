@@ -48,7 +48,6 @@ def _sage_fwd_no_mask_mxfp4(
     q_descale,
     k_descale_base_ptrs,
     stride_ksn,
-    SM_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
@@ -257,7 +256,6 @@ def _sage_fwd_mask_mxfp4(
     q_descale,
     k_descale_base_ptrs,
     stride_ksn,
-    SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -673,7 +671,6 @@ def sage_fwd_mxfp4(
     MAX_SEQLENS_Q: tl.constexpr,
     MAX_SEQLENS_K: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
@@ -962,7 +959,6 @@ def sage_fwd_mxfp4(
             q_descale,
             k_descale_ptrs,
             stride_ksn,
-            SM_SCALE,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_N,
@@ -1025,7 +1021,6 @@ def sage_fwd_mxfp4(
             q_descale,
             k_descale_ptrs,
             stride_ksn,
-            SM_SCALE,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -1091,7 +1086,6 @@ def sage_fwd_mxfp4(
             q_descale,
             k_descale_ptrs,
             stride_ksn,
-            SM_SCALE,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_N,
@@ -1254,6 +1248,7 @@ def sage_quant_mxfp4(
     FP8_MAX,
     BLKQ=128,
     BLKK=64,
+    sm_scale=None,
     q_smoothing=False,
     layout="bshd",
 ):
@@ -1279,11 +1274,13 @@ def sage_quant_mxfp4(
 
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
-    sm_scale = (head_dim**-0.5) * 1.4426950408889634
-    
+
     padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
-    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=sm_scale)
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
 
     sage_quant_v_kernel[grid](
         v,

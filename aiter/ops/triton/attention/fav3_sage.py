@@ -78,7 +78,6 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        softmax_scale: float | None,
         causal: bool,
         window_size: Tuple[int, int],
         attention_chunk: int,
@@ -183,7 +182,6 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             k_descale,
             v_descale,
             delta_s,
-            softmax_scale,
             causal,
             window_size,
             attention_chunk,
@@ -234,7 +232,6 @@ def fav3_sage_wrapper_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
@@ -315,7 +312,6 @@ def fav3_sage_wrapper_func(
         q,
         k,
         v,
-        softmax_scale,
         causal,
         window_size,
         attention_chunk,
@@ -338,7 +334,6 @@ def fav3_sage_func(
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
     delta_s: torch.Tensor = None,
-    softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
     attention_chunk: int = 0,
@@ -458,9 +453,6 @@ def fav3_sage_func(
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
 
     if USE_MXFP4_SAGE:
-        softmax_scale = softmax_scale or (head_size_qk**-0.5)
-        softmax_scale *= 1.4426950408889634
-
         USE_Q_SMOOTHING = delta_s is not None
 
         if USE_Q_SMOOTHING:
@@ -538,7 +530,6 @@ def fav3_sage_func(
             MAX_SEQLENS_Q=seqlen_q,
             MAX_SEQLENS_K=seqlen_k,
             IS_VARLEN=False,
-            SM_SCALE=softmax_scale,
             IS_CAUSAL=causal,
             USE_SLIDING_WINDOW=use_sliding_window,
             WINDOW_SIZE_LEFT=window_size_left,
