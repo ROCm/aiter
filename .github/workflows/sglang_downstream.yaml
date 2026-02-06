@@ -25,7 +25,6 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
-    if: ${{ !github.event.pull_request.head.repo.fork }}
     name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
