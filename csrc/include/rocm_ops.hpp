@@ -413,8 +413,8 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
-          py::arg("reg_input_buffer") = std::nullopt,                                               \
-          py::arg("reg_output_buffer") = std::nullopt);                                               \
+          py::arg("reg_input_buffer")  = std::nullopt,                                         \
+          py::arg("reg_output_buffer") = std::nullopt);                                        \
     m.def("fused_allreduce_rmsnorm",                                                           \
           &aiter::fused_allreduce_rmsnorm,                                                     \
           py::arg("_fa"),                                                                      \
@@ -430,9 +430,9 @@ namespace py = pybind11;
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
-    m.def("register_input_buffer",                                                                   \
-          &aiter::register_input_buffer,                                                             \
-          "register_input_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",             \
+    m.def("register_input_buffer",                                                             \
+          &aiter::register_input_buffer,                                                       \
+          "register_input_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",       \
           py::arg("_fa"),                                                                      \
           py::arg("t"),                                                                        \
           py::arg("handles"),                                                                  \
@@ -1386,12 +1386,10 @@ namespace py = pybind11;
           py::arg("input"),                                              \
           py::arg("scales"),                                             \
           py::arg("smooth_scale"),                                       \
-          py::arg("smooth_scale_map")      = std::nullopt,               \
-          py::arg("shuffle_scale")         = false,                      \
-          py::arg("num_rows")              = std::nullopt,               \
-          py::arg("num_rows_factor")       = 1,                          \
-          py::arg("smooth_scale_map_hash") = std::nullopt,               \
-          py::arg("enable_ps")             = true);                                  \
+          py::arg("smooth_scale_map") = std::nullopt,                    \
+          py::arg("shuffle_scale")    = false,                           \
+          py::arg("num_rows")         = std::nullopt,                    \
+          py::arg("num_rows_factor")  = 1);                               \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
@@ -1516,12 +1514,15 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
-#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND \
-    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
+#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND               \
+    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
+          &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle); \
-    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle", &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle);
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND               \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle",        \
+          &aiter::fused_qk_norm_rope_cache_quant_shuffle); \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",    \
+          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \

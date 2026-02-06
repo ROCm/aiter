@@ -738,8 +738,7 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'",
-            "f'{AITER_CSRC_DIR}/include/opus'"
+            "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
         "verbose": "False",
         "blob_gen_cmd": "''"
