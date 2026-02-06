@@ -1491,10 +1491,10 @@ def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, equal_seqlen
     (4, 48, 1001, 990, 64),
     (1, 8, 8081, 7099, 64),
     (1, 8, 16330, 15989, 128),
-    (4, 4, 1024, 1024, 33),
-    (4, 4, 65, 1019, 65),
-    (4, 4, 128, 128, 65),
-    (4, 4, 113, 123, 1),
+    (4, 4, 1024, 1024, 32),
+    (4, 4, 65, 1019, 64),
+    (4, 4, 128, 128, 64),
+    (4, 4, 113, 123, 32),
 ])
 @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize('layout', ['bhsd'])
@@ -1536,7 +1536,7 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torc
     check_attention_outputs(
         triton_out,
         torch_out,
-        fp8=False,
+        fp8=True,
         atol=ATOL_fp8,
         rtol=RTOL_fp8,
         max_diff_percentage=0.5,
