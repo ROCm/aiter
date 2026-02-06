@@ -182,8 +182,18 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            Case(16, 256, 256, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4)
+            Case(1, 6144, 3072, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(32, 6144, 3072, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(128, 6144, 3072, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(512, 6144, 3072, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(1024, 6144, 3072, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 6144, 3072, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(1, 3072, 3072, "mxfloat8_e4m3fn", 128, 4),
+            Case(32, 3072, 3072, "mxfloat8_e4m3fn", 128, 4),
+            Case(128, 3072, 3072, "mxfloat8_e4m3fn", 128, 4),
+            Case(512, 3072, 3072, "mxfloat8_e4m3fn", 128, 4),
+            Case(1024, 3072, 3072, "mxfloat8_e4m3fn", 128, 4),
+            Case(4096, 3072, 3072, "mxfloat8_e4m3fn", 128, 4),
         ]
     ],
 )

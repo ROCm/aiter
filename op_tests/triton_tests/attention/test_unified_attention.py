@@ -96,7 +96,27 @@ def ref_paged_attn(
 # @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 # @pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328)],]
+    "seq_lens", [
+        [(1, 1)],
+        [(32, 32)],
+        [(64, 64)],
+        [(128, 128)],
+        [(256, 256)],
+        [(512, 512)],
+        [(1024, 1024)],
+        [(2048, 2048)],
+        [(4096, 4096)],
+        [(8192, 8192)],
+        [(1, 128)],
+        [(1, 512)],
+        [(1, 1024)],
+        [(1, 2048)],
+        [(1, 4096)],
+        [(1, 8192)],
+        [(1, 1024), (1, 2048)],
+        [(128, 128), (256, 256)],
+        [(1, 512), (1, 1024), (1, 2048)],
+    ]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
