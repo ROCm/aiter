@@ -4,12 +4,12 @@ import warnings
 import argparse
 import itertools
 import triton
-from aiter.ops.triton.attention.mha import (
+from aiter.ops.triton.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
 )
-from aiter.ops.triton.attention.mha_v3 import (
+from aiter.ops.triton.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
@@ -23,6 +23,100 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
+
+
+from typing import Optional
+
+import pytest
+import triton
+from aiter.ops.triton.unified_attention import unified_attention
+
+
+def triton_unified_attn_func_caller(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: Optional[int],
+    dtype: torch.dtype,
+    block_size: int,
+    soft_cap: Optional[float],
+    num_blocks: int,
+    q_dtype: Optional[torch.dtype],
+) -> None:
+    if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
+        pytest.skip("block size must be at least 32 for fp8")
+
+    torch.manual_seed(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (num_seqs, max_num_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
+    output = torch.empty_like(query)
+
+    maybe_quantized_query = query
+    maybe_quantized_key_cache = key_cache
+    maybe_quantized_value_cache = value_cache
+    q_descale = None
+    k_descale = None
+    v_descale = None
+    if q_dtype is not None:
+        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
+        maybe_quantized_query = query.to(q_dtype)
+        maybe_quantized_key_cache = key_cache.to(q_dtype)
+        maybe_quantized_value_cache = value_cache.to(q_dtype)
+
+        scale_shape = (num_seqs, num_kv_heads)
+        q_descale = None  # Not yet supported
+        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+
+    return lambda: unified_attention(
+        q=maybe_quantized_query,
+        k=maybe_quantized_key_cache,
+        v=maybe_quantized_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+    )
 
 
 def nonvarlen_benchmark_configs():
@@ -209,6 +303,20 @@ def create_benchmark_configs(custom, args):
     return configs
 
 
+from einops import repeat
+
+
+def generate_exact_padding_mask(seqlens, device):
+    max_seqlen = seqlens.max()
+    batch_size = len(seqlens)
+    lengths = seqlens.to(device).unsqueeze(1)
+    padding_mask = (
+        repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size)
+        < lengths
+    )
+    return padding_mask
+
+
 def run_benchmark(custom, args):
     torch.manual_seed(20)
 
@@ -238,6 +346,21 @@ def run_benchmark(custom, args):
         requires_grad = mode == "bwd" or args.test_mode
         return_lse = True
         return_attn_probs = False
+
+        exact_lengths_provided = isinstance(N_CTX_Q, str)
+        if exact_lengths_provided:
+            assert args.layout == "thd"
+            seqlens_q = torch.tensor([int(x.strip()) for x in N_CTX_Q.split(",")])
+            if isinstance(N_CTX_K, str):
+                seqlens_k = torch.tensor([int(x.strip()) for x in N_CTX_K.split(",")])
+            else:
+                seqlens_k = torch.ones_like(seqlens_q) * N_CTX_K
+            max_seqlen_q = seqlens_q.max()
+            max_seqlen_k = seqlens_k.max()
+        else:
+            max_seqlen_q = N_CTX_Q
+            max_seqlen_k = N_CTX_K
+
         varlen = args.layout == "thd"
         has_pe = D_HEAD > D_HEAD_V
         assert not (
@@ -246,12 +369,6 @@ def run_benchmark(custom, args):
         assert not (
             has_pe and "fused-bwd" in provider
         ), "'Fused' backward implementation doesn't support Positional Encoding (PE)."
-        assert not (
-            args.fp8 and args.sink
-        ), "Attention sink doesn't support FP8 data type."
-        assert not (
-            args.sink and "fused-bwd" in provider
-        ), "'Fused' backward implementation doesn't support Attention Sink."
 
         global _USE_FUSED_BWD
         fused_backward = "fused-bwd" in provider
@@ -261,165 +378,35 @@ def run_benchmark(custom, args):
         if sm_scale is None:
             sm_scale = 1.0 / (D_HEAD**0.5)
 
-        # Test mode: run tests from op_tests with specified shapes
-        if args.test_mode:
-            import op_tests.triton_tests.attention.test_mha as test_mha
-
-            print(
-                f"Testing kernel implementation <{provider}> against Torch with shape:"
-            )
-            print(
-                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}, D_HEAD_V={D_HEAD_V}"
-            )
-            if not varlen:
-                if not has_pe:
-                    test_mha.test_mha(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        dropout,
-                        True,
-                        True,
-                        causal,
-                        args.fp8,
-                        dtype,
-                    )
-                else:
-                    test_mha.test_mha_with_pe(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        D_HEAD_V,
-                        dropout,
-                        causal,
-                    )
-                print("Forward test passed!")
-                if not has_pe:
-                    test_mha.test_mha_backward_varlen(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        dropout,
-                        causal,
-                        args.fp8,
-                        dtype,
-                    )
-                else:
-                    test_mha.test_mha_backward_with_pe(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        D_HEAD_V,
-                        dropout,
-                        causal,
-                    )
-                print("Backward test passed!")
-            else:
-                if not has_pe:
-                    test_mha.test_mha_varlen(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        dropout,
-                        True,
-                        True,
-                        causal,
-                        args.fp8,
-                        dtype,
-                    )
-                else:
-                    test_mha.test_mha_varlen_with_pe(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        D_HEAD_V,
-                        dropout,
-                        causal,
-                    )
-                print("Forward test passed!")
-                if not has_pe:
-                    test_mha.test_mha_backward(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        dropout,
-                        causal,
-                        args.fp8,
-                        dtype,
-                    )
-                else:
-                    test_mha.test_mha_backward_varlen_with_pe(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        D_HEAD_V,
-                        dropout,
-                        causal,
-                    )
-                print("Backward test passed!")
-
-            return 0
-
         # Generate base inputs
-        q = torch.randn(
-            (BATCH, N_CTX_Q, HQ, D_HEAD),
-            device=device,
-            dtype=dtype,
-            requires_grad=requires_grad,
-        )
-        k = torch.randn(
-            (BATCH, N_CTX_K, HK, D_HEAD),
-            device=device,
-            dtype=dtype,
-            requires_grad=requires_grad,
-        )
-        v = torch.randn(
-            (BATCH, N_CTX_K, HK, D_HEAD_V),
-            device=device,
-            dtype=dtype,
-            requires_grad=requires_grad,
-        )
-        sink = (
-            torch.randn((HQ,), device=device, dtype=dtype, requires_grad=requires_grad)
-            if args.sink
-            else None
-        )
+        q = torch.randn((BATCH, max_seqlen_q, HQ, D_HEAD), device=device, dtype=dtype)
+        k = torch.randn((BATCH, max_seqlen_k, HK, D_HEAD), device=device, dtype=dtype)
+        v = torch.randn((BATCH, max_seqlen_k, HK, D_HEAD_V), device=device, dtype=dtype)
+        q.requires_grad = requires_grad
+        k.requires_grad = requires_grad
+        v.requires_grad = requires_grad
 
         # FLOPS calculation variables
         total_flops = 0.0
 
         # Input preparation
         if varlen:
-            query_padding_mask = generate_random_padding_mask(
-                N_CTX_Q, BATCH, device, mode="full" if args.equal_seqlens else "random"
-            )
-            key_padding_mask = generate_random_padding_mask(
-                N_CTX_K, BATCH, device, mode="full" if args.equal_seqlens else "random"
-            )
+            if exact_lengths_provided:
+                query_padding_mask = generate_exact_padding_mask(seqlens_q, device)
+                key_padding_mask = generate_exact_padding_mask(seqlens_k, device)
+            else:
+                query_padding_mask = generate_random_padding_mask(
+                    N_CTX_Q,
+                    BATCH,
+                    device,
+                    mode="full" if args.equal_seqlens else "random",
+                )
+                key_padding_mask = generate_random_padding_mask(
+                    N_CTX_K,
+                    BATCH,
+                    device,
+                    mode="full" if args.equal_seqlens else "random",
+                )
             (
                 q_unpad,
                 k_unpad,
@@ -437,9 +424,9 @@ def run_benchmark(custom, args):
             ) = generate_qkv(
                 q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
             )
-            q_unpad.requires_grad = requires_grad
-            k_unpad.requires_grad = requires_grad
-            v_unpad.requires_grad = requires_grad
+            q_unpad.requires_grad = True
+            k_unpad.requires_grad = True
+            v_unpad.requires_grad = True
 
             q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
 
@@ -506,7 +493,6 @@ def run_benchmark(custom, args):
                         causal=causal,
                         return_lse=return_lse,
                         return_attn_probs=return_attn_probs,
-                        sink=sink,
                     )
 
         else:
@@ -533,7 +519,6 @@ def run_benchmark(custom, args):
                         causal=causal,
                         return_lse=return_lse,
                         return_attn_probs=return_attn_probs,
-                        sink=sink,
                     )
 
         if mode == "bwd":
@@ -541,18 +526,49 @@ def run_benchmark(custom, args):
                 triton_out = fn()[0]
                 d_out = torch.randn_like(triton_out)
 
-                grad_inputs = (q_input, k_input, v_input)
-                if sink is not None:
-                    grad_inputs += (sink,)
-
                 def fn():
                     grads = torch.autograd.grad(
                         triton_out,
-                        grad_inputs,
+                        (q_input, k_input, v_input),
                         d_out,
                         retain_graph=True,
                     )
                     return grads
+
+        if args.unified_attention:
+            assert not args.fp8, "FP8 not supported in unified attention yet."
+            assert (
+                not has_pe
+            ), "Positional Encoding (PE) not supported in unified attention yet."
+            assert not dropout > 0.0, "Dropout not supported in unified attention yet."
+            assert (
+                not return_attn_probs
+            ), "return_attn_probs not supported in unified attention yet."
+            assert (
+                not fused_backward
+            ), "Fused backward not supported in unified attention yet."
+            assert (
+                mode == "fwd"
+            ), "Only forward mode supported in unified attention yet."
+            assert varlen, "Only varlen layout supported in unified attention yet."
+            assert causal, "Only causal attention supported in unified attention yet."
+            fn = triton_unified_attn_func_caller(
+                seq_lens=[
+                    (
+                        (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item(),
+                        (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item(),
+                    )
+                    for i in range(len(cu_seqlens_q) - 1)
+                ],
+                num_heads=(HQ, HK),
+                head_size=D_HEAD,
+                sliding_window=None,
+                dtype=dtype,
+                block_size=32,
+                soft_cap=None,
+                num_blocks=1024,
+                q_dtype=torch.uint8 if args.fp8 else None,
+            )
 
         ms = triton.testing.do_bench(fn)
 
@@ -620,8 +636,28 @@ def parse_args():
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
-    parser.add_argument("-sq", type=int, default=0)
-    parser.add_argument("-sk", type=int, default=0)
+
+    def parse_int_or_list(value):
+        if "," in value:
+            return (
+                value.strip()
+            )  # if list, return stripped string and parse when creating tensor
+        else:
+            return int(value)
+
+    parser.add_argument(
+        "-sq",
+        type=parse_int_or_list,
+        default=0,
+        help="Query sequence length - can be a single number or comma-separated list. -b is overwritten as the list length.",
+    )
+    parser.add_argument(
+        "-sk",
+        type=parse_int_or_list,
+        default=0,
+        help="Key sequence length - can be a single number or comma-separated list. Defaults to the same as sq if 0",
+    )
+
     parser.add_argument(
         "-equal_seqlens",
         action="store_true",
@@ -634,6 +670,7 @@ def parse_args():
         default=0,
         help="Q and K head size, if -dv is absent then -d specifies V head size too",
     )
+    parser.add_argument("-unified_attention", action="store_true", default=False)
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
@@ -669,9 +706,6 @@ def parse_args():
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
-    parser.add_argument(
-        "-sink", action="store_true", default=False, help="use attention sink"
-    )
     return parser.parse_args()
 
 
@@ -684,6 +718,12 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+
+    if isinstance(args.sk, int) and args.sk == 0:
+        args.sk = args.sq
+
+    if isinstance(args.sq, str):
+        args.b = len([x for x in args.sq.split(",")])
 
     if args.model:
         if args.causal is None:  # User didn't specify -causal
