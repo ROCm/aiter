@@ -1356,7 +1356,7 @@ def quantize_input(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
-    q, k, _ = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=False, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
+    q, k, _ = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=False, layout=layout, sm_scale=None)
 
     sage_quant_v_kernel[grid](
         v,
@@ -1496,9 +1496,14 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torc
 
     assert torch_out.shape == triton_out.shape
 
-    from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outputs
+    from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outputs, compare_accuracy
     ATOL_fp8 = 3.0e-1
     RTOL_fp8 = 2.5e-1
+
+    compare_accuracy(
+        triton_out,
+        torch_out
+    )
 
     check_attention_outputs(
         triton_out,
@@ -1787,7 +1792,5 @@ def main():
 
 
 if __name__ == '__main__':
-    test_op_fwd_mxfp4(1, 5, 4096, 4096, 128, False, 'bhsd', dtype=torch.float16)
-    
-    
+    test_op_fwd_mxfp4(2, 5, 16384, 16384, 128, False, 'bhsd', dtype=torch.float16)
     sys.exit(main())
