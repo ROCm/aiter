@@ -1467,6 +1467,103 @@ class OManager32bitsV1
     }
 };
 
+template <typename T, typename out_t>
+class OManager32bitsV2
+{
+    private:
+    static_assert(sizeof(out_t) == 4, "Output type must be 32 bits");
+
+    static constexpr uint32_t kNumRows              = 16;
+    static constexpr uint32_t kNumCols              = 32;
+    static constexpr uint32_t kNumPaddingElemPerRow = 4;
+    static constexpr uint32_t kNumElemPerPaddedRow  = kNumCols + kNumPaddingElemPerRow; // 32+4=36
+    static constexpr uint32_t kVramStElemPerLane    = 4; // use buffer_store_dwordx4
+    static constexpr uint32_t kVramStLanePerRow     = kNumCols / kVramStElemPerLane; // 32/4=8
+    static constexpr uint32_t kVramStRowsPerRnd =
+        ckt::get_warp_size() / kVramStLanePerRow; // 64/8=8
+    static constexpr uint32_t kLdsLdOffsetDeltaInBytes =
+        kVramStRowsPerRnd * kNumElemPerPaddedRow * sizeof(out_t); // 8*36*4=1152
+    static constexpr uint32_t kVramStOffsetDeltaInBytes =
+        kVramStRowsPerRnd * T::kVoHeadDim * sizeof(out_t); // 8*512*4=16384
+
+    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    static constexpr uint32_t kMfmaRows = 16;
+    static constexpr uint32_t kMfmaCols = 16;
+    static constexpr uint32_t kMfmaElemPerLane =
+        kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*16/64=4
+
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_per_warp_in_byte()
+    {
+        return kNumRows * kNumElemPerPaddedRow * sizeof(out_t); // 16*36*4=2304
+    }
+
+    public:
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
+    {
+        return T::kNumWarps * get_lds_size_per_warp_in_byte();
+    }
+
+    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
+    // GPR_START: Starting GPR index for current 16x32 block
+    // kColOffset: Element-wise column offset in output buffer.
+    template <uint32_t GPR_START, uint32_t kColOffset>
+    __device__ __forceinline__ void output_to_vram(const out_t* p_output,
+                                                   const uint32_t warp_idx,
+                                                   const uint32_t qo_start,
+                                                   const uintptr_t p_lds)
+    {
+        static_assert((kColOffset % 32) == 0, "kColOffset must be divisible by 32");
+        constexpr uint32_t kOffsetInBytes = kColOffset * sizeof(out_t);
+
+        const uint32_t lane_idx = ckt::get_lane_id();
+
+        const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_warp_in_byte();
+
+        auto get_v_offset_lds = [&](const uint32_t row, const uint32_t col) -> uint32_t {
+            return (row * kNumElemPerPaddedRow + col) * sizeof(out_t);
+        };
+
+        const uint32_t row_lds_st      = lane_idx % kNumRows;
+        const uint32_t col_lds_st      = (lane_idx / kNumRows) * kMfmaElemPerLane;
+        const uint32_t v_offset_lds_st = get_v_offset_lds(row_lds_st, col_lds_st);
+
+        const uint32_t row_lds_ld      = lane_idx / kVramStLanePerRow;
+        const uint32_t col_lds_ld      = (lane_idx % kVramStLanePerRow) * kVramStElemPerLane;
+        const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
+
+        const uint32_t row_vram_st = row_lds_ld + qo_start * T::kQoNumHead + warp_idx * kNumRows;
+        const uint32_t col_vram_st = col_lds_ld;
+        const uint32_t v_offset_vram_st =
+            (row_vram_st * T::kVoHeadDim + col_vram_st) * sizeof(out_t);
+
+        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
+        const uint64_t out_as_u64  = static_cast<uint64_t>(out_as_int);
+        const hk::buffer_resource out_br =
+            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+
+        if constexpr(std::is_same_v<out_t, float>)
+        {
+            asm volatile("s_waitcnt vmcnt(0)");
+            hkm::ds_write_b128<GPR_START>(p_lds_warp + v_offset_lds_st, 0);
+            hkm::ds_write_b128<GPR_START + 4>(p_lds_warp + v_offset_lds_st,
+                                              kNumCols / 2 * sizeof(out_t));
+        }
+        else
+        {
+            static_assert(false, "Unsupported output type");
+        }
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        const v4ui data_0 = hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, 0);
+        const v4ui data_1 =
+            hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, kLdsLdOffsetDeltaInBytes);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        hkm::buffer_store_dwordx4(out_br, v_offset_vram_st, 0, kOffsetInBytes, data_0);
+        hkm::buffer_store_dwordx4(
+            out_br, v_offset_vram_st + kVramStOffsetDeltaInBytes, 0, kOffsetInBytes, data_1);
+    }
+};
+
 template <bool kCheckBoundary, uint32_t GPR>
 __device__ __forceinline__ void
 softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const float softmax_scale)
@@ -1809,7 +1906,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     KvManagerV2<T> kv_manager;
     VtManagerV1<T> vt_manager;
     OManager16bitsV1<T, out_t> o_manager;
-    OManager32bitsV1<T, split_t> split_o_manager;
+    OManager32bitsV2<T, split_t> split_o_manager;
 
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_ranges> kv_1;
@@ -1840,9 +1937,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     constexpr uint32_t kSzLdsO =
         ckt::max(o_manager.get_lds_size_in_byte(), split_o_manager.get_lds_size_in_byte());
 
+    static_assert(kSzLdsO <= kSzLdsKv,
+                  "kSzLdsO must be less than or equal to kSzLdsKv because we want to reuse p_lds_o "
+                  "and p_lds_kv_next.");
+
     const uintptr_t p_lds_vt = reinterpret_cast<uintptr_t>(p_lds);
     const uintptr_t p_lds_q  = p_lds_vt + kSzLdsTv;
-    const uintptr_t p_lds_o  = p_lds_q + kSzLdsQ; // reuse p_lds_o and p_lds_kv
     uintptr_t p_lds_kv_curr  = p_lds_q + kSzLdsQ;
     uintptr_t p_lds_kv_next  = p_lds_kv_curr + kSzLdsKv;
 
@@ -2235,6 +2335,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         ///
         /// Outputs
         ///
+
+        const uintptr_t p_lds_o = p_lds_kv_next; // reuse p_lds_o and p_lds_kv_next
 
         if(partial_qo_loc < 0)
         {
