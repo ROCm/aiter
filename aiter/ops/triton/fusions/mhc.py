@@ -165,7 +165,7 @@ def fused_mhc(
     
     # Calculate expected dimensions based on mode
     n_squared = n * n
-    n_factorial = factorial(n) if hres_lite_mode else n_squared
+    n_factorial = factorial(n)
     n_res_expected = n_factorial if hres_lite_mode else n_squared
     N_total_expected = n_res_expected + 2 * n  # n (pre) + n (post) + n_res
 
@@ -178,8 +178,8 @@ def fused_mhc(
     hres_op = config.pop("HRES_OP", 0)
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     # BLOCK_N: Column tile size (must be power of 2 for Triton arange)
-    if hres_lite_mode:        
-        min_block_n = n_factorial if hres_op == 1 else n_squared
+    if hres_lite_mode:
+        min_block_n = max(n_res_expected, n_squared)
         config_block_n = config.pop("BLOCK_N", min_block_n)
         BLOCK_N = triton.next_power_of_2(max(config_block_n, min_block_n))
     else:
@@ -204,8 +204,8 @@ def fused_mhc(
     
     # Validate phi_res shape based on mode
     if hres_lite_mode:
-        assert phi_res_cols == n_factorial, (
-            f"In lite mode, phi_res must have {n_factorial} columns (n!={n_factorial}), got {phi_res_cols}"
+        assert phi_res_cols == n_res_expected, (
+            f"In lite mode, phi_res must have {n_res_expected} columns (n!={n_res_expected}), got {phi_res_cols}"
         )
     else:
         assert phi_res_cols == n_squared, (
@@ -264,7 +264,7 @@ def fused_mhc(
         
         # Allocate intermediate buffers (float32 for precision)
         # acc_res size depends on mode: n² for sinkhorn, n! for lite
-        acc_res_cols = n_factorial if hres_lite_mode else n_squared
+        acc_res_cols = n_res_expected
         acc_pre_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
         acc_post_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
         acc_res_partial = torch.empty((num_ksplit, M, acc_res_cols), dtype=torch.float32, device=x.device)
@@ -287,7 +287,7 @@ def fused_mhc(
             N=N,
             n=n,
             n_squared=n_squared,
-            n_factorial=n_factorial,
+            n_factorial=n_res_expected,
             # Input strides
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
@@ -339,7 +339,7 @@ def fused_mhc(
             N=N,
             n=n,
             n_squared=n_squared,
-            n_factorial=n_factorial,
+            n_factorial=n_res_expected,
             eps=eps,
             # Intermediate buffer strides
             stride_acc_pre_k=acc_pre_partial.stride(0),
@@ -393,7 +393,7 @@ def fused_mhc(
             N=N,                   # Output features
             n=n,                   # Stream parameter
             n_squared=n_squared,   # n*n (precomputed for constexpr usage)
-            n_factorial=n_factorial,  # n! for lite mode
+            n_factorial=n_res_expected,  # n! for lite mode, n² for sinkhorn mode
             eps=eps,               # Numerical stability epsilon for RMSNorm
             # Tensor strides for memory access
             stride_xm=x.stride(0),
