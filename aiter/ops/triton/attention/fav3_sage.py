@@ -116,7 +116,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         # 3. Quantization
         # Note: softmax_scale is integrated into quantization descaling
-        softmax_scale = softmax_scale or (head_dim**-0.5)
+        softmax_scale = (head_dim**-0.5)
         fp8_dtype = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_dtype).max
 
@@ -136,6 +136,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                 v,
                 fp8_dtype,
                 fp8_max,
+                sm_scale=softmax_scale,
                 BLKQ=BLKQ,
                 BLKK=BLKK,
                 q_smoothing=q_smooth,
