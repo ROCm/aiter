@@ -73,7 +73,6 @@ std::string get_heuristic_kernel_mla(std::string q_type,
             continue;
         if (cfg.causal != causal || cfg.qSeqLen != qseqlen)
             continue;
-        
         return el.first;
     }
     
@@ -92,7 +91,7 @@ std::string get_heuristic_kernel_mla(std::string q_type,
 
 void mla_decode_stage1_asm_fwd(
     torch::Tensor& Q,                    //   [num_seqs, num_heads, head_size]
-    torch::Tensor& KV,                   //   [num_page, page_size, num_kv_heads, head_size]
+    torch::Tensor& KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
     torch::Tensor& qo_indptr,            //   [batch_size+1]
     torch::Tensor& kv_indptr,            //   [batch_size+1]
     torch::Tensor& kv_page_indices,      //   [num_page_used]
@@ -102,6 +101,8 @@ void mla_decode_stage1_asm_fwd(
     std::optional<torch::Tensor>& work_indptr,            //   metadata
     std::optional<torch::Tensor>& work_info_set,          //   [batch_size+1]
     int max_seqlen_q,
+    int page_size,
+    int nhead_kv,
     float softmax_scale,
     // following are output
     torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
@@ -114,8 +115,7 @@ void mla_decode_stage1_asm_fwd(
     int batch           = qo_indptr.size(0) - 1;
     int num_heads       = Q.size(1);
     int head_size       = Q.size(2);
-    int page_size       = KV.size(1);
-    int num_kv_heads    = KV.size(2);
+    int num_kv_heads    = nhead_kv;
     int kv_split        = splitData.size(1);
     const int gqa_ratio = num_heads / num_kv_heads;
 
@@ -197,7 +197,9 @@ void mla_decode_stage1_asm_fwd(
 
     TORCH_CHECK(Q.is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     TORCH_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
-    TORCH_CHECK(head_size == KV.size(3), __func__, ":only support head_size == KV.size(3) for now");
+    if (KV.dtype() != at::ScalarType::Byte && KV.dtype() != at::ScalarType::Char) {
+        TORCH_CHECK(head_size == KV.size(3), __func__, ":only support head_size == KV.size(3) for now");
+    }
     
     if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn)
     {
@@ -225,6 +227,8 @@ void mla_decode_stage1_asm_fwd(
         kv_type = "bf16";
     else if(KV.dtype() == at::ScalarType::Float8_e4m3fnuz || KV.dtype() == at::ScalarType::Float8_e4m3fn)
         kv_type = "fp8";
+    else if(KV.dtype() == at::ScalarType::Byte || KV.dtype() == at::ScalarType::Char)
+        kv_type = "byte";
     else
         TORCH_CHECK(false, __func__, ": unsupport KV dtype:", KV.scalar_type());
 
@@ -263,7 +267,7 @@ void mla_decode_stage1_asm_fwd(
                     config_max_seqlen_q = 8;
                 }
             }
-        }else if (q_type == "bf16" && kv_type == "fp8"){
+        }else if ((q_type == "bf16" && kv_type == "fp8") || (q_type == "bf16" && kv_type == "byte")){
             if(persistent){
                 if(max_seqlen_q <= 4){
                     config_max_seqlen_q = 4;

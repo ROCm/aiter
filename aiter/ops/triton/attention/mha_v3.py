@@ -49,7 +49,7 @@ class _FlashAttnV3Func(torch.autograd.Function):
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in AMD Triton v3")
 
-        out, softmax_lse = flash_attn_3.fwd(
+        out, softmax_lse, _, _ = flash_attn_3.fwd(
             q,
             k,
             v,
@@ -101,16 +101,21 @@ class _FlashAttnV3Func(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
 
-        dq, dk, dv, _delta = flash_attn_3.bwd(
+        # Allocate gradients - upstream pattern
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+
+        _delta = flash_attn_3.bwd(
             dout,
             q,
             k,
             v,
             out,
             softmax_lse,
-            None,  # dq
-            None,  # dk
-            None,  # dv
+            dq,
+            dk,
+            dv,
             None,  # cu_seqlens_q
             None,  # cu_seqlens_k
             None,  # seqused_q
@@ -220,7 +225,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in varlen v3 yet")
 
-        out, softmax_lse = flash_attn_3.fwd(
+        out, softmax_lse, _, _ = flash_attn_3.fwd(
             q,
             k,
             v,
@@ -276,16 +281,21 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
 
-        dq, dk, dv, _delta = flash_attn_3.bwd(
+        # Allocate gradients - upstream pattern
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+
+        _delta = flash_attn_3.bwd(
             dout,
             q,
             k,
             v,
             out,
             softmax_lse,
-            None,  # dq
-            None,  # dk
-            None,  # dv
+            dq,
+            dk,
+            dv,
             ctx.cu_seqlens_q,
             ctx.cu_seqlens_k,
             None,  # seqused_q
@@ -446,7 +456,7 @@ def flash_attn_with_kvcache(
     leftpad_k = cache_leftpad
     seqlens_rotary = rotary_seqlens
 
-    out, softmax_lse = flash_attn_3.fwd(
+    out, softmax_lse, _, _ = flash_attn_3.fwd(
         q,
         k_cache,
         v_cache,
@@ -760,7 +770,7 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
             )
 
         # Call flash attention forward
-        out, softmax_lse = flash_attn_3.fwd(
+        out, softmax_lse, _, _ = flash_attn_3.fwd(
             q_fp8,
             k_fp8,
             v_fp8,
@@ -822,23 +832,28 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
             ctx.saved_tensors
         )
 
-        # Call flash attention backward - returns FP32 gradients
-        dq, dk, dv, _delta = flash_attn_3.bwd(
+        # Allocate gradients - upstream pattern
+        dq = torch.empty_like(q_fp8)
+        dk = torch.empty_like(k_fp8)
+        dv = torch.empty_like(v_fp8)
+
+        # Call flash attention backward - gradients are written in-place
+        _delta = flash_attn_3.bwd(
             grad_output,
             q_fp8,
             k_fp8,
             v_fp8,
             out,
             softmax_lse,
-            None,
-            None,
-            None,  # dq, dk, dv (will be allocated)
-            None,
-            None,  # cu_seqlens_q, cu_seqlens_k
-            None,
-            None,
-            None,
-            None,  # seqused_q, seqused_k, max_seqlen_q, max_seqlen_k
+            dq,
+            dk,
+            dv,
+            None,  # cu_seqlens_q
+            None,  # cu_seqlens_k
+            None,  # seqused_q
+            None,  # seqused_k
+            None,  # max_seqlen_q
+            None,  # max_seqlen_k
             ctx.softmax_scale,
             ctx.causal,
             int(ctx.window_size[0]),
@@ -1049,7 +1064,7 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
             )
 
         # Call flash attention varlen forward
-        out, softmax_lse = flash_attn_3.fwd(
+        out, softmax_lse, _, _ = flash_attn_3.fwd(
             q_fp8,
             k_fp8,
             v_fp8,
@@ -1115,17 +1130,22 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
             ctx.saved_tensors
         )
 
-        # Call flash attention varlen backward - returns FP32 gradients
-        dq, dk, dv, _delta = flash_attn_3.bwd(
+        # Allocate gradients - upstream pattern
+        dq = torch.empty_like(q_fp8)
+        dk = torch.empty_like(k_fp8)
+        dv = torch.empty_like(v_fp8)
+
+        # Call flash attention varlen backward - gradients are written in-place
+        _delta = flash_attn_3.bwd(
             grad_output,
             q_fp8,
             k_fp8,
             v_fp8,
             out,
             softmax_lse,
-            None,  # dq
-            None,  # dk
-            None,  # dv
+            dq,
+            dk,
+            dv,
             ctx.cu_seqlens_q,
             ctx.cu_seqlens_k,
             None,  # seqused_q
