@@ -899,7 +899,7 @@ def test_mla(
             new_qo_indptr,
             new_kv_indptr,
             new_indices,
-            kv_last_page_lens,
+            new_kv_last_page_lens,
             sm_scale,
             kv_lora_rank,
             qk_rope_head_dim,
@@ -1077,8 +1077,8 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-# list_nhead = [(16, 2), (48, 1), (128, 2)]
-list_nhead = [(16, 1), (16, 2), (16, 4), (16, 3)]
+list_nhead = [(16, 2), (48, 1), (128, 2)]
+# list_nhead = [(16, 1), (16, 2), (16, 4), (16, 3)]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1148,7 +1148,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[64, 256, 512, 1200, 3200, 5200, 2048],
+    default=[21, 64, 256, 512, 1200, 2048, 3200, 5200, 8192],
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -1157,7 +1157,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[1, 3, 5, 16, 32, 64, 128],
+    default=[1, 3, 5, 16, 32, 64, 128, 256],
     help="""Batch size.
     e.g.: -b 16""",
 )
