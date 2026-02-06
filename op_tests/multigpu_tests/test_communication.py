@@ -20,7 +20,7 @@ logger = logging.getLogger("aiter")
 NORM = 0
 DUMP = 1
 VERIFY = 2
-debug_mode = DUMP
+# debug_mode = DUMP
 # debug_mode = VERIFY
 debug_mode = NORM
 
