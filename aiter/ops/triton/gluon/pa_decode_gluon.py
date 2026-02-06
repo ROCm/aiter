@@ -1326,7 +1326,7 @@ def paged_attention_decode_sliding_window(
         )
 
     # ==================== SEQUENCE PROCESSING ====================
-    query_converted = query_shared.load(qk_lhs_operand_layout)
+    
     if ONE_SHOT and sinks_ptr is not None:
         # sinks_ptr is per-query-head: [num_query_heads] where
         # num_query_heads = num_kv_heads * query_group_size.
@@ -1338,6 +1338,12 @@ def paged_attention_decode_sliding_window(
         ).to(gl.float32)
 
     max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
+
+    if KV_QUANT_MODE == 0:
+        # Per-tensor quantization
+        key_scale_value = gl.load(key_scale)
+        value_scale_value = gl.load(value_scale)
+    query_converted = gl.convert_layout(mtp_query_tensor, layout=qk_lhs_operand_layout)
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
         # Quantize bf16 query to fp8
         # Convert query to float32 for computation
@@ -1352,18 +1358,32 @@ def paged_attention_decode_sliding_window(
         query_converted = query_f32.to(COMPUTE_TYPE)
     else:
         query_converted = query_converted.to(COMPUTE_TYPE)
+    block_indices = gl.arange(
+        0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout
+    )
+    kv_block_numbers = gl.amd.cdna3.buffer_load(
+        ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
+        + sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE// CONTEXT_PARTITION_SIZE_PER_BLOCK,
+        offsets=block_indices,
+    ).to(gl.int64)
 
-    if KV_QUANT_MODE == 0:
-        # Per-tensor quantization
-        key_scale_value = gl.load(key_scale)
-        value_scale_value = gl.load(value_scale)
-
+    # kv_block_numbers = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
         kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+        kv_block_start_idx2 = (sequence_partition_idx+1) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+        # Create mask for valid blocks
         num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
-
+        valid_block_mask = block_indices < num_kv_blocks
+        kv_block_numbers = gl.where(valid_block_mask, kv_block_numbers, 0)
+    
+        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
+            ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
+            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
+            offsets=block_indices,
+        ).to(gl.int64)
+        
         # For KV_BLOCK_SIZE==1024 we process a CONTEXT_PARTITION_SIZE window inside a 1024-token page.
         # Map partition -> (page_id, page_offset) where page_offset in [0, 256, 512, 768].
         page_offset = (
@@ -1372,20 +1392,8 @@ def paged_attention_decode_sliding_window(
         qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
             0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
-        # Load KV block indices from block table
-        block_indices = gl.arange(
-            0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout
-        )
-        # Create mask for valid blocks
-        valid_block_mask = block_indices < num_kv_blocks
-        masked_block_indices = gl.where(valid_block_mask, block_indices, 0)
-        block_table_start_ptr = block_tables_ptr + sequence_idx * stride_block_table_seq
-        kv_block_numbers = gl.amd.cdna3.buffer_load(
-            ptr=block_table_start_ptr
-            + kv_block_start_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-            offsets=masked_block_indices,
-        ).to(gl.int64)
 
+        
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
         key_block_offsets = (
@@ -1664,6 +1672,7 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
+        kv_block_numbers = kv_block_numbers2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
