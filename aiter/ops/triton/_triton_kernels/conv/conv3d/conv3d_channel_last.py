@@ -26,7 +26,6 @@ _conv3d_forward_repr = make_kernel_repr(
     ],
 )
 
-
 @triton.jit(repr=_conv3d_forward_repr)
 def _conv3d_channel_last_kernel(
     # Pointers to tensors
@@ -82,21 +81,27 @@ def _conv3d_channel_last_kernel(
     pid_co = tl.program_id(1)
     pid_g = tl.program_id(2)
 
-    # calculate n/od/oh/ow in-kernel
-    n_odoho_owo = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_odoho = n_odoho_owo // OW
-    n_odo = n_odoho // OH
-    n_idx = n_odo // OD
-    od_idx = n_odo % OD
-    oh_idx = n_odoho % OH
-    ow_idx = n_odoho_owo % OW
+    # calculate n*od*oh*ow in-kernel
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_odoh = offs_n // OW
+    offs_od = offs_odoh // OH
+    n_idx = offs_od // OD
+    od_idx = offs_od % OD
+    oh_idx = offs_odoh % OH
+    ow_idx = offs_n % OW
 
     # input: [N, G, C, D, H, W], weight: [G, OC, C, KD, KH, KW]
     out_per_g = OC // GROUPS
     co_off = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
 
-    x_ptr += (s_x_n * n_idx + s_x_c * pid_g * K_C)[:, None]
-    w_ptr += (s_w_o * co_off + s_w_o * pid_g * out_per_g)[None, :]
+    # base pointers (improve address arithmetic + help coalescing)
+    x_base = x_ptr + s_x_n * n_idx + s_x_c * (pid_g * K_C)
+    w_base = w_ptr + s_w_o * (pid_g * out_per_g + co_off)
+
+    # Load x as [BLOCK_CI, BLOCK_N] so the *last* dimension is contiguous
+    # (typically along W). Transpose in registers back for tl.dot.
+    x_ptr = x_base[None, :]
+    w_ptr = w_base[None, :]
 
     acc = tl.zeros((BLOCK_N, BLOCK_CO), dtype=tl.float32)
     CI_TILES = (K_C + BLOCK_CI - 1) // BLOCK_CI
@@ -115,31 +120,31 @@ def _conv3d_channel_last_kernel(
 
         x_blk_ptr = (
             x_ptr
-            + (s_x_c * ci_off)[None, :]
-            + (s_x_d * in_d_off)[:, None]
-            + (s_x_h * in_h_off)[:, None]
-            + (s_x_w * in_w_off)[:, None]
+            + (s_x_c * ci_off)[:, None]
+            + (s_x_d * in_d_off)[None, :]
+            + (s_x_h * in_h_off)[None, :]
+            + (s_x_w * in_w_off)[None, :]
         )
         w_blk_ptr = (
             w_ptr + (s_w_c * ci_off)[:, None] + (s_w_d * d) + (s_w_h * h) + (s_w_w * w)
         )
 
         x_mask = (
-            (n_idx < N)[:, None]
-            & (ci_off < K_C)[None, :]
-            & (0 <= in_d_off)[:, None]
-            & (in_d_off < D)[:, None]
-            & (0 <= in_h_off)[:, None]
-            & (in_h_off < H)[:, None]
-            & (0 <= in_w_off)[:, None]
-            & (in_w_off < W)[:, None]
+            (ci_off < K_C)[:, None]
+            & (n_idx < N)[None, :]
+            & (0 <= in_d_off)[None, :]
+            & (in_d_off < D)[None, :]
+            & (0 <= in_h_off)[None, :]
+            & (in_h_off < H)[None, :]
+            & (0 <= in_w_off)[None, :]
+            & (in_w_off < W)[None, :]
         )
         w_mask = (ci_off < K_C)[:, None] & (co_off < out_per_g)[None, :]
 
-        x_blk = tl.load(x_blk_ptr, mask=x_mask)
+        x_blk = tl.load(x_blk_ptr, mask=x_mask, other=0.0)
         w_blk = tl.load(w_blk_ptr, mask=w_mask)
 
-        acc += tl.dot(x_blk, w_blk, allow_tf32=False)
+        acc += tl.dot(tl.trans(x_blk), w_blk, allow_tf32=False)
 
     b_ptr += (pid_g[None] * out_per_g)[None, :] + co_off[None, :]
     b_mask = (co_off < out_per_g)[None, :]

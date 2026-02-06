@@ -26,7 +26,6 @@ _conv3d_forward_repr = make_kernel_repr(
     ],
 )
 
-
 @triton.jit(repr=_conv3d_forward_repr)
 def _conv3d_std_kernel(
     # Pointers to tensors
@@ -82,22 +81,25 @@ def _conv3d_std_kernel(
     pid_co = tl.program_id(1)
     pid_g = tl.program_id(2)
 
-    # calculate n/od/oh/ow in-kernel
-    n_odoho_owo = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_odoho = n_odoho_owo // OW
-    n_odo = n_odoho // OH
-    n_idx = n_odo // OD
-    od_idx = n_odo % OD
-    oh_idx = n_odoho % OH
-    ow_idx = n_odoho_owo % OW
+    # calculate n*od*oh*ow in-kernel
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_odoh = offs_n // OW
+    offs_od = offs_odoh // OH
+    n_idx = offs_od // OD
+    od_idx = offs_od % OD
+    oh_idx = offs_odoh % OH
+    ow_idx = offs_n % OW
 
     # input: [N, G, C, D, H, W], weight: [G, OC, C, KD, KH, KW]
     out_per_g = OC // GROUPS
     co_off = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
 
-    x_ptr += (s_x_n * n_idx + s_x_c * pid_g * K_C)[:, None]
-    w_ptr += (s_w_o * co_off + s_w_o * pid_g * out_per_g)[None, :]
+    # base pointers (improve address arithmetic + help coalescing)
+    x_base = x_ptr + s_x_n * n_idx + s_x_c * (pid_g * K_C)
+    w_base = w_ptr + s_w_o * (pid_g * out_per_g + co_off)
 
+    x_ptr = x_base[:, None]
+    w_ptr = w_base[None, :]
     acc = tl.zeros((BLOCK_N, BLOCK_CO), dtype=tl.float32)
     CI_TILES = (K_C + BLOCK_CI - 1) // BLOCK_CI
     for dhwc in range(K_D * K_H * K_W * CI_TILES):

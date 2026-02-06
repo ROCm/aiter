@@ -1,4 +1,5 @@
 from typing import Optional, Union
+import os
 import triton
 import torch
 
@@ -8,6 +9,9 @@ from aiter.ops.triton._triton_kernels.conv.conv3d.conv3d_channel_last import (
 from aiter.ops.triton.utils.conv_common import (
     conv3d_output_shape,
     padding_type,
+)
+from aiter.ops.triton.utils.conv_config_utils import (
+    get_default_conv3d_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -70,14 +74,7 @@ def conv3d_channel_last(
     output = torch.empty(out_shape, dtype=x.dtype, device=x.device)
 
     if config is None:
-        config = {
-            "BLOCK_N": 256,
-            "BLOCK_CI": 16,
-            "BLOCK_CO": 64,
-            "num_warps": 8,
-            "num_stages": 2,
-            "waves_per_eu": 1,
-        }
+        config = get_default_conv3d_config()
 
     # BLOCK_NI for N x od x oh x ow,
     # BLOCK_CO for oc,
