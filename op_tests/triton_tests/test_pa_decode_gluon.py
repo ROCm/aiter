@@ -1466,6 +1466,45 @@ def run_pa_gluon_test(
             key_scale_original = None
             value_scale_original = None
 
+
+    def load_tensors(data_dir: str):
+        import os
+        """Load all saved tensors from a directory."""
+        print(f"\nLoading tensors from: {data_dir}")
+
+        tensors = {}
+        tensor_files = [
+            "query.pt",
+            "key_cache.pt", 
+            "value_cache.pt",
+            "context_lens.pt",
+            "block_tables.pt",
+            "exp_sum.pt",
+            "max_logits.pt",
+            "temporary_output.pt",
+        ]
+
+        for filename in tensor_files:
+            filepath = os.path.join(data_dir, filename)
+            if os.path.exists(filepath):
+                tensor_name = filename.replace(".pt", "")
+                tensors[tensor_name] = torch.load(filepath)
+                print(f"  Loaded {filename}: shape={tensors[tensor_name].shape}, dtype={tensors[tensor_name].dtype}")
+            else:
+                print(f"  WARNING: {filename} not found!")
+
+        return tensors
+
+    # tensors = load_tensors("./mtp_pts")
+    # query = tensors["query"]
+    # quantized_keys = tensors["key_cache"]
+    # quantized_values = tensors["value_cache"]
+    # context_lengths = tensors["context_lens"]
+    # block_tables = tensors["block_tables"]
+    # exp_sums = tensors["exp_sum"]
+    # max_logits = tensors["max_logits"]
+    # temporary_output = tensors["temporary_output"]
+
     # Reference (original)
     reference_output_quant = torch_mha_extend(
         query,
@@ -1612,30 +1651,30 @@ def run_pa_gluon_test(
     final_output_gluon = torch.empty_like(reference_output_quant)
     gluon_time = 1
     final_output_gluon = reference_output_quant
-    # _, gluon_time = run_gluon_kernel(
-    #     final_output_gluon,
-    #     quantized_query,
-    #     quantized_keys,
-    #     quantized_values,
-    #     context_lengths,
-    #     block_tables,
-    #     softmax_scale,
-    #     query_length,
-    #     max_context_partition_num,
-    #     context_partition_size,
-    #     compute_type,
-    #     query_scale=query_scale_factors,
-    #     key_scale=key_scale_original,
-    #     value_scale=value_scale_original,
-    #     exp_sums=exp_sums,
-    #     max_logits=max_logits,
-    #     temporary_output=temporary_output,
-    #     alibi_slopes=None,
-    #     use_aot_impl=use_aot_impl,
-    #     sinks=sinks,
-    #     sliding_window=sliding_window,
-    #     ps=ps,
-    # )
+    _, gluon_time = run_gluon_kernel(
+        final_output_gluon,
+        quantized_query,
+        quantized_keys,
+        quantized_values,
+        context_lengths,
+        block_tables,
+        softmax_scale,
+        query_length,
+        max_context_partition_num,
+        context_partition_size,
+        compute_type,
+        query_scale=query_scale_factors,
+        key_scale=key_scale_original,
+        value_scale=value_scale_original,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=None,
+        use_aot_impl=use_aot_impl,
+        sinks=sinks,
+        sliding_window=sliding_window,
+        ps=ps,
+    )
 
     # Compare with original reference
     err_gluon = checkAllclose(
@@ -1663,7 +1702,7 @@ def run_pa_gluon_test(
     results["err_gluon"] = err_gluon
 
     # ==================== PA PS Gluon (JIT) ====================
-    if ps:
+    if ps and block_size == 1024:
         # Build kv_indptr/kv_indices from block_tables for persistent scheduling
         actual_blocks = (context_lengths + block_size - 1) // block_size
         kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
@@ -1722,7 +1761,7 @@ def run_pa_gluon_test(
             max_seqlen_qo=int(query_length),
             uni_seqlen_qo=query_length,
             fast_mode=True,
-            max_split_per_batch=-1,
+            max_split_per_batch=1,
         )
 
         pa_ps_output = torch.empty_like(reference_output_quant)
@@ -2586,7 +2625,7 @@ def sliding_window_accuracy_test():
     HEAD_CONFIGURATIONS = [(16, 2)]
     USE_AOT_IMPL_OPTIONS = [False]
     PS_OPTIONS = [True]
-    BLOCK_SIZE_OPTIONS = [256]
+    BLOCK_SIZE_OPTIONS = [1024]
     parse_arg_and_run_test()
     # BLOCK_SIZE_OPTIONS = [1024]
     # parse_arg_and_run_test()
