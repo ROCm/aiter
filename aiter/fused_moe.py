@@ -1947,18 +1947,21 @@ def flydsl_moe_stage1(
             d = rem % int(inter_dim)
         else:
             t = s = d = 0
-        logger.warning(
-            "[flydsl-compare][stage1] tokens=%d topk=%d inter=%d kernel=%s max_abs=%.6g mean_abs=%.6g argmax=(t=%d,s=%d,d=%d)",
-            int(token_num),
-            int(topk),
-            int(inter_dim),
-            str(kernelName),
-            max_abs,
-            mean_abs,
-            int(t),
-            int(s),
-            int(d),
-        )
+
+        debug_flydsl = os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1"
+        if debug_flydsl:
+            logger.warning(
+                "[flydsl-compare][stage1] tokens=%d topk=%d inter=%d kernel=%s max_abs=%.6g mean_abs=%.6g argmax=(t=%d,s=%d,d=%d)",
+                int(token_num),
+                int(topk),
+                int(inter_dim),
+                str(kernelName),
+                max_abs,
+                mean_abs,
+                int(t),
+                int(s),
+                int(d),
+            )
 
         # Optional verbose info + shuffle experiments for diagnosing layout mismatches.
         _verbose = os.environ.get("AITER_FLYDSL_MOE_COMPARE_VERBOSE", "0") in (
@@ -2222,7 +2225,7 @@ def flydsl_moe_stage2(
             "YES",
             "yes",
         )
-        _cmp_s2 = os.environ.get("AITER_FLYDSL_MOE_COMPARE_STAGE2", "1") in (
+        _cmp_s2 = os.environ.get("AITER_FLYDSL_MOE_COMPARE_STAGE2", "0") in (
             "1",
             "true",
             "True",
@@ -2244,7 +2247,11 @@ def flydsl_moe_stage2(
             moe_mode = MoeGemm2Mode.ATOMIC
     except Exception:
         pass
-    logger.info("[flydsl] moe stage2 using mode=%s", str(moe_mode))
+
+
+    debug_flydsl = os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1"
+    if debug_flydsl:
+        logger.info("[flydsl] moe stage2 using mode=%s", str(moe_mode))
 
     stream_ptr = torch.cuda.current_stream().cuda_stream
     thread_size = 256  # if token_num > 128 else 64
