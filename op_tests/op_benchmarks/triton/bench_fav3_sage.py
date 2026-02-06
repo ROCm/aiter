@@ -314,6 +314,7 @@ def fav3_sage_forward_func(
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
     use_mxfp4_sage: bool = False,
+    q_smooth: bool = False,
     include_quantization_overhead: bool = False,
 ):
     head_dim = q.shape[-1]
@@ -331,8 +332,7 @@ def fav3_sage_forward_func(
         )
     else: # exclude quantization overhead
         config = get_sage_fwd_configs(use_mxfp4_sage)
-        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
-        
+        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]    
         
         # Note: softmax_scale is integrated into quantization descaling
         fp8_dtype = aiter.dtypes.fp8
@@ -347,6 +347,7 @@ def fav3_sage_forward_func(
                     fp8_max,
                     BLKQ=BLKQ,
                     BLKK=BLKK,
+                    q_smoothing=q_smooth,
                     layout=layout,
                 )
             )
@@ -503,7 +504,7 @@ def primary_output(result):
     return result
 
 
-def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, use_mxfp4_sage=False):
+def attn_forward_func(q, k, v, func_name, softmax_scale, q_smooth, layout, dtype, use_mxfp4_sage=False):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
@@ -512,6 +513,7 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
             causal=False,
             inference_mode=True,
             layout=layout,
+            q_smooth=q_smooth,
             use_mxfp4_sage=use_mxfp4_sage
         )
     else:
@@ -563,7 +565,7 @@ def bench_kernel(q, k, v, args, provider):
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
     softmax_scale = 1.0 / (D_HEAD**0.5)
-    k_smooth = args.k_smooth
+    q_smooth = args.q_smooth
 
     # FLOPS calculation variables
     total_flops = 0.0
@@ -586,7 +588,7 @@ def bench_kernel(q, k, v, args, provider):
         v,
         func_name=bench_func_name,
         softmax_scale=softmax_scale,
-        k_smooth=k_smooth,
+        q_smooth=q_smooth,
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
         use_mxfp4_sage=use_mxfp4_sage
@@ -610,7 +612,7 @@ def bench_kernel(q, k, v, args, provider):
                 v,
                 func_name=args.ref,
                 softmax_scale=softmax_scale,
-                k_smooth=k_smooth,
+                q_smooth=q_smooth,
                 layout=args.layout,
                 dtype=arg_to_torch_dtype[args.dtype],
             )()
@@ -796,7 +798,7 @@ def parse_args():
         default=False,
         help="Use asm fav3 bf16 kernel (instead of default fav3_sage)",
     )
-    parser.add_argument("-k_smooth", action="store_true", default=True)
+    parser.add_argument("-q_smooth", action="store_true", default=False)
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
     parser.add_argument("--layout", type=str, default="bshd", help=supported_layouts())

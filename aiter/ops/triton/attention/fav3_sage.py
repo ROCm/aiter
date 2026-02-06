@@ -27,7 +27,7 @@ def get_sage_fwd_configs(USE_MXFP4_SAGE=False):
             "BLOCK_N": 128,
             "waves_per_eu": 2,
             "PRE_LOAD_V": False,
-            "num_stages": 5,
+            "num_stages": 3,
             "num_warps": 8,
         }
     if arch == "gfx950":
@@ -88,6 +88,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         return_lse: bool = True,
         layout: str = "bshd",
         USE_MXFP4_SAGE: bool = False,
+        q_smooth: bool = False,
         config: Optional[dict] = None,
     ):
         # 1. Dimension Mapping & Config Setup
@@ -131,6 +132,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                     fp8_max,
                     BLKQ=BLKQ,
                     BLKK=BLKK,
+                    q_smoothing=q_smooth,
                     layout=layout,
                 )
             )
@@ -241,6 +243,7 @@ def fav3_sage_wrapper_func(
     sm_margin: int = 0,
     inference_mode: bool = True,
     layout: str = "bshd",
+    q_smooth: bool = False,
     USE_MXFP4_SAGE: bool = False,
     config: Optional[dict] = None,
 ):
@@ -321,6 +324,7 @@ def fav3_sage_wrapper_func(
         sm_margin,
         return_lse,
         layout,
+        q_smooth,
         USE_MXFP4_SAGE,
         config,
     )
@@ -371,9 +375,6 @@ def fav3_sage_func(
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
     """
-    if USE_MXFP4_SAGE:
-        assert delta_s != None, "Delta_S is needed for mxfp sage attention"
-
     # --- 1. Layout & Dimension Mapping ---
     # bshd: [0,1,2,3], bhsd: [0,2,1,3]
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -457,9 +458,16 @@ def fav3_sage_func(
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
 
     if USE_MXFP4_SAGE:
-        stride_dsz, stride_dsh, stride_dsq, _ = delta_s.stride()
         softmax_scale = softmax_scale or (head_size_qk**-0.5)
         softmax_scale *= 1.4426950408889634
+
+        USE_Q_SMOOTHING = delta_s is not None
+
+        if USE_Q_SMOOTHING:
+            stride_dsz, stride_dsh, stride_dsq, _ = delta_s.stride()
+        else:
+            stride_dsz, stride_dsh, stride_dsq = (None, None, None)
+
         sage_fwd_mxfp4[grid](
             q,
             k,
@@ -543,6 +551,7 @@ def fav3_sage_func(
             USE_ALIBI=False,
             USE_EXP2=True,
             USE_SEQUSED=False,
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING,
             **config,
         )
     else:

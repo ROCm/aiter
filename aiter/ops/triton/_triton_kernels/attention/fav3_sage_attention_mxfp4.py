@@ -62,6 +62,8 @@ def _sage_fwd_no_mask_mxfp4(
     RETURN_SCORES: tl.constexpr,
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
+    ACCUMULATOR_TYPE: tl.constexpr,
+    USE_Q_SMOOTHING: tl.constexpr
 ):
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -69,7 +71,8 @@ def _sage_fwd_no_mask_mxfp4(
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
         k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
-        delta_s_ptrs = delta_s_base_ptrs + start_n
+        if USE_Q_SMOOTHING:
+            delta_s_ptrs = delta_s_base_ptrs + start_n
 
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
         # Load K
@@ -80,7 +83,8 @@ def _sage_fwd_no_mask_mxfp4(
             k = tl.load(k_ptrs)
 
         k_descale = tl.load(k_descale_ptrs)
-        delta_s = tl.load(delta_s_ptrs)
+        if USE_Q_SMOOTHING:
+            delta_s = tl.load(delta_s_ptrs)
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -91,7 +95,10 @@ def _sage_fwd_no_mask_mxfp4(
                 v = tl.load(v_ptrs)
 
         # setup qk accumlator
-        qk = delta_s[None, :].broadcast_to((BLOCK_M, BLOCK_N))
+        if USE_Q_SMOOTHING:
+            qk = delta_s.broadcast_to((BLOCK_M, BLOCK_N))
+        else:
+            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
         # -- compute qk ----
         qk = (
@@ -103,9 +110,8 @@ def _sage_fwd_no_mask_mxfp4(
                 k_descale,
                 K_DTYPE_STR,
                 fast_math=True,
-                acc=qk,
+                acc=qk
             )
-            * SM_SCALE
         )
 
         if USE_ALIBI:
@@ -269,6 +275,8 @@ def _sage_fwd_mask_mxfp4(
     WINDOW_SIZE_RIGHT: tl.constexpr,
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
+    ACCUMULATOR_TYPE: tl.constexpr,
+    USE_Q_SMOOTHING: tl.constexpr
 ):
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
@@ -278,7 +286,8 @@ def _sage_fwd_mask_mxfp4(
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
         k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
-        delta_s_ptrs = delta_s_base_ptrs + start_n
+        if USE_Q_SMOOTHING:
+            delta_s_ptrs = delta_s_base_ptrs + start_n
 
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
@@ -295,14 +304,17 @@ def _sage_fwd_mask_mxfp4(
         k_descale = tl.load(
             k_descale_ptrs, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
         )
-        delta_s = tl.load(delta_s_ptrs, kv_offs_n < seqlen_k, other=0.0)
+        if USE_Q_SMOOTHING:
+            delta_s = tl.load(delta_s_ptrs, kv_offs_n < seqlen_k, other=0.0)
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # setup qk accumlator
-        qk = delta_s[None, :].broadcast_to((BLOCK_M, BLOCK_N))
-
+        if USE_Q_SMOOTHING:
+            qk = delta_s.broadcast_to((BLOCK_M, BLOCK_N))
+        else:
+            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
@@ -327,9 +339,8 @@ def _sage_fwd_mask_mxfp4(
                 k_descale,
                 K_DTYPE_STR,
                 fast_math=True,
-                acc=qk,
+                acc=qk
             )
-            * SM_SCALE
         )
 
         if USE_ALIBI:
@@ -676,8 +687,10 @@ def sage_fwd_mxfp4(
     ENABLE_DROPOUT: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     USE_ALIBI: tl.constexpr,
+    # TODO make this default
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
+    USE_Q_SMOOTHING: tl.constexpr,
 ):
     # set params
     Q_HEAD_DIM_DIVISOR: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
@@ -866,10 +879,13 @@ def sage_fwd_mxfp4(
         k_descale_offset + offs_n[:, None] * stride_ksn + offs_d_qk_s[None, :]
     )
     v_descale_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
-    delta_s_offset = (
-        Delta_S + off_z * stride_dsz + off_h_q * stride_dsh + start_m * stride_dsq
-    )
-    delta_s_ptrs = delta_s_offset + offs_n
+    if USE_Q_SMOOTHING:
+        delta_s_offset = (
+            Delta_S + off_z * stride_dsz + off_h_q * stride_dsh + start_m * stride_dsq
+        )
+        delta_s_ptrs = delta_s_offset + offs_n[None, :]
+    else:
+        delta_s_ptrs = None
 
     q_descale = tl.load(
         q_descale_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0
@@ -964,6 +980,8 @@ def sage_fwd_mxfp4(
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1021,6 +1039,8 @@ def sage_fwd_mxfp4(
             RETURN_SCORES=RETURN_SCORES,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1089,6 +1109,8 @@ def sage_fwd_mxfp4(
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING
         )
 
     # ============================================================
@@ -1232,6 +1254,7 @@ def sage_quant_mxfp4(
     FP8_MAX,
     BLKQ=128,
     BLKK=64,
+    q_smoothing=False,
     layout="bshd",
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
@@ -1256,7 +1279,11 @@ def sage_quant_mxfp4(
 
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
-    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, layout=layout)
+    sm_scale = (head_dim**-0.5) * 1.4426950408889634
+    
+    padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
+
+    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=sm_scale)
 
     sage_quant_v_kernel[grid](
         v,
@@ -1335,6 +1362,7 @@ def _rot_q_kernel(
     Q_rot,
     Q_mean,
     R,  # Hadamard matrix
+    sm_scale: tl.constexpr,
     stride_qb,
     stride_qh,
     stride_qm,
@@ -1346,6 +1374,7 @@ def _rot_q_kernel(
     n_heads,
     seq_len,
     d_model,
+    q_smoothing: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,  # BLOCK_D is 32
 ):
@@ -1380,6 +1409,8 @@ def _rot_q_kernel(
 
     # Rotate: Q_rot = Q @ R
     q_rot_tile = tl.dot(q_tile, r_mat)
+    if sm_scale is not None:
+        q_rot_tile *= sm_scale
 
     # Store rotated Q
     rot_ptr = (
@@ -1392,11 +1423,23 @@ def _rot_q_kernel(
 
     # Calculate mean for the block (reduction over d within the BLOCK_M)
     # q_mean shape: [B, H, Q_NUM_BLKS, D]
-    m_row_mean = (
-        tl.sum(q_rot_tile, axis=0) / BLOCK_M
-    )  # Sum over BLOCK_M -> shape [BLOCK_D]
+    if q_smoothing:
+        m_row_mean = (
+            tl.sum(q_rot_tile, axis=0) / BLOCK_M
+        )  # Sum over BLOCK_M -> shape [BLOCK_D]
 
-    q_rot_tile -= m_row_mean[None, :]
+        q_rot_tile -= m_row_mean[None, :]
+        # Store mean (Atomic add or structured store)
+        # For simplicity in this layout, we store the block-sum
+        # and divide by BLOCK_M in the host or final step
+        mean_ptr = (
+            Q_mean
+            + pid_b * stride_mb
+            + pid_h * stride_mh
+            + pid_m * stride_mm
+            + offs_d * stride_md
+        )
+        tl.store(mean_ptr, m_row_mean)
 
     tl.store(
         rot_ptr,
@@ -1404,17 +1447,7 @@ def _rot_q_kernel(
         mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model),
     )
 
-    # Store mean (Atomic add or structured store)
-    # For simplicity in this layout, we store the block-sum
-    # and divide by BLOCK_M in the host or final step
-    mean_ptr = (
-        Q_mean
-        + pid_b * stride_mb
-        + pid_h * stride_mh
-        + pid_m * stride_mm
-        + offs_d * stride_md
-    )
-    tl.store(mean_ptr, m_row_mean)
+
 
 
 @triton.jit
@@ -1597,8 +1630,9 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     return H
 
 
-def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, layout="bhsd"):
+def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False, sm_scale=None, layout="bhsd"):
     # Generate Hadamard Matrix R (Rank 32)
+    # TODO we might want to manually define this matrix
     R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
@@ -1613,10 +1647,14 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, layout="bhsd"):
     K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
     # TODO check the dtypes for scales
-    q_mean = torch.empty((b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device)
-    delta_s = torch.empty(
-        (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
-    )
+    if q_smoothing:
+        q_mean = torch.empty((b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device)
+        delta_s = torch.empty(
+            (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
+        )
+    else:
+        q_mean = None
+        delta_s = None
 
     stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
     stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
@@ -1628,17 +1666,19 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, layout="bhsd"):
         Q_rot,
         q_mean,
         R,
+        sm_scale,
         stride_qb,
         stride_qh,
         stride_qm,
         stride_qd,
-        q_mean.stride(0),
-        q_mean.stride(1),
-        q_mean.stride(2),
-        q_mean.stride(3),
+        q_mean.stride(0) if q_smoothing else None,
+        q_mean.stride(1) if q_smoothing else None,
+        q_mean.stride(2) if q_smoothing else None,
+        q_mean.stride(3) if q_smoothing else None,
         h_q,
         s_q,
         d,
+        q_smoothing=q_smoothing,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_D=block_size,
     )
@@ -1663,29 +1703,30 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, layout="bhsd"):
     # smooth k after rotation
     k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
-    # 3. Compute Smoothing Delta S
-    # Grid: Each Q-block x Each K-block
-    grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
-    _compute_delta_s_kernel[grid_delta](
-        q_mean,
-        K_rot,
-        delta_s,
-        q_mean.stride(0),
-        q_mean.stride(1),
-        q_mean.stride(2),
-        q_mean.stride(3),
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_kd,
-        delta_s.stride(0),
-        delta_s.stride(1),
-        delta_s.stride(2),
-        delta_s.stride(3),
-        h_k,
-        s_k,
-        d,
-        BLOCK_N=BLOCK_SIZE_M,
-    )
+    if q_smoothing:
+        # 3. Compute Smoothing Delta S
+        # Grid: Each Q-block x Each K-block
+        grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
+        _compute_delta_s_kernel[grid_delta](
+            q_mean,
+            K_rot,
+            delta_s,
+            q_mean.stride(0),
+            q_mean.stride(1),
+            q_mean.stride(2),
+            q_mean.stride(3),
+            stride_kb,
+            stride_kh,
+            stride_kn,
+            stride_kd,
+            delta_s.stride(0),
+            delta_s.stride(1),
+            delta_s.stride(2),
+            delta_s.stride(3),
+            h_k,
+            s_k,
+            d,
+            BLOCK_N=BLOCK_SIZE_M,
+        )
 
     return Q_rot, K_rot, delta_s
