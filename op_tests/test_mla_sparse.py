@@ -67,7 +67,6 @@ def init_3buffer_kv_cache(
 
     # Generate random scale factors
     scale_values = [1.0, 2.0, 4.0, 8.0]
-    # scale_values = [1.0, 1.0, 1.0, 1.0]
     scale_indices = torch.randint(
         0, len(scale_values), size=(num_page, page_size, 1, scale_dim)
     )
@@ -107,8 +106,9 @@ def split_3buffer_kv_cache(
     This is the inverse operation of concatenating after flattening last 3 dimensions.
 
     Args:
-        kv_buffer_bytes: Concatenated buffer (uint8), shape (num_page, page_size*656)
-                        where 656 = 512(nope) + 16(scale) + 128(rope)
+        kv_buffer_bytes: Concatenated buffer (uint8), shape (num_page, page_size * nhead_kv * total_bytes_per_head)
+                        where total_bytes_per_head = kv_lora_rank*1 + scale_dim*4 + qk_rope_head_dim*2
+                        (for example, 656 = 512 + 16 + 128 for specific choices of these dimensions)
         page_size: Size of each page (block size)
         nhead_kv: Number of heads in the KV cache
         kv_lora_rank: Rank of KV LoRA (nope dimension)
@@ -210,7 +210,6 @@ def ref_masked_attention(
         # valid_mask: [seq_k] -> broadcast to [1, 1, seq_k] -> [nhead, seq_q, seq_k]
         attn_bias = torch.zeros_like(attn_weights)
         attn_bias.masked_fill_(~valid_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-        attn_bias.to(query.dtype)
         attn_weights += attn_bias
 
     if is_causal:
@@ -431,7 +430,7 @@ def gather_sparse_kv_buffer(
     """
     page_num, page_size, nhead_kv, head_dim = kv_buffer.shape
     total_kv_page_nums = page_num * page_size
-    num_tokens, num_topk = converted_indices.shape
+
     valid_mask = (converted_indices >= 0) & (converted_indices < total_kv_page_nums)
     safe_indices = torch.where(valid_mask, converted_indices, 0)
     gathered_kv = (kv_buffer.reshape(total_kv_page_nums, nhead_kv, head_dim))[
@@ -662,9 +661,6 @@ def test_mla(
 
     kv_len_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
-    # print(
-    #     f"seq_lens_kv is {seq_lens_kv}, kv_len_indptr is {kv_len_indptr}, kv_block_nums is {kv_block_nums}, kv_indptr is {kv_indptr}"
-    # )
     num_page = kv_indptr[-1].item()
     kv_indices = torch.randperm(num_page, dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -788,11 +784,7 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
-    # num_works = work_indptr[-1].item()
-    # for i in range(num_works):
-    #     print(
-    #         f"work_info_set[{i}, 0]: {work_info_set[i, 0]}, [{i}, 1]: {work_info_set[i, 1]}, [{i}, 2]: {work_info_set[i, 2]}, [{i}, 3]: {work_info_set[i, 3]}, [{i}, 4]: {work_info_set[i, 4]}, [{i}, 5]: {work_info_set[i, 5]}, [{i}, 6]: {work_info_set[i, 6]}"
-    #     )
+
     # generate kv topk per token & convert indices into per token
     token_indices = generate_topk_kv(kv_len_indptr, decode_qlen, topk)
 
@@ -817,13 +809,8 @@ def test_mla(
             page_size=1,
         )
     )
+
     total_kv = new_kv_indptr[-1].item()  # change into pertoken total_kv
-    # print(
-    #     f"new_qo_indptr shape is {new_qo_indptr.shape}, new_qo_indptr is {new_qo_indptr}, "
-    #     f"new_kv_indptr shape is {new_kv_indptr.shape}, new_kv_indptr is {new_kv_indptr}, "
-    #     f"new_kv_last_page_lens shape is {new_kv_last_page_lens.shape}, new_kv_last_page_lens is {new_kv_last_page_lens}, "
-    #     f"new_indices shape is {new_indices.shape}, new_indices is {new_indices}"
-    # )
 
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -835,7 +822,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=False,
+        is_causal=True,
         dtype=out_dtype,
     )
 
@@ -983,7 +970,6 @@ def test_mla(
             )
         )
 
-        # print(f"dense_kv_last_page_lens is {dense_kv_last_page_lens}, dense_kv_indptr is {dense_kv_indptr}, dense_kv_indices is {dense_kv_indices}")
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend_3buffer(
             q,
             kv_buffer_bytes,
@@ -1076,8 +1062,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-# list_nhead = [(16, 2), (48, 1), (128, 2)]
-list_nhead = [(16, 1), (16, 2), (16, 4), (16, 3)]
+list_nhead = [(16, 2), (48, 1), (128, 2)]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1147,8 +1132,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    # default=[21, 64, 256, 512, 1200, 2048, 3200, 5200, 8192],
-    default=[21, 64, 256, 512, 1200, 2048, 3200, 5200],
+    default=[21, 64, 256, 512, 1200, 2048, 3200, 5200, 8192],
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -1157,8 +1141,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    # default=[1, 3, 5, 16, 32, 64, 128, 256],
-    default=[1, 3, 5, 16, 32, 64, 128],
+    default=[1, 3, 5, 16, 32, 64, 128, 256],
     help="""Batch size.
     e.g.: -b 16""",
 )
