@@ -224,7 +224,8 @@ def run_aiter_mla_reduce(
 
 @benchmark()
 def test_mla_prefill(
-    ctx_lens: int,
+    max_qlen: int,
+    max_kvlen: int,
     batch_size: int,
     num_head: int,
     qk_head_dim: int,
@@ -251,15 +252,20 @@ def test_mla_prefill(
 
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    seq_lens_qo = torch.empty(batch_size, dtype=torch.int)
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
     if varlen:
         for i in range(batch_size):
+            seq_lens_qo[i] = max(
+                min(random.normalvariate(max_qlen, max_qlen / 2), max_qlen), 1
+            )
             seq_lens_kv[i] = max(
-                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
+                min(random.normalvariate(max_kvlen, max_kvlen / 2), max_kvlen), 1
             )
     else:
-        seq_lens_kv.fill_(ctx_lens)
-    seq_lens_qo = seq_lens_kv.clone()
+        seq_lens_qo.fill_(max_qlen)
+        seq_lens_kv.fill_(max_kvlen)
+    # seq_lens_qo = seq_lens_kv.clone()
     max_qlen = seq_lens_qo.max().item()
 
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -384,7 +390,7 @@ def test_mla_prefill(
         for name, meta in metadata_map.items():
             file_name = f"{name}.bin"
             torch.set_printoptions(threshold=99999999, linewidth=120)
-            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}")
+            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}", flush=True)
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
     output = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
@@ -448,8 +454,8 @@ def test_mla_prefill(
             2.0
             * batch_size
             * num_head_q
-            * ctx_len
-            * (qk_head_dim * ctx_len + v_head_dim * ctx_len)
+            * max_qlen
+            * (qk_head_dim * max_kvlen + v_head_dim * max_kvlen)
         ) / g_div
         tflops_mla_prefill_asm = ops / us_mla_prefill_asm / (1e6)
         # calulate reduce kernel bandwidth
@@ -567,7 +573,8 @@ def test_mla_prefill(
 
 l_dtype = ["fp8"]
 l_kv_dtype = ["fp8"]
-l_num_heads = [1, 16]
+# l_num_heads = [1, 16]
+l_num_heads = [16]
 l_ctx_len = [
     21,
     64,
@@ -581,7 +588,10 @@ l_ctx_len = [
     16384,
     # 90000,
 ]
-l_batch_size = [1, 4, 16]
+l_max_qlen = [3000]
+l_max_kvlen = [3000, 60000]
+# l_batch_size = [1, 4, 16]
+l_batch_size = list(range(1, 9))
 l_block_size = [1]
 l_varlen = [False]
 l_causal = [True, False]
@@ -635,12 +645,20 @@ parser.add_argument(
     e.g.: -kvd fp8""",
 )
 parser.add_argument(
-    "-c",
-    "--ctx_len",
+    "-q",
+    "--max_qlen",
     type=int,
     default=None,
-    help="""Context length(for prefill, qo_len = kv_len = context_len).
-    e.g.: -c 21""",
+    help="""Max query length.
+    e.g.: -q 21""",
+)
+parser.add_argument(
+    "-kv",
+    "--max_kvlen",
+    type=int,
+    default=None,
+    help="""Max key/value length.
+    e.g.: -kv 21""",
 )
 parser.add_argument(
     "-b",
@@ -702,8 +720,10 @@ if args.kv_dtype is not None:
     l_kvdtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
 if args.num_heads is not None:
     l_num_heads = [args.num_heads]
-if args.ctx_len is not None:
-    l_ctx_len = [args.ctx_len]
+if args.max_qlen is not None:
+    l_max_qlen = [args.max_qlen]
+if args.max_kvlen is not None:
+    l_max_kvlen = [args.max_kvlen]
 if args.batch_size is not None:
     l_batch_size = [args.batch_size]
 if args.block_size is not None:
@@ -724,7 +744,8 @@ for (
     num_head,
     dtype,
     kv_dtype,
-    ctx_len,
+    max_qlen,
+    max_kvlen,
     batch_size,
     block_size,
     varlen,
@@ -733,13 +754,15 @@ for (
     l_num_heads,
     l_dtype,
     l_kvdtype,
-    l_ctx_len,
+    l_max_qlen,
+    l_max_kvlen,
     l_batch_size,
     l_block_size,
     l_varlen,
 ):
     ret = test_mla_prefill(
-        ctx_len,
+        max_qlen,
+        max_kvlen,
         batch_size,
         num_head,
         args.qk_head_dim,
@@ -755,6 +778,7 @@ for (
         skip_reference=args.skip_reference,
     )
     df.append(ret)
+
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("mla_prefill_ps summary (markdown):\n%s", df_md)
