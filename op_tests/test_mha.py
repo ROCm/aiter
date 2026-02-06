@@ -353,6 +353,45 @@ def test_flash_attn_output(
     print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
     print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
 
+    # --- Debug: Print mismatch point indices and values ---
+    def print_mismatch_info(name, tensor_aiter, tensor_ref, tensor_pt):
+        diff = (tensor_aiter - tensor_ref).abs()
+        max_diff = diff.max().item()
+        if max_diff > 0:
+            # Find max diff location
+            max_idx = torch.unravel_index(torch.argmax(diff), diff.shape)
+            coords = tuple(idx.item() for idx in max_idx)
+            print(f"\n--- {name} Mismatch Details ---")
+            print(f"  Max diff: {max_diff}")
+            print(f"  Max diff coords (batch, seq, head, dim): {coords}")
+            print(f"  Aiter value:  {tensor_aiter[max_idx].item()}")
+            print(f"  Ref value:    {tensor_ref[max_idx].item()}")
+            print(f"  PyTorch value: {tensor_pt[max_idx].item()}")
+            print(f"  Aiter-Ref diff: {(tensor_aiter[max_idx] - tensor_ref[max_idx]).item()}")
+            print(f"  PyTorch-Ref diff: {(tensor_pt[max_idx] - tensor_ref[max_idx]).item()}")
+            
+            # Print top 5 largest mismatches (handle large tensors)
+            flat_diff = diff.flatten()
+            top_k = 5
+            if flat_diff.numel() <= 2**31 - 1:
+                # Small enough for topk
+                top_k = min(top_k, flat_diff.numel())
+                top_vals, top_indices = torch.topk(flat_diff, top_k)
+                print(f"  Top {top_k} mismatches:")
+                for i in range(top_k):
+                    idx = torch.unravel_index(top_indices[i], diff.shape)
+                    coords = tuple(ix.item() for ix in idx)
+                    print(f"    [{i+1}] coords={coords}, diff={top_vals[i].item():.6f}, "
+                          f"aiter={tensor_aiter[idx].item():.6f}, ref={tensor_ref[idx].item():.6f}")
+            else:
+                # Tensor too large for topk, just show the max
+                print(f"  (Tensor too large for top-k analysis, showing max only)")
+    
+    print_mismatch_info("dQ", dq, dq_ref, dq_pt)
+    print_mismatch_info("dK", dk, dk_ref, dk_pt)
+    print_mismatch_info("dV", dv, dv_ref, dv_pt)
+    # --- End Debug ---
+
     dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
     dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
     dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)

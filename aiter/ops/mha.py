@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Any, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
 
 from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
+
+# Environment variables to control v3 kernel usage
+# Set AITER_DISABLE_V3_FWD=1 to disable v3 forward kernel
+# Set AITER_DISABLE_V3_BWD=1 to disable v3 backward kernel
+AITER_DISABLE_V3_FWD = os.environ.get("AITER_DISABLE_V3_FWD", "0") == "1"
+AITER_DISABLE_V3_BWD = os.environ.get("AITER_DISABLE_V3_BWD", "0") == "1"
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
@@ -1253,9 +1260,11 @@ def _flash_attn_forward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal and window_size_left == -1  # causal mask
+    mask = causal and window_size_left == -1  # causal mask (top_left)
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    # bottom_right causal has window_size_left >= 0 and window_size_right == 0
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     def can_impl_fmha_v3_fwd():
         # basic
@@ -1284,7 +1293,7 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
-    if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
+    if can_impl_fmha_v3_fwd() and seqlen_q > 128 and not AITER_DISABLE_V3_FWD:  # Prefer CK for decode cases
         out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
@@ -1376,9 +1385,11 @@ def can_impl_fmha_v3_bwd(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal and window_size_left == -1  # causal mask
+    mask = causal and window_size_left == -1  # causal mask (top_left)
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    # bottom_right causal has window_size_left >= 0 and window_size_right == 0
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     def np():
         # bwd_hd128_bf16_a16_rtne
@@ -1602,7 +1613,8 @@ def _flash_attn_backward(
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     # only 1 block when sk <= 256, thus deterministic
     is_950_1block = (
@@ -1615,23 +1627,32 @@ def _flash_attn_backward(
 
     def can_impl_fmha_v3_bwd_gfx950():
         ret = get_gfx() == "gfx950"
+        print(f"[DEBUG] gfx950 check: {ret}, gfx={get_gfx()}")
         ret &= alibi_slopes is None
+        print(f"[DEBUG] alibi_slopes is None: {alibi_slopes is None}, ret={ret}")
         ret &= bias is None
+        print(f"[DEBUG] bias is None: {bias is None}, ret={ret}")
         ret &= dbias is None
+        print(f"[DEBUG] dbias is None: {dbias is None}, ret={ret}")
         ret &= dropout_p == 0.0
+        print(f"[DEBUG] dropout_p == 0.0: {dropout_p == 0.0}, ret={ret}")
         ret &= not deterministic or is_950_1block
+        print(f"[DEBUG] not deterministic or is_950_1block: {not deterministic or is_950_1block}, det={deterministic}, 1block={is_950_1block}, ret={ret}")
         ret &= nhead_q % nhead_k == 0
+        print(f"[DEBUG] nhead_q % nhead_k == 0: {nhead_q % nhead_k == 0}, nhead_q={nhead_q}, nhead_k={nhead_k}, ret={ret}")
         ret &= (
-            (hdim_q > 64 and hdim_q <= 128)
-            or (hdim_q == 192 and hdim_v == 128 and nmask)
+            (hdim_q > 64 and hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)
         ) and hdim_q % 8 == 0
+        print(f"[DEBUG] hdim check: hdim_q={hdim_q}, hdim_v={hdim_v}, ret={ret}")
         ret &= not swa
+        print(f"[DEBUG] not swa: {not swa}, swa={swa}, causal={causal}, window_size_left={window_size_left}, window_size_right={window_size_right}, ret={ret}")
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+    print(f"[DEBUG] Final can_impl_fmha_v3_bwd_ = {can_impl_fmha_v3_bwd_}, seqlen_q={seqlen_q}, AITER_DISABLE_V3_BWD={AITER_DISABLE_V3_BWD}")
 
     if (
-        can_impl_fmha_v3_bwd_ and seqlen_q > 16
+        can_impl_fmha_v3_bwd_ and seqlen_q > 16 and not AITER_DISABLE_V3_BWD
     ):  # ck fmha bwd has optimization for seqlen_q <= 16
         if dq is not None:
             dq.zero_()
@@ -1869,6 +1890,7 @@ def flash_attn_func(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,  # True=A32 kernel, False=A16 kernel
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1935,7 +1957,7 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
-        True,  # is_v3_atomic_fp32
+        is_v3_atomic_fp32,  # True=A32 kernel, False=A16 kernel
         how_v3_bf16_cvt,
         cu_seqlens_q,
         cu_seqlens_kv,
@@ -1988,11 +2010,12 @@ def _flash_attn_varlen_forward(
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
     sink_size = 0 if sink_size >= max_seqlen_k else sink_size
-    mask = causal == True and window_size_left == -1  # causal mask
+    mask = causal == True and window_size_left == -1  # causal mask (top_left)
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
     )  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     def can_impl_fmha_v3_fwd():
         # basic
@@ -2009,7 +2032,7 @@ def _flash_attn_varlen_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_v3_fwd():
+    if can_impl_fmha_v3_fwd() and not AITER_DISABLE_V3_FWD:
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,
@@ -2127,11 +2150,12 @@ def _flash_attn_varlen_backward(
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
-    mask = causal == True and window_size_left == -1  # causal mask
+    mask = causal == True and window_size_left == -1  # causal mask (top_left)
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
     )  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     def pssk():
         # only for hd64 a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
@@ -2211,7 +2235,7 @@ def _flash_attn_varlen_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
 
-    if can_impl_fmha_v3_bwd_:
+    if can_impl_fmha_v3_bwd_ and not AITER_DISABLE_V3_BWD:
         (
             dq,
             dk,
@@ -2511,6 +2535,7 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,  # True=A32 kernel, False=A16 kernel
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -2599,7 +2624,7 @@ def flash_attn_varlen_func(
         torch.is_grad_enabled(),
         cu_seqlens_q_padded,
         cu_seqlens_k_padded,
-        True,
+        is_v3_atomic_fp32,  # True=A32 kernel, False=A16 kernel
         how_v3_bf16_cvt,
         sink_ptr,
     )

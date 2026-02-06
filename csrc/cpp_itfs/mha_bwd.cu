@@ -337,6 +337,10 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* co_name = cfg.co_name.c_str();
         ts_kv               = cfg.ts;
 
+        // Debug: print which kernel is being used
+        std::cout << "[aiter] BWD kernel selected: " << co_name << " (knl: " << name << ")" << std::endl;
+        std::cout.flush();
+        
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
