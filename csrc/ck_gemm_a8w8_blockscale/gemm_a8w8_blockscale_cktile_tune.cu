@@ -12,7 +12,7 @@
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, bool)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.

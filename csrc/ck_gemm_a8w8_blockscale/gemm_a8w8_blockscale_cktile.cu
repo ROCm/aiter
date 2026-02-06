@@ -14,7 +14,7 @@
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, bool)>;
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash
@@ -83,7 +83,7 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     }
 
     // Default tile kernel
-    return a8w8_blockscale_cktile_128x128x128_1x4x1_16x16x128_intrawave_0x0x0_1<DDataType,
+    return a8w8_blockscale_cktile_128x128x128_1x4x1_16x16x64_intrawave_0x1x0_1<DDataType,
                                                                                EDataType>;
 }
 

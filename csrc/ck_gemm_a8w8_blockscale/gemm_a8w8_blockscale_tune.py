@@ -121,7 +121,7 @@ def generate_data(m, n, k, seed, device="cuda"):
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
     weight_shuffle = shuffle_weight(weight, layout=(16, 16))
-    w_scale_shuffle = shuffle_bq(w_scale, block_shape_k / 128)  #  #TODO: instead of block_shape_k it should be k_tile / group_k
+    w_scale_shuffle = shuffle_bq(w_scale, block_shape_k // 128)  #  #TODO: instead of block_shape_k it should be k_tile / group_k
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     return (x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t, w_scale_shuffle)
@@ -204,15 +204,18 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ):
         cu_num, M, N, K = info_keys
         #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
-        kernel_list = candidate_kernels_cktile_dict
+        kernel_list = candidate_kernels_cktile_dict #TODO: fix for candidate list based on diff scenario
         kernels_num = len(kernel_list)
         #gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 3]
         tasks_cktile = []
         for i in range(kernels_num):
             kernel = kernel_list[i]
-            if not get_gfx().startswith("gfx95") and (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp) == 8:
-                continue
+            if not get_gfx().startswith("gfx95"):
+                if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8) or (
+                    kernel.K_Warp_Tile > 64
+                ):
+                    continue
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -235,7 +238,18 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         (M, N, K, seed),
                         run_gemm_a8w8_blockscale_cktile,
                         (
-                            [0, 5 if preshuffleB else 1, 6 if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp) == 8 else 2, 7 if preshuffleQuantB else 3, 4],
+                            [
+                                0,
+                                5 if preshuffleB else 1,
+                                (
+                                    6
+                                    if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp)
+                                    == 8
+                                    else 2
+                                ),
+                                7 if preshuffleQuantB else 3,
+                                4,
+                            ],
                             i,
                             splitK,
                             preshuffleB,
@@ -265,7 +279,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleQuantB,
     ):
         cu_num, M, N, K = info_keys
-        kernel_list = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
+        kernel_list = (
+            candidate_kernels_bpreshuffle_dict
+            if preshuffleB
+            else candidate_kernels_dict
+        )
         kernels_num = len(kernel_list)
         gemm_a8w8_idx = [0, 5, 6, 3, 4] if preshuffleB else [0, 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 3]
