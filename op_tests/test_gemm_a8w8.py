@@ -19,6 +19,7 @@ from functools import lru_cache
 # pd.set_option('display.max_columns', 100)
 # pd.set_option('display.width', 1000)
 TEST_NUM_ITERS = 100
+ASM_KERNEL_NAME = "_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_80x128E"
 
 
 _TUNED_SHAPES_CACHE = None
@@ -91,7 +92,17 @@ def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
+    out = torch.empty(x.shape[0], weightshuffle.shape[0], dtype=dtype, device=x.device)
+    return aiter.gemm_a8w8_asm(
+        x,
+        weightshuffle,
+        x_scale,
+        w_scale,
+        out,
+        ASM_KERNEL_NAME,
+        bias,
+        splitK=1,
+    )
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -111,12 +122,23 @@ def init_hipblas():
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
-    dim = (m, n, k)
+def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128):
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
     weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
+    pad_k = max(pad_a, 0)
+    if pad_k > 0:
+        x_full = torch.empty_strided(
+            (m, k + pad_k),
+            (k + pad_k, 1),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        x_full[:, :k] = x
+        x_asm = x_full[:, :k]
+    else:
+        x_asm = x
     weightshuffle = shuffle_weight(weight, layout=(16, 16))
 
     # CK fp8 kernel set bias=None
@@ -130,7 +152,6 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
-
     shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(m, n, k, quantDtype)
     if shape_is_tuned:
         err_b = checkAllclose(
@@ -154,18 +175,10 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
 
     avg_d = None
     err_d = None
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-    if (
-        dtype == dtypes.bf16
-        and quantDtype == dtypes.i8
-        and bias is not None
-        and cu_num == 80
-    ):
-        weightshuffle_asm = shuffle_weight(weight, layout=(32, 16))
+    if dtype == dtypes.bf16 and quantDtype == dtypes.i8 and bias is not None:
         bias_f32 = bias.to(dtypes.fp32)
-        d, avg_d = run_gemm_asm(x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)
+        d, avg_d = run_gemm_asm(x_asm, weightshuffle, x_scale, w_scale, bias_f32, dtype)
+        err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
         if d is not None:
             err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
         else:
@@ -317,12 +330,12 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
-def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk):
+def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk, pad_a=0):
     df = []
     for dtype in l_dtype:
         for quantDtype in l_quantDtype:
             for m, n, k in l_mnk:
-                ret = test_gemm(dtype, m, n, k, quantDtype)
+                ret = test_gemm(dtype, m, n, k, quantDtype, pad_a=pad_a)
                 df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
@@ -463,6 +476,12 @@ parser.add_argument(
     help="""Shape of mnk.
     e.g. -mnk 1280,8192,1024""",
 )
+parser.add_argument(
+    "--pad_a",
+    type=int,
+    default=128,
+    help="Pad A on K dimension, stride_a = K + pad_a.",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -476,5 +495,5 @@ else:
 if args.mnk is not None:
     l_mnk_nm = [args.mnk]
 
-test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
+test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm, pad_a=args.pad_a)
 test_skinny_gemm_a8w8_pertoken_quant()

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_i8gemm_configs.hpp"
 #include "py_itfs_common.h"
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 // start to prepare the input and output buffer
 struct __attribute__((packed)) KernelArgs
@@ -59,8 +59,13 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
     }
 };
 
-std::tuple<std::string, int> get_heuristic_kernel(
-    int M, int N, int K, std::string arch_id, std::optional<int> k_split, std::optional<bool> bpreshuffle, CFG* cfgs)
+std::tuple<std::string, int> get_heuristic_kernel(int M,
+                                                  int N,
+                                                  int K,
+                                                  std::string arch_id,
+                                                  std::optional<int> k_split,
+                                                  std::optional<bool> bpreshuffle,
+                                                  CFG* cfgs)
 {
     k_split = k_split.value_or(0) ?: 1;
     hipDevice_t dev;
@@ -98,13 +103,13 @@ std::tuple<std::string, int> get_heuristic_kernel(
 
                 for(auto& splitK : splitK_list)
                 {
-                    int tg_num_M         = (M + cfg.tile_m - 1) / cfg.tile_m; 
+                    int tg_num_M         = (M + cfg.tile_m - 1) / cfg.tile_m;
                     int tg_num_N         = (N + cfg.tile_n - 1) / cfg.tile_n;
                     tg_num               = tg_num_M * tg_num_N * splitK;
                     uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
 
                     float local_compute2mem_effi =
-                        cfg.tile_m * cfg.tile_n / (cfg.tile_m + cfg.tile_n); 
+                        cfg.tile_m * cfg.tile_n / (cfg.tile_m + cfg.tile_n);
 
                     bool is_earlier_round        = (local_round < round);
                     bool is_same_round           = (local_round == round);
@@ -143,12 +148,9 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
     int Mdim     = A.size(0);
     int Ndim     = out.size(1);
     int Kdim     = A.size(1);
-    int pad_a    = 0;
-    int pad_b    = 0;
-    int pad_c    = 0;
-    int stride_a = Kdim + pad_a;
-    int stride_b = Kdim + pad_b;
-    int stride_c = Ndim + pad_c;
+    int stride_a = A.stride(0);
+    int stride_b = B.stride(0);
+    int stride_c = out.stride(0);
     stride_c     = stride_c * sizeof(uint16_t);
     int ks       = splitK.value_or(0) ?: 1;
 
@@ -171,8 +173,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    CFG* config_map           = get_cfg(A, out);
-    using DictKey             = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
+    CFG* config_map          = get_cfg(A, out);
+    using DictKey            = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
     struct SimpleHash
     {
         size_t operator()(const DictKey& key) const
@@ -194,7 +196,7 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
     kernelName          = kernelName.empty() ? "" : arch_id + kernelName;
-    int selectedksplit = splitK.value_or(0) ?: 1;
+    int selectedksplit  = splitK.value_or(0) ?: 1;
     if(kernelName.empty())
     {
         auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, splitK, bpreshuffle));
@@ -206,7 +208,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
         }
         else
         {
-            auto it = get_heuristic_kernel(Mdim, Ndim, Kdim, arch_id, splitK, bpreshuffle, config_map);
+            auto it =
+                get_heuristic_kernel(Mdim, Ndim, Kdim, arch_id, splitK, bpreshuffle, config_map);
 
             kernelName     = std::get<0>(it);
             selectedksplit = std::get<1>(it);

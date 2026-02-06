@@ -1,3 +1,4 @@
 tile_m,tile_n,splitK,bpreshuffle,knl_name,co_name
+80,128,1,1,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_80x128E,I8gemm_bf16_perTokenI8_BpreShuffle_80x128.co
 128,128,1,1,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_128x128E,I8gemm_bf16_perTokenI8_BpreShuffle_128x128.co
 192,128,1,1,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,I8gemm_bf16_perTokenI8_BpreShuffle_192x128.co
