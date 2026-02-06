@@ -1,0 +1,234 @@
+[aiter INFO] 2025-11-20 07:02:31.964 - MainProcess:11547 - /home/memin/code/aiter/aiter/jit/core.py:133 - get_config_file
+merge tuned file under model_configs/ and configs/ /home/memin/code/aiter/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_dsv3.csv
+[aiter INFO] 2025-11-20 07:02:32.082 - MainProcess:11547 - /home/memin/code/aiter/aiter/jit/core.py:133 - get_config_file
+merge tuned file under model_configs/ and configs/ /home/memin/code/aiter/aiter/configs/a8w8_blockscale_tuned_gemm.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_ds_v3.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_qwen3_235b.csv
+[aiter INFO] 2025-11-20 07:02:32.090 - MainProcess:11547 - /home/memin/code/aiter/aiter/jit/core.py:133 - get_config_file
+merge tuned file under model_configs/ and configs/ /home/memin/code/aiter/aiter/configs/tuned_fmoe.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_fmoe_qwen3_235b.csv
+[aiter INFO] 2025-11-20 07:02:32.103 - MainProcess:11547 - /home/memin/code/aiter/aiter/jit/core.py:133 - get_config_file
+merge tuned file under model_configs/ and configs/ /home/memin/code/aiter/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3.csv
+[aiter INFO] 2025-11-20 07:02:32.452 - MainProcess:11547 - /home/memin/code/aiter/aiter/jit/core.py:410 - get_module_custom_op
+import [module_aiter_enum] under /home/memin/code/aiter/aiter/jit/module_aiter_enum.so
+[aiter INFO] 2025-11-20 07:02:32.453 - MainProcess:11547 - /home/memin/code/aiter/aiter/test_common.py:214 - log_args
+
+calling _ActivationType(dummy                        = 0)
+[aiter INFO] 2025-11-20 07:02:32.453 - MainProcess:11547 - /home/memin/code/aiter/aiter/test_common.py:214 - log_args
+
+calling _QuantType(dummy                        = 0)
+[aiter INFO] 2025-11-20 07:02:33.155 - MainProcess:11547 - /home/memin/code/aiter/aiter/jit/core.py:410 - get_module_custom_op
+import [module_fmha_v3_varlen_fwd] under /home/memin/code/aiter/aiter/jit/module_fmha_v3_varlen_fwd.so
+[aiter WARNING] 2025-11-20 07:02:33.156 - MainProcess:11547 - /home/memin/code/aiter/aiter/jit/core.py:860 - check_args
+type hints mismatch, override to --> fmha_v3_varlen_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens_q: torch.Tensor, cu_seqlens_k: Optional[torch.Tensor], max_seqlen_q: int, max_seqlen_k: int, min_seqlen_q: int, dropout_p: float, softmax_scale: float, logits_soft_cap: float, zero_tensors: bool, is_causal: bool, window_size_left: int, window_size_right: int, return_softmax_lse: bool, return_dropout_randval: bool, how_v3_bf16_cvt: int, out: Optional[torch.Tensor] = None, block_table: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+[aiter INFO] 2025-11-20 07:02:33.156 - MainProcess:11547 - /home/memin/code/aiter/aiter/test_common.py:214 - log_args
+
+calling fmha_v3_varlen_fwd(q                            = torch.Size([1459, 32, 128]) torch.bfloat16 cuda:0 0x7f85a9200000,
+                           k                            = torch.Size([5555, 8, 128]) torch.bfloat16 cuda:0 0x7f85aa800000,
+                           v                            = torch.Size([5555, 8, 128]) torch.bfloat16 cuda:0 0x7f5d7c800000,
+                           cu_seqlens_q                 = torch.Size([2]) torch.int32 cuda:0 0x7f5d7c400000,
+                           cu_seqlens_k                 = torch.Size([2]) torch.int32 cuda:0 0x7f5d7c400400,
+                           max_seqlen_q                 = 2048,
+                           max_seqlen_k                 = 2048,
+                           min_seqlen_q                 = 1,
+                           dropout_p                    = 0.0,
+                           softmax_scale                = 0.1352337788608801,
+                           logits_soft_cap              = 0.0,
+                           zero_tensors                 = False,
+                           is_causal                    = True,
+                           window_size_left             = -1,
+                           window_size_right            = 0,
+                           return_softmax_lse           = False,
+                           return_dropout_randval       = False,
+                           how_v3_bf16_cvt              = 1,
+                           out                          = torch.Size([1459, 32, 128]) torch.bfloat16 cuda:0 0x7f5d7b600000,
+                           block_table                  = None,
+                           bias                         = None,
+                           alibi_slopes                 = None,
+                           gen                          = None)
+q shape is torch.Size([1459, 32, 128]), stride is (6144, 128, 1)
+k shape is torch.Size([5555, 8, 128]), stride is (1024, 128, 1)
+v shape is torch.Size([5555, 8, 128]), stride is (1024, 128, 1)
+cu_seqlens_q is tensor([   0, 1459], device='cuda:0', dtype=torch.int32)
+cu_seqlens_k is tensor([   0, 5555], device='cuda:0', dtype=torch.int32)
+tensor([[[-8.6719e-01,  1.8750e-01,  7.8613e-02,  ...,  8.0078e-02,
+           7.7148e-02,  6.5234e-01],
+         [-1.2812e+00, -1.2891e-01,  2.4609e-01,  ...,  8.3496e-02,
+          -4.2383e-01, -1.1035e-01],
+         [-5.9375e-01,  1.5918e-01,  2.3828e-01,  ...,  2.0508e-01,
+           4.6631e-02,  1.8945e-01],
+         ...,
+         [-3.3203e-01, -3.1250e-01,  6.6406e-01,  ..., -3.2227e-01,
+           1.4746e-01,  4.9219e-01],
+         [-2.1240e-02, -3.0078e-01, -1.6406e-01,  ..., -4.8047e-01,
+           5.8105e-02,  3.2617e-01],
+         [-7.5195e-02, -1.7188e-01,  4.5312e-01,  ..., -1.9922e-01,
+           1.4062e-01,  3.2422e-01]],
+
+        [[-6.9531e-01,  1.0889e-01,  2.6758e-01,  ...,  8.5449e-02,
+          -2.3438e-01,  3.2617e-01],
+         [-8.4766e-01,  2.4414e-02, -1.4771e-02,  ...,  7.1777e-02,
+           9.6680e-02,  5.1953e-01],
+         [-7.3828e-01, -6.1951e-03,  1.4954e-02,  ...,  4.1016e-02,
+          -8.0078e-02,  3.6133e-01],
+         ...,
+         [-5.0293e-02, -2.2363e-01,  6.7188e-01,  ..., -1.8750e-01,
+           1.1084e-01,  3.5156e-01],
+         [ 1.4746e-01, -4.2969e-01, -1.9434e-01,  ..., -3.1250e-01,
+          -2.7710e-02,  2.1094e-01],
+         [-8.2031e-02, -2.0703e-01,  2.5391e-01,  ..., -1.1621e-01,
+           1.5820e-01,  2.3633e-01]],
+
+        [[-6.6797e-01,  2.4121e-01,  1.0559e-02,  ...,  1.4160e-01,
+          -5.8350e-02,  5.4688e-01],
+         [-8.0078e-01,  1.6113e-01,  1.7700e-02,  ...,  1.8457e-01,
+           1.5234e-01,  4.6680e-01],
+         [-3.6914e-01,  2.4512e-01,  1.0010e-01,  ...,  1.4062e-01,
+           5.3101e-03,  4.5508e-01],
+         ...,
+         [ 1.2207e-01, -3.1250e-01,  5.5469e-01,  ...,  3.7842e-02,
+           4.8828e-02,  2.0703e-01],
+         [ 1.7188e-01, -3.2812e-01,  1.0449e-01,  ..., -2.2852e-01,
+          -2.1484e-02,  2.5977e-01],
+         [ 7.6660e-02, -2.6562e-01,  2.1289e-01,  ..., -1.7383e-01,
+          -3.0823e-03,  2.8516e-01]],
+
+        ...,
+
+        [[-6.9922e-01,  2.0703e-01,  1.3611e-02,  ...,  1.4941e-01,
+          -1.2779e-04,  6.0547e-01],
+         [-9.6094e-01,  6.5918e-02,  1.1084e-01,  ...,  1.0156e-01,
+          -1.3672e-01,  2.6367e-01],
+         [-7.6562e-01,  3.3594e-01,  4.9561e-02,  ...,  3.9648e-01,
+          -2.0508e-02,  2.4023e-01],
+         ...,
+         [-9.8145e-02, -2.8711e-01,  3.6523e-01,  ..., -8.2031e-02,
+          -5.4626e-03,  2.4414e-01],
+         [ 4.2236e-02, -3.0664e-01, -2.8711e-01,  ..., -5.5469e-01,
+           4.5898e-02,  2.3145e-01],
+         [ 6.7871e-02, -2.3535e-01,  1.4160e-01,  ...,  2.9785e-02,
+          -1.7456e-02,  2.0117e-01]],
+
+        [[-6.3672e-01,  9.5215e-02, -1.7700e-02,  ...,  8.0566e-02,
+           1.2158e-01,  6.3672e-01],
+         [-9.8047e-01,  4.0039e-02,  1.3965e-01,  ...,  1.4551e-01,
+          -2.2852e-01,  1.1475e-01],
+         [-1.2109e+00, -1.0791e-01,  1.8359e-01,  ..., -2.3633e-01,
+          -2.3145e-01,  4.8828e-01],
+         ...,
+         [-1.7188e-01, -2.2461e-01,  4.6094e-01,  ..., -1.7676e-01,
+           1.8652e-01,  2.1875e-01],
+         [ 1.1523e-01, -3.3203e-01, -2.1289e-01,  ..., -3.1055e-01,
+           5.9082e-02,  2.0020e-01],
+         [-2.2949e-01, -2.6953e-01,  1.1963e-01,  ..., -9.1309e-02,
+           4.9744e-03,  1.6797e-01]],
+
+        [[-5.8594e-01,  2.9785e-02,  4.9219e-01,  ...,  9.1309e-02,
+          -1.8164e-01,  8.2422e-01],
+         [-8.2422e-01,  1.6895e-01, -1.5488e-03,  ...,  1.5430e-01,
+           1.6602e-01,  6.5625e-01],
+         [-4.6875e-01,  2.1680e-01,  4.0234e-01,  ...,  1.9922e-01,
+          -1.7578e-01,  5.1172e-01],
+         ...,
+         [-3.6133e-02, -1.9336e-01,  1.8945e-01,  ..., -2.0898e-01,
+           9.2285e-02,  1.9141e-01],
+         [ 3.9551e-02, -1.7676e-01, -5.5176e-02,  ..., -1.7383e-01,
+          -7.4219e-02,  2.0703e-01],
+         [-2.7344e-02, -8.1543e-02,  4.8633e-01,  ..., -9.6191e-02,
+          -1.2573e-02,  2.1191e-01]]], device='cuda:0', dtype=torch.bfloat16,
+       grad_fn=<FlashAttnVarlenFuncBackward>)
+attn_softmax shape is torch.Size([1459, 32, 128]), stride is (4096, 128, 1)
+tensor([[[-8.6719e-01,  1.8750e-01,  7.8613e-02,  ...,  8.0078e-02,
+           7.7148e-02,  6.5234e-01],
+         [-1.2812e+00, -1.2891e-01,  2.4609e-01,  ...,  8.3496e-02,
+          -4.2383e-01, -1.1035e-01],
+         [-5.9375e-01,  1.5918e-01,  2.3828e-01,  ...,  2.0508e-01,
+           4.6631e-02,  1.8945e-01],
+         ...,
+         [-3.3203e-01, -3.1250e-01,  6.6406e-01,  ..., -3.2227e-01,
+           1.4746e-01,  4.9219e-01],
+         [-2.1240e-02, -3.0078e-01, -1.6406e-01,  ..., -4.8047e-01,
+           5.8105e-02,  3.2617e-01],
+         [-7.5195e-02, -1.7188e-01,  4.5312e-01,  ..., -1.9922e-01,
+           1.4062e-01,  3.2422e-01]],
+
+        [[-6.9531e-01,  1.0889e-01,  2.6758e-01,  ...,  8.5938e-02,
+          -2.3438e-01,  3.2617e-01],
+         [-8.4766e-01,  2.4414e-02, -1.4771e-02,  ...,  7.1777e-02,
+           9.6680e-02,  5.1953e-01],
+         [-7.3828e-01, -6.1951e-03,  1.4954e-02,  ...,  4.1016e-02,
+          -8.0078e-02,  3.6133e-01],
+         ...,
+         [-5.0293e-02, -2.2363e-01,  6.7188e-01,  ..., -1.8750e-01,
+           1.1084e-01,  3.5156e-01],
+         [ 1.4746e-01, -4.2969e-01, -1.9434e-01,  ..., -3.1250e-01,
+          -2.7710e-02,  2.1094e-01],
+         [-8.2031e-02, -2.0703e-01,  2.5391e-01,  ..., -1.1621e-01,
+           1.5820e-01,  2.3633e-01]],
+
+        [[-6.6797e-01,  2.4121e-01,  1.0559e-02,  ...,  1.4160e-01,
+          -5.8350e-02,  5.4688e-01],
+         [-8.0078e-01,  1.6113e-01,  1.7700e-02,  ...,  1.8457e-01,
+           1.5234e-01,  4.6680e-01],
+         [-3.6914e-01,  2.4512e-01,  1.0010e-01,  ...,  1.4062e-01,
+           5.2795e-03,  4.5508e-01],
+         ...,
+         [ 1.2207e-01, -3.1250e-01,  5.5469e-01,  ...,  3.7842e-02,
+           4.8828e-02,  2.0703e-01],
+         [ 1.7188e-01, -3.2812e-01,  1.0449e-01,  ..., -2.2852e-01,
+          -2.1484e-02,  2.5977e-01],
+         [ 7.6660e-02, -2.6562e-01,  2.1289e-01,  ..., -1.7383e-01,
+          -3.1128e-03,  2.8516e-01]],
+
+        ...,
+
+        [[-6.9922e-01,  2.0703e-01,  1.3733e-02,  ...,  1.4941e-01,
+          -1.0443e-04,  6.0547e-01],
+         [-9.6094e-01,  6.5918e-02,  1.1084e-01,  ...,  1.0156e-01,
+          -1.3672e-01,  2.6367e-01],
+         [-7.6562e-01,  3.3594e-01,  4.9561e-02,  ...,  3.9648e-01,
+          -2.0508e-02,  2.4023e-01],
+         ...,
+         [-9.8633e-02, -2.8711e-01,  3.6523e-01,  ..., -8.2031e-02,
+          -5.3711e-03,  2.4414e-01],
+         [ 4.2236e-02, -3.0664e-01, -2.8711e-01,  ..., -5.5469e-01,
+           4.5654e-02,  2.3145e-01],
+         [ 6.7871e-02, -2.3535e-01,  1.4160e-01,  ...,  2.9663e-02,
+          -1.7334e-02,  2.0117e-01]],
+
+        [[-6.3672e-01,  9.5703e-02, -1.7700e-02,  ...,  8.1055e-02,
+           1.2158e-01,  6.3672e-01],
+         [-9.8047e-01,  4.0039e-02,  1.3965e-01,  ...,  1.4551e-01,
+          -2.2852e-01,  1.1475e-01],
+         [-1.2109e+00, -1.0791e-01,  1.8359e-01,  ..., -2.3633e-01,
+          -2.3145e-01,  4.8828e-01],
+         ...,
+         [-1.7188e-01, -2.2461e-01,  4.6094e-01,  ..., -1.7676e-01,
+           1.8652e-01,  2.1973e-01],
+         [ 1.1523e-01, -3.3203e-01, -2.1289e-01,  ..., -3.1055e-01,
+           5.9082e-02,  2.0020e-01],
+         [-2.2949e-01, -2.6953e-01,  1.2012e-01,  ..., -9.1309e-02,
+           5.0049e-03,  1.6797e-01]],
+
+        [[-5.8594e-01,  2.9785e-02,  4.9219e-01,  ...,  9.1309e-02,
+          -1.8164e-01,  8.2422e-01],
+         [-8.2422e-01,  1.6895e-01, -1.5030e-03,  ...,  1.5430e-01,
+           1.6602e-01,  6.5625e-01],
+         [-4.6875e-01,  2.1680e-01,  4.0234e-01,  ...,  1.9922e-01,
+          -1.7578e-01,  5.1172e-01],
+         ...,
+         [-3.6133e-02, -1.9434e-01,  1.8945e-01,  ..., -2.0898e-01,
+           9.2285e-02,  1.9141e-01],
+         [ 3.9551e-02, -1.7676e-01, -5.5176e-02,  ..., -1.7285e-01,
+          -7.4707e-02,  2.0703e-01],
+         [-2.7466e-02, -8.1543e-02,  4.8633e-01,  ..., -9.6191e-02,
+          -1.2634e-02,  2.1191e-01]]], device='cuda:0', dtype=torch.bfloat16)
+attn_softmax_ref shape is torch.Size([1459, 32, 128]), stride is (4096, 128, 1)
+   attn_out_flash:
+     has_nan=False, has_inf=False
+   attn_out_ref:
+     has_nan=False, has_inf=False
+   torch.allclose(atol=0.1, rtol=0.1): True
+   Max absolute difference: 1.562500e-02
+   Mean absolute difference: 4.479052e-05
+   Max reference value: 4.093750e+00
+   Relative difference: 3.816794e-03
+
+PASS!!!!

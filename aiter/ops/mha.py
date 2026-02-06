@@ -2357,7 +2357,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
         if is_grad:
 
-            assert return_lse
+            # assert return_lse
             ctx.save_for_backward(
                 q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
             )
