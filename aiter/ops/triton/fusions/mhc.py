@@ -172,9 +172,8 @@ def fused_mhc(
     # Get config from JSON files if not provided (mode-aware config loading)
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode=hres_mode)
-    else:
-        config = dict(config)  # Copy to avoid mutation
-    
+    config = dict(config)  # Always copy to avoid mutating LRU cache
+    print(config)
     num_ksplit = config.get("NUM_KSPLIT", 1)
     hres_op = config.pop("HRES_OP", 0)
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
@@ -611,9 +610,8 @@ def sinkhorn_knopp(
     # Get config from JSON files if not provided
     if config is None:
         config, _ = get_mhc_config("MHC_SINKHORN", M)
-    else:
-        config = dict(config)  # Copy to avoid mutation
-
+    config = dict(config)  # Always copy to avoid mutating LRU cache
+    print(config)
     # Pop BLOCK_M for grid calculation (handle legacy BLOCK_SIZE name)
     BLOCK_M = config.pop("BLOCK_M", config.pop("BLOCK_SIZE", 8))
     
