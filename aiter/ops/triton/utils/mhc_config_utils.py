@@ -2,6 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import glob
+import os
+import re
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
@@ -12,13 +15,16 @@ from aiter.ops.triton.utils.gemm_config_utils import _load_config_file, USE_LRU_
 def get_mhc_config(
     config_name: str,
     M: int,
-    C: int | None = None,
+    C: int,
     mode: str | None = None,
 ) -> tuple[dict, bool]:
     """
-    Load MHC configuration with matching of M_LEQ_x keys, C, and mode.
+    Load MHC configuration with threshold matching of M_LEQ_x keys, C, and mode.
 
-    Selection finds the smallest threshold >= input M value.
+    Selection logic:
+    - C: Finds the largest C-specific config file threshold <= input C value.
+      Available C configs are discovered from files named {arch}-{config}-C={value}.json.
+    - M: Within the selected config, finds the largest M_LEQ_x threshold <= input M value.
 
     Config file naming convention:
     - For MHC_FUSED: mode is required ("lite" or "sinkhorn")
@@ -29,7 +35,8 @@ def get_mhc_config(
     Args:
         config_name: Base name of the config (e.g., "MHC_FUSED", "MHC_SINKHORN")
         M: M dimension (batch/sequence size)
-        C: C dimension (hidden dim per stream, optional for specialized configs)
+        C: C dimension (hidden dim per stream). Uses threshold matching
+            to find the largest available C config <= input C.
         mode: H_res mode for MHC_FUSED - "lite" or "sinkhorn" (required for MHC_FUSED)
 
     Returns:
@@ -66,19 +73,33 @@ def get_mhc_config(
     config_dict_key = "default"
     used_specialized = False
 
-    # Try C-specific config if C is provided
-    if C is not None:
-        c_key = f"C_{C}"
-        if c_key not in get_mhc_config._config_cache[cache_key]:
-            fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C={C}.json"
-            if _load_config_file(
-                get_mhc_config._config_cache, cache_key, fpath, c_key
-            ):
-                config_dict_key = c_key
-                used_specialized = True
-        elif c_key in get_mhc_config._config_cache[cache_key]:
+    # Try C-specific config (threshold matching: largest C <= input C)
+    c_thresholds_key = f"{cache_key}_c_thresholds"
+
+    # Discover available C-specific config files once per cache_key
+    if c_thresholds_key not in get_mhc_config._config_cache:
+        pattern = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C=*.json"
+        c_thresholds = []
+        for fpath in glob.glob(pattern):
+            basename = os.path.basename(fpath)
+            match = re.search(r"-C=(\d+)\.json$", basename)
+            if match:
+                c_thresholds.append(int(match.group(1)))
+        c_thresholds.sort()
+        get_mhc_config._config_cache[c_thresholds_key] = c_thresholds
+
+    # Find largest C threshold <= input C
+    for c_threshold in reversed(get_mhc_config._config_cache[c_thresholds_key]):
+        if C >= c_threshold:
+            c_key = f"C_{c_threshold}"
+            if c_key not in get_mhc_config._config_cache[cache_key]:
+                fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C={c_threshold}.json"
+                _load_config_file(
+                    get_mhc_config._config_cache, cache_key, fpath, c_key
+                )
             config_dict_key = c_key
             used_specialized = True
+            break
 
     config_dict = get_mhc_config._config_cache[cache_key][config_dict_key]
 
@@ -93,10 +114,16 @@ def get_mhc_config(
                 continue
     m_leq_keys.sort()  # Sort by threshold value
 
-    # Find smallest threshold >= M (up to or equal to matching)
+    # Find largest threshold <= M
+    matched_key = None
     for threshold, key in m_leq_keys:
-        if M <= threshold:
-            return dict(config_dict[key]), used_specialized
+        if M >= threshold:
+            matched_key = key
+        else:
+            break
+
+    if matched_key is not None:
+        return dict(config_dict[matched_key]), used_specialized
 
     # Fallback to "any" if no matching key found
     if "any" in config_dict:

@@ -41,7 +41,7 @@
     },
     "M_LEQ_16384": {
         "BLOCK_M": 64,
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "BLOCK_K": 128,
         "NUM_KSPLIT": 1,
         "num_warps": 4,

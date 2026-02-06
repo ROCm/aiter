@@ -2,7 +2,7 @@
     "M_LEQ_1024": {
         "BLOCK_M": 64,
         "BLOCK_K": 128,
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "NUM_KSPLIT": 4,
         "num_warps": 8,
         "num_stages": 1,
@@ -12,7 +12,7 @@
     "M_LEQ_2048": {
         "BLOCK_M": 64,
         "BLOCK_K": 128,
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "NUM_KSPLIT": 4,
         "num_warps": 8,
         "num_stages": 2,
@@ -22,7 +22,7 @@
     "M_LEQ_4096": {
         "BLOCK_M": 64,
         "BLOCK_K": 128,
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "NUM_KSPLIT": 4,
         "num_warps": 4,
         "num_stages": 2,
@@ -32,7 +32,7 @@
     "M_LEQ_8192": {
         "BLOCK_M": 128,
         "BLOCK_K": 64,
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "NUM_KSPLIT": 4,
         "num_warps": 4,
         "num_stages": 2,
@@ -42,7 +42,7 @@
     "M_LEQ_16384": {
         "BLOCK_M": 128,
         "BLOCK_K": 128,
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "NUM_KSPLIT": 2,
         "num_warps": 4,
         "num_stages": 2,
@@ -52,7 +52,7 @@
     "any": {
         "BLOCK_M": 64,
         "BLOCK_K": 64,
-        "BLOCK_N": 16,
+        "BLOCK_N": 32,
         "waves_per_eu": 2,
         "num_stages": 1,
         "num_warps": 4,

@@ -173,13 +173,13 @@ def fused_mhc(
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode=hres_mode)
     config = dict(config)  # Always copy to avoid mutating LRU cache
-    print(config)
+    # print(config)
     num_ksplit = config.get("NUM_KSPLIT", 1)
     hres_op = config.pop("HRES_OP", 0)
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     # BLOCK_N: Column tile size (must be power of 2 for Triton arange)
-    if hres_lite_mode:
-        min_block_n = max(n_res_expected, n_squared)
+    if hres_lite_mode:        
+        min_block_n = n_factorial
         config_block_n = config.pop("BLOCK_N", min_block_n)
         BLOCK_N = triton.next_power_of_2(max(config_block_n, min_block_n))
     else:
@@ -534,14 +534,16 @@ def mhc(
         # Apply Sinkhorn-Knopp (Equation 19) to make H_res doubly stochastic
         # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn kernel
         M = out_res.shape[0]
+        C = x.shape[1] // n
         out_res_3d = out_res.view(M, n, n)
-        sinkhorn_knopp(out_res_3d, num_iters=sinkhorn_iters, out=out_res_3d)
+        sinkhorn_knopp(out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d)
         
         return out_pre, out_post, out_res
 
 
 def sinkhorn_knopp(
     logits: torch.Tensor,
+    C: int,
     num_iters: int = 20,
     out: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
@@ -562,6 +564,7 @@ def sinkhorn_knopp(
             - M is the batch size (e.g., number of layers or heads)
             - N is the matrix size (e.g., n_streams, typically 4)
             N must be a power of 2 and <= 64.
+        C (int): C dimension (hidden dim per stream) for config selection.
         num_iters (int): Number of Sinkhorn-Knopp iterations. Default: 10.
             More iterations = better convergence to doubly stochastic.
             Typically 10-20 iterations suffice.
@@ -609,7 +612,7 @@ def sinkhorn_knopp(
 
     # Get config from JSON files if not provided
     if config is None:
-        config, _ = get_mhc_config("MHC_SINKHORN", M)
+        config, _ = get_mhc_config("MHC_SINKHORN", M, C)
     config = dict(config)  # Always copy to avoid mutating LRU cache
     print(config)
     # Pop BLOCK_M for grid calculation (handle legacy BLOCK_SIZE name)
